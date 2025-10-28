@@ -796,18 +796,246 @@ Build a next-generation operating system that prioritizes:
 
 ---
 
-## Phase 12: Hardware Support & Compatibility (Weeks 43-46)
+## Phase 12: Raspberry Pi Support (Weeks 43-48)
+
+### 12.0 Raspberry Pi Foundation (Priority Target)
+
+#### 12.0.1 Raspberry Pi Hardware Support
+- [ ] **Raspberry Pi 4 Model B** (Primary target - ARM Cortex-A72, 4 cores, 1-8GB RAM)
+  - [ ] Board-specific bootloader
+    - [ ] Parse config.txt and cmdline.txt
+    - [ ] Load kernel8.img (64-bit kernel)
+    - [ ] GPU firmware interaction (start4.elf)
+    - [ ] Device tree blob loading
+  - [ ] BCM2711 SoC support
+    - [ ] ARM Cortex-A72 initialization
+    - [ ] Memory map setup (MMIO base 0xFE000000)
+    - [ ] L1/L2 cache configuration
+  - [ ] Peripheral drivers
+    - [ ] Mini UART (primary serial console)
+    - [ ] PL011 UART (secondary)
+    - [ ] GPIO controller
+    - [ ] SPI controller
+    - [ ] I2C controller
+    - [ ] PWM controller
+  - [ ] Video Core IV GPU integration
+    - [ ] Mailbox interface for GPU communication
+    - [ ] Framebuffer allocation via mailbox
+    - [ ] Display settings (resolution, depth)
+    - [ ] Hardware video decoding (H.264)
+  - [ ] Storage
+    - [ ] SD/MMC controller (EMMC2)
+    - [ ] USB 3.0 mass storage
+    - [ ] Boot from USB support
+    - [ ] Network boot (PXE)
+  - [ ] Networking
+    - [ ] Gigabit Ethernet (BCM54213PE PHY)
+    - [ ] WiFi (Cypress CYW43455 chipset)
+    - [ ] Bluetooth 5.0 (same chipset)
+  - [ ] USB support
+    - [ ] USB 3.0 controller (VL805)
+    - [ ] USB 2.0 backward compatibility
+    - [ ] USB hub support
+    - [ ] USB OTG (USB-C port)
+  - [ ] Audio
+    - [ ] Analog audio (PWM-based)
+    - [ ] HDMI audio output
+    - [ ] I2S audio interface
+    - [ ] USB audio devices
+  - [ ] Display
+    - [ ] Dual micro-HDMI outputs
+    - [ ] 4K@60Hz support
+    - [ ] DSI interface (touchscreen displays)
+    - [ ] Composite video output
+  - [ ] Power management
+    - [ ] CPU frequency scaling (600MHz - 1.8GHz)
+    - [ ] Thermal throttling
+    - [ ] GPIO power rails
+    - [ ] USB power management
+
+- [ ] **Raspberry Pi 5** (Latest model - ARM Cortex-A76, 4 cores, 4-8GB RAM)
+  - [ ] BCM2712 SoC support
+    - [ ] ARM Cortex-A76 initialization (2.4GHz)
+    - [ ] Updated memory map
+    - [ ] Enhanced PCIe support (RP1 southbridge)
+  - [ ] RP1 I/O controller
+    - [ ] PCIe Gen 2.0 connection to SoC
+    - [ ] Improved GPIO performance
+    - [ ] Enhanced USB 3.0 support
+    - [ ] Gigabit Ethernet (Broadcom BCM54213S)
+  - [ ] Video Core VII GPU
+    - [ ] Vulkan 1.2 support
+    - [ ] OpenGL ES 3.1
+    - [ ] H.265 (HEVC) hardware decode
+    - [ ] Dual 4K@60Hz display output
+  - [ ] PCIe 2.0 interface
+    - [ ] M.2 HAT+ support
+    - [ ] NVMe SSD support
+    - [ ] External GPU support (experimental)
+  - [ ] Enhanced power delivery
+    - [ ] USB-C Power Delivery (5V/5A)
+    - [ ] Power button support
+    - [ ] RTC with battery backup
+    - [ ] Power management IC
+
+- [ ] **Raspberry Pi 3 Model B+** (Legacy support - ARM Cortex-A53, 1GB RAM)
+  - [ ] BCM2837B0 SoC support
+  - [ ] Basic peripheral support (UART, GPIO, SPI, I2C)
+  - [ ] Single-core boot, then SMP
+  - [ ] WiFi/Bluetooth (Cypress CYW43455)
+  - [ ] Reduced feature set (target: minimal desktop)
+
+#### 12.0.2 ARM64 Kernel Adaptations
+- [ ] ARM-specific kernel entry
+  - [ ] Exception level handling (EL2 → EL1 transition)
+  - [ ] ARM64 system registers setup (SCTLR_EL1, TCR_EL1, MAIR_EL1)
+  - [ ] Vector table (VBAR_EL1)
+  - [ ] Stack pointer initialization
+- [ ] Memory management (ARM64)
+  - [ ] 4KB, 16KB, 64KB page granules (use 4KB for compatibility)
+  - [ ] 4-level page tables (48-bit VA)
+  - [ ] ASID (Address Space ID) management
+  - [ ] Cache maintenance operations
+  - [ ] Barrier instructions (DSB, DMB, ISB)
+- [ ] Interrupt handling (ARM64)
+  - [ ] GIC-400 initialization (Raspberry Pi 4)
+  - [ ] GIC-600 support (Raspberry Pi 5)
+  - [ ] IRQ/FIQ routing
+  - [ ] SGI (Software Generated Interrupts) for IPI
+  - [ ] Exception handlers
+- [ ] SMP (Symmetric Multiprocessing)
+  - [ ] Secondary CPU spin-up
+  - [ ] Per-CPU stacks
+  - [ ] TLB shootdown
+  - [ ] CPU hotplug
+- [ ] Timer support
+  - [ ] ARM Generic Timer
+  - [ ] System timer (BCM2835)
+  - [ ] High-resolution timer
+  - [ ] Tick scheduling
+
+#### 12.0.3 Device Tree Integration
+- [ ] Device tree compiler integration
+  - [ ] Parse DTB (Device Tree Blob) from bootloader
+  - [ ] Device tree overlay support
+  - [ ] Runtime device tree modification
+- [ ] Board-specific device trees
+  - [ ] bcm2711-rpi-4-b.dts (Pi 4)
+  - [ ] bcm2712-rpi-5-b.dts (Pi 5)
+  - [ ] bcm2837-rpi-3-b-plus.dts (Pi 3)
+  - [ ] Custom overlays for HATs
+- [ ] Driver probing from device tree
+  - [ ] Match compatible strings
+  - [ ] Parse properties (reg, interrupts, clocks)
+  - [ ] Resource allocation
+
+#### 12.0.4 Raspberry Pi-Specific Optimizations
+- [ ] Memory optimization for low-RAM models
+  - [ ] Kernel memory footprint <50MB
+  - [ ] Aggressive page reclamation
+  - [ ] No swap (use ZRAM instead)
+  - [ ] Compressed kernel modules
+- [ ] Boot time optimization
+  - [ ] Target: <3 seconds to shell (Pi 4/5)
+  - [ ] Parallel device initialization
+  - [ ] Lazy module loading
+  - [ ] Skip unnecessary hardware probes
+- [ ] Thermal management
+  - [ ] CPU temperature monitoring
+  - [ ] Passive cooling (throttling at 80°C)
+  - [ ] Fan control (GPIO-based, if present)
+  - [ ] Thermal zones for Pi 5
+- [ ] Power efficiency
+  - [ ] CPU idle states
+  - [ ] Dynamic voltage and frequency scaling (DVFS)
+  - [ ] Peripheral power gating
+  - [ ] Display blanking
+
+#### 12.0.5 HAT (Hardware Attached on Top) Support
+- [ ] HAT detection via I2C EEPROM
+  - [ ] Read HAT ID EEPROM
+  - [ ] Parse HAT metadata
+  - [ ] Load appropriate device tree overlay
+- [ ] Common HAT support
+  - [ ] Sense HAT (sensors, LED matrix)
+  - [ ] Camera modules (v1, v2, v3)
+  - [ ] Official touchscreen display
+  - [ ] PoE HAT (Power over Ethernet)
+  - [ ] Coral AI accelerator
+  - [ ] M.2 HAT+ (NVMe, Wi-Fi cards)
+
+#### 12.0.6 Cross-Platform Build System
+- [ ] ARM64 cross-compilation toolchain
+  - [ ] Home language ARM64 backend (via LLVM)
+  - [ ] Cross-compile from x86-64 → ARM64
+  - [ ] Build kernel and userspace for ARM64
+- [ ] SD card image creation
+  - [ ] Partition layout (FAT32 boot + ext4 root)
+  - [ ] Bootloader installation (config.txt, start4.elf, kernel8.img)
+  - [ ] Rootfs population
+  - [ ] Image compression (xz or gzip)
+- [ ] QEMU testing
+  - [ ] QEMU ARM64 raspi3b machine
+  - [ ] QEMU ARM64 raspi4b machine
+  - [ ] Automated testing in QEMU
+  - [ ] GDB remote debugging
+
+#### 12.0.7 Raspberry Pi-Specific Applications
+- [ ] GPIO control utility
+  - [ ] Command-line GPIO manipulation
+  - [ ] libgpiod-compatible API
+  - [ ] PWM control
+  - [ ] Hardware PWM vs software PWM
+- [ ] Configuration tool (raspi-config equivalent)
+  - [ ] System configuration TUI
+  - [ ] Display settings
+  - [ ] Overclock settings (with warnings)
+  - [ ] Boot options
+  - [ ] Locale and keyboard
+- [ ] Hardware monitoring dashboard
+  - [ ] CPU temperature
+  - [ ] CPU frequency (current/min/max)
+  - [ ] Throttling status
+  - [ ] Voltage (under-voltage detection)
+  - [ ] Memory usage
+
+#### 12.0.8 Performance Targets (Raspberry Pi)
+- **Raspberry Pi 4 (4GB model)**:
+  - Boot time: <3 seconds to shell, <8 seconds to GUI
+  - RAM usage (idle): <256MB (GUI), <128MB (headless)
+  - Graphics: 1080p@60fps UI, 30fps for 4K
+  - Network: 940 Mbps Ethernet, 150+ Mbps WiFi
+  - Storage: >40 MB/s sequential read (SD card)
+
+- **Raspberry Pi 5 (8GB model)**:
+  - Boot time: <2 seconds to shell, <6 seconds to GUI
+  - RAM usage (idle): <384MB (GUI), <192MB (headless)
+  - Graphics: 4K@60fps UI with smooth animations
+  - Network: 940 Mbps Ethernet, 300+ Mbps WiFi
+  - Storage: >400 MB/s sequential read (NVMe via PCIe)
+
+- **Raspberry Pi 3 B+ (1GB model)**:
+  - Boot time: <5 seconds to shell, <15 seconds to minimal GUI
+  - RAM usage (idle): <192MB (minimal GUI), <96MB (headless)
+  - Graphics: 720p@30fps UI (acceptable)
+  - Network: 300 Mbps Ethernet, 50+ Mbps WiFi
+
+---
+
+## Phase 13: Hardware Support & Compatibility (Weeks 49-52)
+
+### 13.1 Architecture Support (Continued)
 
 ### 12.1 Architecture Support
 - [ ] x86-64 (primary target, already in progress)
-- [ ] ARM64 (AArch64)
+- [ ] ARM64 (AArch64) - **Raspberry Pi 3/4/5**
   - [ ] Boot process (U-Boot or UEFI)
   - [ ] Device tree support
   - [ ] MMU setup
   - [ ] GIC (Generic Interrupt Controller)
 - [ ] RISC-V (future consideration)
 
-### 12.2 Additional Hardware Support
+### 13.2 Additional Hardware Support
 - [ ] More storage controllers
   - [ ] RAID controllers
   - [ ] SAS controllers
@@ -825,7 +1053,7 @@ Build a next-generation operating system that prioritizes:
   - [ ] Network printers (IPP)
   - [ ] CUPS-compatible API
 
-### 12.3 Power Management
+### 13.3 Power Management
 - [ ] ACPI (Advanced Configuration and Power Interface)
   - [ ] System sleep states (S3, S4)
   - [ ] CPU power states (P-states, C-states)
@@ -839,7 +1067,7 @@ Build a next-generation operating system that prioritizes:
   - [ ] Wake-on-LAN
   - [ ] USB selective suspend
 
-### 12.4 Laptop-Specific Features
+### 13.4 Laptop-Specific Features
 - [ ] Lid switch handling
 - [ ] Brightness control (keyboard and screen)
 - [ ] Volume control
@@ -847,7 +1075,7 @@ Build a next-generation operating system that prioritizes:
 - [ ] Battery status indicators
 - [ ] Touchpad gestures
 
-### 12.5 Virtualization Support
+### 13.5 Virtualization Support
 - [ ] Virtio drivers (as guest)
   - [ ] virtio-net
   - [ ] virtio-blk
@@ -863,9 +1091,9 @@ Build a next-generation operating system that prioritizes:
 
 ---
 
-## Phase 13: Developer Tools & Ecosystem (Weeks 47-50)
+## Phase 14: Developer Tools & Ecosystem (Weeks 53-56)
 
-### 13.1 Build System
+### 14.1 Build System
 - [ ] Integrate with Home's build system
 - [ ] Kernel build configuration
   - [ ] menuconfig-like interface
@@ -875,7 +1103,7 @@ Build a next-generation operating system that prioritizes:
 - [ ] Incremental builds
 - [ ] Distributed builds
 
-### 13.2 Debugging Tools
+### 14.2 Debugging Tools
 - [ ] Kernel debugger (KDB/KGDB-like)
   - [ ] Breakpoints
   - [ ] Single-stepping
@@ -897,7 +1125,7 @@ Build a next-generation operating system that prioritizes:
   - [ ] Event tracing
   - [ ] eBPF support (for advanced tracing)
 
-### 13.3 Development Environment
+### 14.3 Development Environment
 - [ ] SDK for application development
   - [ ] Headers and libraries
   - [ ] Documentation
@@ -911,7 +1139,7 @@ Build a next-generation operating system that prioritizes:
   - [ ] Build scripts
   - [ ] Package signing
 
-### 13.4 Documentation
+### 14.4 Documentation
 - [ ] Kernel API documentation
 - [ ] System call reference
 - [ ] Driver development guide
@@ -920,7 +1148,7 @@ Build a next-generation operating system that prioritizes:
 - [ ] Security guidelines
 - [ ] Performance tuning guide
 
-### 13.5 Testing Infrastructure
+### 14.5 Testing Infrastructure
 - [ ] Unit tests (per-component)
 - [ ] Integration tests
 - [ ] Regression tests
@@ -933,9 +1161,9 @@ Build a next-generation operating system that prioritizes:
 
 ---
 
-## Phase 14: Containerization & Virtualization (Weeks 51-54)
+## Phase 15: Containerization & Virtualization (Weeks 57-60)
 
-### 14.1 Container Runtime
+### 15.1 Container Runtime
 - [ ] Namespace implementation (enhance Phase 2)
   - [ ] PID namespace
   - [ ] Mount namespace
@@ -959,14 +1187,14 @@ Build a next-generation operating system that prioritizes:
   - [ ] Volume management
   - [ ] Container logs
 
-### 14.2 Container Orchestration (Basic)
+### 15.2 Container Orchestration (Basic)
 - [ ] Pod abstraction (Kubernetes-inspired)
 - [ ] Service discovery
 - [ ] Load balancing
 - [ ] Health checks
 - [ ] Auto-restart on failure
 
-### 14.3 Virtual Machine Support
+### 15.3 Virtual Machine Support
 - [ ] KVM integration (as host)
 - [ ] QEMU-like device emulation
 - [ ] VM creation and management
@@ -975,9 +1203,9 @@ Build a next-generation operating system that prioritizes:
 
 ---
 
-## Phase 15: Advanced Features & Polish (Weeks 55-60)
+## Phase 16: Advanced Features & Polish (Weeks 61-66)
 
-### 15.1 Multimedia Support
+### 16.1 Multimedia Support
 - [ ] Video playback
   - [ ] H.264/H.265 decoding
   - [ ] VP8/VP9 support
@@ -989,7 +1217,7 @@ Build a next-generation operating system that prioritizes:
   - [ ] V4L2 (Video4Linux2) interface
   - [ ] Camera application
 
-### 15.2 Accessibility
+### 16.2 Accessibility
 - [ ] Screen reader
 - [ ] High contrast themes
 - [ ] Magnifier
@@ -997,7 +1225,7 @@ Build a next-generation operating system that prioritizes:
 - [ ] Text-to-speech (TTS)
 - [ ] Speech-to-text (STT)
 
-### 15.3 Internationalization (i18n)
+### 16.3 Internationalization (i18n)
 - [ ] Unicode support (UTF-8)
 - [ ] Multiple language support
 - [ ] Keyboard layouts (extend Phase 4)
@@ -1005,7 +1233,7 @@ Build a next-generation operating system that prioritizes:
 - [ ] RTL (Right-to-Left) text support
 - [ ] Time zones and locales
 
-### 15.4 System Management
+### 16.4 System Management
 - [ ] System logs viewer
 - [ ] Crash reporting
 - [ ] System updates
@@ -1017,19 +1245,19 @@ Build a next-generation operating system that prioritizes:
   - [ ] Incremental backups
   - [ ] User data backup
 
-### 15.5 Cloud Integration
+### 16.5 Cloud Integration
 - [ ] Cloud storage support (optional)
 - [ ] Remote desktop protocol (RDP/VNC)
 - [ ] SSH server and client
 - [ ] Cloud sync for settings
 
-### 15.6 Gaming Support (Optional)
+### 16.6 Gaming Support (Optional)
 - [ ] Game controller input (enhance Phase 4)
 - [ ] Vulkan API support (already in Craft)
 - [ ] Steam compatibility layer (Proton-like)
 - [ ] DirectX translation (DXVK-like)
 
-### 15.7 Advanced Networking
+### 16.7 Advanced Networking
 - [ ] VPN client (OpenVPN, WireGuard)
 - [ ] Advanced WiFi features
   - [ ] WiFi hotspot mode
@@ -1038,7 +1266,7 @@ Build a next-generation operating system that prioritizes:
 - [ ] IPv6 enhancements
 - [ ] QoS (Quality of Service)
 
-### 15.8 System Aesthetics
+### 16.8 System Aesthetics
 - [ ] Boot splash screen (enhance from Phase 1)
 - [ ] Smooth animations throughout UI
 - [ ] Multiple themes and icon packs
@@ -1050,18 +1278,22 @@ Build a next-generation operating system that prioritizes:
 
 ---
 
-## Phase 16: Testing, Refinement & Release (Weeks 61-70)
+## Phase 17: Testing, Refinement & Release (Weeks 67-78)
 
-### 16.1 Comprehensive Testing
+### 17.1 Comprehensive Testing
 - [ ] Alpha testing on virtual machines
 - [ ] Beta testing on real hardware
+  - [ ] Raspberry Pi 4 Model B (all RAM variants)
+  - [ ] Raspberry Pi 5 (4GB and 8GB)
+  - [ ] Raspberry Pi 3 B+ (legacy support)
+  - [ ] x86-64 laptops and desktops
 - [ ] User acceptance testing
 - [ ] Security audit
 - [ ] Performance benchmarking (final)
 - [ ] Stability testing (stress tests, long runs)
 - [ ] Compatibility testing (hardware matrix)
 
-### 16.2 Bug Fixing & Refinement
+### 17.2 Bug Fixing & Refinement
 - [ ] Address all critical bugs
 - [ ] Fix high-priority bugs
 - [ ] Performance tuning based on profiling
@@ -1069,7 +1301,7 @@ Build a next-generation operating system that prioritizes:
 - [ ] Race condition fixes
 - [ ] Edge case handling
 
-### 16.3 Documentation Polish
+### 17.3 Documentation Polish
 - [ ] User manual
 - [ ] Installation guide
 - [ ] Troubleshooting guide
@@ -1077,8 +1309,12 @@ Build a next-generation operating system that prioritizes:
 - [ ] Video tutorials
 - [ ] API documentation finalization
 
-### 16.4 Installation System
-- [ ] Live USB/CD creation
+### 17.4 Installation System
+- [ ] Live USB/CD creation (x86-64)
+- [ ] SD card images for Raspberry Pi
+  - [ ] Raspberry Pi Imager integration
+  - [ ] Pre-configured images (desktop, server, minimal)
+  - [ ] First-boot setup wizard
 - [ ] Graphical installer
   - [ ] Disk partitioning
   - [ ] Timezone/locale selection
@@ -1088,20 +1324,21 @@ Build a next-generation operating system that prioritizes:
 - [ ] Automated installation (preseed/kickstart-like)
 - [ ] Upgrade path from previous versions
 
-### 16.5 Release Preparation
+### 17.5 Release Preparation
 - [ ] Version numbering scheme
 - [ ] Release notes
 - [ ] Change log
 - [ ] Download mirrors
 - [ ] Torrent distribution
-- [ ] ISO checksums and signatures
+- [ ] ISO checksums and signatures (x86-64)
+- [ ] SD card image checksums and signatures (ARM64/Raspberry Pi)
 - [ ] Marketing materials
   - [ ] Website
   - [ ] Screenshots
   - [ ] Feature highlights
   - [ ] Comparison with other OSes
 
-### 16.6 Community Building
+### 17.6 Community Building
 - [ ] Open source repository setup (GitHub/GitLab)
 - [ ] Contribution guidelines
 - [ ] Code of conduct
@@ -1110,7 +1347,7 @@ Build a next-generation operating system that prioritizes:
 - [ ] Wiki for community docs
 - [ ] Social media presence
 
-### 16.7 Post-Release Support
+### 17.7 Post-Release Support
 - [ ] Patch release cycle planning
 - [ ] Security update process
 - [ ] Bug bounty program (optional)
@@ -1147,9 +1384,16 @@ Build a next-generation operating system that prioritizes:
 ## Success Metrics
 
 ### Performance Targets
-- **Boot Time**: <5 seconds (SSD, x86-64)
-- **RAM Usage (Idle)**: <512MB (full GUI environment)
-- **Binary Size (Kernel)**: <10MB
+- **Boot Time**:
+  - x86-64 (SSD): <5 seconds
+  - Raspberry Pi 4: <8 seconds (GUI)
+  - Raspberry Pi 5: <6 seconds (GUI)
+- **RAM Usage (Idle)**:
+  - x86-64: <512MB (full GUI environment)
+  - Raspberry Pi 4: <256MB (full GUI)
+  - Raspberry Pi 5: <384MB (full GUI)
+  - Raspberry Pi 3: <192MB (minimal GUI)
+- **Binary Size (Kernel)**: <10MB (x86-64), <8MB (ARM64)
 - **Context Switch Time**: <2μs
 - **System Call Latency**: <500ns
 - **Network Throughput**: Near line rate (depends on hardware)
@@ -1162,9 +1406,13 @@ Build a next-generation operating system that prioritizes:
 - **Memory Leaks**: None detected in 72-hour stress test
 
 ### Compatibility Targets
-- **Hardware Support**: Boot on 80% of consumer x86-64 laptops/desktops from last 5 years
+- **Hardware Support**:
+  - Boot on 80% of consumer x86-64 laptops/desktops from last 5 years
+  - Full support for Raspberry Pi 3 B+, 4, and 5
+  - Support for common Raspberry Pi HATs
 - **Application Compatibility**: Run top 50 open-source applications (via porting or compatibility layer)
 - **POSIX Compliance**: 95% of POSIX.1-2017 interfaces
+- **Cross-Platform**: Identical user experience on x86-64 and ARM64
 
 ### Security Targets
 - **Memory Safety**: 100% (enforced by Home language)
@@ -1199,7 +1447,8 @@ Build a next-generation operating system that prioritizes:
 
 ## Notes
 
-- This is an ambitious 70-week (17.5 month) plan for building a full operating system from scratch
+- This is an ambitious 78-week (19.5 month) plan for building a full operating system from scratch
+- **Raspberry Pi is a first-class target**, not an afterthought
 - Phases can overlap where dependencies allow
 - Some phases may take longer or shorter depending on complexity and team size
 - Regular checkpoints and adjustments are expected
