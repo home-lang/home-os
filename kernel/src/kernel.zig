@@ -36,22 +36,11 @@ export fn kernel_main(magic: u32, info_addr: u32) callconv(.c) noreturn {
     serial.writeString("Serial initialized OK\n");
 
     // Initialize VGA text mode
-    serial.writeString("Initializing VGA...\n");
-    // TODO: VGA causes crash - debug later
-    // vga.init();
-    serial.writeString("VGA init OK (skipped)\n");
-    // vga.clear();
-    serial.writeString("VGA clear OK (skipped)\n");
-
-    // Display boot banner
+    // TODO: VGA has issues accessing 0xB8000 buffer - needs investigation
+    // For now, using serial console only
     serial.writeString("=== home-os ===\n");
     serial.writeString("A modern, minimal operating system\n");
     serial.writeString("Built with Home, Craft, and Pantry\n\n");
-    // vga.setColor(.Cyan, .Black);
-    // vga.writeString("=== home-os ===\n");
-    // vga.setColor(.White, .Black);
-    // vga.writeString("A modern, minimal operating system\n");
-    // vga.writeString("Built with Home, Craft, and Pantry\n\n");
 
     // Verify Multiboot2 magic number
     if (magic != MULTIBOOT2_MAGIC) {
@@ -61,18 +50,19 @@ export fn kernel_main(magic: u32, info_addr: u32) callconv(.c) noreturn {
     serial.writeString("Multiboot2 magic verified: ");
     serial.writeHex(magic);
     serial.writeString("\n");
-    // vga.writeString("Multiboot2: OK\n");
+    serial.writeString("Multiboot2: OK\n");
 
     // Display boot info
     serial.writeString("Boot info address: ");
     serial.writeHex(info_addr);
     serial.writeString("\n");
 
-    // vga.writeString("Boot info: OK\n");
-    // vga.writeString("Bootloader: GRUB\n");
+    serial.writeString("Boot info: OK\n");
+    serial.writeString("Bootloader: GRUB\n");
 
     // Kernel initialized successfully
-    serial.writeString("\nKernel initialized successfully!\n");
+    serial.writeString("\n");
+    serial.writeString("Kernel initialized successfully!\n");
     serial.writeString("Entering idle loop...\n");
 
     // Display system info

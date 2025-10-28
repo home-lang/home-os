@@ -3,7 +3,12 @@
 
 const VGA_WIDTH: usize = 80;
 const VGA_HEIGHT: usize = 25;
-const VGA_BUFFER: *[VGA_HEIGHT][VGA_WIDTH]u16 = @ptrFromInt(0xB8000);
+const VGA_BUFFER_ADDR: usize = 0xB8000;
+
+// Get VGA buffer pointer (runtime evaluation)
+inline fn getVgaBuffer() *volatile [VGA_HEIGHT][VGA_WIDTH]u16 {
+    return @ptrFromInt(VGA_BUFFER_ADDR);
+}
 
 pub const Color = enum(u8) {
     Black = 0,
@@ -24,10 +29,11 @@ pub const Color = enum(u8) {
     White = 15,
 };
 
+// Explicitly initialized variables (not .bss)
 var row: usize = 0;
 var column: usize = 0;
-var fg_color: Color = .White;
-var bg_color: Color = .Black;
+var fg_color: Color = Color.White;
+var bg_color: Color = Color.Black;
 
 // Create VGA entry (character + color)
 inline fn vgaEntry(c: u8, fg: Color, bg: Color) u16 {
@@ -39,10 +45,13 @@ inline fn vgaEntry(c: u8, fg: Color, bg: Color) u16 {
 
 // Initialize VGA
 pub fn init() void {
-    row = 0;
-    column = 0;
-    fg_color = .White;
-    bg_color = .Black;
+    // Don't access any variables - they cause crashes in current setup
+    // Variables will be implicitly zero-initialized from .bss
+    // Just return for now
+    _ = row;
+    _ = column;
+    _ = fg_color;
+    _ = bg_color;
 }
 
 // Set colors
@@ -57,7 +66,7 @@ pub fn clear() void {
     while (y < VGA_HEIGHT) : (y += 1) {
         var x: usize = 0;
         while (x < VGA_WIDTH) : (x += 1) {
-            VGA_BUFFER[y][x] = vgaEntry(' ', fg_color, bg_color);
+            getVgaBuffer()[y][x] = vgaEntry(' ', fg_color, bg_color);
         }
     }
     row = 0;
@@ -71,14 +80,14 @@ fn scroll() void {
     while (y < VGA_HEIGHT - 1) : (y += 1) {
         var x: usize = 0;
         while (x < VGA_WIDTH) : (x += 1) {
-            VGA_BUFFER[y][x] = VGA_BUFFER[y + 1][x];
+            getVgaBuffer()[y][x] = getVgaBuffer()[y + 1][x];
         }
     }
 
     // Clear last row
     var x: usize = 0;
     while (x < VGA_WIDTH) : (x += 1) {
-        VGA_BUFFER[VGA_HEIGHT - 1][x] = vgaEntry(' ', fg_color, bg_color);
+        getVgaBuffer()[VGA_HEIGHT - 1][x] = vgaEntry(' ', fg_color, bg_color);
     }
 
     row = VGA_HEIGHT - 1;
@@ -100,7 +109,7 @@ pub fn writeChar(c: u8) void {
         return;
     }
 
-    VGA_BUFFER[row][column] = vgaEntry(c, fg_color, bg_color);
+    getVgaBuffer()[row][column] = vgaEntry(c, fg_color, bg_color);
 
     column += 1;
     if (column >= VGA_WIDTH) {
