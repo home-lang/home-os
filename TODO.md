@@ -21,9 +21,10 @@ Build a next-generation operating system that prioritizes:
 - **UI Engine**: Craft (1.4MB binary, <100ms startup, 35+ native components)
   - Location: `~/Code/craft`
   - Backends: Vulkan (primary), Metal (macOS), OpenGL (fallback)
-- **Package Manager**: Pantry (pkgx-powered, 10,000+ packages, sub-5ms environment switching)
+- **Package Manager**: Pantry (multi-source package manager, sub-5ms environment switching)
   - Location: `~/Code/pantry`
-  - Registry: pkgx.sh with 10,000+ packages
+  - Package Sources: pkgx.sh (10,000+ packages), npm registry, GitHub releases, custom HTTP endpoints
+  - Installation Modes: Global, project-local, environment-isolated
 
 ---
 
@@ -500,55 +501,89 @@ Build a next-generation operating system that prioritizes:
 
 ### 7.1 Port Pantry to home-os
 - [ ] Rewrite Pantry core in Home language
-  - [ ] Package manifest parsing (YAML/JSON)
+  - [ ] Package manifest parsing (YAML/JSON/TOML)
   - [ ] Dependency resolution algorithm
-  - [ ] Version constraint handling
-  - [ ] Cache management
+  - [ ] Version constraint handling (semver, ranges, wildcards)
+  - [ ] Multi-tier cache management (in-memory, disk, CDN)
 - [ ] Integrate with home-os kernel
   - [ ] System call interface for package operations
-  - [ ] File system operations (extract, symlink)
-  - [ ] Process spawning (post-install scripts)
-- [ ] Adapt pkgx registry integration
-  - [ ] HTTP client for package downloads
-  - [ ] TLS support for secure downloads
-  - [ ] Signature verification
-  - [ ] Metadata parsing
+  - [ ] File system operations (extract, symlink, hardlink)
+  - [ ] Process spawning (post-install scripts, hooks)
+  - [ ] Sandboxed execution for untrusted packages
+- [ ] Multi-source package registry integration
+  - [ ] pkgx.sh registry client (primary source, 10,000+ packages)
+  - [ ] npm registry client (for JavaScript/Node.js packages)
+  - [ ] GitHub releases API (for downloading release artifacts)
+  - [ ] Custom HTTP endpoint support (self-hosted registries)
+  - [ ] Registry priority and fallback mechanism
+  - [ ] Mirror support for offline/airgapped environments
+- [ ] Package verification and security
+  - [ ] HTTP client with connection pooling
+  - [ ] TLS 1.3 support for secure downloads
+  - [ ] Signature verification (GPG, minisign, cosign)
+  - [ ] Checksum validation (SHA256, SHA512)
+  - [ ] Metadata parsing and validation
+  - [ ] Supply chain security (SBOM, provenance)
 
 ### 7.2 Package Management Features
 - [ ] Package installation
-  - [ ] Download from registry
-  - [ ] Extract to package directory
-  - [ ] Create symlinks
-  - [ ] Run post-install scripts
-  - [ ] Register in package database
+  - [ ] Download from multiple sources (pkgx, npm, GitHub, custom)
+  - [ ] Source selection based on package type and availability
+  - [ ] Parallel downloads for multiple packages
+  - [ ] Extract to package directory (versioned paths)
+  - [ ] Create symlinks (version, compatibility, PKG_CONFIG)
+  - [ ] Run post-install scripts (sandboxed)
+  - [ ] Register in package database (SQLite)
+  - [ ] Binary cache support (skip compilation)
 - [ ] Package removal
-  - [ ] Dependency checking (prevent breaking)
-  - [ ] File cleanup
-  - [ ] Symlink removal
-  - [ ] Database update
+  - [ ] Dependency checking (prevent breaking dependent packages)
+  - [ ] Reverse dependency tracking
+  - [ ] File cleanup (garbage collection)
+  - [ ] Symlink removal (safe unlinking)
+  - [ ] Database update (transaction-safe)
+  - [ ] Orphan package detection and cleanup
 - [ ] Package updates
-  - [ ] Check for newer versions
+  - [ ] Check for newer versions across all sources
+  - [ ] Version comparison (respect semver constraints)
   - [ ] Download and install updates
   - [ ] Atomic updates (rollback on failure)
+  - [ ] Update all vs selective update
+  - [ ] Security update prioritization
 - [ ] Environment management
-  - [ ] Per-project environments
-  - [ ] Environment activation/deactivation
-  - [ ] Shell integration hooks
-  - [ ] Environment caching
+  - [ ] Per-project environments (isolated dependency trees)
+  - [ ] Environment fingerprinting (hash of dependencies)
+  - [ ] Environment activation/deactivation (PATH, LD_LIBRARY_PATH)
+  - [ ] Shell integration hooks (bash, zsh, fish)
+  - [ ] Multi-tier environment caching (instant switching)
+  - [ ] Environment inspection and debugging
 
 ### 7.3 System Integration
 - [ ] Bootstrap essential packages
-  - [ ] Compiler toolchain (Home compiler)
-  - [ ] Build tools (make, cmake)
-  - [ ] Core utilities
+  - [ ] Compiler toolchain (Home compiler, LLVM, GCC)
+  - [ ] Build tools (make, cmake, ninja)
+  - [ ] Core utilities (coreutils, findutils)
+  - [ ] Network tools (curl, wget, openssh)
+  - [ ] Development tools (git, vim, tmux)
 - [ ] Service management integration
-  - [ ] PostgreSQL, Redis, Nginx, etc.
-  - [ ] Automatic service initialization
-  - [ ] Service configuration
+  - [ ] 30+ pre-configured services (PostgreSQL, Redis, Nginx, etc.)
+  - [ ] Automatic service initialization and configuration
+  - [ ] Service configuration templates
+  - [ ] Service health checks and monitoring
+  - [ ] Service logs and debugging
+  - [ ] Multi-instance support (different versions side-by-side)
 - [ ] Development environment setup
-  - [ ] Automatic tool installation
-  - [ ] Version management
-  - [ ] Environment isolation
+  - [ ] Automatic tool installation based on project files
+  - [ ] Language-specific version management (Node, Python, Go, Rust, etc.)
+  - [ ] Environment isolation per project
+  - [ ] IDE integration (VSCode, JetBrains)
+  - [ ] Pre-configured development stacks
+- [ ] Package source configuration
+  - [ ] Configure custom HTTP endpoints (self-hosted, corporate)
+  - [ ] npm registry authentication (npm token support)
+  - [ ] GitHub releases authentication (GitHub token support)
+  - [ ] Source priority configuration (prefer certain sources)
+  - [ ] Proxy and mirror configuration
+  - [ ] Airgapped/offline mode support
 
 ---
 
@@ -1681,7 +1716,11 @@ Choose the option that scores highest across these dimensions.
 
 ### Pantry (Package Manager)
 - **Used For**: Package installation, environment management, system services
-- **Key Features**: Fast (sub-5ms switching), 10,000+ packages via pkgx, project-aware
+- **Key Features**:
+  - Fast (sub-5ms environment switching)
+  - Multi-source support: pkgx.sh (10,000+), npm, GitHub releases, custom HTTP endpoints
+  - Project-aware with automatic environment activation
+  - Service management (30+ pre-configured services)
 - **Integration Points**: Phase 7 for system integration, used throughout for software distribution
 
 ---
