@@ -6,23 +6,63 @@
 
 Build a next-generation operating system that prioritizes:
 - **Performance**: Sub-second boot, instant responsiveness
-- **Minimal Resources**: <512MB RAM for base system
+- **Minimal Resources**: <512MB RAM for base system (x86-64), <256MB for Raspberry Pi
 - **Security**: Memory-safe language, capability-based security
 - **Developer Experience**: Built-in tooling, zero-config development
 - **Modern UX**: GPU-accelerated UI, beautiful design
+- **Portability**: First-class support for x86-64 and ARM64 (Raspberry Pi)
+- **Education**: Ideal for learning OS development and embedded systems
 
 ## Technology Stack
 
 - **Language**: Home (memory-safe systems language, Zig-like speed, Rust-like safety)
+  - Location: `~/Code/home`
+  - Status: Active development, foundation phase complete
 - **UI Engine**: Craft (1.4MB binary, <100ms startup, 35+ native components)
+  - Location: `~/Code/craft`
+  - Backends: Vulkan (primary), Metal (macOS), OpenGL (fallback)
 - **Package Manager**: Pantry (pkgx-powered, 10,000+ packages, sub-5ms environment switching)
+  - Location: `~/Code/pantry`
+  - Registry: pkgx.sh with 10,000+ packages
+
+---
+
+## Development Milestones
+
+### Milestone 1: "Hello World" (Week 4)
+- Bootable kernel that prints "home-os" to serial console
+- Runs on QEMU x86-64
+
+### Milestone 2: "Interactive" (Week 12)
+- Basic keyboard input and framebuffer output
+- Simple shell that can run one built-in command
+
+### Milestone 3: "Persistent" (Week 20)
+- File system support with ability to create/read/write files
+- Basic network stack (ping works)
+
+### Milestone 4: "Visual" (Week 30)
+- Craft UI displaying simple window with button
+- Mouse cursor working
+
+### Milestone 5: "Portable" (Week 48)
+- Boots on real Raspberry Pi 4 hardware
+- Boots on real x86-64 laptop
+
+### Milestone 6: "Useful" (Week 60)
+- Can browse the web, edit text files, compile Home code
+- Package manager can install common tools
+
+### Milestone 7: "Release" (Week 78)
+- Public 1.0 release
+- Documentation, installers, community ready
 
 ---
 
 ## Phase 1: Foundation & Bootloader (Weeks 1-4)
 
 ### 1.1 Bootloader Implementation
-- [ ] Create UEFI bootloader using Home
+- [ ] **Week 1-2**: Create UEFI bootloader using Home
   - [ ] Implement UEFI boot services protocol
   - [ ] Set up memory map and paging structures
   - [ ] Load kernel binary into memory
@@ -44,7 +84,7 @@ Build a next-generation operating system that prioritizes:
   - [ ] Display boot splash screen
 
 ### 1.2 Minimal Kernel Core
-- [ ] Kernel entry point and initialization
+- [ ] **Week 2-3**: Kernel entry point and initialization
   - [ ] Switch to kernel address space
   - [ ] Set up GDT (Global Descriptor Table)
   - [ ] Set up IDT (Interrupt Descriptor Table)
@@ -77,7 +117,7 @@ Build a next-generation operating system that prioritizes:
   - [ ] FPU/SSE state management
 
 ### 1.3 Device Drivers (Basic)
-- [ ] Serial port driver (for early debugging)
+- [ ] **Week 3-4**: Serial port driver (for early debugging)
   - [ ] COM1/COM2 initialization
   - [ ] Buffered output
   - [ ] Interrupt-driven receive
@@ -1356,28 +1396,153 @@ Build a next-generation operating system that prioritizes:
 
 ---
 
+## Phase 18: Edge Computing & IoT Features (Optional - Weeks 79-82)
+
+### 18.1 IoT Device Support
+- [ ] GPIO-based sensors (temperature, humidity, motion)
+- [ ] I2C/SPI device drivers for common sensors
+- [ ] Low-power modes for battery operation
+- [ ] Wake-on-interrupt support
+- [ ] Real-time kernel patches (PREEMPT_RT-like)
+
+### 18.2 Edge Computing Features
+- [ ] Container runtime optimized for ARM
+- [ ] Kubernetes (k3s-like) lightweight orchestration
+- [ ] MQTT broker for IoT messaging
+- [ ] Time-series database (lightweight)
+- [ ] Edge ML inference (TensorFlow Lite, ONNX)
+
+### 18.3 Home Automation Integration
+- [ ] Zigbee/Z-Wave USB dongle support
+- [ ] Home Assistant compatibility layer
+- [ ] Smart home dashboard (Craft-based)
+- [ ] Automation rules engine
+- [ ] Voice assistant integration (local, privacy-focused)
+
+### 18.4 Industrial Applications
+- [ ] CAN bus support (automotive, industrial)
+- [ ] Modbus protocol (RTU and TCP)
+- [ ] OPC UA client/server
+- [ ] Deterministic scheduling (real-time tasks)
+- [ ] Watchdog timer support
+
+---
+
 ## Continuous Tasks (Throughout Development)
 
 ### Code Quality
-- [ ] Code reviews for all major changes
-- [ ] Static analysis (linting, type checking)
-- [ ] Memory leak detection (valgrind-like tools)
-- [ ] Security scanning
+- [ ] Code reviews for all major changes (PR template with checklist)
+- [ ] Static analysis (linting, type checking via Home compiler)
+- [ ] Memory leak detection (valgrind-like tools, Home's ownership analysis)
+- [ ] Security scanning (automated vulnerability checks)
+- [ ] Coding standards document (Home style guide)
+- [ ] Pre-commit hooks (formatting, basic checks)
 
 ### Performance Monitoring
-- [ ] Regular benchmarking
-- [ ] Profile-guided optimization
-- [ ] Resource usage tracking (memory, CPU, disk)
+- [ ] Regular benchmarking (weekly automated runs)
+- [ ] Profile-guided optimization (PGO builds)
+- [ ] Resource usage tracking (memory, CPU, disk, I/O)
+- [ ] Performance regression detection
+- [ ] Flamegraph generation for hotspots
+- [ ] Boot time tracking (per-phase breakdown)
 
 ### Documentation
-- [ ] Keep docs updated with code
-- [ ] Document design decisions
-- [ ] Architecture decision records (ADRs)
+- [ ] Keep docs updated with code (enforce via CI)
+- [ ] Document design decisions (why, not just what)
+- [ ] Architecture decision records (ADRs in docs/adr/)
+- [ ] API documentation (auto-generated from code)
+- [ ] Tutorial series (blog posts)
+- [ ] Video walkthroughs (YouTube channel)
 
 ### Testing
-- [ ] Write tests for new features
-- [ ] Maintain test coverage >80%
-- [ ] Run regression tests regularly
+- [ ] Write tests for new features (TDD where practical)
+- [ ] Maintain test coverage >80% (kernel: >70%, userspace: >85%)
+- [ ] Run regression tests regularly (on every PR)
+- [ ] Fuzzing for security-critical components
+- [ ] Hardware-in-the-loop testing (real Pi boards)
+- [ ] Chaos engineering (random fault injection)
+
+---
+
+## Project Structure
+
+```
+home-os/
+├── kernel/                 # Kernel source (Home)
+│   ├── arch/              # Architecture-specific code
+│   │   ├── x86_64/        # x86-64 support
+│   │   └── aarch64/       # ARM64/Raspberry Pi
+│   ├── drivers/           # Device drivers
+│   ├── fs/                # File systems
+│   ├── mm/                # Memory management
+│   ├── net/               # Network stack
+│   └── proc/              # Process management
+├── userspace/             # User-space programs
+│   ├── init/              # Init system
+│   ├── shell/             # home-sh shell
+│   ├── coreutils/         # Core utilities
+│   └── apps/              # Applications (file manager, etc.)
+├── libc/                  # home-libc implementation
+├── ui/                    # Craft UI integration
+│   ├── compositor/        # Wayland compositor
+│   ├── desktop/           # Desktop environment
+│   └── apps/              # GUI applications
+├── pkgmgr/                # Pantry package manager port
+├── bootloader/            # UEFI bootloader
+│   ├── x86_64/           # x86-64 bootloader
+│   └── aarch64/          # Raspberry Pi bootloader
+├── toolchain/             # Build tools and cross-compilers
+├── tests/                 # Test suites
+│   ├── unit/             # Unit tests
+│   ├── integration/      # Integration tests
+│   └── hardware/         # Hardware tests
+├── docs/                  # Documentation
+│   ├── architecture/     # Architecture docs
+│   ├── api/              # API reference
+│   ├── tutorials/        # Tutorials
+│   └── adr/              # Architecture Decision Records
+├── scripts/              # Build and utility scripts
+│   ├── build.home        # Build system
+│   ├── qemu-test.sh      # QEMU testing
+│   └── flash-pi.sh       # Flash to Raspberry Pi SD card
+├── images/               # Disk images and installers
+└── third-party/          # External dependencies
+```
+
+---
+
+## Development Environment Setup
+
+### Prerequisites
+- Home compiler (from `~/Code/home`)
+- Craft UI engine (from `~/Code/craft`)
+- Pantry package manager (from `~/Code/pantry`)
+- QEMU (for x86-64 and ARM64 testing)
+- Cross-compilation toolchain (ARM64-linux-gnu)
+- GNU Make or Ninja build system
+- Git for version control
+
+### Quick Start
+```bash
+# Clone and setup
+git clone <home-os-repo>
+cd home-os
+
+# Install dependencies via Pantry
+pantry install qemu gcc-aarch64-linux-gnu make
+
+# Build for x86-64
+./scripts/build.home --arch x86_64 --config debug
+
+# Test in QEMU
+./scripts/qemu-test.sh x86_64
+
+# Build for Raspberry Pi 4
+./scripts/build.home --arch aarch64 --board rpi4 --config release
+
+# Flash to SD card
+./scripts/flash-pi.sh /dev/sdX  # Replace X with your SD card
+```
 
 ---
 
@@ -1424,24 +1589,30 @@ Build a next-generation operating system that prioritizes:
 ## Risk Mitigation
 
 ### Technical Risks
-- **Risk**: Home language not mature enough
-  - **Mitigation**: Contribute to Home development, consider hybrid approach (Home + Zig)
-- **Risk**: WebKit porting too complex
-  - **Mitigation**: Use lightweight alternatives (WebKitGTK subset, or framebuffer-based rendering)
-- **Risk**: Hardware compatibility issues
-  - **Mitigation**: Extensive testing, prioritize common hardware first
+| Risk | Impact | Likelihood | Mitigation Strategy | Contingency Plan |
+|------|--------|------------|---------------------|------------------|
+| Home language not mature enough | High | Medium | Contribute to Home development, extensive testing | Hybrid approach (Home + Zig), or rewrite critical paths in Zig |
+| WebKit porting too complex | Medium | High | Use lightweight alternatives (WebKitGTK subset) | Framebuffer-based rendering, or embed Servo |
+| Hardware compatibility issues | Medium | Medium | Extensive testing, prioritize common hardware | Focus on well-supported hardware initially |
+| Raspberry Pi firmware changes | Low | Low | Track official firmware updates | Maintain compatibility with multiple firmware versions |
+| Performance targets not met | High | Medium | Profile-guided optimization, assembly hotspots | Adjust targets based on realistic measurements |
+| Security vulnerabilities | High | Medium | Security audits, fuzzing, bounty program | Rapid patch releases, security-focused sprints |
 
 ### Resource Risks
-- **Risk**: Development takes longer than 70 weeks
-  - **Mitigation**: Prioritize MVP features, defer nice-to-haves
-- **Risk**: Insufficient developer resources
-  - **Mitigation**: Open source early, build community
+| Risk | Impact | Likelihood | Mitigation Strategy | Contingency Plan |
+|------|--------|------------|---------------------|------------------|
+| Development takes longer than 78 weeks | Medium | High | Prioritize MVP features, defer nice-to-haves | Extend timeline, phase releases (alpha, beta, stable) |
+| Insufficient developer resources | High | Medium | Open source early, build community | Focus on core features, recruit contributors |
+| Budget constraints (hardware testing) | Medium | Low | Use QEMU extensively, community hardware testing | Partner with Raspberry Pi Foundation for hardware |
+| Key developer leaves | Medium | Low | Documentation, knowledge sharing | Pair programming, cross-training |
 
 ### Adoption Risks
-- **Risk**: Lack of application ecosystem
-  - **Mitigation**: Provide compatibility layers, port key applications
-- **Risk**: User resistance to new OS
-  - **Mitigation**: Excellent UX, clear migration path, comprehensive docs
+| Risk | Impact | Likelihood | Mitigation Strategy | Contingency Plan |
+|------|--------|------------|---------------------|------------------|
+| Lack of application ecosystem | High | High | Port key apps, compatibility layers | Focus on web apps via browser, terminal apps |
+| User resistance to new OS | Medium | Medium | Excellent UX, clear migration path | Target early adopters, education sector |
+| Competition from established OSes | Medium | High | Differentiate on performance, security, simplicity | Niche positioning (education, embedded, development) |
+| Raspberry Pi community adoption | Medium | Medium | Engage Pi community early, showcase benefits | Highlight Pi-specific features, performance gains |
 
 ---
 
@@ -1456,6 +1627,43 @@ Build a next-generation operating system that prioritizes:
 - Performance and security are first-class concerns throughout
 - Leverage existing open-source components where possible (but ensure licensing compatibility)
 - The OS should feel familiar to users of modern OSes while offering unique advantages (speed, security, developer experience)
+
+### Key Principles
+1. **Memory Safety First**: Home's ownership system prevents entire classes of bugs
+2. **Performance by Design**: Every feature should be benchmarked and optimized
+3. **Minimal Dependencies**: Keep the system small and auditable
+4. **Documentation as Code**: Docs are as important as the code itself
+5. **Test Everything**: If it's not tested, it's broken
+6. **Community Driven**: Open source from day one, welcome contributions
+7. **Educational Value**: Should be easy to understand and learn from
+8. **Portability**: Write once, run on x86-64 and ARM64
+
+### Decision Making Framework
+When faced with a design choice, ask:
+1. Does it improve security?
+2. Does it improve performance?
+3. Does it reduce complexity?
+4. Is it testable?
+5. Is it maintainable?
+6. Does it align with the vision?
+
+Choose the option that scores highest across these dimensions.
+
+### Communication Channels (Post-Open Source)
+- **GitHub Issues**: Bug reports, feature requests
+- **GitHub Discussions**: Q&A, design discussions
+- **Discord Server**: Real-time chat, community support
+- **Mailing List**: Development updates, announcements
+- **Blog**: Progress reports, technical deep-dives
+- **Twitter/Mastodon**: Release announcements, highlights
+
+### Funding Strategy
+- **Open Source Foundation**: Apply for grants (Linux Foundation, etc.)
+- **Sponsorships**: GitHub Sponsors, Open Collective
+- **Corporate Partnerships**: Raspberry Pi Foundation, cloud providers
+- **Hardware Vendors**: Collaborate with ARM, AMD, Intel
+- **Educational Institutions**: Partner with universities
+- **Consulting**: Offer paid support and custom development
 
 ---
 
@@ -1478,6 +1686,30 @@ Build a next-generation operating system that prioritizes:
 
 ---
 
+## Changelog
+
+### 2025-10-28
+- Initial TODO.md created with 17 phases
+- Added comprehensive Raspberry Pi support (Phase 12)
+- Added development milestones for tracking progress
+- Added project structure and setup instructions
+- Enhanced risk mitigation with detailed tables
+- Added Phase 18: Edge Computing & IoT Features (optional)
+- Added key principles and decision-making framework
+- Expanded continuous tasks with specific actions
+
+### Future Updates
+- [ ] After Phase 1: Review and adjust timeline based on actual progress
+- [ ] After Phase 6: Assess if user-space is on track for milestone goals
+- [ ] After Phase 12: Validate Raspberry Pi support on real hardware
+- [ ] Weekly: Update task completion status
+- [ ] Monthly: Review and update risk assessments
+
+---
+
 **Last Updated**: 2025-10-28
-**Status**: Initial Draft
-**Next Review**: After Phase 1 completion
+**Status**: Initial Comprehensive Draft
+**Next Review**: After Phase 1 completion (Week 4)
+**Version**: 1.0.0
+**Total Tasks**: ~800+ across 18 phases
+**Estimated Duration**: 78-82 weeks (19.5-20.5 months)
