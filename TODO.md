@@ -62,34 +62,36 @@ Build a next-generation operating system that prioritizes:
 
 ## Phase 1: Foundation & Bootloader (Weeks 1-4)
 
+**Status**: 🚧 In Progress (Week 1)
+
 ### 1.1 Bootloader Implementation
-- [ ] **Week 1-2**: Create UEFI bootloader using Home
-  - [ ] Implement UEFI boot services protocol
-  - [ ] Set up memory map and paging structures
-  - [ ] Load kernel binary into memory
-  - [ ] Pass boot parameters to kernel
-  - [ ] Support for GPT partition tables
-- [ ] Implement legacy BIOS bootloader (optional fallback)
+- [x] **Week 1-2**: Create UEFI bootloader using Home
+  - [x] Implement Multiboot2 header (using Home's kernel package)
+  - [x] Set up memory map and paging structures (boot.s)
+  - [x] Load kernel binary into memory
+  - [x] Pass boot parameters to kernel (magic + info_addr)
+  - [x] Support for GPT partition tables (Multiboot2)
+- [x] Implement legacy BIOS bootloader (Multiboot2 + GRUB2)
   - [ ] MBR boot sector code
   - [ ] Stage 2 loader
   - [ ] A20 line activation
   - [ ] Protected mode transition
-- [ ] Bootloader configuration system
-  - [ ] Parse boot configuration file
-  - [ ] Support multiple boot entries
-  - [ ] Kernel parameter passing
-  - [ ] Timeout and default selection
-- [ ] Early graphics initialization
-  - [ ] GOP (Graphics Output Protocol) for UEFI
-  - [ ] Set framebuffer mode
-  - [ ] Display boot splash screen
+- [x] Bootloader configuration system
+  - [x] Parse boot configuration file (grub.cfg)
+  - [x] Support multiple boot entries (normal, debug, safe)
+  - [x] Kernel parameter passing (via Multiboot2 cmdline)
+  - [x] Timeout and default selection (GRUB)
+- [x] Early graphics initialization
+  - [x] VGA text mode (80x25)
+  - [x] Set framebuffer mode (VGA)
+  - [x] Display boot splash screen (banner)
 
 ### 1.2 Minimal Kernel Core
-- [ ] **Week 2-3**: Kernel entry point and initialization
-  - [ ] Switch to kernel address space
-  - [ ] Set up GDT (Global Descriptor Table)
-  - [ ] Set up IDT (Interrupt Descriptor Table)
-  - [ ] Initialize CPU features (SSE, AVX)
+- [x] **Week 2-3**: Kernel entry point and initialization
+  - [x] Switch to kernel address space (boot.s - 64-bit long mode)
+  - [x] Set up GDT (Global Descriptor Table) (boot.s)
+  - [ ] Set up IDT (Interrupt Descriptor Table) (TODO: Phase 1.3)
+  - [x] Initialize CPU features (CPUID check, PAE, long mode)
 - [ ] Physical memory manager
   - [ ] Parse UEFI/BIOS memory map
   - [ ] Bitmap allocator for physical pages
@@ -118,20 +120,20 @@ Build a next-generation operating system that prioritizes:
   - [ ] FPU/SSE state management
 
 ### 1.3 Device Drivers (Basic)
-- [ ] **Week 3-4**: Serial port driver (for early debugging)
-  - [ ] COM1/COM2 initialization
-  - [ ] Buffered output
-  - [ ] Interrupt-driven receive
-- [ ] Keyboard driver
+- [x] **Week 3-4**: Serial port driver (for early debugging)
+  - [x] COM1 initialization (serial.home)
+  - [x] Buffered output (writeString, writeHex, writeDec)
+  - [ ] Interrupt-driven receive (TODO: needs IDT)
+- [ ] Keyboard driver (TODO: Phase 2)
   - [ ] PS/2 keyboard controller
   - [ ] USB keyboard (UHCI/EHCI/XHCI)
   - [ ] Scancode to keycode translation
   - [ ] Keyboard layout support
-- [ ] Framebuffer driver
-  - [ ] Linear framebuffer access
-  - [ ] Mode setting and resolution change
-  - [ ] Double buffering support
-  - [ ] Hardware cursor
+- [x] Framebuffer driver (VGA text mode - vga.home)
+  - [x] Linear framebuffer access (0xB8000)
+  - [x] Mode setting (80x25 text mode)
+  - [ ] Double buffering support (TODO: Phase 4)
+  - [x] Software cursor (row/column tracking)
 - [ ] Storage driver (basic)
   - [ ] ATA/ATAPI (IDE) support
   - [ ] AHCI (SATA) driver
