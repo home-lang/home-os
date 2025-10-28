@@ -126,16 +126,16 @@ _start:
     ljmp $0x08, $long_mode_start
 
 no_cpuid:
-    mov $0x4F524F45, 0xb8000  # 'E'
-    mov $0x4F524F52, 0xb8002  # 'R'
-    mov $0x4F524F52, 0xb8004  # 'R'
+    movl $0x4F524F45, 0xb8000  # 'E'
+    movl $0x4F524F52, 0xb8002  # 'R'
+    movl $0x4F524F52, 0xb8004  # 'R'
     hlt
     jmp no_cpuid
 
 no_long_mode:
-    mov $0x4F4E4F45, 0xb8000  # 'E'
-    mov $0x4F364F52, 0xb8002  # 'R'
-    mov $0x4F344F52, 0xb8004  # 'R'
+    movl $0x4F4E4F45, 0xb8000  # 'E'
+    movl $0x4F364F52, 0xb8002  # 'R'
+    movl $0x4F344F52, 0xb8004  # 'R'
     hlt
     jmp no_long_mode
 

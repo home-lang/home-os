@@ -8,12 +8,13 @@ SECTIONS
     /* Kernel loaded at 1MB physical */
     . = 1M;
 
-    .boot ALIGN(4K) : {
-        /* Multiboot2 header must be in first 32KB */
-        *(.multiboot)
+    /* Multiboot2 header MUST be in first 32KB and in a LOAD segment */
+    .multiboot : {
+        KEEP(*(.multiboot))
     }
 
-    .text ALIGN(4K) : {
+    /* Text section right after multiboot, ensuring it's in first segment */
+    .text : {
         *(.text)
         *(.text.*)
     }
