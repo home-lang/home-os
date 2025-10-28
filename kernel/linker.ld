@@ -3,37 +3,43 @@
 
 ENTRY(_start)
 
+PHDRS
+{
+    boot PT_LOAD FLAGS(5); /* Read + Execute */
+    data PT_LOAD FLAGS(6); /* Read + Write */
+}
+
 SECTIONS
 {
     /* Kernel loaded at 1MB physical */
     . = 1M;
 
-    /* Multiboot2 header MUST be in first 32KB and in a LOAD segment */
-    .multiboot : {
+    /* Multiboot2 header MUST be in first 32KB - place at very start */
+    .multiboot ALIGN(8) : {
         KEEP(*(.multiboot))
-    }
+    } :boot
 
-    /* Text section right after multiboot, ensuring it's in first segment */
-    .text : {
+    /* Text section immediately after, in same segment */
+    .text ALIGN(16) : {
         *(.text)
         *(.text.*)
-    }
+    } :boot
 
     .rodata ALIGN(4K) : {
         *(.rodata)
         *(.rodata.*)
-    }
+    } :boot
 
     .data ALIGN(4K) : {
         *(.data)
         *(.data.*)
-    }
+    } :data
 
     .bss ALIGN(4K) : {
         *(COMMON)
         *(.bss)
         *(.bss.*)
-    }
+    } :data
 
     /* TLS support */
     .tdata ALIGN(4K) : {

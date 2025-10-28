@@ -6,8 +6,13 @@
 .set HEADER_LENGTH, multiboot_header_end - multiboot_header_start
 .set CHECKSUM, -(MAGIC + ARCH + HEADER_LENGTH)
 
-/* Multiboot2 header */
-.section .multiboot
+/* Boot code with Multiboot2 header at the very start */
+.section .text
+.code32
+.global _start
+.type _start, @function
+
+/* Multiboot2 header MUST be at start of .text section */
 .align 8
 multiboot_header_start:
     .long MAGIC
@@ -22,27 +27,8 @@ multiboot_header_start:
     .long 8     # size
 multiboot_header_end:
 
-/* Stack */
-.section .bss
+/* Entry point immediately after header */
 .align 16
-stack_bottom:
-    .skip 16384  # 16KB stack
-stack_top:
-
-/* Page tables for 64-bit mode */
-.align 4096
-pml4:
-    .skip 4096
-pdpt:
-    .skip 4096
-pd:
-    .skip 4096
-
-/* Boot code */
-.section .text
-.code32
-.global _start
-.type _start, @function
 _start:
     /* Set up stack */
     mov $stack_top, %esp
@@ -178,3 +164,19 @@ gdt64_end:
 gdt64_pointer:
     .word gdt64_end - gdt64 - 1
     .quad gdt64
+
+/* Stack and page tables */
+.section .bss
+.align 16
+stack_bottom:
+    .skip 16384  # 16KB stack
+stack_top:
+
+/* Page tables for 64-bit mode */
+.align 4096
+pml4:
+    .skip 4096
+pdpt:
+    .skip 4096
+pd:
+    .skip 4096
