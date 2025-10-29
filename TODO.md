@@ -2,6 +2,39 @@
 
 > A modern, performant, minimal operating system built from scratch using Home (language), Craft (UI), and Pantry (package manager)
 
+## 🎉 Recent Progress (October 29, 2025 - Afternoon)
+
+### Home Language Improvements
+- ✅ **Added Bitwise NOT Operator (`~`)** - Essential for bit manipulation in OS code
+- ✅ **Added Reflection Functions** - `@intFromPtr`, `@ptrFromInt`, `@truncate`, `@as`, `@bitCast`
+- ✅ **Improved Lexer** - Added Tilde token support
+- ✅ **Enhanced Parser** - Support for new unary and reflection operators
+- ✅ **Updated Formatter & Interpreter** - Full support for new features
+
+### Codebase Improvements
+- ✅ **Consolidated Kernel Files** - Single `kernel.home` file (was 15+ files)
+- ✅ **Deleted All Zig Files** - Fully migrated to Home language
+- ✅ **Cleaned Up Build System** - Streamlined build process
+- ✅ **Verified Kernel Boots** - Successfully tested in QEMU
+
+### Files Modified
+- `~/Code/home/packages/lexer/src/token.zig` - Added Tilde token
+- `~/Code/home/packages/lexer/src/lexer.zig` - Added tilde scanning
+- `~/Code/home/packages/ast/src/ast.zig` - Added BitNot + reflection functions
+- `~/Code/home/packages/parser/src/parser.zig` - Added parsing support
+- `~/Code/home/packages/formatter/src/formatter.zig` - Added formatting
+- `~/Code/home/packages/interpreter/src/interpreter.zig` - Added evaluation
+- `~/Code/home-os/kernel/src/kernel.home` - Consolidated kernel
+- `~/Code/home-os/scripts/build-standalone.sh` - Updated build script
+
+### Current Status
+- **Phase 1: ~70% Complete** (up from 65%)
+- **Kernel**: Builds and boots successfully
+- **Home Compiler**: Enhanced with OS development features
+- **Next**: Implement real serial/VGA drivers, complete IDT, add timer support
+
+---
+
 ## Project Vision
 
 Build a next-generation operating system that prioritizes:
