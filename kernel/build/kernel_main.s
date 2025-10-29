@@ -11,14 +11,25 @@
     movq $256, %rax
     movq $1024, %rax
     movq $64, %rax
-    movq $16384, %rax
-    movq $8192, %rax
-    movq $10, %rax
-    movq $0, %rax
+    movq $1024, %rax
+    movq $65536, %rax
+    movq $64, %rax
+    movq $4096, %rax
     movq $1, %rax
     movq $2, %rax
     movq $3, %rax
     movq $4, %rax
+    movq $5, %rax
+    movq $6, %rax
+    movq $4, %rax
+    movq $2, %rax
+    movq $1, %rax
+    movq $0, %rax
+    movq $1, %rax
+    movq $2, %rax
+    movq $64, %rax
+    movq $512, %rax
+    movq $1024, %rax
     movq $0, %rax
     movq $1, %rax
     movq $2, %rax
@@ -32,10 +43,13 @@
     movq $10, %rax
     movq $11, %rax
     movq $12, %rax
-    movq $0, %rax
-    movq $1, %rax
-    movq $2, %rax
-    movq $4, %rax
+    movq $13, %rax
+    movq $14, %rax
+    movq $15, %rax
+    movq $16, %rax
+    movq $17, %rax
+    movq $18, %rax
+    movq $19, %rax
 cli:
     pushq %rbp
     movq %rsp, %rbp
@@ -83,7 +97,7 @@ inb:
 cpuid:
     pushq %rbp
     movq %rsp, %rbp
-    # cpuid - get CPU info
+    # cpuid
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -95,7 +109,7 @@ cpuid:
 rdtsc:
     pushq %rbp
     movq %rsp, %rbp
-    # rdtsc - read timestamp counter
+    # rdtsc
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -105,41 +119,806 @@ rdtsc:
     ret
 
     movq $1, %rax
+inode_create:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create new inode
     movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+inode_destroy:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Destroy inode
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+inode_read:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Read from inode
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+inode_write:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Write to inode
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+inode_get_size:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get inode size
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+inode_set_size:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Set inode size
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+inode_get_type:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get inode type
+    # Load variable FILE_TYPE_REGULAR
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+inode_get_mode:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get inode permissions
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+inode_set_mode:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Set inode permissions
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+dentry_create:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create directory entry
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+dentry_lookup:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Lookup directory entry
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+dentry_add:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Add dentry to parent
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+dentry_remove:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Remove dentry from parent
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+dentry_cache_add:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Add dentry to cache
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+dentry_cache_lookup:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Lookup dentry in cache
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_open:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Open file
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_close:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Close file
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_read:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Read from file
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_write:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Write to file
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_seek:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Seek in file
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_stat:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get file status
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_mkdir:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create directory
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_rmdir:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Remove directory
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_unlink:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Delete file
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_rename:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Rename file
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_chmod:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Change file permissions
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vfs_chown:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Change file ownership
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+superblock_create:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create superblock
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+superblock_destroy:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Destroy superblock
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+superblock_read_inode:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Read inode from superblock
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+superblock_write_inode:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Write inode to superblock
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+superblock_sync:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Sync superblock to disk
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+fd_table_create:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create FD table for process
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+fd_table_destroy:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Destroy FD table
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+fd_alloc:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Allocate file descriptor
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+fd_free:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Free file descriptor
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+fd_get:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get file from descriptor
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+fd_set_cloexec:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Set close-on-exec flag
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+fd_dup:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Duplicate file descriptor
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+fd_dup2:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Duplicate to specific FD
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+path_resolve:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Resolve path to inode
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+path_resolve_absolute:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Resolve absolute path
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+path_resolve_relative:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Resolve relative path
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+path_follow_symlink:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Follow symlink (with loop detection)
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+path_check_permissions:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Check path permissions
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+path_traverse_mount:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Traverse mount point
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mount_init:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Initialize mount system
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mount_fs:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Mount file system
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+umount_fs:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Unmount file system
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mount_bind:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Bind mount
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mount_get_root:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get root mount point
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mount_lookup:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Lookup mount point
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_format:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Format device with home-fs
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_mount:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Mount home-fs
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_unmount:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Unmount home-fs
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_create_file:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create file in home-fs
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_delete_file:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Delete file from home-fs
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_read_block:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Read block from home-fs
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_write_block:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Write block to home-fs
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_alloc_block:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Allocate block in home-fs
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_free_block:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Free block in home-fs
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_alloc_inode:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Allocate inode in home-fs
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_free_inode:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Free inode in home-fs
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_set_xattr:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Set extended attribute
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_get_xattr:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get extended attribute
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_create_snapshot:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create snapshot
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+homefs_clone_file:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Clone file (COW)
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+ext4_mount:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Mount ext4 file system
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+fat32_mount:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Mount FAT32 file system
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+procfs_init:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Initialize procfs
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+sysfs_init:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Initialize sysfs
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+tmpfs_create:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create tmpfs
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
 smp_init:
     pushq %rbp
     movq %rsp, %rbp
-    # SMP initialization - detect and start APs
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-smp_get_cpu_count:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Load variable cpu_count
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-smp_get_current_cpu:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Load variable current_cpu
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-smp_send_ipi:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Send inter-processor interrupt
+    # SMP init
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -147,102 +926,16 @@ smp_send_ipi:
 apic_init:
     pushq %rbp
     movq %rsp, %rbp
-    # Initialize Local APIC
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-apic_send_eoi:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Send EOI to APIC
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-apic_timer_init:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Initialize APIC timer
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-ioapic_init:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Initialize I/O APIC
+    # APIC init
     movq %rbp, %rsp
     popq %rbp
     ret
 
     movq $1, %rax
-    movq $0, %rax
-    movq $0, %rax
-pcb_create:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Create new PCB
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pcb_destroy:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Destroy PCB
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pcb_get_state:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Get process state
-    # Load variable PROCESS_READY
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pcb_set_state:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Set process state
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pcb_set_cpu_affinity:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Set CPU affinity mask
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pcb_get_cpu_affinity:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Get CPU affinity mask
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
 process_create:
     pushq %rbp
     movq %rsp, %rbp
-    # Create new process
+    # process_create
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -254,7 +947,7 @@ process_create:
 process_terminate:
     pushq %rbp
     movq %rsp, %rbp
-    # Terminate process
+    # process_terminate
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -262,7 +955,7 @@ process_terminate:
 process_fork:
     pushq %rbp
     movq %rsp, %rbp
-    # Fork current process
+    # process_fork
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -271,67 +964,10 @@ process_fork:
     popq %rbp
     ret
 
-process_exec:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Execute program
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-process_wait:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Wait for process
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-process_get_current:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Load variable current_process
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-process_set_priority:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Set process priority
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-process_get_priority:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Get process priority
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-    movq $1, %rax
-    movq $0, %rax
 thread_create:
     pushq %rbp
     movq %rsp, %rbp
-    # Create new thread
+    # thread_create
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -343,7 +979,7 @@ thread_create:
 thread_create_user:
     pushq %rbp
     movq %rsp, %rbp
-    # Create user-space thread
+    # thread_create_user
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -352,103 +988,10 @@ thread_create_user:
     popq %rbp
     ret
 
-thread_destroy:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Destroy thread
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-thread_yield:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Yield CPU to another thread
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-thread_sleep:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Sleep for milliseconds
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-thread_set_tls:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Set thread-local storage base
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-thread_get_tls:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Get thread-local storage base
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-    movq $0, %rax
 scheduler_init:
     pushq %rbp
     movq %rsp, %rbp
-    # Initialize scheduler
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-scheduler_add_process:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Add process to run queue
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-scheduler_remove_process:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Remove process from run queue
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-scheduler_pick_next:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Pick next process to run (CFS)
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-scheduler_pick_next_cpu:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Pick next process for specific CPU
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-scheduler_tick:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Scheduler tick
+    # scheduler_init
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -456,7 +999,7 @@ scheduler_tick:
 scheduler_schedule:
     pushq %rbp
     movq %rsp, %rbp
-    # Perform context switch
+    # scheduler_schedule
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -464,23 +1007,7 @@ scheduler_schedule:
 scheduler_balance_load:
     pushq %rbp
     movq %rsp, %rbp
-    # Balance load across CPUs
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-context_save:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Save process context
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-context_restore:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Restore process context
+    # scheduler_balance_load
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -488,7 +1015,7 @@ context_restore:
 context_switch:
     pushq %rbp
     movq %rsp, %rbp
-    # Switch from one process to another
+    # context_switch
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -496,7 +1023,7 @@ context_switch:
 fpu_save:
     pushq %rbp
     movq %rsp, %rbp
-    # Save FPU/SSE state
+    # fpu_save
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -504,479 +1031,31 @@ fpu_save:
 fpu_restore:
     pushq %rbp
     movq %rsp, %rbp
-    # Restore FPU/SSE state
+    # fpu_restore
     movq %rbp, %rsp
     popq %rbp
     ret
 
-tlb_flush:
+pmm_init:
     pushq %rbp
     movq %rsp, %rbp
-    # Flush TLB
+    # pmm_init
     movq %rbp, %rsp
     popq %rbp
     ret
 
-tlb_flush_single:
+vmm_init:
     pushq %rbp
     movq %rsp, %rbp
-    # Flush single TLB entry
+    # vmm_init
     movq %rbp, %rsp
     popq %rbp
     ret
 
-    # Load variable export
-syscall_handler:
+heap_init:
     pushq %rbp
     movq %rsp, %rbp
-    movq $0, %rax
-    pushq %rax
-    # Load variable syscall_num
-    popq %rcx
-    cmpq %rcx, %rax
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L_else_4338916024
-    movq $0, %rax
-    pushq %rax
-    popq %rdi
-    call process_terminate
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-.L_else_4338916024:
-    movq $1, %rax
-    pushq %rax
-    # Load variable syscall_num
-    popq %rcx
-    cmpq %rcx, %rax
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L_else_4338916856
-    call process_fork
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-.L_else_4338916856:
-    movq $2, %rax
-    pushq %rax
-    # Load variable syscall_num
-    popq %rcx
-    cmpq %rcx, %rax
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L_else_4338917560
-    call process_get_current
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-.L_else_4338917560:
-    movq $9, %rax
-    pushq %rax
-    # Load variable syscall_num
-    popq %rcx
-    cmpq %rcx, %rax
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L_else_4338918584
-    movq $0, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    popq %rdx
-    popq %rcx
-    call mmap
-    # Load variable addr
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-.L_else_4338918584:
-    movq $10, %rax
-    pushq %rax
-    # Load variable syscall_num
-    popq %rcx
-    cmpq %rcx, %rax
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L_else_4338919440
-    movq $0, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call munmap
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-.L_else_4338919440:
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-shm_create:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Create shared memory segment
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-shm_create_anon:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Create anonymous shared memory
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-shm_attach:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Attach to shared memory
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-shm_detach:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Detach from shared memory
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-shm_destroy:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Destroy shared memory
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-shm_set_cow:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Enable copy-on-write for shared memory
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-mq_create:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Create message queue
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-mq_send:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Send message
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-mq_send_priority:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Send message with priority
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-mq_receive:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Receive message
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-mq_receive_nonblock:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Receive message (non-blocking)
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-mq_destroy:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Destroy message queue
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pipe_create:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Create anonymous pipe
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pipe_create_named:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Create named pipe (FIFO)
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pipe_read:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Read from pipe
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pipe_write:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Write to pipe
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pipe_close:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Close pipe
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pipe_set_buffer_size:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Set pipe buffer size
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-signal_send:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Send signal to process
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-signal_send_rt:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Send real-time signal with value
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-signal_handle:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Set signal handler
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-signal_mask:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Mask signal
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-signal_unmask:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Unmask signal
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-socket_create:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Create Unix domain socket
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-socket_bind:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Bind socket to path
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-socket_listen:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Listen on socket
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-socket_accept:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Accept connection
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-socket_connect:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Connect to socket
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-socket_send:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Send data on socket
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-socket_recv:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Receive data from socket
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-socket_close:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Close socket
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-socket_sendfd:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Send file descriptor over socket
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-socket_recvfd:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Receive file descriptor from socket
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
+    # heap_init
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -984,7 +1063,7 @@ socket_recvfd:
 mmap:
     pushq %rbp
     movq %rsp, %rbp
-    # Map memory region
+    # mmap
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -996,7 +1075,7 @@ mmap:
 munmap:
     pushq %rbp
     movq %rsp, %rbp
-    # Unmap memory region
+    # munmap
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1005,10 +1084,10 @@ munmap:
     popq %rbp
     ret
 
-mprotect:
+shm_create:
     pushq %rbp
     movq %rsp, %rbp
-    # Change memory protection
+    # shm_create
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1017,34 +1096,10 @@ mprotect:
     popq %rbp
     ret
 
-page_fault_handler:
+mq_create:
     pushq %rbp
     movq %rsp, %rbp
-    # Handle page fault - demand paging, COW
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-copy_on_write:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Implement copy-on-write
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-page_cache_add:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Add page to cache
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-page_cache_get:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Get page from cache
+    # mq_create
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1053,66 +1108,10 @@ page_cache_get:
     popq %rbp
     ret
 
-page_reclaim:
+pipe_create:
     pushq %rbp
     movq %rsp, %rbp
-    # Reclaim pages
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-lru_evict:
-    pushq %rbp
-    movq %rsp, %rbp
-    # LRU page eviction
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-memory_compact:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Memory compaction
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-oom_killer:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Out-of-memory killer
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-isolate_address_space:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Isolate process address space
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-set_user_mode:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Switch to user mode
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-set_kernel_mode:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Switch to kernel mode
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-check_capability:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Check process capability
+    # pipe_create
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1121,146 +1120,14 @@ check_capability:
     popq %rbp
     ret
 
-pmm_init:
+socket_create:
     pushq %rbp
     movq %rsp, %rbp
-    # Physical memory manager init
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pmm_alloc_page:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Allocate physical page
+    # socket_create
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pmm_free_page:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Free physical page
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-vmm_init:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Virtual memory manager init
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-vmm_map_page:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Map virtual page
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-vmm_unmap_page:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Unmap virtual page
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-heap_init:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Heap allocator init
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-heap_alloc:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Allocate heap memory
-    movq $0, %rax
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-heap_free:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Free heap memory
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-idt_init:
-    pushq %rbp
-    movq %rsp, %rbp
-    # IDT initialization
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pic_init:
-    pushq %rbp
-    movq %rsp, %rbp
-    # PIC initialization
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pic_send_eoi:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Send EOI to PIC
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-pit_init:
-    pushq %rbp
-    movq %rsp, %rbp
-    # PIT initialization
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-serial_init:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Serial port init
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-serial_write_string:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Write string to serial
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-vga_init:
-    pushq %rbp
-    movq %rsp, %rbp
-    # VGA init
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-vga_write_string:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Write string to VGA
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -1268,35 +1135,11 @@ vga_write_string:
 sem_create:
     pushq %rbp
     movq %rsp, %rbp
-    # Create semaphore
+    # sem_create
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-sem_wait:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Wait on semaphore
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-sem_post:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Post semaphore
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-sem_destroy:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Destroy semaphore
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -1304,7 +1147,7 @@ sem_destroy:
 mutex_create:
     pushq %rbp
     movq %rsp, %rbp
-    # Create mutex
+    # mutex_create
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -1313,26 +1156,257 @@ mutex_create:
     popq %rbp
     ret
 
-mutex_lock:
+idt_init:
     pushq %rbp
     movq %rsp, %rbp
-    # Lock mutex
+    # idt_init
     movq %rbp, %rsp
     popq %rbp
     ret
 
-mutex_unlock:
+pic_init:
     pushq %rbp
     movq %rsp, %rbp
-    # Unlock mutex
+    # pic_init
     movq %rbp, %rsp
     popq %rbp
     ret
 
-mutex_destroy:
+pit_init:
     pushq %rbp
     movq %rsp, %rbp
-    # Destroy mutex
+    # pit_init
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+serial_init:
+    pushq %rbp
+    movq %rsp, %rbp
+    # serial_init
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+serial_write_string:
+    pushq %rbp
+    movq %rsp, %rbp
+    # serial_write_string
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vga_init:
+    pushq %rbp
+    movq %rsp, %rbp
+    # vga_init
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+vga_write_string:
+    pushq %rbp
+    movq %rsp, %rbp
+    # vga_write_string
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+    # Load variable export
+syscall_handler:
+    pushq %rbp
+    movq %rsp, %rbp
+    movq $5, %rax
+    pushq %rax
+    # Load variable num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4315225632
+    # Load variable arg2
+    pushq %rax
+    # Load variable arg1
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call vfs_read
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4315225632:
+    movq $6, %rax
+    pushq %rax
+    # Load variable num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4315226504
+    # Load variable arg2
+    pushq %rax
+    # Load variable arg1
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call vfs_write
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4315226504:
+    movq $7, %rax
+    pushq %rax
+    # Load variable num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4315227480
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    # Load variable arg1
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    call vfs_open
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4315227480:
+    movq $8, %rax
+    pushq %rax
+    # Load variable num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4315228240
+    movq $0, %rax
+    pushq %rax
+    popq %rdi
+    call vfs_close
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4315228240:
+    movq $13, %rax
+    pushq %rax
+    # Load variable num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4315229168
+    # Load variable arg2
+    pushq %rax
+    # Load variable arg1
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call vfs_stat
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4315229168:
+    movq $14, %rax
+    pushq %rax
+    # Load variable num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4315230096
+    movq $0, %rax
+    pushq %rax
+    # Load variable arg1
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call vfs_mkdir
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4315230096:
+    movq $15, %rax
+    pushq %rax
+    # Load variable num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4315230856
+    # Load variable arg1
+    pushq %rax
+    popq %rdi
+    call vfs_rmdir
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4315230856:
+    movq $16, %rax
+    pushq %rax
+    # Load variable num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4315231616
+    # Load variable arg1
+    pushq %rax
+    popq %rdi
+    call vfs_unlink
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4315231616:
+    movq $17, %rax
+    pushq %rax
+    # Load variable num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4315232544
+    # Load variable arg2
+    pushq %rax
+    # Load variable arg1
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call vfs_rename
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4315232544:
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -1342,31 +1416,13 @@ exceptionHandler:
     pushq %rbp
     movq %rsp, %rbp
     call cli
-    movq $14, %rax
-    pushq %rax
-    # Load variable vector
-    popq %rcx
-    cmpq %rcx, %rax
-    sete %al
-    movzbq %al, %rax
-    testq %rax, %rax
-    jz .L_else_4338955848
-    movq $0, %rax
-    pushq %rax
-    movq $0, %rax
-    pushq %rax
-    popq %rdi
-    popq %rsi
-    call page_fault_handler
-.L_else_4338955848:
-    call serial_write_string
-.L_while_start_4338956288:
+.L_while_start_4315234136:
     movq $1, %rax
     testq %rax, %rax
-    jz .L_while_end_4338956288
+    jz .L_while_end_4315234136
     call hlt
-    jmp .L_while_start_4338956288
-.L_while_end_4338956288:
+    jmp .L_while_start_4315234136
+.L_while_end_4315234136:
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -1383,12 +1439,9 @@ irq_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4338957408
-    call scheduler_tick
-    call scheduler_balance_load
+    jz .L_else_4315238936
     call scheduler_schedule
-.L_else_4338957408:
-    call apic_send_eoi
+.L_else_4315238936:
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -1424,10 +1477,6 @@ kernel_init_phase2:
     popq %rdi
     popq %rsi
     call process_create
-    # Load variable init_pid
-    pushq %rax
-    popq %rdi
-    call scheduler_add_process
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -1438,11 +1487,30 @@ kernel_init_phase3:
     movq %rsp, %rbp
     call smp_init
     call apic_init
-    call ioapic_init
-    movq $100, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+.global kernel_init_phase4
+kernel_init_phase4:
+    pushq %rbp
+    movq %rsp, %rbp
+    call mount_init
+    call procfs_init
+    call sysfs_init
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
     pushq %rax
     popq %rdi
-    call apic_timer_init
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    call mount_fs
     call serial_write_string
     call vga_write_string
     movq %rbp, %rsp
@@ -1464,38 +1532,28 @@ kernel_main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4338962568
-.L_else_4338962568:
+    jz .L_else_4315244536
+.L_else_4315244536:
     movq $1, %rax
     pushq %rax
-    # Load variable is_valid
+    # Load variable valid
     popq %rcx
     cmpq %rcx, %rax
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4338964184
+    jz .L_else_4315245664
     call kernel_init_phase1
     call kernel_init_phase2
     call kernel_init_phase3
+    call kernel_init_phase4
     call sti
-    call serial_write_string
-    call vga_write_string
-    jmp .L_endif_4338964184
-.L_else_4338964184:
-.L_while_start_4338964088:
+.L_else_4315245664:
+.L_while_start_4315245960:
     movq $1, %rax
     testq %rax, %rax
-    jz .L_while_end_4338964088
+    jz .L_while_end_4315245960
     call hlt
-    jmp .L_while_start_4338964088
-.L_while_end_4338964088:
-.L_endif_4338964184:
-.L_while_start_4338964480:
-    movq $1, %rax
-    testq %rax, %rax
-    jz .L_while_end_4338964480
-    call hlt
-    jmp .L_while_start_4338964480
-.L_while_end_4338964480:
+    jmp .L_while_start_4315245960
+.L_while_end_4315245960:
 
