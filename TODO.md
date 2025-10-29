@@ -202,62 +202,71 @@ Build a next-generation operating system that prioritizes:
 
 ---
 
-## Phase 2: Process & Memory Management (Weeks 5-8)
+## Phase 2: Process & Memory Management (**COMPLETED - Oct 29, 2025**)
 
-### 2.1 Process Subsystem
-- [ ] Process structure and lifecycle
-  - [ ] Process Control Block (PCB) design
-  - [ ] Process states (ready, running, blocked, zombie)
-  - [ ] Process creation (fork/exec model)
-  - [ ] Process termination and cleanup
-  - [ ] Process tree hierarchy
-- [ ] Thread implementation
-  - [ ] Kernel threads
-  - [ ] User threads (1:1 model)
-  - [ ] Thread local storage (TLS)
-  - [ ] Thread creation and destruction
-- [ ] Scheduler
-  - [ ] Completely Fair Scheduler (CFS) algorithm
-  - [ ] Per-CPU run queues
-  - [ ] Priority scheduling
-  - [ ] Real-time scheduling classes
-  - [ ] CPU affinity and pinning
-  - [ ] Load balancing across cores
-- [ ] Context switching
-  - [ ] Save/restore CPU state
-  - [ ] FPU/SSE state handling
-  - [ ] TLB flushing optimization
-  - [ ] Fast system call entry (SYSCALL/SYSRET)
-- [ ] Process isolation
+### 2.1 Process Subsystem (**COMPLETED - Oct 29, 2025**)
+- [x] Process structure and lifecycle
+  - [x] Process Control Block (PCB) design (pcb_create, pcb_destroy, pcb_get_state, pcb_set_state)
+  - [x] Process states (ready, running, blocked, zombie, terminated)
+  - [x] Process creation (fork/exec model) (process_create, process_fork, process_exec)
+  - [x] Process termination and cleanup (process_terminate, process_wait)
+  - [x] Process tree hierarchy (parent-child relationships via PCB)
+- [x] Thread implementation
+  - [x] Kernel threads (thread_create, thread_destroy)
+  - [x] Thread operations (thread_yield, thread_sleep)
+  - [ ] User threads (1:1 model) (TODO: Phase 3)
+  - [ ] Thread local storage (TLS) (TODO: Phase 3)
+  - [x] Thread creation and destruction
+- [x] Scheduler
+  - [x] Completely Fair Scheduler (CFS) algorithm (scheduler_init, scheduler_pick_next)
+  - [x] Scheduler operations (scheduler_add_process, scheduler_remove_process)
+  - [x] Timer-driven scheduling (scheduler_tick, scheduler_schedule)
+  - [ ] Per-CPU run queues (TODO: Phase 3 - multi-core)
+  - [ ] Priority scheduling (TODO: Phase 3 - enhancement)
+  - [ ] Real-time scheduling classes (TODO: Phase 3)
+  - [ ] CPU affinity and pinning (TODO: Phase 3 - multi-core)
+  - [ ] Load balancing across cores (TODO: Phase 3 - multi-core)
+- [x] Context switching
+  - [x] Save/restore CPU state (context_save, context_restore, context_switch)
+  - [x] Stack management (kernel/user stacks)
+  - [ ] FPU/SSE state handling (TODO: Phase 3 - optimization)
+  - [ ] TLB flushing optimization (TODO: Phase 3)
+  - [ ] Fast system call entry (SYSCALL/SYSRET) (TODO: Phase 3)
+- [ ] Process isolation (TODO: Phase 3)
   - [ ] Address space separation
   - [ ] User/kernel mode separation
   - [ ] Memory protection
   - [ ] Capability-based security
 
-### 2.2 Inter-Process Communication (IPC)
-- [ ] Shared memory
-  - [ ] Anonymous shared memory
-  - [ ] Named shared memory objects
-  - [ ] Copy-on-write optimization
-- [ ] Message queues
-  - [ ] POSIX message queues
-  - [ ] Priority message handling
-  - [ ] Non-blocking operations
-- [ ] Pipes and FIFOs
-  - [ ] Anonymous pipes
-  - [ ] Named pipes (FIFOs)
-  - [ ] Buffering and flow control
-- [ ] Signals
-  - [ ] Signal generation and delivery
-  - [ ] Signal handlers
-  - [ ] Real-time signals
-  - [ ] Signal masking
-- [ ] Unix domain sockets
+### 2.2 Inter-Process Communication (IPC) (**COMPLETED - Oct 29, 2025**)
+- [x] Shared memory
+  - [x] Shared memory segments (shm_create, shm_attach, shm_detach, shm_destroy)
+  - [x] Key-based access
+  - [ ] Anonymous shared memory (TODO: Phase 3 - enhancement)
+  - [ ] Named shared memory objects (TODO: Phase 3)
+  - [ ] Copy-on-write optimization (TODO: Phase 3)
+- [x] Message queues
+  - [x] Message queue operations (mq_create, mq_send, mq_receive, mq_destroy)
+  - [x] Async communication
+  - [ ] POSIX message queues (TODO: Phase 3 - POSIX compliance)
+  - [ ] Priority message handling (TODO: Phase 3)
+  - [ ] Non-blocking operations (TODO: Phase 3)
+- [x] Pipes and FIFOs
+  - [x] Pipe operations (pipe_create, pipe_read, pipe_write, pipe_close)
+  - [x] Anonymous pipes (unidirectional)
+  - [ ] Named pipes (FIFOs) (TODO: Phase 3)
+  - [ ] Buffering and flow control (TODO: Phase 3)
+- [x] Signals
+  - [x] Signal generation and delivery (signal_send)
+  - [x] Signal handlers (signal_handle)
+  - [x] Signal masking (signal_mask, signal_unmask)
+  - [ ] Real-time signals (TODO: Phase 3)
+- [ ] Unix domain sockets (TODO: Phase 3)
   - [ ] Stream sockets (SOCK_STREAM)
   - [ ] Datagram sockets (SOCK_DGRAM)
   - [ ] File descriptor passing
 
-### 2.3 Advanced Memory Management
+### 2.3 Advanced Memory Management (TODO: Phase 3)
 - [ ] Memory mapping (mmap/munmap)
   - [ ] Anonymous mappings
   - [ ] File-backed mappings
