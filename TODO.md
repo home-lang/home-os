@@ -90,13 +90,13 @@ Build a next-generation operating system that prioritizes:
 - [x] **Week 2-3**: Kernel entry point and initialization
   - [x] Switch to kernel address space (boot.s - 64-bit long mode)
   - [x] Set up GDT (Global Descriptor Table) (boot.s)
-  - [ ] Set up IDT (Interrupt Descriptor Table) (TODO: Phase 1.3)
+  - [ ] Set up IDT (Interrupt Descriptor Table) (TODO: causes triple fault)
   - [x] Initialize CPU features (CPUID check, PAE, long mode)
-- [ ] Physical memory manager
-  - [ ] Parse UEFI/BIOS memory map
-  - [ ] Bitmap allocator for physical pages
-  - [ ] Page frame allocator (4KB pages)
-  - [ ] Support for huge pages (2MB, 1GB)
+- [~] Physical memory manager (**IN PROGRESS - Oct 28, 2025**)
+  - [x] Bitmap allocator for physical pages (pmm.zig, pmm.home)
+  - [x] Page frame allocator (4KB pages)
+  - [~] Parse Multiboot2 memory map (TODO: causes crashes, using simple layout for now)
+  - [ ] Support for huge pages (2MB, 1GB) (TODO: Phase 2)
 - [ ] Virtual memory manager
   - [ ] 4-level page table implementation
   - [ ] Kernel space mapping (higher half)

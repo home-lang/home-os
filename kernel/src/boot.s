@@ -63,30 +63,46 @@ _start:
     test $0x20000000, %edx  # LM bit
     jz no_long_mode
 
-    /* Set up page tables (identity map first 1GB) */
-    /* PML4[0] -> PDPT */
+    /* Set up page tables (identity map first 2GB) */
+    /* CRITICAL: Zero out all page tables first */
+    mov $pml4, %edi
+    mov $3072, %ecx        # 3 pages * 1024 dwords = 3072
+    xor %eax, %eax
+    rep stosl              # Zero PML4, PDPT, and PD
+
+    /* PML4[0] -> PDPT (with Present + Writable flags) */
     mov $pdpt, %eax
-    or $0x03, %eax  # Present + Writable
+    or $0x03, %eax         # Present + Writable
     mov %eax, pml4
+    movl $0, pml4 + 4      # Clear upper 32 bits
 
-    /* PDPT[0] -> PD */
+    /* PDPT[0] -> PD (with Present + Writable flags) */
     mov $pd, %eax
-    or $0x03, %eax  # Present + Writable
+    or $0x03, %eax         # Present + Writable
     mov %eax, pdpt
+    movl $0, pdpt + 4      # Clear upper 32 bits
 
-    /* PD entries: 512 * 2MB pages = 1GB */
+    /* PD entries: Map first 2GB using 1024 * 2MB huge pages */
+    /* This ensures kernel, stack, and all data are writable */
     mov $pd, %edi
     mov $0x00000083, %eax  # Present + Writable + Huge (2MB pages)
-    mov $512, %ecx
+    xor %edx, %edx         # Upper 32 bits = 0
+    mov $1024, %ecx        # Map 1024 * 2MB = 2GB
 
 .fill_pd:
-    mov %eax, (%edi)
-    add $0x200000, %eax  # 2MB
-    add $8, %edi
+    mov %eax, (%edi)       # Write lower 32 bits
+    mov %edx, 4(%edi)      # Write upper 32 bits (0)
+    add $0x200000, %eax    # Next 2MB physical address (lower)
+    adc $0, %edx           # Add carry to upper 32 bits
+    add $8, %edi           # Next PDE (8 bytes = 64 bits)
     loop .fill_pd
 
     /* Load PML4 into CR3 */
     mov $pml4, %eax
+    mov %eax, %cr3
+
+    /* Flush TLB by reloading CR3 */
+    mov %cr3, %eax
     mov %eax, %cr3
 
     /* Enable PAE */
@@ -100,9 +116,10 @@ _start:
     or $0x00000100, %eax   # LM bit
     wrmsr
 
-    /* Enable paging */
+    /* Enable paging and ensure WP bit is CLEAR */
     mov %cr0, %eax
-    or $0x80000000, %eax  # PG bit
+    and $0xFFFEFFFF, %eax  # Clear WP bit (bit 16)
+    or $0x80000000, %eax   # Set PG bit (bit 31)
     mov %eax, %cr0
 
     /* Load 64-bit GDT */
@@ -136,6 +153,15 @@ long_mode_start:
     mov %ax, %gs
     mov %ax, %ss
 
+    /* Ensure WP bit is STILL clear in 64-bit mode */
+    mov %cr0, %rax
+    and $0xFFFFFFFFFFFEFFFF, %rax  # Clear WP bit (bit 16) in 64-bit
+    mov %rax, %cr0
+
+    /* Zero out .bss section */
+    /* Note: We can't use external symbols here as they may not be accessible yet */
+    /* So we'll skip .bss zeroing and rely on Zig's undefined initialization */
+
     /* Restore Multiboot2 info (zero-extend to 64-bit) */
     pop %rax  # magic
     pop %rbx  # info address
@@ -165,14 +191,8 @@ gdt64_pointer:
     .word gdt64_end - gdt64 - 1
     .quad gdt64
 
-/* Stack and page tables */
+/* Page tables MUST come first to avoid stack corruption */
 .section .bss
-.align 16
-stack_bottom:
-    .skip 16384  # 16KB stack
-stack_top:
-
-/* Page tables for 64-bit mode */
 .align 4096
 pml4:
     .skip 4096
@@ -180,3 +200,9 @@ pdpt:
     .skip 4096
 pd:
     .skip 4096
+
+/* Stack comes after page tables */
+.align 16
+stack_bottom:
+    .skip 16384  # 16KB stack
+stack_top:

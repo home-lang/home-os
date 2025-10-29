@@ -14,6 +14,9 @@ SECTIONS
     /* Kernel loaded at 1MB physical */
     . = 1M;
 
+    /* Export kernel start before any sections */
+    __kernel_start = .;
+
     /* Multiboot2 header MUST be in first 32KB - place at very start */
     .multiboot ALIGN(8) : {
         KEEP(*(.multiboot))
@@ -57,8 +60,7 @@ SECTIONS
         *(.tbss.*)
     }
 
-    /* Export kernel boundaries */
-    __kernel_start = 1M;
+    /* Export kernel end */
     __kernel_end = .;
     __kernel_size = __kernel_end - __kernel_start;
 }
