@@ -11,7 +11,7 @@ This is **HomeOS** - an operating system built with the Home programming languag
 1. **Default to Home**: All new code MUST be written in Home (`.home` files)
 2. **Home Compiler Location**: `~/Code/home/`
 3. **Import Statement**: Use `const basics = @import("basics")` NOT `const std = @import("std")`
-4. **File Extensions**: `.home` for Home language files, NOT `.zig`
+4. **File Extensions**: `.home` for Home language files
 
 ### When to Use Other Languages
 
