@@ -1,0 +1,283 @@
+// Virtual Memory Manager for home-os
+// 4-level page table implementation for x86-64
+// Based on Home's kernel package: ~/Code/home/packages/kernel/src/paging.zig
+
+import cpu from "./os/cpu.home"
+import serial from "./serial.home"
+
+// Constants
+let PAGE_SIZE: usize = 4096
+let PAGE_SHIFT: usize = 12
+let ENTRIES_PER_TABLE: usize = 512
+
+// Page Table Entry Flags (64-bit)
+packed struct PageFlags: u64 {
+    present: bool,           // Page is present in memory
+    writable: bool,          // Page is writable
+    user: bool,              // User mode accessible
+    write_through: bool,     // Write-through caching
+    cache_disable: bool,     // Cache disabled
+    accessed: bool,          // Page has been accessed
+    dirty: bool,             // Page has been written to
+    huge: bool,              // Huge page (2MB/1GB)
+    global: bool,            // Global page (not flushed on CR3 reload)
+    available1: u3,          // Available for OS use
+    address: u40,            // Physical address (bits 12-51)
+    available2: u11,         // Available for OS use
+    no_execute: bool,        // No execute
+}
+
+// Page Table Entry
+struct PageTableEntry {
+    flags: PageFlags,
+}
+
+// Page Table (512 entries, 4KB aligned)
+struct PageTable {
+    entries: [512]PageTableEntry align(4096),
+}
+
+// Virtual Address decomposition
+packed struct VirtualAddress: u64 {
+    offset: u12,        // Page offset (bits 0-11)
+    pt_index: u9,       // PT index (bits 12-20)
+    pd_index: u9,       // PD index (bits 21-29)
+    pdpt_index: u9,     // PDPT index (bits 30-38)
+    pml4_index: u9,     // PML4 index (bits 39-47)
+    sign_ext: u16,      // Sign extension (bits 48-63)
+}
+
+// Kernel address space starts at higher half
+let KERNEL_BASE: u64 = 0xFFFFFFFF80000000
+
+// Page tables (will be allocated properly later)
+let pml4: PageTable align(4096) = undefined
+let pdpt: PageTable align(4096) = undefined
+let pd: PageTable align(4096) = undefined
+let pt: PageTable align(4096) = undefined
+
+// Create a page table entry
+fn createPageEntry(phys_addr: u64, writable: bool, user: bool, no_exec: bool) -> PageFlags {
+    return PageFlags {
+        present: true,
+        writable: writable,
+        user: user,
+        write_through: false,
+        cache_disable: false,
+        accessed: false,
+        dirty: false,
+        huge: false,
+        global: false,
+        available1: 0,
+        address: @truncate(phys_addr >> 12),
+        available2: 0,
+        no_execute: no_exec,
+    }
+}
+
+// Get physical address from page flags
+fn getPhysicalAddress(flags: PageFlags) -> u64 {
+    return @as(u64, flags.address) << 12
+}
+
+// Initialize virtual memory manager
+export fn init() {
+    serial.writeString("Initializing Virtual Memory Manager...\n")
+
+    // Zero out all page tables
+    let i = 0
+    loop {
+        if i >= 512 {
+            break
+        }
+        pml4.entries[i] = PageTableEntry {
+            flags: PageFlags {
+                present: false,
+                writable: false,
+                user: false,
+                write_through: false,
+                cache_disable: false,
+                accessed: false,
+                dirty: false,
+                huge: false,
+                global: false,
+                available1: 0,
+                address: 0,
+                available2: 0,
+                no_execute: false,
+            }
+        }
+        pdpt.entries[i] = PageTableEntry {
+            flags: PageFlags {
+                present: false,
+                writable: false,
+                user: false,
+                write_through: false,
+                cache_disable: false,
+                accessed: false,
+                dirty: false,
+                huge: false,
+                global: false,
+                available1: 0,
+                address: 0,
+                available2: 0,
+                no_execute: false,
+            }
+        }
+        pd.entries[i] = PageTableEntry {
+            flags: PageFlags {
+                present: false,
+                writable: false,
+                user: false,
+                write_through: false,
+                cache_disable: false,
+                accessed: false,
+                dirty: false,
+                huge: false,
+                global: false,
+                available1: 0,
+                address: 0,
+                available2: 0,
+                no_execute: false,
+            }
+        }
+        pt.entries[i] = PageTableEntry {
+            flags: PageFlags {
+                present: false,
+                writable: false,
+                user: false,
+                write_through: false,
+                cache_disable: false,
+                accessed: false,
+                dirty: false,
+                huge: false,
+                global: false,
+                available1: 0,
+                address: 0,
+                available2: 0,
+                no_execute: false,
+            }
+        }
+        i = i + 1
+    }
+
+    serial.writeString("VMM: Page tables zeroed\n")
+
+    // Set up identity mapping for first 4MB (for kernel)
+    // This maps virtual 0x0 - 0x400000 to physical 0x0 - 0x400000
+    mapKernelSpace()
+
+    serial.writeString("VMM: Kernel space mapped\n")
+
+    // Load CR3 with PML4 address
+    let pml4_addr = @intFromPtr(&pml4)
+    serial.writeString("VMM: Loading CR3 with PML4 at ")
+    serial.writeHex(pml4_addr)
+    serial.writeString("\n")
+
+    cpu.write_cr3(pml4_addr)
+
+    serial.writeString("VMM initialized successfully!\n")
+}
+
+// Map kernel space (identity mapping for first 4MB)
+fn mapKernelSpace() {
+    // Link PML4[0] -> PDPT
+    let pdpt_addr = @intFromPtr(&pdpt)
+    pml4.entries[0].flags = createPageEntry(pdpt_addr, true, false, false)
+
+    // Link PDPT[0] -> PD
+    let pd_addr = @intFromPtr(&pd)
+    pdpt.entries[0].flags = createPageEntry(pd_addr, true, false, false)
+
+    // Link PD[0] -> PT
+    let pt_addr = @intFromPtr(&pt)
+    pd.entries[0].flags = createPageEntry(pt_addr, true, false, false)
+
+    // Map first 2MB (512 pages * 4KB = 2MB) with identity mapping
+    let i = 0
+    loop {
+        if i >= 512 {
+            break
+        }
+        let phys_addr = i * PAGE_SIZE
+        pt.entries[i].flags = createPageEntry(phys_addr, true, false, false)
+        i = i + 1
+    }
+}
+
+// Map a virtual address to a physical address
+export fn mapPage(virt_addr: u64, phys_addr: u64, writable: bool, user: bool) {
+    // Decompose virtual address
+    let vaddr: VirtualAddress = @bitCast(virt_addr)
+
+    // For now, we only support mapping in the first PML4 entry
+    // TODO: Implement full 4-level page table walking and allocation
+
+    serial.writeString("VMM: Mapping virtual ")
+    serial.writeHex(virt_addr)
+    serial.writeString(" to physical ")
+    serial.writeHex(phys_addr)
+    serial.writeString("\n")
+
+    // Create page entry
+    let entry = createPageEntry(phys_addr, writable, user, false)
+
+    // Set the page table entry
+    // This is simplified - in a real implementation, we'd walk the page tables
+    let pt_index = vaddr.pt_index
+    pt.entries[pt_index].flags = entry
+
+    // Invalidate TLB for this address
+    cpu.invlpg(virt_addr)
+}
+
+// Unmap a virtual address
+export fn unmapPage(virt_addr: u64) {
+    let vaddr: VirtualAddress = @bitCast(virt_addr)
+    let pt_index = vaddr.pt_index
+
+    // Clear the page table entry
+    pt.entries[pt_index].flags = PageFlags {
+        present: false,
+        writable: false,
+        user: false,
+        write_through: false,
+        cache_disable: false,
+        accessed: false,
+        dirty: false,
+        huge: false,
+        global: false,
+        available1: 0,
+        address: 0,
+        available2: 0,
+        no_execute: false,
+    }
+
+    // Invalidate TLB for this address
+    cpu.invlpg(virt_addr)
+}
+
+// Get physical address for a virtual address
+export fn getPhysicalAddr(virt_addr: u64) -> u64 {
+    let vaddr: VirtualAddress = @bitCast(virt_addr)
+    let pt_index = vaddr.pt_index
+
+    let entry = pt.entries[pt_index].flags
+    if !entry.present {
+        return 0  // Page not present
+    }
+
+    let phys_base = getPhysicalAddress(entry)
+    return phys_base + vaddr.offset
+}
+
+// Align address down to page boundary
+export fn alignDown(addr: u64) -> u64 {
+    return addr & ~(PAGE_SIZE - 1)
+}
+
+// Align address up to page boundary
+export fn alignUp(addr: u64) -> u64 {
+    return (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+}
