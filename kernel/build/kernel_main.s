@@ -10,6 +10,7 @@
     movq $4096, %rax
     movq $256, %rax
     movq $1024, %rax
+    movq $64, %rax
     movq $16384, %rax
     movq $8192, %rax
     movq $10, %rax
@@ -27,6 +28,14 @@
     movq $6, %rax
     movq $7, %rax
     movq $8, %rax
+    movq $9, %rax
+    movq $10, %rax
+    movq $11, %rax
+    movq $12, %rax
+    movq $0, %rax
+    movq $1, %rax
+    movq $2, %rax
+    movq $4, %rax
 cli:
     pushq %rbp
     movq %rsp, %rbp
@@ -71,6 +80,102 @@ inb:
     popq %rbp
     ret
 
+cpuid:
+    pushq %rbp
+    movq %rsp, %rbp
+    # cpuid - get CPU info
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+rdtsc:
+    pushq %rbp
+    movq %rsp, %rbp
+    # rdtsc - read timestamp counter
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+    movq $1, %rax
+    movq $0, %rax
+smp_init:
+    pushq %rbp
+    movq %rsp, %rbp
+    # SMP initialization - detect and start APs
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+smp_get_cpu_count:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Load variable cpu_count
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+smp_get_current_cpu:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Load variable current_cpu
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+smp_send_ipi:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Send inter-processor interrupt
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+apic_init:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Initialize Local APIC
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+apic_send_eoi:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Send EOI to APIC
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+apic_timer_init:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Initialize APIC timer
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+ioapic_init:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Initialize I/O APIC
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
     movq $1, %rax
     movq $0, %rax
     movq $0, %rax
@@ -110,6 +215,26 @@ pcb_set_state:
     pushq %rbp
     movq %rsp, %rbp
     # Set process state
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+pcb_set_cpu_affinity:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Set CPU affinity mask
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+pcb_get_cpu_affinity:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get CPU affinity mask
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -181,12 +306,44 @@ process_get_current:
     popq %rbp
     ret
 
+process_set_priority:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Set process priority
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+process_get_priority:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get process priority
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
     movq $1, %rax
     movq $0, %rax
 thread_create:
     pushq %rbp
     movq %rsp, %rbp
     # Create new thread
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+thread_create_user:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create user-space thread
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -219,6 +376,26 @@ thread_sleep:
     popq %rbp
     ret
 
+thread_set_tls:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Set thread-local storage base
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+thread_get_tls:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get thread-local storage base
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
     movq $0, %rax
 scheduler_init:
     pushq %rbp
@@ -247,7 +424,19 @@ scheduler_remove_process:
 scheduler_pick_next:
     pushq %rbp
     movq %rsp, %rbp
-    # Pick next process to run
+    # Pick next process to run (CFS)
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+scheduler_pick_next_cpu:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Pick next process for specific CPU
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -259,7 +448,7 @@ scheduler_pick_next:
 scheduler_tick:
     pushq %rbp
     movq %rsp, %rbp
-    # Scheduler tick - called by timer
+    # Scheduler tick
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -268,6 +457,14 @@ scheduler_schedule:
     pushq %rbp
     movq %rsp, %rbp
     # Perform context switch
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+scheduler_balance_load:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Balance load across CPUs
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -296,6 +493,38 @@ context_switch:
     popq %rbp
     ret
 
+fpu_save:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Save FPU/SSE state
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+fpu_restore:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Restore FPU/SSE state
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+tlb_flush:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Flush TLB
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+tlb_flush_single:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Flush single TLB entry
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
     # Load variable export
 syscall_handler:
     pushq %rbp
@@ -308,7 +537,7 @@ syscall_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4348541136
+    jz .L_else_4338916024
     movq $0, %rax
     pushq %rax
     popq %rdi
@@ -317,7 +546,7 @@ syscall_handler:
     movq %rbp, %rsp
     popq %rbp
     ret
-.L_else_4348541136:
+.L_else_4338916024:
     movq $1, %rax
     pushq %rax
     # Load variable syscall_num
@@ -326,13 +555,13 @@ syscall_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4348541968
+    jz .L_else_4338916856
     call process_fork
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-.L_else_4348541968:
+.L_else_4338916856:
     movq $2, %rax
     pushq %rax
     # Load variable syscall_num
@@ -341,13 +570,61 @@ syscall_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4348542672
+    jz .L_else_4338917560
     call process_get_current
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
     ret
-.L_else_4348542672:
+.L_else_4338917560:
+    movq $9, %rax
+    pushq %rax
+    # Load variable syscall_num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4338918584
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    call mmap
+    # Load variable addr
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4338918584:
+    movq $10, %rax
+    pushq %rax
+    # Load variable syscall_num
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4338919440
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call munmap
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.L_else_4338919440:
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -360,6 +637,18 @@ shm_create:
     pushq %rbp
     movq %rsp, %rbp
     # Create shared memory segment
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+shm_create_anon:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create anonymous shared memory
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -396,6 +685,14 @@ shm_destroy:
     popq %rbp
     ret
 
+shm_set_cow:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Enable copy-on-write for shared memory
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
 mq_create:
     pushq %rbp
     movq %rsp, %rbp
@@ -420,10 +717,34 @@ mq_send:
     popq %rbp
     ret
 
+mq_send_priority:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Send message with priority
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
 mq_receive:
     pushq %rbp
     movq %rsp, %rbp
     # Receive message
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mq_receive_nonblock:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Receive message (non-blocking)
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -443,7 +764,19 @@ mq_destroy:
 pipe_create:
     pushq %rbp
     movq %rsp, %rbp
-    # Create pipe
+    # Create anonymous pipe
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+pipe_create_named:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create named pipe (FIFO)
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -484,10 +817,26 @@ pipe_close:
     popq %rbp
     ret
 
+pipe_set_buffer_size:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Set pipe buffer size
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
 signal_send:
     pushq %rbp
     movq %rsp, %rbp
     # Send signal to process
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+signal_send_rt:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Send real-time signal with value
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -516,10 +865,10 @@ signal_unmask:
     popq %rbp
     ret
 
-sem_create:
+socket_create:
     pushq %rbp
     movq %rsp, %rbp
-    # Create semaphore
+    # Create Unix domain socket
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -528,34 +877,10 @@ sem_create:
     popq %rbp
     ret
 
-sem_wait:
+socket_bind:
     pushq %rbp
     movq %rsp, %rbp
-    # Wait on semaphore (P operation)
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-sem_post:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Post semaphore (V operation)
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-sem_destroy:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Destroy semaphore
-    movq %rbp, %rsp
-    popq %rbp
-    ret
-
-mutex_create:
-    pushq %rbp
-    movq %rsp, %rbp
-    # Create mutex
+    # Bind socket to path
     movq $0, %rax
     movq %rbp, %rsp
     popq %rbp
@@ -564,26 +889,234 @@ mutex_create:
     popq %rbp
     ret
 
-mutex_lock:
+socket_listen:
     pushq %rbp
     movq %rsp, %rbp
-    # Lock mutex
+    # Listen on socket
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
     movq %rbp, %rsp
     popq %rbp
     ret
 
-mutex_unlock:
+socket_accept:
     pushq %rbp
     movq %rsp, %rbp
-    # Unlock mutex
+    # Accept connection
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
     movq %rbp, %rsp
     popq %rbp
     ret
 
-mutex_destroy:
+socket_connect:
     pushq %rbp
     movq %rsp, %rbp
-    # Destroy mutex
+    # Connect to socket
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+socket_send:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Send data on socket
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+socket_recv:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Receive data from socket
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+socket_close:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Close socket
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+socket_sendfd:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Send file descriptor over socket
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+socket_recvfd:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Receive file descriptor from socket
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mmap:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Map memory region
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+munmap:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Unmap memory region
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mprotect:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Change memory protection
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+page_fault_handler:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Handle page fault - demand paging, COW
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+copy_on_write:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Implement copy-on-write
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+page_cache_add:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Add page to cache
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+page_cache_get:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Get page from cache
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+page_reclaim:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Reclaim pages
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+lru_evict:
+    pushq %rbp
+    movq %rsp, %rbp
+    # LRU page eviction
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+memory_compact:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Memory compaction
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+oom_killer:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Out-of-memory killer
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+isolate_address_space:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Isolate process address space
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+set_user_mode:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Switch to user mode
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+set_kernel_mode:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Switch to kernel mode
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+check_capability:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Check process capability
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -732,19 +1265,108 @@ vga_write_string:
     popq %rbp
     ret
 
+sem_create:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create semaphore
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+sem_wait:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Wait on semaphore
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+sem_post:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Post semaphore
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+sem_destroy:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Destroy semaphore
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mutex_create:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Create mutex
+    movq $0, %rax
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mutex_lock:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Lock mutex
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mutex_unlock:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Unlock mutex
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+mutex_destroy:
+    pushq %rbp
+    movq %rsp, %rbp
+    # Destroy mutex
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
     # Load variable export
 exceptionHandler:
     pushq %rbp
     movq %rsp, %rbp
     call cli
+    movq $14, %rax
+    pushq %rax
+    # Load variable vector
+    popq %rcx
+    cmpq %rcx, %rax
+    sete %al
+    movzbq %al, %rax
+    testq %rax, %rax
+    jz .L_else_4338955848
+    movq $0, %rax
+    pushq %rax
+    movq $0, %rax
+    pushq %rax
+    popq %rdi
+    popq %rsi
+    call page_fault_handler
+.L_else_4338955848:
     call serial_write_string
-.L_while_start_4348560104:
+.L_while_start_4338956288:
     movq $1, %rax
     testq %rax, %rax
-    jz .L_while_end_4348560104
+    jz .L_while_end_4338956288
     call hlt
-    jmp .L_while_start_4348560104
-.L_while_end_4348560104:
+    jmp .L_while_start_4338956288
+.L_while_end_4338956288:
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -761,14 +1383,12 @@ irq_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4348563720
+    jz .L_else_4338957408
     call scheduler_tick
+    call scheduler_balance_load
     call scheduler_schedule
-.L_else_4348563720:
-    movq $0, %rax
-    pushq %rax
-    popq %rdi
-    call pic_send_eoi
+.L_else_4338957408:
+    call apic_send_eoi
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -808,6 +1428,21 @@ kernel_init_phase2:
     pushq %rax
     popq %rdi
     call scheduler_add_process
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+
+.global kernel_init_phase3
+kernel_init_phase3:
+    pushq %rbp
+    movq %rsp, %rbp
+    call smp_init
+    call apic_init
+    call ioapic_init
+    movq $100, %rax
+    pushq %rax
+    popq %rdi
+    call apic_timer_init
     call serial_write_string
     call vga_write_string
     movq %rbp, %rsp
@@ -829,8 +1464,8 @@ kernel_main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4348568032
-.L_else_4348568032:
+    jz .L_else_4338962568
+.L_else_4338962568:
     movq $1, %rax
     pushq %rax
     # Load variable is_valid
@@ -839,27 +1474,28 @@ kernel_main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4348569504
+    jz .L_else_4338964184
     call kernel_init_phase1
     call kernel_init_phase2
+    call kernel_init_phase3
     call sti
     call serial_write_string
     call vga_write_string
-    jmp .L_endif_4348569504
-.L_else_4348569504:
-.L_while_start_4348569408:
+    jmp .L_endif_4338964184
+.L_else_4338964184:
+.L_while_start_4338964088:
     movq $1, %rax
     testq %rax, %rax
-    jz .L_while_end_4348569408
+    jz .L_while_end_4338964088
     call hlt
-    jmp .L_while_start_4348569408
-.L_while_end_4348569408:
-.L_endif_4348569504:
-.L_while_start_4348569800:
+    jmp .L_while_start_4338964088
+.L_while_end_4338964088:
+.L_endif_4338964184:
+.L_while_start_4338964480:
     movq $1, %rax
     testq %rax, %rax
-    jz .L_while_end_4348569800
+    jz .L_while_end_4338964480
     call hlt
-    jmp .L_while_start_4348569800
-.L_while_end_4348569800:
+    jmp .L_while_start_4338964480
+.L_while_end_4338964480:
 

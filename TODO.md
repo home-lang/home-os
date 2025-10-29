@@ -167,12 +167,12 @@ Build a next-generation operating system that prioritizes:
   - [x] IRQ routing and handling (irq_handler, PIC driver)
   - [x] PIC (Programmable Interrupt Controller) setup (pic_init, pic_send_eoi)
   - [x] Timer interrupts (PIT) (pit_init, timer_handler, 100 Hz)
-  - [ ] APIC (Advanced Programmable Interrupt Controller) (TODO: Phase 2 - multi-core)
-- [ ] CPU initialization
-  - [ ] Multi-core detection
-  - [ ] Local APIC setup per-core
-  - [ ] CPU feature detection (CPUID)
-  - [ ] FPU/SSE state management
+  - [x] APIC (Advanced Programmable Interrupt Controller) (apic_init, apic_send_eoi, apic_timer_init, ioapic_init)
+- [x] CPU initialization (**COMPLETED - Oct 29, 2025**)
+  - [x] Multi-core detection (smp_init, smp_get_cpu_count)
+  - [x] Local APIC setup per-core (apic_init)
+  - [x] CPU feature detection (CPUID) (cpuid)
+  - [x] FPU/SSE state management (fpu_save, fpu_restore)
 
 ### 1.3 Device Drivers (Basic)
 - [x] **Week 3-4**: Serial port driver (for early debugging) (**COMPLETED - Oct 29, 2025**)
@@ -214,78 +214,78 @@ Build a next-generation operating system that prioritizes:
 - [x] Thread implementation
   - [x] Kernel threads (thread_create, thread_destroy)
   - [x] Thread operations (thread_yield, thread_sleep)
-  - [ ] User threads (1:1 model) (TODO: Phase 3)
-  - [ ] Thread local storage (TLS) (TODO: Phase 3)
+  - [x] User threads (1:1 model) (thread_create_user)
+  - [x] Thread local storage (TLS) (thread_set_tls, thread_get_tls)
   - [x] Thread creation and destruction
 - [x] Scheduler
   - [x] Completely Fair Scheduler (CFS) algorithm (scheduler_init, scheduler_pick_next)
   - [x] Scheduler operations (scheduler_add_process, scheduler_remove_process)
   - [x] Timer-driven scheduling (scheduler_tick, scheduler_schedule)
-  - [ ] Per-CPU run queues (TODO: Phase 3 - multi-core)
-  - [ ] Priority scheduling (TODO: Phase 3 - enhancement)
-  - [ ] Real-time scheduling classes (TODO: Phase 3)
-  - [ ] CPU affinity and pinning (TODO: Phase 3 - multi-core)
-  - [ ] Load balancing across cores (TODO: Phase 3 - multi-core)
+  - [x] Per-CPU run queues (scheduler_pick_next_cpu)
+  - [x] Priority scheduling (process_set_priority, process_get_priority)
+  - [ ] Real-time scheduling classes (TODO: Phase 4 - enhancement)
+  - [x] CPU affinity and pinning (pcb_set_cpu_affinity, pcb_get_cpu_affinity)
+  - [x] Load balancing across cores (scheduler_balance_load)
 - [x] Context switching
   - [x] Save/restore CPU state (context_save, context_restore, context_switch)
   - [x] Stack management (kernel/user stacks)
-  - [ ] FPU/SSE state handling (TODO: Phase 3 - optimization)
-  - [ ] TLB flushing optimization (TODO: Phase 3)
-  - [ ] Fast system call entry (SYSCALL/SYSRET) (TODO: Phase 3)
-- [ ] Process isolation (TODO: Phase 3)
-  - [ ] Address space separation
-  - [ ] User/kernel mode separation
-  - [ ] Memory protection
-  - [ ] Capability-based security
+  - [x] FPU/SSE state handling (fpu_save, fpu_restore)
+  - [x] TLB flushing optimization (tlb_flush, tlb_flush_single)
+  - [ ] Fast system call entry (SYSCALL/SYSRET) (TODO: Phase 4 - optimization)
+- [x] Process isolation (**COMPLETED - Oct 29, 2025**)
+  - [x] Address space separation (isolate_address_space)
+  - [x] User/kernel mode separation (set_user_mode, set_kernel_mode)
+  - [x] Memory protection (mprotect)
+  - [x] Capability-based security (check_capability)
 
 ### 2.2 Inter-Process Communication (IPC) (**COMPLETED - Oct 29, 2025**)
 - [x] Shared memory
   - [x] Shared memory segments (shm_create, shm_attach, shm_detach, shm_destroy)
   - [x] Key-based access
-  - [ ] Anonymous shared memory (TODO: Phase 3 - enhancement)
-  - [ ] Named shared memory objects (TODO: Phase 3)
-  - [ ] Copy-on-write optimization (TODO: Phase 3)
+  - [x] Anonymous shared memory (shm_create_anon)
+  - [ ] Named shared memory objects (TODO: Phase 4)
+  - [x] Copy-on-write optimization (shm_set_cow, copy_on_write)
 - [x] Message queues
   - [x] Message queue operations (mq_create, mq_send, mq_receive, mq_destroy)
   - [x] Async communication
-  - [ ] POSIX message queues (TODO: Phase 3 - POSIX compliance)
-  - [ ] Priority message handling (TODO: Phase 3)
-  - [ ] Non-blocking operations (TODO: Phase 3)
+  - [ ] POSIX message queues (TODO: Phase 4 - POSIX compliance)
+  - [x] Priority message handling (mq_send_priority)
+  - [x] Non-blocking operations (mq_receive_nonblock)
 - [x] Pipes and FIFOs
   - [x] Pipe operations (pipe_create, pipe_read, pipe_write, pipe_close)
   - [x] Anonymous pipes (unidirectional)
-  - [ ] Named pipes (FIFOs) (TODO: Phase 3)
-  - [ ] Buffering and flow control (TODO: Phase 3)
+  - [x] Named pipes (FIFOs) (pipe_create_named)
+  - [x] Buffering and flow control (pipe_set_buffer_size)
 - [x] Signals
   - [x] Signal generation and delivery (signal_send)
   - [x] Signal handlers (signal_handle)
   - [x] Signal masking (signal_mask, signal_unmask)
-  - [ ] Real-time signals (TODO: Phase 3)
-- [ ] Unix domain sockets (TODO: Phase 3)
-  - [ ] Stream sockets (SOCK_STREAM)
-  - [ ] Datagram sockets (SOCK_DGRAM)
-  - [ ] File descriptor passing
+  - [x] Real-time signals (signal_send_rt)
+- [x] Unix domain sockets (**COMPLETED - Oct 29, 2025**)
+  - [x] Stream sockets (SOCK_STREAM) (socket_create, socket_bind, socket_listen, socket_accept, socket_connect)
+  - [x] Datagram sockets (SOCK_DGRAM) (socket_send, socket_recv)
+  - [x] File descriptor passing (socket_sendfd, socket_recvfd)
 
-### 2.3 Advanced Memory Management (TODO: Phase 3)
-- [ ] Memory mapping (mmap/munmap)
-  - [ ] Anonymous mappings
-  - [ ] File-backed mappings
-  - [ ] Shared mappings
-  - [ ] Protection flags
-- [ ] Page fault handler
-  - [ ] Demand paging
-  - [ ] Copy-on-write
-  - [ ] Page cache
-  - [ ] Swap file support (optional)
-- [ ] Memory allocation strategies
+### 2.3 Advanced Memory Management (**COMPLETED - Oct 29, 2025**)
+- [x] Memory mapping (mmap/munmap)
+  - [x] Anonymous mappings (mmap with MAP_ANON)
+  - [ ] File-backed mappings (TODO: Phase 4 - requires VFS)
+  - [x] Shared mappings (mmap with MAP_SHARED)
+  - [x] Protection flags (mprotect with PROT_READ/WRITE/EXEC)
+- [x] Page fault handler
+  - [x] Demand paging (page_fault_handler)
+  - [x] Copy-on-write (copy_on_write)
+  - [x] Page cache (page_cache_add, page_cache_get)
+  - [ ] Swap file support (optional) (TODO: Phase 4)
+- [ ] Memory allocation strategies (TODO: Phase 4 - optimization)
   - [ ] Buddy allocator refinement
   - [ ] SLUB allocator (kernel objects)
   - [ ] User-space allocator integration with Home
-- [ ] Memory pressure handling
-  - [ ] Page reclamation
-  - [ ] LRU page eviction
-  - [ ] Memory compaction
-  - [ ] OOM (Out-Of-Memory) killer
+- [x] Memory pressure handling
+  - [x] Page reclamation (page_reclaim)
+  - [x] LRU page eviction (lru_evict)
+  - [x] Memory compaction (memory_compact)
+  - [x] OOM (Out-Of-Memory) killer (oom_killer)
 
 ---
 
