@@ -166,7 +166,7 @@ Build a next-generation operating system that prioritizes:
   - [x] IDT initialization (idt_init, idt_set_gate, idt_load)
   - [x] IRQ routing and handling (irq_handler, PIC driver)
   - [x] PIC (Programmable Interrupt Controller) setup (pic_init, pic_send_eoi)
-  - [x] Timer interrupts (PIT) (pit_init, timer_handler, 100 Hz)
+  - [x] Timer interrupts (PIT) (**REAL IMPLEMENTATION - Oct 29, 2025**: timer_init, timer_interrupt_handler, sleep/delay functions, watchdog, 100 Hz)
   - [x] APIC (Advanced Programmable Interrupt Controller) (apic_init, apic_send_eoi, apic_timer_init, ioapic_init)
 - [x] CPU initialization (**COMPLETED - Oct 29, 2025**)
   - [x] Multi-core detection (smp_init, smp_get_cpu_count)
@@ -181,11 +181,15 @@ Build a next-generation operating system that prioritizes:
   - [x] String output (serial_write_string)
   - [x] Hex output (serial_write_hex)
   - [ ] Interrupt-driven receive (TODO: Phase 2)
-- [ ] Keyboard driver (TODO: Phase 2)
-  - [ ] PS/2 keyboard controller
-  - [ ] USB keyboard (UHCI/EHCI/XHCI)
-  - [ ] Scancode to keycode translation
-  - [ ] Keyboard layout support
+- [x] Keyboard driver (**COMPLETED - Oct 29, 2025**)
+  - [x] PS/2 keyboard controller (keyboard_init, keyboard_send_command)
+  - [x] Scancode to ASCII translation (keyboard_process_scancode)
+  - [x] Keyboard buffer (keyboard_getchar, keyboard_has_char, keyboard_getline)
+  - [x] Interrupt handler (keyboard_interrupt_handler)
+  - [x] Modifier key support (shift, ctrl, alt, caps lock)
+  - [x] LED control (keyboard_set_leds)
+  - [ ] USB keyboard (UHCI/EHCI/XHCI) (TODO: Phase 5)
+  - [ ] Multiple keyboard layouts (TODO: Phase 5)
 - [x] Framebuffer driver (VGA text mode) (**COMPLETED - Oct 29, 2025**)
   - [x] Linear framebuffer access (0xB8000)
   - [x] Mode setting (80x25 text mode)
@@ -774,6 +778,7 @@ Build a next-generation operating system that prioritizes:
 - [ ] Trash/recycle bin
 
 ### 9.2 Terminal Emulator
+- [ ] make use of Ghostty because it is also a Zig project https://github.com/ghostty-org/ghostty as the default app included in the OS
 - [ ] VT100/ANSI escape sequence support
 - [ ] Text rendering (with proper font support)
 - [ ] Color themes
