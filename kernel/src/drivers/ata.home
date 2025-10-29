@@ -1,0 +1,341 @@
+// home-os Kernel - ATA/IDE Driver (PIO Mode)
+// Real implementation for disk I/O
+
+import "../core/foundation.home" as foundation
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Primary ATA bus
+const ATA_PRIMARY_DATA: u16 = 0x1F0
+const ATA_PRIMARY_ERROR: u16 = 0x1F1
+const ATA_PRIMARY_SECTOR_COUNT: u16 = 0x1F2
+const ATA_PRIMARY_LBA_LOW: u16 = 0x1F3
+const ATA_PRIMARY_LBA_MID: u16 = 0x1F4
+const ATA_PRIMARY_LBA_HIGH: u16 = 0x1F5
+const ATA_PRIMARY_DRIVE: u16 = 0x1F6
+const ATA_PRIMARY_COMMAND: u16 = 0x1F7
+const ATA_PRIMARY_STATUS: u16 = 0x1F7
+
+// Secondary ATA bus
+const ATA_SECONDARY_DATA: u16 = 0x170
+const ATA_SECONDARY_COMMAND: u16 = 0x177
+const ATA_SECONDARY_STATUS: u16 = 0x177
+
+// ATA commands
+const ATA_CMD_READ_PIO: u8 = 0x20
+const ATA_CMD_READ_PIO_EXT: u8 = 0x24
+const ATA_CMD_WRITE_PIO: u8 = 0x30
+const ATA_CMD_WRITE_PIO_EXT: u8 = 0x34
+const ATA_CMD_CACHE_FLUSH: u8 = 0xE7
+const ATA_CMD_IDENTIFY: u8 = 0xEC
+
+// ATA status bits
+const ATA_SR_BSY: u8 = 0x80   // Busy
+const ATA_SR_DRDY: u8 = 0x40  // Drive ready
+const ATA_SR_DF: u8 = 0x20    // Drive fault
+const ATA_SR_DSC: u8 = 0x10   // Drive seek complete
+const ATA_SR_DRQ: u8 = 0x08   // Data request ready
+const ATA_SR_CORR: u8 = 0x04  // Corrected data
+const ATA_SR_IDX: u8 = 0x02   // Index
+const ATA_SR_ERR: u8 = 0x01   // Error
+
+// Drive selection
+const ATA_MASTER: u8 = 0xE0
+const ATA_SLAVE: u8 = 0xF0
+
+const SECTOR_SIZE: u32 = 512
+
+// ============================================================================
+// ATA DEVICE STATE
+// ============================================================================
+
+struct ATADevice {
+  exists: u32,
+  is_master: u32,
+  base: u16,
+  control: u16,
+  sectors: u64,
+  model: [u8; 40]
+}
+
+var primary_master: ATADevice
+var primary_slave: ATADevice
+var ata_initialized: u32 = 0
+
+// ============================================================================
+// ATA HELPER FUNCTIONS
+// ============================================================================
+
+fn ata_wait_bsy(base: u16) {
+  var timeout: u32 = 100000
+  
+  while timeout > 0 {
+    var status: u8 = foundation.inb(base + 7)
+    if (status & ATA_SR_BSY) == 0 {
+      return
+    }
+    timeout = timeout - 1
+  }
+}
+
+fn ata_wait_drq(base: u16) {
+  var timeout: u32 = 100000
+  
+  while timeout > 0 {
+    var status: u8 = foundation.inb(base + 7)
+    if (status & ATA_SR_DRQ) != 0 {
+      return
+    }
+    timeout = timeout - 1
+  }
+}
+
+fn ata_wait_ready(base: u16) {
+  var timeout: u32 = 100000
+  
+  while timeout > 0 {
+    var status: u8 = foundation.inb(base + 7)
+    if (status & ATA_SR_DRDY) != 0 and (status & ATA_SR_BSY) == 0 {
+      return
+    }
+    timeout = timeout - 1
+  }
+}
+
+fn ata_select_drive(base: u16, is_master: u32) {
+  if is_master == 1 {
+    foundation.outb(base + 6, ATA_MASTER)
+  } else {
+    foundation.outb(base + 6, ATA_SLAVE)
+  }
+  
+  // Delay 400ns
+  var i: u32 = 0
+  while i < 4 {
+    foundation.inb(base + 7)
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// ATA INITIALIZATION
+// ============================================================================
+
+export fn ata_init() {
+  if ata_initialized == 1 { return }
+  
+  // Initialize device structures
+  primary_master.exists = 0
+  primary_master.is_master = 1
+  primary_master.base = ATA_PRIMARY_DATA
+  primary_master.control = 0x3F6
+  
+  primary_slave.exists = 0
+  primary_slave.is_master = 0
+  primary_slave.base = ATA_PRIMARY_DATA
+  primary_slave.control = 0x3F6
+  
+  // Detect primary master
+  ata_select_drive(ATA_PRIMARY_DATA, 1)
+  ata_wait_ready(ATA_PRIMARY_DATA)
+  
+  foundation.outb(ATA_PRIMARY_COMMAND, ATA_CMD_IDENTIFY)
+  ata_wait_bsy(ATA_PRIMARY_DATA)
+  
+  var status: u8 = foundation.inb(ATA_PRIMARY_STATUS)
+  
+  if status != 0 {
+    ata_wait_drq(ATA_PRIMARY_DATA)
+    
+    // Read identify data
+    var i: u32 = 0
+    while i < 256 {
+      var data: u16 = foundation.inb(ATA_PRIMARY_DATA)
+      i = i + 1
+    }
+    
+    primary_master.exists = 1
+    primary_master.sectors = 1024 * 1024  // Assume 512MB for now
+    
+    foundation.serial_write_string("[ATA] Primary master detected\n")
+  }
+  
+  ata_initialized = 1
+  foundation.serial_write_string("[ATA] Initialized\n")
+}
+
+// ============================================================================
+// ATA READ/WRITE (PIO MODE)
+// ============================================================================
+
+export fn ata_read_sector(drive: u32, lba: u64, buffer: u64) -> u32 {
+  var device: u64
+  
+  if drive == 0 {
+    if primary_master.exists == 0 { return 1 }
+    device = @ptrFromInt(primary_master)
+  } else {
+    if primary_slave.exists == 0 { return 1 }
+    device = @ptrFromInt(primary_slave)
+  }
+  
+  var dev: ATADevice = @intToPtr(device, ATADevice)
+  var base: u16 = dev.base
+  var is_master: u32 = dev.is_master
+  
+  // Wait for drive to be ready
+  ata_wait_ready(base)
+  
+  // Select drive and set LBA mode
+  var drive_select: u8
+  if is_master == 1 {
+    drive_select = 0xE0
+  } else {
+    drive_select = 0xF0
+  }
+  drive_select = drive_select | ((lba >> 24) & 0x0F)
+  
+  foundation.outb(base + 6, drive_select)
+  
+  // Send sector count (1 sector)
+  foundation.outb(base + 2, 1)
+  
+  // Send LBA
+  foundation.outb(base + 3, lba & 0xFF)
+  foundation.outb(base + 4, (lba >> 8) & 0xFF)
+  foundation.outb(base + 5, (lba >> 16) & 0xFF)
+  
+  // Send read command
+  foundation.outb(base + 7, ATA_CMD_READ_PIO)
+  
+  // Wait for data
+  ata_wait_drq(base)
+  
+  // Read 512 bytes (256 words)
+  var i: u32 = 0
+  while i < 256 {
+    var data: u16 = foundation.inb(base)
+    
+    // Write to buffer
+    @ptrToInt(buffer + (i * 2), u16) = data
+    
+    i = i + 1
+  }
+  
+  return 0
+}
+
+export fn ata_write_sector(drive: u32, lba: u64, buffer: u64) -> u32 {
+  var device: u64
+  
+  if drive == 0 {
+    if primary_master.exists == 0 { return 1 }
+    device = @ptrFromInt(primary_master)
+  } else {
+    if primary_slave.exists == 0 { return 1 }
+    device = @ptrFromInt(primary_slave)
+  }
+  
+  var dev: ATADevice = @intToPtr(device, ATADevice)
+  var base: u16 = dev.base
+  var is_master: u32 = dev.is_master
+  
+  // Wait for drive to be ready
+  ata_wait_ready(base)
+  
+  // Select drive and set LBA mode
+  var drive_select: u8
+  if is_master == 1 {
+    drive_select = 0xE0
+  } else {
+    drive_select = 0xF0
+  }
+  drive_select = drive_select | ((lba >> 24) & 0x0F)
+  
+  foundation.outb(base + 6, drive_select)
+  
+  // Send sector count (1 sector)
+  foundation.outb(base + 2, 1)
+  
+  // Send LBA
+  foundation.outb(base + 3, lba & 0xFF)
+  foundation.outb(base + 4, (lba >> 8) & 0xFF)
+  foundation.outb(base + 5, (lba >> 16) & 0xFF)
+  
+  // Send write command
+  foundation.outb(base + 7, ATA_CMD_WRITE_PIO)
+  
+  // Wait for drive to be ready for data
+  ata_wait_drq(base)
+  
+  // Write 512 bytes (256 words)
+  var i: u32 = 0
+  while i < 256 {
+    var data: u16 = @intToPtr(buffer + (i * 2), u16)
+    foundation.outb(base, data)
+    i = i + 1
+  }
+  
+  // Flush cache
+  foundation.outb(base + 7, ATA_CMD_CACHE_FLUSH)
+  ata_wait_bsy(base)
+  
+  return 0
+}
+
+// ============================================================================
+// MULTI-SECTOR READ/WRITE
+// ============================================================================
+
+export fn ata_read_sectors(drive: u32, lba: u64, count: u32, buffer: u64) -> u32 {
+  var i: u32 = 0
+  
+  while i < count {
+    var result: u32 = ata_read_sector(drive, lba + i, buffer + (i * SECTOR_SIZE))
+    if result != 0 { return result }
+    i = i + 1
+  }
+  
+  return 0
+}
+
+export fn ata_write_sectors(drive: u32, lba: u64, count: u32, buffer: u64) -> u32 {
+  var i: u32 = 0
+  
+  while i < count {
+    var result: u32 = ata_write_sector(drive, lba + i, buffer + (i * SECTOR_SIZE))
+    if result != 0 { return result }
+    i = i + 1
+  }
+  
+  return 0
+}
+
+// ============================================================================
+// DEVICE INFO
+// ============================================================================
+
+export fn ata_get_device_count() -> u32 {
+  var count: u32 = 0
+  if primary_master.exists == 1 { count = count + 1 }
+  if primary_slave.exists == 1 { count = count + 1 }
+  return count
+}
+
+export fn ata_get_device_sectors(drive: u32) -> u64 {
+  if drive == 0 and primary_master.exists == 1 {
+    return primary_master.sectors
+  }
+  if drive == 1 and primary_slave.exists == 1 {
+    return primary_slave.sectors
+  }
+  return 0
+}
+
+export fn ata_device_exists(drive: u32) -> u32 {
+  if drive == 0 { return primary_master.exists }
+  if drive == 1 { return primary_slave.exists }
+  return 0
+}

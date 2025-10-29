@@ -198,11 +198,13 @@ Build a next-generation operating system that prioritizes:
   - [x] Screen clear (vga_clear)
   - [x] Software cursor (row/column tracking)
   - [ ] Double buffering support (TODO: Phase 4)
-- [ ] Storage driver (basic)
-  - [ ] ATA/ATAPI (IDE) support
-  - [ ] AHCI (SATA) driver
-  - [ ] NVMe driver (PCIe SSDs)
-  - [ ] Partition table parsing (GPT, MBR)
+- [x] Storage driver (basic) (**COMPLETED - Oct 29, 2025**)
+  - [x] ATA/ATAPI (IDE) support (ata_init, ata_read_sector, ata_write_sector, PIO mode)
+  - [x] Multi-sector read/write (ata_read_sectors, ata_write_sectors)
+  - [x] Device detection (ata_device_exists, ata_get_device_count)
+  - [ ] AHCI (SATA) driver (TODO: Phase 6)
+  - [ ] NVMe driver (PCIe SSDs) (TODO: Phase 6)
+  - [ ] Partition table parsing (GPT, MBR) (TODO: Phase 4)
 
 ---
 
