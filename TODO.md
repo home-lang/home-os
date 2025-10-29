@@ -92,6 +92,14 @@ Build a next-generation operating system that prioritizes:
   - [x] Set up GDT (Global Descriptor Table) (boot.s)
   - [ ] Set up IDT (Interrupt Descriptor Table) (TODO: causes triple fault)
   - [x] Initialize CPU features (CPUID check, PAE, long mode)
+- [x] **Home Language Compiler Integration** (**COMPLETED - Oct 29, 2025**)
+  - [x] Added `loop` keyword support to Home parser (parser.zig:963-984)
+  - [x] Implemented boolean literal code generation (home_kernel_codegen.zig:172-175)
+  - [x] Created minimal test kernel in Home language (kernel_simple.home)
+  - [x] Integrated Home compiler into build process (build-home-zig.sh)
+  - [x] Successfully compiled and booted Home-compiled kernel in QEMU
+  - [x] Generated x86-64 assembly from Home source code
+  - [x] Achieved end-to-end Home language → Assembly → Bootable ISO workflow
 - [~] Physical memory manager (**IN PROGRESS - Oct 28, 2025**)
   - [x] Bitmap allocator for physical pages (pmm.zig, pmm.home)
   - [x] Page frame allocator (4KB pages)
@@ -1729,6 +1737,18 @@ Choose the option that scores highest across these dimensions.
 
 ## Changelog
 
+### 2025-10-29
+- **MAJOR MILESTONE**: Home Language Compiler Integration Complete
+  - Added `loop` keyword support to Home parser
+  - Implemented boolean literal code generation for kernel
+  - Created minimal test kernel in Home language (kernel_simple.home)
+  - Integrated Home compiler into build process (build-home-zig.sh)
+  - Successfully compiled and booted Home-compiled kernel in QEMU
+  - Achieved end-to-end workflow: Home source → x86-64 assembly → bootable ISO
+  - Generated assembly proves Home compiler works for kernel code
+  - Boot sequence verified: SeaBIOS → iPXE → GRUB → Home-compiled kernel
+  - Updated TODO.md with completion status
+
 ### 2025-10-28
 - Initial TODO.md created with 17 phases
 - Added comprehensive Raspberry Pi support (Phase 12)
@@ -1748,9 +1768,9 @@ Choose the option that scores highest across these dimensions.
 
 ---
 
-**Last Updated**: 2025-10-28
-**Status**: Initial Comprehensive Draft
+**Last Updated**: 2025-10-29
+**Status**: Phase 1 - Home Compiler Integration Complete
 **Next Review**: After Phase 1 completion (Week 4)
-**Version**: 1.0.0
+**Version**: 1.1.0
 **Total Tasks**: ~800+ across 18 phases
 **Estimated Duration**: 78-82 weeks (19.5-20.5 months)
