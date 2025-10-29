@@ -35,6 +35,11 @@ SECTIONS
         *(.data.*)
     } :data
 
+    /* IDT table (writable, must be page-aligned) */
+    .idt ALIGN(4K) : {
+        *(.idt)
+    } :data
+
     .bss ALIGN(4K) : {
         *(COMMON)
         *(.bss)

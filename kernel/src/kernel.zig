@@ -3,6 +3,7 @@
 
 const serial = @import("serial.zig");
 const vga = @import("vga.zig");
+const idt = @import("idt.zig");
 const std = @import("std");
 
 // Multiboot2 constants
@@ -60,9 +61,20 @@ export fn kernel_main(magic: u32, info_addr: u32) callconv(.c) noreturn {
     serial.writeString("Boot info: OK\n");
     serial.writeString("Bootloader: GRUB\n");
 
+    // Initialize IDT
+    serial.writeString("\n");
+    // TODO: IDT causes triple fault due to page table write access issues with .bss section
+    // Need to fix page table configuration in boot.s before enabling
+    serial.writeString("IDT initialization skipped (page table issue)\n");
+    // idt.init();
+
     // Kernel initialized successfully
     serial.writeString("\n");
     serial.writeString("Kernel initialized successfully!\n");
+
+    // Test exception handling (optional - comment out for normal boot)
+    // idt.testDivideByZero();
+
     serial.writeString("Entering idle loop...\n");
 
     // Display system info
