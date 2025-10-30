@@ -1,0 +1,303 @@
+// home-os Kernel - Intel E1000 Network Driver
+// Real implementation for network I/O
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// E1000 registers
+const E1000_REG_CTRL: u32 = 0x00000
+const E1000_REG_STATUS: u32 = 0x00008
+const E1000_REG_EECD: u32 = 0x00010
+const E1000_REG_EERD: u32 = 0x00014
+const E1000_REG_CTRL_EXT: u32 = 0x00018
+const E1000_REG_MDIC: u32 = 0x00020
+const E1000_REG_ICR: u32 = 0x000C0
+const E1000_REG_IMS: u32 = 0x000D0
+const E1000_REG_RCTL: u32 = 0x00100
+const E1000_REG_TCTL: u32 = 0x00400
+const E1000_REG_RDBAL: u32 = 0x02800
+const E1000_REG_RDBAH: u32 = 0x02804
+const E1000_REG_RDLEN: u32 = 0x02808
+const E1000_REG_RDH: u32 = 0x02810
+const E1000_REG_RDT: u32 = 0x02818
+const E1000_REG_TDBAL: u32 = 0x03800
+const E1000_REG_TDBAH: u32 = 0x03804
+const E1000_REG_TDLEN: u32 = 0x03808
+const E1000_REG_TDH: u32 = 0x03810
+const E1000_REG_TDT: u32 = 0x03818
+const E1000_REG_RAL: u32 = 0x05400
+const E1000_REG_RAH: u32 = 0x05404
+
+// Control bits
+const E1000_CTRL_RST: u32 = 0x04000000
+const E1000_CTRL_SLU: u32 = 0x00000040
+
+// Receive control bits
+const E1000_RCTL_EN: u32 = 0x00000002
+const E1000_RCTL_BAM: u32 = 0x00008000
+const E1000_RCTL_BSIZE_2048: u32 = 0x00000000
+
+// Transmit control bits
+const E1000_TCTL_EN: u32 = 0x00000002
+const E1000_TCTL_PSP: u32 = 0x00000008
+
+const RX_DESC_COUNT: u32 = 32
+const TX_DESC_COUNT: u32 = 32
+const PACKET_SIZE: u32 = 2048
+
+// ============================================================================
+// DESCRIPTOR STRUCTURES
+// ============================================================================
+
+struct RxDescriptor {
+  addr: u64,
+  length: u16,
+  checksum: u16,
+  status: u8,
+  errors: u8,
+  special: u16
+}
+
+struct TxDescriptor {
+  addr: u64,
+  length: u16,
+  cso: u8,
+  cmd: u8,
+  status: u8,
+  css: u8,
+  special: u16
+}
+
+// ============================================================================
+// DEVICE STATE
+// ============================================================================
+
+var e1000_base: u64 = 0
+var e1000_initialized: u32 = 0
+var mac_address: [u8; 6]
+
+var rx_descriptors: [RxDescriptor; 32]
+var tx_descriptors: [TxDescriptor; 32]
+var rx_buffers: u64 = 0
+var tx_buffers: u64 = 0
+
+var rx_current: u32 = 0
+var tx_current: u32 = 0
+
+// ============================================================================
+// MMIO ACCESS
+// ============================================================================
+
+fn e1000_read_reg(reg: u32) -> u32 {
+  var addr: u64 = e1000_base + reg
+  return @intToPtr(addr, u32)
+}
+
+fn e1000_write_reg(reg: u32, value: u32) {
+  var addr: u64 = e1000_base + reg
+  @ptrToInt(addr, u32) = value
+}
+
+// ============================================================================
+// EEPROM ACCESS
+// ============================================================================
+
+fn e1000_read_eeprom(addr: u8) -> u16 {
+  var tmp: u32 = 0
+  
+  // Start read
+  e1000_write_reg(E1000_REG_EERD, 1 | (addr << 8))
+  
+  // Wait for completion
+  var timeout: u32 = 1000
+  while timeout > 0 {
+    tmp = e1000_read_reg(E1000_REG_EERD)
+    if (tmp & 0x10) != 0 {
+      break
+    }
+    timeout = timeout - 1
+  }
+  
+  return (tmp >> 16) & 0xFFFF
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn e1000_init(base_addr: u64) {
+  if e1000_initialized == 1 { return }
+  
+  e1000_base = base_addr
+  
+  // Reset device
+  e1000_write_reg(E1000_REG_CTRL, E1000_CTRL_RST)
+  
+  // Wait for reset
+  var i: u32 = 0
+  while i < 1000 {
+    i = i + 1
+  }
+  
+  // Read MAC address from EEPROM
+  var mac_low: u16 = e1000_read_eeprom(0)
+  var mac_mid: u16 = e1000_read_eeprom(1)
+  var mac_high: u16 = e1000_read_eeprom(2)
+  
+  mac_address[0] = mac_low & 0xFF
+  mac_address[1] = (mac_low >> 8) & 0xFF
+  mac_address[2] = mac_mid & 0xFF
+  mac_address[3] = (mac_mid >> 8) & 0xFF
+  mac_address[4] = mac_high & 0xFF
+  mac_address[5] = (mac_high >> 8) & 0xFF
+  
+  // Allocate descriptor rings
+  rx_buffers = memory.kmalloc(RX_DESC_COUNT * PACKET_SIZE)
+  tx_buffers = memory.kmalloc(TX_DESC_COUNT * PACKET_SIZE)
+  
+  // Initialize RX descriptors
+  i = 0
+  while i < RX_DESC_COUNT {
+    rx_descriptors[i].addr = rx_buffers + (i * PACKET_SIZE)
+    rx_descriptors[i].status = 0
+    i = i + 1
+  }
+  
+  // Initialize TX descriptors
+  i = 0
+  while i < TX_DESC_COUNT {
+    tx_descriptors[i].addr = tx_buffers + (i * PACKET_SIZE)
+    tx_descriptors[i].cmd = 0
+    tx_descriptors[i].status = 1  // Done
+    i = i + 1
+  }
+  
+  // Set up receive ring
+  e1000_write_reg(E1000_REG_RDBAL, @ptrFromInt(rx_descriptors) & 0xFFFFFFFF)
+  e1000_write_reg(E1000_REG_RDBAH, (@ptrFromInt(rx_descriptors) >> 32) & 0xFFFFFFFF)
+  e1000_write_reg(E1000_REG_RDLEN, RX_DESC_COUNT * @sizeOf(RxDescriptor))
+  e1000_write_reg(E1000_REG_RDH, 0)
+  e1000_write_reg(E1000_REG_RDT, RX_DESC_COUNT - 1)
+  
+  // Set up transmit ring
+  e1000_write_reg(E1000_REG_TDBAL, @ptrFromInt(tx_descriptors) & 0xFFFFFFFF)
+  e1000_write_reg(E1000_REG_TDBAH, (@ptrFromInt(tx_descriptors) >> 32) & 0xFFFFFFFF)
+  e1000_write_reg(E1000_REG_TDLEN, TX_DESC_COUNT * @sizeOf(TxDescriptor))
+  e1000_write_reg(E1000_REG_TDH, 0)
+  e1000_write_reg(E1000_REG_TDT, 0)
+  
+  // Enable receive
+  e1000_write_reg(E1000_REG_RCTL, E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_BSIZE_2048)
+  
+  // Enable transmit
+  e1000_write_reg(E1000_REG_TCTL, E1000_TCTL_EN | E1000_TCTL_PSP)
+  
+  // Link up
+  e1000_write_reg(E1000_REG_CTRL, e1000_read_reg(E1000_REG_CTRL) | E1000_CTRL_SLU)
+  
+  e1000_initialized = 1
+  foundation.serial_write_string("[E1000] Initialized - MAC: ")
+  foundation.serial_write_string("\n")
+}
+
+// ============================================================================
+// PACKET TRANSMISSION
+// ============================================================================
+
+export fn e1000_send_packet(data: u64, length: u32) -> u32 {
+  if e1000_initialized == 0 { return 1 }
+  if length > PACKET_SIZE { return 1 }
+  
+  // Wait for current descriptor to be free
+  var timeout: u32 = 10000
+  while timeout > 0 {
+    if (tx_descriptors[tx_current].status & 1) != 0 {
+      break
+    }
+    timeout = timeout - 1
+  }
+  
+  if timeout == 0 { return 1 }
+  
+  // Copy data to buffer
+  var dest: u64 = tx_descriptors[tx_current].addr
+  var i: u32 = 0
+  while i < length {
+    @ptrToInt(dest + i, u8) = @intToPtr(data + i, u8)
+    i = i + 1
+  }
+  
+  // Set up descriptor
+  tx_descriptors[tx_current].length = length
+  tx_descriptors[tx_current].cmd = 0x0B  // EOP | IFCS | RS
+  tx_descriptors[tx_current].status = 0
+  
+  // Update tail
+  tx_current = (tx_current + 1) % TX_DESC_COUNT
+  e1000_write_reg(E1000_REG_TDT, tx_current)
+  
+  return 0
+}
+
+// ============================================================================
+// PACKET RECEPTION
+// ============================================================================
+
+export fn e1000_receive_packet(buffer: u64, max_length: u32) -> u32 {
+  if e1000_initialized == 0 { return 0 }
+  
+  // Check if packet available
+  if (rx_descriptors[rx_current].status & 1) == 0 {
+    return 0  // No packet
+  }
+  
+  var length: u32 = rx_descriptors[rx_current].length
+  if length > max_length {
+    length = max_length
+  }
+  
+  // Copy data from buffer
+  var src: u64 = rx_descriptors[rx_current].addr
+  var i: u32 = 0
+  while i < length {
+    @ptrToInt(buffer + i, u8) = @intToPtr(src + i, u8)
+    i = i + 1
+  }
+  
+  // Reset descriptor
+  rx_descriptors[rx_current].status = 0
+  
+  // Update tail
+  var old_current: u32 = rx_current
+  rx_current = (rx_current + 1) % RX_DESC_COUNT
+  e1000_write_reg(E1000_REG_RDT, old_current)
+  
+  return length
+}
+
+// ============================================================================
+// DEVICE INFO
+// ============================================================================
+
+export fn e1000_get_mac_address(dest: u64) {
+  var i: u32 = 0
+  while i < 6 {
+    @ptrToInt(dest + i, u8) = mac_address[i]
+    i = i + 1
+  }
+}
+
+export fn e1000_is_initialized() -> u32 {
+  return e1000_initialized
+}
+
+export fn e1000_get_link_status() -> u32 {
+  if e1000_initialized == 0 { return 0 }
+  
+  var status: u32 = e1000_read_reg(E1000_REG_STATUS)
+  return (status & 0x02) != 0  // Link up bit
+}
