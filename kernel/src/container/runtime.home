@@ -1,0 +1,306 @@
+// home-os Kernel - Container Runtime
+// OCI-compatible container runtime
+
+import "../core/foundation.home" as foundation
+import "../core/process.home" as process
+import "../core/filesystem.home" as filesystem
+import "cgroups.home" as cgroups
+import "namespaces.home" as namespaces
+
+const MAX_CONTAINERS: u32 = 256
+
+struct Container {
+  id: [u8; 64],
+  name: [u8; 128],
+  image: [u8; 256],
+  rootfs: [u8; 256],
+  pid: u32,
+  cgroup_id: u32,
+  namespace_id: u32,
+  state: u32,  // 0=created, 1=running, 2=stopped, 3=paused
+  created_at: u64,
+  started_at: u64
+}
+
+var containers: [Container; 256]
+var container_count: u32 = 0
+var runtime_initialized: u32 = 0
+
+export fn container_runtime_init() {
+  if runtime_initialized == 1 { return }
+  
+  container_count = 0
+  
+  // Initialize dependencies
+  cgroups.cgroup_init()
+  namespaces.namespace_init()
+  
+  runtime_initialized = 1
+  foundation.serial_write_string("[Container] Runtime initialized\n")
+}
+
+export fn container_create(id: u64, name: u64, image: u64, rootfs: u64) -> u32 {
+  if container_count >= MAX_CONTAINERS { return 0xFFFFFFFF }
+  
+  var container_id: u32 = container_count
+  
+  // Copy ID
+  var i: u32 = 0
+  while i < 63 {
+    var ch: u8 = @intToPtr(id + i, u8)
+    containers[container_id].id[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  containers[container_id].id[i] = 0
+  
+  // Copy name
+  i = 0
+  while i < 127 {
+    var ch: u8 = @intToPtr(name + i, u8)
+    containers[container_id].name[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  containers[container_id].name[i] = 0
+  
+  // Copy image
+  i = 0
+  while i < 255 {
+    var ch: u8 = @intToPtr(image + i, u8)
+    containers[container_id].image[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  containers[container_id].image[i] = 0
+  
+  // Copy rootfs
+  i = 0
+  while i < 255 {
+    var ch: u8 = @intToPtr(rootfs + i, u8)
+    containers[container_id].rootfs[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  containers[container_id].rootfs[i] = 0
+  
+  containers[container_id].state = 0  // Created
+  containers[container_id].created_at = foundation.timer_get_ticks()
+  
+  // Create cgroup
+  var cgroup_name: [u8; 256]
+  container_build_cgroup_name(@ptrFromInt(cgroup_name), id)
+  containers[container_id].cgroup_id = cgroups.cgroup_create(@ptrFromInt(cgroup_name), 0)
+  
+  // Create namespace
+  containers[container_id].namespace_id = namespaces.namespace_create()
+  
+  container_count = container_count + 1
+  
+  foundation.serial_write_string("[Container] Created: ")
+  foundation.serial_write_string(name)
+  foundation.serial_write_string("\n")
+  
+  return container_id
+}
+
+fn container_build_cgroup_name(out: u64, id: u64) {
+  var prefix: u64 = @ptrFromInt("/containers/")
+  var i: u32 = 0
+  
+  while @intToPtr(prefix + i, u8) != 0 {
+    @intToPtr(out + i, u8) = @intToPtr(prefix + i, u8)
+    i = i + 1
+  }
+  
+  var j: u32 = 0
+  while @intToPtr(id + j, u8) != 0 {
+    @intToPtr(out + i, u8) = @intToPtr(id + j, u8)
+    i = i + 1
+    j = j + 1
+  }
+  
+  @intToPtr(out + i, u8) = 0
+}
+
+export fn container_start(container_id: u32) -> u32 {
+  if container_id >= container_count { return 0 }
+  if containers[container_id].state != 0 { return 0 }
+  
+  foundation.serial_write_string("[Container] Starting: ")
+  foundation.serial_write_string(@ptrFromInt(containers[container_id].name))
+  foundation.serial_write_string("\n")
+  
+  // Fork process
+  var pid: u32 = process.process_fork()
+  
+  if pid == 0 {
+    // Child process
+    
+    // Enter namespaces
+    namespaces.namespace_enter(containers[container_id].namespace_id)
+    
+    // Change root to container rootfs
+    filesystem.vfs_chroot(@ptrFromInt(containers[container_id].rootfs))
+    
+    // Execute container init
+    var init_path: u64 = @ptrFromInt("/init")
+    process.process_exec(init_path, 0, 0)
+    
+    // Should not reach here
+    process.process_exit(1)
+  }
+  
+  // Parent process
+  containers[container_id].pid = pid
+  containers[container_id].state = 1  // Running
+  containers[container_id].started_at = foundation.timer_get_ticks()
+  
+  // Add to cgroup
+  cgroups.cgroup_add_process(containers[container_id].cgroup_id, pid)
+  
+  foundation.serial_write_string("[Container] Started with PID ")
+  foundation.serial_write_hex(pid)
+  foundation.serial_write_string("\n")
+  
+  return 1
+}
+
+export fn container_stop(container_id: u32) -> u32 {
+  if container_id >= container_count { return 0 }
+  if containers[container_id].state != 1 { return 0 }
+  
+  foundation.serial_write_string("[Container] Stopping: ")
+  foundation.serial_write_string(@ptrFromInt(containers[container_id].name))
+  foundation.serial_write_string("\n")
+  
+  // Send SIGTERM to container process
+  process.process_signal(containers[container_id].pid, 15)
+  
+  // Wait for process to exit
+  process.process_wait(containers[container_id].pid)
+  
+  containers[container_id].state = 2  // Stopped
+  
+  // Remove from cgroup
+  cgroups.cgroup_remove_process(containers[container_id].cgroup_id, containers[container_id].pid)
+  
+  return 1
+}
+
+export fn container_pause(container_id: u32) -> u32 {
+  if container_id >= container_count { return 0 }
+  if containers[container_id].state != 1 { return 0 }
+  
+  // Freeze cgroup
+  process.process_stop(containers[container_id].pid)
+  
+  containers[container_id].state = 3  // Paused
+  
+  return 1
+}
+
+export fn container_resume(container_id: u32) -> u32 {
+  if container_id >= container_count { return 0 }
+  if containers[container_id].state != 3 { return 0 }
+  
+  // Unfreeze cgroup
+  process.process_resume(containers[container_id].pid)
+  
+  containers[container_id].state = 1  // Running
+  
+  return 1
+}
+
+export fn container_delete(container_id: u32) -> u32 {
+  if container_id >= container_count { return 0 }
+  
+  // Stop if running
+  if containers[container_id].state == 1 {
+    container_stop(container_id)
+  }
+  
+  // Destroy cgroup
+  cgroups.cgroup_destroy(containers[container_id].cgroup_id)
+  
+  // Destroy namespace
+  namespaces.namespace_destroy(containers[container_id].namespace_id)
+  
+  foundation.serial_write_string("[Container] Deleted: ")
+  foundation.serial_write_string(@ptrFromInt(containers[container_id].name))
+  foundation.serial_write_string("\n")
+  
+  return 1
+}
+
+export fn container_set_limits(container_id: u32, memory_mb: u32, cpu_shares: u32) -> u32 {
+  if container_id >= container_count { return 0 }
+  
+  var cgroup_id: u32 = containers[container_id].cgroup_id
+  
+  // Set memory limit
+  cgroups.cgroup_set_memory_limit(cgroup_id, memory_mb * 1024 * 1024, 0)
+  
+  // Set CPU shares
+  cgroups.cgroup_set_cpu_limit(cgroup_id, cpu_shares, 0, 100000)
+  
+  return 1
+}
+
+export fn container_list() {
+  foundation.serial_write_string("\n[Container] Running containers:\n")
+  foundation.serial_write_string("ID                Name              State     PID\n")
+  foundation.serial_write_string("-----------------------------------------------\n")
+  
+  var i: u32 = 0
+  while i < container_count {
+    foundation.serial_write_string(@ptrFromInt(containers[i].id))
+    foundation.serial_write_string("  ")
+    foundation.serial_write_string(@ptrFromInt(containers[i].name))
+    foundation.serial_write_string("  ")
+    
+    if containers[i].state == 0 {
+      foundation.serial_write_string("created ")
+    } else if containers[i].state == 1 {
+      foundation.serial_write_string("running ")
+    } else if containers[i].state == 2 {
+      foundation.serial_write_string("stopped ")
+    } else if containers[i].state == 3 {
+      foundation.serial_write_string("paused  ")
+    }
+    
+    foundation.serial_write_hex(containers[i].pid)
+    foundation.serial_write_string("\n")
+    
+    i = i + 1
+  }
+}
+
+export fn container_find(name: u64) -> u32 {
+  var i: u32 = 0
+  while i < container_count {
+    if container_strcmp(@ptrFromInt(containers[i].name), name) == 1 {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+fn container_strcmp(s1: u64, s2: u64) -> u32 {
+  var i: u32 = 0
+  while 1 == 1 {
+    var c1: u8 = @intToPtr(s1 + i, u8)
+    var c2: u8 = @intToPtr(s2 + i, u8)
+    
+    if c1 != c2 { return 0 }
+    if c1 == 0 { return 1 }
+    
+    i = i + 1
+  }
+  return 0
+}
+
+export fn container_get_count() -> u32 {
+  return container_count
+}
