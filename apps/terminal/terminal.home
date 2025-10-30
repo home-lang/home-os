@@ -1,0 +1,372 @@
+// home-os Terminal Emulator
+// Inspired by Ghostty (https://github.com/ghostty-org/ghostty)
+// A modern terminal emulator for home-os
+
+import "../../kernel/src/core/foundation.home" as foundation
+import "../../kernel/src/drivers/keyboard.home" as keyboard
+import "../../kernel/src/drivers/framebuffer.home" as fb
+import "vt100.home" as vt100
+import "ansi.home" as ansi
+
+const TERM_WIDTH: u32 = 80
+const TERM_HEIGHT: u32 = 24
+const MAX_SCROLLBACK: u32 = 10000
+const MAX_TABS: u32 = 10
+
+struct TerminalCell {
+  ch: u32,
+  fg_color: u32,
+  bg_color: u32,
+  bold: u32,
+  italic: u32,
+  underline: u32
+}
+
+struct TerminalTab {
+  name: [u8; 64],
+  buffer: [[TerminalCell; 80]; 24],
+  scrollback: [[TerminalCell; 80]; 10000],
+  scrollback_pos: u32,
+  cursor_x: u32,
+  cursor_y: u32,
+  active: u32
+}
+
+var tabs: [TerminalTab; 10]
+var tab_count: u32 = 0
+var active_tab: u32 = 0
+
+var terminal_initialized: u32 = 0
+
+export fn terminal_init() {
+  if terminal_initialized == 1 { return }
+  
+  vt100.vt100_init()
+  ansi.ansi_init()
+  fb.fb_init(0xFD000000, 1024, 768)
+  
+  // Create initial tab
+  terminal_new_tab("Terminal 1")
+  
+  terminal_initialized = 1
+  foundation.serial_write_string("[Terminal] Emulator initialized\n")
+}
+
+export fn terminal_new_tab(name: u64) -> u32 {
+  if tab_count >= MAX_TABS { return 0xFFFFFFFF }
+  
+  var i: u32 = 0
+  while i < 64 {
+    tabs[tab_count].name[i] = @intToPtr(name + i, u8)
+    if tabs[tab_count].name[i] == 0 { break }
+    i = i + 1
+  }
+  
+  tabs[tab_count].cursor_x = 0
+  tabs[tab_count].cursor_y = 0
+  tabs[tab_count].scrollback_pos = 0
+  tabs[tab_count].active = 1
+  
+  // Initialize buffer with default colors
+  var y: u32 = 0
+  while y < TERM_HEIGHT {
+    var x: u32 = 0
+    while x < TERM_WIDTH {
+      tabs[tab_count].buffer[y][x].ch = ' '
+      tabs[tab_count].buffer[y][x].fg_color = 0xFFFFFF
+      tabs[tab_count].buffer[y][x].bg_color = 0x000000
+      tabs[tab_count].buffer[y][x].bold = 0
+      tabs[tab_count].buffer[y][x].italic = 0
+      tabs[tab_count].buffer[y][x].underline = 0
+      x = x + 1
+    }
+    y = y + 1
+  }
+  
+  var id: u32 = tab_count
+  tab_count = tab_count + 1
+  
+  foundation.serial_write_string("[Terminal] Created tab: ")
+  foundation.serial_write_string(name)
+  foundation.serial_write_string("\n")
+  
+  return id
+}
+
+export fn terminal_close_tab(tab_id: u32) {
+  if tab_id >= tab_count { return }
+  tabs[tab_id].active = 0
+  
+  // Switch to next active tab
+  var i: u32 = 0
+  while i < tab_count {
+    if tabs[i].active == 1 {
+      active_tab = i
+      break
+    }
+    i = i + 1
+  }
+}
+
+export fn terminal_switch_tab(tab_id: u32) {
+  if tab_id >= tab_count { return }
+  if tabs[tab_id].active == 0 { return }
+  
+  active_tab = tab_id
+  terminal_render()
+}
+
+fn terminal_scroll_up() {
+  if tabs[active_tab].scrollback_pos < MAX_SCROLLBACK - TERM_HEIGHT {
+    tabs[active_tab].scrollback_pos = tabs[active_tab].scrollback_pos + 1
+    terminal_render()
+  }
+}
+
+fn terminal_scroll_down() {
+  if tabs[active_tab].scrollback_pos > 0 {
+    tabs[active_tab].scrollback_pos = tabs[active_tab].scrollback_pos - 1
+    terminal_render()
+  }
+}
+
+fn terminal_add_to_scrollback(line: u32) {
+  // Shift scrollback buffer
+  var i: u32 = MAX_SCROLLBACK - 1
+  while i > 0 {
+    var x: u32 = 0
+    while x < TERM_WIDTH {
+      tabs[active_tab].scrollback[i][x] = tabs[active_tab].scrollback[i - 1][x]
+      x = x + 1
+    }
+    i = i - 1
+  }
+  
+  // Copy line to scrollback
+  var x: u32 = 0
+  while x < TERM_WIDTH {
+    tabs[active_tab].scrollback[0][x] = tabs[active_tab].buffer[line][x]
+    x = x + 1
+  }
+}
+
+export fn terminal_write_char(ch: u32) {
+  var tab: u32 = active_tab
+  
+  // Handle special characters
+  if ch == '\n' {
+    tabs[tab].cursor_x = 0
+    tabs[tab].cursor_y = tabs[tab].cursor_y + 1
+    
+    if tabs[tab].cursor_y >= TERM_HEIGHT {
+      // Scroll up
+      terminal_add_to_scrollback(0)
+      
+      var y: u32 = 0
+      while y < TERM_HEIGHT - 1 {
+        var x: u32 = 0
+        while x < TERM_WIDTH {
+          tabs[tab].buffer[y][x] = tabs[tab].buffer[y + 1][x]
+          x = x + 1
+        }
+        y = y + 1
+      }
+      
+      // Clear last line
+      var x: u32 = 0
+      while x < TERM_WIDTH {
+        tabs[tab].buffer[TERM_HEIGHT - 1][x].ch = ' '
+        x = x + 1
+      }
+      
+      tabs[tab].cursor_y = TERM_HEIGHT - 1
+    }
+    return
+  }
+  
+  if ch == '\r' {
+    tabs[tab].cursor_x = 0
+    return
+  }
+  
+  if ch == '\t' {
+    tabs[tab].cursor_x = (tabs[tab].cursor_x + 8) & ~7
+    if tabs[tab].cursor_x >= TERM_WIDTH {
+      tabs[tab].cursor_x = 0
+      tabs[tab].cursor_y = tabs[tab].cursor_y + 1
+    }
+    return
+  }
+  
+  if ch == '\b' {
+    if tabs[tab].cursor_x > 0 {
+      tabs[tab].cursor_x = tabs[tab].cursor_x - 1
+    }
+    return
+  }
+  
+  // Write character to buffer
+  tabs[tab].buffer[tabs[tab].cursor_y][tabs[tab].cursor_x].ch = ch
+  
+  tabs[tab].cursor_x = tabs[tab].cursor_x + 1
+  if tabs[tab].cursor_x >= TERM_WIDTH {
+    tabs[tab].cursor_x = 0
+    tabs[tab].cursor_y = tabs[tab].cursor_y + 1
+    
+    if tabs[tab].cursor_y >= TERM_HEIGHT {
+      tabs[tab].cursor_y = TERM_HEIGHT - 1
+      // Scroll
+    }
+  }
+}
+
+export fn terminal_write_string(str: u64) {
+  var i: u32 = 0
+  while i < 4096 {
+    var ch: u8 = @intToPtr(str + i, u8)
+    if ch == 0 { break }
+    
+    // Check for ANSI escape sequences
+    if ch == 0x1B {
+      var seq_len: u32 = ansi.ansi_parse_sequence(str + i)
+      if seq_len > 0 {
+        i = i + seq_len
+        continue
+      }
+    }
+    
+    terminal_write_char(ch)
+    i = i + 1
+  }
+  
+  terminal_render()
+}
+
+fn terminal_render_tabs() {
+  // Draw tab bar at top
+  fb.fb_fill_rect(0, 0, 1024, 30, 0x2A2A2A)
+  
+  var x_offset: u32 = 5
+  var i: u32 = 0
+  while i < tab_count {
+    if tabs[i].active == 1 {
+      var bg_color: u32 = 0x3A3A3A
+      if i == active_tab {
+        bg_color = 0x4A4A4A
+      }
+      
+      fb.fb_fill_rect(x_offset, 5, 150, 20, bg_color)
+      fb.fb_draw_text(x_offset + 10, 10, @ptrFromInt(tabs[i].name), 0xFFFFFF)
+      
+      x_offset = x_offset + 160
+    }
+    i = i + 1
+  }
+}
+
+export fn terminal_render() {
+  if terminal_initialized == 0 { return }
+  
+  fb.fb_clear(0x000000)
+  
+  // Render tabs
+  terminal_render_tabs()
+  
+  // Render terminal content
+  var tab: u32 = active_tab
+  var y: u32 = 0
+  while y < TERM_HEIGHT {
+    var x: u32 = 0
+    while x < TERM_WIDTH {
+      var cell: TerminalCell = tabs[tab].buffer[y][x]
+      
+      var screen_x: u32 = x * 10
+      var screen_y: u32 = y * 16 + 35
+      
+      // Draw background
+      if cell.bg_color != 0x000000 {
+        fb.fb_fill_rect(screen_x, screen_y, 10, 16, cell.bg_color)
+      }
+      
+      // Draw character
+      if cell.ch != ' ' {
+        fb.fb_draw_char(screen_x, screen_y, cell.ch, cell.fg_color)
+      }
+      
+      x = x + 1
+    }
+    y = y + 1
+  }
+  
+  // Draw cursor
+  var cursor_x: u32 = tabs[tab].cursor_x * 10
+  var cursor_y: u32 = tabs[tab].cursor_y * 16 + 35
+  fb.fb_fill_rect(cursor_x, cursor_y + 14, 10, 2, 0xFFFFFF)
+  
+  fb.fb_present()
+}
+
+export fn terminal_main() {
+  terminal_init()
+  terminal_render()
+  
+  // Display welcome message
+  terminal_write_string("Welcome to home-os Terminal\n")
+  terminal_write_string("home-os v1.0\n\n")
+  terminal_write_string("$ ")
+  
+  var running: u32 = 1
+  while running == 1 {
+    while keyboard.keyboard_has_char() == 0 {}
+    var ch: u8 = keyboard.keyboard_getchar()
+    
+    // Handle special keys
+    if ch == 0x1B {  // ESC
+      // Check for escape sequences
+      continue
+    }
+    
+    // Ctrl+Shift+T - New tab
+    if ch == 20 {
+      var tab_name: [u8; 64] = "Terminal "
+      terminal_new_tab(@ptrFromInt(tab_name))
+      continue
+    }
+    
+    // Ctrl+Shift+W - Close tab
+    if ch == 23 {
+      terminal_close_tab(active_tab)
+      continue
+    }
+    
+    // Ctrl+PageUp - Previous tab
+    if ch == 25 {
+      if active_tab > 0 {
+        terminal_switch_tab(active_tab - 1)
+      }
+      continue
+    }
+    
+    // Ctrl+PageDown - Next tab
+    if ch == 26 {
+      if active_tab < tab_count - 1 {
+        terminal_switch_tab(active_tab + 1)
+      }
+      continue
+    }
+    
+    // Shift+PageUp - Scroll up
+    if ch == 27 {
+      terminal_scroll_up()
+      continue
+    }
+    
+    // Shift+PageDown - Scroll down
+    if ch == 28 {
+      terminal_scroll_down()
+      continue
+    }
+    
+    terminal_write_char(ch)
+  }
+}
