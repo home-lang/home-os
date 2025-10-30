@@ -1,0 +1,235 @@
+// home-os Kernel - Seccomp-BPF (Secure Computing with BPF)
+// System call filtering for sandboxing
+
+import "../core/foundation.home" as foundation
+
+// Seccomp modes
+const SECCOMP_MODE_DISABLED: u32 = 0
+const SECCOMP_MODE_STRICT: u32 = 1
+const SECCOMP_MODE_FILTER: u32 = 2
+
+// Seccomp return values
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x80000000
+const SECCOMP_RET_KILL_THREAD: u32 = 0x00000000
+const SECCOMP_RET_TRAP: u32 = 0x00030000
+const SECCOMP_RET_ERRNO: u32 = 0x00050000
+const SECCOMP_RET_TRACE: u32 = 0x7FF00000
+const SECCOMP_RET_LOG: u32 = 0x7FFC0000
+const SECCOMP_RET_ALLOW: u32 = 0x7FFF0000
+
+// BPF instruction
+struct BPFInstruction {
+  code: u16,
+  jt: u8,
+  jf: u8,
+  k: u32
+}
+
+// Seccomp filter
+const MAX_FILTER_INSTRUCTIONS: u32 = 4096
+const MAX_PROCESSES: u32 = 256
+
+struct SeccompFilter {
+  mode: u32,
+  instruction_count: u32,
+  instructions: [BPFInstruction; 4096]
+}
+
+var process_filters: [SeccompFilter; 256]
+var seccomp_initialized: u32 = 0
+var seccomp_violations: u64 = 0
+
+export fn seccomp_init() {
+  if seccomp_initialized == 1 { return }
+  
+  var i: u32 = 0
+  while i < MAX_PROCESSES {
+    process_filters[i].mode = SECCOMP_MODE_DISABLED
+    process_filters[i].instruction_count = 0
+    i = i + 1
+  }
+  
+  seccomp_initialized = 1
+  foundation.serial_write_string("[Seccomp] Initialized\n")
+}
+
+export fn seccomp_set_mode_strict(pid: u32) -> u32 {
+  if pid >= MAX_PROCESSES { return 0 }
+  
+  process_filters[pid].mode = SECCOMP_MODE_STRICT
+  
+  foundation.serial_write_string("[Seccomp] PID ")
+  foundation.serial_write_hex(pid)
+  foundation.serial_write_string(" set to strict mode\n")
+  
+  return 1
+}
+
+export fn seccomp_set_mode_filter(pid: u32, instructions: u64, count: u32) -> u32 {
+  if pid >= MAX_PROCESSES { return 0 }
+  if count > MAX_FILTER_INSTRUCTIONS { return 0 }
+  
+  // Copy BPF instructions
+  var i: u32 = 0
+  while i < count {
+    var inst_ptr: u64 = instructions + (i * 8)
+    process_filters[pid].instructions[i].code = @intToPtr(inst_ptr, u16)
+    process_filters[pid].instructions[i].jt = @intToPtr(inst_ptr + 2, u8)
+    process_filters[pid].instructions[i].jf = @intToPtr(inst_ptr + 3, u8)
+    process_filters[pid].instructions[i].k = @intToPtr(inst_ptr + 4, u32)
+    i = i + 1
+  }
+  
+  process_filters[pid].instruction_count = count
+  process_filters[pid].mode = SECCOMP_MODE_FILTER
+  
+  foundation.serial_write_string("[Seccomp] PID ")
+  foundation.serial_write_hex(pid)
+  foundation.serial_write_string(" set to filter mode with ")
+  foundation.serial_write_hex(count)
+  foundation.serial_write_string(" instructions\n")
+  
+  return 1
+}
+
+export fn seccomp_check_syscall(pid: u32, syscall_nr: u32) -> u32 {
+  if pid >= MAX_PROCESSES { return SECCOMP_RET_ALLOW }
+  
+  var mode: u32 = process_filters[pid].mode
+  
+  if mode == SECCOMP_MODE_DISABLED {
+    return SECCOMP_RET_ALLOW
+  }
+  
+  if mode == SECCOMP_MODE_STRICT {
+    // Strict mode: only allow read, write, exit, sigreturn
+    if syscall_nr == 0 or syscall_nr == 1 or syscall_nr == 60 or syscall_nr == 15 {
+      return SECCOMP_RET_ALLOW
+    }
+    
+    seccomp_violations = seccomp_violations + 1
+    foundation.serial_write_string("[Seccomp] Strict mode violation: syscall ")
+    foundation.serial_write_hex(syscall_nr)
+    foundation.serial_write_string("\n")
+    
+    return SECCOMP_RET_KILL_PROCESS
+  }
+  
+  if mode == SECCOMP_MODE_FILTER {
+    // Run BPF filter
+    var result: u32 = seccomp_run_filter(pid, syscall_nr)
+    
+    if result != SECCOMP_RET_ALLOW {
+      seccomp_violations = seccomp_violations + 1
+      foundation.serial_write_string("[Seccomp] Filter blocked syscall ")
+      foundation.serial_write_hex(syscall_nr)
+      foundation.serial_write_string(" with result 0x")
+      foundation.serial_write_hex(result)
+      foundation.serial_write_string("\n")
+    }
+    
+    return result
+  }
+  
+  return SECCOMP_RET_ALLOW
+}
+
+fn seccomp_run_filter(pid: u32, syscall_nr: u32) -> u32 {
+  // Simple BPF interpreter
+  var accumulator: u32 = syscall_nr
+  var pc: u32 = 0
+  var count: u32 = process_filters[pid].instruction_count
+  
+  while pc < count {
+    var inst: BPFInstruction = process_filters[pid].instructions[pc]
+    
+    // BPF_LD | BPF_W | BPF_ABS
+    if inst.code == 0x20 {
+      accumulator = inst.k
+    }
+    
+    // BPF_JMP | BPF_JEQ | BPF_K
+    if inst.code == 0x15 {
+      if accumulator == inst.k {
+        pc = pc + inst.jt
+      } else {
+        pc = pc + inst.jf
+      }
+      continue
+    }
+    
+    // BPF_RET | BPF_K
+    if inst.code == 0x06 {
+      return inst.k
+    }
+    
+    pc = pc + 1
+  }
+  
+  return SECCOMP_RET_KILL_PROCESS
+}
+
+export fn seccomp_get_mode(pid: u32) -> u32 {
+  if pid >= MAX_PROCESSES { return SECCOMP_MODE_DISABLED }
+  return process_filters[pid].mode
+}
+
+export fn seccomp_is_enabled(pid: u32) -> u32 {
+  if pid >= MAX_PROCESSES { return 0 }
+  if process_filters[pid].mode != SECCOMP_MODE_DISABLED {
+    return 1
+  }
+  return 0
+}
+
+export fn seccomp_get_violations() -> u64 {
+  return seccomp_violations
+}
+
+export fn seccomp_fork(parent_pid: u32, child_pid: u32) -> u32 {
+  if parent_pid >= MAX_PROCESSES or child_pid >= MAX_PROCESSES { return 0 }
+  
+  // Child inherits parent's seccomp filter
+  process_filters[child_pid].mode = process_filters[parent_pid].mode
+  process_filters[child_pid].instruction_count = process_filters[parent_pid].instruction_count
+  
+  var i: u32 = 0
+  while i < process_filters[parent_pid].instruction_count {
+    process_filters[child_pid].instructions[i] = process_filters[parent_pid].instructions[i]
+    i = i + 1
+  }
+  
+  return 1
+}
+
+// Predefined filters
+export fn seccomp_create_readonly_filter(pid: u32) -> u32 {
+  // Allow only read operations
+  var instructions: [BPFInstruction; 4]
+  
+  // Load syscall number
+  instructions[0].code = 0x20
+  instructions[0].k = 0
+  
+  // Check if syscall == read (0)
+  instructions[1].code = 0x15
+  instructions[1].jt = 0
+  instructions[1].jf = 1
+  instructions[1].k = 0
+  
+  // Allow
+  instructions[2].code = 0x06
+  instructions[2].k = SECCOMP_RET_ALLOW
+  
+  // Kill
+  instructions[3].code = 0x06
+  instructions[3].k = SECCOMP_RET_KILL_PROCESS
+  
+  return seccomp_set_mode_filter(pid, @ptrFromInt(instructions), 4)
+}
+
+export fn seccomp_create_network_filter(pid: u32) -> u32 {
+  // Allow only network-related syscalls
+  // This is a simplified example
+  return seccomp_set_mode_filter(pid, 0, 0)
+}

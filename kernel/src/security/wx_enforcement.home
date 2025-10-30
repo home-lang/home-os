@@ -1,0 +1,305 @@
+// home-os Kernel - W^X Enforcement (Write XOR Execute)
+// Ensure memory pages are either writable OR executable, never both
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+
+const WX_ENFORCEMENT_ENABLED: u32 = 1
+const NX_BIT_SUPPORTED: u32 = 1
+
+// Page protection flags
+const PAGE_PROT_NONE: u32 = 0x0
+const PAGE_PROT_READ: u32 = 0x1
+const PAGE_PROT_WRITE: u32 = 0x2
+const PAGE_PROT_EXEC: u32 = 0x4
+
+// NX bit position in page table entry (bit 63)
+const NX_BIT: u64 = 1 << 63
+
+var wx_enforcement_initialized: u32 = 0
+var wx_violations: u64 = 0
+
+export fn wx_enforcement_init() {
+  if wx_enforcement_initialized == 1 { return }
+  
+  // Check if NX bit is supported by CPU
+  if wx_check_nx_support() == 0 {
+    foundation.serial_write_string("[W^X] WARNING: NX bit not supported by CPU\n")
+    wx_enforcement_initialized = 1
+    return
+  }
+  
+  // Enable NX bit in EFER MSR
+  wx_enable_nx_bit()
+  
+  wx_enforcement_initialized = 1
+  foundation.serial_write_string("[W^X] Enforcement enabled\n")
+}
+
+fn wx_check_nx_support() -> u32 {
+  // Check CPUID for NX bit support
+  // CPUID.80000001h:EDX[20] = NX bit support
+  
+  var eax: u32 = 0x80000001
+  var edx: u32 = foundation.cpuid_edx(eax)
+  
+  if (edx & (1 << 20)) != 0 {
+    return 1  // NX supported
+  }
+  
+  return 0  // NX not supported
+}
+
+fn wx_enable_nx_bit() {
+  // Enable NX bit in EFER MSR (Model Specific Register)
+  // EFER MSR address: 0xC0000080
+  // NXE bit: bit 11
+  
+  var efer: u64 = foundation.rdmsr(0xC0000080)
+  efer = efer | (1 << 11)  // Set NXE bit
+  foundation.wrmsr(0xC0000080, efer)
+  
+  foundation.serial_write_string("[W^X] NX bit enabled in EFER\n")
+}
+
+export fn wx_check_page_protection(addr: u64, prot: u32) -> u32 {
+  if WX_ENFORCEMENT_ENABLED == 0 { return 1 }
+  
+  // Check if page is both writable and executable
+  var is_writable: u32 = (prot & PAGE_PROT_WRITE) != 0
+  var is_executable: u32 = (prot & PAGE_PROT_EXEC) != 0
+  
+  if is_writable == 1 and is_executable == 1 {
+    wx_violations = wx_violations + 1
+    
+    foundation.serial_write_string("[W^X] VIOLATION: Page is both writable and executable!\n")
+    foundation.serial_write_string("  Address: 0x")
+    foundation.serial_write_hex(@truncate(addr, u32))
+    foundation.serial_write_string("\n  Protection: 0x")
+    foundation.serial_write_hex(prot)
+    foundation.serial_write_string("\n")
+    
+    return 0  // Violation
+  }
+  
+  return 1  // OK
+}
+
+export fn wx_set_page_protection(addr: u64, prot: u32) -> u32 {
+  // Validate protection flags
+  if wx_check_page_protection(addr, prot) == 0 {
+    foundation.serial_write_string("[W^X] Refusing to set invalid protection\n")
+    return 0  // Failed
+  }
+  
+  // Get page table entry
+  var pte: u64 = memory.memory_get_pte(addr)
+  
+  // Clear existing protection bits
+  pte = pte & ~0x7  // Clear RWX bits
+  
+  // Set new protection bits
+  if (prot & PAGE_PROT_READ) != 0 {
+    pte = pte | 0x1  // Present bit
+  }
+  
+  if (prot & PAGE_PROT_WRITE) != 0 {
+    pte = pte | 0x2  // Write bit
+  }
+  
+  if (prot & PAGE_PROT_EXEC) == 0 {
+    // Set NX bit if NOT executable
+    pte = pte | NX_BIT
+  } else {
+    // Clear NX bit if executable
+    pte = pte & ~NX_BIT
+  }
+  
+  // Update page table entry
+  memory.memory_set_pte(addr, pte)
+  
+  foundation.serial_write_string("[W^X] Set page protection: 0x")
+  foundation.serial_write_hex(@truncate(addr, u32))
+  foundation.serial_write_string(" -> ")
+  wx_print_protection(prot)
+  foundation.serial_write_string("\n")
+  
+  return 1  // Success
+}
+
+fn wx_print_protection(prot: u32) {
+  if (prot & PAGE_PROT_READ) != 0 {
+    foundation.serial_write_string("R")
+  } else {
+    foundation.serial_write_string("-")
+  }
+  
+  if (prot & PAGE_PROT_WRITE) != 0 {
+    foundation.serial_write_string("W")
+  } else {
+    foundation.serial_write_string("-")
+  }
+  
+  if (prot & PAGE_PROT_EXEC) != 0 {
+    foundation.serial_write_string("X")
+  } else {
+    foundation.serial_write_string("-")
+  }
+}
+
+export fn wx_make_readonly(addr: u64, size: u64) -> u32 {
+  var current: u64 = addr
+  var end: u64 = addr + size
+  
+  while current < end {
+    if wx_set_page_protection(current, PAGE_PROT_READ) == 0 {
+      return 0  // Failed
+    }
+    current = current + 4096  // Next page
+  }
+  
+  return 1  // Success
+}
+
+export fn wx_make_executable(addr: u64, size: u64) -> u32 {
+  var current: u64 = addr
+  var end: u64 = addr + size
+  
+  while current < end {
+    // Executable pages should be read-only
+    if wx_set_page_protection(current, PAGE_PROT_READ | PAGE_PROT_EXEC) == 0 {
+      return 0  // Failed
+    }
+    current = current + 4096  // Next page
+  }
+  
+  return 1  // Success
+}
+
+export fn wx_make_writable(addr: u64, size: u64) -> u32 {
+  var current: u64 = addr
+  var end: u64 = addr + size
+  
+  while current < end {
+    // Writable pages should NOT be executable
+    if wx_set_page_protection(current, PAGE_PROT_READ | PAGE_PROT_WRITE) == 0 {
+      return 0  // Failed
+    }
+    current = current + 4096  // Next page
+  }
+  
+  return 1  // Success
+}
+
+// Protect kernel code sections
+export fn wx_protect_kernel_code(code_start: u64, code_end: u64) -> u32 {
+  foundation.serial_write_string("[W^X] Protecting kernel code: 0x")
+  foundation.serial_write_hex(@truncate(code_start, u32))
+  foundation.serial_write_string(" - 0x")
+  foundation.serial_write_hex(@truncate(code_end, u32))
+  foundation.serial_write_string("\n")
+  
+  var size: u64 = code_end - code_start
+  return wx_make_executable(code_start, size)
+}
+
+// Protect kernel data sections
+export fn wx_protect_kernel_data(data_start: u64, data_end: u64) -> u32 {
+  foundation.serial_write_string("[W^X] Protecting kernel data: 0x")
+  foundation.serial_write_hex(@truncate(data_start, u32))
+  foundation.serial_write_string(" - 0x")
+  foundation.serial_write_hex(@truncate(data_end, u32))
+  foundation.serial_write_string("\n")
+  
+  var size: u64 = data_end - data_start
+  return wx_make_writable(data_start, size)
+}
+
+// Protect kernel rodata sections
+export fn wx_protect_kernel_rodata(rodata_start: u64, rodata_end: u64) -> u32 {
+  foundation.serial_write_string("[W^X] Protecting kernel rodata: 0x")
+  foundation.serial_write_hex(@truncate(rodata_start, u32))
+  foundation.serial_write_string(" - 0x")
+  foundation.serial_write_hex(@truncate(rodata_end, u32))
+  foundation.serial_write_string("\n")
+  
+  var size: u64 = rodata_end - rodata_start
+  return wx_make_readonly(rodata_start, size)
+}
+
+// JIT compilation support (temporary W+X for code generation)
+export fn wx_jit_begin(addr: u64, size: u64) -> u32 {
+  if WX_ENFORCEMENT_ENABLED == 0 { return 1 }
+  
+  foundation.serial_write_string("[W^X] JIT: Temporarily allowing W+X for code generation\n")
+  
+  // Temporarily allow W+X for JIT compilation
+  // This should be tightly controlled and audited
+  var current: u64 = addr
+  var end: u64 = addr + size
+  
+  while current < end {
+    var pte: u64 = memory.memory_get_pte(current)
+    pte = pte | 0x3  // Set R+W
+    pte = pte & ~NX_BIT  // Clear NX (allow execute)
+    memory.memory_set_pte(current, pte)
+    current = current + 4096
+  }
+  
+  return 1
+}
+
+export fn wx_jit_end(addr: u64, size: u64) -> u32 {
+  if WX_ENFORCEMENT_ENABLED == 0 { return 1 }
+  
+  foundation.serial_write_string("[W^X] JIT: Restoring W^X enforcement\n")
+  
+  // Make code executable but not writable
+  return wx_make_executable(addr, size)
+}
+
+// Statistics
+export fn wx_get_violations() -> u64 {
+  return wx_violations
+}
+
+export fn wx_is_enabled() -> u32 {
+  return WX_ENFORCEMENT_ENABLED
+}
+
+export fn wx_is_nx_supported() -> u32 {
+  return NX_BIT_SUPPORTED
+}
+
+// Audit all pages for W^X violations
+export fn wx_audit_all_pages() -> u32 {
+  foundation.serial_write_string("[W^X] Auditing all pages for violations...\n")
+  
+  var violations_found: u32 = 0
+  var addr: u64 = 0
+  
+  // Scan kernel address space
+  while addr < 0xFFFFFFFF80000000 {
+    var pte: u64 = memory.memory_get_pte(addr)
+    
+    if (pte & 0x1) != 0 {  // Page is present
+      var is_writable: u32 = (pte & 0x2) != 0
+      var is_executable: u32 = (pte & NX_BIT) == 0
+      
+      if is_writable == 1 and is_executable == 1 {
+        foundation.serial_write_string("  Violation at: 0x")
+        foundation.serial_write_hex(@truncate(addr, u32))
+        foundation.serial_write_string("\n")
+        violations_found = violations_found + 1
+      }
+    }
+    
+    addr = addr + 4096
+  }
+  
+  foundation.serial_write_string("[W^X] Audit complete: ")
+  foundation.serial_write_hex(violations_found)
+  foundation.serial_write_string(" violations found\n")
+  
+  return violations_found
+}
