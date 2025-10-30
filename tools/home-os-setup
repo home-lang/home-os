@@ -1,0 +1,692 @@
+#!/usr/bin/env bash
+#
+# HomeOS Raspberry Pi 5 Setup CLI
+# Automates the installation and configuration of HomeOS on Raspberry Pi 5
+#
+
+set -e
+
+VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK_DIR="${HOME}/.home-os-setup"
+LOG_FILE="${WORK_DIR}/setup.log"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Default values
+IMAGE_URL="https://releases.home-os.dev/rpi5/home-os-rpi5-latest.img.xz"
+CHECKSUM_URL="https://releases.home-os.dev/rpi5/home-os-rpi5-latest.img.xz.sha256"
+ENABLE_UART=true
+ENABLE_PCIE=true
+ENABLE_I2C=false
+ENABLE_SPI=false
+GPU_MEM=256
+CPU_FREQ=2400
+OVERCLOCK=false
+
+# Utility functions
+log() {
+    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $*" | tee -a "$LOG_FILE"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE" >&2
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*" | tee -a "$LOG_FILE"
+}
+
+info() {
+    echo -e "${BLUE}[INFO]${NC} $*" | tee -a "$LOG_FILE"
+}
+
+success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $*" | tee -a "$LOG_FILE"
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run as root (use sudo)"
+        exit 1
+    fi
+}
+
+check_dependencies() {
+    local deps=("curl" "xz" "dd" "lsblk" "mount" "umount")
+    local missing=()
+    
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "Missing required dependencies: ${missing[*]}"
+        info "Please install them and try again"
+        exit 1
+    fi
+}
+
+show_banner() {
+    cat << "EOF"
+╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║   HomeOS - Raspberry Pi 5 Setup CLI                      ║
+║   Automated installation and configuration               ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝
+EOF
+    echo ""
+}
+
+show_help() {
+    cat << EOF
+Usage: home-os-setup [COMMAND] [OPTIONS]
+
+Commands:
+  flash           Flash HomeOS image to SD card or USB drive
+  configure       Configure boot settings for an existing installation
+  verify          Verify an existing HomeOS installation
+  backup          Backup an existing HomeOS installation
+  clone-to-nvme   Clone SD card installation to NVMe SSD
+  help            Show this help message
+  version         Show version information
+
+Flash Options:
+  -d, --device DEVICE       Target device (e.g., /dev/sdb, /dev/mmcblk0)
+  -i, --image PATH          Custom image file path
+  -u, --url URL             Custom image download URL
+  --no-verify               Skip checksum verification
+  --auto-configure          Automatically configure boot settings after flash
+
+Configure Options:
+  -d, --device DEVICE       Device with boot partition
+  --uart                    Enable UART console (default: enabled)
+  --no-uart                 Disable UART console
+  --pcie                    Enable PCIe Gen 2.0 (default: enabled)
+  --no-pcie                 Disable PCIe
+  --i2c                     Enable I2C
+  --spi                     Enable SPI
+  --gpu-mem SIZE            GPU memory in MB (default: 256)
+  --cpu-freq MHZ            CPU frequency in MHz (default: 2400)
+  --overclock               Enable overclocking (2.6GHz, use with caution)
+
+Examples:
+  # Flash image to SD card and auto-configure
+  sudo home-os-setup flash -d /dev/sdb --auto-configure
+
+  # Flash custom image
+  sudo home-os-setup flash -d /dev/sdb -i ~/home-os-custom.img.xz
+
+  # Configure existing installation
+  sudo home-os-setup configure -d /dev/sdb --uart --pcie --i2c
+
+  # Clone to NVMe
+  sudo home-os-setup clone-to-nvme -s /dev/mmcblk0 -t /dev/nvme0n1
+
+  # Backup installation
+  sudo home-os-setup backup -d /dev/sdb -o ~/home-os-backup.img
+
+EOF
+}
+
+list_devices() {
+    info "Available storage devices:"
+    lsblk -d -o NAME,SIZE,TYPE,VENDOR,MODEL | grep -E "disk|mmc"
+}
+
+confirm_device() {
+    local device=$1
+    
+    if [[ ! -b "$device" ]]; then
+        error "Device $device does not exist or is not a block device"
+        return 1
+    fi
+    
+    info "Target device: $device"
+    lsblk "$device" -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
+    
+    echo ""
+    warn "⚠️  WARNING: All data on $device will be DESTROYED!"
+    read -p "Are you sure you want to continue? (type 'yes' to confirm): " confirm
+    
+    if [[ "$confirm" != "yes" ]]; then
+        error "Operation cancelled by user"
+        return 1
+    fi
+    
+    return 0
+}
+
+unmount_device() {
+    local device=$1
+    info "Unmounting any mounted partitions on $device..."
+    
+    # Unmount all partitions
+    for part in "${device}"*; do
+        if mountpoint -q "$part" 2>/dev/null; then
+            umount "$part" || true
+        fi
+    done
+}
+
+download_image() {
+    local url=$1
+    local output=$2
+    
+    log "Downloading HomeOS image from $url..."
+    
+    if ! curl -L --progress-bar -o "$output" "$url"; then
+        error "Failed to download image"
+        return 1
+    fi
+    
+    success "Image downloaded successfully"
+}
+
+verify_checksum() {
+    local image=$1
+    local checksum_file=$2
+    
+    log "Verifying image checksum..."
+    
+    if ! sha256sum -c "$checksum_file" &>/dev/null; then
+        error "Checksum verification failed!"
+        return 1
+    fi
+    
+    success "Checksum verified successfully"
+}
+
+extract_image() {
+    local compressed=$1
+    local output=$2
+    
+    log "Extracting image (this may take a few minutes)..."
+    
+    if ! xz -d -c "$compressed" > "$output"; then
+        error "Failed to extract image"
+        return 1
+    fi
+    
+    success "Image extracted successfully"
+}
+
+flash_image() {
+    local image=$1
+    local device=$2
+    
+    log "Flashing image to $device (this will take several minutes)..."
+    info "Please be patient and do not interrupt this process"
+    
+    # Use dd with progress if pv is available, otherwise use dd with status
+    if command -v pv &> /dev/null; then
+        pv "$image" | dd of="$device" bs=4M conv=fsync
+    else
+        dd if="$image" of="$device" bs=4M status=progress conv=fsync
+    fi
+    
+    sync
+    success "Image flashed successfully to $device"
+}
+
+configure_boot() {
+    local device=$1
+    local boot_mount="/tmp/home-os-boot-$$"
+    
+    log "Configuring boot settings..."
+    
+    # Create mount point
+    mkdir -p "$boot_mount"
+    
+    # Find boot partition (usually partition 1)
+    local boot_part="${device}1"
+    if [[ "$device" =~ "mmcblk" ]] || [[ "$device" =~ "nvme" ]]; then
+        boot_part="${device}p1"
+    fi
+    
+    # Mount boot partition
+    if ! mount "$boot_part" "$boot_mount"; then
+        error "Failed to mount boot partition $boot_part"
+        rmdir "$boot_mount"
+        return 1
+    fi
+    
+    # Backup original config.txt
+    if [[ -f "$boot_mount/config.txt" ]]; then
+        cp "$boot_mount/config.txt" "$boot_mount/config.txt.backup"
+    fi
+    
+    # Create or update config.txt
+    cat > "$boot_mount/config.txt" << EOF
+# HomeOS Configuration for Raspberry Pi 5
+# Generated by home-os-setup v${VERSION}
+# $(date)
+
+[all]
+# ARM CPU frequency (MHz)
+arm_freq=${CPU_FREQ}
+
+# GPU memory allocation (MB)
+gpu_mem=${GPU_MEM}
+
+EOF
+    
+    # UART configuration
+    if [[ "$ENABLE_UART" == true ]]; then
+        echo "# Enable UART console (GPIO 14/15)" >> "$boot_mount/config.txt"
+        echo "enable_uart=1" >> "$boot_mount/config.txt"
+        echo "" >> "$boot_mount/config.txt"
+    fi
+    
+    # PCIe configuration
+    if [[ "$ENABLE_PCIE" == true ]]; then
+        echo "# Enable PCIe Gen 2.0 (for NVMe)" >> "$boot_mount/config.txt"
+        echo "dtparam=pciex1" >> "$boot_mount/config.txt"
+        echo "" >> "$boot_mount/config.txt"
+    fi
+    
+    # I2C configuration
+    if [[ "$ENABLE_I2C" == true ]]; then
+        echo "# Enable I2C" >> "$boot_mount/config.txt"
+        echo "dtparam=i2c_arm=on" >> "$boot_mount/config.txt"
+        echo "" >> "$boot_mount/config.txt"
+    fi
+    
+    # SPI configuration
+    if [[ "$ENABLE_SPI" == true ]]; then
+        echo "# Enable SPI" >> "$boot_mount/config.txt"
+        echo "dtparam=spi=on" >> "$boot_mount/config.txt"
+        echo "" >> "$boot_mount/config.txt"
+    fi
+    
+    # Overclock settings
+    if [[ "$OVERCLOCK" == true ]]; then
+        cat >> "$boot_mount/config.txt" << EOF
+# Overclocking settings (use with adequate cooling!)
+over_voltage=6
+arm_freq=2600
+
+EOF
+        warn "Overclocking enabled - ensure you have adequate cooling!"
+    fi
+    
+    # Create cmdline.txt if it doesn't exist
+    if [[ ! -f "$boot_mount/cmdline.txt" ]]; then
+        echo "console=serial0,115200 console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 elevator=deadline fsck.repair=yes rootwait" > "$boot_mount/cmdline.txt"
+    fi
+    
+    sync
+    umount "$boot_mount"
+    rmdir "$boot_mount"
+    
+    success "Boot configuration completed"
+}
+
+clone_to_nvme() {
+    local source=$1
+    local target=$2
+    
+    if [[ ! -b "$source" ]] || [[ ! -b "$target" ]]; then
+        error "Source or target device does not exist"
+        return 1
+    fi
+    
+    info "Cloning $source to $target..."
+    warn "This will destroy all data on $target"
+    
+    read -p "Continue? (yes/no): " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        error "Operation cancelled"
+        return 1
+    fi
+    
+    log "Cloning in progress (this may take 10-30 minutes)..."
+    
+    if command -v pv &> /dev/null; then
+        dd if="$source" bs=4M status=none | pv | dd of="$target" bs=4M conv=fsync
+    else
+        dd if="$source" of="$target" bs=4M status=progress conv=fsync
+    fi
+    
+    sync
+    success "Clone completed successfully"
+    info "You can now configure your Pi to boot from NVMe"
+}
+
+backup_device() {
+    local device=$1
+    local output=$2
+    
+    log "Creating backup of $device to $output..."
+    
+    if command -v pv &> /dev/null; then
+        dd if="$device" bs=4M status=none | pv | xz -9 > "$output"
+    else
+        dd if="$device" bs=4M status=progress | xz -9 > "$output"
+    fi
+    
+    success "Backup created: $output"
+}
+
+verify_installation() {
+    local device=$1
+    local boot_mount="/tmp/home-os-verify-$$"
+    
+    log "Verifying HomeOS installation on $device..."
+    
+    mkdir -p "$boot_mount"
+    
+    local boot_part="${device}1"
+    if [[ "$device" =~ "mmcblk" ]] || [[ "$device" =~ "nvme" ]]; then
+        boot_part="${device}p1"
+    fi
+    
+    if ! mount "$boot_part" "$boot_mount" 2>/dev/null; then
+        error "Failed to mount boot partition"
+        rmdir "$boot_mount"
+        return 1
+    fi
+    
+    # Check for required files
+    local required_files=("config.txt" "cmdline.txt")
+    local missing=()
+    
+    for file in "${required_files[@]}"; do
+        if [[ ! -f "$boot_mount/$file" ]]; then
+            missing+=("$file")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        warn "Missing files: ${missing[*]}"
+    else
+        success "All required boot files present"
+    fi
+    
+    # Display config
+    if [[ -f "$boot_mount/config.txt" ]]; then
+        info "Current boot configuration:"
+        cat "$boot_mount/config.txt"
+    fi
+    
+    umount "$boot_mount"
+    rmdir "$boot_mount"
+}
+
+# Command handlers
+cmd_flash() {
+    local device=""
+    local image_path=""
+    local image_url="$IMAGE_URL"
+    local verify=true
+    local auto_config=false
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -d|--device)
+                device="$2"
+                shift 2
+                ;;
+            -i|--image)
+                image_path="$2"
+                shift 2
+                ;;
+            -u|--url)
+                image_url="$2"
+                shift 2
+                ;;
+            --no-verify)
+                verify=false
+                shift
+                ;;
+            --auto-configure)
+                auto_config=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                return 1
+                ;;
+        esac
+    done
+    
+    if [[ -z "$device" ]]; then
+        error "Device not specified. Use -d or --device"
+        list_devices
+        return 1
+    fi
+    
+    check_root
+    confirm_device "$device" || return 1
+    unmount_device "$device"
+    
+    # Download or use local image
+    local image_file
+    if [[ -n "$image_path" ]]; then
+        image_file="$image_path"
+        if [[ ! -f "$image_file" ]]; then
+            error "Image file not found: $image_file"
+            return 1
+        fi
+    else
+        mkdir -p "$WORK_DIR"
+        local compressed="${WORK_DIR}/home-os-rpi5.img.xz"
+        local checksum="${WORK_DIR}/home-os-rpi5.img.xz.sha256"
+        
+        download_image "$image_url" "$compressed" || return 1
+        
+        if [[ "$verify" == true ]]; then
+            download_image "$CHECKSUM_URL" "$checksum" || return 1
+            verify_checksum "$compressed" "$checksum" || return 1
+        fi
+        
+        image_file="${WORK_DIR}/home-os-rpi5.img"
+        extract_image "$compressed" "$image_file" || return 1
+    fi
+    
+    flash_image "$image_file" "$device" || return 1
+    
+    if [[ "$auto_config" == true ]]; then
+        sleep 2  # Wait for kernel to update partition table
+        configure_boot "$device" || return 1
+    fi
+    
+    success "HomeOS has been successfully flashed to $device"
+    
+    if [[ "$auto_config" != true ]]; then
+        info "Run 'home-os-setup configure -d $device' to configure boot settings"
+    fi
+}
+
+cmd_configure() {
+    local device=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -d|--device)
+                device="$2"
+                shift 2
+                ;;
+            --uart)
+                ENABLE_UART=true
+                shift
+                ;;
+            --no-uart)
+                ENABLE_UART=false
+                shift
+                ;;
+            --pcie)
+                ENABLE_PCIE=true
+                shift
+                ;;
+            --no-pcie)
+                ENABLE_PCIE=false
+                shift
+                ;;
+            --i2c)
+                ENABLE_I2C=true
+                shift
+                ;;
+            --spi)
+                ENABLE_SPI=true
+                shift
+                ;;
+            --gpu-mem)
+                GPU_MEM="$2"
+                shift 2
+                ;;
+            --cpu-freq)
+                CPU_FREQ="$2"
+                shift 2
+                ;;
+            --overclock)
+                OVERCLOCK=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                return 1
+                ;;
+        esac
+    done
+    
+    if [[ -z "$device" ]]; then
+        error "Device not specified. Use -d or --device"
+        return 1
+    fi
+    
+    check_root
+    configure_boot "$device"
+}
+
+cmd_verify() {
+    local device="$1"
+    
+    if [[ -z "$device" ]]; then
+        error "Device not specified"
+        return 1
+    fi
+    
+    verify_installation "$device"
+}
+
+cmd_backup() {
+    local device=""
+    local output=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -d|--device)
+                device="$2"
+                shift 2
+                ;;
+            -o|--output)
+                output="$2"
+                shift 2
+                ;;
+            *)
+                error "Unknown option: $1"
+                return 1
+                ;;
+        esac
+    done
+    
+    if [[ -z "$device" ]] || [[ -z "$output" ]]; then
+        error "Device and output path required"
+        return 1
+    fi
+    
+    check_root
+    backup_device "$device" "$output"
+}
+
+cmd_clone_to_nvme() {
+    local source=""
+    local target=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -s|--source)
+                source="$2"
+                shift 2
+                ;;
+            -t|--target)
+                target="$2"
+                shift 2
+                ;;
+            *)
+                error "Unknown option: $1"
+                return 1
+                ;;
+        esac
+    done
+    
+    if [[ -z "$source" ]] || [[ -z "$target" ]]; then
+        error "Source and target devices required"
+        return 1
+    fi
+    
+    check_root
+    clone_to_nvme "$source" "$target"
+}
+
+# Main entry point
+main() {
+    mkdir -p "$WORK_DIR"
+    
+    if [[ $# -eq 0 ]]; then
+        show_banner
+        show_help
+        exit 0
+    fi
+    
+    local command=$1
+    shift
+    
+    case $command in
+        flash)
+            show_banner
+            check_dependencies
+            cmd_flash "$@"
+            ;;
+        configure)
+            show_banner
+            cmd_configure "$@"
+            ;;
+        verify)
+            show_banner
+            cmd_verify "$@"
+            ;;
+        backup)
+            show_banner
+            check_dependencies
+            cmd_backup "$@"
+            ;;
+        clone-to-nvme)
+            show_banner
+            check_dependencies
+            cmd_clone_to_nvme "$@"
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        version|--version|-v)
+            echo "home-os-setup v${VERSION}"
+            ;;
+        *)
+            error "Unknown command: $command"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

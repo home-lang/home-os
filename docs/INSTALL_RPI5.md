@@ -53,9 +53,33 @@ sha256sum -c home-os-rpi5-latest.img.xz.sha256
 
 ## Installation Steps
 
-### 1. Prepare the SD Card
+### Quick Install (Recommended)
 
-#### On Linux/macOS
+Use the automated `home-os-setup` CLI tool for the easiest installation:
+
+```bash
+# Download the setup tool
+curl -LO https://raw.githubusercontent.com/home-os/home-os/main/tools/home-os-setup
+chmod +x home-os-setup
+
+# Flash and auto-configure (replace /dev/sdX with your SD card device)
+sudo ./home-os-setup flash -d /dev/sdX --auto-configure
+```
+
+The CLI tool will:
+
+- Download the latest HomeOS image
+- Verify the checksum
+- Flash to your SD card
+- Configure boot settings automatically
+
+For more options, see the [CLI Tool Documentation](../tools/README.md).
+
+### Manual Installation
+
+#### 1. Prepare the SD Card
+
+##### On Linux/macOS
 
 ```bash
 # Extract the image
@@ -71,14 +95,14 @@ sudo dd if=home-os-rpi5-latest.img of=/dev/sdX bs=4M status=progress conv=fsync
 sudo dd if=home-os-rpi5-latest.img of=/dev/rdiskX bs=4m
 ```
 
-#### On Windows
+##### On Windows
 
 1. Download and install [balenaEtcher](https://www.balena.io/etcher/)
 2. Select the `home-os-rpi5-latest.img.xz` file
 3. Select your SD card
 4. Click "Flash!"
 
-### 2. Configure Boot Settings (Optional)
+#### 2. Configure Boot Settings (Optional)
 
 Mount the boot partition and edit `config.txt`:
 
@@ -120,7 +144,7 @@ Unmount the partition:
 sudo umount /mnt
 ```
 
-### 3. Boot HomeOS
+#### 3. Boot HomeOS
 
 1. **Insert the SD card** into your Raspberry Pi 5
 2. **Connect peripherals** (keyboard, display, ethernet/WiFi)
@@ -142,7 +166,7 @@ sudo umount /mnt
 [KERNEL] HomeOS kernel started
 ```
 
-### 4. First Boot Setup
+#### 4. First Boot Setup
 
 On first boot, you'll be prompted to:
 
