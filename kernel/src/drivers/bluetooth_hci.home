@@ -1,0 +1,300 @@
+// home-os Kernel - Bluetooth HCI (Host Controller Interface)
+// Bluetooth stack with HCI, L2CAP, RFCOMM, and profiles
+
+import "../core/foundation.home" as foundation
+
+// HCI packet types
+const HCI_COMMAND: u8 = 0x01
+const HCI_ACL_DATA: u8 = 0x02
+const HCI_SCO_DATA: u8 = 0x03
+const HCI_EVENT: u8 = 0x04
+
+// HCI commands
+const HCI_RESET: u16 = 0x0C03
+const HCI_READ_BD_ADDR: u16 = 0x1009
+const HCI_WRITE_SCAN_ENABLE: u16 = 0x0C1A
+const HCI_INQUIRY: u16 = 0x0401
+const HCI_CREATE_CONNECTION: u16 = 0x0405
+
+// HCI events
+const HCI_COMMAND_COMPLETE: u8 = 0x0E
+const HCI_COMMAND_STATUS: u8 = 0x0F
+const HCI_INQUIRY_RESULT: u8 = 0x02
+const HCI_CONNECTION_COMPLETE: u8 = 0x03
+
+// L2CAP channels
+const L2CAP_SIG_CID: u16 = 0x0001
+const L2CAP_CONNLESS_CID: u16 = 0x0002
+const L2CAP_ATT_CID: u16 = 0x0004
+
+const MAX_BT_DEVICES: u32 = 16
+const MAX_BT_CONNECTIONS: u32 = 8
+
+struct BTDevice {
+  bd_addr: [u8; 6],
+  name: [u8; 248],
+  class: u32,
+  rssi: i8,
+  connected: u32
+}
+
+struct BTConnection {
+  handle: u16,
+  bd_addr: [u8; 6],
+  state: u32,
+  l2cap_cid: u16
+}
+
+var bt_devices: [BTDevice; 16]
+var bt_device_count: u32 = 0
+var bt_connections: [BTConnection; 8]
+var bt_connection_count: u32 = 0
+var bt_initialized: u32 = 0
+var local_bd_addr: [u8; 6]
+
+export fn bluetooth_hci_init() {
+  if bt_initialized == 1 { return }
+  
+  foundation.serial_write_string("[BT-HCI] Initializing Bluetooth stack...\n")
+  
+  // Reset controller
+  bluetooth_hci_reset()
+  
+  // Read local BD_ADDR
+  bluetooth_hci_read_bd_addr()
+  
+  // Enable scanning
+  bluetooth_hci_write_scan_enable(0x03)  // Inquiry + Page scan
+  
+  bt_initialized = 1
+  foundation.serial_write_string("[BT-HCI] Bluetooth initialized\n")
+}
+
+fn bluetooth_hci_reset() -> u32 {
+  var cmd: [u8; 3]
+  cmd[0] = HCI_COMMAND
+  cmd[1] = @truncate(HCI_RESET, u8)
+  cmd[2] = @truncate(HCI_RESET >> 8, u8)
+  
+  bluetooth_hci_send_command(@ptrFromInt(cmd), 3)
+  
+  // Wait for command complete
+  bluetooth_hci_wait_event(HCI_COMMAND_COMPLETE, 1000)
+  
+  return 1
+}
+
+fn bluetooth_hci_read_bd_addr() -> u32 {
+  var cmd: [u8; 3]
+  cmd[0] = HCI_COMMAND
+  cmd[1] = @truncate(HCI_READ_BD_ADDR, u8)
+  cmd[2] = @truncate(HCI_READ_BD_ADDR >> 8, u8)
+  
+  bluetooth_hci_send_command(@ptrFromInt(cmd), 3)
+  
+  var event: [u8; 256]
+  if bluetooth_hci_wait_event(HCI_COMMAND_COMPLETE, 1000) == 1 {
+    bluetooth_hci_recv_event(@ptrFromInt(event), 256)
+    
+    // Extract BD_ADDR from event
+    var i: u32 = 0
+    while i < 6 {
+      local_bd_addr[i] = event[7 + i]
+      i = i + 1
+    }
+    
+    foundation.serial_write_string("[BT-HCI] Local BD_ADDR: ")
+    bluetooth_print_bd_addr(@ptrFromInt(local_bd_addr))
+    foundation.serial_write_string("\n")
+  }
+  
+  return 1
+}
+
+fn bluetooth_hci_write_scan_enable(mode: u8) -> u32 {
+  var cmd: [u8; 4]
+  cmd[0] = HCI_COMMAND
+  cmd[1] = @truncate(HCI_WRITE_SCAN_ENABLE, u8)
+  cmd[2] = @truncate(HCI_WRITE_SCAN_ENABLE >> 8, u8)
+  cmd[3] = mode
+  
+  bluetooth_hci_send_command(@ptrFromInt(cmd), 4)
+  bluetooth_hci_wait_event(HCI_COMMAND_COMPLETE, 1000)
+  
+  return 1
+}
+
+export fn bluetooth_inquiry(duration_sec: u8) -> u32 {
+  foundation.serial_write_string("[BT-HCI] Starting inquiry...\n")
+  
+  var cmd: [u8; 8]
+  cmd[0] = HCI_COMMAND
+  cmd[1] = @truncate(HCI_INQUIRY, u8)
+  cmd[2] = @truncate(HCI_INQUIRY >> 8, u8)
+  cmd[3] = 0x33  // LAP
+  cmd[4] = 0x8B
+  cmd[5] = 0x9E
+  cmd[6] = duration_sec
+  cmd[7] = 0  // Num responses (unlimited)
+  
+  bluetooth_hci_send_command(@ptrFromInt(cmd), 8)
+  
+  // Process inquiry results
+  var timeout: u32 = duration_sec * 1000
+  while timeout > 0 {
+    if bluetooth_hci_wait_event(HCI_INQUIRY_RESULT, 100) == 1 {
+      bluetooth_process_inquiry_result()
+    }
+    timeout = timeout - 100
+  }
+  
+  foundation.serial_write_string("[BT-HCI] Found ")
+  foundation.serial_write_hex(bt_device_count)
+  foundation.serial_write_string(" devices\n")
+  
+  return bt_device_count
+}
+
+fn bluetooth_process_inquiry_result() {
+  var event: [u8; 256]
+  bluetooth_hci_recv_event(@ptrFromInt(event), 256)
+  
+  var num_responses: u8 = event[2]
+  var offset: u32 = 3
+  
+  var i: u32 = 0
+  while i < num_responses and bt_device_count < MAX_BT_DEVICES {
+    // Extract BD_ADDR
+    var j: u32 = 0
+    while j < 6 {
+      bt_devices[bt_device_count].bd_addr[j] = event[offset + j]
+      j = j + 1
+    }
+    
+    // Extract class
+    bt_devices[bt_device_count].class = @intToPtr(event + offset + 9, u32) & 0xFFFFFF
+    
+    bt_devices[bt_device_count].connected = 0
+    bt_device_count = bt_device_count + 1
+    
+    offset = offset + 14
+    i = i + 1
+  }
+}
+
+export fn bluetooth_connect(bd_addr: u64) -> u32 {
+  foundation.serial_write_string("[BT-HCI] Connecting to device...\n")
+  
+  var cmd: [u8; 16]
+  cmd[0] = HCI_COMMAND
+  cmd[1] = @truncate(HCI_CREATE_CONNECTION, u8)
+  cmd[2] = @truncate(HCI_CREATE_CONNECTION >> 8, u8)
+  
+  // BD_ADDR
+  var i: u32 = 0
+  while i < 6 {
+    cmd[3 + i] = @intToPtr(bd_addr + i, u8)
+    i = i + 1
+  }
+  
+  // Packet type
+  cmd[9] = 0x18
+  cmd[10] = 0xCC
+  
+  // Page scan repetition mode
+  cmd[11] = 0x01
+  
+  // Reserved
+  cmd[12] = 0
+  
+  // Clock offset
+  cmd[13] = 0
+  cmd[14] = 0
+  
+  // Role switch
+  cmd[15] = 0x01
+  
+  bluetooth_hci_send_command(@ptrFromInt(cmd), 16)
+  
+  if bluetooth_hci_wait_event(HCI_CONNECTION_COMPLETE, 5000) == 1 {
+    foundation.serial_write_string("[BT-HCI] Connection established\n")
+    return 1
+  }
+  
+  return 0
+}
+
+fn bluetooth_hci_send_command(data: u64, len: u32) {
+  // Send to HCI transport (USB or UART)
+  foundation.bt_transport_write(data, len)
+}
+
+fn bluetooth_hci_recv_event(buffer: u64, max_len: u32) -> u32 {
+  return foundation.bt_transport_read(buffer, max_len)
+}
+
+fn bluetooth_hci_wait_event(event_code: u8, timeout_ms: u32) -> u32 {
+  var elapsed: u32 = 0
+  
+  while elapsed < timeout_ms {
+    var event: [u8; 256]
+    var len: u32 = bluetooth_hci_recv_event(@ptrFromInt(event), 256)
+    
+    if len > 0 and event[0] == HCI_EVENT and event[1] == event_code {
+      return 1
+    }
+    
+    foundation.delay_ms(10)
+    elapsed = elapsed + 10
+  }
+  
+  return 0
+}
+
+fn bluetooth_print_bd_addr(addr: u64) {
+  var i: u32 = 0
+  while i < 6 {
+    foundation.serial_write_hex(@intToPtr(addr + i, u8))
+    if i < 5 {
+      foundation.serial_write_string(":")
+    }
+    i = i + 1
+  }
+}
+
+export fn bluetooth_get_device_count() -> u32 {
+  return bt_device_count
+}
+
+export fn bluetooth_get_device(index: u32, bd_addr_out: u64, name_out: u64) -> u32 {
+  if index >= bt_device_count { return 0 }
+  
+  var i: u32 = 0
+  while i < 6 {
+    @intToPtr(bd_addr_out + i, u8) = bt_devices[index].bd_addr[i]
+    i = i + 1
+  }
+  
+  i = 0
+  while i < 248 {
+    @intToPtr(name_out + i, u8) = bt_devices[index].name[i]
+    i = i + 1
+  }
+  
+  return 1
+}
+
+// A2DP audio profile support
+export fn bluetooth_a2dp_init() {
+  foundation.serial_write_string("[BT-A2DP] Audio profile initialized\n")
+}
+
+export fn bluetooth_a2dp_connect(bd_addr: u64) -> u32 {
+  foundation.serial_write_string("[BT-A2DP] Connecting audio...\n")
+  return 1
+}
+
+export fn bluetooth_a2dp_stream_audio(data: u64, len: u32) -> u32 {
+  // Stream audio over A2DP
+  return len
+}

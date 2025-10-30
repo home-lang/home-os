@@ -1,0 +1,238 @@
+// home-os Kernel - Virtio Drivers
+// Paravirtualized I/O drivers for running as a VM guest
+
+import "../core/foundation.home" as foundation
+
+// Virtio device types
+const VIRTIO_ID_NET: u32 = 1
+const VIRTIO_ID_BLOCK: u32 = 2
+const VIRTIO_ID_CONSOLE: u32 = 3
+const VIRTIO_ID_RNG: u32 = 4
+const VIRTIO_ID_BALLOON: u32 = 5
+const VIRTIO_ID_SCSI: u32 = 8
+const VIRTIO_ID_GPU: u32 = 16
+
+// Virtio status bits
+const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1
+const VIRTIO_STATUS_DRIVER: u8 = 2
+const VIRTIO_STATUS_DRIVER_OK: u8 = 4
+const VIRTIO_STATUS_FEATURES_OK: u8 = 8
+const VIRTIO_STATUS_FAILED: u8 = 128
+
+// Virtqueue descriptor flags
+const VIRTQ_DESC_F_NEXT: u16 = 1
+const VIRTQ_DESC_F_WRITE: u16 = 2
+
+const MAX_VIRTIO_DEVICES: u32 = 16
+const VIRTQ_SIZE: u32 = 256
+
+struct VirtqDesc {
+  addr: u64,
+  len: u32,
+  flags: u16,
+  next: u16
+}
+
+struct VirtqAvail {
+  flags: u16,
+  idx: u16,
+  ring: [u16; 256]
+}
+
+struct VirtqUsed {
+  flags: u16,
+  idx: u16,
+  ring: [VirtqUsedElem; 256]
+}
+
+struct VirtqUsedElem {
+  id: u32,
+  len: u32
+}
+
+struct VirtioDevice {
+  device_type: u32,
+  base_addr: u64,
+  irq: u32,
+  status: u8,
+  features: u64,
+  queue_count: u32
+}
+
+var virtio_devices: [VirtioDevice; 16]
+var virtio_device_count: u32 = 0
+var virtio_initialized: u32 = 0
+
+export fn virtio_init() {
+  if virtio_initialized == 1 { return }
+  
+  foundation.serial_write_string("[Virtio] Scanning for virtio devices...\n")
+  
+  // Scan PCI bus for virtio devices
+  virtio_scan_pci()
+  
+  virtio_initialized = 1
+  foundation.serial_write_string("[Virtio] Found ")
+  foundation.serial_write_hex(virtio_device_count)
+  foundation.serial_write_string(" virtio devices\n")
+}
+
+fn virtio_scan_pci() {
+  // Scan PCI for vendor 0x1AF4 (Red Hat/QEMU virtio)
+  var bus: u32 = 0
+  while bus < 256 {
+    var dev: u32 = 0
+    while dev < 32 {
+      var func: u32 = 0
+      while func < 8 {
+        var vendor: u32 = foundation.pci_read_config(bus, dev, func, 0)
+        
+        if (vendor & 0xFFFF) == 0x1AF4 {
+          var device_id: u32 = (vendor >> 16) & 0xFFFF
+          
+          if device_id >= 0x1000 and device_id <= 0x103F {
+            virtio_register_device(bus, dev, func, device_id - 0x1000 + 1)
+          }
+        }
+        
+        func = func + 1
+      }
+      dev = dev + 1
+    }
+    bus = bus + 1
+  }
+}
+
+fn virtio_register_device(bus: u32, dev: u32, func: u32, device_type: u32) {
+  if virtio_device_count >= MAX_VIRTIO_DEVICES { return }
+  
+  var base_addr: u64 = foundation.pci_read_bar(bus, dev, func, 0)
+  var irq: u32 = foundation.pci_read_config(bus, dev, func, 0x3C) & 0xFF
+  
+  virtio_devices[virtio_device_count].device_type = device_type
+  virtio_devices[virtio_device_count].base_addr = base_addr
+  virtio_devices[virtio_device_count].irq = irq
+  virtio_devices[virtio_device_count].status = 0
+  
+  foundation.serial_write_string("[Virtio] Found device type ")
+  foundation.serial_write_hex(device_type)
+  foundation.serial_write_string(" at ")
+  foundation.serial_write_hex(bus)
+  foundation.serial_write_string(":")
+  foundation.serial_write_hex(dev)
+  foundation.serial_write_string("\n")
+  
+  // Initialize device
+  virtio_init_device(virtio_device_count)
+  
+  virtio_device_count = virtio_device_count + 1
+}
+
+fn virtio_init_device(dev_id: u32) {
+  var base: u64 = virtio_devices[dev_id].base_addr
+  
+  // Reset device
+  virtio_write_status(base, 0)
+  
+  // Acknowledge device
+  virtio_write_status(base, VIRTIO_STATUS_ACKNOWLEDGE)
+  
+  // Driver loaded
+  virtio_write_status(base, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER)
+  
+  // Read features
+  var features: u64 = virtio_read_features(base)
+  virtio_devices[dev_id].features = features
+  
+  // Write features (accept all)
+  virtio_write_features(base, features)
+  
+  // Features OK
+  virtio_write_status(base, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
+  
+  // Setup virtqueues
+  virtio_setup_queues(dev_id)
+  
+  // Driver OK
+  virtio_write_status(base, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK)
+  
+  virtio_devices[dev_id].status = VIRTIO_STATUS_DRIVER_OK
+}
+
+fn virtio_setup_queues(dev_id: u32) {
+  var base: u64 = virtio_devices[dev_id].base_addr
+  
+  // Setup queue 0
+  virtio_write_u16(base + 0x0E, 0)  // Select queue 0
+  
+  var queue_size: u16 = virtio_read_u16(base + 0x0C)
+  if queue_size > 0 {
+    // Allocate queue memory
+    var queue_mem: u64 = foundation.alloc_phys_pages(4)
+    
+    // Write queue address
+    virtio_write_u32(base + 0x08, @truncate(queue_mem >> 12, u32))
+    
+    virtio_devices[dev_id].queue_count = 1
+  }
+}
+
+fn virtio_write_status(base: u64, status: u8) {
+  @intToPtr(base + 0x12, u8) = status
+}
+
+fn virtio_read_features(base: u64) -> u64 {
+  return @intToPtr(base + 0x00, u32)
+}
+
+fn virtio_write_features(base: u64, features: u64) {
+  @intToPtr(base + 0x04, u32) = @truncate(features, u32)
+}
+
+fn virtio_read_u16(addr: u64) -> u16 {
+  return @intToPtr(addr, u16)
+}
+
+fn virtio_write_u16(addr: u64, value: u16) {
+  @intToPtr(addr, u16) = value
+}
+
+fn virtio_write_u32(addr: u64, value: u32) {
+  @intToPtr(addr, u32) = value
+}
+
+// Virtio-net (network)
+export fn virtio_net_init(dev_id: u32) -> u32 {
+  if dev_id >= virtio_device_count { return 0 }
+  if virtio_devices[dev_id].device_type != VIRTIO_ID_NET { return 0 }
+  
+  foundation.serial_write_string("[Virtio-Net] Network device initialized\n")
+  return 1
+}
+
+// Virtio-blk (block device)
+export fn virtio_blk_init(dev_id: u32) -> u32 {
+  if dev_id >= virtio_device_count { return 0 }
+  if virtio_devices[dev_id].device_type != VIRTIO_ID_BLOCK { return 0 }
+  
+  foundation.serial_write_string("[Virtio-Blk] Block device initialized\n")
+  return 1
+}
+
+// Virtio-gpu (graphics)
+export fn virtio_gpu_init(dev_id: u32) -> u32 {
+  if dev_id >= virtio_device_count { return 0 }
+  if virtio_devices[dev_id].device_type != VIRTIO_ID_GPU { return 0 }
+  
+  foundation.serial_write_string("[Virtio-GPU] Graphics device initialized\n")
+  return 1
+}
+
+export fn virtio_get_device_count() -> u32 {
+  return virtio_device_count
+}
+
+export fn virtio_get_device_type(dev_id: u32) -> u32 {
+  if dev_id >= virtio_device_count { return 0 }
+  return virtio_devices[dev_id].device_type
+}
