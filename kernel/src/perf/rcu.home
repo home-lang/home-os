@@ -1,0 +1,181 @@
+// home-os Kernel - RCU (Read-Copy-Update)
+// Lock-free synchronization for read-heavy data structures
+
+import "../core/foundation.home" as foundation
+
+const MAX_RCU_CALLBACKS: u32 = 1000
+const MAX_CPUS: u32 = 64
+
+struct RCUCallback {
+  func: u64,
+  data: u64,
+  next: u32
+}
+
+struct RCUData {
+  grace_period: u64,
+  callbacks_head: u32,
+  callbacks_tail: u32,
+  callback_count: u32,
+  quiescent_state: u32
+}
+
+var rcu_callbacks: [RCUCallback; 1000]
+var callback_free_list: u32 = 0
+var rcu_per_cpu: [RCUData; 64]
+var rcu_global_gp: u64 = 0
+var rcu_initialized: u32 = 0
+
+export fn rcu_init() {
+  if rcu_initialized == 1 { return }
+  
+  // Initialize free list
+  var i: u32 = 0
+  while i < MAX_RCU_CALLBACKS - 1 {
+    rcu_callbacks[i].next = i + 1
+    i = i + 1
+  }
+  rcu_callbacks[MAX_RCU_CALLBACKS - 1].next = 0xFFFFFFFF
+  callback_free_list = 0
+  
+  // Initialize per-CPU data
+  i = 0
+  while i < MAX_CPUS {
+    rcu_per_cpu[i].grace_period = 0
+    rcu_per_cpu[i].callbacks_head = 0xFFFFFFFF
+    rcu_per_cpu[i].callbacks_tail = 0xFFFFFFFF
+    rcu_per_cpu[i].callback_count = 0
+    rcu_per_cpu[i].quiescent_state = 0
+    i = i + 1
+  }
+  
+  rcu_global_gp = 0
+  rcu_initialized = 1
+  
+  foundation.serial_write_string("[RCU] Initialized\n")
+}
+
+export fn rcu_read_lock() {
+  // Disable preemption
+  foundation.preempt_disable()
+}
+
+export fn rcu_read_unlock() {
+  // Enable preemption
+  foundation.preempt_enable()
+}
+
+export fn rcu_dereference(ptr: u64) -> u64 {
+  // Memory barrier to ensure we see the latest value
+  foundation.memory_barrier()
+  return @intToPtr(ptr, u64)
+}
+
+export fn rcu_assign_pointer(ptr: u64, value: u64) {
+  // Memory barrier to ensure writes are visible
+  foundation.memory_barrier()
+  @intToPtr(ptr, u64) = value
+  foundation.memory_barrier()
+}
+
+export fn rcu_call(func: u64, data: u64) -> u32 {
+  if callback_free_list == 0xFFFFFFFF {
+    return 0  // No free callbacks
+  }
+  
+  var cpu: u32 = foundation.get_cpu_id()
+  var cb_idx: u32 = callback_free_list
+  
+  callback_free_list = rcu_callbacks[cb_idx].next
+  
+  rcu_callbacks[cb_idx].func = func
+  rcu_callbacks[cb_idx].data = data
+  rcu_callbacks[cb_idx].next = 0xFFFFFFFF
+  
+  // Add to per-CPU callback list
+  if rcu_per_cpu[cpu].callbacks_tail == 0xFFFFFFFF {
+    rcu_per_cpu[cpu].callbacks_head = cb_idx
+    rcu_per_cpu[cpu].callbacks_tail = cb_idx
+  } else {
+    rcu_callbacks[rcu_per_cpu[cpu].callbacks_tail].next = cb_idx
+    rcu_per_cpu[cpu].callbacks_tail = cb_idx
+  }
+  
+  rcu_per_cpu[cpu].callback_count = rcu_per_cpu[cpu].callback_count + 1
+  
+  return 1
+}
+
+export fn rcu_synchronize() {
+  // Wait for grace period
+  var old_gp: u64 = rcu_global_gp
+  
+  // Start new grace period
+  rcu_global_gp = rcu_global_gp + 1
+  
+  // Wait for all CPUs to pass through quiescent state
+  var all_done: u32 = 0
+  while all_done == 0 {
+    all_done = 1
+    
+    var cpu: u32 = 0
+    while cpu < MAX_CPUS {
+      if rcu_per_cpu[cpu].grace_period < rcu_global_gp {
+        if rcu_per_cpu[cpu].quiescent_state == 0 {
+          all_done = 0
+        }
+      }
+      cpu = cpu + 1
+    }
+    
+    if all_done == 0 {
+      foundation.cpu_relax()
+    }
+  }
+  
+  // Process callbacks
+  rcu_process_callbacks()
+}
+
+fn rcu_process_callbacks() {
+  var cpu: u32 = foundation.get_cpu_id()
+  
+  var cb_idx: u32 = rcu_per_cpu[cpu].callbacks_head
+  
+  while cb_idx != 0xFFFFFFFF {
+    var next: u32 = rcu_callbacks[cb_idx].next
+    
+    // Call callback function
+    var func: u64 = rcu_callbacks[cb_idx].func
+    var data: u64 = rcu_callbacks[cb_idx].data
+    
+    if func != 0 {
+      foundation.call_function(func, data)
+    }
+    
+    // Return to free list
+    rcu_callbacks[cb_idx].next = callback_free_list
+    callback_free_list = cb_idx
+    
+    cb_idx = next
+  }
+  
+  rcu_per_cpu[cpu].callbacks_head = 0xFFFFFFFF
+  rcu_per_cpu[cpu].callbacks_tail = 0xFFFFFFFF
+  rcu_per_cpu[cpu].callback_count = 0
+}
+
+export fn rcu_quiescent_state() {
+  var cpu: u32 = foundation.get_cpu_id()
+  rcu_per_cpu[cpu].quiescent_state = 1
+  rcu_per_cpu[cpu].grace_period = rcu_global_gp
+}
+
+export fn rcu_barrier() {
+  // Wait for all callbacks to complete
+  rcu_synchronize()
+}
+
+export fn rcu_get_gp() -> u64 {
+  return rcu_global_gp
+}

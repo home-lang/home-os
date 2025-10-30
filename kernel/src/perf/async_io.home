@@ -1,0 +1,185 @@
+// home-os Kernel - Async I/O (io_uring-like interface)
+// High-performance asynchronous I/O subsystem
+
+import "../core/foundation.home" as foundation
+import "../core/filesystem.home" as filesystem
+
+// Operation types
+const IO_OP_READ: u32 = 0
+const IO_OP_WRITE: u32 = 1
+const IO_OP_FSYNC: u32 = 2
+const IO_OP_POLL: u32 = 3
+
+// Queue sizes
+const SQ_SIZE: u32 = 256  // Submission queue
+const CQ_SIZE: u32 = 512  // Completion queue
+
+struct IORequest {
+  op: u32,
+  fd: u32,
+  buffer: u64,
+  size: u32,
+  offset: u64,
+  user_data: u64
+}
+
+struct IOCompletion {
+  user_data: u64,
+  result: i32,
+  flags: u32
+}
+
+struct IOUring {
+  sq_head: u32,
+  sq_tail: u32,
+  sq_entries: [IORequest; 256],
+  cq_head: u32,
+  cq_tail: u32,
+  cq_entries: [IOCompletion; 512],
+  active: u32
+}
+
+var io_rings: [IOUring; 64]
+var ring_count: u32 = 0
+var async_io_initialized: u32 = 0
+
+export fn async_io_init() {
+  if async_io_initialized == 1 { return }
+  
+  ring_count = 0
+  
+  async_io_initialized = 1
+  foundation.serial_write_string("[AsyncIO] Initialized\n")
+}
+
+export fn async_io_create_ring() -> u32 {
+  if ring_count >= 64 { return 0xFFFFFFFF }
+  
+  var ring_id: u32 = ring_count
+  
+  io_rings[ring_id].sq_head = 0
+  io_rings[ring_id].sq_tail = 0
+  io_rings[ring_id].cq_head = 0
+  io_rings[ring_id].cq_tail = 0
+  io_rings[ring_id].active = 1
+  
+  ring_count = ring_count + 1
+  
+  foundation.serial_write_string("[AsyncIO] Created ring ")
+  foundation.serial_write_hex(ring_id)
+  foundation.serial_write_string("\n")
+  
+  return ring_id
+}
+
+export fn async_io_submit(ring_id: u32, op: u32, fd: u32, buffer: u64, size: u32, offset: u64, user_data: u64) -> u32 {
+  if ring_id >= ring_count { return 0 }
+  
+  var tail: u32 = io_rings[ring_id].sq_tail
+  var next_tail: u32 = (tail + 1) % SQ_SIZE
+  
+  if next_tail == io_rings[ring_id].sq_head {
+    return 0  // Queue full
+  }
+  
+  io_rings[ring_id].sq_entries[tail].op = op
+  io_rings[ring_id].sq_entries[tail].fd = fd
+  io_rings[ring_id].sq_entries[tail].buffer = buffer
+  io_rings[ring_id].sq_entries[tail].size = size
+  io_rings[ring_id].sq_entries[tail].offset = offset
+  io_rings[ring_id].sq_entries[tail].user_data = user_data
+  
+  io_rings[ring_id].sq_tail = next_tail
+  
+  return 1
+}
+
+export fn async_io_process(ring_id: u32) -> u32 {
+  if ring_id >= ring_count { return 0 }
+  
+  var processed: u32 = 0
+  
+  while io_rings[ring_id].sq_head != io_rings[ring_id].sq_tail {
+    var head: u32 = io_rings[ring_id].sq_head
+    var req: IORequest = io_rings[ring_id].sq_entries[head]
+    
+    var result: i32 = 0
+    
+    if req.op == IO_OP_READ {
+      result = @bitCast(filesystem.vfs_read(req.fd, req.buffer, req.size), i32)
+    } else if req.op == IO_OP_WRITE {
+      result = @bitCast(filesystem.vfs_write(req.fd, req.buffer, req.size), i32)
+    } else if req.op == IO_OP_FSYNC {
+      result = @bitCast(filesystem.vfs_fsync(req.fd), i32)
+    }
+    
+    // Add to completion queue
+    var cq_tail: u32 = io_rings[ring_id].cq_tail
+    var next_cq_tail: u32 = (cq_tail + 1) % CQ_SIZE
+    
+    if next_cq_tail != io_rings[ring_id].cq_head {
+      io_rings[ring_id].cq_entries[cq_tail].user_data = req.user_data
+      io_rings[ring_id].cq_entries[cq_tail].result = result
+      io_rings[ring_id].cq_entries[cq_tail].flags = 0
+      
+      io_rings[ring_id].cq_tail = next_cq_tail
+    }
+    
+    io_rings[ring_id].sq_head = (head + 1) % SQ_SIZE
+    processed = processed + 1
+  }
+  
+  return processed
+}
+
+export fn async_io_reap(ring_id: u32, user_data_out: u64, result_out: u64) -> u32 {
+  if ring_id >= ring_count { return 0 }
+  
+  if io_rings[ring_id].cq_head == io_rings[ring_id].cq_tail {
+    return 0  // No completions
+  }
+  
+  var head: u32 = io_rings[ring_id].cq_head
+  var comp: IOCompletion = io_rings[ring_id].cq_entries[head]
+  
+  @intToPtr(user_data_out, u64) = comp.user_data
+  @intToPtr(result_out, i32) = comp.result
+  
+  io_rings[ring_id].cq_head = (head + 1) % CQ_SIZE
+  
+  return 1
+}
+
+export fn async_io_destroy_ring(ring_id: u32) -> u32 {
+  if ring_id >= ring_count { return 0 }
+  
+  io_rings[ring_id].active = 0
+  
+  return 1
+}
+
+export fn async_io_get_pending(ring_id: u32) -> u32 {
+  if ring_id >= ring_count { return 0 }
+  
+  var sq_count: u32 = 0
+  if io_rings[ring_id].sq_tail >= io_rings[ring_id].sq_head {
+    sq_count = io_rings[ring_id].sq_tail - io_rings[ring_id].sq_head
+  } else {
+    sq_count = SQ_SIZE - io_rings[ring_id].sq_head + io_rings[ring_id].sq_tail
+  }
+  
+  return sq_count
+}
+
+export fn async_io_get_completions(ring_id: u32) -> u32 {
+  if ring_id >= ring_count { return 0 }
+  
+  var cq_count: u32 = 0
+  if io_rings[ring_id].cq_tail >= io_rings[ring_id].cq_head {
+    cq_count = io_rings[ring_id].cq_tail - io_rings[ring_id].cq_head
+  } else {
+    cq_count = CQ_SIZE - io_rings[ring_id].cq_head + io_rings[ring_id].cq_tail
+  }
+  
+  return cq_count
+}
