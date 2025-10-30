@@ -1,0 +1,526 @@
+// home-os Text Editor
+// Modern code editor with syntax highlighting and IDE features
+
+import "../../kernel/src/core/foundation.home" as foundation
+import "../../kernel/src/drivers/keyboard.home" as keyboard
+import "../../kernel/src/drivers/framebuffer.home" as fb
+import "../../kernel/src/core/filesystem.home" as filesystem
+import "syntax.home" as syntax
+import "autocomplete.home" as autocomplete
+
+const MAX_LINES: u32 = 10000
+const MAX_LINE_LENGTH: u32 = 1024
+const MAX_TABS: u32 = 10
+
+struct EditorLine {
+  text: [u8; 1024],
+  length: u32,
+  syntax_tokens: [u32; 256]
+}
+
+struct EditorTab {
+  filename: [u8; 256],
+  lines: [EditorLine; 10000],
+  line_count: u32,
+  cursor_line: u32,
+  cursor_col: u32,
+  scroll_offset: u32,
+  modified: u32,
+  language: u32,
+  active: u32
+}
+
+var tabs: [EditorTab; 10]
+var tab_count: u32 = 0
+var active_tab: u32 = 0
+
+var show_line_numbers: u32 = 1
+var auto_save: u32 = 0
+var search_query: [u8; 256]
+var search_active: u32 = 0
+
+var editor_initialized: u32 = 0
+
+export fn editor_init() {
+  if editor_initialized == 1 { return }
+  
+  syntax.syntax_init()
+  autocomplete.autocomplete_init()
+  fb.fb_init(0xFD000000, 1024, 768)
+  
+  editor_initialized = 1
+  foundation.serial_write_string("[Editor] Initialized\n")
+}
+
+export fn editor_new_tab(filename: u64) -> u32 {
+  if tab_count >= MAX_TABS { return 0xFFFFFFFF }
+  
+  var i: u32 = 0
+  while i < 256 {
+    tabs[tab_count].filename[i] = @intToPtr(filename + i, u8)
+    if tabs[tab_count].filename[i] == 0 { break }
+    i = i + 1
+  }
+  
+  tabs[tab_count].line_count = 1
+  tabs[tab_count].cursor_line = 0
+  tabs[tab_count].cursor_col = 0
+  tabs[tab_count].scroll_offset = 0
+  tabs[tab_count].modified = 0
+  tabs[tab_count].active = 1
+  
+  // Detect language from extension
+  tabs[tab_count].language = syntax.syntax_detect_language(filename)
+  
+  // Initialize first line
+  tabs[tab_count].lines[0].length = 0
+  tabs[tab_count].lines[0].text[0] = 0
+  
+  var id: u32 = tab_count
+  tab_count = tab_count + 1
+  
+  foundation.serial_write_string("[Editor] Created tab: ")
+  foundation.serial_write_string(filename)
+  foundation.serial_write_string("\n")
+  
+  return id
+}
+
+export fn editor_open_file(filename: u64) -> u32 {
+  var tab_id: u32 = editor_new_tab(filename)
+  if tab_id == 0xFFFFFFFF { return 0xFFFFFFFF }
+  
+  var fd: u32 = filesystem.vfs_open(filename, 0)
+  if fd == 0 {
+    foundation.serial_write_string("[Editor] File not found, creating new\n")
+    return tab_id
+  }
+  
+  var buffer: [u8; 65536]
+  var bytes: u64 = filesystem.vfs_read(fd, @ptrFromInt(buffer), 65536)
+  filesystem.vfs_close(fd)
+  
+  // Parse file into lines
+  tabs[tab_id].line_count = 0
+  var line_idx: u32 = 0
+  var col_idx: u32 = 0
+  
+  var i: u32 = 0
+  while i < bytes {
+    var ch: u8 = buffer[i]
+    
+    if ch == '\n' {
+      tabs[tab_id].lines[line_idx].text[col_idx] = 0
+      tabs[tab_id].lines[line_idx].length = col_idx
+      line_idx = line_idx + 1
+      col_idx = 0
+      
+      if line_idx >= MAX_LINES { break }
+    } else {
+      tabs[tab_id].lines[line_idx].text[col_idx] = ch
+      col_idx = col_idx + 1
+      
+      if col_idx >= MAX_LINE_LENGTH {
+        tabs[tab_id].lines[line_idx].text[col_idx - 1] = 0
+        tabs[tab_id].lines[line_idx].length = col_idx - 1
+        line_idx = line_idx + 1
+        col_idx = 0
+      }
+    }
+    
+    i = i + 1
+  }
+  
+  if col_idx > 0 {
+    tabs[tab_id].lines[line_idx].text[col_idx] = 0
+    tabs[tab_id].lines[line_idx].length = col_idx
+    line_idx = line_idx + 1
+  }
+  
+  tabs[tab_id].line_count = line_idx
+  if tabs[tab_id].line_count == 0 {
+    tabs[tab_id].line_count = 1
+  }
+  
+  // Syntax highlight all lines
+  editor_rehighlight_all(tab_id)
+  
+  return tab_id
+}
+
+export fn editor_save_file(tab_id: u32) -> u32 {
+  if tab_id >= tab_count { return 1 }
+  
+  var fd: u32 = filesystem.vfs_open(@ptrFromInt(tabs[tab_id].filename), 1)
+  if fd == 0 {
+    foundation.serial_write_string("[Editor] Cannot save file\n")
+    return 1
+  }
+  
+  var i: u32 = 0
+  while i < tabs[tab_id].line_count {
+    filesystem.vfs_write(fd, @ptrFromInt(tabs[tab_id].lines[i].text), tabs[tab_id].lines[i].length)
+    
+    if i < tabs[tab_id].line_count - 1 {
+      var newline: [u8; 1] = "\n"
+      filesystem.vfs_write(fd, @ptrFromInt(newline), 1)
+    }
+    
+    i = i + 1
+  }
+  
+  filesystem.vfs_close(fd)
+  tabs[tab_id].modified = 0
+  
+  foundation.serial_write_string("[Editor] Saved: ")
+  foundation.serial_write_string(@ptrFromInt(tabs[tab_id].filename))
+  foundation.serial_write_string("\n")
+  
+  return 0
+}
+
+fn editor_rehighlight_all(tab_id: u32) {
+  var i: u32 = 0
+  while i < tabs[tab_id].line_count {
+    syntax.syntax_highlight_line(
+      @ptrFromInt(tabs[tab_id].lines[i].text),
+      tabs[tab_id].lines[i].length,
+      tabs[tab_id].language,
+      @ptrFromInt(tabs[tab_id].lines[i].syntax_tokens)
+    )
+    i = i + 1
+  }
+}
+
+fn editor_insert_char(ch: u8) {
+  var tab: u32 = active_tab
+  var line: u32 = tabs[tab].cursor_line
+  var col: u32 = tabs[tab].cursor_col
+  
+  if line >= tabs[tab].line_count { return }
+  
+  // Shift characters right
+  var i: u32 = tabs[tab].lines[line].length
+  while i > col {
+    tabs[tab].lines[line].text[i] = tabs[tab].lines[line].text[i - 1]
+    i = i - 1
+  }
+  
+  tabs[tab].lines[line].text[col] = ch
+  tabs[tab].lines[line].length = tabs[tab].lines[line].length + 1
+  tabs[tab].lines[line].text[tabs[tab].lines[line].length] = 0
+  tabs[tab].cursor_col = tabs[tab].cursor_col + 1
+  tabs[tab].modified = 1
+  
+  // Re-highlight line
+  syntax.syntax_highlight_line(
+    @ptrFromInt(tabs[tab].lines[line].text),
+    tabs[tab].lines[line].length,
+    tabs[tab].language,
+    @ptrFromInt(tabs[tab].lines[line].syntax_tokens)
+  )
+}
+
+fn editor_delete_char() {
+  var tab: u32 = active_tab
+  var line: u32 = tabs[tab].cursor_line
+  var col: u32 = tabs[tab].cursor_col
+  
+  if col == 0 {
+    // Join with previous line
+    if line > 0 {
+      var prev_len: u32 = tabs[tab].lines[line - 1].length
+      
+      // Copy current line to end of previous
+      var i: u32 = 0
+      while i < tabs[tab].lines[line].length {
+        tabs[tab].lines[line - 1].text[prev_len + i] = tabs[tab].lines[line].text[i]
+        i = i + 1
+      }
+      
+      tabs[tab].lines[line - 1].length = prev_len + tabs[tab].lines[line].length
+      tabs[tab].lines[line - 1].text[tabs[tab].lines[line - 1].length] = 0
+      
+      // Shift lines up
+      i = line
+      while i < tabs[tab].line_count - 1 {
+        tabs[tab].lines[i] = tabs[tab].lines[i + 1]
+        i = i + 1
+      }
+      
+      tabs[tab].line_count = tabs[tab].line_count - 1
+      tabs[tab].cursor_line = line - 1
+      tabs[tab].cursor_col = prev_len
+      tabs[tab].modified = 1
+    }
+    return
+  }
+  
+  // Shift characters left
+  var i: u32 = col - 1
+  while i < tabs[tab].lines[line].length - 1 {
+    tabs[tab].lines[line].text[i] = tabs[tab].lines[line].text[i + 1]
+    i = i + 1
+  }
+  
+  tabs[tab].lines[line].length = tabs[tab].lines[line].length - 1
+  tabs[tab].lines[line].text[tabs[tab].lines[line].length] = 0
+  tabs[tab].cursor_col = col - 1
+  tabs[tab].modified = 1
+}
+
+fn editor_insert_newline() {
+  var tab: u32 = active_tab
+  var line: u32 = tabs[tab].cursor_line
+  var col: u32 = tabs[tab].cursor_col
+  
+  if tabs[tab].line_count >= MAX_LINES { return }
+  
+  // Shift lines down
+  var i: u32 = tabs[tab].line_count
+  while i > line + 1 {
+    tabs[tab].lines[i] = tabs[tab].lines[i - 1]
+    i = i - 1
+  }
+  
+  // Split current line
+  var j: u32 = 0
+  while col + j < tabs[tab].lines[line].length {
+    tabs[tab].lines[line + 1].text[j] = tabs[tab].lines[line].text[col + j]
+    j = j + 1
+  }
+  
+  tabs[tab].lines[line + 1].length = j
+  tabs[tab].lines[line + 1].text[j] = 0
+  tabs[tab].lines[line].length = col
+  tabs[tab].lines[line].text[col] = 0
+  
+  tabs[tab].line_count = tabs[tab].line_count + 1
+  tabs[tab].cursor_line = line + 1
+  tabs[tab].cursor_col = 0
+  tabs[tab].modified = 1
+}
+
+export fn editor_search(query: u64) {
+  var i: u32 = 0
+  while i < 256 {
+    search_query[i] = @intToPtr(query + i, u8)
+    if search_query[i] == 0 { break }
+    i = i + 1
+  }
+  
+  search_active = 1
+  editor_find_next()
+}
+
+fn editor_find_next() {
+  var tab: u32 = active_tab
+  var start_line: u32 = tabs[tab].cursor_line
+  var start_col: u32 = tabs[tab].cursor_col + 1
+  
+  var line: u32 = start_line
+  while line < tabs[tab].line_count {
+    var col: u32 = 0
+    if line == start_line { col = start_col }
+    
+    while col < tabs[tab].lines[line].length {
+      var match: u32 = 1
+      var i: u32 = 0
+      
+      while search_query[i] != 0 {
+        if col + i >= tabs[tab].lines[line].length {
+          match = 0
+          break
+        }
+        if tabs[tab].lines[line].text[col + i] != search_query[i] {
+          match = 0
+          break
+        }
+        i = i + 1
+      }
+      
+      if match == 1 {
+        tabs[tab].cursor_line = line
+        tabs[tab].cursor_col = col
+        return
+      }
+      
+      col = col + 1
+    }
+    
+    line = line + 1
+  }
+}
+
+export fn editor_replace(old: u64, new: u64) {
+  // Find and replace (stub)
+  foundation.serial_write_string("[Editor] Replace not yet implemented\n")
+}
+
+fn editor_render_tabs() {
+  fb.fb_fill_rect(0, 0, 1024, 30, 0x2A2A2A)
+  
+  var x_offset: u32 = 5
+  var i: u32 = 0
+  while i < tab_count {
+    if tabs[i].active == 1 {
+      var bg_color: u32 = 0x3A3A3A
+      if i == active_tab {
+        bg_color = 0x4A4A4A
+      }
+      
+      fb.fb_fill_rect(x_offset, 5, 200, 20, bg_color)
+      
+      // Show filename
+      fb.fb_draw_text(x_offset + 10, 10, @ptrFromInt(tabs[i].filename), 0xFFFFFF)
+      
+      // Show modified indicator
+      if tabs[i].modified == 1 {
+        fb.fb_draw_text(x_offset + 180, 10, "*", 0xFF5555)
+      }
+      
+      x_offset = x_offset + 210
+    }
+    i = i + 1
+  }
+}
+
+export fn editor_render() {
+  if editor_initialized == 0 { return }
+  
+  fb.fb_clear(0x1E1E1E)
+  
+  // Render tabs
+  editor_render_tabs()
+  
+  var tab: u32 = active_tab
+  var line_num_width: u32 = 0
+  if show_line_numbers == 1 {
+    line_num_width = 60
+  }
+  
+  // Render lines
+  var visible_lines: u32 = 40
+  var y: u32 = 0
+  
+  while y < visible_lines {
+    var line_idx: u32 = tabs[tab].scroll_offset + y
+    if line_idx >= tabs[tab].line_count { break }
+    
+    var screen_y: u32 = y * 18 + 35
+    
+    // Draw line number
+    if show_line_numbers == 1 {
+      fb.fb_draw_text(10, screen_y, "", 0x666666)
+    }
+    
+    // Draw line content with syntax highlighting
+    var x: u32 = 0
+    while x < tabs[tab].lines[line_idx].length {
+      var ch: u8 = tabs[tab].lines[line_idx].text[x]
+      var token_type: u32 = tabs[tab].lines[line_idx].syntax_tokens[x]
+      var color: u32 = syntax.syntax_get_color(token_type)
+      
+      var screen_x: u32 = line_num_width + (x * 8)
+      fb.fb_draw_char(screen_x, screen_y, ch, color)
+      
+      x = x + 1
+    }
+    
+    y = y + 1
+  }
+  
+  // Draw cursor
+  if tabs[tab].cursor_line >= tabs[tab].scroll_offset and 
+     tabs[tab].cursor_line < tabs[tab].scroll_offset + visible_lines {
+    var cursor_y: u32 = (tabs[tab].cursor_line - tabs[tab].scroll_offset) * 18 + 35
+    var cursor_x: u32 = line_num_width + (tabs[tab].cursor_col * 8)
+    fb.fb_fill_rect(cursor_x, cursor_y, 2, 16, 0xFFFFFF)
+  }
+  
+  // Draw status bar
+  fb.fb_fill_rect(0, 738, 1024, 30, 0x2A2A2A)
+  fb.fb_draw_text(10, 745, @ptrFromInt(tabs[tab].filename), 0xFFFFFF)
+  fb.fb_draw_text(600, 745, "Line:", 0xFFFFFF)
+  fb.fb_draw_text(800, 745, "Col:", 0xFFFFFF)
+  
+  fb.fb_present()
+}
+
+export fn editor_main(filename: u64) {
+  editor_init()
+  
+  if filename != 0 {
+    editor_open_file(filename)
+  } else {
+    editor_new_tab("untitled.txt")
+  }
+  
+  active_tab = 0
+  editor_render()
+  
+  var running: u32 = 1
+  while running == 1 {
+    while keyboard.keyboard_has_char() == 0 {}
+    var ch: u8 = keyboard.keyboard_getchar()
+    
+    // Ctrl+S - Save
+    if ch == 19 {
+      editor_save_file(active_tab)
+      editor_render()
+      continue
+    }
+    
+    // Ctrl+F - Find
+    if ch == 6 {
+      // Open search dialog (stub)
+      continue
+    }
+    
+    // Ctrl+Q - Quit
+    if ch == 17 {
+      running = 0
+      continue
+    }
+    
+    // Ctrl+T - New tab
+    if ch == 20 {
+      editor_new_tab("untitled.txt")
+      active_tab = tab_count - 1
+      editor_render()
+      continue
+    }
+    
+    // Arrow keys
+    if ch == 0x1B {
+      // Handle arrow keys (stub)
+      continue
+    }
+    
+    // Backspace
+    if ch == '\b' {
+      editor_delete_char()
+      editor_render()
+      continue
+    }
+    
+    // Enter
+    if ch == '\n' {
+      editor_insert_newline()
+      editor_render()
+      continue
+    }
+    
+    // Regular character
+    if ch >= 32 and ch <= 126 {
+      editor_insert_char(ch)
+      
+      // Auto-save if enabled
+      if auto_save == 1 {
+        editor_save_file(active_tab)
+      }
+      
+      editor_render()
+    }
+  }
+}
