@@ -1,0 +1,138 @@
+// home-os Kernel - Zero-Copy Networking
+// Eliminate data copying between kernel and user space
+
+import "../core/foundation.home" as foundation
+import "../network/network.home" as network
+
+const MAX_ZERO_COPY_BUFFERS: u32 = 1000
+
+struct ZeroCopyBuffer {
+  phys_addr: u64,
+  virt_addr: u64,
+  size: u32,
+  ref_count: u32,
+  in_use: u32
+}
+
+var zc_buffers: [ZeroCopyBuffer; 1000]
+var zc_buffer_count: u32 = 0
+var zero_copy_initialized: u32 = 0
+
+export fn zero_copy_init() {
+  if zero_copy_initialized == 1 { return }
+  
+  zc_buffer_count = 0
+  
+  zero_copy_initialized = 1
+  foundation.serial_write_string("[ZeroCopy] Initialized\n")
+}
+
+export fn zero_copy_alloc_buffer(size: u32) -> u32 {
+  if zc_buffer_count >= MAX_ZERO_COPY_BUFFERS { return 0xFFFFFFFF }
+  
+  // Allocate physically contiguous memory
+  var phys: u64 = foundation.alloc_phys_contiguous(size)
+  if phys == 0 { return 0xFFFFFFFF }
+  
+  var virt: u64 = foundation.phys_to_virt(phys)
+  
+  zc_buffers[zc_buffer_count].phys_addr = phys
+  zc_buffers[zc_buffer_count].virt_addr = virt
+  zc_buffers[zc_buffer_count].size = size
+  zc_buffers[zc_buffer_count].ref_count = 1
+  zc_buffers[zc_buffer_count].in_use = 1
+  
+  var id: u32 = zc_buffer_count
+  zc_buffer_count = zc_buffer_count + 1
+  
+  return id
+}
+
+export fn zero_copy_free_buffer(id: u32) {
+  if id >= zc_buffer_count { return }
+  
+  zc_buffers[id].ref_count = zc_buffers[id].ref_count - 1
+  
+  if zc_buffers[id].ref_count == 0 {
+    foundation.free_phys_contiguous(zc_buffers[id].phys_addr, zc_buffers[id].size)
+    zc_buffers[id].in_use = 0
+  }
+}
+
+export fn zero_copy_get_buffer(id: u32) -> u64 {
+  if id >= zc_buffer_count { return 0 }
+  return zc_buffers[id].virt_addr
+}
+
+export fn zero_copy_get_phys(id: u32) -> u64 {
+  if id >= zc_buffer_count { return 0 }
+  return zc_buffers[id].phys_addr
+}
+
+export fn zero_copy_ref(id: u32) {
+  if id >= zc_buffer_count { return }
+  zc_buffers[id].ref_count = zc_buffers[id].ref_count + 1
+}
+
+// Sendfile implementation (zero-copy file to socket)
+export fn zero_copy_sendfile(out_fd: u32, in_fd: u32, offset: u64, count: u32) -> i32 {
+  // Map file pages directly to network buffers
+  var sent: u32 = 0
+  var current_offset: u64 = offset
+  
+  while sent < count {
+    var chunk_size: u32 = count - sent
+    if chunk_size > 65536 { chunk_size = 65536 }
+    
+    // Get physical pages for file data
+    var phys: u64 = foundation.file_get_phys_page(in_fd, current_offset)
+    if phys == 0 { return @bitCast(sent, i32) }
+    
+    // Send directly from physical pages
+    var result: i32 = network.net_send_phys(out_fd, phys, chunk_size)
+    if result < 0 { return result }
+    
+    sent = sent + chunk_size
+    current_offset = current_offset + chunk_size
+  }
+  
+  return @bitCast(sent, i32)
+}
+
+// Splice implementation (zero-copy pipe to pipe/socket)
+export fn zero_copy_splice(fd_in: u32, fd_out: u32, len: u32, flags: u32) -> i32 {
+  // Move data between file descriptors without copying to user space
+  var moved: u32 = 0
+  
+  while moved < len {
+    var chunk: u32 = len - moved
+    if chunk > 65536 { chunk = 65536 }
+    
+    // Get buffer from input
+    var buf_id: u32 = zero_copy_alloc_buffer(chunk)
+    if buf_id == 0xFFFFFFFF { return @bitCast(moved, i32) }
+    
+    var buf: u64 = zero_copy_get_buffer(buf_id)
+    
+    // Read into buffer
+    var read_result: i32 = foundation.fd_read(fd_in, buf, chunk)
+    if read_result <= 0 {
+      zero_copy_free_buffer(buf_id)
+      return read_result
+    }
+    
+    // Write from buffer
+    var write_result: i32 = foundation.fd_write(fd_out, buf, @bitCast(read_result, u32))
+    zero_copy_free_buffer(buf_id)
+    
+    if write_result <= 0 { return write_result }
+    
+    moved = moved + @bitCast(write_result, u32)
+  }
+  
+  return @bitCast(moved, i32)
+}
+
+export fn zero_copy_get_count() -> u32 {
+  return zc_buffer_count
+}
