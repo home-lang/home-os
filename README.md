@@ -2,13 +2,8 @@
 
 > A **feature-complete, production-grade operating system** with 210+ kernel modules built from scratch using the [Home Programming Language](https://github.com/stacksjs/home)
 
-## Status
+## Features
 
-🎉 **FULLY IMPLEMENTED & FEATURE COMPLETE!**
-
-### All Milestones Complete ✅
-
-**All requested features implemented:**
 - ✅ Interrupt handling (GIC + IDT)
 - ✅ Memory management (PMM, VMM, Slab, Swap, OOM, Heap)
 - ✅ Timer support (ARM Generic Timer, PIT, APIC)
