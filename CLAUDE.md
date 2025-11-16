@@ -173,7 +173,7 @@ fn main() {
 }
 
 // Functions with parameters and return types
-fn add(a: int, b: int) -> int {
+fn add(a: int, b: int): int {
   return a + b
 }
 
@@ -201,7 +201,7 @@ import basics/os/serial  // Home-style path
 const serial = @import("os/serial.zig")  // Current Zig implementation
 
 // Export functions (for kernel entry points)
-export fn kernel_main(magic: u32, info: u32) -> never {
+export fn kernel_main(magic: u32, info: u32): never {
   // never return type for functions that don't return
   loop {
     cpu.hlt()
@@ -212,7 +212,7 @@ export fn kernel_main(magic: u32, info: u32) -> never {
 **Key Differences from Zig:**
 - `let` for variable declarations (not `const` or `var`)
 - `loop` for infinite loops (not `while (true)`)
-- `->` for return types (not `:`)
+- `:` for return types with space before colon (TypeScript-style, not `->`)
 - No semicolons needed in many cases
 - `import` statements use `/` path separators
 - `never` type for non-returning functions
