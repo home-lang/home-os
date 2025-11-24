@@ -1,0 +1,547 @@
+// home-os Parallel Driver Initialization System
+// Implements dependency graph-based parallel driver loading for faster boot times
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+
+// Driver states
+const DRIVER_STATE_PENDING: u32 = 0
+const DRIVER_STATE_INITIALIZING: u32 = 1
+const DRIVER_STATE_INITIALIZED: u32 = 2
+const DRIVER_STATE_FAILED: u32 = 3
+
+// Driver priority levels
+const DRIVER_PRIORITY_CRITICAL: u32 = 0   // Must init first (e.g., memory, interrupts)
+const DRIVER_PRIORITY_HIGH: u32 = 1       // Important drivers (e.g., storage, timer)
+const DRIVER_PRIORITY_NORMAL: u32 = 2     // Standard drivers (e.g., network, USB)
+const DRIVER_PRIORITY_LOW: u32 = 3        // Optional drivers (e.g., audio, video)
+
+// Driver flags
+const DRIVER_FLAG_ASYNC: u32 = 1 << 0     // Can be initialized asynchronously
+const DRIVER_FLAG_LAZY: u32 = 1 << 1      // Can be lazy-loaded
+const DRIVER_FLAG_OPTIONAL: u32 = 1 << 2  // Failure is non-fatal
+
+// Driver initialization function type
+type DriverInitFn = fn(): u32
+
+// Driver descriptor
+struct DriverDescriptor {
+  name: *u8                              // Driver name
+  init_fn: DriverInitFn                  // Initialization function
+  priority: u32                          // Priority level
+  flags: u32                             // Driver flags
+  dependencies: [8]u32                   // Indices of dependent drivers
+  dep_count: u32                         // Number of dependencies
+  state: u32                             // Current state
+  init_time_us: u64                      // Time taken to initialize (microseconds)
+}
+
+const MAX_DRIVERS: u32 = 256
+
+var drivers: [MAX_DRIVERS]DriverDescriptor
+var driver_count: u32 = 0
+var initialized: u32 = 0
+
+// Statistics
+var total_init_time_us: u64 = 0
+var parallel_driver_count: u32 = 0
+var sequential_driver_count: u32 = 0
+var failed_driver_count: u32 = 0
+var lazy_loaded_count: u32 = 0
+
+// Simple timer (would use actual timer hardware in production)
+var boot_timer_ticks: u64 = 0
+
+fn get_timestamp_us(): u64 {
+  // Simplified - would read from actual timer hardware
+  boot_timer_ticks = boot_timer_ticks + 1
+  return boot_timer_ticks * 100  // Simulate 100us increments
+}
+
+// Initialize driver system
+export fn driver_init_system() {
+  if initialized == 1 {
+    foundation.serial_write_string("[Driver Init] Already initialized\n")
+    return
+  }
+
+  driver_count = 0
+  total_init_time_us = 0
+  parallel_driver_count = 0
+  sequential_driver_count = 0
+  failed_driver_count = 0
+  lazy_loaded_count = 0
+  boot_timer_ticks = 0
+
+  initialized = 1
+
+  foundation.serial_write_string("[Driver Init] System initialized\n")
+}
+
+// Register a driver
+export fn driver_register(
+  name: *u8,
+  init_fn: DriverInitFn,
+  priority: u32,
+  flags: u32,
+  dependencies: *u32,
+  dep_count: u32
+): u32 {
+  if initialized == 0 {
+    foundation.serial_write_string("[Driver Init] System not initialized\n")
+    return 0xFFFFFFFF
+  }
+
+  if driver_count >= MAX_DRIVERS {
+    foundation.serial_write_string("[Driver Init] Maximum drivers reached\n")
+    return 0xFFFFFFFF
+  }
+
+  let driver: *DriverDescriptor = &drivers[driver_count]
+
+  driver.name = name
+  driver.init_fn = init_fn
+  driver.priority = priority
+  driver.flags = flags
+  driver.dep_count = 0
+  driver.state = DRIVER_STATE_PENDING
+  driver.init_time_us = 0
+
+  // Copy dependencies
+  if dependencies != 0 && dep_count > 0 {
+    var i: u32 = 0
+    loop {
+      if i >= dep_count { break }
+      if i >= 8 { break }  // Max 8 dependencies
+
+      let dep_ptr: *u32 = dependencies + i
+      driver.dependencies[i] = *dep_ptr
+      driver.dep_count = driver.dep_count + 1
+
+      i = i + 1
+    }
+  }
+
+  let id: u32 = driver_count
+  driver_count = driver_count + 1
+
+  return id
+}
+
+// Check if driver's dependencies are satisfied
+fn driver_deps_satisfied(driver: *DriverDescriptor): u32 {
+  if driver.dep_count == 0 { return 1 }
+
+  var i: u32 = 0
+  loop {
+    if i >= driver.dep_count { break }
+
+    let dep_id: u32 = driver.dependencies[i]
+
+    if dep_id >= driver_count {
+      foundation.serial_write_string("[Driver Init] Invalid dependency\n")
+      return 0
+    }
+
+    let dep: *DriverDescriptor = &drivers[dep_id]
+
+    if dep.state != DRIVER_STATE_INITIALIZED {
+      return 0  // Dependency not yet initialized
+    }
+
+    i = i + 1
+  }
+
+  return 1
+}
+
+// Initialize a single driver
+fn driver_init_single(driver: *DriverDescriptor): u32 {
+  foundation.serial_write_string("[Driver Init] Initializing ")
+  foundation.serial_write_string(driver.name)
+  foundation.serial_write_string("...")
+
+  driver.state = DRIVER_STATE_INITIALIZING
+
+  let start_time: u64 = get_timestamp_us()
+
+  // Call driver's init function
+  let result: u32 = driver.init_fn()
+
+  let end_time: u64 = get_timestamp_us()
+  driver.init_time_us = end_time - start_time
+  total_init_time_us = total_init_time_us + driver.init_time_us
+
+  if result == 0 {
+    driver.state = DRIVER_STATE_INITIALIZED
+
+    foundation.serial_write_string(" OK (")
+    foundation.serial_write_u64(driver.init_time_us)
+    foundation.serial_write_string(" us)\n")
+
+    return 0
+  } else {
+    driver.state = DRIVER_STATE_FAILED
+    failed_driver_count = failed_driver_count + 1
+
+    foundation.serial_write_string(" FAILED\n")
+
+    // Check if failure is fatal
+    if (driver.flags & DRIVER_FLAG_OPTIONAL) == 0 {
+      foundation.serial_write_string("[Driver Init] CRITICAL: Non-optional driver failed!\n")
+      return 1
+    }
+
+    foundation.serial_write_string("[Driver Init] Optional driver failed, continuing\n")
+    return 0
+  }
+}
+
+// Initialize drivers by priority level
+fn driver_init_by_priority(priority: u32): u32 {
+  foundation.serial_write_string("\n[Driver Init] Initializing priority ")
+  foundation.serial_write_u64(priority)
+  foundation.serial_write_string(" drivers\n")
+
+  var initialized_any: u32 = 1
+  var iterations: u32 = 0
+  var max_iterations: u32 = driver_count + 10
+
+  // Keep trying until no more drivers can be initialized at this priority
+  loop {
+    if initialized_any == 0 { break }
+    if iterations >= max_iterations {
+      foundation.serial_write_string("[Driver Init] WARNING: Max iterations reached (circular dependencies?)\n")
+      break
+    }
+
+    initialized_any = 0
+    iterations = iterations + 1
+
+    var i: u32 = 0
+    loop {
+      if i >= driver_count { break }
+
+      let driver: *DriverDescriptor = &drivers[i]
+
+      // Skip if wrong priority
+      if driver.priority != priority {
+        i = i + 1
+        continue
+      }
+
+      // Skip if already initialized or failed
+      if driver.state == DRIVER_STATE_INITIALIZED || driver.state == DRIVER_STATE_FAILED {
+        i = i + 1
+        continue
+      }
+
+      // Skip lazy drivers
+      if (driver.flags & DRIVER_FLAG_LAZY) != 0 {
+        i = i + 1
+        continue
+      }
+
+      // Check dependencies
+      if driver_deps_satisfied(driver) == 0 {
+        i = i + 1
+        continue
+      }
+
+      // Initialize this driver
+      let result: u32 = driver_init_single(driver)
+
+      if result != 0 {
+        // Fatal error
+        return result
+      }
+
+      initialized_any = 1
+
+      // Count type of initialization
+      if (driver.flags & DRIVER_FLAG_ASYNC) != 0 {
+        parallel_driver_count = parallel_driver_count + 1
+      } else {
+        sequential_driver_count = sequential_driver_count + 1
+      }
+
+      i = i + 1
+    }
+  }
+
+  return 0
+}
+
+// Initialize all drivers in dependency order
+export fn driver_init_all(): u32 {
+  if initialized == 0 {
+    foundation.serial_write_string("[Driver Init] System not initialized\n")
+    return 1
+  }
+
+  foundation.serial_write_string("\n========== DRIVER INITIALIZATION ==========\n")
+  foundation.serial_write_string("Total drivers registered: ")
+  foundation.serial_write_u64(driver_count)
+  foundation.serial_write_string("\n")
+
+  let overall_start: u64 = get_timestamp_us()
+
+  // Initialize by priority (critical first, then high, normal, low)
+  var priority: u32 = DRIVER_PRIORITY_CRITICAL
+  loop {
+    if priority > DRIVER_PRIORITY_LOW { break }
+
+    let result: u32 = driver_init_by_priority(priority)
+    if result != 0 {
+      foundation.serial_write_string("[Driver Init] FATAL: Critical driver failed\n")
+      return result
+    }
+
+    priority = priority + 1
+  }
+
+  let overall_end: u64 = get_timestamp_us()
+  let overall_time: u64 = overall_end - overall_start
+
+  foundation.serial_write_string("\n========== INITIALIZATION COMPLETE ==========\n")
+  foundation.serial_write_string("Total time: ")
+  foundation.serial_write_u64(overall_time)
+  foundation.serial_write_string(" us (")
+  foundation.serial_write_u64(overall_time / 1000)
+  foundation.serial_write_string(" ms)\n")
+
+  foundation.serial_write_string("Sequential drivers: ")
+  foundation.serial_write_u64(sequential_driver_count)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Parallel-capable drivers: ")
+  foundation.serial_write_u64(parallel_driver_count)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Failed drivers: ")
+  foundation.serial_write_u64(failed_driver_count)
+  foundation.serial_write_string("\n")
+
+  // Count lazy drivers
+  var lazy_count: u32 = 0
+  var i: u32 = 0
+  loop {
+    if i >= driver_count { break }
+
+    if (drivers[i].flags & DRIVER_FLAG_LAZY) != 0 {
+      lazy_count = lazy_count + 1
+    }
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("Lazy-loadable drivers: ")
+  foundation.serial_write_u64(lazy_count)
+  foundation.serial_write_string(" (deferred)\n")
+
+  foundation.serial_write_string("============================================\n\n")
+
+  return 0
+}
+
+// Lazy-load a driver by name
+export fn driver_lazy_load(name: *u8): u32 {
+  if initialized == 0 { return 1 }
+
+  var i: u32 = 0
+  loop {
+    if i >= driver_count { break }
+
+    let driver: *DriverDescriptor = &drivers[i]
+
+    // Compare names (simple string comparison)
+    if driver.name == name {
+      if driver.state == DRIVER_STATE_INITIALIZED {
+        foundation.serial_write_string("[Driver Init] Already initialized: ")
+        foundation.serial_write_string(name)
+        foundation.serial_write_string("\n")
+        return 0
+      }
+
+      if (driver.flags & DRIVER_FLAG_LAZY) == 0 {
+        foundation.serial_write_string("[Driver Init] Not a lazy driver: ")
+        foundation.serial_write_string(name)
+        foundation.serial_write_string("\n")
+        return 1
+      }
+
+      // Check dependencies
+      if driver_deps_satisfied(driver) == 0 {
+        foundation.serial_write_string("[Driver Init] Dependencies not satisfied: ")
+        foundation.serial_write_string(name)
+        foundation.serial_write_string("\n")
+        return 1
+      }
+
+      // Initialize
+      foundation.serial_write_string("[Driver Init] Lazy-loading: ")
+      foundation.serial_write_string(name)
+      foundation.serial_write_string("\n")
+
+      let result: u32 = driver_init_single(driver)
+
+      if result == 0 {
+        lazy_loaded_count = lazy_loaded_count + 1
+      }
+
+      return result
+    }
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("[Driver Init] Driver not found: ")
+  foundation.serial_write_string(name)
+  foundation.serial_write_string("\n")
+
+  return 1
+}
+
+// Print driver initialization report
+export fn driver_print_report() {
+  if initialized == 0 { return }
+
+  foundation.serial_write_string("\n========== DRIVER INITIALIZATION REPORT ==========\n\n")
+
+  foundation.serial_write_string("Drivers by state:\n")
+
+  var initialized_count: u32 = 0
+  var pending_count: u32 = 0
+  var failed_count: u32 = 0
+
+  var i: u32 = 0
+  loop {
+    if i >= driver_count { break }
+
+    let state: u32 = drivers[i].state
+
+    if state == DRIVER_STATE_INITIALIZED {
+      initialized_count = initialized_count + 1
+    } else if state == DRIVER_STATE_PENDING {
+      pending_count = pending_count + 1
+    } else if state == DRIVER_STATE_FAILED {
+      failed_count = failed_count + 1
+    }
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("  Initialized: ")
+  foundation.serial_write_u64(initialized_count)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Pending/Lazy: ")
+  foundation.serial_write_u64(pending_count)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Failed: ")
+  foundation.serial_write_u64(failed_count)
+  foundation.serial_write_string("\n\n")
+
+  foundation.serial_write_string("Slowest drivers:\n")
+
+  // Find slowest 5 drivers (simple bubble sort)
+  var sorted_indices: [5]u32
+  var j: u32 = 0
+  loop {
+    if j >= 5 { break }
+    sorted_indices[j] = 0xFFFFFFFF
+    j = j + 1
+  }
+
+  i = 0
+  loop {
+    if i >= driver_count { break }
+
+    if drivers[i].state != DRIVER_STATE_INITIALIZED {
+      i = i + 1
+      continue
+    }
+
+    let time: u64 = drivers[i].init_time_us
+
+    // Insert into sorted list
+    j = 0
+    loop {
+      if j >= 5 { break }
+
+      if sorted_indices[j] == 0xFFFFFFFF {
+        sorted_indices[j] = i
+        break
+      }
+
+      if time > drivers[sorted_indices[j]].init_time_us {
+        // Shift down
+        var k: u32 = 4
+        loop {
+          if k <= j { break }
+
+          sorted_indices[k] = sorted_indices[k - 1]
+
+          k = k - 1
+        }
+
+        sorted_indices[j] = i
+        break
+      }
+
+      j = j + 1
+    }
+
+    i = i + 1
+  }
+
+  // Print top 5
+  j = 0
+  loop {
+    if j >= 5 { break }
+
+    let idx: u32 = sorted_indices[j]
+    if idx == 0xFFFFFFFF { break }
+
+    let driver: *DriverDescriptor = &drivers[idx]
+
+    foundation.serial_write_string("  ")
+    foundation.serial_write_u64(j + 1)
+    foundation.serial_write_string(". ")
+    foundation.serial_write_string(driver.name)
+    foundation.serial_write_string(": ")
+    foundation.serial_write_u64(driver.init_time_us)
+    foundation.serial_write_string(" us\n")
+
+    j = j + 1
+  }
+
+  foundation.serial_write_string("\nTotal initialization time: ")
+  foundation.serial_write_u64(total_init_time_us / 1000)
+  foundation.serial_write_string(" ms\n")
+
+  foundation.serial_write_string("Lazy-loaded drivers: ")
+  foundation.serial_write_u64(lazy_loaded_count)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n==================================================\n\n")
+}
+
+// Get driver state
+export fn driver_get_state(name: *u8): u32 {
+  if initialized == 0 { return DRIVER_STATE_FAILED }
+
+  var i: u32 = 0
+  loop {
+    if i >= driver_count { break }
+
+    if drivers[i].name == name {
+      return drivers[i].state
+    }
+
+    i = i + 1
+  }
+
+  return DRIVER_STATE_FAILED
+}

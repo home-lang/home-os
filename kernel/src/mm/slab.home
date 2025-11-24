@@ -1,75 +1,517 @@
 // home-os Slab Allocator
-// Efficient kernel object allocation
+// Efficient kernel object allocation with per-CPU caches and magazine layer
+// Based on Bonwick's magazine layer design for improved SMP scalability
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
 
 const SLAB_SIZE: u32 = 4096
-const MAX_SLABS: u32 = 64
+const MAX_SLABS: u32 = 128
+const MAX_CPUS: u32 = 16
 
-struct Slab {
-  size: u32,
-  free_count: u32,
-  total_count: u32,
-  free_list: u64,
-  memory: u64
+// Magazine layer configuration
+const MAGAZINE_SIZE: u32 = 15      // Objects per magazine (odd number for better distribution)
+const MAGAZINES_PER_CPU: u32 = 2   // Loaded + previous magazine per CPU
+
+// Slab flags
+const SLAB_FLAG_ACTIVE: u32 = 1 << 0
+const SLAB_FLAG_HW_CACHE_ALIGNED: u32 = 1 << 1
+const SLAB_FLAG_RECLAIM_ENABLED: u32 = 1 << 2
+
+// Magazine for per-CPU caching
+struct Magazine {
+  objects: [MAGAZINE_SIZE]u64  // Cached object pointers
+  count: u32                    // Number of objects in magazine
+  next: *Magazine               // Next magazine in depot
 }
 
-var slabs: [Slab; 64]
-var slab_count: u32 = 0
+// Per-CPU cache
+struct CpuCache {
+  loaded_mag: *Magazine         // Currently active magazine
+  previous_mag: *Magazine       // Previous magazine (for quick swap)
+  cpu_id: u32                   // CPU this cache belongs to
+  allocs: u64                   // Allocations from this CPU cache
+  frees: u64                    // Frees to this CPU cache
+  magazine_exchanges: u64       // Times we swapped magazines
+}
 
-export fn slab_create(object_size: u32): u32 {
-  if slab_count >= MAX_SLABS { return 0xFFFFFFFF }
-  
-  var slab: Slab
+// Slab structure
+struct Slab {
+  size: u32                     // Object size in bytes
+  free_count: u32               // Free objects in slab
+  total_count: u32              // Total objects in slab
+  free_list: u64                // Free list head
+  memory: u64                   // Base memory address
+  flags: u32                    // Slab flags
+
+  // Per-CPU caches
+  cpu_caches: [MAX_CPUS]CpuCache
+
+  // Magazine depot (shared between CPUs)
+  depot_full: *Magazine         // Full magazines
+  depot_empty: *Magazine        // Empty magazines
+  depot_full_count: u32
+  depot_empty_count: u32
+
+  // Statistics
+  total_allocs: u64
+  total_frees: u64
+  cache_hits: u64               // Allocations served from CPU cache
+  cache_misses: u64             // Allocations that went to slab
+}
+
+var slabs: [MAX_SLABS]Slab
+var slab_count: u32 = 0
+var slab_initialized: u32 = 0
+
+// Current CPU ID (simplified - would use proper CPU ID in real kernel)
+var current_cpu: u32 = 0
+
+// Initialize slab allocator
+export fn slab_init() {
+  if slab_initialized == 1 {
+    foundation.serial_write_string("[Slab] Already initialized\n")
+    return
+  }
+
+  slab_count = 0
+  current_cpu = 0
+  slab_initialized = 1
+
+  foundation.serial_write_string("[Slab] Initialized with per-CPU magazine caches\n")
+}
+
+// Get current CPU ID (stub - would use actual CPU detection)
+fn get_cpu_id(): u32 {
+  // In real implementation, would read CPU ID from register
+  return current_cpu
+}
+
+// Create a new magazine
+fn magazine_create(): *Magazine {
+  let mag: *Magazine = memory.kmalloc(MAGAZINE_SIZE * 8 + 16)  // objects + count + next
+  if mag == 0 { return 0 }
+
+  mag.count = 0
+  mag.next = 0
+
+  return mag
+}
+
+// Destroy a magazine
+fn magazine_destroy(mag: *Magazine) {
+  if mag == 0 { return }
+  memory.kfree(mag)
+}
+
+// Push an object to magazine
+fn magazine_push(mag: *Magazine, obj: u64): u32 {
+  if mag == 0 { return 1 }
+  if mag.count >= MAGAZINE_SIZE { return 1 }
+
+  mag.objects[mag.count] = obj
+  mag.count = mag.count + 1
+
+  return 0
+}
+
+// Pop an object from magazine
+fn magazine_pop(mag: *Magazine): u64 {
+  if mag == 0 { return 0 }
+  if mag.count == 0 { return 0 }
+
+  mag.count = mag.count - 1
+  return mag.objects[mag.count]
+}
+
+// Check if magazine is full
+fn magazine_is_full(mag: *Magazine): u32 {
+  if mag == 0 { return 0 }
+  return if mag.count >= MAGAZINE_SIZE { 1 } else { 0 }
+}
+
+// Check if magazine is empty
+fn magazine_is_empty(mag: *Magazine): u32 {
+  if mag == 0 { return 1 }
+  return if mag.count == 0 { 1 } else { 0 }
+}
+
+// Add magazine to depot
+fn depot_add_full(slab: *Slab, mag: *Magazine) {
+  if mag == 0 { return }
+
+  mag.next = slab.depot_full
+  slab.depot_full = mag
+  slab.depot_full_count = slab.depot_full_count + 1
+}
+
+fn depot_add_empty(slab: *Slab, mag: *Magazine) {
+  if mag == 0 { return }
+
+  mag.next = slab.depot_empty
+  slab.depot_empty = mag
+  slab.depot_empty_count = slab.depot_empty_count + 1
+}
+
+// Get magazine from depot
+fn depot_get_full(slab: *Slab): *Magazine {
+  if slab.depot_full == 0 { return 0 }
+
+  let mag: *Magazine = slab.depot_full
+  slab.depot_full = mag.next
+  slab.depot_full_count = slab.depot_full_count - 1
+
+  return mag
+}
+
+fn depot_get_empty(slab: *Slab): *Magazine {
+  if slab.depot_empty == 0 { return 0 }
+
+  let mag: *Magazine = slab.depot_empty
+  slab.depot_empty = mag.next
+  slab.depot_empty_count = slab.depot_empty_count - 1
+
+  return mag
+}
+
+// Create a slab for objects of given size
+export fn slab_create(object_size: u32, flags: u32): u32 {
+  if slab_initialized == 0 {
+    foundation.serial_write_string("[Slab] Not initialized\n")
+    return 0xFFFFFFFF
+  }
+
+  if slab_count >= MAX_SLABS {
+    foundation.serial_write_string("[Slab] Maximum slabs reached\n")
+    return 0xFFFFFFFF
+  }
+
+  let slab: *Slab = &slabs[slab_count]
+
   slab.size = object_size
   slab.total_count = SLAB_SIZE / object_size
   slab.free_count = slab.total_count
+  slab.flags = flags | SLAB_FLAG_ACTIVE
   slab.memory = memory.kmalloc(SLAB_SIZE)
-  
-  if slab.memory == 0 { return 0xFFFFFFFF }
-  
+
+  if slab.memory == 0 {
+    foundation.serial_write_string("[Slab] Failed to allocate slab memory\n")
+    return 0xFFFFFFFF
+  }
+
   // Build free list
   var i: u32 = 0
-  while i < slab.total_count - 1 {
-    var obj: u64 = slab.memory + (i * object_size)
-    @ptrToInt(obj, u64) = obj + object_size
+  loop {
+    if i >= slab.total_count - 1 { break }
+
+    let obj: u64 = slab.memory + (i * object_size)
+    let next_obj: u64 = obj + object_size
+
+    // Store next pointer at object location
+    let ptr: *u64 = obj
+    *ptr = next_obj
+
     i = i + 1
   }
-  
-  var last: u64 = slab.memory + ((slab.total_count - 1) * object_size)
-  @ptrToInt(last, u64) = 0
-  
+
+  // Last object points to null
+  let last: u64 = slab.memory + ((slab.total_count - 1) * object_size)
+  let last_ptr: *u64 = last
+  *last_ptr = 0
+
   slab.free_list = slab.memory
-  
-  slabs[slab_count] = slab
-  var id: u32 = slab_count
+
+  // Initialize statistics
+  slab.total_allocs = 0
+  slab.total_frees = 0
+  slab.cache_hits = 0
+  slab.cache_misses = 0
+
+  // Initialize depots
+  slab.depot_full = 0
+  slab.depot_empty = 0
+  slab.depot_full_count = 0
+  slab.depot_empty_count = 0
+
+  // Initialize per-CPU caches
+  var cpu: u32 = 0
+  loop {
+    if cpu >= MAX_CPUS { break }
+
+    let cache: *CpuCache = &slab.cpu_caches[cpu]
+    cache.loaded_mag = 0
+    cache.previous_mag = 0
+    cache.cpu_id = cpu
+    cache.allocs = 0
+    cache.frees = 0
+    cache.magazine_exchanges = 0
+
+    cpu = cpu + 1
+  }
+
+  let id: u32 = slab_count
   slab_count = slab_count + 1
-  
+
   return id
 }
 
-export fn slab_alloc(slab_id: u32): u64 {
-  if slab_id >= slab_count { return 0 }
-  
-  if slabs[slab_id].free_count == 0 { return 0 }
-  
-  var obj: u64 = slabs[slab_id].free_list
-  slabs[slab_id].free_list = @intToPtr(obj, u64)
-  slabs[slab_id].free_count = slabs[slab_id].free_count - 1
-  
+// Allocate from slab's free list
+fn slab_alloc_from_freelist(slab: *Slab): u64 {
+  if slab.free_count == 0 { return 0 }
+
+  let obj: u64 = slab.free_list
+  let next_ptr: *u64 = obj
+  slab.free_list = *next_ptr
+
+  slab.free_count = slab.free_count - 1
+
   return obj
 }
 
-export fn slab_free(slab_id: u32, obj: u64) {
-  if slab_id >= slab_count { return }
-  
-  @ptrToInt(obj, u64) = slabs[slab_id].free_list
-  slabs[slab_id].free_list = obj
-  slabs[slab_id].free_count = slabs[slab_id].free_count + 1
+// Free back to slab's free list
+fn slab_free_to_freelist(slab: *Slab, obj: u64) {
+  let ptr: *u64 = obj
+  *ptr = slab.free_list
+
+  slab.free_list = obj
+  slab.free_count = slab.free_count + 1
 }
 
-export fn slab_init() {
-  slab_count = 0
-  foundation.serial_write_string("[Slab] Initialized\n")
+// Fill a magazine from slab
+fn magazine_fill_from_slab(mag: *Magazine, slab: *Slab): u32 {
+  if mag == 0 { return 1 }
+
+  loop {
+    if mag.count >= MAGAZINE_SIZE { break }
+    if slab.free_count == 0 { break }
+
+    let obj: u64 = slab_alloc_from_freelist(slab)
+    if obj == 0 { break }
+
+    magazine_push(mag, obj)
+  }
+
+  return 0
+}
+
+// Empty a magazine back to slab
+fn magazine_empty_to_slab(mag: *Magazine, slab: *Slab) {
+  if mag == 0 { return }
+
+  loop {
+    if mag.count == 0 { break }
+
+    let obj: u64 = magazine_pop(mag)
+    if obj == 0 { break }
+
+    slab_free_to_freelist(slab, obj)
+  }
+}
+
+// Allocate object from slab
+export fn slab_alloc(slab_id: u32): u64 {
+  if slab_initialized == 0 { return 0 }
+  if slab_id >= slab_count { return 0 }
+
+  let slab: *Slab = &slabs[slab_id]
+  let cpu: u32 = get_cpu_id()
+  let cache: *CpuCache = &slab.cpu_caches[cpu]
+
+  slab.total_allocs = slab.total_allocs + 1
+  cache.allocs = cache.allocs + 1
+
+  // Try loaded magazine first
+  if cache.loaded_mag != 0 && cache.loaded_mag.count > 0 {
+    let obj: u64 = magazine_pop(cache.loaded_mag)
+    if obj != 0 {
+      slab.cache_hits = slab.cache_hits + 1
+      return obj
+    }
+  }
+
+  // Loaded magazine empty, try swapping with previous
+  if cache.previous_mag != 0 && cache.previous_mag.count > 0 {
+    let temp: *Magazine = cache.loaded_mag
+    cache.loaded_mag = cache.previous_mag
+    cache.previous_mag = temp
+    cache.magazine_exchanges = cache.magazine_exchanges + 1
+
+    let obj: u64 = magazine_pop(cache.loaded_mag)
+    if obj != 0 {
+      slab.cache_hits = slab.cache_hits + 1
+      return obj
+    }
+  }
+
+  // Both magazines empty, try getting a full one from depot
+  let full_mag: *Magazine = depot_get_full(slab)
+  if full_mag != 0 {
+    // Return previous empty magazine to depot
+    if cache.previous_mag != 0 {
+      depot_add_empty(slab, cache.previous_mag)
+    }
+
+    cache.previous_mag = cache.loaded_mag
+    cache.loaded_mag = full_mag
+    cache.magazine_exchanges = cache.magazine_exchanges + 1
+
+    let obj: u64 = magazine_pop(cache.loaded_mag)
+    if obj != 0 {
+      slab.cache_hits = slab.cache_hits + 1
+      return obj
+    }
+  }
+
+  // No full magazines in depot, allocate directly from slab
+  slab.cache_misses = slab.cache_misses + 1
+
+  // Try to fill current magazine
+  if cache.loaded_mag == 0 {
+    cache.loaded_mag = magazine_create()
+  }
+
+  if cache.loaded_mag != 0 {
+    magazine_fill_from_slab(cache.loaded_mag, slab)
+
+    if cache.loaded_mag.count > 0 {
+      return magazine_pop(cache.loaded_mag)
+    }
+  }
+
+  // Direct allocation as last resort
+  return slab_alloc_from_freelist(slab)
+}
+
+// Free object back to slab
+export fn slab_free(slab_id: u32, obj: u64) {
+  if slab_initialized == 0 { return }
+  if slab_id >= slab_count { return }
+  if obj == 0 { return }
+
+  let slab: *Slab = &slabs[slab_id]
+  let cpu: u32 = get_cpu_id()
+  let cache: *CpuCache = &slab.cpu_caches[cpu]
+
+  slab.total_frees = slab.total_frees + 1
+  cache.frees = cache.frees + 1
+
+  // Try to add to loaded magazine
+  if cache.loaded_mag != 0 && cache.loaded_mag.count < MAGAZINE_SIZE {
+    magazine_push(cache.loaded_mag, obj)
+    return
+  }
+
+  // Loaded magazine full, try swapping with previous
+  if cache.previous_mag != 0 && cache.previous_mag.count < MAGAZINE_SIZE {
+    let temp: *Magazine = cache.loaded_mag
+    cache.loaded_mag = cache.previous_mag
+    cache.previous_mag = temp
+    cache.magazine_exchanges = cache.magazine_exchanges + 1
+
+    magazine_push(cache.loaded_mag, obj)
+    return
+  }
+
+  // Both magazines full, move loaded to depot and get empty
+  if cache.loaded_mag != 0 && magazine_is_full(cache.loaded_mag) == 1 {
+    depot_add_full(slab, cache.loaded_mag)
+
+    let empty_mag: *Magazine = depot_get_empty(slab)
+    if empty_mag == 0 {
+      empty_mag = magazine_create()
+    }
+
+    cache.loaded_mag = empty_mag
+    cache.magazine_exchanges = cache.magazine_exchanges + 1
+
+    if cache.loaded_mag != 0 {
+      magazine_push(cache.loaded_mag, obj)
+      return
+    }
+  }
+
+  // Fallback: free directly to slab
+  slab_free_to_freelist(slab, obj)
+}
+
+// Print slab statistics
+export fn slab_print_stats() {
+  if slab_initialized == 0 {
+    foundation.serial_write_string("[Slab] Not initialized\n")
+    return
+  }
+
+  foundation.serial_write_string("\n========== SLAB ALLOCATOR STATISTICS ==========\n\n")
+
+  foundation.serial_write_string("Total slabs: ")
+  foundation.serial_write_u64(slab_count)
+  foundation.serial_write_string("\n\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= slab_count { break }
+
+    let slab: *Slab = &slabs[i]
+
+    foundation.serial_write_string("Slab ")
+    foundation.serial_write_u64(i)
+    foundation.serial_write_string(" (")
+    foundation.serial_write_u64(slab.size)
+    foundation.serial_write_string(" byte objects):\n")
+
+    foundation.serial_write_string("  Total objects: ")
+    foundation.serial_write_u64(slab.total_count)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Free objects: ")
+    foundation.serial_write_u64(slab.free_count)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Total allocations: ")
+    foundation.serial_write_u64(slab.total_allocs)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Total frees: ")
+    foundation.serial_write_u64(slab.total_frees)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Cache hits: ")
+    foundation.serial_write_u64(slab.cache_hits)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Cache misses: ")
+    foundation.serial_write_u64(slab.cache_misses)
+    foundation.serial_write_string("\n")
+
+    if slab.total_allocs > 0 {
+      let hit_rate: u64 = (slab.cache_hits * 100) / slab.total_allocs
+      foundation.serial_write_string("  Cache hit rate: ")
+      foundation.serial_write_u64(hit_rate)
+      foundation.serial_write_string("%\n")
+    }
+
+    foundation.serial_write_string("  Magazine depot (full): ")
+    foundation.serial_write_u64(slab.depot_full_count)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Magazine depot (empty): ")
+    foundation.serial_write_u64(slab.depot_empty_count)
+    foundation.serial_write_string("\n\n")
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("===============================================\n\n")
+}
+
+// Get slab utilization
+export fn slab_get_utilization(slab_id: u32): u32 {
+  if slab_id >= slab_count { return 0 }
+
+  let slab: *Slab = &slabs[slab_id]
+
+  if slab.total_count == 0 { return 0 }
+
+  let used: u32 = slab.total_count - slab.free_count
+  return (used * 100) / slab.total_count
 }

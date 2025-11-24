@@ -1,0 +1,476 @@
+// home-os Memory Pool Allocator
+// Pre-allocated pools for common object sizes
+// Reduces fragmentation and improves performance on long-running systems
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+
+// Common object sizes (in bytes)
+const POOL_SIZE_16: u32 = 16
+const POOL_SIZE_32: u32 = 32
+const POOL_SIZE_64: u32 = 64
+const POOL_SIZE_128: u32 = 128
+const POOL_SIZE_256: u32 = 256
+const POOL_SIZE_512: u32 = 512
+const POOL_SIZE_1024: u32 = 1024
+const POOL_SIZE_2048: u32 = 2048
+const POOL_SIZE_4096: u32 = 4096
+
+const NUM_POOLS: u32 = 9
+
+// Pool configuration
+struct PoolConfig {
+  object_size: u32
+  objects_per_pool: u32
+  max_pools: u32
+}
+
+const pool_configs: [NUM_POOLS]PoolConfig = [
+  PoolConfig { object_size: 16,   objects_per_pool: 256, max_pools: 4 },   // 16KB per pool
+  PoolConfig { object_size: 32,   objects_per_pool: 256, max_pools: 4 },   // 32KB per pool
+  PoolConfig { object_size: 64,   objects_per_pool: 128, max_pools: 4 },   // 32KB per pool
+  PoolConfig { object_size: 128,  objects_per_pool: 64,  max_pools: 4 },   // 32KB per pool
+  PoolConfig { object_size: 256,  objects_per_pool: 64,  max_pools: 4 },   // 64KB per pool
+  PoolConfig { object_size: 512,  objects_per_pool: 32,  max_pools: 2 },   // 64KB per pool
+  PoolConfig { object_size: 1024, objects_per_pool: 32,  max_pools: 2 },   // 128KB per pool
+  PoolConfig { object_size: 2048, objects_per_pool: 16,  max_pools: 2 },   // 128KB per pool
+  PoolConfig { object_size: 4096, objects_per_pool: 16,  max_pools: 2 }    // 256KB per pool
+]
+
+// Free list node
+struct FreeNode {
+  next: *FreeNode
+}
+
+// Memory pool
+struct MemoryPool {
+  config_idx: u32           // Index into pool_configs
+  base_addr: u64            // Base address of pool memory
+  free_list: *FreeNode      // Head of free list
+  free_count: u32           // Number of free objects
+  total_count: u32          // Total objects in pool
+  allocations: u64          // Total allocations served
+  frees: u64                // Total frees processed
+}
+
+const MAX_TOTAL_POOLS: u32 = 32
+
+var pools: [MAX_TOTAL_POOLS]MemoryPool
+var pool_count: u32 = 0
+var initialized: u32 = 0
+
+// Statistics
+var total_pool_allocs: u64 = 0
+var total_pool_frees: u64 = 0
+var total_fallback_allocs: u64 = 0  // Had to use kmalloc
+
+// Initialize memory pools
+export fn pool_init() {
+  if initialized == 1 {
+    foundation.serial_write_string("[Pool] Already initialized\n")
+    return
+  }
+
+  pool_count = 0
+
+  // Create initial pools for each size class
+  var i: u32 = 0
+  loop {
+    if i >= NUM_POOLS { break }
+
+    create_pool_for_config(i)
+
+    i = i + 1
+  }
+
+  initialized = 1
+
+  foundation.serial_write_string("[Pool] Initialized ")
+  foundation.serial_write_u64(pool_count)
+  foundation.serial_write_string(" pools\n")
+}
+
+// Create a new pool for a given config
+fn create_pool_for_config(config_idx: u32): u32 {
+  if pool_count >= MAX_TOTAL_POOLS {
+    foundation.serial_write_string("[Pool] Maximum number of pools reached\n")
+    return 0
+  }
+
+  let config: *PoolConfig = &pool_configs[config_idx]
+  let pool_size: u64 = config.object_size * config.objects_per_pool
+
+  // Allocate memory for pool
+  let base: u64 = memory.kmalloc(pool_size)
+  if base == 0 {
+    foundation.serial_write_string("[Pool] Failed to allocate pool memory\n")
+    return 0
+  }
+
+  // Initialize pool structure
+  let pool_idx: u32 = pool_count
+  let pool: *MemoryPool = &pools[pool_idx]
+
+  pool.config_idx = config_idx
+  pool.base_addr = base
+  pool.free_list = 0
+  pool.free_count = 0
+  pool.total_count = config.objects_per_pool
+  pool.allocations = 0
+  pool.frees = 0
+
+  // Build free list
+  var obj_idx: u32 = 0
+  loop {
+    if obj_idx >= config.objects_per_pool { break }
+
+    let obj_addr: u64 = base + (obj_idx * config.object_size)
+    let node: *FreeNode = obj_addr
+
+    // Link to previous head
+    node.next = pool.free_list
+    pool.free_list = node
+    pool.free_count = pool.free_count + 1
+
+    obj_idx = obj_idx + 1
+  }
+
+  pool_count = pool_count + 1
+
+  return pool_idx
+}
+
+// Find pool index for a given size
+fn find_pool_for_size(size: u32): i32 {
+  var best_pool_idx: i32 = -1
+  var best_free_count: u32 = 0
+
+  var i: u32 = 0
+  loop {
+    if i >= pool_count { break }
+
+    let pool: *MemoryPool = &pools[i]
+    let config: *PoolConfig = &pool_configs[pool.config_idx]
+
+    // Check if this pool can fit the requested size
+    if config.object_size >= size {
+      // Prefer pools with more free objects
+      if pool.free_count > 0 {
+        if best_pool_idx == -1 || pool.free_count > best_free_count {
+          // Find a pool with the smallest sufficient size
+          if best_pool_idx == -1 {
+            best_pool_idx = i
+            best_free_count = pool.free_count
+          } else {
+            let best_config: *PoolConfig = &pool_configs[pools[best_pool_idx].config_idx]
+            if config.object_size < best_config.object_size {
+              best_pool_idx = i
+              best_free_count = pool.free_count
+            }
+          }
+        }
+      }
+    }
+
+    i = i + 1
+  }
+
+  return best_pool_idx
+}
+
+// Allocate from pool
+export fn pool_alloc(size: u32): u64 {
+  if initialized == 0 {
+    foundation.serial_write_string("[Pool] Not initialized, using kmalloc\n")
+    total_fallback_allocs = total_fallback_allocs + 1
+    return memory.kmalloc(size)
+  }
+
+  // Find suitable pool
+  let pool_idx: i32 = find_pool_for_size(size)
+
+  if pool_idx == -1 {
+    // No suitable pool found, try to create one or use kmalloc
+    var config_idx: u32 = 0
+    var found_config: u32 = 0
+
+    loop {
+      if config_idx >= NUM_POOLS { break }
+
+      let config: *PoolConfig = &pool_configs[config_idx]
+
+      if config.object_size >= size {
+        // Check if we can create another pool for this config
+        var existing_pools: u32 = 0
+
+        var i: u32 = 0
+        loop {
+          if i >= pool_count { break }
+
+          if pools[i].config_idx == config_idx {
+            existing_pools = existing_pools + 1
+          }
+
+          i = i + 1
+        }
+
+        if existing_pools < config.max_pools {
+          let new_pool_idx: u32 = create_pool_for_config(config_idx)
+          if new_pool_idx > 0 {
+            pool_idx = new_pool_idx
+            found_config = 1
+            break
+          }
+        }
+
+        break
+      }
+
+      config_idx = config_idx + 1
+    }
+
+    if found_config == 0 {
+      // Still no pool, use kmalloc
+      total_fallback_allocs = total_fallback_allocs + 1
+      return memory.kmalloc(size)
+    }
+  }
+
+  // Allocate from pool
+  let pool: *MemoryPool = &pools[pool_idx]
+
+  if pool.free_count == 0 {
+    foundation.serial_write_string("[Pool] Pool exhausted, using kmalloc\n")
+    total_fallback_allocs = total_fallback_allocs + 1
+    return memory.kmalloc(size)
+  }
+
+  // Pop from free list
+  let node: *FreeNode = pool.free_list
+  pool.free_list = node.next
+  pool.free_count = pool.free_count - 1
+
+  pool.allocations = pool.allocations + 1
+  total_pool_allocs = total_pool_allocs + 1
+
+  return node
+}
+
+// Free back to pool
+export fn pool_free(ptr: u64) {
+  if initialized == 0 {
+    foundation.serial_write_string("[Pool] Not initialized, using kfree\n")
+    memory.kfree(ptr)
+    return
+  }
+
+  if ptr == 0 { return }
+
+  // Find which pool this belongs to
+  var found: u32 = 0
+  var i: u32 = 0
+
+  loop {
+    if i >= pool_count { break }
+
+    let pool: *MemoryPool = &pools[i]
+    let config: *PoolConfig = &pool_configs[pool.config_idx]
+
+    let pool_end: u64 = pool.base_addr + (config.object_size * config.objects_per_pool)
+
+    if ptr >= pool.base_addr && ptr < pool_end {
+      // This belongs to this pool
+      let node: *FreeNode = ptr
+
+      node.next = pool.free_list
+      pool.free_list = node
+      pool.free_count = pool.free_count + 1
+
+      pool.frees = pool.frees + 1
+      total_pool_frees = total_pool_frees + 1
+
+      found = 1
+      break
+    }
+
+    i = i + 1
+  }
+
+  if found == 0 {
+    // Not from a pool, use kfree
+    memory.kfree(ptr)
+  }
+}
+
+// Get pool statistics
+export fn pool_print_stats() {
+  if initialized == 0 {
+    foundation.serial_write_string("[Pool] Not initialized\n")
+    return
+  }
+
+  foundation.serial_write_string("\n========== MEMORY POOL STATISTICS ==========\n\n")
+
+  foundation.serial_write_string("Total pools: ")
+  foundation.serial_write_u64(pool_count)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Pool allocations: ")
+  foundation.serial_write_u64(total_pool_allocs)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Pool frees: ")
+  foundation.serial_write_u64(total_pool_frees)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Fallback (kmalloc) allocations: ")
+  foundation.serial_write_u64(total_fallback_allocs)
+  foundation.serial_write_string("\n")
+
+  if total_pool_allocs + total_fallback_allocs > 0 {
+    let pool_percent: u64 = (total_pool_allocs * 100) / (total_pool_allocs + total_fallback_allocs)
+    foundation.serial_write_string("Pool hit rate: ")
+    foundation.serial_write_u64(pool_percent)
+    foundation.serial_write_string("%\n")
+  }
+
+  foundation.serial_write_string("\nPer-pool statistics:\n\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= pool_count { break }
+
+    let pool: *MemoryPool = &pools[i]
+    let config: *PoolConfig = &pool_configs[pool.config_idx]
+
+    foundation.serial_write_string("Pool ")
+    foundation.serial_write_u64(i)
+    foundation.serial_write_string(" (")
+    foundation.serial_write_u64(config.object_size)
+    foundation.serial_write_string(" bytes):\n")
+
+    foundation.serial_write_string("  Total objects: ")
+    foundation.serial_write_u64(pool.total_count)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Free objects: ")
+    foundation.serial_write_u64(pool.free_count)
+    foundation.serial_write_string("\n")
+
+    let used_count: u32 = pool.total_count - pool.free_count
+    foundation.serial_write_string("  Used objects: ")
+    foundation.serial_write_u64(used_count)
+    foundation.serial_write_string("\n")
+
+    if pool.total_count > 0 {
+      let utilization: u64 = (used_count * 100) / pool.total_count
+      foundation.serial_write_string("  Utilization: ")
+      foundation.serial_write_u64(utilization)
+      foundation.serial_write_string("%\n")
+    }
+
+    foundation.serial_write_string("  Allocations served: ")
+    foundation.serial_write_u64(pool.allocations)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Frees processed: ")
+    foundation.serial_write_u64(pool.frees)
+    foundation.serial_write_string("\n\n")
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("============================================\n\n")
+}
+
+// Get pool utilization summary
+export fn pool_get_utilization(): u32 {
+  if initialized == 0 { return 0 }
+
+  var total_objects: u32 = 0
+  var used_objects: u32 = 0
+
+  var i: u32 = 0
+  loop {
+    if i >= pool_count { break }
+
+    let pool: *MemoryPool = &pools[i]
+
+    total_objects = total_objects + pool.total_count
+    used_objects = used_objects + (pool.total_count - pool.free_count)
+
+    i = i + 1
+  }
+
+  if total_objects == 0 { return 0 }
+
+  return (used_objects * 100) / total_objects
+}
+
+// Calculate total pool memory usage
+export fn pool_get_total_memory(): u64 {
+  if initialized == 0 { return 0 }
+
+  var total: u64 = 0
+
+  var i: u32 = 0
+  loop {
+    if i >= pool_count { break }
+
+    let pool: *MemoryPool = &pools[i]
+    let config: *PoolConfig = &pool_configs[pool.config_idx]
+
+    total = total + (config.object_size * config.objects_per_pool)
+
+    i = i + 1
+  }
+
+  return total
+}
+
+// Calculate wasted memory (internal fragmentation)
+export fn pool_get_wasted_memory(): u64 {
+  if initialized == 0 { return 0 }
+
+  // For pools, wasted memory is the difference between allocated object size
+  // and actual object size. This is tracked at allocation time in real implementations.
+  // For now, we estimate as free objects * average object size
+  var wasted: u64 = 0
+
+  var i: u32 = 0
+  loop {
+    if i >= pool_count { break }
+
+    let pool: *MemoryPool = &pools[i]
+    let config: *PoolConfig = &pool_configs[pool.config_idx]
+
+    // Free objects are wasted space
+    wasted = wasted + (pool.free_count * config.object_size)
+
+    i = i + 1
+  }
+
+  return wasted
+}
+
+// Shutdown pools
+export fn pool_shutdown() {
+  if initialized == 0 { return }
+
+  pool_print_stats()
+
+  var i: u32 = 0
+  loop {
+    if i >= pool_count { break }
+
+    let pool: *MemoryPool = &pools[i]
+    memory.kfree(pool.base_addr)
+
+    i = i + 1
+  }
+
+  pool_count = 0
+  initialized = 0
+
+  foundation.serial_write_string("[Pool] Shutdown complete\n")
+}

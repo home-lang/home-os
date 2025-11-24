@@ -1,0 +1,449 @@
+// home-os ZRAM - Compressed RAM Block Device
+// Provides compressed swap in RAM for memory-constrained devices
+// Target: 2:1 compression ratio for Pi 3 B+ (1GB RAM)
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "./swap.home" as swap
+
+// ZRAM Configuration
+const ZRAM_MAX_SIZE: u64 = 512 * 1024 * 1024  // 512MB max (2:1 = 1GB effective)
+const ZRAM_PAGE_SIZE: u32 = 4096
+const ZRAM_MAX_PAGES: u32 = 131072  // 512MB / 4KB
+const ZRAM_COMPRESSION_RATIO: u32 = 2  // Target 2:1 compression
+
+// Compression algorithms (simplified LZ4-style)
+const ZRAM_COMP_NONE: u8 = 0
+const ZRAM_COMP_LZ4: u8 = 1
+const ZRAM_COMP_ZSTD: u8 = 2
+
+// ZRAM page table entry
+struct ZramPageEntry {
+  physical_addr: u64     // Physical address of compressed data
+  compressed_size: u32   // Actual compressed size
+  flags: u32             // Status flags
+}
+
+// ZRAM page flags
+const ZRAM_FLAG_ALLOCATED: u32 = 1 << 0
+const ZRAM_FLAG_COMPRESSED: u32 = 1 << 1
+const ZRAM_FLAG_ZERO_PAGE: u32 = 1 << 2
+
+// ZRAM device state
+struct ZramDevice {
+  page_table: *ZramPageEntry   // Page table for all ZRAM pages
+  storage_pool: u64             // Physical memory pool for compressed data
+  storage_used: u64             // Bytes used in storage pool
+  storage_capacity: u64         // Total storage pool capacity
+  pages_stored: u32             // Number of pages stored
+  pages_zero: u32               // Number of zero pages (not stored)
+  compression_algo: u8          // Compression algorithm in use
+  initialized: u32              // Initialization flag
+}
+
+var zram_dev: ZramDevice
+
+// Statistics
+var zram_stats_reads: u64 = 0
+var zram_stats_writes: u64 = 0
+var zram_stats_compressed_bytes: u64 = 0
+var zram_stats_uncompressed_bytes: u64 = 0
+
+// Initialize ZRAM device
+export fn zram_init(size: u64, algo: u8) {
+  if zram_dev.initialized == 1 {
+    foundation.serial_write_string("[ZRAM] Already initialized\n")
+    return
+  }
+
+  // Allocate page table
+  let table_size: u64 = ZRAM_MAX_PAGES * 16  // sizeof(ZramPageEntry) = 16
+  zram_dev.page_table = memory.kmalloc(table_size)
+
+  if zram_dev.page_table == 0 {
+    foundation.serial_write_string("[ZRAM] Failed to allocate page table\n")
+    return
+  }
+
+  // Allocate storage pool
+  let actual_size: u64 = if size > ZRAM_MAX_SIZE { ZRAM_MAX_SIZE } else { size }
+  zram_dev.storage_pool = memory.kmalloc(actual_size)
+
+  if zram_dev.storage_pool == 0 {
+    foundation.serial_write_string("[ZRAM] Failed to allocate storage pool\n")
+    memory.kfree(zram_dev.page_table)
+    return
+  }
+
+  // Initialize device state
+  zram_dev.storage_capacity = actual_size
+  zram_dev.storage_used = 0
+  zram_dev.pages_stored = 0
+  zram_dev.pages_zero = 0
+  zram_dev.compression_algo = algo
+  zram_dev.initialized = 1
+
+  // Zero out page table
+  memory.memset(zram_dev.page_table, 0, table_size)
+
+  foundation.serial_write_string("[ZRAM] Initialized ")
+  foundation.serial_write_u64(actual_size / 1024 / 1024)
+  foundation.serial_write_string("MB storage (")
+
+  if algo == ZRAM_COMP_LZ4 {
+    foundation.serial_write_string("LZ4")
+  } else if algo == ZRAM_COMP_ZSTD {
+    foundation.serial_write_string("ZSTD")
+  } else {
+    foundation.serial_write_string("NONE")
+  }
+
+  foundation.serial_write_string(" compression)\n")
+}
+
+// Check if a page is all zeros
+fn is_zero_page(data: *u8, size: u32): u32 {
+  var i: u32 = 0
+  loop {
+    if i >= size { break }
+
+    let ptr: *u8 = data + i
+    if *ptr != 0 { return 0 }
+
+    i = i + 1
+  }
+  return 1
+}
+
+// Simple LZ4-style compression (run-length encoding for zeros)
+// Real implementation would use proper LZ4 or ZSTD
+fn zram_compress_lz4(src: *u8, src_len: u32, dst: *u8, dst_capacity: u32): u32 {
+  var src_pos: u32 = 0
+  var dst_pos: u32 = 0
+
+  loop {
+    if src_pos >= src_len { break }
+    if dst_pos >= dst_capacity { return 0 }  // Not enough space
+
+    let src_ptr: *u8 = src + src_pos
+    let byte_val: u8 = *src_ptr
+
+    // Count consecutive identical bytes (simple RLE)
+    var run_len: u32 = 1
+    loop {
+      if src_pos + run_len >= src_len { break }
+      if run_len >= 255 { break }
+
+      let next_ptr: *u8 = src + src_pos + run_len
+      if *next_ptr != byte_val { break }
+
+      run_len = run_len + 1
+    }
+
+    // Store: length byte + data byte
+    let dst_len_ptr: *u8 = dst + dst_pos
+    *dst_len_ptr = run_len
+    dst_pos = dst_pos + 1
+
+    if dst_pos >= dst_capacity { return 0 }
+
+    let dst_data_ptr: *u8 = dst + dst_pos
+    *dst_data_ptr = byte_val
+    dst_pos = dst_pos + 1
+
+    src_pos = src_pos + run_len
+  }
+
+  return dst_pos
+}
+
+// Simple LZ4-style decompression
+fn zram_decompress_lz4(src: *u8, src_len: u32, dst: *u8, dst_capacity: u32): u32 {
+  var src_pos: u32 = 0
+  var dst_pos: u32 = 0
+
+  loop {
+    if src_pos >= src_len { break }
+    if dst_pos >= dst_capacity { return 0 }
+
+    // Read length
+    let src_len_ptr: *u8 = src + src_pos
+    let run_len: u32 = *src_len_ptr
+    src_pos = src_pos + 1
+
+    if src_pos >= src_len { return 0 }
+
+    // Read data byte
+    let src_data_ptr: *u8 = src + src_pos
+    let byte_val: u8 = *src_data_ptr
+    src_pos = src_pos + 1
+
+    // Write run
+    var i: u32 = 0
+    loop {
+      if i >= run_len { break }
+      if dst_pos >= dst_capacity { return 0 }
+
+      let dst_ptr: *u8 = dst + dst_pos
+      *dst_ptr = byte_val
+      dst_pos = dst_pos + 1
+      i = i + 1
+    }
+  }
+
+  return dst_pos
+}
+
+// Write a page to ZRAM
+export fn zram_write_page(page_index: u32, data: *u8): u32 {
+  if zram_dev.initialized == 0 {
+    foundation.serial_write_string("[ZRAM] Not initialized\n")
+    return 1
+  }
+
+  if page_index >= ZRAM_MAX_PAGES {
+    foundation.serial_write_string("[ZRAM] Invalid page index\n")
+    return 1
+  }
+
+  // Get page table entry
+  let entry: *ZramPageEntry = zram_dev.page_table + (page_index * 16)
+
+  // Check if page is already allocated, free it first
+  if (entry.flags & ZRAM_FLAG_ALLOCATED) != 0 {
+    zram_free_page_internal(entry)
+  }
+
+  // Check for zero page (optimization)
+  if is_zero_page(data, ZRAM_PAGE_SIZE) == 1 {
+    entry.flags = ZRAM_FLAG_ALLOCATED | ZRAM_FLAG_ZERO_PAGE
+    entry.physical_addr = 0
+    entry.compressed_size = 0
+    zram_dev.pages_zero = zram_dev.pages_zero + 1
+    zram_stats_writes = zram_stats_writes + 1
+    return 0
+  }
+
+  // Allocate temporary compression buffer
+  let comp_buffer: *u8 = memory.kmalloc(ZRAM_PAGE_SIZE)
+  if comp_buffer == 0 {
+    foundation.serial_write_string("[ZRAM] Compression buffer allocation failed\n")
+    return 1
+  }
+
+  // Compress the page
+  var compressed_size: u32 = 0
+
+  if zram_dev.compression_algo == ZRAM_COMP_LZ4 {
+    compressed_size = zram_compress_lz4(data, ZRAM_PAGE_SIZE, comp_buffer, ZRAM_PAGE_SIZE)
+  } else {
+    // No compression - just copy
+    memory.memcpy(comp_buffer, data, ZRAM_PAGE_SIZE)
+    compressed_size = ZRAM_PAGE_SIZE
+  }
+
+  if compressed_size == 0 || compressed_size > ZRAM_PAGE_SIZE {
+    // Compression failed or data is incompressible, store uncompressed
+    memory.kfree(comp_buffer)
+    compressed_size = ZRAM_PAGE_SIZE
+
+    if zram_dev.storage_used + compressed_size > zram_dev.storage_capacity {
+      foundation.serial_write_string("[ZRAM] Out of storage space\n")
+      return 1
+    }
+
+    let storage_addr: u64 = zram_dev.storage_pool + zram_dev.storage_used
+    memory.memcpy(storage_addr, data, ZRAM_PAGE_SIZE)
+
+    entry.physical_addr = storage_addr
+    entry.compressed_size = compressed_size
+    entry.flags = ZRAM_FLAG_ALLOCATED
+
+    zram_dev.storage_used = zram_dev.storage_used + compressed_size
+  } else {
+    // Compression successful
+    if zram_dev.storage_used + compressed_size > zram_dev.storage_capacity {
+      foundation.serial_write_string("[ZRAM] Out of storage space\n")
+      memory.kfree(comp_buffer)
+      return 1
+    }
+
+    let storage_addr: u64 = zram_dev.storage_pool + zram_dev.storage_used
+    memory.memcpy(storage_addr, comp_buffer, compressed_size)
+    memory.kfree(comp_buffer)
+
+    entry.physical_addr = storage_addr
+    entry.compressed_size = compressed_size
+    entry.flags = ZRAM_FLAG_ALLOCATED | ZRAM_FLAG_COMPRESSED
+
+    zram_dev.storage_used = zram_dev.storage_used + compressed_size
+  }
+
+  zram_dev.pages_stored = zram_dev.pages_stored + 1
+  zram_stats_writes = zram_stats_writes + 1
+  zram_stats_compressed_bytes = zram_stats_compressed_bytes + compressed_size
+  zram_stats_uncompressed_bytes = zram_stats_uncompressed_bytes + ZRAM_PAGE_SIZE
+
+  return 0
+}
+
+// Read a page from ZRAM
+export fn zram_read_page(page_index: u32, data: *u8): u32 {
+  if zram_dev.initialized == 0 {
+    foundation.serial_write_string("[ZRAM] Not initialized\n")
+    return 1
+  }
+
+  if page_index >= ZRAM_MAX_PAGES {
+    foundation.serial_write_string("[ZRAM] Invalid page index\n")
+    return 1
+  }
+
+  let entry: *ZramPageEntry = zram_dev.page_table + (page_index * 16)
+
+  if (entry.flags & ZRAM_FLAG_ALLOCATED) == 0 {
+    foundation.serial_write_string("[ZRAM] Page not allocated\n")
+    return 1
+  }
+
+  // Handle zero page
+  if (entry.flags & ZRAM_FLAG_ZERO_PAGE) != 0 {
+    memory.memset(data, 0, ZRAM_PAGE_SIZE)
+    zram_stats_reads = zram_stats_reads + 1
+    return 0
+  }
+
+  // Decompress page
+  if (entry.flags & ZRAM_FLAG_COMPRESSED) != 0 {
+    let decompressed_size: u32 = 0
+
+    if zram_dev.compression_algo == ZRAM_COMP_LZ4 {
+      decompressed_size = zram_decompress_lz4(entry.physical_addr, entry.compressed_size, data, ZRAM_PAGE_SIZE)
+    } else {
+      memory.memcpy(data, entry.physical_addr, entry.compressed_size)
+      decompressed_size = entry.compressed_size
+    }
+
+    if decompressed_size == 0 {
+      foundation.serial_write_string("[ZRAM] Decompression failed\n")
+      return 1
+    }
+  } else {
+    // Uncompressed data
+    memory.memcpy(data, entry.physical_addr, entry.compressed_size)
+  }
+
+  zram_stats_reads = zram_stats_reads + 1
+  return 0
+}
+
+// Free a ZRAM page internally
+fn zram_free_page_internal(entry: *ZramPageEntry) {
+  if (entry.flags & ZRAM_FLAG_ZERO_PAGE) != 0 {
+    zram_dev.pages_zero = zram_dev.pages_zero - 1
+  } else {
+    zram_dev.storage_used = zram_dev.storage_used - entry.compressed_size
+    zram_dev.pages_stored = zram_dev.pages_stored - 1
+  }
+
+  entry.flags = 0
+  entry.physical_addr = 0
+  entry.compressed_size = 0
+}
+
+// Free a ZRAM page
+export fn zram_free_page(page_index: u32): u32 {
+  if zram_dev.initialized == 0 { return 1 }
+  if page_index >= ZRAM_MAX_PAGES { return 1 }
+
+  let entry: *ZramPageEntry = zram_dev.page_table + (page_index * 16)
+
+  if (entry.flags & ZRAM_FLAG_ALLOCATED) == 0 {
+    return 1  // Already free
+  }
+
+  zram_free_page_internal(entry)
+  return 0
+}
+
+// Get ZRAM statistics
+export fn zram_get_stats() {
+  if zram_dev.initialized == 0 {
+    foundation.serial_write_string("[ZRAM] Not initialized\n")
+    return
+  }
+
+  foundation.serial_write_string("\n[ZRAM] Statistics:\n")
+
+  foundation.serial_write_string("  Storage: ")
+  foundation.serial_write_u64(zram_dev.storage_used / 1024)
+  foundation.serial_write_string(" KB / ")
+  foundation.serial_write_u64(zram_dev.storage_capacity / 1024)
+  foundation.serial_write_string(" KB\n")
+
+  foundation.serial_write_string("  Pages stored: ")
+  foundation.serial_write_u64(zram_dev.pages_stored)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Zero pages: ")
+  foundation.serial_write_u64(zram_dev.pages_zero)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Reads: ")
+  foundation.serial_write_u64(zram_stats_reads)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Writes: ")
+  foundation.serial_write_u64(zram_stats_writes)
+  foundation.serial_write_string("\n")
+
+  if zram_stats_uncompressed_bytes > 0 {
+    let ratio: u64 = (zram_stats_uncompressed_bytes * 100) / zram_stats_compressed_bytes
+    foundation.serial_write_string("  Compression ratio: ")
+    foundation.serial_write_u64(ratio / 100)
+    foundation.serial_write_string(".")
+    foundation.serial_write_u64(ratio % 100)
+    foundation.serial_write_string(":1\n")
+  }
+}
+
+// Get current usage
+export fn zram_get_usage(): u64 {
+  return zram_dev.storage_used
+}
+
+// Get free space
+export fn zram_get_free(): u64 {
+  return zram_dev.storage_capacity - zram_dev.storage_used
+}
+
+// Get compression ratio (percentage)
+export fn zram_get_compression_ratio(): u32 {
+  if zram_stats_compressed_bytes == 0 { return 100 }
+  return (zram_stats_uncompressed_bytes * 100) / zram_stats_compressed_bytes
+}
+
+// Reset ZRAM (clear all pages)
+export fn zram_reset() {
+  if zram_dev.initialized == 0 { return }
+
+  memory.memset(zram_dev.page_table, 0, ZRAM_MAX_PAGES * 16)
+  zram_dev.storage_used = 0
+  zram_dev.pages_stored = 0
+  zram_dev.pages_zero = 0
+
+  foundation.serial_write_string("[ZRAM] Device reset\n")
+}
+
+// Shutdown ZRAM
+export fn zram_shutdown() {
+  if zram_dev.initialized == 0 { return }
+
+  zram_get_stats()
+
+  memory.kfree(zram_dev.storage_pool)
+  memory.kfree(zram_dev.page_table)
+
+  zram_dev.initialized = 0
+  foundation.serial_write_string("[ZRAM] Shutdown complete\n")
+}
