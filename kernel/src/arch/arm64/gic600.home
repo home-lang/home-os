@@ -1,0 +1,488 @@
+// home-os ARM GIC-600 Interrupt Controller Driver
+// Generic Interrupt Controller version 3/4 with GIC-600 extensions
+// Used in Raspberry Pi 5 (BCM2712)
+
+import "../../core/foundation.home" as foundation
+import "../../core/memory.home" as memory
+
+// GIC-600 Base Addresses for BCM2712 (Raspberry Pi 5)
+const GIC600_GICD_BASE: u64 = 0x1F00100000  // Distributor
+const GIC600_GICR_BASE: u64 = 0x1F00140000  // Redistributor
+
+// Distributor registers
+const GICD_CTLR: u64 = GIC600_GICD_BASE + 0x0000
+const GICD_TYPER: u64 = GIC600_GICD_BASE + 0x0004
+const GICD_IIDR: u64 = GIC600_GICD_BASE + 0x0008
+const GICD_IGROUPR: u64 = GIC600_GICD_BASE + 0x0080
+const GICD_ISENABLER: u64 = GIC600_GICD_BASE + 0x0100
+const GICD_ICENABLER: u64 = GIC600_GICD_BASE + 0x0180
+const GICD_ISPENDR: u64 = GIC600_GICD_BASE + 0x0200
+const GICD_ICPENDR: u64 = GIC600_GICD_BASE + 0x0280
+const GICD_ISACTIVER: u64 = GIC600_GICD_BASE + 0x0300
+const GICD_ICACTIVER: u64 = GIC600_GICD_BASE + 0x0380
+const GICD_IPRIORITYR: u64 = GIC600_GICD_BASE + 0x0400
+const GICD_ITARGETSR: u64 = GIC600_GICD_BASE + 0x0800
+const GICD_ICFGR: u64 = GIC600_GICD_BASE + 0x0C00
+const GICD_IROUTER: u64 = GIC600_GICD_BASE + 0x6000
+
+// Redistributor registers (per CPU)
+const GICR_CTLR: u64 = 0x0000
+const GICR_IIDR: u64 = 0x0004
+const GICR_TYPER: u64 = 0x0008
+const GICR_WAKER: u64 = 0x0014
+const GICR_IGROUPR0: u64 = 0x10080
+const GICR_ISENABLER0: u64 = 0x10100
+const GICR_ICENABLER0: u64 = 0x10180
+const GICR_ISPENDR0: u64 = 0x10200
+const GICR_ICPENDR0: u64 = 0x10280
+const GICR_ISACTIVER0: u64 = 0x10300
+const GICR_ICACTIVER0: u64 = 0x10380
+const GICR_IPRIORITYR: u64 = 0x10400
+const GICR_ICFGR0: u64 = 0x10C00
+
+// GIC control register bits
+const GICD_CTLR_ENABLE_GRP0: u32 = 1 << 0
+const GICD_CTLR_ENABLE_GRP1NS: u32 = 1 << 1
+const GICD_CTLR_ENABLE_GRP1S: u32 = 1 << 2
+const GICD_CTLR_ARE_S: u32 = 1 << 4
+const GICD_CTLR_ARE_NS: u32 = 1 << 5
+const GICD_CTLR_DS: u32 = 1 << 6
+const GICD_CTLR_RWP: u32 = 1 << 31
+
+// Redistributor waker bits
+const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1
+const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2
+
+// Interrupt types
+const GIC_INT_TYPE_LEVEL: u32 = 0
+const GIC_INT_TYPE_EDGE: u32 = 2
+
+// Interrupt priorities (lower = higher priority)
+const GIC_PRIORITY_HIGHEST: u32 = 0x00
+const GIC_PRIORITY_HIGH: u32 = 0x40
+const GIC_PRIORITY_NORMAL: u32 = 0x80
+const GIC_PRIORITY_LOW: u32 = 0xC0
+const GIC_PRIORITY_LOWEST: u32 = 0xF0
+
+// Interrupt ID ranges
+const GIC_SGI_BASE: u32 = 0      // Software Generated Interrupts (0-15)
+const GIC_PPI_BASE: u32 = 16     // Private Peripheral Interrupts (16-31)
+const GIC_SPI_BASE: u32 = 32     // Shared Peripheral Interrupts (32+)
+const GIC_MAX_INTERRUPTS: u32 = 1020
+
+// GIC-600 specific features
+const GIC600_MAX_CPUS: u32 = 4
+const GIC600_REDISTRIBUTOR_STRIDE: u64 = 0x20000
+
+// Interrupt handler type
+type InterruptHandler = fn(irq: u32, context: u64)
+
+// Interrupt descriptor
+struct InterruptDescriptor {
+  handler: InterruptHandler
+  context: u64
+  priority: u32
+  enabled: u32
+  trigger_type: u32  // Level or edge
+}
+
+// GIC-600 controller state
+struct GIC600Controller {
+  gicd_base: u64
+  gicr_base: u64
+  num_cpus: u32
+  num_interrupts: u32
+  initialized: u32
+}
+
+var gic600: GIC600Controller
+var interrupt_descriptors: [GIC_MAX_INTERRUPTS]InterruptDescriptor
+
+// Statistics
+var total_interrupts: u64 = 0
+var spurious_interrupts: u64 = 0
+var unhandled_interrupts: u64 = 0
+
+// Read GIC register
+fn gic_read_reg(addr: u64): u32 {
+  return memory.read_u32(addr)
+}
+
+// Write GIC register
+fn gic_write_reg(addr: u64, value: u32) {
+  memory.write_u32(addr, value)
+}
+
+// Get redistributor base for CPU
+fn gic_get_redistributor(cpu_id: u32): u64 {
+  return gic600.gicr_base + (cpu_id * GIC600_REDISTRIBUTOR_STRIDE)
+}
+
+// Wait for register write pending to clear
+fn gic_wait_rwp() {
+  var timeout: u32 = 100000
+  loop {
+    if timeout == 0 { break }
+
+    let ctlr: u32 = gic_read_reg(GICD_CTLR)
+    if (ctlr & GICD_CTLR_RWP) == 0 {
+      break
+    }
+
+    timeout = timeout - 1
+  }
+}
+
+// Initialize GIC-600 distributor
+fn gic600_init_distributor(): u32 {
+  foundation.serial_write_string("[GIC-600] Initializing distributor...\n")
+
+  // Disable distributor
+  gic_write_reg(GICD_CTLR, 0)
+  gic_wait_rwp()
+
+  // Read number of interrupt lines
+  let typer: u32 = gic_read_reg(GICD_TYPER)
+  gic600.num_interrupts = ((typer & 0x1F) + 1) * 32
+
+  foundation.serial_write_string("[GIC-600] Supports ")
+  foundation.serial_write_u64(gic600.num_interrupts)
+  foundation.serial_write_string(" interrupt lines\n")
+
+  // Disable all SPIs
+  var i: u32 = GIC_SPI_BASE / 32
+  loop {
+    if i >= (gic600.num_interrupts / 32) { break }
+
+    gic_write_reg(GICD_ICENABLER + (i * 4), 0xFFFFFFFF)
+    i = i + 1
+  }
+
+  // Clear all pending SPIs
+  i = GIC_SPI_BASE / 32
+  loop {
+    if i >= (gic600.num_interrupts / 32) { break }
+
+    gic_write_reg(GICD_ICPENDR + (i * 4), 0xFFFFFFFF)
+    i = i + 1
+  }
+
+  // Set all SPIs to Group 1 (non-secure)
+  i = GIC_SPI_BASE / 32
+  loop {
+    if i >= (gic600.num_interrupts / 32) { break }
+
+    gic_write_reg(GICD_IGROUPR + (i * 4), 0xFFFFFFFF)
+    i = i + 1
+  }
+
+  // Set default priority for all SPIs
+  i = GIC_SPI_BASE
+  loop {
+    if i >= gic600.num_interrupts { break }
+
+    gic_write_reg(GICD_IPRIORITYR + i, GIC_PRIORITY_NORMAL)
+    i = i + 1
+  }
+
+  // Configure all SPIs as level-triggered
+  i = GIC_SPI_BASE / 16
+  loop {
+    if i >= (gic600.num_interrupts / 16) { break }
+
+    gic_write_reg(GICD_ICFGR + (i * 4), 0)
+    i = i + 1
+  }
+
+  // Enable distributor with affinity routing
+  let ctlr: u32 = GICD_CTLR_ENABLE_GRP1NS | GICD_CTLR_ARE_NS
+  gic_write_reg(GICD_CTLR, ctlr)
+  gic_wait_rwp()
+
+  foundation.serial_write_string("[GIC-600] Distributor initialized\n")
+  return 0
+}
+
+// Initialize GIC-600 redistributor for current CPU
+fn gic600_init_redistributor(cpu_id: u32): u32 {
+  foundation.serial_write_string("[GIC-600] Initializing redistributor for CPU ")
+  foundation.serial_write_u64(cpu_id)
+  foundation.serial_write_string("\n")
+
+  let gicr_base: u64 = gic_get_redistributor(cpu_id)
+
+  // Wake up redistributor
+  let waker: u32 = gic_read_reg(gicr_base + GICR_WAKER)
+  gic_write_reg(gicr_base + GICR_WAKER, waker & ~GICR_WAKER_PROCESSOR_SLEEP)
+
+  // Wait for children to wake up
+  var timeout: u32 = 100000
+  loop {
+    if timeout == 0 { break }
+
+    let waker_status: u32 = gic_read_reg(gicr_base + GICR_WAKER)
+    if (waker_status & GICR_WAKER_CHILDREN_ASLEEP) == 0 {
+      break
+    }
+
+    timeout = timeout - 1
+  }
+
+  // Disable all SGIs and PPIs
+  gic_write_reg(gicr_base + GICR_ICENABLER0, 0xFFFFFFFF)
+
+  // Clear all pending SGIs and PPIs
+  gic_write_reg(gicr_base + GICR_ICPENDR0, 0xFFFFFFFF)
+
+  // Set all SGIs and PPIs to Group 1
+  gic_write_reg(gicr_base + GICR_IGROUPR0, 0xFFFFFFFF)
+
+  // Set default priority for all SGIs and PPIs
+  var i: u32 = 0
+  loop {
+    if i >= 32 { break }
+
+    gic_write_reg(gicr_base + GICR_IPRIORITYR + i, GIC_PRIORITY_NORMAL)
+    i = i + 1
+  }
+
+  foundation.serial_write_string("[GIC-600] Redistributor initialized for CPU ")
+  foundation.serial_write_u64(cpu_id)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Initialize CPU interface (system registers)
+fn gic600_init_cpu_interface(): u32 {
+  foundation.serial_write_string("[GIC-600] Initializing CPU interface\n")
+
+  // These would be done via system register writes in real implementation
+  // ICC_PMR_EL1 = 0xFF (unmask all priorities)
+  // ICC_BPR1_EL1 = 0 (no priority grouping)
+  // ICC_IGRPEN1_EL1 = 1 (enable Group 1 interrupts)
+  // ICC_CTLR_EL1 = 0 (default settings)
+
+  foundation.serial_write_string("[GIC-600] CPU interface initialized\n")
+  return 0
+}
+
+// Initialize GIC-600
+export fn gic600_init(): u32 {
+  if gic600.initialized == 1 {
+    foundation.serial_write_string("[GIC-600] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[GIC-600] Initializing Generic Interrupt Controller v3/4\n")
+
+  gic600.gicd_base = GIC600_GICD_BASE
+  gic600.gicr_base = GIC600_GICR_BASE
+  gic600.num_cpus = GIC600_MAX_CPUS
+  gic600.num_interrupts = 0
+
+  // Initialize interrupt descriptors
+  var i: u32 = 0
+  loop {
+    if i >= GIC_MAX_INTERRUPTS { break }
+
+    interrupt_descriptors[i].handler = 0
+    interrupt_descriptors[i].context = 0
+    interrupt_descriptors[i].priority = GIC_PRIORITY_NORMAL
+    interrupt_descriptors[i].enabled = 0
+    interrupt_descriptors[i].trigger_type = GIC_INT_TYPE_LEVEL
+
+    i = i + 1
+  }
+
+  // Initialize distributor
+  if gic600_init_distributor() != 0 {
+    foundation.serial_write_string("[GIC-600] Failed to initialize distributor\n")
+    return 1
+  }
+
+  // Initialize redistributor for CPU 0
+  if gic600_init_redistributor(0) != 0 {
+    foundation.serial_write_string("[GIC-600] Failed to initialize redistributor\n")
+    return 1
+  }
+
+  // Initialize CPU interface
+  if gic600_init_cpu_interface() != 0 {
+    foundation.serial_write_string("[GIC-600] Failed to initialize CPU interface\n")
+    return 1
+  }
+
+  gic600.initialized = 1
+
+  foundation.serial_write_string("[GIC-600] Initialization complete\n")
+  return 0
+}
+
+// Register interrupt handler
+export fn gic600_register_handler(irq: u32, handler: InterruptHandler, context: u64, priority: u32): u32 {
+  if gic600.initialized == 0 { return 1 }
+  if irq >= GIC_MAX_INTERRUPTS { return 1 }
+  if handler == 0 { return 1 }
+
+  interrupt_descriptors[irq].handler = handler
+  interrupt_descriptors[irq].context = context
+  interrupt_descriptors[irq].priority = priority
+
+  // Set priority in hardware
+  if irq >= GIC_SPI_BASE {
+    gic_write_reg(GICD_IPRIORITYR + irq, priority)
+  }
+
+  foundation.serial_write_string("[GIC-600] Registered handler for IRQ ")
+  foundation.serial_write_u64(irq)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Enable interrupt
+export fn gic600_enable_interrupt(irq: u32): u32 {
+  if gic600.initialized == 0 { return 1 }
+  if irq >= GIC_MAX_INTERRUPTS { return 1 }
+
+  interrupt_descriptors[irq].enabled = 1
+
+  if irq >= GIC_SPI_BASE {
+    // SPI - enable in distributor
+    let reg_offset: u32 = (irq / 32) * 4
+    let bit: u32 = 1 << (irq % 32)
+    gic_write_reg(GICD_ISENABLER + reg_offset, bit)
+  } else {
+    // SGI/PPI - enable in redistributor
+    let gicr_base: u64 = gic_get_redistributor(0)  // CPU 0 for now
+    let bit: u32 = 1 << irq
+    gic_write_reg(gicr_base + GICR_ISENABLER0, bit)
+  }
+
+  return 0
+}
+
+// Disable interrupt
+export fn gic600_disable_interrupt(irq: u32): u32 {
+  if gic600.initialized == 0 { return 1 }
+  if irq >= GIC_MAX_INTERRUPTS { return 1 }
+
+  interrupt_descriptors[irq].enabled = 0
+
+  if irq >= GIC_SPI_BASE {
+    // SPI - disable in distributor
+    let reg_offset: u32 = (irq / 32) * 4
+    let bit: u32 = 1 << (irq % 32)
+    gic_write_reg(GICD_ICENABLER + reg_offset, bit)
+  } else {
+    // SGI/PPI - disable in redistributor
+    let gicr_base: u64 = gic_get_redistributor(0)
+    let bit: u32 = 1 << irq
+    gic_write_reg(gicr_base + GICR_ICENABLER0, bit)
+  }
+
+  return 0
+}
+
+// Set interrupt trigger type
+export fn gic600_set_trigger_type(irq: u32, trigger_type: u32): u32 {
+  if gic600.initialized == 0 { return 1 }
+  if irq >= GIC_MAX_INTERRUPTS { return 1 }
+
+  interrupt_descriptors[irq].trigger_type = trigger_type
+
+  if irq >= GIC_SPI_BASE {
+    let reg_offset: u32 = (irq / 16) * 4
+    let shift: u32 = (irq % 16) * 2
+
+    var cfg: u32 = gic_read_reg(GICD_ICFGR + reg_offset)
+    cfg = cfg & ~(0x3 << shift)
+    cfg = cfg | (trigger_type << shift)
+    gic_write_reg(GICD_ICFGR + reg_offset, cfg)
+  }
+
+  return 0
+}
+
+// Acknowledge interrupt (read IAR)
+export fn gic600_acknowledge_interrupt(): u32 {
+  // In real implementation, would read ICC_IAR1_EL1 system register
+  // For now, return placeholder
+  total_interrupts = total_interrupts + 1
+  return 0xFFFFFFFF  // Spurious interrupt
+}
+
+// End of interrupt (write EOIR)
+export fn gic600_end_of_interrupt(irq: u32) {
+  // In real implementation, would write to ICC_EOIR1_EL1 system register
+}
+
+// Handle interrupt
+export fn gic600_handle_interrupt() {
+  let irq: u32 = gic600_acknowledge_interrupt()
+
+  if irq >= GIC_MAX_INTERRUPTS {
+    spurious_interrupts = spurious_interrupts + 1
+    return
+  }
+
+  let desc: *InterruptDescriptor = &interrupt_descriptors[irq]
+
+  if desc.handler != 0 {
+    desc.handler(irq, desc.context)
+  } else {
+    unhandled_interrupts = unhandled_interrupts + 1
+    foundation.serial_write_string("[GIC-600] Unhandled interrupt: ")
+    foundation.serial_write_u64(irq)
+    foundation.serial_write_string("\n")
+  }
+
+  gic600_end_of_interrupt(irq)
+}
+
+// Send SGI (Software Generated Interrupt)
+export fn gic600_send_sgi(target_cpu: u32, sgi_id: u32): u32 {
+  if gic600.initialized == 0 { return 1 }
+  if sgi_id >= 16 { return 1 }
+  if target_cpu >= gic600.num_cpus { return 1 }
+
+  // In real implementation, would write to ICC_SGI1R_EL1 system register
+  foundation.serial_write_string("[GIC-600] Sending SGI ")
+  foundation.serial_write_u64(sgi_id)
+  foundation.serial_write_string(" to CPU ")
+  foundation.serial_write_u64(target_cpu)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Get number of supported interrupts
+export fn gic600_get_num_interrupts(): u32 {
+  return gic600.num_interrupts
+}
+
+// Print statistics
+export fn gic600_print_stats() {
+  foundation.serial_write_string("\n[GIC-600] Statistics:\n")
+
+  foundation.serial_write_string("  Total interrupts: ")
+  foundation.serial_write_u64(total_interrupts)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Spurious interrupts: ")
+  foundation.serial_write_u64(spurious_interrupts)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Unhandled interrupts: ")
+  foundation.serial_write_u64(unhandled_interrupts)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Supported interrupt lines: ")
+  foundation.serial_write_u64(gic600.num_interrupts)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Number of CPUs: ")
+  foundation.serial_write_u64(gic600.num_cpus)
+  foundation.serial_write_string("\n")
+}

@@ -1,0 +1,485 @@
+// home-os ARM GIC-400 Interrupt Controller Driver
+// Generic Interrupt Controller version 2
+// Used in Raspberry Pi 4 (BCM2711)
+
+import "../../core/foundation.home" as foundation
+import "../../core/memory.home" as memory
+
+// GIC-400 Base Addresses for BCM2711 (Raspberry Pi 4)
+const GIC400_GICD_BASE: u64 = 0xFF841000  // Distributor
+const GIC400_GICC_BASE: u64 = 0xFF842000  // CPU Interface
+
+// Distributor registers
+const GICD_CTLR: u64 = GIC400_GICD_BASE + 0x0000
+const GICD_TYPER: u64 = GIC400_GICD_BASE + 0x0004
+const GICD_IIDR: u64 = GIC400_GICD_BASE + 0x0008
+const GICD_IGROUPR: u64 = GIC400_GICD_BASE + 0x0080
+const GICD_ISENABLER: u64 = GIC400_GICD_BASE + 0x0100
+const GICD_ICENABLER: u64 = GIC400_GICD_BASE + 0x0180
+const GICD_ISPENDR: u64 = GIC400_GICD_BASE + 0x0200
+const GICD_ICPENDR: u64 = GIC400_GICD_BASE + 0x0280
+const GICD_ISACTIVER: u64 = GIC400_GICD_BASE + 0x0300
+const GICD_ICACTIVER: u64 = GIC400_GICD_BASE + 0x0380
+const GICD_IPRIORITYR: u64 = GIC400_GICD_BASE + 0x0400
+const GICD_ITARGETSR: u64 = GIC400_GICD_BASE + 0x0800
+const GICD_ICFGR: u64 = GIC400_GICD_BASE + 0x0C00
+const GICD_SGIR: u64 = GIC400_GICD_BASE + 0x0F00
+
+// CPU Interface registers
+const GICC_CTLR: u64 = GIC400_GICC_BASE + 0x0000
+const GICC_PMR: u64 = GIC400_GICC_BASE + 0x0004
+const GICC_BPR: u64 = GIC400_GICC_BASE + 0x0008
+const GICC_IAR: u64 = GIC400_GICC_BASE + 0x000C
+const GICC_EOIR: u64 = GIC400_GICC_BASE + 0x0010
+const GICC_RPR: u64 = GIC400_GICC_BASE + 0x0014
+const GICC_HPPIR: u64 = GIC400_GICC_BASE + 0x0018
+const GICC_IIDR: u64 = GIC400_GICC_BASE + 0x00FC
+
+// GIC control register bits
+const GICD_CTLR_ENABLE: u32 = 1 << 0
+
+// CPU interface control bits
+const GICC_CTLR_ENABLE_GRP0: u32 = 1 << 0
+const GICC_CTLR_ENABLE_GRP1: u32 = 1 << 1
+const GICC_CTLR_EOI_MODE: u32 = 1 << 9
+
+// Interrupt types
+const GIC_INT_TYPE_LEVEL: u32 = 0
+const GIC_INT_TYPE_EDGE: u32 = 2
+
+// Interrupt priorities (lower = higher priority)
+const GIC_PRIORITY_HIGHEST: u32 = 0x00
+const GIC_PRIORITY_HIGH: u32 = 0x40
+const GIC_PRIORITY_NORMAL: u32 = 0x80
+const GIC_PRIORITY_LOW: u32 = 0xC0
+const GIC_PRIORITY_LOWEST: u32 = 0xF0
+
+// Interrupt ID ranges
+const GIC_SGI_BASE: u32 = 0      // Software Generated Interrupts (0-15)
+const GIC_PPI_BASE: u32 = 16     // Private Peripheral Interrupts (16-31)
+const GIC_SPI_BASE: u32 = 32     // Shared Peripheral Interrupts (32+)
+const GIC_MAX_INTERRUPTS: u32 = 1020
+
+// Spurious interrupt ID
+const GIC_SPURIOUS_IRQ: u32 = 1023
+
+// GIC-400 specific
+const GIC400_MAX_CPUS: u32 = 4
+
+// Interrupt handler type
+type InterruptHandler = fn(irq: u32, context: u64)
+
+// Interrupt descriptor
+struct InterruptDescriptor {
+  handler: InterruptHandler
+  context: u64
+  priority: u32
+  enabled: u32
+  trigger_type: u32  // Level or edge
+  target_cpu: u32    // CPU affinity
+}
+
+// GIC-400 controller state
+struct GIC400Controller {
+  gicd_base: u64
+  gicc_base: u64
+  num_cpus: u32
+  num_interrupts: u32
+  initialized: u32
+}
+
+var gic400: GIC400Controller
+var interrupt_descriptors: [GIC_MAX_INTERRUPTS]InterruptDescriptor
+
+// Statistics
+var total_interrupts: u64 = 0
+var spurious_interrupts: u64 = 0
+var unhandled_interrupts: u64 = 0
+
+// Read GIC register
+fn gic_read_reg(addr: u64): u32 {
+  return memory.read_u32(addr)
+}
+
+// Write GIC register
+fn gic_write_reg(addr: u64, value: u32) {
+  memory.write_u32(addr, value)
+}
+
+// Initialize GIC-400 distributor
+fn gic400_init_distributor(): u32 {
+  foundation.serial_write_string("[GIC-400] Initializing distributor...\n")
+
+  // Disable distributor
+  gic_write_reg(GICD_CTLR, 0)
+
+  // Read number of interrupt lines
+  let typer: u32 = gic_read_reg(GICD_TYPER)
+  gic400.num_interrupts = ((typer & 0x1F) + 1) * 32
+  gic400.num_cpus = ((typer >> 5) & 0x7) + 1
+
+  foundation.serial_write_string("[GIC-400] Supports ")
+  foundation.serial_write_u64(gic400.num_interrupts)
+  foundation.serial_write_string(" interrupt lines, ")
+  foundation.serial_write_u64(gic400.num_cpus)
+  foundation.serial_write_string(" CPUs\n")
+
+  // Disable all interrupts
+  var i: u32 = 0
+  loop {
+    if i >= (gic400.num_interrupts / 32) { break }
+
+    gic_write_reg(GICD_ICENABLER + (i * 4), 0xFFFFFFFF)
+    i = i + 1
+  }
+
+  // Clear all pending interrupts
+  i = 0
+  loop {
+    if i >= (gic400.num_interrupts / 32) { break }
+
+    gic_write_reg(GICD_ICPENDR + (i * 4), 0xFFFFFFFF)
+    i = i + 1
+  }
+
+  // Set all interrupts to Group 0
+  i = 0
+  loop {
+    if i >= (gic400.num_interrupts / 32) { break }
+
+    gic_write_reg(GICD_IGROUPR + (i * 4), 0)
+    i = i + 1
+  }
+
+  // Set default priority for all interrupts
+  i = 0
+  loop {
+    if i >= gic400.num_interrupts { break }
+
+    gic_write_reg(GICD_IPRIORITYR + i, GIC_PRIORITY_NORMAL)
+    i = i + 1
+  }
+
+  // Set all SPIs to target CPU 0
+  i = GIC_SPI_BASE
+  loop {
+    if i >= gic400.num_interrupts { break }
+
+    gic_write_reg(GICD_ITARGETSR + i, 0x01)  // CPU 0
+    i = i + 1
+  }
+
+  // Configure all interrupts as level-triggered
+  i = 0
+  loop {
+    if i >= (gic400.num_interrupts / 16) { break }
+
+    gic_write_reg(GICD_ICFGR + (i * 4), 0)
+    i = i + 1
+  }
+
+  // Enable distributor
+  gic_write_reg(GICD_CTLR, GICD_CTLR_ENABLE)
+
+  foundation.serial_write_string("[GIC-400] Distributor initialized\n")
+  return 0
+}
+
+// Initialize GIC-400 CPU interface
+fn gic400_init_cpu_interface(): u32 {
+  foundation.serial_write_string("[GIC-400] Initializing CPU interface...\n")
+
+  // Set priority mask to allow all interrupts
+  gic_write_reg(GICC_PMR, 0xFF)
+
+  // Set binary point to 0 (no priority grouping)
+  gic_write_reg(GICC_BPR, 0)
+
+  // Enable CPU interface for Group 0 interrupts
+  gic_write_reg(GICC_CTLR, GICC_CTLR_ENABLE_GRP0)
+
+  foundation.serial_write_string("[GIC-400] CPU interface initialized\n")
+  return 0
+}
+
+// Initialize GIC-400
+export fn gic400_init(): u32 {
+  if gic400.initialized == 1 {
+    foundation.serial_write_string("[GIC-400] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[GIC-400] Initializing Generic Interrupt Controller v2\n")
+
+  gic400.gicd_base = GIC400_GICD_BASE
+  gic400.gicc_base = GIC400_GICC_BASE
+  gic400.num_cpus = 0
+  gic400.num_interrupts = 0
+
+  // Initialize interrupt descriptors
+  var i: u32 = 0
+  loop {
+    if i >= GIC_MAX_INTERRUPTS { break }
+
+    interrupt_descriptors[i].handler = 0
+    interrupt_descriptors[i].context = 0
+    interrupt_descriptors[i].priority = GIC_PRIORITY_NORMAL
+    interrupt_descriptors[i].enabled = 0
+    interrupt_descriptors[i].trigger_type = GIC_INT_TYPE_LEVEL
+    interrupt_descriptors[i].target_cpu = 0
+
+    i = i + 1
+  }
+
+  // Initialize distributor
+  if gic400_init_distributor() != 0 {
+    foundation.serial_write_string("[GIC-400] Failed to initialize distributor\n")
+    return 1
+  }
+
+  // Initialize CPU interface
+  if gic400_init_cpu_interface() != 0 {
+    foundation.serial_write_string("[GIC-400] Failed to initialize CPU interface\n")
+    return 1
+  }
+
+  gic400.initialized = 1
+
+  foundation.serial_write_string("[GIC-400] Initialization complete\n")
+  return 0
+}
+
+// Register interrupt handler
+export fn gic400_register_handler(irq: u32, handler: InterruptHandler, context: u64, priority: u32): u32 {
+  if gic400.initialized == 0 { return 1 }
+  if irq >= GIC_MAX_INTERRUPTS { return 1 }
+  if handler == 0 { return 1 }
+
+  interrupt_descriptors[irq].handler = handler
+  interrupt_descriptors[irq].context = context
+  interrupt_descriptors[irq].priority = priority
+
+  // Set priority in hardware
+  gic_write_reg(GICD_IPRIORITYR + irq, priority)
+
+  foundation.serial_write_string("[GIC-400] Registered handler for IRQ ")
+  foundation.serial_write_u64(irq)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Enable interrupt
+export fn gic400_enable_interrupt(irq: u32): u32 {
+  if gic400.initialized == 0 { return 1 }
+  if irq >= GIC_MAX_INTERRUPTS { return 1 }
+
+  interrupt_descriptors[irq].enabled = 1
+
+  let reg_offset: u32 = (irq / 32) * 4
+  let bit: u32 = 1 << (irq % 32)
+  gic_write_reg(GICD_ISENABLER + reg_offset, bit)
+
+  return 0
+}
+
+// Disable interrupt
+export fn gic400_disable_interrupt(irq: u32): u32 {
+  if gic400.initialized == 0 { return 1 }
+  if irq >= GIC_MAX_INTERRUPTS { return 1 }
+
+  interrupt_descriptors[irq].enabled = 0
+
+  let reg_offset: u32 = (irq / 32) * 4
+  let bit: u32 = 1 << (irq % 32)
+  gic_write_reg(GICD_ICENABLER + reg_offset, bit)
+
+  return 0
+}
+
+// Set interrupt trigger type
+export fn gic400_set_trigger_type(irq: u32, trigger_type: u32): u32 {
+  if gic400.initialized == 0 { return 1 }
+  if irq >= GIC_MAX_INTERRUPTS { return 1 }
+
+  interrupt_descriptors[irq].trigger_type = trigger_type
+
+  let reg_offset: u32 = (irq / 16) * 4
+  let shift: u32 = (irq % 16) * 2
+
+  var cfg: u32 = gic_read_reg(GICD_ICFGR + reg_offset)
+  cfg = cfg & ~(0x3 << shift)
+  cfg = cfg | (trigger_type << shift)
+  gic_write_reg(GICD_ICFGR + reg_offset, cfg)
+
+  return 0
+}
+
+// Set interrupt target CPU
+export fn gic400_set_target_cpu(irq: u32, cpu_mask: u32): u32 {
+  if gic400.initialized == 0 { return 1 }
+  if irq < GIC_SPI_BASE { return 1 }  // Can't set target for SGI/PPI
+  if irq >= GIC_MAX_INTERRUPTS { return 1 }
+
+  interrupt_descriptors[irq].target_cpu = cpu_mask
+
+  gic_write_reg(GICD_ITARGETSR + irq, cpu_mask)
+
+  return 0
+}
+
+// Acknowledge interrupt (read IAR)
+export fn gic400_acknowledge_interrupt(): u32 {
+  let irq: u32 = gic_read_reg(GICC_IAR) & 0x3FF
+
+  if irq != GIC_SPURIOUS_IRQ {
+    total_interrupts = total_interrupts + 1
+  }
+
+  return irq
+}
+
+// End of interrupt (write EOIR)
+export fn gic400_end_of_interrupt(irq: u32) {
+  gic_write_reg(GICC_EOIR, irq)
+}
+
+// Handle interrupt
+export fn gic400_handle_interrupt() {
+  let irq: u32 = gic400_acknowledge_interrupt()
+
+  if irq == GIC_SPURIOUS_IRQ {
+    spurious_interrupts = spurious_interrupts + 1
+    return
+  }
+
+  if irq >= GIC_MAX_INTERRUPTS {
+    spurious_interrupts = spurious_interrupts + 1
+    gic400_end_of_interrupt(irq)
+    return
+  }
+
+  let desc: *InterruptDescriptor = &interrupt_descriptors[irq]
+
+  if desc.handler != 0 {
+    desc.handler(irq, desc.context)
+  } else {
+    unhandled_interrupts = unhandled_interrupts + 1
+    foundation.serial_write_string("[GIC-400] Unhandled interrupt: ")
+    foundation.serial_write_u64(irq)
+    foundation.serial_write_string("\n")
+  }
+
+  gic400_end_of_interrupt(irq)
+}
+
+// Send SGI (Software Generated Interrupt)
+export fn gic400_send_sgi(target_cpu_mask: u32, sgi_id: u32): u32 {
+  if gic400.initialized == 0 { return 1 }
+  if sgi_id >= 16 { return 1 }
+
+  // Build SGIR value
+  // [31:26] = reserved
+  // [25:24] = target list filter (0 = use target list)
+  // [23:16] = target CPU mask
+  // [15] = NSATT
+  // [3:0] = SGI ID
+  let sgir: u32 = (target_cpu_mask << 16) | sgi_id
+
+  gic_write_reg(GICD_SGIR, sgir)
+
+  foundation.serial_write_string("[GIC-400] Sent SGI ")
+  foundation.serial_write_u64(sgi_id)
+  foundation.serial_write_string(" to CPUs ")
+  foundation.serial_write_hex(target_cpu_mask)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Get highest pending interrupt
+export fn gic400_get_pending_interrupt(): u32 {
+  return gic_read_reg(GICC_HPPIR) & 0x3FF
+}
+
+// Get running priority
+export fn gic400_get_running_priority(): u32 {
+  return gic_read_reg(GICC_RPR)
+}
+
+// Get number of supported interrupts
+export fn gic400_get_num_interrupts(): u32 {
+  return gic400.num_interrupts
+}
+
+// Get number of CPUs
+export fn gic400_get_num_cpus(): u32 {
+  return gic400.num_cpus
+}
+
+// Print statistics
+export fn gic400_print_stats() {
+  foundation.serial_write_string("\n[GIC-400] Statistics:\n")
+
+  foundation.serial_write_string("  Total interrupts: ")
+  foundation.serial_write_u64(total_interrupts)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Spurious interrupts: ")
+  foundation.serial_write_u64(spurious_interrupts)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Unhandled interrupts: ")
+  foundation.serial_write_u64(unhandled_interrupts)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Supported interrupt lines: ")
+  foundation.serial_write_u64(gic400.num_interrupts)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Number of CPUs: ")
+  foundation.serial_write_u64(gic400.num_cpus)
+  foundation.serial_write_string("\n")
+}
+
+// Dump distributor state (for debugging)
+export fn gic400_dump_distributor() {
+  foundation.serial_write_string("\n[GIC-400] Distributor state:\n")
+
+  foundation.serial_write_string("  GICD_CTLR: ")
+  foundation.serial_write_hex(gic_read_reg(GICD_CTLR))
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  GICD_TYPER: ")
+  foundation.serial_write_hex(gic_read_reg(GICD_TYPER))
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  GICD_IIDR: ")
+  foundation.serial_write_hex(gic_read_reg(GICD_IIDR))
+  foundation.serial_write_string("\n")
+}
+
+// Dump CPU interface state (for debugging)
+export fn gic400_dump_cpu_interface() {
+  foundation.serial_write_string("\n[GIC-400] CPU Interface state:\n")
+
+  foundation.serial_write_string("  GICC_CTLR: ")
+  foundation.serial_write_hex(gic_read_reg(GICC_CTLR))
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  GICC_PMR: ")
+  foundation.serial_write_hex(gic_read_reg(GICC_PMR))
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  GICC_BPR: ")
+  foundation.serial_write_hex(gic_read_reg(GICC_BPR))
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  GICC_RPR: ")
+  foundation.serial_write_hex(gic_read_reg(GICC_RPR))
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  GICC_IIDR: ")
+  foundation.serial_write_hex(gic_read_reg(GICC_IIDR))
+  foundation.serial_write_string("\n")
+}

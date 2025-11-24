@@ -1,0 +1,464 @@
+// home-os Read-Ahead Cache
+// Predictive file reading for improved sequential workload performance
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+
+// Read-ahead window sizes
+const READAHEAD_MIN_PAGES: u32 = 8      // 32 KB minimum
+const READAHEAD_MAX_PAGES: u32 = 128    // 512 KB maximum
+const PAGE_SIZE: u32 = 4096
+
+// Cache entry states
+const CACHE_STATE_FREE: u32 = 0
+const CACHE_STATE_READING: u32 = 1
+const CACHE_STATE_VALID: u32 = 2
+const CACHE_STATE_DIRTY: u32 = 3
+
+// Read-ahead strategies
+const STRATEGY_SEQUENTIAL: u32 = 0
+const STRATEGY_RANDOM: u32 = 1
+const STRATEGY_STRIDE: u32 = 2
+
+// Cache entry
+struct CacheEntry {
+  file_id: u64               // File identifier
+  offset: u64                // File offset
+  data: u64                  // Cached data address
+  size: u32                  // Entry size
+  state: u32                 // Cache state
+  last_access: u64           // Last access time
+  access_count: u32          // Number of accesses
+  next: *CacheEntry          // LRU list next
+  prev: *CacheEntry          // LRU list prev
+}
+
+// Read-ahead window per file
+struct ReadAheadWindow {
+  file_id: u64               // Associated file
+  last_offset: u64           // Last read offset
+  window_size: u32           // Current window size (pages)
+  sequential_count: u32      // Sequential access counter
+  strategy: u32              // Detected access pattern
+  stride: u64                // Stride for stride pattern
+  active: u32                // Window is active
+}
+
+const MAX_CACHE_ENTRIES: u32 = 256
+const MAX_WINDOWS: u32 = 64
+
+var cache_entries: [MAX_CACHE_ENTRIES]CacheEntry
+var cache_entry_count: u32 = 0
+var lru_head: *CacheEntry = 0
+var lru_tail: *CacheEntry = 0
+
+var windows: [MAX_WINDOWS]ReadAheadWindow
+var window_count: u32 = 0
+
+// Statistics
+var cache_hits: u64 = 0
+var cache_misses: u64 = 0
+var readahead_triggers: u64 = 0
+var bytes_prefetched: u64 = 0
+var evictions: u64 = 0
+
+// Global time counter
+var current_time: u64 = 0
+
+// Initialize read-ahead cache
+export fn readahead_init() {
+  cache_entry_count = 0
+  window_count = 0
+  lru_head = 0
+  lru_tail = 0
+  current_time = 0
+
+  cache_hits = 0
+  cache_misses = 0
+  readahead_triggers = 0
+  bytes_prefetched = 0
+  evictions = 0
+
+  foundation.serial_write_string("[Read-Ahead] Cache initialized\n")
+}
+
+// Find or create window for file
+fn get_or_create_window(file_id: u64): *ReadAheadWindow {
+  // Search for existing window
+  var i: u32 = 0
+  loop {
+    if i >= window_count { break }
+
+    if windows[i].file_id == file_id && windows[i].active == 1 {
+      return &windows[i]
+    }
+
+    i = i + 1
+  }
+
+  // Create new window
+  if window_count >= MAX_WINDOWS {
+    // Reuse oldest inactive window
+    i = 0
+    loop {
+      if i >= window_count { break }
+
+      if windows[i].active == 0 {
+        let window: *ReadAheadWindow = &windows[i]
+        window.file_id = file_id
+        window.last_offset = 0
+        window.window_size = READAHEAD_MIN_PAGES
+        window.sequential_count = 0
+        window.strategy = STRATEGY_SEQUENTIAL
+        window.stride = 0
+        window.active = 1
+        return window
+      }
+
+      i = i + 1
+    }
+
+    return 0  // All windows in use
+  }
+
+  let window: *ReadAheadWindow = &windows[window_count]
+  window.file_id = file_id
+  window.last_offset = 0
+  window.window_size = READAHEAD_MIN_PAGES
+  window.sequential_count = 0
+  window.strategy = STRATEGY_SEQUENTIAL
+  window.stride = 0
+  window.active = 1
+
+  window_count = window_count + 1
+
+  return window
+}
+
+// Update access pattern detection
+fn update_access_pattern(window: *ReadAheadWindow, offset: u64) {
+  if window.last_offset == 0 {
+    window.last_offset = offset
+    return
+  }
+
+  let diff: i64 = offset - window.last_offset
+
+  // Check for sequential access
+  if diff > 0 && diff <= (PAGE_SIZE * 2) {
+    window.sequential_count = window.sequential_count + 1
+    window.strategy = STRATEGY_SEQUENTIAL
+
+    // Grow window for confirmed sequential access
+    if window.sequential_count > 3 && window.window_size < READAHEAD_MAX_PAGES {
+      window.window_size = window.window_size * 2
+      if window.window_size > READAHEAD_MAX_PAGES {
+        window.window_size = READAHEAD_MAX_PAGES
+      }
+    }
+  } else if diff < 0 || diff > (PAGE_SIZE * 16) {
+    // Random or backward access
+    window.sequential_count = 0
+    window.strategy = STRATEGY_RANDOM
+    window.window_size = READAHEAD_MIN_PAGES
+  } else {
+    // Possible stride pattern
+    if window.stride == 0 {
+      window.stride = diff
+    } else if window.stride == diff {
+      window.sequential_count = window.sequential_count + 1
+      window.strategy = STRATEGY_STRIDE
+    } else {
+      window.stride = diff
+      window.sequential_count = 0
+    }
+  }
+
+  window.last_offset = offset
+}
+
+// Find cache entry
+fn find_cache_entry(file_id: u64, offset: u64): *CacheEntry {
+  var i: u32 = 0
+  loop {
+    if i >= cache_entry_count { break }
+
+    let entry: *CacheEntry = &cache_entries[i]
+
+    if entry.file_id == file_id &&
+       entry.offset <= offset &&
+       (entry.offset + entry.size) > offset &&
+       entry.state == CACHE_STATE_VALID {
+      return entry
+    }
+
+    i = i + 1
+  }
+
+  return 0
+}
+
+// Move entry to front of LRU list
+fn lru_touch(entry: *CacheEntry) {
+  if entry == lru_head { return }  // Already at front
+
+  // Remove from current position
+  if entry.prev != 0 {
+    entry.prev.next = entry.next
+  }
+
+  if entry.next != 0 {
+    entry.next.prev = entry.prev
+  }
+
+  if entry == lru_tail {
+    lru_tail = entry.prev
+  }
+
+  // Insert at front
+  entry.prev = 0
+  entry.next = lru_head
+  if lru_head != 0 {
+    lru_head.prev = entry
+  }
+  lru_head = entry
+
+  if lru_tail == 0 {
+    lru_tail = entry
+  }
+}
+
+// Evict LRU entry
+fn evict_lru_entry(): *CacheEntry {
+  if lru_tail == 0 { return 0 }
+
+  let entry: *CacheEntry = lru_tail
+
+  // Remove from LRU list
+  if entry.prev != 0 {
+    entry.prev.next = 0
+  }
+  lru_tail = entry.prev
+
+  if lru_head == entry {
+    lru_head = 0
+  }
+
+  // Free cached data
+  if entry.data != 0 {
+    memory.kfree(entry.data)
+    entry.data = 0
+  }
+
+  entry.state = CACHE_STATE_FREE
+  evictions = evictions + 1
+
+  return entry
+}
+
+// Allocate cache entry
+fn allocate_cache_entry(): *CacheEntry {
+  // Find free entry
+  var i: u32 = 0
+  loop {
+    if i >= cache_entry_count { break }
+
+    if cache_entries[i].state == CACHE_STATE_FREE {
+      return &cache_entries[i]
+    }
+
+    i = i + 1
+  }
+
+  // No free entries, try to add new one
+  if cache_entry_count < MAX_CACHE_ENTRIES {
+    let entry: *CacheEntry = &cache_entries[cache_entry_count]
+    cache_entry_count = cache_entry_count + 1
+    entry.state = CACHE_STATE_FREE
+    return entry
+  }
+
+  // Evict LRU entry
+  return evict_lru_entry()
+}
+
+// Trigger read-ahead
+fn trigger_readahead(window: *ReadAheadWindow, offset: u64) {
+  if window.strategy == STRATEGY_RANDOM {
+    return  // Don't prefetch for random access
+  }
+
+  let pages_to_prefetch: u32 = window.window_size
+  let next_offset: u64 = if window.strategy == STRATEGY_STRIDE {
+    offset + window.stride
+  } else {
+    offset + PAGE_SIZE
+  }
+
+  var i: u32 = 0
+  loop {
+    if i >= pages_to_prefetch { break }
+
+    let prefetch_offset: u64 = next_offset + (i * PAGE_SIZE)
+
+    // Check if already cached
+    if find_cache_entry(window.file_id, prefetch_offset) != 0 {
+      i = i + 1
+      continue
+    }
+
+    // Allocate cache entry
+    let entry: *CacheEntry = allocate_cache_entry()
+    if entry == 0 { break }
+
+    // Allocate data buffer
+    entry.data = memory.kmalloc(PAGE_SIZE)
+    if entry.data == 0 {
+      entry.state = CACHE_STATE_FREE
+      break
+    }
+
+    entry.file_id = window.file_id
+    entry.offset = prefetch_offset
+    entry.size = PAGE_SIZE
+    entry.state = CACHE_STATE_READING
+    entry.last_access = current_time
+    entry.access_count = 0
+
+    // Would trigger actual I/O here
+    // For now, just mark as valid
+    entry.state = CACHE_STATE_VALID
+
+    // Add to LRU list
+    lru_touch(entry)
+
+    bytes_prefetched = bytes_prefetched + PAGE_SIZE
+    i = i + 1
+  }
+
+  readahead_triggers = readahead_triggers + 1
+}
+
+// Public read interface with read-ahead
+export fn readahead_read(file_id: u64, offset: u64, size: u32, buffer: u64): u32 {
+  current_time = current_time + 1
+
+  // Get or create window
+  let window: *ReadAheadWindow = get_or_create_window(file_id)
+  if window == 0 {
+    cache_misses = cache_misses + 1
+    return 1  // Would fall back to normal read
+  }
+
+  // Update access pattern
+  update_access_pattern(window, offset)
+
+  // Check cache
+  let entry: *CacheEntry = find_cache_entry(file_id, offset)
+
+  if entry != 0 {
+    // Cache hit
+    cache_hits = cache_hits + 1
+    entry.last_access = current_time
+    entry.access_count = entry.access_count + 1
+    lru_touch(entry)
+
+    // Copy data to buffer (simplified)
+    let copy_size: u32 = if size > entry.size { entry.size } else { size }
+    memory.memcpy(buffer, entry.data, copy_size)
+
+    // Trigger read-ahead for sequential access
+    if window.strategy == STRATEGY_SEQUENTIAL || window.strategy == STRATEGY_STRIDE {
+      trigger_readahead(window, offset)
+    }
+
+    return 0
+  }
+
+  // Cache miss
+  cache_misses = cache_misses + 1
+
+  // Would perform actual read here
+  // Then trigger read-ahead
+  trigger_readahead(window, offset)
+
+  return 0
+}
+
+// Invalidate cache entries for a file
+export fn readahead_invalidate(file_id: u64) {
+  var i: u32 = 0
+  loop {
+    if i >= cache_entry_count { break }
+
+    let entry: *CacheEntry = &cache_entries[i]
+
+    if entry.file_id == file_id && entry.state != CACHE_STATE_FREE {
+      if entry.data != 0 {
+        memory.kfree(entry.data)
+        entry.data = 0
+      }
+      entry.state = CACHE_STATE_FREE
+    }
+
+    i = i + 1
+  }
+
+  // Deactivate window
+  i = 0
+  loop {
+    if i >= window_count { break }
+
+    if windows[i].file_id == file_id {
+      windows[i].active = 0
+    }
+
+    i = i + 1
+  }
+}
+
+// Print statistics
+export fn readahead_print_stats() {
+  foundation.serial_write_string("\n[Read-Ahead] Statistics:\n")
+
+  foundation.serial_write_string("  Cache hits: ")
+  foundation.serial_write_u64(cache_hits)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Cache misses: ")
+  foundation.serial_write_u64(cache_misses)
+  foundation.serial_write_string("\n")
+
+  let total: u64 = cache_hits + cache_misses
+  if total > 0 {
+    let hit_rate: u64 = (cache_hits * 100) / total
+    foundation.serial_write_string("  Hit rate: ")
+    foundation.serial_write_u64(hit_rate)
+    foundation.serial_write_string("%\n")
+  }
+
+  foundation.serial_write_string("  Read-ahead triggers: ")
+  foundation.serial_write_u64(readahead_triggers)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Bytes prefetched: ")
+  foundation.serial_write_u64(bytes_prefetched / 1024)
+  foundation.serial_write_string(" KB\n")
+
+  foundation.serial_write_string("  Evictions: ")
+  foundation.serial_write_u64(evictions)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Active windows: ")
+  var active_count: u32 = 0
+  var i: u32 = 0
+  loop {
+    if i >= window_count { break }
+    if windows[i].active == 1 {
+      active_count = active_count + 1
+    }
+    i = i + 1
+  }
+  foundation.serial_write_u64(active_count)
+  foundation.serial_write_string("\n")
+}

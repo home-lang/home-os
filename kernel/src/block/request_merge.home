@@ -1,0 +1,353 @@
+// home-os Block Layer Request Merging
+// Combines adjacent I/O requests for better performance and reduced SD card wear
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+
+// Request types
+const REQ_TYPE_READ: u32 = 0
+const REQ_TYPE_WRITE: u32 = 1
+const REQ_TYPE_FLUSH: u32 = 2
+
+// Request flags
+const REQ_FLAG_MERGEABLE: u32 = 1 << 0
+const REQ_FLAG_BARRIER: u32 = 1 << 1
+const REQ_FLAG_SYNC: u32 = 1 << 2
+
+// Block request structure
+struct BlockRequest {
+  type: u32                  // Read/write/flush
+  block_start: u64           // Starting block number
+  block_count: u32           // Number of blocks
+  buffer: u64                // Data buffer address
+  flags: u32                 // Request flags
+  next: *BlockRequest        // Next request in queue
+  merged_count: u32          // How many requests merged into this one
+}
+
+// Request queue for a device
+struct RequestQueue {
+  head: *BlockRequest        // First request
+  tail: *BlockRequest        // Last request
+  count: u32                 // Number of requests
+  max_merge_size: u32        // Maximum blocks per merged request
+  device_id: u32             // Associated device
+}
+
+const MAX_QUEUES: u32 = 16
+const MAX_MERGE_SIZE: u32 = 128  // 64KB with 512-byte blocks
+
+var queues: [MAX_QUEUES]RequestQueue
+var queue_count: u32 = 0
+
+// Statistics
+var total_requests: u64 = 0
+var merged_requests: u64 = 0
+var merge_operations: u64 = 0
+var barrier_splits: u64 = 0
+
+// Initialize block layer
+export fn block_merge_init() {
+  queue_count = 0
+  total_requests = 0
+  merged_requests = 0
+  merge_operations = 0
+  barrier_splits = 0
+
+  foundation.serial_write_string("[Block Merge] Subsystem initialized\n")
+}
+
+// Create request queue for a device
+export fn block_create_queue(device_id: u32, max_merge_size: u32): u32 {
+  if queue_count >= MAX_QUEUES {
+    foundation.serial_write_string("[Block Merge] Maximum queues reached\n")
+    return 0xFFFFFFFF
+  }
+
+  let queue: *RequestQueue = &queues[queue_count]
+  queue.head = 0
+  queue.tail = 0
+  queue.count = 0
+  queue.max_merge_size = if max_merge_size > 0 { max_merge_size } else { MAX_MERGE_SIZE }
+  queue.device_id = device_id
+
+  let id: u32 = queue_count
+  queue_count = queue_count + 1
+
+  foundation.serial_write_string("[Block Merge] Created queue ")
+  foundation.serial_write_u64(id)
+  foundation.serial_write_string(" for device ")
+  foundation.serial_write_u64(device_id)
+  foundation.serial_write_string(" (max merge: ")
+  foundation.serial_write_u64(queue.max_merge_size)
+  foundation.serial_write_string(" blocks)\n")
+
+  return id
+}
+
+// Check if two requests can be merged
+fn can_merge_requests(req1: *BlockRequest, req2: *BlockRequest): u32 {
+  // Must be same type
+  if req1.type != req2.type { return 0 }
+
+  // Must both be mergeable
+  if (req1.flags & REQ_FLAG_MERGEABLE) == 0 { return 0 }
+  if (req2.flags & REQ_FLAG_MERGEABLE) == 0 { return 0 }
+
+  // Can't merge across barriers
+  if (req1.flags & REQ_FLAG_BARRIER) != 0 { return 0 }
+  if (req2.flags & REQ_FLAG_BARRIER) != 0 { return 0 }
+
+  // Must be adjacent blocks
+  let req1_end: u64 = req1.block_start + req1.block_count
+  if req1_end != req2.block_start { return 0 }
+
+  return 1
+}
+
+// Merge two requests
+fn merge_requests(queue: *RequestQueue, req1: *BlockRequest, req2: *BlockRequest): u32 {
+  let new_count: u32 = req1.block_count + req2.block_count
+
+  // Check if merge would exceed max size
+  if new_count > queue.max_merge_size {
+    return 0
+  }
+
+  // For writes, we need contiguous buffers to merge
+  if req1.type == REQ_TYPE_WRITE {
+    let req1_buffer_end: u64 = req1.buffer + (req1.block_count * 512)
+    if req1_buffer_end != req2.buffer {
+      return 0  // Buffers not contiguous
+    }
+  }
+
+  // Merge req2 into req1
+  req1.block_count = new_count
+  req1.merged_count = req1.merged_count + 1 + req2.merged_count
+
+  // Remove req2 from queue
+  req1.next = req2.next
+  if queue.tail == req2 {
+    queue.tail = req1
+  }
+
+  queue.count = queue.count - 1
+
+  // Free req2
+  memory.kfree(req2)
+
+  merged_requests = merged_requests + 1
+  merge_operations = merge_operations + 1
+
+  return 1
+}
+
+// Try to merge request with existing ones in queue
+fn try_merge_with_queue(queue: *RequestQueue, new_req: *BlockRequest): u32 {
+  if queue.head == 0 { return 0 }
+
+  let current: *BlockRequest = queue.head
+  var prev: *BlockRequest = 0
+
+  loop {
+    if current == 0 { break }
+
+    // Try forward merge (current + new_req)
+    if can_merge_requests(current, new_req) == 1 {
+      if merge_requests(queue, current, new_req) == 1 {
+        return 1  // Successfully merged
+      }
+    }
+
+    // Try backward merge (new_req + current)
+    if can_merge_requests(new_req, current) == 1 {
+      if merge_requests(queue, new_req, current) == 1 {
+        // Replace current with new_req in list
+        if prev == 0 {
+          queue.head = new_req
+        } else {
+          prev.next = new_req
+        }
+
+        if queue.tail == current {
+          queue.tail = new_req
+        }
+
+        return 1
+      }
+    }
+
+    prev = current
+    current = current.next
+  }
+
+  return 0  // No merge possible
+}
+
+// Submit a block request
+export fn block_submit_request(
+  queue_id: u32,
+  type: u32,
+  block_start: u64,
+  block_count: u32,
+  buffer: u64,
+  flags: u32
+): u32 {
+  if queue_id >= queue_count {
+    foundation.serial_write_string("[Block Merge] Invalid queue ID\n")
+    return 1
+  }
+
+  let queue: *RequestQueue = &queues[queue_id]
+
+  // Allocate request structure
+  let req: *BlockRequest = memory.kmalloc(32)  // sizeof(BlockRequest)
+  if req == 0 {
+    foundation.serial_write_string("[Block Merge] Failed to allocate request\n")
+    return 1
+  }
+
+  req.type = type
+  req.block_start = block_start
+  req.block_count = block_count
+  req.buffer = buffer
+  req.flags = flags
+  req.next = 0
+  req.merged_count = 0
+
+  total_requests = total_requests + 1
+
+  // Try to merge with existing requests
+  if (flags & REQ_FLAG_BARRIER) == 0 && (flags & REQ_FLAG_MERGEABLE) != 0 {
+    if try_merge_with_queue(queue, req) == 1 {
+      return 0  // Successfully merged
+    }
+  } else if (flags & REQ_FLAG_BARRIER) != 0 {
+    barrier_splits = barrier_splits + 1
+  }
+
+  // Add to end of queue
+  if queue.tail == 0 {
+    queue.head = req
+    queue.tail = req
+  } else {
+    queue.tail.next = req
+    queue.tail = req
+  }
+
+  queue.count = queue.count + 1
+
+  return 0
+}
+
+// Get next request from queue
+export fn block_get_next_request(queue_id: u32): *BlockRequest {
+  if queue_id >= queue_count { return 0 }
+
+  let queue: *RequestQueue = &queues[queue_id]
+
+  if queue.head == 0 { return 0 }
+
+  let req: *BlockRequest = queue.head
+  queue.head = req.next
+
+  if queue.head == 0 {
+    queue.tail = 0
+  }
+
+  queue.count = queue.count - 1
+
+  req.next = 0
+  return req
+}
+
+// Complete a request
+export fn block_complete_request(req: *BlockRequest) {
+  if req == 0 { return }
+  memory.kfree(req)
+}
+
+// Get queue stats
+export fn block_get_queue_depth(queue_id: u32): u32 {
+  if queue_id >= queue_count { return 0 }
+  return queues[queue_id].count
+}
+
+// Print statistics
+export fn block_merge_print_stats() {
+  foundation.serial_write_string("\n[Block Merge] Statistics:\n")
+
+  foundation.serial_write_string("  Total requests: ")
+  foundation.serial_write_u64(total_requests)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Merged requests: ")
+  foundation.serial_write_u64(merged_requests)
+  foundation.serial_write_string("\n")
+
+  if total_requests > 0 {
+    let merge_rate: u64 = (merged_requests * 100) / total_requests
+    foundation.serial_write_string("  Merge rate: ")
+    foundation.serial_write_u64(merge_rate)
+    foundation.serial_write_string("%\n")
+  }
+
+  foundation.serial_write_string("  Merge operations: ")
+  foundation.serial_write_u64(merge_operations)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Barrier splits: ")
+  foundation.serial_write_u64(barrier_splits)
+  foundation.serial_write_string("\n")
+
+  // Per-queue stats
+  foundation.serial_write_string("\n  Per-queue status:\n")
+  var i: u32 = 0
+  loop {
+    if i >= queue_count { break }
+
+    let queue: *RequestQueue = &queues[i]
+
+    foundation.serial_write_string("    Queue ")
+    foundation.serial_write_u64(i)
+    foundation.serial_write_string(" (device ")
+    foundation.serial_write_u64(queue.device_id)
+    foundation.serial_write_string("): ")
+    foundation.serial_write_u64(queue.count)
+    foundation.serial_write_string(" pending requests\n")
+
+    i = i + 1
+  }
+}
+
+// Flush all requests in queue
+export fn block_flush_queue(queue_id: u32): u32 {
+  if queue_id >= queue_count { return 1 }
+
+  let queue: *RequestQueue = &queues[queue_id]
+
+  foundation.serial_write_string("[Block Merge] Flushing queue ")
+  foundation.serial_write_u64(queue_id)
+  foundation.serial_write_string(" (")
+  foundation.serial_write_u64(queue.count)
+  foundation.serial_write_string(" requests)\n")
+
+  // In real implementation, would process all requests
+  // For now, just clear the queue
+
+  var req: *BlockRequest = queue.head
+  loop {
+    if req == 0 { break }
+
+    let next: *BlockRequest = req.next
+    memory.kfree(req)
+    req = next
+  }
+
+  queue.head = 0
+  queue.tail = 0
+  queue.count = 0
+
+  return 0
+}
