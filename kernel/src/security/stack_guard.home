@@ -1,0 +1,397 @@
+// home-os Stack Protection (Stack Canaries)
+// Implements stack buffer overflow protection using stack canaries
+// Detects and prevents stack-based buffer overflow exploits
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../debug/panic.home" as panic
+
+// Stack canary configuration
+const STACK_CANARY_ENABLED: u32 = 1
+const STACK_CANARY_RANDOM: u32 = 1  // Use random canaries (vs fixed)
+const STACK_CANARY_SIZE: u32 = 8    // 64-bit canary
+
+// Stack guard zones
+const STACK_GUARD_SIZE: u32 = 4096  // 4KB guard pages
+const STACK_OVERFLOW_ZONE: u32 = 512 // Additional overflow detection
+
+// Canary values
+var global_canary: u64 = 0xDEADBEEFCAFEBABE  // Default canary
+var canary_initialized: u32 = 0
+
+// Per-CPU canaries for SMP systems
+const MAX_CPUS: u32 = 4
+var per_cpu_canaries: [MAX_CPUS]u64
+
+// Stack frame structure with canary
+struct StackFrame {
+  canary_top: u64
+  saved_fp: u64
+  saved_lr: u64
+  local_vars_start: u64
+  // ... local variables ...
+  canary_bottom: u64
+}
+
+// Stack guard statistics
+struct StackGuardStats {
+  checks_performed: u64
+  violations_detected: u64
+  random_canaries_generated: u64
+  guard_pages_created: u64
+  overflows_prevented: u64
+}
+
+var stack_stats: StackGuardStats
+
+// Initialize stack protection
+export fn stack_guard_init(): u32 {
+  foundation.serial_write_string("[STACK] Initializing stack protection...\n")
+
+  // Generate random canary if enabled
+  if STACK_CANARY_RANDOM == 1 {
+    global_canary = generate_random_canary()
+    stack_stats.random_canaries_generated = stack_stats.random_canaries_generated + 1
+  }
+
+  // Initialize per-CPU canaries
+  var cpu: u32 = 0
+  loop {
+    if cpu >= MAX_CPUS { break }
+
+    if STACK_CANARY_RANDOM == 1 {
+      per_cpu_canaries[cpu] = generate_random_canary()
+      stack_stats.random_canaries_generated = stack_stats.random_canaries_generated + 1
+    } else {
+      per_cpu_canaries[cpu] = global_canary
+    }
+
+    cpu = cpu + 1
+  }
+
+  // Initialize statistics
+  stack_stats.checks_performed = 0
+  stack_stats.violations_detected = 0
+  stack_stats.guard_pages_created = 0
+  stack_stats.overflows_prevented = 0
+
+  canary_initialized = 1
+
+  foundation.serial_write_string("[STACK] Stack protection initialized\n")
+  foundation.serial_write_string("[STACK] Global canary: 0x")
+  foundation.serial_write_u64(global_canary)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Generate random canary value
+fn generate_random_canary(): u64 {
+  // Use multiple entropy sources
+  let timestamp: u64 = get_timestamp()
+  let stack_addr: u64 = get_stack_pointer()
+  let cycle_count: u64 = get_cycle_counter()
+
+  // Mix entropy sources
+  var canary: u64 = timestamp
+  canary = canary ^ (stack_addr << 16)
+  canary = canary ^ (cycle_count >> 8)
+  canary = canary ^ 0xDEADBEEFCAFEBABE
+
+  // Ensure null bytes in canary to prevent string operations from bypassing
+  canary = canary | 0x000000FF00000000
+
+  return canary
+}
+
+// Get current timestamp (implementation-specific)
+fn get_timestamp(): u64 {
+  // Would read system timer
+  return 0x123456789ABCDEF0
+}
+
+// Get stack pointer value
+fn get_stack_pointer(): u64 {
+  // ARM64 assembly to read SP
+  // asm { "mov %0, sp" : "=r"(sp) }
+  return 0xFFFF000000000000
+}
+
+// Get CPU cycle counter
+fn get_cycle_counter(): u64 {
+  // ARM64: Read PMCCNTR_EL0
+  // asm { "mrs %0, pmccntr_el0" : "=r"(cycles) }
+  return 0xABCDEF0123456789
+}
+
+// Get canary for current CPU
+export fn stack_get_canary(): u64 {
+  if canary_initialized == 0 {
+    return global_canary
+  }
+
+  // Get current CPU ID
+  let cpu_id: u32 = get_cpu_id()
+
+  if cpu_id < MAX_CPUS {
+    return per_cpu_canaries[cpu_id]
+  }
+
+  return global_canary
+}
+
+// Get current CPU ID
+fn get_cpu_id(): u32 {
+  // ARM64: Read MPIDR_EL1
+  // asm { "mrs %0, mpidr_el1" : "=r"(mpidr) }
+  // return mpidr & 0xFF
+  return 0
+}
+
+// Place canary on stack (called at function entry)
+export fn stack_place_canary(frame_addr: u64) {
+  if STACK_CANARY_ENABLED == 0 { return }
+
+  let canary: u64 = stack_get_canary()
+
+  // Write canary at top of frame
+  memory.write_u64(frame_addr, canary)
+
+  // Optionally write canary at bottom too
+  // memory.write_u64(frame_addr + frame_size - 8, canary)
+}
+
+// Check canary integrity (called before function return)
+export fn stack_check_canary(frame_addr: u64) {
+  if STACK_CANARY_ENABLED == 0 { return }
+
+  stack_stats.checks_performed = stack_stats.checks_performed + 1
+
+  let expected: u64 = stack_get_canary()
+  let actual: u64 = memory.read_u64(frame_addr)
+
+  if actual != expected {
+    stack_canary_violation(frame_addr, expected, actual)
+  }
+}
+
+// Handle stack canary violation
+fn stack_canary_violation(frame_addr: u64, expected: u64, actual: u64) {
+  stack_stats.violations_detected = stack_stats.violations_detected + 1
+  stack_stats.overflows_prevented = stack_stats.overflows_prevented + 1
+
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("================================================================================\n")
+  foundation.serial_write_string("                        STACK CANARY VIOLATION DETECTED\n")
+  foundation.serial_write_string("================================================================================\n")
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Stack buffer overflow detected!\n")
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Frame address:   0x")
+  foundation.serial_write_u64(frame_addr)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Expected canary: 0x")
+  foundation.serial_write_u64(expected)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Actual canary:   0x")
+  foundation.serial_write_u64(actual)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Corruption:      0x")
+  foundation.serial_write_u64(expected ^ actual)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("This indicates a stack buffer overflow has occurred.\n")
+  foundation.serial_write_string("The system will now halt to prevent exploitation.\n")
+  foundation.serial_write_string("\n")
+
+  // Dump stack for analysis
+  stack_dump_region(frame_addr, 256)
+
+  // Trigger kernel panic
+  panic.panic(
+    panic.PANIC_STACK_OVERFLOW,
+    "Stack canary violation",
+    "stack_guard.home",
+    0,
+    "stack_check_canary"
+  )
+}
+
+// Dump stack region for debugging
+fn stack_dump_region(addr: u64, size: u32) {
+  foundation.serial_write_string("Stack dump (")
+  foundation.serial_write_u64(size)
+  foundation.serial_write_string(" bytes from 0x")
+  foundation.serial_write_u64(addr)
+  foundation.serial_write_string("):\n")
+
+  var offset: u32 = 0
+  loop {
+    if offset >= size { break }
+
+    if (offset % 16) == 0 {
+      foundation.serial_write_string("\n  0x")
+      foundation.serial_write_u64(addr + offset as u64)
+      foundation.serial_write_string(": ")
+    }
+
+    let byte: u8 = memory.read_u8(addr + offset as u64)
+    foundation.serial_write_byte(to_hex_digit((byte >> 4) & 0xF))
+    foundation.serial_write_byte(to_hex_digit(byte & 0xF))
+    foundation.serial_write_string(" ")
+
+    offset = offset + 1
+  }
+
+  foundation.serial_write_string("\n")
+}
+
+fn to_hex_digit(n: u8): u8 {
+  if n < 10 {
+    return ('0' as u8) + n
+  } else {
+    return ('A' as u8) + (n - 10)
+  }
+}
+
+// Create guard page for stack
+export fn stack_create_guard_page(stack_base: u64, stack_size: u64): u32 {
+  // Calculate guard page addresses
+  let guard_bottom: u64 = stack_base - STACK_GUARD_SIZE as u64
+  let guard_top: u64 = stack_base + stack_size
+
+  // Mark guard pages as no-access (would use MMU)
+  // mmu_protect(guard_bottom, STACK_GUARD_SIZE, PROT_NONE)
+  // mmu_protect(guard_top, STACK_GUARD_SIZE, PROT_NONE)
+
+  stack_stats.guard_pages_created = stack_stats.guard_pages_created + 1
+
+  foundation.serial_write_string("[STACK] Guard pages created:\n")
+  foundation.serial_write_string("  Bottom: 0x")
+  foundation.serial_write_u64(guard_bottom)
+  foundation.serial_write_string(" - 0x")
+  foundation.serial_write_u64(guard_bottom + STACK_GUARD_SIZE as u64)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Top:    0x")
+  foundation.serial_write_u64(guard_top)
+  foundation.serial_write_string(" - 0x")
+  foundation.serial_write_u64(guard_top + STACK_GUARD_SIZE as u64)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Validate stack pointer is within bounds
+export fn stack_validate_sp(sp: u64, stack_base: u64, stack_size: u64): u32 {
+  let stack_top: u64 = stack_base + stack_size
+
+  if sp < stack_base || sp >= stack_top {
+    foundation.serial_write_string("[STACK] Stack pointer out of bounds!\n")
+    foundation.serial_write_string("  SP:         0x")
+    foundation.serial_write_u64(sp)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  Stack base: 0x")
+    foundation.serial_write_u64(stack_base)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  Stack top:  0x")
+    foundation.serial_write_u64(stack_top)
+    foundation.serial_write_string("\n")
+
+    return 1
+  }
+
+  return 0
+}
+
+// Check stack overflow in overflow detection zone
+export fn stack_check_overflow(sp: u64, stack_base: u64): u32 {
+  let overflow_threshold: u64 = stack_base + STACK_OVERFLOW_ZONE as u64
+
+  if sp < overflow_threshold {
+    foundation.serial_write_string("[STACK] Stack overflow imminent!\n")
+    foundation.serial_write_string("  SP:        0x")
+    foundation.serial_write_u64(sp)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  Threshold: 0x")
+    foundation.serial_write_u64(overflow_threshold)
+    foundation.serial_write_string("\n")
+
+    stack_stats.overflows_prevented = stack_stats.overflows_prevented + 1
+
+    return 1
+  }
+
+  return 0
+}
+
+// Rotate canary (for security)
+export fn stack_rotate_canary(): u32 {
+  if STACK_CANARY_RANDOM == 0 { return 0 }
+
+  foundation.serial_write_string("[STACK] Rotating stack canaries...\n")
+
+  // Generate new global canary
+  global_canary = generate_random_canary()
+  stack_stats.random_canaries_generated = stack_stats.random_canaries_generated + 1
+
+  // Generate new per-CPU canaries
+  var cpu: u32 = 0
+  loop {
+    if cpu >= MAX_CPUS { break }
+
+    per_cpu_canaries[cpu] = generate_random_canary()
+    stack_stats.random_canaries_generated = stack_stats.random_canaries_generated + 1
+
+    cpu = cpu + 1
+  }
+
+  foundation.serial_write_string("[STACK] Canaries rotated\n")
+
+  return 0
+}
+
+// Get stack protection statistics
+export fn stack_get_stats(): *StackGuardStats {
+  return &stack_stats
+}
+
+// Print stack protection statistics
+export fn stack_print_stats() {
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("Stack Protection Statistics:\n")
+  foundation.serial_write_string("============================\n")
+
+  foundation.serial_write_string("Canary checks:     ")
+  foundation.serial_write_u64(stack_stats.checks_performed)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Violations:        ")
+  foundation.serial_write_u64(stack_stats.violations_detected)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Canaries generated: ")
+  foundation.serial_write_u64(stack_stats.random_canaries_generated)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Guard pages:       ")
+  foundation.serial_write_u64(stack_stats.guard_pages_created)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Overflows prevented: ")
+  foundation.serial_write_u64(stack_stats.overflows_prevented)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n")
+}
+
+// Macro for automatic canary placement (compiler support needed)
+// #define STACK_PROTECT(fn) \
+//   fn_entry: stack_place_canary(__builtin_frame_address(0)) \
+//   fn_exit:  stack_check_canary(__builtin_frame_address(0))

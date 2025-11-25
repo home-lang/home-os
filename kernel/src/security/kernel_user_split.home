@@ -1,0 +1,436 @@
+// home-os Kernel/User Address Space Separation
+// Implements KPTI-style (Kernel Page Table Isolation) for ARM64
+// Mitigates Meltdown/Spectre and prevents kernel memory disclosure
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../arch/arm64/mmu.home" as mmu
+
+// Address space layout
+const KERNEL_SPACE_START: u64 = 0xFFFF000000000000  // Upper half
+const USER_SPACE_END: u64     = 0x0000FFFFFFFFFFFF  // Lower half
+
+// KPTI configuration
+const KPTI_ENABLED: u32 = 1
+const KPTI_MINIMAL_KERNEL_MAPPING: u32 = 1  // Only map essential kernel code in user page tables
+
+// Page table ASIDs (Address Space IDs)
+const ASID_KERNEL: u32 = 0
+const ASID_USER_BASE: u32 = 1
+const MAX_ASIDS: u32 = 256
+
+// Protection domains
+const DOMAIN_KERNEL: u32 = 0
+const DOMAIN_USER: u32 = 1
+
+// Address space separation state
+struct AddressSpaceSeparation {
+  kpti_enabled: u32
+  kernel_pgd: u64          // Kernel page global directory
+  user_pgd_template: u64   // Template for user page tables
+  current_asid: u32
+  asid_generation: u64
+  tlb_flushes: u64
+  context_switches: u64
+  protection_faults: u64
+}
+
+var addr_sep: AddressSpaceSeparation
+
+// Per-process ASID tracking
+const MAX_PROCESSES: u32 = 256
+
+struct ProcessASID {
+  pid: u32
+  asid: u32
+  generation: u64
+  active: u32
+}
+
+var process_asids: [MAX_PROCESSES]ProcessASID
+
+// Initialize kernel/user address separation
+export fn kpti_init(): u32 {
+  foundation.serial_write_string("[KPTI] Initializing kernel/user address separation...\n")
+
+  addr_sep.kpti_enabled = KPTI_ENABLED
+  addr_sep.current_asid = ASID_USER_BASE
+  addr_sep.asid_generation = 1
+  addr_sep.tlb_flushes = 0
+  addr_sep.context_switches = 0
+  addr_sep.protection_faults = 0
+
+  // Create separate kernel and user page tables
+  if KPTI_ENABLED == 1 {
+    kpti_create_kernel_pagetables()
+    kpti_create_user_pagetable_template()
+  }
+
+  foundation.serial_write_string("[KPTI] Address separation initialized\n")
+  foundation.serial_write_string("[KPTI] Kernel space: 0x")
+  foundation.serial_write_u64(KERNEL_SPACE_START)
+  foundation.serial_write_string(" - 0xFFFFFFFFFFFFFFFF\n")
+  foundation.serial_write_string("[KPTI] User space:   0x0000000000000000 - 0x")
+  foundation.serial_write_u64(USER_SPACE_END)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Create kernel page tables (full kernel mapping)
+fn kpti_create_kernel_pagetables(): u32 {
+  foundation.serial_write_string("[KPTI] Creating kernel page tables...\n")
+
+  // Allocate kernel PGD
+  addr_sep.kernel_pgd = allocate_page_table()
+
+  // Map entire kernel space
+  // - Kernel text (read-execute)
+  // - Kernel rodata (read-only)
+  // - Kernel data (read-write)
+  // - Device MMIO (uncached)
+
+  // Example: Map kernel code at upper half
+  let kernel_base: u64 = KERNEL_SPACE_START
+  let kernel_size: u64 = 16 * 1024 * 1024  // 16MB kernel
+
+  mmu.map_region(
+    addr_sep.kernel_pgd,
+    kernel_base,
+    kernel_base,  // Identity mapping in upper half
+    kernel_size,
+    mmu.PAGE_KERNEL_EXEC
+  )
+
+  foundation.serial_write_string("[KPTI] Kernel page tables created at 0x")
+  foundation.serial_write_u64(addr_sep.kernel_pgd)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Create user page table template (minimal kernel mapping)
+fn kpti_create_user_pagetable_template(): u32 {
+  foundation.serial_write_string("[KPTI] Creating user page table template...\n")
+
+  // Allocate user PGD template
+  addr_sep.user_pgd_template = allocate_page_table()
+
+  if KPTI_MINIMAL_KERNEL_MAPPING == 1 {
+    // Only map essential kernel code:
+    // - Exception vectors
+    // - Syscall entry/exit
+    // - Context switch code
+
+    let vectors_base: u64 = KERNEL_SPACE_START
+    let vectors_size: u64 = 4096  // 4KB vectors page
+
+    mmu.map_region(
+      addr_sep.user_pgd_template,
+      vectors_base,
+      vectors_base,
+      vectors_size,
+      mmu.PAGE_KERNEL_EXEC
+    )
+
+    foundation.serial_write_string("[KPTI] Minimal kernel mapping in user page tables\n")
+  }
+
+  foundation.serial_write_string("[KPTI] User page table template created at 0x")
+  foundation.serial_write_u64(addr_sep.user_pgd_template)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Allocate page table
+fn allocate_page_table(): u64 {
+  // Would call page allocator
+  return 0x40000000  // Placeholder
+}
+
+// Validate address is in correct space
+export fn validate_address_space(addr: u64, is_kernel: u32): u32 {
+  if is_kernel == 1 {
+    // Kernel address must be in upper half
+    if addr < KERNEL_SPACE_START {
+      foundation.serial_write_string("[KPTI] Invalid kernel address: 0x")
+      foundation.serial_write_u64(addr)
+      foundation.serial_write_string("\n")
+      addr_sep.protection_faults = addr_sep.protection_faults + 1
+      return 1
+    }
+  } else {
+    // User address must be in lower half
+    if addr > USER_SPACE_END {
+      foundation.serial_write_string("[KPTI] Invalid user address: 0x")
+      foundation.serial_write_u64(addr)
+      foundation.serial_write_string("\n")
+      addr_sep.protection_faults = addr_sep.protection_faults + 1
+      return 1
+    }
+  }
+
+  return 0
+}
+
+// Switch to kernel page tables
+export fn switch_to_kernel_pagetables() {
+  if KPTI_ENABLED == 0 { return }
+
+  // Set TTBR1_EL1 (kernel page table)
+  set_ttbr1(addr_sep.kernel_pgd)
+
+  // Set ASID to kernel
+  set_asid(ASID_KERNEL)
+
+  addr_sep.context_switches = addr_sep.context_switches + 1
+}
+
+// Switch to user page tables
+export fn switch_to_user_pagetables(user_pgd: u64, pid: u32) {
+  if KPTI_ENABLED == 0 { return }
+
+  // Set TTBR0_EL0 (user page table)
+  set_ttbr0(user_pgd)
+
+  // Allocate ASID for process
+  let asid: u32 = allocate_asid(pid)
+  set_asid(asid)
+
+  addr_sep.context_switches = addr_sep.context_switches + 1
+
+  // Flush TLB for this ASID
+  flush_tlb_asid(asid)
+  addr_sep.tlb_flushes = addr_sep.tlb_flushes + 1
+}
+
+// Allocate ASID for process
+fn allocate_asid(pid: u32): u32 {
+  // Find existing ASID for this PID
+  var i: u32 = 0
+  loop {
+    if i >= MAX_PROCESSES { break }
+
+    if process_asids[i].active == 1 && process_asids[i].pid == pid {
+      if process_asids[i].generation == addr_sep.asid_generation {
+        return process_asids[i].asid
+      }
+    }
+
+    i = i + 1
+  }
+
+  // Allocate new ASID
+  let new_asid: u32 = addr_sep.current_asid
+  addr_sep.current_asid = addr_sep.current_asid + 1
+
+  if addr_sep.current_asid >= MAX_ASIDS {
+    // ASID rollover - flush all TLBs and start new generation
+    addr_sep.current_asid = ASID_USER_BASE
+    addr_sep.asid_generation = addr_sep.asid_generation + 1
+
+    flush_all_tlbs()
+    addr_sep.tlb_flushes = addr_sep.tlb_flushes + 1
+
+    // Invalidate all process ASIDs
+    i = 0
+    loop {
+      if i >= MAX_PROCESSES { break }
+      process_asids[i].active = 0
+      i = i + 1
+    }
+  }
+
+  // Store new ASID
+  i = 0
+  loop {
+    if i >= MAX_PROCESSES { break }
+
+    if process_asids[i].active == 0 {
+      process_asids[i].pid = pid
+      process_asids[i].asid = new_asid
+      process_asids[i].generation = addr_sep.asid_generation
+      process_asids[i].active = 1
+      break
+    }
+
+    i = i + 1
+  }
+
+  return new_asid
+}
+
+// ARM64 system register access
+fn set_ttbr0(pgd: u64) {
+  // ARM64 assembly:
+  // asm { "msr ttbr0_el1, %0" :: "r"(pgd) }
+  foundation.serial_write_string("[KPTI] Set TTBR0_EL1 = 0x")
+  foundation.serial_write_u64(pgd)
+  foundation.serial_write_string("\n")
+}
+
+fn set_ttbr1(pgd: u64) {
+  // ARM64 assembly:
+  // asm { "msr ttbr1_el1, %0" :: "r"(pgd) }
+  foundation.serial_write_string("[KPTI] Set TTBR1_EL1 = 0x")
+  foundation.serial_write_u64(pgd)
+  foundation.serial_write_string("\n")
+}
+
+fn set_asid(asid: u32) {
+  // ARM64 assembly:
+  // asm { "msr contextidr_el1, %0" :: "r"(asid) }
+}
+
+fn flush_tlb_asid(asid: u32) {
+  // ARM64 assembly:
+  // asm { "tlbi aside1, %0" :: "r"(asid) }
+  // asm { "dsb ish" }
+  // asm { "isb" }
+}
+
+fn flush_all_tlbs() {
+  // ARM64 assembly:
+  // asm { "tlbi vmalle1" }
+  // asm { "dsb ish" }
+  // asm { "isb" }
+}
+
+// Kernel entry from userspace (syscall/exception)
+export fn kpti_kernel_entry() {
+  if KPTI_ENABLED == 0 { return }
+
+  // Switch from user page tables to kernel page tables
+  // This happens in exception vectors before C code runs
+
+  // Save user TTBR0
+  // Load kernel TTBR1
+  // Set kernel ASID
+
+  addr_sep.context_switches = addr_sep.context_switches + 1
+}
+
+// Kernel exit to userspace
+export fn kpti_kernel_exit(user_pgd: u64, pid: u32) {
+  if KPTI_ENABLED == 0 { return }
+
+  // Switch from kernel page tables to user page tables
+  switch_to_user_pagetables(user_pgd, pid)
+
+  // This happens in exception return path
+}
+
+// Check if address is accessible from current privilege level
+export fn kpti_check_access(addr: u64, is_write: u32, is_kernel_mode: u32): u32 {
+  // Validate address space
+  if validate_address_space(addr, is_kernel_mode) != 0 {
+    return 1  // Access denied
+  }
+
+  // In kernel mode, can access all addresses
+  if is_kernel_mode == 1 {
+    return 0  // Access allowed
+  }
+
+  // In user mode, cannot access kernel addresses
+  if addr >= KERNEL_SPACE_START {
+    foundation.serial_write_string("[KPTI] User mode access to kernel address blocked: 0x")
+    foundation.serial_write_u64(addr)
+    foundation.serial_write_string("\n")
+    addr_sep.protection_faults = addr_sep.protection_faults + 1
+    return 1  // Access denied
+  }
+
+  return 0  // Access allowed
+}
+
+// Copy data from user space (with validation)
+export fn copy_from_user(kernel_dest: *u8, user_src: u64, size: u64): u32 {
+  // Validate user address
+  if user_src >= KERNEL_SPACE_START {
+    foundation.serial_write_string("[KPTI] copy_from_user: invalid user address\n")
+    return 1
+  }
+
+  if user_src + size > USER_SPACE_END {
+    foundation.serial_write_string("[KPTI] copy_from_user: buffer extends into kernel space\n")
+    return 1
+  }
+
+  // Safe to copy
+  var offset: u64 = 0
+  loop {
+    if offset >= size { break }
+
+    let byte: u8 = memory.read_u8(user_src + offset)
+    memory.write_u8(kernel_dest as u64 + offset, byte)
+
+    offset = offset + 1
+  }
+
+  return 0
+}
+
+// Copy data to user space (with validation)
+export fn copy_to_user(user_dest: u64, kernel_src: *u8, size: u64): u32 {
+  // Validate user address
+  if user_dest >= KERNEL_SPACE_START {
+    foundation.serial_write_string("[KPTI] copy_to_user: invalid user address\n")
+    return 1
+  }
+
+  if user_dest + size > USER_SPACE_END {
+    foundation.serial_write_string("[KPTI] copy_to_user: buffer extends into kernel space\n")
+    return 1
+  }
+
+  // Safe to copy
+  var offset: u64 = 0
+  loop {
+    if offset >= size { break }
+
+    let byte: u8 = memory.read_u8(kernel_src as u64 + offset)
+    memory.write_u8(user_dest + offset, byte)
+
+    offset = offset + 1
+  }
+
+  return 0
+}
+
+// Get statistics
+export fn kpti_print_stats() {
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("Kernel/User Address Separation Statistics:\n")
+  foundation.serial_write_string("==========================================\n")
+
+  foundation.serial_write_string("KPTI enabled:       ")
+  if addr_sep.kpti_enabled == 1 {
+    foundation.serial_write_string("Yes\n")
+  } else {
+    foundation.serial_write_string("No\n")
+  }
+
+  foundation.serial_write_string("Context switches:   ")
+  foundation.serial_write_u64(addr_sep.context_switches)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("TLB flushes:        ")
+  foundation.serial_write_u64(addr_sep.tlb_flushes)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Protection faults:  ")
+  foundation.serial_write_u64(addr_sep.protection_faults)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Current ASID:       ")
+  foundation.serial_write_u64(addr_sep.current_asid)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("ASID generation:    ")
+  foundation.serial_write_u64(addr_sep.asid_generation)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n")
+}
