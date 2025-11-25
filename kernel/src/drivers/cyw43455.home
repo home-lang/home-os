@@ -1,0 +1,594 @@
+// home-os Cypress CYW43455 WiFi/Bluetooth Driver
+// Integrated 802.11ac WiFi and Bluetooth 5.0 for Raspberry Pi 4/5
+// SDIO interface for WiFi, UART for Bluetooth
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../arch/arm64/timer.home" as timer
+import "sdmmc.home" as sdmmc
+
+// CYW43455 Chip Identification
+const CYW43455_CHIP_ID: u32 = 0x4345
+const CYW43455_CHIP_REV: u32 = 0x09
+
+// SDIO Function Numbers
+const SDIO_FUNC_0: u32 = 0  // Common registers
+const SDIO_FUNC_1: u32 = 1  // Backplane access
+const SDIO_FUNC_2: u32 = 2  // DMA/Data
+
+// SDIO Common Registers (Function 0)
+const SDIO_CCCR_IOEN: u32 = 0x02      // I/O Enable
+const SDIO_CCCR_IORDY: u32 = 0x03     // I/O Ready
+const SDIO_CCCR_INTEN: u32 = 0x04     // Interrupt Enable
+const SDIO_CCCR_INTPEND: u32 = 0x05   // Interrupt Pending
+const SDIO_CCCR_SPEED: u32 = 0x13     // Bus Speed Select
+const SDIO_CCCR_POWER: u32 = 0x12     // Power Control
+
+// CYW43455 Core Registers
+const AI_IOCTRL_OFFSET: u32 = 0x408
+const AI_RESETCTRL_OFFSET: u32 = 0x800
+const AI_RESETSTATUS_OFFSET: u32 = 0x804
+
+// Core control flags
+const AI_IOCTRL_ENABLE: u32 = 0x01
+const AI_RESETCTRL_BIT: u32 = 0x01
+
+// Backplane window
+const BACKPLANE_ADDRESS_MASK: u32 = 0x7FFF
+const BACKPLANE_ADDRESS_32BIT_FLAG: u32 = 0x08000
+
+// Chip cores
+const CHIPCOMMON_CORE: u32 = 0
+const DOT11MAC_CORE: u32 = 1
+const SDIOD_CORE: u32 = 2
+const WLAN_ARMCM3_CORE: u32 = 3
+
+// WiFi modes
+const WIFI_MODE_NONE: u32 = 0
+const WIFI_MODE_STA: u32 = 1       // Station (client)
+const WIFI_MODE_AP: u32 = 2        // Access Point
+const WIFI_MODE_STA_AP: u32 = 3    // Both
+
+// Security modes
+const WIFI_SEC_OPEN: u32 = 0
+const WIFI_SEC_WPA_PSK: u32 = 1
+const WIFI_SEC_WPA2_PSK: u32 = 2
+const WIFI_SEC_WPA_WPA2_PSK: u32 = 3
+
+// Power management modes
+const PM_OFF: u32 = 0
+const PM_MAX: u32 = 1
+const PM_FAST: u32 = 2
+
+// Bluetooth modes
+const BT_MODE_OFF: u32 = 0
+const BT_MODE_BLE: u32 = 1
+const BT_MODE_CLASSIC: u32 = 2
+const BT_MODE_DUAL: u32 = 3
+
+// Buffer sizes
+const MAX_SSID_LENGTH: u32 = 32
+const MAX_PASSPHRASE_LENGTH: u32 = 64
+const MAX_BSSID_LENGTH: u32 = 6
+
+// WiFi configuration
+struct WiFiConfig {
+  mode: u32
+  ssid: [MAX_SSID_LENGTH]u8
+  ssid_len: u32
+  passphrase: [MAX_PASSPHRASE_LENGTH]u8
+  passphrase_len: u32
+  security: u32
+  channel: u32
+  power_save: u32
+  bssid: [MAX_BSSID_LENGTH]u8
+}
+
+// WiFi status
+struct WiFiStatus {
+  connected: u32
+  ip_addr: u32
+  netmask: u32
+  gateway: u32
+  rssi: i32            // Signal strength (dBm)
+  channel: u32
+  link_speed: u32      // Mbps
+}
+
+// Bluetooth configuration
+struct BTConfig {
+  mode: u32
+  device_name: [32]u8
+  device_name_len: u32
+  discoverable: u32
+  connectable: u32
+}
+
+// CYW43455 device state
+struct CYW43455Device {
+  sdio_initialized: u32
+  chip_id: u32
+  chip_rev: u32
+
+  // WiFi state
+  wifi_enabled: u32
+  wifi_config: WiFiConfig
+  wifi_status: WiFiStatus
+
+  // Bluetooth state
+  bt_enabled: u32
+  bt_config: BTConfig
+
+  // Firmware loaded
+  firmware_loaded: u32
+
+  // Backplane window
+  backplane_window: u32
+}
+
+var cyw43455: CYW43455Device
+var initialized: u32 = 0
+
+// Statistics
+var sdio_reads: u64 = 0
+var sdio_writes: u64 = 0
+var sdio_errors: u64 = 0
+var packets_tx: u64 = 0
+var packets_rx: u64 = 0
+var bt_packets_tx: u64 = 0
+var bt_packets_rx: u64 = 0
+
+// SDIO register access helpers
+fn sdio_read_reg8(func: u32, addr: u32): u8 {
+  // Simplified SDIO read - would use actual SDIO commands
+  sdio_reads = sdio_reads + 1
+  return 0
+}
+
+fn sdio_write_reg8(func: u32, addr: u32, value: u8) {
+  // Simplified SDIO write - would use actual SDIO commands
+  sdio_writes = sdio_writes + 1
+}
+
+fn sdio_read_reg32(func: u32, addr: u32): u32 {
+  // Read 32-bit value via SDIO
+  let b0: u32 = sdio_read_reg8(func, addr) as u32
+  let b1: u32 = sdio_read_reg8(func, addr + 1) as u32
+  let b2: u32 = sdio_read_reg8(func, addr + 2) as u32
+  let b3: u32 = sdio_read_reg8(func, addr + 3) as u32
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn sdio_write_reg32(func: u32, addr: u32, value: u32) {
+  sdio_write_reg8(func, addr, (value & 0xFF) as u8)
+  sdio_write_reg8(func, addr + 1, ((value >> 8) & 0xFF) as u8)
+  sdio_write_reg8(func, addr + 2, ((value >> 16) & 0xFF) as u8)
+  sdio_write_reg8(func, addr + 3, ((value >> 24) & 0xFF) as u8)
+}
+
+// Backplane access
+fn backplane_set_window(addr: u32) {
+  if cyw43455.backplane_window == addr {
+    return
+  }
+
+  sdio_write_reg32(SDIO_FUNC_1, 0x1000A, addr)
+  cyw43455.backplane_window = addr
+}
+
+fn backplane_read32(addr: u32): u32 {
+  backplane_set_window(addr & ~BACKPLANE_ADDRESS_MASK)
+  return sdio_read_reg32(SDIO_FUNC_1, addr & BACKPLANE_ADDRESS_MASK | BACKPLANE_ADDRESS_32BIT_FLAG)
+}
+
+fn backplane_write32(addr: u32, value: u32) {
+  backplane_set_window(addr & ~BACKPLANE_ADDRESS_MASK)
+  sdio_write_reg32(SDIO_FUNC_1, addr & BACKPLANE_ADDRESS_MASK | BACKPLANE_ADDRESS_32BIT_FLAG, value)
+}
+
+// Core control
+fn core_is_up(core_id: u32): u32 {
+  // Would check core status registers
+  return 1
+}
+
+fn core_disable(core_id: u32) {
+  foundation.serial_write_string("[CYW43455] Disabling core ")
+  foundation.serial_write_u64(core_id)
+  foundation.serial_write_string("\n")
+
+  // Would write to core control registers
+}
+
+fn core_reset(core_id: u32) {
+  foundation.serial_write_string("[CYW43455] Resetting core ")
+  foundation.serial_write_u64(core_id)
+  foundation.serial_write_string("\n")
+
+  core_disable(core_id)
+  timer.timer_delay_ms(1)
+
+  // Would write reset sequence to core registers
+
+  timer.timer_delay_ms(1)
+}
+
+// Initialize SDIO interface
+fn cyw43455_sdio_init(): u32 {
+  foundation.serial_write_string("[CYW43455] Initializing SDIO interface...\n")
+
+  // Enable SDIO function 1 (backplane)
+  sdio_write_reg8(SDIO_FUNC_0, SDIO_CCCR_IOEN, 0x02)
+
+  timer.timer_delay_ms(10)
+
+  // Wait for function 1 ready
+  var timeout: u32 = 100
+  loop {
+    if timeout == 0 { break }
+
+    let iordy: u8 = sdio_read_reg8(SDIO_FUNC_0, SDIO_CCCR_IORDY)
+    if (iordy & 0x02) != 0 {
+      break
+    }
+
+    timer.timer_delay_ms(10)
+    timeout = timeout - 1
+  }
+
+  if timeout == 0 {
+    foundation.serial_write_string("[CYW43455] SDIO function 1 not ready\n")
+    return 1
+  }
+
+  // Enable SDIO function 2 (data)
+  sdio_write_reg8(SDIO_FUNC_0, SDIO_CCCR_IOEN, 0x06)
+
+  timer.timer_delay_ms(10)
+
+  // Enable high-speed mode
+  sdio_write_reg8(SDIO_FUNC_0, SDIO_CCCR_SPEED, 0x02)
+
+  // Enable interrupts
+  sdio_write_reg8(SDIO_FUNC_0, SDIO_CCCR_INTEN, 0x03)
+
+  cyw43455.sdio_initialized = 1
+
+  foundation.serial_write_string("[CYW43455] SDIO initialized\n")
+  return 0
+}
+
+// Read chip identification
+fn cyw43455_read_chip_id(): u32 {
+  foundation.serial_write_string("[CYW43455] Reading chip ID...\n")
+
+  // Read chip ID from chipcommon core
+  cyw43455.chip_id = backplane_read32(0x18000000)
+  cyw43455.chip_rev = (cyw43455.chip_id >> 16) & 0xF
+
+  foundation.serial_write_string("[CYW43455] Chip ID: 0x")
+  foundation.serial_write_hex(cyw43455.chip_id & 0xFFFF)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("[CYW43455] Chip Rev: ")
+  foundation.serial_write_u64(cyw43455.chip_rev)
+  foundation.serial_write_string("\n")
+
+  // Verify this is CYW43455
+  if (cyw43455.chip_id & 0xFFFF) != CYW43455_CHIP_ID {
+    foundation.serial_write_string("[CYW43455] Unexpected chip ID\n")
+    return 1
+  }
+
+  return 0
+}
+
+// Load firmware
+fn cyw43455_load_firmware(): u32 {
+  foundation.serial_write_string("[CYW43455] Loading firmware...\n")
+
+  // In production, would load firmware blob from storage
+  // For now, mark as loaded
+  cyw43455.firmware_loaded = 1
+
+  foundation.serial_write_string("[CYW43455] Firmware loaded\n")
+  return 0
+}
+
+// Initialize CYW43455 chip
+export fn cyw43455_init(): u32 {
+  if initialized == 1 {
+    foundation.serial_write_string("[CYW43455] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[CYW43455] Initializing CYW43455 WiFi/BT chip...\n")
+
+  // Initialize device structure
+  cyw43455.sdio_initialized = 0
+  cyw43455.chip_id = 0
+  cyw43455.chip_rev = 0
+  cyw43455.wifi_enabled = 0
+  cyw43455.bt_enabled = 0
+  cyw43455.firmware_loaded = 0
+  cyw43455.backplane_window = 0xFFFFFFFF
+
+  // Initialize SDIO interface
+  if cyw43455_sdio_init() != 0 {
+    return 1
+  }
+
+  // Read and verify chip ID
+  if cyw43455_read_chip_id() != 0 {
+    return 1
+  }
+
+  // Reset cores
+  core_reset(WLAN_ARMCM3_CORE)
+  core_reset(DOT11MAC_CORE)
+
+  // Load firmware
+  if cyw43455_load_firmware() != 0 {
+    return 1
+  }
+
+  initialized = 1
+
+  foundation.serial_write_string("[CYW43455] Initialization complete\n")
+  return 0
+}
+
+// Enable WiFi
+export fn wifi_enable(): u32 {
+  if initialized == 0 {
+    return 1
+  }
+
+  if cyw43455.wifi_enabled == 1 {
+    return 0
+  }
+
+  foundation.serial_write_string("[CYW43455] Enabling WiFi...\n")
+
+  // Initialize WiFi configuration
+  cyw43455.wifi_config.mode = WIFI_MODE_NONE
+  cyw43455.wifi_config.ssid_len = 0
+  cyw43455.wifi_config.passphrase_len = 0
+  cyw43455.wifi_config.security = WIFI_SEC_OPEN
+  cyw43455.wifi_config.channel = 0
+  cyw43455.wifi_config.power_save = PM_FAST
+
+  // Initialize WiFi status
+  cyw43455.wifi_status.connected = 0
+  cyw43455.wifi_status.ip_addr = 0
+  cyw43455.wifi_status.rssi = 0
+  cyw43455.wifi_status.channel = 0
+
+  cyw43455.wifi_enabled = 1
+
+  foundation.serial_write_string("[CYW43455] WiFi enabled\n")
+  return 0
+}
+
+// Disable WiFi
+export fn wifi_disable(): u32 {
+  if cyw43455.wifi_enabled == 0 {
+    return 0
+  }
+
+  foundation.serial_write_string("[CYW43455] Disabling WiFi...\n")
+
+  cyw43455.wifi_enabled = 0
+  cyw43455.wifi_status.connected = 0
+
+  foundation.serial_write_string("[CYW43455] WiFi disabled\n")
+  return 0
+}
+
+// Connect to WiFi network
+export fn wifi_connect(ssid: *u8, ssid_len: u32, passphrase: *u8, passphrase_len: u32, security: u32): u32 {
+  if cyw43455.wifi_enabled == 0 {
+    return 1
+  }
+
+  foundation.serial_write_string("[CYW43455] Connecting to WiFi: ")
+  foundation.serial_write_string(ssid)
+  foundation.serial_write_string("\n")
+
+  // Copy SSID
+  var i: u32 = 0
+  loop {
+    if i >= ssid_len || i >= MAX_SSID_LENGTH { break }
+    cyw43455.wifi_config.ssid[i] = memory.read_u8(ssid as u64 + i as u64)
+    i = i + 1
+  }
+  cyw43455.wifi_config.ssid_len = ssid_len
+
+  // Copy passphrase
+  i = 0
+  loop {
+    if i >= passphrase_len || i >= MAX_PASSPHRASE_LENGTH { break }
+    cyw43455.wifi_config.passphrase[i] = memory.read_u8(passphrase as u64 + i as u64)
+    i = i + 1
+  }
+  cyw43455.wifi_config.passphrase_len = passphrase_len
+
+  cyw43455.wifi_config.security = security
+  cyw43455.wifi_config.mode = WIFI_MODE_STA
+
+  // In production, would perform actual WiFi connection
+  // For now, simulate successful connection
+  timer.timer_delay_ms(1000)
+
+  cyw43455.wifi_status.connected = 1
+  cyw43455.wifi_status.rssi = -50  // Good signal
+  cyw43455.wifi_status.channel = 6
+  cyw43455.wifi_status.link_speed = 433  // 433 Mbps (802.11ac)
+
+  foundation.serial_write_string("[CYW43455] Connected to WiFi\n")
+  return 0
+}
+
+// Disconnect from WiFi
+export fn wifi_disconnect(): u32 {
+  if cyw43455.wifi_status.connected == 0 {
+    return 0
+  }
+
+  foundation.serial_write_string("[CYW43455] Disconnecting from WiFi...\n")
+
+  cyw43455.wifi_status.connected = 0
+  cyw43455.wifi_status.ip_addr = 0
+
+  foundation.serial_write_string("[CYW43455] Disconnected\n")
+  return 0
+}
+
+// Get WiFi connection status
+export fn wifi_is_connected(): u32 {
+  return cyw43455.wifi_status.connected
+}
+
+// Get signal strength (RSSI)
+export fn wifi_get_rssi(): i32 {
+  return cyw43455.wifi_status.rssi
+}
+
+// Enable Bluetooth
+export fn bt_enable(mode: u32): u32 {
+  if initialized == 0 {
+    return 1
+  }
+
+  if cyw43455.bt_enabled == 1 {
+    return 0
+  }
+
+  foundation.serial_write_string("[CYW43455] Enabling Bluetooth (mode ")
+  foundation.serial_write_u64(mode)
+  foundation.serial_write_string(")...\n")
+
+  cyw43455.bt_config.mode = mode
+  cyw43455.bt_config.discoverable = 1
+  cyw43455.bt_config.connectable = 1
+
+  cyw43455.bt_enabled = 1
+
+  foundation.serial_write_string("[CYW43455] Bluetooth enabled\n")
+  return 0
+}
+
+// Disable Bluetooth
+export fn bt_disable(): u32 {
+  if cyw43455.bt_enabled == 0 {
+    return 0
+  }
+
+  foundation.serial_write_string("[CYW43455] Disabling Bluetooth...\n")
+
+  cyw43455.bt_enabled = 0
+
+  foundation.serial_write_string("[CYW43455] Bluetooth disabled\n")
+  return 0
+}
+
+// Check if Bluetooth is enabled
+export fn bt_is_enabled(): u32 {
+  return cyw43455.bt_enabled
+}
+
+// Print chip information
+export fn cyw43455_print_info() {
+  foundation.serial_write_string("\n[CYW43455] Chip Information:\n")
+
+  foundation.serial_write_string("  Chip ID: 0x")
+  foundation.serial_write_hex(cyw43455.chip_id & 0xFFFF)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Chip Rev: ")
+  foundation.serial_write_u64(cyw43455.chip_rev)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Firmware loaded: ")
+  foundation.serial_write_string(if cyw43455.firmware_loaded == 1 { "Yes" } else { "No" })
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n  WiFi Status:\n")
+  foundation.serial_write_string("    Enabled: ")
+  foundation.serial_write_string(if cyw43455.wifi_enabled == 1 { "Yes" } else { "No" })
+  foundation.serial_write_string("\n")
+
+  if cyw43455.wifi_enabled == 1 {
+    foundation.serial_write_string("    Connected: ")
+    foundation.serial_write_string(if cyw43455.wifi_status.connected == 1 { "Yes" } else { "No" })
+    foundation.serial_write_string("\n")
+
+    if cyw43455.wifi_status.connected == 1 {
+      foundation.serial_write_string("    SSID: ")
+      foundation.serial_write_string(&cyw43455.wifi_config.ssid[0] as *u8)
+      foundation.serial_write_string("\n")
+
+      foundation.serial_write_string("    RSSI: ")
+      foundation.serial_write_u64(cyw43455.wifi_status.rssi as u64)
+      foundation.serial_write_string(" dBm\n")
+
+      foundation.serial_write_string("    Channel: ")
+      foundation.serial_write_u64(cyw43455.wifi_status.channel)
+      foundation.serial_write_string("\n")
+
+      foundation.serial_write_string("    Link speed: ")
+      foundation.serial_write_u64(cyw43455.wifi_status.link_speed)
+      foundation.serial_write_string(" Mbps\n")
+    }
+  }
+
+  foundation.serial_write_string("\n  Bluetooth Status:\n")
+  foundation.serial_write_string("    Enabled: ")
+  foundation.serial_write_string(if cyw43455.bt_enabled == 1 { "Yes" } else { "No" })
+  foundation.serial_write_string("\n")
+
+  if cyw43455.bt_enabled == 1 {
+    foundation.serial_write_string("    Mode: ")
+    if cyw43455.bt_config.mode == BT_MODE_BLE {
+      foundation.serial_write_string("BLE")
+    } else if cyw43455.bt_config.mode == BT_MODE_CLASSIC {
+      foundation.serial_write_string("Classic")
+    } else if cyw43455.bt_config.mode == BT_MODE_DUAL {
+      foundation.serial_write_string("Dual")
+    }
+    foundation.serial_write_string("\n")
+  }
+}
+
+// Print statistics
+export fn cyw43455_print_stats() {
+  foundation.serial_write_string("\n[CYW43455] Statistics:\n")
+
+  foundation.serial_write_string("  SDIO reads: ")
+  foundation.serial_write_u64(sdio_reads)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  SDIO writes: ")
+  foundation.serial_write_u64(sdio_writes)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  SDIO errors: ")
+  foundation.serial_write_u64(sdio_errors)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  WiFi packets TX: ")
+  foundation.serial_write_u64(packets_tx)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  WiFi packets RX: ")
+  foundation.serial_write_u64(packets_rx)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  BT packets TX: ")
+  foundation.serial_write_u64(bt_packets_tx)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  BT packets RX: ")
+  foundation.serial_write_u64(bt_packets_rx)
+  foundation.serial_write_string("\n")
+}

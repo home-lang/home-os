@@ -1,0 +1,635 @@
+// home-os BCM2711/BCM2712 EMMC2 Controller Driver
+// Broadcom SD/MMC host controller for Raspberry Pi 4/5
+// SDHCI-compatible controller with DMA support
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../arch/arm64/timer.home" as timer
+
+// EMMC2 Register Base Addresses
+// Pi 4: 0xFE340000 (BCM2711)
+// Pi 5: 0x1100FFF000 (BCM2712, accessed via RP1)
+const EMMC2_BASE_PI4: u64 = 0xFE340000
+const EMMC2_BASE_PI5: u64 = 0x1100FFF000
+
+// SDHCI Standard Registers (offsets from base)
+const EMMC2_ARG2: u32 = 0x00           // Argument2 register
+const EMMC2_BLKSIZECNT: u32 = 0x04     // Block size and count
+const EMMC2_ARG1: u32 = 0x08           // Argument register
+const EMMC2_CMDTM: u32 = 0x0C          // Command and transfer mode
+const EMMC2_RESP0: u32 = 0x10          // Response bits 31:0
+const EMMC2_RESP1: u32 = 0x14          // Response bits 63:32
+const EMMC2_RESP2: u32 = 0x18          // Response bits 95:64
+const EMMC2_RESP3: u32 = 0x1C          // Response bits 127:96
+const EMMC2_DATA: u32 = 0x20           // Data register
+const EMMC2_STATUS: u32 = 0x24         // Status register
+const EMMC2_CONTROL0: u32 = 0x28       // Host configuration
+const EMMC2_CONTROL1: u32 = 0x2C       // Control register
+const EMMC2_INTERRUPT: u32 = 0x30      // Interrupt flags
+const EMMC2_IRPT_MASK: u32 = 0x34      // Interrupt mask
+const EMMC2_IRPT_EN: u32 = 0x38        // Interrupt enable
+const EMMC2_CONTROL2: u32 = 0x3C       // Control2 register
+const EMMC2_CAPABILITIES: u32 = 0x40   // Capabilities
+const EMMC2_FORCE_IRPT: u32 = 0x50     // Force interrupt
+const EMMC2_BOOT_TIMEOUT: u32 = 0x70   // Boot timeout
+const EMMC2_DBG_SEL: u32 = 0x74        // Debug select
+const EMMC2_EXRDFIFO_CFG: u32 = 0x80   // Extension FIFO config
+const EMMC2_EXRDFIFO_EN: u32 = 0x84    // Extension FIFO enable
+const EMMC2_TUNE_STEP: u32 = 0x88      // Tuning step
+const EMMC2_TUNE_STEPS_STD: u32 = 0x8C // Tuning steps for SDR
+const EMMC2_TUNE_STEPS_DDR: u32 = 0x90 // Tuning steps for DDR
+const EMMC2_SPI_INT_SPT: u32 = 0xF0    // SPI interrupt support
+const EMMC2_SLOTISR_VER: u32 = 0xFC    // Slot and version
+
+// Command flags (CMDTM register)
+const CMD_RSPNS_TYPE_NONE: u32 = 0x00000000
+const CMD_RSPNS_TYPE_136: u32 = 0x00010000
+const CMD_RSPNS_TYPE_48: u32 = 0x00020000
+const CMD_RSPNS_TYPE_48B: u32 = 0x00030000
+const CMD_CRCCHK_EN: u32 = 0x00080000
+const CMD_IXCHK_EN: u32 = 0x00100000
+const CMD_ISDATA: u32 = 0x00200000
+const CMD_TYPE_NORMAL: u32 = 0x00000000
+const CMD_TYPE_SUSPEND: u32 = 0x00400000
+const CMD_TYPE_RESUME: u32 = 0x00800000
+const CMD_TYPE_ABORT: u32 = 0x00C00000
+const TM_MULTI_BLOCK: u32 = 0x00000020
+const TM_DAT_DIR_READ: u32 = 0x00000010
+const TM_AUTO_CMD12: u32 = 0x00000004
+const TM_BLKCNT_EN: u32 = 0x00000002
+const TM_DMA_EN: u32 = 0x00000001
+
+// Status register flags
+const SR_DAT_INHIBIT: u32 = 0x00000002
+const SR_CMD_INHIBIT: u32 = 0x00000001
+const SR_READ_AVAILABLE: u32 = 0x00000800
+const SR_WRITE_AVAILABLE: u32 = 0x00000400
+
+// Interrupt flags
+const INT_CMD_DONE: u32 = 0x00000001
+const INT_DATA_DONE: u32 = 0x00000002
+const INT_BLOCK_GAP: u32 = 0x00000004
+const INT_WRITE_RDY: u32 = 0x00000010
+const INT_READ_RDY: u32 = 0x00000020
+const INT_CARD_INSERT: u32 = 0x00000040
+const INT_CARD_REMOVE: u32 = 0x00000080
+const INT_CMD_TIMEOUT: u32 = 0x00010000
+const INT_CMD_CRC: u32 = 0x00020000
+const INT_CMD_END_BIT: u32 = 0x00040000
+const INT_CMD_INDEX: u32 = 0x00080000
+const INT_DATA_TIMEOUT: u32 = 0x00100000
+const INT_DATA_CRC: u32 = 0x00200000
+const INT_DATA_END_BIT: u32 = 0x00400000
+const INT_CURRENT_LIMIT: u32 = 0x00800000
+const INT_AUTO_CMD12_ERR: u32 = 0x01000000
+const INT_ADMA_ERR: u32 = 0x02000000
+
+const INT_ERROR_MASK: u32 = 0xFFFF0000
+const INT_ALL_MASK: u32 = 0xFFFFFFFF
+
+// Control register flags
+const C0_SPI_MODE_EN: u32 = 0x00100000
+const C0_HCTL_HS_EN: u32 = 0x00000004
+const C0_HCTL_DWITDH: u32 = 0x00000002
+
+const C1_SRST_HC: u32 = 0x01000000
+const C1_SRST_CMD: u32 = 0x02000000
+const C1_SRST_DATA: u32 = 0x04000000
+const C1_TOUNIT_DIS: u32 = 0x000F0000
+const C1_TOUNIT_MAX: u32 = 0x000E0000
+const C1_CLK_GENSEL: u32 = 0x00000020
+const C1_CLK_EN: u32 = 0x00000004
+const C1_CLK_STABLE: u32 = 0x00000002
+const C1_CLK_INTLEN: u32 = 0x00000001
+
+// SD Card Commands
+const SD_CMD_GO_IDLE: u32 = 0
+const SD_CMD_ALL_SEND_CID: u32 = 2
+const SD_CMD_SEND_REL_ADDR: u32 = 3
+const SD_CMD_SET_DSR: u32 = 4
+const SD_CMD_SWITCH_FUNC: u32 = 6
+const SD_CMD_CARD_SELECT: u32 = 7
+const SD_CMD_SEND_IF_COND: u32 = 8
+const SD_CMD_SEND_CSD: u32 = 9
+const SD_CMD_SEND_CID: u32 = 10
+const SD_CMD_VOLTAGE_SWITCH: u32 = 11
+const SD_CMD_STOP_TRANS: u32 = 12
+const SD_CMD_SEND_STATUS: u32 = 13
+const SD_CMD_GO_INACTIVE: u32 = 15
+const SD_CMD_SET_BLOCKLEN: u32 = 16
+const SD_CMD_READ_SINGLE: u32 = 17
+const SD_CMD_READ_MULTI: u32 = 18
+const SD_CMD_SEND_TUNING: u32 = 19
+const SD_CMD_SPEED_CLASS: u32 = 20
+const SD_CMD_SET_BLOCK_COUNT: u32 = 23
+const SD_CMD_WRITE_SINGLE: u32 = 24
+const SD_CMD_WRITE_MULTI: u32 = 25
+const SD_CMD_PROGRAM_CSD: u32 = 27
+const SD_CMD_SET_WRITE_PROT: u32 = 28
+const SD_CMD_CLR_WRITE_PROT: u32 = 29
+const SD_CMD_SEND_WRITE_PROT: u32 = 30
+const SD_CMD_ERASE_WR_BLK_START: u32 = 32
+const SD_CMD_ERASE_WR_BLK_END: u32 = 33
+const SD_CMD_ERASE: u32 = 38
+const SD_CMD_LOCK_UNLOCK: u32 = 42
+const SD_CMD_APP_CMD: u32 = 55
+const SD_CMD_GEN_CMD: u32 = 56
+
+// ACMD commands (sent after APP_CMD)
+const SD_ACMD_SET_BUS_WIDTH: u32 = 6
+const SD_ACMD_SD_STATUS: u32 = 13
+const SD_ACMD_SEND_NUM_WR_BLKS: u32 = 22
+const SD_ACMD_SET_WR_BLK_ERASE_CNT: u32 = 23
+const SD_ACMD_SD_SEND_OP_COND: u32 = 41
+const SD_ACMD_SET_CLR_CARD_DETECT: u32 = 42
+const SD_ACMD_SEND_SCR: u32 = 51
+
+// Configuration
+const EMMC2_BLOCK_SIZE: u32 = 512
+const EMMC2_TIMEOUT_MS: u64 = 1000
+
+// Controller state
+struct EMMC2Controller {
+  base: u64              // Base address
+  rca: u32               // Relative Card Address
+  card_present: u32      // Card detected flag
+  card_initialized: u32  // Card initialized flag
+  block_size: u32        // Block size (usually 512)
+  num_blocks: u64        // Total number of blocks
+  is_sdhc: u32           // High capacity card flag
+  clock_rate: u32        // Current clock rate (Hz)
+}
+
+var emmc2: EMMC2Controller
+var initialized: u32 = 0
+
+// Statistics
+var total_reads: u64 = 0
+var total_writes: u64 = 0
+var total_errors: u64 = 0
+var cmd_timeouts: u64 = 0
+var data_errors: u64 = 0
+
+// Read register
+fn emmc2_read(offset: u32): u32 {
+  return memory.read_u32(emmc2.base + offset as u64)
+}
+
+// Write register
+fn emmc2_write(offset: u32, value: u32) {
+  memory.write_u32(emmc2.base + offset as u64, value)
+}
+
+// Wait for status bits to be set
+fn emmc2_wait_status(mask: u32, timeout_ms: u64): u32 {
+  let start: u64 = timer.timer_get_ms()
+
+  loop {
+    let status: u32 = emmc2_read(EMMC2_STATUS)
+    if (status & mask) != 0 {
+      return 0
+    }
+
+    let now: u64 = timer.timer_get_ms()
+    if now - start > timeout_ms {
+      return 1  // Timeout
+    }
+  }
+}
+
+// Wait for interrupt
+fn emmc2_wait_interrupt(mask: u32, timeout_ms: u64): u32 {
+  let start: u64 = timer.timer_get_ms()
+
+  loop {
+    let irpt: u32 = emmc2_read(EMMC2_INTERRUPT)
+
+    // Check for errors
+    if (irpt & INT_ERROR_MASK) != 0 {
+      total_errors = total_errors + 1
+
+      if (irpt & INT_CMD_TIMEOUT) != 0 {
+        cmd_timeouts = cmd_timeouts + 1
+      }
+      if (irpt & (INT_DATA_TIMEOUT | INT_DATA_CRC | INT_DATA_END_BIT)) != 0 {
+        data_errors = data_errors + 1
+      }
+
+      emmc2_write(EMMC2_INTERRUPT, irpt)  // Clear interrupts
+      return 1
+    }
+
+    // Check for desired interrupt
+    if (irpt & mask) != 0 {
+      emmc2_write(EMMC2_INTERRUPT, irpt)  // Clear interrupts
+      return 0
+    }
+
+    let now: u64 = timer.timer_get_ms()
+    if now - start > timeout_ms {
+      cmd_timeouts = cmd_timeouts + 1
+      return 1  // Timeout
+    }
+  }
+}
+
+// Send command
+fn emmc2_send_command(cmd: u32, arg: u32, timeout_ms: u64): u32 {
+  // Wait for command line ready
+  if emmc2_wait_status(SR_CMD_INHIBIT, timeout_ms) != 0 {
+    return 1
+  }
+
+  // If command uses data line, wait for it
+  if (cmd & CMD_ISDATA) != 0 {
+    if emmc2_wait_status(SR_DAT_INHIBIT, timeout_ms) != 0 {
+      return 1
+    }
+  }
+
+  // Write argument and command
+  emmc2_write(EMMC2_ARG1, arg)
+  emmc2_write(EMMC2_CMDTM, cmd)
+
+  // Wait for command complete
+  return emmc2_wait_interrupt(INT_CMD_DONE, timeout_ms)
+}
+
+// Send APP command
+fn emmc2_send_app_command(acmd: u32, arg: u32): u32 {
+  // Send CMD55 first
+  let cmd55: u32 = (SD_CMD_APP_CMD << 24) | CMD_RSPNS_TYPE_48 | CMD_CRCCHK_EN
+
+  if emmc2_send_command(cmd55, emmc2.rca, EMMC2_TIMEOUT_MS) != 0 {
+    return 1
+  }
+
+  // Send actual ACMD
+  return emmc2_send_command(acmd, arg, EMMC2_TIMEOUT_MS)
+}
+
+// Initialize EMMC2 controller
+export fn emmc2_init(model: u32): u32 {
+  if initialized == 1 {
+    foundation.serial_write_string("[EMMC2] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[EMMC2] Initializing EMMC2 controller...\n")
+
+  // Set base address based on model
+  emmc2.base = if model == 1 { EMMC2_BASE_PI5 } else { EMMC2_BASE_PI4 }
+  emmc2.rca = 0
+  emmc2.card_present = 0
+  emmc2.card_initialized = 0
+  emmc2.block_size = EMMC2_BLOCK_SIZE
+  emmc2.num_blocks = 0
+  emmc2.is_sdhc = 0
+  emmc2.clock_rate = 400000  // Start at 400kHz
+
+  // Reset controller
+  foundation.serial_write_string("[EMMC2] Resetting controller...\n")
+  emmc2_write(EMMC2_CONTROL1, C1_SRST_HC)
+
+  // Wait for reset complete
+  var timeout: u32 = 10000
+  loop {
+    if timeout == 0 { break }
+
+    let control1: u32 = emmc2_read(EMMC2_CONTROL1)
+    if (control1 & C1_SRST_HC) == 0 {
+      break
+    }
+
+    timeout = timeout - 1
+  }
+
+  if timeout == 0 {
+    foundation.serial_write_string("[EMMC2] Reset timeout\n")
+    return 1
+  }
+
+  // Enable internal clock
+  emmc2_write(EMMC2_CONTROL1, C1_CLK_INTLEN | C1_TOUNIT_MAX)
+
+  timer.timer_delay_ms(10)
+
+  // Set clock frequency to 400kHz for initialization
+  emmc2_set_clock(400000)
+
+  // Enable interrupts
+  emmc2_write(EMMC2_IRPT_EN, INT_ALL_MASK)
+  emmc2_write(EMMC2_IRPT_MASK, INT_ALL_MASK)
+
+  // Clear any pending interrupts
+  emmc2_write(EMMC2_INTERRUPT, INT_ALL_MASK)
+
+  initialized = 1
+
+  foundation.serial_write_string("[EMMC2] Controller initialized\n")
+
+  // Try to detect and initialize card
+  return emmc2_card_init()
+}
+
+// Set clock frequency
+fn emmc2_set_clock(freq_hz: u32): u32 {
+  // Disable clock
+  emmc2_write(EMMC2_CONTROL1, emmc2_read(EMMC2_CONTROL1) & ~C1_CLK_EN)
+
+  timer.timer_delay_ms(10)
+
+  // Calculate divider (base clock is ~200MHz on Pi 4)
+  let base_clock: u32 = 200000000
+  var divider: u32 = base_clock / freq_hz
+  if divider < 2 {
+    divider = 2
+  }
+
+  // Set divider
+  let control1: u32 = emmc2_read(EMMC2_CONTROL1)
+  emmc2_write(EMMC2_CONTROL1, (control1 & 0xFFFF003F) | ((divider & 0xFF) << 8))
+
+  timer.timer_delay_ms(10)
+
+  // Enable clock
+  emmc2_write(EMMC2_CONTROL1, emmc2_read(EMMC2_CONTROL1) | C1_CLK_EN)
+
+  timer.timer_delay_ms(10)
+
+  // Wait for clock stable
+  var timeout: u32 = 10000
+  loop {
+    if timeout == 0 { break }
+
+    if (emmc2_read(EMMC2_CONTROL1) & C1_CLK_STABLE) != 0 {
+      break
+    }
+
+    timeout = timeout - 1
+  }
+
+  emmc2.clock_rate = freq_hz
+
+  return if timeout == 0 { 1 } else { 0 }
+}
+
+// Initialize SD card
+fn emmc2_card_init(): u32 {
+  foundation.serial_write_string("[EMMC2] Initializing SD card...\n")
+
+  // Send CMD0 - GO_IDLE_STATE
+  let cmd0: u32 = (SD_CMD_GO_IDLE << 24)
+  if emmc2_send_command(cmd0, 0, EMMC2_TIMEOUT_MS) != 0 {
+    foundation.serial_write_string("[EMMC2] CMD0 failed\n")
+    return 1
+  }
+
+  // Send CMD8 - SEND_IF_COND (for SDHC detection)
+  let cmd8: u32 = (SD_CMD_SEND_IF_COND << 24) | CMD_RSPNS_TYPE_48 | CMD_CRCCHK_EN
+  if emmc2_send_command(cmd8, 0x1AA, EMMC2_TIMEOUT_MS) == 0 {
+    // Card supports CMD8, likely SDHC
+    emmc2.is_sdhc = 1
+  }
+
+  // Send ACMD41 - SD_SEND_OP_COND repeatedly until card is ready
+  var retries: u32 = 100
+  loop {
+    if retries == 0 { break }
+
+    let acmd41: u32 = (SD_ACMD_SD_SEND_OP_COND << 24) | CMD_RSPNS_TYPE_48
+    let arg: u32 = if emmc2.is_sdhc == 1 { 0x40FF8000 } else { 0x00FF8000 }
+
+    if emmc2_send_app_command(acmd41, arg) == 0 {
+      let resp: u32 = emmc2_read(EMMC2_RESP0)
+      if (resp & 0x80000000) != 0 {
+        // Card is ready
+        break
+      }
+    }
+
+    timer.timer_delay_ms(10)
+    retries = retries - 1
+  }
+
+  if retries == 0 {
+    foundation.serial_write_string("[EMMC2] Card initialization timeout\n")
+    return 1
+  }
+
+  // Send CMD2 - ALL_SEND_CID
+  let cmd2: u32 = (SD_CMD_ALL_SEND_CID << 24) | CMD_RSPNS_TYPE_136
+  if emmc2_send_command(cmd2, 0, EMMC2_TIMEOUT_MS) != 0 {
+    foundation.serial_write_string("[EMMC2] CMD2 failed\n")
+    return 1
+  }
+
+  // Send CMD3 - SEND_RELATIVE_ADDR
+  let cmd3: u32 = (SD_CMD_SEND_REL_ADDR << 24) | CMD_RSPNS_TYPE_48 | CMD_CRCCHK_EN
+  if emmc2_send_command(cmd3, 0, EMMC2_TIMEOUT_MS) != 0 {
+    foundation.serial_write_string("[EMMC2] CMD3 failed\n")
+    return 1
+  }
+
+  emmc2.rca = emmc2_read(EMMC2_RESP0) & 0xFFFF0000
+
+  // Send CMD7 - SELECT_CARD
+  let cmd7: u32 = (SD_CMD_CARD_SELECT << 24) | CMD_RSPNS_TYPE_48B
+  if emmc2_send_command(cmd7, emmc2.rca, EMMC2_TIMEOUT_MS) != 0 {
+    foundation.serial_write_string("[EMMC2] CMD7 failed\n")
+    return 1
+  }
+
+  // Set block size to 512 bytes
+  let cmd16: u32 = (SD_CMD_SET_BLOCKLEN << 24) | CMD_RSPNS_TYPE_48 | CMD_CRCCHK_EN
+  if emmc2_send_command(cmd16, 512, EMMC2_TIMEOUT_MS) != 0 {
+    foundation.serial_write_string("[EMMC2] CMD16 failed\n")
+    return 1
+  }
+
+  // Increase clock to 25MHz
+  emmc2_set_clock(25000000)
+
+  emmc2.card_present = 1
+  emmc2.card_initialized = 1
+
+  foundation.serial_write_string("[EMMC2] SD card initialized\n")
+  foundation.serial_write_string("[EMMC2] Type: ")
+  foundation.serial_write_string(if emmc2.is_sdhc == 1 { "SDHC\n" } else { "SD\n" })
+
+  return 0
+}
+
+// Read block
+export fn emmc2_read_block(block_num: u64, buffer: *u8): u32 {
+  if initialized == 0 || emmc2.card_initialized == 0 {
+    return 1
+  }
+
+  // Convert block number for non-SDHC cards
+  let addr: u32 = if emmc2.is_sdhc == 1 {
+    block_num as u32
+  } else {
+    (block_num * 512) as u32
+  }
+
+  // Set block size and count
+  emmc2_write(EMMC2_BLKSIZECNT, (1 << 16) | 512)
+
+  // Send CMD17 - READ_SINGLE_BLOCK
+  let cmd: u32 = (SD_CMD_READ_SINGLE << 24) | CMD_RSPNS_TYPE_48 | CMD_CRCCHK_EN | CMD_ISDATA | TM_DAT_DIR_READ
+
+  if emmc2_send_command(cmd, addr, EMMC2_TIMEOUT_MS) != 0 {
+    return 1
+  }
+
+  // Wait for data ready
+  if emmc2_wait_interrupt(INT_READ_RDY, EMMC2_TIMEOUT_MS) != 0 {
+    return 1
+  }
+
+  // Read data
+  var i: u32 = 0
+  loop {
+    if i >= 512 { break }
+
+    let word: u32 = emmc2_read(EMMC2_DATA)
+    buffer[i] = (word & 0xFF) as u8
+    buffer[i + 1] = ((word >> 8) & 0xFF) as u8
+    buffer[i + 2] = ((word >> 16) & 0xFF) as u8
+    buffer[i + 3] = ((word >> 24) & 0xFF) as u8
+
+    i = i + 4
+  }
+
+  // Wait for transfer complete
+  if emmc2_wait_interrupt(INT_DATA_DONE, EMMC2_TIMEOUT_MS) != 0 {
+    return 1
+  }
+
+  total_reads = total_reads + 1
+  return 0
+}
+
+// Write block
+export fn emmc2_write_block(block_num: u64, buffer: *u8): u32 {
+  if initialized == 0 || emmc2.card_initialized == 0 {
+    return 1
+  }
+
+  // Convert block number for non-SDHC cards
+  let addr: u32 = if emmc2.is_sdhc == 1 {
+    block_num as u32
+  } else {
+    (block_num * 512) as u32
+  }
+
+  // Set block size and count
+  emmc2_write(EMMC2_BLKSIZECNT, (1 << 16) | 512)
+
+  // Send CMD24 - WRITE_SINGLE_BLOCK
+  let cmd: u32 = (SD_CMD_WRITE_SINGLE << 24) | CMD_RSPNS_TYPE_48 | CMD_CRCCHK_EN | CMD_ISDATA
+
+  if emmc2_send_command(cmd, addr, EMMC2_TIMEOUT_MS) != 0 {
+    return 1
+  }
+
+  // Wait for write ready
+  if emmc2_wait_interrupt(INT_WRITE_RDY, EMMC2_TIMEOUT_MS) != 0 {
+    return 1
+  }
+
+  // Write data
+  var i: u32 = 0
+  loop {
+    if i >= 512 { break }
+
+    let word: u32 = (buffer[i] as u32) |
+                    ((buffer[i + 1] as u32) << 8) |
+                    ((buffer[i + 2] as u32) << 16) |
+                    ((buffer[i + 3] as u32) << 24)
+
+    emmc2_write(EMMC2_DATA, word)
+
+    i = i + 4
+  }
+
+  // Wait for transfer complete
+  if emmc2_wait_interrupt(INT_DATA_DONE, EMMC2_TIMEOUT_MS) != 0 {
+    return 1
+  }
+
+  total_writes = total_writes + 1
+  return 0
+}
+
+// Check if card is present
+export fn emmc2_card_present(): u32 {
+  return emmc2.card_present
+}
+
+// Get block size
+export fn emmc2_get_block_size(): u32 {
+  return emmc2.block_size
+}
+
+// Get number of blocks
+export fn emmc2_get_num_blocks(): u64 {
+  return emmc2.num_blocks
+}
+
+// Print controller information
+export fn emmc2_print_info() {
+  foundation.serial_write_string("\n[EMMC2] Controller Information:\n")
+
+  foundation.serial_write_string("  Base address: 0x")
+  foundation.serial_write_hex(emmc2.base)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Card present: ")
+  foundation.serial_write_string(if emmc2.card_present == 1 { "Yes" } else { "No" })
+  foundation.serial_write_string("\n")
+
+  if emmc2.card_present == 1 {
+    foundation.serial_write_string("  Card type: ")
+    foundation.serial_write_string(if emmc2.is_sdhc == 1 { "SDHC" } else { "SD" })
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  RCA: 0x")
+    foundation.serial_write_hex(emmc2.rca)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Block size: ")
+    foundation.serial_write_u64(emmc2.block_size)
+    foundation.serial_write_string(" bytes\n")
+
+    foundation.serial_write_string("  Clock rate: ")
+    foundation.serial_write_u64(emmc2.clock_rate / 1000000)
+    foundation.serial_write_string(" MHz\n")
+  }
+}
+
+// Print statistics
+export fn emmc2_print_stats() {
+  foundation.serial_write_string("\n[EMMC2] Statistics:\n")
+
+  foundation.serial_write_string("  Total reads: ")
+  foundation.serial_write_u64(total_reads)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Total writes: ")
+  foundation.serial_write_u64(total_writes)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Total errors: ")
+  foundation.serial_write_u64(total_errors)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Command timeouts: ")
+  foundation.serial_write_u64(cmd_timeouts)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Data errors: ")
+  foundation.serial_write_u64(data_errors)
+  foundation.serial_write_string("\n")
+}

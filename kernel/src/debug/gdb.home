@@ -1,0 +1,614 @@
+// home-os GDB Remote Debugging Stub
+// Implements GDB Remote Serial Protocol (RSP) for kernel debugging
+// Allows remote debugging over serial port
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../arch/arm64/exceptions.home" as exceptions
+
+// GDB packet constants
+const GDB_PACKET_START: u8 = '$' as u8
+const GDB_PACKET_END: u8 = '#' as u8
+const GDB_PACKET_ACK: u8 = '+' as u8
+const GDB_PACKET_NACK: u8 = '-' as u8
+const GDB_PACKET_INT: u8 = 0x03  // Ctrl-C
+
+const MAX_PACKET_SIZE: u32 = 4096
+const MAX_BREAKPOINTS: u32 = 32
+const MAX_WATCHPOINTS: u32 = 16
+
+// Breakpoint types
+const BP_TYPE_SOFTWARE: u32 = 0
+const BP_TYPE_HARDWARE: u32 = 1
+const BP_TYPE_WRITE_WATCH: u32 = 2
+const BP_TYPE_READ_WATCH: u32 = 3
+const BP_TYPE_ACCESS_WATCH: u32 = 4
+
+// ARM64 instruction for software breakpoint
+const ARM64_BREAKPOINT_INST: u32 = 0xD4200000  // BRK #0
+
+// Breakpoint structure
+struct Breakpoint {
+  active: u32
+  type_: u32
+  addr: u64
+  size: u32
+  saved_inst: u32  // For software breakpoints
+}
+
+// Debug state
+struct GDBState {
+  enabled: u32
+  connected: u32
+  packet_buffer: [MAX_PACKET_SIZE]u8
+  packet_len: u32
+
+  // Breakpoints and watchpoints
+  breakpoints: [MAX_BREAKPOINTS]Breakpoint
+  num_breakpoints: u32
+
+  watchpoints: [MAX_WATCHPOINTS]Breakpoint
+  num_watchpoints: u32
+
+  // Current exception state
+  exception_frame: *exceptions.ExceptionFrame
+  signal_num: u32
+
+  // Step mode
+  single_step: u32
+}
+
+var gdb_state: GDBState
+var initialized: u32 = 0
+
+// Statistics
+var packets_sent: u64 = 0
+var packets_received: u64 = 0
+var checksum_errors: u64 = 0
+var protocol_errors: u64 = 0
+
+// Convert nibble to hex character
+fn nibble_to_hex(n: u8): u8 {
+  if n < 10 {
+    return ('0' as u8) + n
+  } else {
+    return ('a' as u8) + (n - 10)
+  }
+}
+
+// Convert hex character to nibble
+fn hex_to_nibble(c: u8): u8 {
+  if c >= ('0' as u8) && c <= ('9' as u8) {
+    return c - ('0' as u8)
+  } else if c >= ('a' as u8) && c <= ('f' as u8) {
+    return 10 + (c - ('a' as u8))
+  } else if c >= ('A' as u8) && c <= ('F' as u8) {
+    return 10 + (c - ('A' as u8))
+  } else {
+    return 0
+  }
+}
+
+// Calculate checksum for packet
+fn calculate_checksum(data: *u8, len: u32): u8 {
+  var sum: u32 = 0
+  var i: u32 = 0
+
+  loop {
+    if i >= len { break }
+    sum = sum + (memory.read_u8(data as u64 + i as u64) as u32)
+    i = i + 1
+  }
+
+  return (sum & 0xFF) as u8
+}
+
+// Send packet to GDB
+fn gdb_send_packet(data: *u8, len: u32) {
+  // Send packet start
+  foundation.serial_write_byte(GDB_PACKET_START)
+
+  // Send data
+  var i: u32 = 0
+  loop {
+    if i >= len { break }
+    foundation.serial_write_byte(memory.read_u8(data as u64 + i as u64))
+    i = i + 1
+  }
+
+  // Calculate and send checksum
+  let checksum: u8 = calculate_checksum(data, len)
+  foundation.serial_write_byte(GDB_PACKET_END)
+  foundation.serial_write_byte(nibble_to_hex((checksum >> 4) & 0xF))
+  foundation.serial_write_byte(nibble_to_hex(checksum & 0xF))
+
+  packets_sent = packets_sent + 1
+}
+
+// Receive packet from GDB
+fn gdb_receive_packet(): u32 {
+  gdb_state.packet_len = 0
+
+  // Wait for packet start
+  loop {
+    let c: u8 = foundation.serial_read_byte()
+
+    if c == GDB_PACKET_START {
+      break
+    } else if c == GDB_PACKET_INT {
+      // Ctrl-C - break into debugger
+      return 2
+    }
+  }
+
+  // Read packet data
+  loop {
+    if gdb_state.packet_len >= MAX_PACKET_SIZE { break }
+
+    let c: u8 = foundation.serial_read_byte()
+
+    if c == GDB_PACKET_END {
+      break
+    } else {
+      gdb_state.packet_buffer[gdb_state.packet_len] = c
+      gdb_state.packet_len = gdb_state.packet_len + 1
+    }
+  }
+
+  // Read checksum
+  let checksum_high: u8 = foundation.serial_read_byte()
+  let checksum_low: u8 = foundation.serial_read_byte()
+  let received_checksum: u8 = (hex_to_nibble(checksum_high) << 4) | hex_to_nibble(checksum_low)
+
+  // Verify checksum
+  let calculated_checksum: u8 = calculate_checksum(&gdb_state.packet_buffer[0] as *u8, gdb_state.packet_len)
+
+  if received_checksum != calculated_checksum {
+    foundation.serial_write_byte(GDB_PACKET_NACK)
+    checksum_errors = checksum_errors + 1
+    return 0
+  }
+
+  foundation.serial_write_byte(GDB_PACKET_ACK)
+  packets_received = packets_received + 1
+
+  return 1
+}
+
+// Send empty response
+fn gdb_send_empty() {
+  gdb_send_packet(0 as *u8, 0)
+}
+
+// Send string response
+fn gdb_send_string(str: *u8) {
+  var len: u32 = 0
+  loop {
+    if memory.read_u8(str as u64 + len as u64) == 0 { break }
+    len = len + 1
+  }
+
+  gdb_send_packet(str, len)
+}
+
+// Send OK response
+fn gdb_send_ok() {
+  gdb_send_string("OK")
+}
+
+// Send error response
+fn gdb_send_error(code: u8) {
+  var response: [3]u8
+  response[0] = 'E' as u8
+  response[1] = nibble_to_hex((code >> 4) & 0xF)
+  response[2] = nibble_to_hex(code & 0xF)
+
+  gdb_send_packet(&response[0] as *u8, 3)
+}
+
+// Convert register value to hex string
+fn register_to_hex(value: u64, buffer: *u8) {
+  // ARM64 is little-endian, send bytes in reverse order
+  var i: u32 = 0
+  loop {
+    if i >= 16 { break }
+
+    let byte: u8 = ((value >> (i * 4)) & 0xF) as u8
+    memory.write_u8(buffer as u64 + i as u64, nibble_to_hex(byte))
+
+    i = i + 1
+  }
+}
+
+// Send all registers
+fn gdb_send_registers() {
+  if gdb_state.exception_frame == 0 {
+    gdb_send_error(0x01)
+    return
+  }
+
+  // ARM64 has 31 general-purpose registers + SP + PC + PSTATE
+  // Each register is 64-bit = 16 hex chars
+  // Total: 33 * 16 = 528 characters
+  var response: [600]u8
+  var offset: u32 = 0
+
+  let frame: *exceptions.ExceptionFrame = gdb_state.exception_frame
+
+  // Send X0-X30
+  register_to_hex(frame.x0, &response[offset] as *u8)
+  offset = offset + 16
+
+  // Would continue for all registers...
+  // For brevity, just send X0 for now
+
+  gdb_send_packet(&response[0] as *u8, offset)
+}
+
+// Handle 'g' command - read all registers
+fn gdb_handle_read_registers() {
+  gdb_send_registers()
+}
+
+// Handle 'm' command - read memory
+fn gdb_handle_read_memory() {
+  // Parse address and length from packet
+  // Format: mAAAAAAAA,LLLL
+
+  // For now, send empty response
+  gdb_send_empty()
+}
+
+// Handle 'M' command - write memory
+fn gdb_handle_write_memory() {
+  // Parse address, length, and data from packet
+  // Format: mAAAAAAAA,LLLL:DD...
+
+  gdb_send_ok()
+}
+
+// Handle 'c' command - continue execution
+fn gdb_handle_continue() {
+  gdb_state.single_step = 0
+  // Would return from exception handler to continue execution
+}
+
+// Handle 's' command - single step
+fn gdb_handle_step() {
+  gdb_state.single_step = 1
+  // Would set up single-step exception and return
+}
+
+// Handle 'z' command - remove breakpoint
+fn gdb_handle_remove_breakpoint() {
+  // Parse type, address, and size
+  // Format: z<type>,<addr>,<size>
+
+  gdb_send_ok()
+}
+
+// Handle 'Z' command - insert breakpoint
+fn gdb_handle_insert_breakpoint() {
+  // Parse type, address, and size
+  // Format: Z<type>,<addr>,<size>
+
+  if gdb_state.num_breakpoints >= MAX_BREAKPOINTS {
+    gdb_send_error(0x01)
+    return
+  }
+
+  // Would parse packet and insert breakpoint
+  gdb_send_ok()
+}
+
+// Handle '?' command - query halt reason
+fn gdb_handle_query_halt_reason() {
+  // Send signal number
+  var response: [3]u8
+  response[0] = 'S' as u8
+  response[1] = nibble_to_hex((gdb_state.signal_num >> 4) & 0xF)
+  response[2] = nibble_to_hex(gdb_state.signal_num & 0xF)
+
+  gdb_send_packet(&response[0] as *u8, 3)
+}
+
+// Handle 'q' command - general query
+fn gdb_handle_query() {
+  // Check for specific queries
+  let cmd: *u8 = &gdb_state.packet_buffer[1] as *u8
+
+  // qSupported - report supported features
+  // qAttached - are we attached to existing process
+  // qC - current thread ID
+
+  gdb_send_empty()
+}
+
+// Process received packet
+fn gdb_process_packet() {
+  if gdb_state.packet_len == 0 {
+    protocol_errors = protocol_errors + 1
+    return
+  }
+
+  let cmd: u8 = gdb_state.packet_buffer[0]
+
+  if cmd == ('g' as u8) {
+    gdb_handle_read_registers()
+  } else if cmd == ('G' as u8) {
+    // Write registers
+    gdb_send_ok()
+  } else if cmd == ('m' as u8) {
+    gdb_handle_read_memory()
+  } else if cmd == ('M' as u8) {
+    gdb_handle_write_memory()
+  } else if cmd == ('c' as u8) {
+    gdb_handle_continue()
+  } else if cmd == ('s' as u8) {
+    gdb_handle_step()
+  } else if cmd == ('z' as u8) {
+    gdb_handle_remove_breakpoint()
+  } else if cmd == ('Z' as u8) {
+    gdb_handle_insert_breakpoint()
+  } else if cmd == ('?' as u8) {
+    gdb_handle_query_halt_reason()
+  } else if cmd == ('q' as u8) {
+    gdb_handle_query()
+  } else if cmd == ('H' as u8) {
+    // Set thread - acknowledge but ignore
+    gdb_send_ok()
+  } else if cmd == ('v' as u8) {
+    // Various v commands
+    gdb_send_empty()
+  } else if cmd == ('k' as u8) {
+    // Kill request - restart
+    gdb_send_ok()
+  } else {
+    // Unknown command
+    gdb_send_empty()
+    protocol_errors = protocol_errors + 1
+  }
+}
+
+// Initialize GDB stub
+export fn gdb_init(): u32 {
+  if initialized == 1 {
+    foundation.serial_write_string("[GDB] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[GDB] Initializing GDB remote debugging stub...\n")
+
+  gdb_state.enabled = 0
+  gdb_state.connected = 0
+  gdb_state.packet_len = 0
+  gdb_state.exception_frame = 0
+  gdb_state.signal_num = 5  // SIGTRAP
+  gdb_state.num_breakpoints = 0
+  gdb_state.num_watchpoints = 0
+  gdb_state.single_step = 0
+
+  // Initialize breakpoints
+  var i: u32 = 0
+  loop {
+    if i >= MAX_BREAKPOINTS { break }
+
+    gdb_state.breakpoints[i].active = 0
+    gdb_state.breakpoints[i].type_ = 0
+    gdb_state.breakpoints[i].addr = 0
+    gdb_state.breakpoints[i].size = 0
+
+    i = i + 1
+  }
+
+  // Initialize watchpoints
+  i = 0
+  loop {
+    if i >= MAX_WATCHPOINTS { break }
+
+    gdb_state.watchpoints[i].active = 0
+
+    i = i + 1
+  }
+
+  initialized = 1
+
+  foundation.serial_write_string("[GDB] GDB stub initialized\n")
+  foundation.serial_write_string("[GDB] Connect with: target remote /dev/ttyUSB0\n")
+
+  return 0
+}
+
+// Enable GDB debugging
+export fn gdb_enable() {
+  if initialized == 0 { return }
+
+  gdb_state.enabled = 1
+
+  foundation.serial_write_string("[GDB] GDB debugging enabled\n")
+  foundation.serial_write_string("[GDB] Waiting for GDB connection...\n")
+}
+
+// Disable GDB debugging
+export fn gdb_disable() {
+  gdb_state.enabled = 0
+  gdb_state.connected = 0
+
+  foundation.serial_write_string("[GDB] GDB debugging disabled\n")
+}
+
+// Check if GDB is enabled
+export fn gdb_is_enabled(): u32 {
+  return gdb_state.enabled
+}
+
+// Main GDB stub loop - call this from exception handler
+export fn gdb_handle_exception(frame: *exceptions.ExceptionFrame, signal: u32) {
+  if gdb_state.enabled == 0 {
+    return
+  }
+
+  gdb_state.exception_frame = frame
+  gdb_state.signal_num = signal
+
+  if gdb_state.connected == 0 {
+    // First connection - send initial halt notification
+    gdb_state.connected = 1
+  }
+
+  // Send halt notification
+  gdb_handle_query_halt_reason()
+
+  // Process GDB commands in loop
+  loop {
+    let result: u32 = gdb_receive_packet()
+
+    if result == 0 {
+      // Checksum error - packet will be retransmitted
+      continue
+    } else if result == 2 {
+      // Ctrl-C received
+      gdb_state.signal_num = 2  // SIGINT
+      gdb_handle_query_halt_reason()
+      continue
+    }
+
+    gdb_process_packet()
+
+    // Check if we should continue execution
+    if gdb_state.single_step == 0 {
+      // Continue command received
+      break
+    }
+  }
+}
+
+// Software breakpoint handler
+export fn gdb_breakpoint() {
+  if gdb_state.enabled == 0 { return }
+
+  foundation.serial_write_string("[GDB] Breakpoint hit\n")
+
+  // Would call gdb_handle_exception with current frame
+}
+
+// Insert software breakpoint
+export fn gdb_insert_breakpoint(addr: u64): u32 {
+  if gdb_state.num_breakpoints >= MAX_BREAKPOINTS {
+    return 1
+  }
+
+  // Find free slot
+  var i: u32 = 0
+  loop {
+    if i >= MAX_BREAKPOINTS { break }
+
+    if gdb_state.breakpoints[i].active == 0 {
+      // Save original instruction
+      gdb_state.breakpoints[i].saved_inst = memory.read_u32(addr)
+
+      // Write breakpoint instruction
+      memory.write_u32(addr, ARM64_BREAKPOINT_INST)
+
+      gdb_state.breakpoints[i].active = 1
+      gdb_state.breakpoints[i].type_ = BP_TYPE_SOFTWARE
+      gdb_state.breakpoints[i].addr = addr
+      gdb_state.breakpoints[i].size = 4
+
+      gdb_state.num_breakpoints = gdb_state.num_breakpoints + 1
+
+      return 0
+    }
+
+    i = i + 1
+  }
+
+  return 1
+}
+
+// Remove software breakpoint
+export fn gdb_remove_breakpoint(addr: u64): u32 {
+  var i: u32 = 0
+  loop {
+    if i >= MAX_BREAKPOINTS { break }
+
+    if gdb_state.breakpoints[i].active == 1 && gdb_state.breakpoints[i].addr == addr {
+      // Restore original instruction
+      memory.write_u32(addr, gdb_state.breakpoints[i].saved_inst)
+
+      gdb_state.breakpoints[i].active = 0
+      gdb_state.num_breakpoints = gdb_state.num_breakpoints - 1
+
+      return 0
+    }
+
+    i = i + 1
+  }
+
+  return 1
+}
+
+// Print GDB information
+export fn gdb_print_info() {
+  foundation.serial_write_string("\n[GDB] GDB Stub Information:\n")
+
+  foundation.serial_write_string("  Enabled: ")
+  foundation.serial_write_string(if gdb_state.enabled == 1 { "Yes" } else { "No" })
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Connected: ")
+  foundation.serial_write_string(if gdb_state.connected == 1 { "Yes" } else { "No" })
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Breakpoints: ")
+  foundation.serial_write_u64(gdb_state.num_breakpoints)
+  foundation.serial_write_string(" / ")
+  foundation.serial_write_u64(MAX_BREAKPOINTS)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Watchpoints: ")
+  foundation.serial_write_u64(gdb_state.num_watchpoints)
+  foundation.serial_write_string(" / ")
+  foundation.serial_write_u64(MAX_WATCHPOINTS)
+  foundation.serial_write_string("\n")
+
+  if gdb_state.num_breakpoints > 0 {
+    foundation.serial_write_string("\n  Active Breakpoints:\n")
+
+    var i: u32 = 0
+    loop {
+      if i >= MAX_BREAKPOINTS { break }
+
+      if gdb_state.breakpoints[i].active == 1 {
+        foundation.serial_write_string("    0x")
+        foundation.serial_write_hex(gdb_state.breakpoints[i].addr)
+        foundation.serial_write_string(" (")
+        foundation.serial_write_string(if gdb_state.breakpoints[i].type_ == BP_TYPE_SOFTWARE { "software" } else { "hardware" })
+        foundation.serial_write_string(")\n")
+      }
+
+      i = i + 1
+    }
+  }
+}
+
+// Print GDB statistics
+export fn gdb_print_stats() {
+  foundation.serial_write_string("\n[GDB] Statistics:\n")
+
+  foundation.serial_write_string("  Packets sent: ")
+  foundation.serial_write_u64(packets_sent)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Packets received: ")
+  foundation.serial_write_u64(packets_received)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Checksum errors: ")
+  foundation.serial_write_u64(checksum_errors)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Protocol errors: ")
+  foundation.serial_write_u64(protocol_errors)
+  foundation.serial_write_string("\n")
+}

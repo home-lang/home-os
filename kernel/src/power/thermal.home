@@ -1,0 +1,475 @@
+// home-os Thermal Monitoring and Throttling
+// Temperature management for Raspberry Pi 4/5
+// Prevents thermal damage and manages cooling
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../rpi/mailbox_vc7.home" as mailbox7
+import "../rpi/mailbox_vc6.home" as mailbox6
+import "cpufreq.home" as cpufreq
+
+// Temperature thresholds (millidegrees Celsius)
+const TEMP_NORMAL_MAX: u32 = 70000      // 70°C
+const TEMP_WARNING: u32 = 75000         // 75°C
+const TEMP_CRITICAL: u32 = 80000        // 80°C
+const TEMP_EMERGENCY: u32 = 85000       // 85°C (force shutdown)
+
+// Temperature zones
+const ZONE_NORMAL: u32 = 0
+const ZONE_WARNING: u32 = 1
+const ZONE_CRITICAL: u32 = 2
+const ZONE_EMERGENCY: u32 = 3
+
+// Thermal sensors
+const SENSOR_CPU: u32 = 0
+const SENSOR_GPU: u32 = 1
+const SENSOR_CORE: u32 = 2
+
+const MAX_SENSORS: u32 = 3
+const MAX_CPUS: u32 = 4
+
+// Polling interval (milliseconds)
+const THERMAL_POLL_INTERVAL_MS: u32 = 1000  // 1 second
+
+// Thermal sensor data
+struct ThermalSensor {
+  sensor_id: u32
+  temperature: u32        // Current temperature (millidegrees C)
+  max_temperature: u32    // Maximum safe temperature
+  critical_temperature: u32  // Critical temperature
+  last_temperature: u32   // Previous reading
+  zone: u32               // Current thermal zone
+  enabled: u32            // Sensor enabled flag
+}
+
+// Thermal zone
+struct ThermalZone {
+  zone_id: u32
+  min_temp: u32
+  max_temp: u32
+  throttle_level: u32  // 0-100%, how much to throttle
+}
+
+// CPU thermal state
+struct CPUThermalState {
+  cpu_id: u32
+  temperature: u32
+  throttled: u32
+  shutdown_pending: u32
+}
+
+var sensors: [MAX_SENSORS]ThermalSensor
+var zones: [4]ThermalZone
+var cpu_thermal: [MAX_CPUS]CPUThermalState
+var num_sensors: u32 = 0
+var num_cpus: u32 = 0
+var rpi_model: u32 = 0
+var initialized: u32 = 0
+
+// Statistics
+var temperature_readings: u64 = 0
+var warning_events: u64 = 0
+var critical_events: u64 = 0
+var emergency_events: u64 = 0
+var throttle_activations: u64 = 0
+var max_temp_reached: u32 = 0
+
+// Initialize thermal monitoring
+export fn thermal_init(model: u32, cpus: u32): u32 {
+  if initialized == 1 {
+    foundation.serial_write_string("[THERMAL] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[THERMAL] Initializing thermal monitoring...\n")
+
+  rpi_model = model
+  num_cpus = if cpus > MAX_CPUS { MAX_CPUS } else { cpus }
+  num_sensors = MAX_SENSORS
+
+  // Initialize thermal zones
+  zones[ZONE_NORMAL].zone_id = ZONE_NORMAL
+  zones[ZONE_NORMAL].min_temp = 0
+  zones[ZONE_NORMAL].max_temp = TEMP_NORMAL_MAX
+  zones[ZONE_NORMAL].throttle_level = 0
+
+  zones[ZONE_WARNING].zone_id = ZONE_WARNING
+  zones[ZONE_WARNING].min_temp = TEMP_NORMAL_MAX
+  zones[ZONE_WARNING].max_temp = TEMP_WARNING
+  zones[ZONE_WARNING].throttle_level = 25
+
+  zones[ZONE_CRITICAL].zone_id = ZONE_CRITICAL
+  zones[ZONE_CRITICAL].min_temp = TEMP_WARNING
+  zones[ZONE_CRITICAL].max_temp = TEMP_CRITICAL
+  zones[ZONE_CRITICAL].throttle_level = 50
+
+  zones[ZONE_EMERGENCY].zone_id = ZONE_EMERGENCY
+  zones[ZONE_EMERGENCY].min_temp = TEMP_CRITICAL
+  zones[ZONE_EMERGENCY].max_temp = TEMP_EMERGENCY
+  zones[ZONE_EMERGENCY].throttle_level = 100
+
+  // Initialize sensors
+  sensors[SENSOR_CPU].sensor_id = SENSOR_CPU
+  sensors[SENSOR_CPU].max_temperature = TEMP_CRITICAL
+  sensors[SENSOR_CPU].critical_temperature = TEMP_EMERGENCY
+  sensors[SENSOR_CPU].enabled = 1
+
+  sensors[SENSOR_GPU].sensor_id = SENSOR_GPU
+  sensors[SENSOR_GPU].max_temperature = TEMP_CRITICAL
+  sensors[SENSOR_GPU].critical_temperature = TEMP_EMERGENCY
+  sensors[SENSOR_GPU].enabled = 1
+
+  sensors[SENSOR_CORE].sensor_id = SENSOR_CORE
+  sensors[SENSOR_CORE].max_temperature = TEMP_CRITICAL
+  sensors[SENSOR_CORE].critical_temperature = TEMP_EMERGENCY
+  sensors[SENSOR_CORE].enabled = 1
+
+  // Initialize per-CPU thermal state
+  var i: u32 = 0
+  loop {
+    if i >= num_cpus { break }
+
+    cpu_thermal[i].cpu_id = i
+    cpu_thermal[i].temperature = 0
+    cpu_thermal[i].throttled = 0
+    cpu_thermal[i].shutdown_pending = 0
+
+    i = i + 1
+  }
+
+  // Read initial temperatures
+  thermal_update_all()
+
+  initialized = 1
+
+  foundation.serial_write_string("[THERMAL] Monitoring ")
+  foundation.serial_write_u64(num_sensors)
+  foundation.serial_write_string(" sensors\n")
+
+  return 0
+}
+
+// Read temperature from firmware
+fn thermal_read_sensor(sensor_id: u32): u32 {
+  let temp: u32 = if rpi_model == cpufreq.RPI_MODEL_PI5 {
+    mailbox7.mailbox_get_temperature(sensor_id)
+  } else {
+    mailbox6.mailbox_get_temperature(sensor_id)
+  }
+
+  temperature_readings = temperature_readings + 1
+
+  return temp
+}
+
+// Determine thermal zone for temperature
+fn get_thermal_zone(temp: u32): u32 {
+  if temp >= TEMP_EMERGENCY {
+    return ZONE_EMERGENCY
+  } else if temp >= TEMP_CRITICAL {
+    return ZONE_CRITICAL
+  } else if temp >= TEMP_WARNING {
+    return ZONE_WARNING
+  } else {
+    return ZONE_NORMAL
+  }
+}
+
+// Update a single sensor
+fn thermal_update_sensor(sensor_id: u32) {
+  if sensor_id >= num_sensors { return }
+
+  let sensor: *ThermalSensor = &sensors[sensor_id]
+  if sensor.enabled == 0 { return }
+
+  // Read current temperature
+  sensor.last_temperature = sensor.temperature
+  sensor.temperature = thermal_read_sensor(sensor_id)
+
+  // Update thermal zone
+  let old_zone: u32 = sensor.zone
+  sensor.zone = get_thermal_zone(sensor.temperature)
+
+  // Track maximum temperature
+  if sensor.temperature > max_temp_reached {
+    max_temp_reached = sensor.temperature
+  }
+
+  // Handle zone transitions
+  if sensor.zone != old_zone {
+    thermal_handle_zone_change(sensor_id, old_zone, sensor.zone)
+  }
+
+  // Check for critical temperatures
+  if sensor.zone == ZONE_CRITICAL {
+    critical_events = critical_events + 1
+    thermal_handle_critical(sensor_id)
+  } else if sensor.zone == ZONE_EMERGENCY {
+    emergency_events = emergency_events + 1
+    thermal_handle_emergency(sensor_id)
+  } else if sensor.zone == ZONE_WARNING {
+    warning_events = warning_events + 1
+  }
+}
+
+// Update all sensors
+export fn thermal_update_all() {
+  if initialized == 0 { return }
+
+  var i: u32 = 0
+  loop {
+    if i >= num_sensors { break }
+    thermal_update_sensor(i)
+    i = i + 1
+  }
+
+  // Update per-CPU state
+  i = 0
+  loop {
+    if i >= num_cpus { break }
+
+    // Use CPU sensor temperature for each core
+    cpu_thermal[i].temperature = sensors[SENSOR_CPU].temperature
+
+    // Update throttle state
+    let zone: u32 = get_thermal_zone(cpu_thermal[i].temperature)
+    if zone >= ZONE_WARNING {
+      if cpu_thermal[i].throttled == 0 {
+        thermal_throttle_cpu(i)
+      }
+    } else {
+      if cpu_thermal[i].throttled == 1 {
+        thermal_unthrottle_cpu(i)
+      }
+    }
+
+    i = i + 1
+  }
+}
+
+// Handle thermal zone change
+fn thermal_handle_zone_change(sensor_id: u32, old_zone: u32, new_zone: u32) {
+  foundation.serial_write_string("[THERMAL] Sensor ")
+  foundation.serial_write_u64(sensor_id)
+  foundation.serial_write_string(": Zone ")
+  foundation.serial_write_u64(old_zone)
+  foundation.serial_write_string(" -> ")
+  foundation.serial_write_u64(new_zone)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("[THERMAL] Temperature: ")
+  foundation.serial_write_u64(sensors[sensor_id].temperature / 1000)
+  foundation.serial_write_string(".")
+  foundation.serial_write_u64((sensors[sensor_id].temperature % 1000) / 100)
+  foundation.serial_write_string("°C\n")
+}
+
+// Handle critical temperature
+fn thermal_handle_critical(sensor_id: u32) {
+  foundation.serial_write_string("[THERMAL] CRITICAL: Sensor ")
+  foundation.serial_write_u64(sensor_id)
+  foundation.serial_write_string(" at ")
+  foundation.serial_write_u64(sensors[sensor_id].temperature / 1000)
+  foundation.serial_write_string("°C\n")
+
+  // Throttle all CPUs
+  var i: u32 = 0
+  loop {
+    if i >= num_cpus { break }
+    thermal_throttle_cpu(i)
+    i = i + 1
+  }
+}
+
+// Handle emergency temperature
+fn thermal_handle_emergency(sensor_id: u32) {
+  foundation.serial_write_string("[THERMAL] EMERGENCY: Sensor ")
+  foundation.serial_write_u64(sensor_id)
+  foundation.serial_write_string(" at ")
+  foundation.serial_write_u64(sensors[sensor_id].temperature / 1000)
+  foundation.serial_write_string("°C\n")
+
+  foundation.serial_write_string("[THERMAL] SYSTEM SHUTDOWN REQUIRED!\n")
+
+  // Maximum throttling
+  var i: u32 = 0
+  loop {
+    if i >= num_cpus { break }
+
+    thermal_throttle_cpu(i)
+    cpu_thermal[i].shutdown_pending = 1
+
+    i = i + 1
+  }
+
+  // In production, would initiate orderly shutdown
+}
+
+// Throttle CPU
+fn thermal_throttle_cpu(cpu_id: u32) {
+  if cpu_id >= num_cpus { return }
+
+  if cpu_thermal[cpu_id].throttled == 1 {
+    return  // Already throttled
+  }
+
+  foundation.serial_write_string("[THERMAL] Throttling CPU")
+  foundation.serial_write_u64(cpu_id)
+  foundation.serial_write_string("\n")
+
+  cpu_thermal[cpu_id].throttled = 1
+  throttle_activations = throttle_activations + 1
+
+  // Reduce CPU frequency
+  cpufreq.cpufreq_throttle(cpu_id)
+}
+
+// Unthrottle CPU
+fn thermal_unthrottle_cpu(cpu_id: u32) {
+  if cpu_id >= num_cpus { return }
+
+  if cpu_thermal[cpu_id].throttled == 0 {
+    return  // Not throttled
+  }
+
+  foundation.serial_write_string("[THERMAL] Unthrottling CPU")
+  foundation.serial_write_u64(cpu_id)
+  foundation.serial_write_string("\n")
+
+  cpu_thermal[cpu_id].throttled = 0
+
+  // Restore CPU frequency
+  cpufreq.cpufreq_unthrottle(cpu_id)
+}
+
+// Get sensor temperature
+export fn thermal_get_temperature(sensor_id: u32): u32 {
+  if sensor_id >= num_sensors { return 0 }
+  return sensors[sensor_id].temperature
+}
+
+// Get CPU temperature
+export fn thermal_get_cpu_temperature(cpu_id: u32): u32 {
+  if cpu_id >= num_cpus { return 0 }
+  return cpu_thermal[cpu_id].temperature
+}
+
+// Check if CPU is throttled
+export fn thermal_is_throttled(cpu_id: u32): u32 {
+  if cpu_id >= num_cpus { return 0 }
+  return cpu_thermal[cpu_id].throttled
+}
+
+// Get thermal zone name
+fn get_zone_name(zone: u32): *u8 {
+  if zone == ZONE_NORMAL {
+    return "NORMAL"
+  } else if zone == ZONE_WARNING {
+    return "WARNING"
+  } else if zone == ZONE_CRITICAL {
+    return "CRITICAL"
+  } else if zone == ZONE_EMERGENCY {
+    return "EMERGENCY"
+  } else {
+    return "UNKNOWN"
+  }
+}
+
+// Print thermal information
+export fn thermal_print_info() {
+  foundation.serial_write_string("\n[THERMAL] Thermal Information:\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= num_sensors { break }
+
+    let sensor: *ThermalSensor = &sensors[i]
+    if sensor.enabled == 0 {
+      i = i + 1
+      continue
+    }
+
+    foundation.serial_write_string("\n  Sensor ")
+    foundation.serial_write_u64(i)
+    foundation.serial_write_string(":\n")
+
+    foundation.serial_write_string("    Temperature: ")
+    foundation.serial_write_u64(sensor.temperature / 1000)
+    foundation.serial_write_string(".")
+    foundation.serial_write_u64((sensor.temperature % 1000) / 100)
+    foundation.serial_write_string("°C\n")
+
+    foundation.serial_write_string("    Zone: ")
+    foundation.serial_write_string(get_zone_name(sensor.zone))
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("    Max: ")
+    foundation.serial_write_u64(sensor.max_temperature / 1000)
+    foundation.serial_write_string("°C\n")
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("\n  CPU Thermal State:\n")
+  i = 0
+  loop {
+    if i >= num_cpus { break }
+
+    foundation.serial_write_string("    CPU")
+    foundation.serial_write_u64(i)
+    foundation.serial_write_string(": ")
+    foundation.serial_write_u64(cpu_thermal[i].temperature / 1000)
+    foundation.serial_write_string("°C ")
+    foundation.serial_write_string(if cpu_thermal[i].throttled == 1 { "[THROTTLED]" } else { "[NORMAL]" })
+    foundation.serial_write_string("\n")
+
+    i = i + 1
+  }
+}
+
+// Print statistics
+export fn thermal_print_stats() {
+  foundation.serial_write_string("\n[THERMAL] Statistics:\n")
+
+  foundation.serial_write_string("  Temperature readings: ")
+  foundation.serial_write_u64(temperature_readings)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Warning events: ")
+  foundation.serial_write_u64(warning_events)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Critical events: ")
+  foundation.serial_write_u64(critical_events)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Emergency events: ")
+  foundation.serial_write_u64(emergency_events)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Throttle activations: ")
+  foundation.serial_write_u64(throttle_activations)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Max temperature reached: ")
+  foundation.serial_write_u64(max_temp_reached / 1000)
+  foundation.serial_write_string(".")
+  foundation.serial_write_u64((max_temp_reached % 1000) / 100)
+  foundation.serial_write_string("°C\n")
+}
+
+// Check if system requires shutdown
+export fn thermal_needs_shutdown(): u32 {
+  var i: u32 = 0
+  loop {
+    if i >= num_cpus { break }
+
+    if cpu_thermal[i].shutdown_pending == 1 {
+      return 1
+    }
+
+    i = i + 1
+  }
+
+  return 0
+}

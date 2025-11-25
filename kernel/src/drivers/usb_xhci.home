@@ -1,0 +1,514 @@
+// home-os xHCI (USB 3.0) Host Controller Driver
+// Supports both Pi 5 (via RP1) and Pi 4 (VL805)
+// Implements USB 3.0 xHCI specification
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../arch/arm64/timer.home" as timer
+import "../rpi/rp1.home" as rp1
+
+// xHCI Capability Registers (offsets from base)
+const XHCI_CAP_CAPLENGTH: u32 = 0x00     // Capability Register Length
+const XHCI_CAP_HCIVERSION: u32 = 0x02    // Interface Version Number
+const XHCI_CAP_HCSPARAMS1: u32 = 0x04    // Structural Parameters 1
+const XHCI_CAP_HCSPARAMS2: u32 = 0x08    // Structural Parameters 2
+const XHCI_CAP_HCSPARAMS3: u32 = 0x0C    // Structural Parameters 3
+const XHCI_CAP_HCCPARAMS1: u32 = 0x10    // Capability Parameters 1
+const XHCI_CAP_DBOFF: u32 = 0x14         // Doorbell Offset
+const XHCI_CAP_RTSOFF: u32 = 0x18        // Runtime Register Space Offset
+
+// xHCI Operational Registers (offsets from base + CAPLENGTH)
+const XHCI_OP_USBCMD: u32 = 0x00         // USB Command
+const XHCI_OP_USBSTS: u32 = 0x04         // USB Status
+const XHCI_OP_PAGESIZE: u32 = 0x08       // Page Size
+const XHCI_OP_DNCTRL: u32 = 0x14         // Device Notification Control
+const XHCI_OP_CRCR: u32 = 0x18           // Command Ring Control
+const XHCI_OP_DCBAAP: u32 = 0x30         // Device Context Base Address Array Pointer
+const XHCI_OP_CONFIG: u32 = 0x38         // Configure
+
+// USB Command Register bits
+const USBCMD_RUN: u32 = 1 << 0           // Run/Stop
+const USBCMD_HCRST: u32 = 1 << 1         // Host Controller Reset
+const USBCMD_INTE: u32 = 1 << 2          // Interrupter Enable
+const USBCMD_HSEE: u32 = 1 << 3          // Host System Error Enable
+const USBCMD_EWE: u32 = 1 << 10          // Enable Wrap Event
+
+// USB Status Register bits
+const USBSTS_HCH: u32 = 1 << 0           // HC Halted
+const USBSTS_HSE: u32 = 1 << 2           // Host System Error
+const USBSTS_EINT: u32 = 1 << 3          // Event Interrupt
+const USBSTS_PCD: u32 = 1 << 4           // Port Change Detect
+const USBSTS_CNR: u32 = 1 << 11          // Controller Not Ready
+
+// Port Status and Control Register bits
+const PORTSC_CCS: u32 = 1 << 0           // Current Connect Status
+const PORTSC_PED: u32 = 1 << 1           // Port Enabled/Disabled
+const PORTSC_OCA: u32 = 1 << 3           // Over-current Active
+const PORTSC_PR: u32 = 1 << 4            // Port Reset
+const PORTSC_PP: u32 = 1 << 9            // Port Power
+const PORTSC_SPEED_MASK: u32 = 0xF << 10 // Port Speed
+const PORTSC_CSC: u32 = 1 << 17          // Connect Status Change
+const PORTSC_PRC: u32 = 1 << 21          // Port Reset Change
+
+// TRB (Transfer Request Block) types
+const TRB_TYPE_NORMAL: u32 = 1
+const TRB_TYPE_SETUP: u32 = 2
+const TRB_TYPE_DATA: u32 = 3
+const TRB_TYPE_STATUS: u32 = 4
+const TRB_TYPE_LINK: u32 = 6
+const TRB_TYPE_EVENT_DATA: u32 = 7
+const TRB_TYPE_NOOP: u32 = 8
+const TRB_TYPE_ENABLE_SLOT: u32 = 9
+const TRB_TYPE_ADDRESS_DEVICE: u32 = 11
+const TRB_TYPE_CONFIGURE_ENDPOINT: u32 = 12
+
+// Constants
+const MAX_PORTS: u32 = 16
+const MAX_SLOTS: u32 = 64
+const MAX_ENDPOINTS: u32 = 32
+const COMMAND_RING_SIZE: u32 = 256
+const EVENT_RING_SIZE: u32 = 256
+
+// TRB structure
+struct TRB {
+  parameter: u64
+  status: u32
+  control: u32
+}
+
+// Port information
+struct XHCIPort {
+  port_num: u32
+  status: u32
+  connected: u32
+  enabled: u32
+  speed: u32           // USB speed (1=Full, 2=Low, 3=High, 4=Super)
+}
+
+// Device slot
+struct DeviceSlot {
+  slot_id: u32
+  active: u32
+  port_num: u32
+  speed: u32
+  max_packet_size: u32
+}
+
+// xHCI Controller state
+struct XHCIController {
+  base_addr: u64       // Base address
+  cap_regs: u64        // Capability registers
+  op_regs: u64         // Operational registers
+  runtime_regs: u64    // Runtime registers
+  doorbell_regs: u64   // Doorbell registers
+
+  max_ports: u32
+  max_slots: u32
+  max_intrs: u32
+
+  ports: [MAX_PORTS]XHCIPort
+  slots: [MAX_SLOTS]DeviceSlot
+
+  command_ring: u64    // Command ring base
+  event_ring: u64      // Event ring base
+  dcbaa: u64           // Device Context Base Address Array
+
+  running: u32
+  initialized: u32
+}
+
+var xhci: XHCIController
+var initialized: u32 = 0
+
+// Statistics
+var total_transfers: u64 = 0
+var transfer_errors: u64 = 0
+var port_changes: u64 = 0
+var devices_connected: u64 = 0
+var devices_disconnected: u64 = 0
+
+// Read register
+fn xhci_read_cap(offset: u32): u32 {
+  return memory.read_u32(xhci.cap_regs + offset as u64)
+}
+
+fn xhci_read_op(offset: u32): u32 {
+  return memory.read_u32(xhci.op_regs + offset as u64)
+}
+
+fn xhci_write_op(offset: u32, value: u32) {
+  memory.write_u32(xhci.op_regs + offset as u64, value)
+}
+
+// Reset controller
+fn xhci_reset(): u32 {
+  foundation.serial_write_string("[XHCI] Resetting controller...\n")
+
+  // Stop controller if running
+  let cmd: u32 = xhci_read_op(XHCI_OP_USBCMD)
+  xhci_write_op(XHCI_OP_USBCMD, cmd & ~USBCMD_RUN)
+
+  // Wait for halt
+  var timeout: u32 = 1000
+  loop {
+    if timeout == 0 { break }
+
+    let status: u32 = xhci_read_op(XHCI_OP_USBSTS)
+    if (status & USBSTS_HCH) != 0 {
+      break
+    }
+
+    timer.timer_delay_ms(1)
+    timeout = timeout - 1
+  }
+
+  if timeout == 0 {
+    foundation.serial_write_string("[XHCI] Failed to halt controller\n")
+    return 1
+  }
+
+  // Reset controller
+  xhci_write_op(XHCI_OP_USBCMD, USBCMD_HCRST)
+
+  // Wait for reset complete
+  timeout = 1000
+  loop {
+    if timeout == 0 { break }
+
+    let cmd: u32 = xhci_read_op(XHCI_OP_USBCMD)
+    if (cmd & USBCMD_HCRST) == 0 {
+      break
+    }
+
+    timer.timer_delay_ms(1)
+    timeout = timeout - 1
+  }
+
+  if timeout == 0 {
+    foundation.serial_write_string("[XHCI] Reset timeout\n")
+    return 1
+  }
+
+  // Wait for controller ready
+  timeout = 1000
+  loop {
+    if timeout == 0 { break }
+
+    let status: u32 = xhci_read_op(XHCI_OP_USBSTS)
+    if (status & USBSTS_CNR) == 0 {
+      break
+    }
+
+    timer.timer_delay_ms(1)
+    timeout = timeout - 1
+  }
+
+  if timeout == 0 {
+    foundation.serial_write_string("[XHCI] Controller not ready\n")
+    return 1
+  }
+
+  foundation.serial_write_string("[XHCI] Controller reset complete\n")
+  return 0
+}
+
+// Initialize xHCI controller
+export fn xhci_init(base_addr: u64): u32 {
+  if initialized == 1 {
+    foundation.serial_write_string("[XHCI] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[XHCI] Initializing xHCI controller...\n")
+  foundation.serial_write_string("[XHCI] Base address: 0x")
+  foundation.serial_write_hex(base_addr)
+  foundation.serial_write_string("\n")
+
+  xhci.base_addr = base_addr
+  xhci.cap_regs = base_addr
+  xhci.running = 0
+
+  // Read capability registers
+  let caplength: u32 = xhci_read_cap(XHCI_CAP_CAPLENGTH) & 0xFF
+  let hciversion: u32 = xhci_read_cap(XHCI_CAP_HCIVERSION)
+  let hcsparams1: u32 = xhci_read_cap(XHCI_CAP_HCSPARAMS1)
+
+  xhci.op_regs = base_addr + caplength as u64
+
+  foundation.serial_write_string("[XHCI] HCI Version: 0x")
+  foundation.serial_write_hex(hciversion)
+  foundation.serial_write_string("\n")
+
+  // Extract parameters
+  xhci.max_slots = hcsparams1 & 0xFF
+  xhci.max_intrs = (hcsparams1 >> 8) & 0x7FF
+  xhci.max_ports = (hcsparams1 >> 24) & 0xFF
+
+  foundation.serial_write_string("[XHCI] Max slots: ")
+  foundation.serial_write_u64(xhci.max_slots)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("[XHCI] Max ports: ")
+  foundation.serial_write_u64(xhci.max_ports)
+  foundation.serial_write_string("\n")
+
+  // Reset controller
+  if xhci_reset() != 0 {
+    return 1
+  }
+
+  // Initialize port structures
+  var i: u32 = 0
+  loop {
+    if i >= xhci.max_ports { break }
+
+    xhci.ports[i].port_num = i
+    xhci.ports[i].status = 0
+    xhci.ports[i].connected = 0
+    xhci.ports[i].enabled = 0
+    xhci.ports[i].speed = 0
+
+    i = i + 1
+  }
+
+  // Initialize slot structures
+  i = 0
+  loop {
+    if i >= xhci.max_slots { break }
+
+    xhci.slots[i].slot_id = i
+    xhci.slots[i].active = 0
+    xhci.slots[i].port_num = 0
+    xhci.slots[i].speed = 0
+
+    i = i + 1
+  }
+
+  // Allocate data structures (simplified - would use proper memory allocation)
+  xhci.command_ring = 0x40000000  // Placeholder
+  xhci.event_ring = 0x40010000    // Placeholder
+  xhci.dcbaa = 0x40020000         // Placeholder
+
+  // Configure controller
+  xhci_write_op(XHCI_OP_CONFIG, xhci.max_slots)
+
+  initialized = 1
+  xhci.initialized = 1
+
+  foundation.serial_write_string("[XHCI] Controller initialized\n")
+
+  return 0
+}
+
+// Start controller
+export fn xhci_start(): u32 {
+  if xhci.initialized == 0 { return 1 }
+  if xhci.running == 1 { return 0 }
+
+  foundation.serial_write_string("[XHCI] Starting controller...\n")
+
+  // Enable interrupts and start
+  let cmd: u32 = USBCMD_RUN | USBCMD_INTE | USBCMD_HSEE
+  xhci_write_op(XHCI_OP_USBCMD, cmd)
+
+  // Wait for controller to start
+  var timeout: u32 = 1000
+  loop {
+    if timeout == 0 { break }
+
+    let status: u32 = xhci_read_op(XHCI_OP_USBSTS)
+    if (status & USBSTS_HCH) == 0 {
+      break
+    }
+
+    timer.timer_delay_ms(1)
+    timeout = timeout - 1
+  }
+
+  if timeout == 0 {
+    foundation.serial_write_string("[XHCI] Failed to start controller\n")
+    return 1
+  }
+
+  xhci.running = 1
+
+  foundation.serial_write_string("[XHCI] Controller started\n")
+
+  // Scan for connected devices
+  xhci_scan_ports()
+
+  return 0
+}
+
+// Stop controller
+export fn xhci_stop() {
+  if xhci.running == 0 { return }
+
+  foundation.serial_write_string("[XHCI] Stopping controller...\n")
+
+  let cmd: u32 = xhci_read_op(XHCI_OP_USBCMD)
+  xhci_write_op(XHCI_OP_USBCMD, cmd & ~USBCMD_RUN)
+
+  xhci.running = 0
+
+  foundation.serial_write_string("[XHCI] Controller stopped\n")
+}
+
+// Scan all ports for devices
+fn xhci_scan_ports() {
+  foundation.serial_write_string("[XHCI] Scanning ports...\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= xhci.max_ports { break }
+
+    // Port registers are at op_base + 0x400 + (port * 0x10)
+    let port_base: u64 = xhci.op_regs + 0x400 + (i * 0x10) as u64
+    let portsc: u32 = memory.read_u32(port_base)
+
+    if (portsc & PORTSC_CCS) != 0 {
+      xhci.ports[i].connected = 1
+      xhci.ports[i].status = portsc
+
+      let speed: u32 = (portsc & PORTSC_SPEED_MASK) >> 10
+      xhci.ports[i].speed = speed
+
+      foundation.serial_write_string("[XHCI] Port ")
+      foundation.serial_write_u64(i)
+      foundation.serial_write_string(": Device connected (speed=")
+      foundation.serial_write_u64(speed)
+      foundation.serial_write_string(")\n")
+
+      devices_connected = devices_connected + 1
+    }
+
+    i = i + 1
+  }
+}
+
+// Handle port change
+export fn xhci_handle_port_change(port_num: u32) {
+  if port_num >= xhci.max_ports { return }
+
+  port_changes = port_changes + 1
+
+  let port_base: u64 = xhci.op_regs + 0x400 + (port_num * 0x10) as u64
+  let portsc: u32 = memory.read_u32(port_base)
+
+  if (portsc & PORTSC_CSC) != 0 {
+    // Connect status changed
+    if (portsc & PORTSC_CCS) != 0 {
+      // Device connected
+      xhci.ports[port_num].connected = 1
+      devices_connected = devices_connected + 1
+
+      foundation.serial_write_string("[XHCI] Port ")
+      foundation.serial_write_u64(port_num)
+      foundation.serial_write_string(": Device connected\n")
+    } else {
+      // Device disconnected
+      xhci.ports[port_num].connected = 0
+      devices_disconnected = devices_disconnected + 1
+
+      foundation.serial_write_string("[XHCI] Port ")
+      foundation.serial_write_u64(port_num)
+      foundation.serial_write_string(": Device disconnected\n")
+    }
+
+    // Clear change bit
+    memory.write_u32(port_base, portsc | PORTSC_CSC)
+  }
+}
+
+// Initialize for Raspberry Pi 5 (via RP1)
+export fn xhci_init_rpi5(): u32 {
+  foundation.serial_write_string("[XHCI] Initializing for Raspberry Pi 5...\n")
+
+  // USB controller is accessed via RP1 southbridge
+  let usb_base: u64 = 0x1F00200000  // RP1 USB base (placeholder)
+
+  return xhci_init(usb_base)
+}
+
+// Initialize for Raspberry Pi 4 (VL805)
+export fn xhci_init_rpi4(): u32 {
+  foundation.serial_write_string("[XHCI] Initializing for Raspberry Pi 4...\n")
+
+  // VL805 USB controller on PCIe
+  let usb_base: u64 = 0x600000000  // VL805 base (placeholder)
+
+  return xhci_init(usb_base)
+}
+
+// Print controller information
+export fn xhci_print_info() {
+  foundation.serial_write_string("\n[XHCI] Controller Information:\n")
+
+  foundation.serial_write_string("  Base address: 0x")
+  foundation.serial_write_hex(xhci.base_addr)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Running: ")
+  foundation.serial_write_string(if xhci.running == 1 { "Yes" } else { "No" })
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Max slots: ")
+  foundation.serial_write_u64(xhci.max_slots)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Max ports: ")
+  foundation.serial_write_u64(xhci.max_ports)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n  Port Status:\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= xhci.max_ports { break }
+
+    if xhci.ports[i].connected == 1 {
+      foundation.serial_write_string("    Port ")
+      foundation.serial_write_u64(i)
+      foundation.serial_write_string(": Connected (")
+
+      if xhci.ports[i].speed == 1 {
+        foundation.serial_write_string("Full Speed")
+      } else if xhci.ports[i].speed == 2 {
+        foundation.serial_write_string("Low Speed")
+      } else if xhci.ports[i].speed == 3 {
+        foundation.serial_write_string("High Speed")
+      } else if xhci.ports[i].speed == 4 {
+        foundation.serial_write_string("Super Speed")
+      }
+
+      foundation.serial_write_string(")\n")
+    }
+
+    i = i + 1
+  }
+}
+
+// Print statistics
+export fn xhci_print_stats() {
+  foundation.serial_write_string("\n[XHCI] Statistics:\n")
+
+  foundation.serial_write_string("  Total transfers: ")
+  foundation.serial_write_u64(total_transfers)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Transfer errors: ")
+  foundation.serial_write_u64(transfer_errors)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Port changes: ")
+  foundation.serial_write_u64(port_changes)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Devices connected: ")
+  foundation.serial_write_u64(devices_connected)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Devices disconnected: ")
+  foundation.serial_write_u64(devices_disconnected)
+  foundation.serial_write_string("\n")
+}

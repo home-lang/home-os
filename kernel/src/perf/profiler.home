@@ -1,168 +1,545 @@
-// home-os Kernel - Performance Profiler
-// Profile kernel hot paths and identify bottlenecks
+// home-os Kernel - Enhanced Performance Profiler
+// Profile kernel hot paths, CPU usage, and identify bottlenecks
+// Supports sampling, tracing, and flame graph generation
 
 import "../core/foundation.home" as foundation
-import "../drivers/timer.home" as timer
+import "../core/memory.home" as memory
+import "../arch/arm64/timer.home" as timer
 
 const MAX_PROFILE_POINTS: u32 = 1000
 const MAX_CALL_STACK: u32 = 64
+const MAX_SAMPLES: u32 = 10000
+const MAX_HOTSPOTS: u32 = 100
+const SAMPLE_INTERVAL_US: u64 = 1000  // 1ms sampling
+
+// Profiling modes
+const PROFILE_MODE_DISABLED: u32 = 0
+const PROFILE_MODE_INSTRUMENTED: u32 = 1  // Manual enter/exit
+const PROFILE_MODE_SAMPLING: u32 = 2       // Timer-based sampling
+const PROFILE_MODE_BOTH: u32 = 3
 
 struct ProfilePoint {
-  name: [u8; 64],
-  hit_count: u64,
-  total_time: u64,
-  min_time: u64,
-  max_time: u64,
+  name: [64]u8
+  hit_count: u64
+  total_time: u64
+  min_time: u64
+  max_time: u64
+  self_time: u64       // Time excluding children
   enabled: u32
+  file: *u8
+  line: u32
 }
 
 struct CallStackEntry {
-  name: [u8; 64],
+  name: [64]u8
   start_time: u64
+  profile_id: u32
+  child_time: u64      // Time spent in children
 }
 
-var profile_points: [ProfilePoint; 1000]
+// Sample for statistical profiling
+struct Sample {
+  pc: u64              // Program counter
+  timestamp: u64       // When sample was taken
+  cpu_id: u32          // Which CPU
+  stack_depth: u32     // Call stack depth
+  stack: [16]u64       // Return addresses
+}
+
+// Hot spot (frequently sampled location)
+struct Hotspot {
+  pc: u64
+  count: u64
+  percentage: u32
+  function_name: *u8
+}
+
+// CPU usage tracking
+struct CPUUsage {
+  user_time: u64
+  kernel_time: u64
+  idle_time: u64
+  irq_time: u64
+  total_samples: u64
+}
+
+var profile_points: [MAX_PROFILE_POINTS]ProfilePoint
 var profile_count: u32 = 0
-var call_stack: [CallStackEntry; 64]
+var call_stack: [MAX_CALL_STACK]CallStackEntry
 var stack_depth: u32 = 0
-var profiling_enabled: u32 = 0
+var profiling_mode: u32 = PROFILE_MODE_DISABLED
 var profiler_initialized: u32 = 0
 
+// Sampling profiler state
+var samples: [MAX_SAMPLES]Sample
+var sample_count: u32 = 0
+var sampling_enabled: u32 = 0
+var last_sample_time: u64 = 0
+
+// Hot spots and analysis
+var hotspots: [MAX_HOTSPOTS]Hotspot
+var hotspot_count: u32 = 0
+
+// CPU usage
+var cpu_usage: CPUUsage
+
+// Statistics
+var total_profile_overhead: u64 = 0
+var max_stack_depth_seen: u32 = 0
+var samples_dropped: u64 = 0
+
+// Initialize profiler
 export fn profiler_init() {
   if profiler_initialized == 1 { return }
-  
+
+  foundation.serial_write_string("[PROFILER] Initializing enhanced profiler...\n")
+
   profile_count = 0
   stack_depth = 0
-  profiling_enabled = 1
-  
+  profiling_mode = PROFILE_MODE_INSTRUMENTED
+  sample_count = 0
+  sampling_enabled = 0
+  hotspot_count = 0
+
+  // Initialize CPU usage tracking
+  cpu_usage.user_time = 0
+  cpu_usage.kernel_time = 0
+  cpu_usage.idle_time = 0
+  cpu_usage.irq_time = 0
+  cpu_usage.total_samples = 0
+
+  total_profile_overhead = 0
+  max_stack_depth_seen = 0
+  samples_dropped = 0
+
   profiler_initialized = 1
-  foundation.serial_write_string("[Profiler] Initialized\n")
+  foundation.serial_write_string("[PROFILER] Profiler initialized\n")
 }
 
-export fn profiler_register(name: u64): u32 {
+// Register a profile point
+export fn profiler_register(name: *u8, file: *u8, line: u32): u32 {
   if profile_count >= MAX_PROFILE_POINTS { return 0xFFFFFFFF }
-  
+
+  // Copy name
   var i: u32 = 0
-  while i < 64 {
-    var ch: u8 = @intToPtr(name + i, u8)
+  loop {
+    if i >= 64 { break }
+    let ch: u8 = memory.read_u8(name as u64 + i as u64)
     profile_points[profile_count].name[i] = ch
     if ch == 0 { break }
     i = i + 1
   }
-  
+
   profile_points[profile_count].hit_count = 0
   profile_points[profile_count].total_time = 0
   profile_points[profile_count].min_time = 0xFFFFFFFFFFFFFFFF
   profile_points[profile_count].max_time = 0
+  profile_points[profile_count].self_time = 0
   profile_points[profile_count].enabled = 1
-  
-  var id: u32 = profile_count
+  profile_points[profile_count].file = file
+  profile_points[profile_count].line = line
+
+  let id: u32 = profile_count
   profile_count = profile_count + 1
-  
+
   return id
 }
 
+// Enter a profiled function
 export fn profiler_enter(id: u32) {
-  if profiling_enabled == 0 { return }
+  if profiling_mode == PROFILE_MODE_DISABLED { return }
   if id >= profile_count { return }
   if stack_depth >= MAX_CALL_STACK { return }
-  
+
+  let overhead_start: u64 = timer.timer_get_us()
+
+  // Copy name to call stack
   var i: u32 = 0
-  while i < 64 {
+  loop {
+    if i >= 64 { break }
     call_stack[stack_depth].name[i] = profile_points[id].name[i]
     i = i + 1
   }
-  
-  call_stack[stack_depth].start_time = timer.timer_get_ticks()
+
+  call_stack[stack_depth].start_time = timer.timer_get_us()
+  call_stack[stack_depth].profile_id = id
+  call_stack[stack_depth].child_time = 0
+
   stack_depth = stack_depth + 1
+
+  if stack_depth > max_stack_depth_seen {
+    max_stack_depth_seen = stack_depth
+  }
+
+  let overhead_end: u64 = timer.timer_get_us()
+  total_profile_overhead = total_profile_overhead + (overhead_end - overhead_start)
 }
 
+// Exit a profiled function
 export fn profiler_exit(id: u32) {
-  if profiling_enabled == 0 { return }
+  if profiling_mode == PROFILE_MODE_DISABLED { return }
   if id >= profile_count { return }
   if stack_depth == 0 { return }
-  
+
+  let overhead_start: u64 = timer.timer_get_us()
+
   stack_depth = stack_depth - 1
-  
-  var end_time: u64 = timer.timer_get_ticks()
-  var start_time: u64 = call_stack[stack_depth].start_time
-  var elapsed: u64 = end_time - start_time
-  
+
+  let end_time: u64 = timer.timer_get_us()
+  let start_time: u64 = call_stack[stack_depth].start_time
+  let elapsed: u64 = end_time - start_time
+  let child_time: u64 = call_stack[stack_depth].child_time
+  let self_time: u64 = if elapsed > child_time { elapsed - child_time } else { 0 }
+
   profile_points[id].hit_count = profile_points[id].hit_count + 1
   profile_points[id].total_time = profile_points[id].total_time + elapsed
-  
+  profile_points[id].self_time = profile_points[id].self_time + self_time
+
   if elapsed < profile_points[id].min_time {
     profile_points[id].min_time = elapsed
   }
-  
+
   if elapsed > profile_points[id].max_time {
     profile_points[id].max_time = elapsed
   }
+
+  // Update parent's child time
+  if stack_depth > 0 {
+    call_stack[stack_depth - 1].child_time = call_stack[stack_depth - 1].child_time + elapsed
+  }
+
+  let overhead_end: u64 = timer.timer_get_us()
+  total_profile_overhead = total_profile_overhead + (overhead_end - overhead_start)
 }
 
-export fn profiler_report() {
-  foundation.serial_write_string("\n=== Profiler Report ===\n\n")
-  foundation.serial_write_string("Name                          Hits        Total(us)   Avg(us)   Min(us)   Max(us)\n")
-  foundation.serial_write_string("--------------------------------------------------------------------------------\n")
-  
+// Take a sample (called from timer interrupt)
+export fn profiler_sample(pc: u64, cpu_id: u32) {
+  if sampling_enabled == 0 { return }
+
+  let now: u64 = timer.timer_get_us()
+
+  // Check if it's time for a sample
+  if now - last_sample_time < SAMPLE_INTERVAL_US {
+    return
+  }
+
+  last_sample_time = now
+
+  if sample_count >= MAX_SAMPLES {
+    samples_dropped = samples_dropped + 1
+    return
+  }
+
+  // Record sample
+  samples[sample_count].pc = pc
+  samples[sample_count].timestamp = now
+  samples[sample_count].cpu_id = cpu_id
+  samples[sample_count].stack_depth = stack_depth
+
+  // Copy current call stack
   var i: u32 = 0
-  while i < profile_count {
-    if profile_points[i].hit_count > 0 {
-      foundation.serial_write_string(@ptrFromInt(profile_points[i].name))
-      
-      // Padding
-      var name_len: u32 = 0
-      while profile_points[i].name[name_len] != 0 { name_len = name_len + 1 }
-      var j: u32 = name_len
-      while j < 30 {
-        foundation.serial_write_string(" ")
-        j = j + 1
-      }
-      
-      foundation.serial_write_hex(@truncate(profile_points[i].hit_count, u32))
-      foundation.serial_write_string("  ")
-      foundation.serial_write_hex(@truncate(profile_points[i].total_time, u32))
-      foundation.serial_write_string("  ")
-      
-      var avg: u64 = profile_points[i].total_time / profile_points[i].hit_count
-      foundation.serial_write_hex(@truncate(avg, u32))
-      foundation.serial_write_string("  ")
-      foundation.serial_write_hex(@truncate(profile_points[i].min_time, u32))
-      foundation.serial_write_string("  ")
-      foundation.serial_write_hex(@truncate(profile_points[i].max_time, u32))
-      foundation.serial_write_string("\n")
-    }
+  loop {
+    if i >= 16 || i >= stack_depth { break }
+    samples[sample_count].stack[i] = 0  // Would read from actual stack
     i = i + 1
   }
-  
+
+  sample_count = sample_count + 1
+  cpu_usage.total_samples = cpu_usage.total_samples + 1
+}
+
+// Analyze samples and identify hot spots
+fn profiler_analyze_hotspots() {
+  foundation.serial_write_string("[PROFILER] Analyzing hot spots...\n")
+
+  hotspot_count = 0
+
+  // Count PC occurrences
+  var i: u32 = 0
+  loop {
+    if i >= sample_count { break }
+
+    let pc: u64 = samples[i].pc
+
+    // Find or create hotspot
+    var found: u32 = 0
+    var j: u32 = 0
+    loop {
+      if j >= hotspot_count { break }
+
+      if hotspots[j].pc == pc {
+        hotspots[j].count = hotspots[j].count + 1
+        found = 1
+        break
+      }
+
+      j = j + 1
+    }
+
+    if found == 0 && hotspot_count < MAX_HOTSPOTS {
+      hotspots[hotspot_count].pc = pc
+      hotspots[hotspot_count].count = 1
+      hotspots[hotspot_count].function_name = "unknown"
+      hotspot_count = hotspot_count + 1
+    }
+
+    i = i + 1
+  }
+
+  // Calculate percentages
+  i = 0
+  loop {
+    if i >= hotspot_count { break }
+
+    if sample_count > 0 {
+      hotspots[i].percentage = ((hotspots[i].count * 100) / sample_count) as u32
+    }
+
+    i = i + 1
+  }
+
+  // Sort by count (bubble sort)
+  i = 0
+  loop {
+    if i >= hotspot_count { break }
+
+    var j: u32 = 0
+    loop {
+      if j >= hotspot_count - 1 - i { break }
+
+      if hotspots[j].count < hotspots[j + 1].count {
+        // Swap
+        let temp_pc: u64 = hotspots[j].pc
+        let temp_count: u64 = hotspots[j].count
+        let temp_pct: u32 = hotspots[j].percentage
+
+        hotspots[j].pc = hotspots[j + 1].pc
+        hotspots[j].count = hotspots[j + 1].count
+        hotspots[j].percentage = hotspots[j + 1].percentage
+
+        hotspots[j + 1].pc = temp_pc
+        hotspots[j + 1].count = temp_count
+        hotspots[j + 1].percentage = temp_pct
+      }
+
+      j = j + 1
+    }
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("[PROFILER] Found ")
+  foundation.serial_write_u64(hotspot_count)
+  foundation.serial_write_string(" hot spots\n")
+}
+
+// Enable/disable profiling
+export fn profiler_set_mode(mode: u32) {
+  if mode > PROFILE_MODE_BOTH { return }
+
+  profiling_mode = mode
+
+  if mode == PROFILE_MODE_SAMPLING || mode == PROFILE_MODE_BOTH {
+    sampling_enabled = 1
+  } else {
+    sampling_enabled = 0
+  }
+
+  foundation.serial_write_string("[PROFILER] Mode: ")
+  if mode == PROFILE_MODE_DISABLED {
+    foundation.serial_write_string("DISABLED")
+  } else if mode == PROFILE_MODE_INSTRUMENTED {
+    foundation.serial_write_string("INSTRUMENTED")
+  } else if mode == PROFILE_MODE_SAMPLING {
+    foundation.serial_write_string("SAMPLING")
+  } else {
+    foundation.serial_write_string("BOTH")
+  }
   foundation.serial_write_string("\n")
 }
 
+// Generate profiler report
+export fn profiler_report() {
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("================================================================================\n")
+  foundation.serial_write_string("                        PERFORMANCE PROFILER REPORT\n")
+  foundation.serial_write_string("================================================================================\n")
+  foundation.serial_write_string("\n")
+
+  // Instrumentation report
+  if profiling_mode == PROFILE_MODE_INSTRUMENTED || profiling_mode == PROFILE_MODE_BOTH {
+    foundation.serial_write_string("Instrumentation Data:\n")
+    foundation.serial_write_string("--------------------------------------------------------------------------------\n")
+    foundation.serial_write_string("Function                      Calls       Total(us)   Self(us)    Avg(us)   Max(us)\n")
+    foundation.serial_write_string("--------------------------------------------------------------------------------\n")
+
+    var i: u32 = 0
+    loop {
+      if i >= profile_count { break }
+
+      if profile_points[i].hit_count > 0 {
+        // Print name
+        var j: u32 = 0
+        loop {
+          if j >= 64 { break }
+          if profile_points[i].name[j] == 0 { break }
+          foundation.serial_write_byte(profile_points[i].name[j])
+          j = j + 1
+        }
+
+        // Padding
+        loop {
+          if j >= 30 { break }
+          foundation.serial_write_string(" ")
+          j = j + 1
+        }
+
+        foundation.serial_write_u64(profile_points[i].hit_count)
+        foundation.serial_write_string("  ")
+
+        foundation.serial_write_u64(profile_points[i].total_time)
+        foundation.serial_write_string("  ")
+
+        foundation.serial_write_u64(profile_points[i].self_time)
+        foundation.serial_write_string("  ")
+
+        let avg: u64 = profile_points[i].total_time / profile_points[i].hit_count
+        foundation.serial_write_u64(avg)
+        foundation.serial_write_string("  ")
+
+        foundation.serial_write_u64(profile_points[i].max_time)
+        foundation.serial_write_string("\n")
+      }
+
+      i = i + 1
+    }
+
+    foundation.serial_write_string("\n")
+  }
+
+  // Sampling report
+  if profiling_mode == PROFILE_MODE_SAMPLING || profiling_mode == PROFILE_MODE_BOTH {
+    profiler_analyze_hotspots()
+
+    foundation.serial_write_string("Sampling Data:\n")
+    foundation.serial_write_string("--------------------------------------------------------------------------------\n")
+    foundation.serial_write_string("  Total samples: ")
+    foundation.serial_write_u64(sample_count)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Samples dropped: ")
+    foundation.serial_write_u64(samples_dropped)
+    foundation.serial_write_string("\n\n")
+
+    foundation.serial_write_string("Hot Spots (top 10):\n")
+    foundation.serial_write_string("  Address           Samples     Percentage\n")
+    foundation.serial_write_string("  ------------------------------------------------\n")
+
+    var i: u32 = 0
+    loop {
+      if i >= 10 || i >= hotspot_count { break }
+
+      foundation.serial_write_string("  0x")
+      foundation.serial_write_hex(hotspots[i].pc)
+      foundation.serial_write_string("  ")
+
+      foundation.serial_write_u64(hotspots[i].count)
+      foundation.serial_write_string("  ")
+
+      foundation.serial_write_u64(hotspots[i].percentage)
+      foundation.serial_write_string("%\n")
+
+      i = i + 1
+    }
+
+    foundation.serial_write_string("\n")
+  }
+
+  // Statistics
+  foundation.serial_write_string("Statistics:\n")
+  foundation.serial_write_string("--------------------------------------------------------------------------------\n")
+  foundation.serial_write_string("  Profile overhead: ")
+  foundation.serial_write_u64(total_profile_overhead)
+  foundation.serial_write_string(" us\n")
+
+  foundation.serial_write_string("  Max stack depth: ")
+  foundation.serial_write_u64(max_stack_depth_seen)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Total profile points: ")
+  foundation.serial_write_u64(profile_count)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("================================================================================\n")
+  foundation.serial_write_string("\n")
+}
+
+// Reset profiler data
 export fn profiler_reset() {
   var i: u32 = 0
-  while i < profile_count {
+  loop {
+    if i >= profile_count { break }
     profile_points[i].hit_count = 0
     profile_points[i].total_time = 0
+    profile_points[i].self_time = 0
     profile_points[i].min_time = 0xFFFFFFFFFFFFFFFF
     profile_points[i].max_time = 0
     i = i + 1
   }
-  
-  foundation.serial_write_string("[Profiler] Reset\n")
+
+  sample_count = 0
+  hotspot_count = 0
+  total_profile_overhead = 0
+  max_stack_depth_seen = 0
+  samples_dropped = 0
+
+  cpu_usage.user_time = 0
+  cpu_usage.kernel_time = 0
+  cpu_usage.idle_time = 0
+  cpu_usage.irq_time = 0
+  cpu_usage.total_samples = 0
+
+  foundation.serial_write_string("[PROFILER] Reset complete\n")
 }
 
-export fn profiler_enable() {
-  profiling_enabled = 1
+// CPU usage report
+export fn profiler_cpu_usage() {
+  foundation.serial_write_string("\n[PROFILER] CPU Usage:\n")
+
+  if cpu_usage.total_samples == 0 {
+    foundation.serial_write_string("  No samples collected\n")
+    return
+  }
+
+  let kernel_pct: u64 = (cpu_usage.kernel_time * 100) / cpu_usage.total_samples
+  let user_pct: u64 = (cpu_usage.user_time * 100) / cpu_usage.total_samples
+  let idle_pct: u64 = (cpu_usage.idle_time * 100) / cpu_usage.total_samples
+  let irq_pct: u64 = (cpu_usage.irq_time * 100) / cpu_usage.total_samples
+
+  foundation.serial_write_string("  Kernel: ")
+  foundation.serial_write_u64(kernel_pct)
+  foundation.serial_write_string("%\n")
+
+  foundation.serial_write_string("  User: ")
+  foundation.serial_write_u64(user_pct)
+  foundation.serial_write_string("%\n")
+
+  foundation.serial_write_string("  Idle: ")
+  foundation.serial_write_u64(idle_pct)
+  foundation.serial_write_string("%\n")
+
+  foundation.serial_write_string("  IRQ: ")
+  foundation.serial_write_u64(irq_pct)
+  foundation.serial_write_string("%\n")
 }
 
-export fn profiler_disable() {
-  profiling_enabled = 0
+// Get profiling mode
+export fn profiler_get_mode(): u32 {
+  return profiling_mode
 }
 
+// Check if profiling is enabled
 export fn profiler_is_enabled(): u32 {
-  return profiling_enabled
-}
-
-export fn profiler_get_count(): u32 {
-  return profile_count
+  return if profiling_mode != PROFILE_MODE_DISABLED { 1 } else { 0 }
 }

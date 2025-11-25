@@ -1,0 +1,579 @@
+// home-os Power Management with Peripheral Gating
+// Controls power to individual peripherals to reduce power consumption
+// Integrates with CPU frequency scaling and thermal management
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../rpi/mailbox_vc7.home" as mailbox7
+import "../rpi/mailbox_vc6.home" as mailbox6
+import "cpufreq.home" as cpufreq
+import "thermal.home" as thermal
+
+// Power domains (Raspberry Pi specific)
+const POWER_DOMAIN_SD: u32 = 0
+const POWER_DOMAIN_UART0: u32 = 1
+const POWER_DOMAIN_UART1: u32 = 2
+const POWER_DOMAIN_USB: u32 = 3
+const POWER_DOMAIN_I2C0: u32 = 4
+const POWER_DOMAIN_I2C1: u32 = 5
+const POWER_DOMAIN_I2C2: u32 = 6
+const POWER_DOMAIN_SPI: u32 = 7
+const POWER_DOMAIN_CCP2TX: u32 = 8
+const POWER_DOMAIN_HDMI: u32 = 9
+const POWER_DOMAIN_USB_HCD: u32 = 10
+
+const MAX_POWER_DOMAINS: u32 = 11
+
+// Power states
+const POWER_STATE_OFF: u32 = 0
+const POWER_STATE_ON: u32 = 1
+const POWER_STATE_SUSPENDED: u32 = 2
+const POWER_STATE_RESUMING: u32 = 3
+
+// Power modes
+const POWER_MODE_PERFORMANCE: u32 = 0
+const POWER_MODE_BALANCED: u32 = 1
+const POWER_MODE_POWERSAVE: u32 = 2
+const POWER_MODE_SUSPEND: u32 = 3
+
+// Idle timeout (milliseconds)
+const IDLE_TIMEOUT_SHORT: u32 = 1000    // 1 second
+const IDLE_TIMEOUT_MEDIUM: u32 = 5000   // 5 seconds
+const IDLE_TIMEOUT_LONG: u32 = 30000    // 30 seconds
+
+// Power domain information
+struct PowerDomain {
+  domain_id: u32
+  name: *u8
+  state: u32              // Current power state
+  enabled: u32            // Domain is enabled flag
+  refcount: u32           // Reference count (usage count)
+  idle_time: u64          // Time idle (milliseconds)
+  idle_timeout: u32       // Timeout before auto-shutoff
+  can_gate: u32           // Can be power-gated flag
+  parent_domain: u32      // Parent domain ID (or 0xFFFFFFFF)
+  dependencies: [4]u32    // Dependent domain IDs
+  num_dependencies: u32   // Number of dependencies
+}
+
+// Power statistics
+struct PowerStats {
+  total_power_on_count: u64
+  total_power_off_count: u64
+  total_suspend_count: u64
+  total_resume_count: u64
+  time_in_performance: u64
+  time_in_balanced: u64
+  time_in_powersave: u64
+  time_in_suspend: u64
+  last_mode_change: u64
+}
+
+var domains: [MAX_POWER_DOMAINS]PowerDomain
+var num_domains: u32 = 0
+var current_mode: u32 = POWER_MODE_BALANCED
+var rpi_model: u32 = 0
+var initialized: u32 = 0
+
+var power_stats: PowerStats
+
+// Get domain name
+fn get_domain_name(domain_id: u32): *u8 {
+  if domain_id == POWER_DOMAIN_SD {
+    return "SD Card"
+  } else if domain_id == POWER_DOMAIN_UART0 {
+    return "UART0"
+  } else if domain_id == POWER_DOMAIN_UART1 {
+    return "UART1"
+  } else if domain_id == POWER_DOMAIN_USB {
+    return "USB"
+  } else if domain_id == POWER_DOMAIN_I2C0 {
+    return "I2C0"
+  } else if domain_id == POWER_DOMAIN_I2C1 {
+    return "I2C1"
+  } else if domain_id == POWER_DOMAIN_I2C2 {
+    return "I2C2"
+  } else if domain_id == POWER_DOMAIN_SPI {
+    return "SPI"
+  } else if domain_id == POWER_DOMAIN_CCP2TX {
+    return "CCP2TX"
+  } else if domain_id == POWER_DOMAIN_HDMI {
+    return "HDMI"
+  } else if domain_id == POWER_DOMAIN_USB_HCD {
+    return "USB HCD"
+  } else {
+    return "Unknown"
+  }
+}
+
+// Initialize power management
+export fn power_init(model: u32): u32 {
+  if initialized == 1 {
+    foundation.serial_write_string("[POWER] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[POWER] Initializing power management...\n")
+
+  rpi_model = model
+  num_domains = MAX_POWER_DOMAINS
+
+  // Initialize power domains
+  var i: u32 = 0
+  loop {
+    if i >= num_domains { break }
+
+    domains[i].domain_id = i
+    domains[i].name = get_domain_name(i)
+    domains[i].state = POWER_STATE_OFF
+    domains[i].enabled = 0
+    domains[i].refcount = 0
+    domains[i].idle_time = 0
+    domains[i].can_gate = 1
+    domains[i].parent_domain = 0xFFFFFFFF
+    domains[i].num_dependencies = 0
+
+    // Set default idle timeouts
+    if i == POWER_DOMAIN_SD {
+      domains[i].idle_timeout = IDLE_TIMEOUT_MEDIUM
+    } else if i == POWER_DOMAIN_USB || i == POWER_DOMAIN_USB_HCD {
+      domains[i].idle_timeout = IDLE_TIMEOUT_LONG
+    } else if i == POWER_DOMAIN_HDMI {
+      domains[i].idle_timeout = 0  // Never auto-shutoff
+      domains[i].can_gate = 0
+    } else {
+      domains[i].idle_timeout = IDLE_TIMEOUT_SHORT
+    }
+
+    i = i + 1
+  }
+
+  // Setup dependencies
+  // USB depends on USB_HCD
+  domains[POWER_DOMAIN_USB].dependencies[0] = POWER_DOMAIN_USB_HCD
+  domains[POWER_DOMAIN_USB].num_dependencies = 1
+
+  // Initialize statistics
+  power_stats.total_power_on_count = 0
+  power_stats.total_power_off_count = 0
+  power_stats.total_suspend_count = 0
+  power_stats.total_resume_count = 0
+  power_stats.time_in_performance = 0
+  power_stats.time_in_balanced = 0
+  power_stats.time_in_powersave = 0
+  power_stats.time_in_suspend = 0
+  power_stats.last_mode_change = 0
+
+  // Set initial power mode
+  power_set_mode(POWER_MODE_BALANCED)
+
+  initialized = 1
+
+  foundation.serial_write_string("[POWER] Power management initialized\n")
+  foundation.serial_write_string("[POWER] Managing ")
+  foundation.serial_write_u64(num_domains)
+  foundation.serial_write_string(" power domains\n")
+
+  return 0
+}
+
+// Power on a domain
+export fn power_domain_on(domain_id: u32): u32 {
+  if initialized == 0 { return 1 }
+  if domain_id >= num_domains { return 1 }
+
+  let domain: *PowerDomain = &domains[domain_id]
+
+  // Check if already on
+  if domain.state == POWER_STATE_ON {
+    domain.refcount = domain.refcount + 1
+    return 0
+  }
+
+  foundation.serial_write_string("[POWER] Powering on: ")
+  foundation.serial_write_string(domain.name)
+  foundation.serial_write_string("\n")
+
+  // Power on dependencies first
+  var i: u32 = 0
+  loop {
+    if i >= domain.num_dependencies { break }
+
+    let dep_id: u32 = domain.dependencies[i]
+    if dep_id != 0xFFFFFFFF {
+      power_domain_on(dep_id)
+    }
+
+    i = i + 1
+  }
+
+  // Use mailbox to power on device
+  let result: u32 = if rpi_model == cpufreq.RPI_MODEL_PI5 {
+    mailbox7.mailbox_set_power_state(domain_id, 1, 0)
+  } else {
+    mailbox6.mailbox_set_power_state(domain_id, 1, 0)
+  }
+
+  if result == 0 {
+    domain.state = POWER_STATE_ON
+    domain.enabled = 1
+    domain.refcount = 1
+    domain.idle_time = 0
+    power_stats.total_power_on_count = power_stats.total_power_on_count + 1
+  }
+
+  return result
+}
+
+// Power off a domain
+export fn power_domain_off(domain_id: u32): u32 {
+  if initialized == 0 { return 1 }
+  if domain_id >= num_domains { return 1 }
+
+  let domain: *PowerDomain = &domains[domain_id]
+
+  // Decrease reference count
+  if domain.refcount > 0 {
+    domain.refcount = domain.refcount - 1
+  }
+
+  // Only power off if no references remain
+  if domain.refcount > 0 {
+    return 0
+  }
+
+  // Check if already off
+  if domain.state == POWER_STATE_OFF {
+    return 0
+  }
+
+  // Check if can be gated
+  if domain.can_gate == 0 {
+    return 1
+  }
+
+  foundation.serial_write_string("[POWER] Powering off: ")
+  foundation.serial_write_string(domain.name)
+  foundation.serial_write_string("\n")
+
+  // Use mailbox to power off device
+  let result: u32 = if rpi_model == cpufreq.RPI_MODEL_PI5 {
+    mailbox7.mailbox_set_power_state(domain_id, 0, 0)
+  } else {
+    mailbox6.mailbox_set_power_state(domain_id, 0, 0)
+  }
+
+  if result == 0 {
+    domain.state = POWER_STATE_OFF
+    domain.enabled = 0
+    power_stats.total_power_off_count = power_stats.total_power_off_count + 1
+  }
+
+  return result
+}
+
+// Suspend a domain (low-power state)
+export fn power_domain_suspend(domain_id: u32): u32 {
+  if initialized == 0 { return 1 }
+  if domain_id >= num_domains { return 1 }
+
+  let domain: *PowerDomain = &domains[domain_id]
+
+  if domain.state != POWER_STATE_ON {
+    return 1
+  }
+
+  foundation.serial_write_string("[POWER] Suspending: ")
+  foundation.serial_write_string(domain.name)
+  foundation.serial_write_string("\n")
+
+  // For now, just power off (would implement suspend via mailbox)
+  domain.state = POWER_STATE_SUSPENDED
+  power_stats.total_suspend_count = power_stats.total_suspend_count + 1
+
+  return 0
+}
+
+// Resume a domain
+export fn power_domain_resume(domain_id: u32): u32 {
+  if initialized == 0 { return 1 }
+  if domain_id >= num_domains { return 1 }
+
+  let domain: *PowerDomain = &domains[domain_id]
+
+  if domain.state != POWER_STATE_SUSPENDED {
+    return 1
+  }
+
+  foundation.serial_write_string("[POWER] Resuming: ")
+  foundation.serial_write_string(domain.name)
+  foundation.serial_write_string("\n")
+
+  domain.state = POWER_STATE_RESUMING
+
+  // Power back on
+  let result: u32 = power_domain_on(domain_id)
+
+  if result == 0 {
+    power_stats.total_resume_count = power_stats.total_resume_count + 1
+  }
+
+  return result
+}
+
+// Update idle time and auto-shutoff
+export fn power_update_idle(domain_id: u32, is_active: u32) {
+  if initialized == 0 { return }
+  if domain_id >= num_domains { return }
+
+  let domain: *PowerDomain = &domains[domain_id]
+
+  if is_active == 1 {
+    // Reset idle time
+    domain.idle_time = 0
+  } else {
+    // Increment idle time (called periodically, e.g., every 100ms)
+    domain.idle_time = domain.idle_time + 100
+
+    // Check for timeout
+    if domain.idle_timeout > 0 && domain.idle_time >= domain.idle_timeout {
+      if domain.state == POWER_STATE_ON && domain.refcount == 0 {
+        foundation.serial_write_string("[POWER] Auto-shutoff: ")
+        foundation.serial_write_string(domain.name)
+        foundation.serial_write_string(" (idle for ")
+        foundation.serial_write_u64(domain.idle_time)
+        foundation.serial_write_string("ms)\n")
+
+        power_domain_off(domain_id)
+      }
+    }
+  }
+}
+
+// Set power mode
+export fn power_set_mode(mode: u32): u32 {
+  if initialized == 0 { return 1 }
+  if mode > POWER_MODE_SUSPEND { return 1 }
+
+  if mode == current_mode {
+    return 0
+  }
+
+  foundation.serial_write_string("[POWER] Switching to ")
+
+  if mode == POWER_MODE_PERFORMANCE {
+    foundation.serial_write_string("PERFORMANCE mode\n")
+
+    // Set CPU governor to performance
+    var i: u32 = 0
+    loop {
+      if i >= 4 { break }
+      cpufreq.cpufreq_set_governor(i, cpufreq.GOVERNOR_PERFORMANCE)
+      i = i + 1
+    }
+
+  } else if mode == POWER_MODE_BALANCED {
+    foundation.serial_write_string("BALANCED mode\n")
+
+    // Set CPU governor to ondemand
+    var i: u32 = 0
+    loop {
+      if i >= 4 { break }
+      cpufreq.cpufreq_set_governor(i, cpufreq.GOVERNOR_ONDEMAND)
+      i = i + 1
+    }
+
+  } else if mode == POWER_MODE_POWERSAVE {
+    foundation.serial_write_string("POWERSAVE mode\n")
+
+    // Set CPU governor to powersave
+    var i: u32 = 0
+    loop {
+      if i >= 4 { break }
+      cpufreq.cpufreq_set_governor(i, cpufreq.GOVERNOR_POWERSAVE)
+      i = i + 1
+    }
+
+    // Power off non-essential peripherals
+    power_domain_off(POWER_DOMAIN_HDMI)
+
+  } else if mode == POWER_MODE_SUSPEND {
+    foundation.serial_write_string("SUSPEND mode\n")
+
+    // Suspend all non-essential domains
+    var i: u32 = 0
+    loop {
+      if i >= num_domains { break }
+
+      if domains[i].can_gate == 1 && domains[i].state == POWER_STATE_ON {
+        power_domain_suspend(i)
+      }
+
+      i = i + 1
+    }
+  }
+
+  current_mode = mode
+  power_stats.last_mode_change = 0  // Would use actual timestamp
+
+  return 0
+}
+
+// Get current power mode
+export fn power_get_mode(): u32 {
+  return current_mode
+}
+
+// Get domain state
+export fn power_get_domain_state(domain_id: u32): u32 {
+  if domain_id >= num_domains { return POWER_STATE_OFF }
+  return domains[domain_id].state
+}
+
+// Check if domain is powered on
+export fn power_is_domain_on(domain_id: u32): u32 {
+  if domain_id >= num_domains { return 0 }
+  return if domains[domain_id].state == POWER_STATE_ON { 1 } else { 0 }
+}
+
+// Acquire domain (increment refcount and power on)
+export fn power_domain_acquire(domain_id: u32): u32 {
+  return power_domain_on(domain_id)
+}
+
+// Release domain (decrement refcount and power off if unused)
+export fn power_domain_release(domain_id: u32): u32 {
+  return power_domain_off(domain_id)
+}
+
+// Periodic update (call from scheduler)
+export fn power_periodic_update() {
+  if initialized == 0 { return }
+
+  // Update idle timers for all domains
+  var i: u32 = 0
+  loop {
+    if i >= num_domains { break }
+
+    if domains[i].state == POWER_STATE_ON {
+      // Check if domain is being used (simplified - would check driver activity)
+      let is_active: u32 = if domains[i].refcount > 0 { 1 } else { 0 }
+      power_update_idle(i, is_active)
+    }
+
+    i = i + 1
+  }
+
+  // Check thermal state and throttle if needed
+  if thermal.thermal_needs_shutdown() == 1 {
+    foundation.serial_write_string("[POWER] Emergency thermal shutdown required!\n")
+    power_set_mode(POWER_MODE_SUSPEND)
+  }
+}
+
+// Print power information
+export fn power_print_info() {
+  foundation.serial_write_string("\n[POWER] Power Management Information:\n")
+
+  foundation.serial_write_string("\n  Current Mode: ")
+  if current_mode == POWER_MODE_PERFORMANCE {
+    foundation.serial_write_string("PERFORMANCE")
+  } else if current_mode == POWER_MODE_BALANCED {
+    foundation.serial_write_string("BALANCED")
+  } else if current_mode == POWER_MODE_POWERSAVE {
+    foundation.serial_write_string("POWERSAVE")
+  } else if current_mode == POWER_MODE_SUSPEND {
+    foundation.serial_write_string("SUSPEND")
+  }
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n  Power Domains:\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= num_domains { break }
+
+    let domain: *PowerDomain = &domains[i]
+
+    foundation.serial_write_string("    ")
+    foundation.serial_write_string(domain.name)
+    foundation.serial_write_string(": ")
+
+    if domain.state == POWER_STATE_ON {
+      foundation.serial_write_string("ON")
+    } else if domain.state == POWER_STATE_OFF {
+      foundation.serial_write_string("OFF")
+    } else if domain.state == POWER_STATE_SUSPENDED {
+      foundation.serial_write_string("SUSPENDED")
+    } else {
+      foundation.serial_write_string("RESUMING")
+    }
+
+    foundation.serial_write_string(" (refs: ")
+    foundation.serial_write_u64(domain.refcount)
+    foundation.serial_write_string(")")
+
+    if domain.state == POWER_STATE_ON && domain.idle_time > 0 {
+      foundation.serial_write_string(" [idle: ")
+      foundation.serial_write_u64(domain.idle_time)
+      foundation.serial_write_string("ms]")
+    }
+
+    foundation.serial_write_string("\n")
+
+    i = i + 1
+  }
+}
+
+// Print power statistics
+export fn power_print_stats() {
+  foundation.serial_write_string("\n[POWER] Statistics:\n")
+
+  foundation.serial_write_string("  Total power-on events: ")
+  foundation.serial_write_u64(power_stats.total_power_on_count)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Total power-off events: ")
+  foundation.serial_write_u64(power_stats.total_power_off_count)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Total suspend events: ")
+  foundation.serial_write_u64(power_stats.total_suspend_count)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Total resume events: ")
+  foundation.serial_write_u64(power_stats.total_resume_count)
+  foundation.serial_write_string("\n")
+}
+
+// Shutdown system (power off all domains)
+export fn power_shutdown() {
+  foundation.serial_write_string("\n[POWER] System shutdown initiated...\n")
+
+  // Power off all domains
+  var i: u32 = 0
+  loop {
+    if i >= num_domains { break }
+
+    if domains[i].state != POWER_STATE_OFF {
+      domains[i].refcount = 0  // Force power off
+      power_domain_off(i)
+    }
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("[POWER] All power domains shut down\n")
+}
+
+// Reboot system
+export fn power_reboot() {
+  foundation.serial_write_string("\n[POWER] System reboot initiated...\n")
+
+  // Use mailbox to reboot
+  if rpi_model == cpufreq.RPI_MODEL_PI5 {
+    mailbox7.mailbox_reboot()
+  } else {
+    mailbox6.mailbox_reboot()
+  }
+}

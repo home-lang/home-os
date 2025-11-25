@@ -1,0 +1,435 @@
+// home-os CPU Frequency Scaling (DVFS - Dynamic Voltage and Frequency Scaling)
+// Power management for ARM Cortex processors on Raspberry Pi
+// Balances performance and power consumption
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../rpi/mailbox_vc7.home" as mailbox7
+import "../rpi/mailbox_vc6.home" as mailbox6
+
+// CPU frequency scaling governors
+const GOVERNOR_PERFORMANCE: u32 = 0  // Always maximum frequency
+const GOVERNOR_POWERSAVE: u32 = 1    // Always minimum frequency
+const GOVERNOR_ONDEMAND: u32 = 2     // Scale based on load
+const GOVERNOR_CONSERVATIVE: u32 = 3 // Scale gradually based on load
+const GOVERNOR_USERSPACE: u32 = 4    // User-controlled frequency
+
+// CPU states
+const CPU_STATE_OFFLINE: u32 = 0
+const CPU_STATE_IDLE: u32 = 1
+const CPU_STATE_ACTIVE: u32 = 2
+const CPU_STATE_TURBO: u32 = 3
+
+// Raspberry Pi models
+const RPI_MODEL_PI4: u32 = 0
+const RPI_MODEL_PI5: u32 = 1
+
+// CPU frequency presets (Hz)
+// Raspberry Pi 4 (Cortex-A72)
+const PI4_FREQ_MIN: u32 = 600000000     // 600 MHz
+const PI4_FREQ_DEFAULT: u32 = 1500000000  // 1.5 GHz
+const PI4_FREQ_MAX: u32 = 1800000000    // 1.8 GHz (with cooling)
+
+// Raspberry Pi 5 (Cortex-A76)
+const PI5_FREQ_MIN: u32 = 1000000000    // 1.0 GHz
+const PI5_FREQ_DEFAULT: u32 = 2400000000  // 2.4 GHz
+const PI5_FREQ_MAX: u32 = 2400000000    // 2.4 GHz
+
+// Load thresholds for ondemand governor (percentage)
+const LOAD_THRESHOLD_UP: u32 = 80
+const LOAD_THRESHOLD_DOWN: u32 = 20
+
+// CPU frequency information
+struct CPUFreqInfo {
+  cpu_id: u32
+  current_freq: u32     // Current frequency (Hz)
+  min_freq: u32         // Minimum frequency (Hz)
+  max_freq: u32         // Maximum frequency (Hz)
+  target_freq: u32      // Target frequency (Hz)
+  governor: u32         // Active governor
+  state: u32            // CPU state
+  load: u32             // Current load (0-100%)
+  voltage: u32          // Current voltage (microvolts)
+  turbo_enabled: u32    // Turbo mode flag
+}
+
+const MAX_CPUS: u32 = 4
+
+var cpu_info: [MAX_CPUS]CPUFreqInfo
+var num_cpus: u32 = 0
+var rpi_model: u32 = RPI_MODEL_PI5
+var initialized: u32 = 0
+
+// Statistics
+var freq_changes: u64 = 0
+var governor_changes: u64 = 0
+var throttle_events: u64 = 0
+var turbo_activations: u64 = 0
+
+// Initialize CPU frequency scaling
+export fn cpufreq_init(model: u32, cpus: u32): u32 {
+  if initialized == 1 {
+    foundation.serial_write_string("[CPUFREQ] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[CPUFREQ] Initializing CPU frequency scaling...\n")
+
+  rpi_model = model
+  num_cpus = if cpus > MAX_CPUS { MAX_CPUS } else { cpus }
+
+  // Initialize per-CPU information
+  var i: u32 = 0
+  loop {
+    if i >= num_cpus { break }
+
+    cpu_info[i].cpu_id = i
+    cpu_info[i].governor = GOVERNOR_ONDEMAND
+    cpu_info[i].state = CPU_STATE_ACTIVE
+    cpu_info[i].load = 0
+    cpu_info[i].turbo_enabled = 0
+
+    if model == RPI_MODEL_PI5 {
+      cpu_info[i].min_freq = PI5_FREQ_MIN
+      cpu_info[i].max_freq = PI5_FREQ_MAX
+      cpu_info[i].current_freq = PI5_FREQ_DEFAULT
+      cpu_info[i].target_freq = PI5_FREQ_DEFAULT
+    } else {
+      cpu_info[i].min_freq = PI4_FREQ_MIN
+      cpu_info[i].max_freq = PI4_FREQ_MAX
+      cpu_info[i].current_freq = PI4_FREQ_DEFAULT
+      cpu_info[i].target_freq = PI4_FREQ_DEFAULT
+    }
+
+    i = i + 1
+  }
+
+  // Query actual frequencies from firmware
+  cpufreq_query_frequencies()
+
+  initialized = 1
+
+  foundation.serial_write_string("[CPUFREQ] Initialized for ")
+  foundation.serial_write_u64(num_cpus)
+  foundation.serial_write_string(" CPUs\n")
+
+  return 0
+}
+
+// Query frequencies from firmware via mailbox
+fn cpufreq_query_frequencies() {
+  foundation.serial_write_string("[CPUFREQ] Querying frequencies from firmware...\n")
+
+  // Get ARM clock rate
+  let clock_rate: u32 = if rpi_model == RPI_MODEL_PI5 {
+    mailbox7.mailbox_get_clock_rate(mailbox7.CLOCK_ARM)
+  } else {
+    mailbox6.mailbox_get_clock_rate(mailbox6.CLOCK_ARM)
+  }
+
+  if clock_rate > 0 {
+    foundation.serial_write_string("[CPUFREQ] Current ARM clock: ")
+    foundation.serial_write_u64(clock_rate / 1000000)
+    foundation.serial_write_string(" MHz\n")
+
+    // Update all CPUs
+    var i: u32 = 0
+    loop {
+      if i >= num_cpus { break }
+      cpu_info[i].current_freq = clock_rate
+      i = i + 1
+    }
+  }
+}
+
+// Set CPU frequency
+export fn cpufreq_set_frequency(cpu_id: u32, freq_hz: u32): u32 {
+  if initialized == 0 { return 1 }
+  if cpu_id >= num_cpus { return 1 }
+
+  let info: *CPUFreqInfo = &cpu_info[cpu_id]
+
+  // Clamp to min/max
+  var target: u32 = freq_hz
+  if target < info.min_freq {
+    target = info.min_freq
+  }
+  if target > info.max_freq {
+    target = info.max_freq
+  }
+
+  if target == info.current_freq {
+    return 0  // Already at target frequency
+  }
+
+  foundation.serial_write_string("[CPUFREQ] CPU")
+  foundation.serial_write_u64(cpu_id)
+  foundation.serial_write_string(": ")
+  foundation.serial_write_u64(info.current_freq / 1000000)
+  foundation.serial_write_string(" MHz -> ")
+  foundation.serial_write_u64(target / 1000000)
+  foundation.serial_write_string(" MHz\n")
+
+  // Set frequency via mailbox
+  let result: u32 = if rpi_model == RPI_MODEL_PI5 {
+    mailbox7.mailbox_set_clock_rate(mailbox7.CLOCK_ARM, target, 0)
+  } else {
+    mailbox6.mailbox_set_clock_rate(mailbox6.CLOCK_ARM, target, 0)
+  }
+
+  if result == 0 {
+    info.current_freq = target
+    info.target_freq = target
+    freq_changes = freq_changes + 1
+  }
+
+  return result
+}
+
+// Set CPU governor
+export fn cpufreq_set_governor(cpu_id: u32, governor: u32): u32 {
+  if initialized == 0 { return 1 }
+  if cpu_id >= num_cpus { return 1 }
+  if governor > GOVERNOR_USERSPACE { return 1 }
+
+  let info: *CPUFreqInfo = &cpu_info[cpu_id]
+
+  if info.governor == governor {
+    return 0  // Already using this governor
+  }
+
+  info.governor = governor
+  governor_changes = governor_changes + 1
+
+  foundation.serial_write_string("[CPUFREQ] CPU")
+  foundation.serial_write_u64(cpu_id)
+  foundation.serial_write_string(": Governor changed to ")
+
+  if governor == GOVERNOR_PERFORMANCE {
+    foundation.serial_write_string("PERFORMANCE\n")
+    cpufreq_set_frequency(cpu_id, info.max_freq)
+  } else if governor == GOVERNOR_POWERSAVE {
+    foundation.serial_write_string("POWERSAVE\n")
+    cpufreq_set_frequency(cpu_id, info.min_freq)
+  } else if governor == GOVERNOR_ONDEMAND {
+    foundation.serial_write_string("ONDEMAND\n")
+  } else if governor == GOVERNOR_CONSERVATIVE {
+    foundation.serial_write_string("CONSERVATIVE\n")
+  } else if governor == GOVERNOR_USERSPACE {
+    foundation.serial_write_string("USERSPACE\n")
+  }
+
+  return 0
+}
+
+// Update CPU load and adjust frequency based on governor
+export fn cpufreq_update_load(cpu_id: u32, load_percent: u32) {
+  if initialized == 0 { return }
+  if cpu_id >= num_cpus { return }
+
+  let info: *CPUFreqInfo = &cpu_info[cpu_id]
+  info.load = load_percent
+
+  // Apply governor policy
+  if info.governor == GOVERNOR_ONDEMAND {
+    if load_percent >= LOAD_THRESHOLD_UP {
+      // High load - scale up to max
+      cpufreq_set_frequency(cpu_id, info.max_freq)
+    } else if load_percent <= LOAD_THRESHOLD_DOWN {
+      // Low load - scale down to min
+      cpufreq_set_frequency(cpu_id, info.min_freq)
+    }
+  } else if info.governor == GOVERNOR_CONSERVATIVE {
+    // Scale gradually
+    if load_percent >= LOAD_THRESHOLD_UP {
+      // Increase by one step
+      let step: u32 = (info.max_freq - info.min_freq) / 4
+      let new_freq: u32 = info.current_freq + step
+      cpufreq_set_frequency(cpu_id, new_freq)
+    } else if load_percent <= LOAD_THRESHOLD_DOWN {
+      // Decrease by one step
+      let step: u32 = (info.max_freq - info.min_freq) / 4
+      if info.current_freq > step {
+        let new_freq: u32 = info.current_freq - step
+        cpufreq_set_frequency(cpu_id, new_freq)
+      }
+    }
+  }
+}
+
+// Enable turbo mode
+export fn cpufreq_enable_turbo(cpu_id: u32): u32 {
+  if initialized == 0 { return 1 }
+  if cpu_id >= num_cpus { return 1 }
+
+  let info: *CPUFreqInfo = &cpu_info[cpu_id]
+
+  if info.turbo_enabled == 1 {
+    return 0  // Already enabled
+  }
+
+  foundation.serial_write_string("[CPUFREQ] CPU")
+  foundation.serial_write_u64(cpu_id)
+  foundation.serial_write_string(": Enabling turbo mode\n")
+
+  // Set turbo via mailbox
+  let result: u32 = if rpi_model == RPI_MODEL_PI5 {
+    mailbox7.mailbox_set_clock_rate(mailbox7.CLOCK_ARM, info.max_freq, 0)
+  } else {
+    mailbox6.mailbox_set_clock_rate(mailbox6.CLOCK_ARM, info.max_freq, 0)
+  }
+
+  if result == 0 {
+    info.turbo_enabled = 1
+    info.state = CPU_STATE_TURBO
+    turbo_activations = turbo_activations + 1
+  }
+
+  return result
+}
+
+// Disable turbo mode
+export fn cpufreq_disable_turbo(cpu_id: u32): u32 {
+  if initialized == 0 { return 1 }
+  if cpu_id >= num_cpus { return 1 }
+
+  let info: *CPUFreqInfo = &cpu_info[cpu_id]
+
+  if info.turbo_enabled == 0 {
+    return 0  // Already disabled
+  }
+
+  foundation.serial_write_string("[CPUFREQ] CPU")
+  foundation.serial_write_u64(cpu_id)
+  foundation.serial_write_string(": Disabling turbo mode\n")
+
+  info.turbo_enabled = 0
+  info.state = CPU_STATE_ACTIVE
+
+  // Restore normal frequency based on governor
+  if info.governor == GOVERNOR_PERFORMANCE {
+    cpufreq_set_frequency(cpu_id, info.max_freq)
+  }
+
+  return 0
+}
+
+// Get CPU information
+export fn cpufreq_get_info(cpu_id: u32): *CPUFreqInfo {
+  if cpu_id >= num_cpus { return 0 }
+  return &cpu_info[cpu_id]
+}
+
+// Get current frequency
+export fn cpufreq_get_frequency(cpu_id: u32): u32 {
+  if cpu_id >= num_cpus { return 0 }
+  return cpu_info[cpu_id].current_freq
+}
+
+// Handle thermal throttling
+export fn cpufreq_throttle(cpu_id: u32) {
+  if initialized == 0 { return }
+  if cpu_id >= num_cpus { return }
+
+  throttle_events = throttle_events + 1
+
+  foundation.serial_write_string("[CPUFREQ] CPU")
+  foundation.serial_write_u64(cpu_id)
+  foundation.serial_write_string(": Thermal throttling activated\n")
+
+  // Reduce to minimum frequency
+  cpufreq_set_frequency(cpu_id, cpu_info[cpu_id].min_freq)
+
+  // Disable turbo
+  cpufreq_disable_turbo(cpu_id)
+}
+
+// Unthrottle CPU
+export fn cpufreq_unthrottle(cpu_id: u32) {
+  if initialized == 0 { return }
+  if cpu_id >= num_cpus { return }
+
+  foundation.serial_write_string("[CPUFREQ] CPU")
+  foundation.serial_write_u64(cpu_id)
+  foundation.serial_write_string(": Thermal throttling released\n")
+
+  // Restore frequency based on governor
+  let info: *CPUFreqInfo = &cpu_info[cpu_id]
+
+  if info.governor == GOVERNOR_PERFORMANCE {
+    cpufreq_set_frequency(cpu_id, info.max_freq)
+  }
+}
+
+// Print CPU frequency information
+export fn cpufreq_print_info() {
+  foundation.serial_write_string("\n[CPUFREQ] CPU Frequency Information:\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= num_cpus { break }
+
+    let info: *CPUFreqInfo = &cpu_info[i]
+
+    foundation.serial_write_string("\n  CPU")
+    foundation.serial_write_u64(i)
+    foundation.serial_write_string(":\n")
+
+    foundation.serial_write_string("    Current: ")
+    foundation.serial_write_u64(info.current_freq / 1000000)
+    foundation.serial_write_string(" MHz\n")
+
+    foundation.serial_write_string("    Min: ")
+    foundation.serial_write_u64(info.min_freq / 1000000)
+    foundation.serial_write_string(" MHz\n")
+
+    foundation.serial_write_string("    Max: ")
+    foundation.serial_write_u64(info.max_freq / 1000000)
+    foundation.serial_write_string(" MHz\n")
+
+    foundation.serial_write_string("    Load: ")
+    foundation.serial_write_u64(info.load)
+    foundation.serial_write_string("%\n")
+
+    foundation.serial_write_string("    Governor: ")
+    if info.governor == GOVERNOR_PERFORMANCE {
+      foundation.serial_write_string("PERFORMANCE")
+    } else if info.governor == GOVERNOR_POWERSAVE {
+      foundation.serial_write_string("POWERSAVE")
+    } else if info.governor == GOVERNOR_ONDEMAND {
+      foundation.serial_write_string("ONDEMAND")
+    } else if info.governor == GOVERNOR_CONSERVATIVE {
+      foundation.serial_write_string("CONSERVATIVE")
+    } else {
+      foundation.serial_write_string("USERSPACE")
+    }
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("    Turbo: ")
+    foundation.serial_write_string(if info.turbo_enabled == 1 { "ENABLED" } else { "DISABLED" })
+    foundation.serial_write_string("\n")
+
+    i = i + 1
+  }
+}
+
+// Print statistics
+export fn cpufreq_print_stats() {
+  foundation.serial_write_string("\n[CPUFREQ] Statistics:\n")
+
+  foundation.serial_write_string("  Frequency changes: ")
+  foundation.serial_write_u64(freq_changes)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Governor changes: ")
+  foundation.serial_write_u64(governor_changes)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Throttle events: ")
+  foundation.serial_write_u64(throttle_events)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Turbo activations: ")
+  foundation.serial_write_u64(turbo_activations)
+  foundation.serial_write_string("\n")
+}

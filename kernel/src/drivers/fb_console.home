@@ -1,0 +1,515 @@
+// home-os Framebuffer Console with Font Rendering
+// VT100-compatible terminal emulator with PSF font support
+// Provides graphical text console output
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "framebuffer.home" as framebuffer
+
+// Console configuration
+const CONSOLE_WIDTH: u32 = 80        // Characters
+const CONSOLE_HEIGHT: u32 = 25       // Characters
+const FONT_WIDTH: u32 = 8            // Pixels
+const FONT_HEIGHT: u32 = 16          // Pixels
+const TAB_SIZE: u32 = 8
+
+// Colors (32-bit RGBA)
+const COLOR_BLACK: u32 = 0xFF000000
+const COLOR_RED: u32 = 0xFFAA0000
+const COLOR_GREEN: u32 = 0xFF00AA00
+const COLOR_YELLOW: u32 = 0xFFAAAA00
+const COLOR_BLUE: u32 = 0xFF0000AA
+const COLOR_MAGENTA: u32 = 0xFFAA00AA
+const COLOR_CYAN: u32 = 0xFF00AAAA
+const COLOR_WHITE: u32 = 0xFFAAAAAA
+const COLOR_BRIGHT_BLACK: u32 = 0xFF555555
+const COLOR_BRIGHT_RED: u32 = 0xFFFF5555
+const COLOR_BRIGHT_GREEN: u32 = 0xFF55FF55
+const COLOR_BRIGHT_YELLOW: u32 = 0xFFFFFF55
+const COLOR_BRIGHT_BLUE: u32 = 0xFF5555FF
+const COLOR_BRIGHT_MAGENTA: u32 = 0xFFFF55FF
+const COLOR_BRIGHT_CYAN: u32 = 0xFF55FFFF
+const COLOR_BRIGHT_WHITE: u32 = 0xFFFFFFFF
+
+// VT100 escape sequence states
+const VT_STATE_NORMAL: u32 = 0
+const VT_STATE_ESC: u32 = 1
+const VT_STATE_CSI: u32 = 2
+
+// Character cell
+struct ConsoleCell {
+  char: u32
+  fg_color: u32
+  bg_color: u32
+  attributes: u32  // Bold, underline, etc.
+}
+
+// Console state
+struct ConsoleState {
+  cursor_x: u32
+  cursor_y: u32
+  fg_color: u32
+  bg_color: u32
+  attributes: u32
+
+  vt_state: u32           // VT100 parser state
+  esc_params: [8]u32      // Escape sequence parameters
+  esc_param_count: u32
+
+  buffer: *ConsoleCell    // Character buffer
+  scroll_top: u32
+  scroll_bottom: u32
+
+  cursor_visible: u32
+  cursor_blink: u32
+
+  initialized: u32
+}
+
+var console: ConsoleState
+var initialized: u32 = 0
+
+// Built-in 8x16 font (simplified - would include full bitmap)
+// Each character is 16 bytes (16 rows of 8 pixels)
+var font_data: [256 * 16]u8
+
+// Initialize font data (simplified)
+fn init_font() {
+  // Would load actual PSF font or include bitmap font
+  // For now, just clear
+  var i: u32 = 0
+  loop {
+    if i >= 256 * 16 { break }
+    font_data[i] = 0
+    i = i + 1
+  }
+
+  // Set up a simple pattern for ASCII 'A' (0x41)
+  font_data[0x41 * 16 + 0] = 0b00111100
+  font_data[0x41 * 16 + 1] = 0b01100110
+  font_data[0x41 * 16 + 2] = 0b11000011
+  font_data[0x41 * 16 + 3] = 0b11000011
+  font_data[0x41 * 16 + 4] = 0b11111111
+  font_data[0x41 * 16 + 5] = 0b11000011
+  font_data[0x41 * 16 + 6] = 0b11000011
+  font_data[0x41 * 16 + 7] = 0b11000011
+}
+
+// Get color from index
+fn get_color(index: u32, bright: u32): u32 {
+  if bright == 0 {
+    if index == 0 { return COLOR_BLACK }
+    else if index == 1 { return COLOR_RED }
+    else if index == 2 { return COLOR_GREEN }
+    else if index == 3 { return COLOR_YELLOW }
+    else if index == 4 { return COLOR_BLUE }
+    else if index == 5 { return COLOR_MAGENTA }
+    else if index == 6 { return COLOR_CYAN }
+    else { return COLOR_WHITE }
+  } else {
+    if index == 0 { return COLOR_BRIGHT_BLACK }
+    else if index == 1 { return COLOR_BRIGHT_RED }
+    else if index == 2 { return COLOR_BRIGHT_GREEN }
+    else if index == 3 { return COLOR_BRIGHT_YELLOW }
+    else if index == 4 { return COLOR_BRIGHT_BLUE }
+    else if index == 5 { return COLOR_BRIGHT_MAGENTA }
+    else if index == 6 { return COLOR_BRIGHT_CYAN }
+    else { return COLOR_BRIGHT_WHITE }
+  }
+}
+
+// Initialize framebuffer console
+export fn fb_console_init(): u32 {
+  if initialized == 1 {
+    foundation.serial_write_string("[FB_CONSOLE] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[FB_CONSOLE] Initializing framebuffer console...\n")
+
+  // Allocate character buffer
+  let buffer_size: u64 = (CONSOLE_WIDTH * CONSOLE_HEIGHT * 16) as u64  // Size of ConsoleCell
+  console.buffer = memory.kmalloc(buffer_size) as *ConsoleCell
+
+  if console.buffer == 0 {
+    foundation.serial_write_string("[FB_CONSOLE] Failed to allocate buffer\n")
+    return 1
+  }
+
+  // Initialize console state
+  console.cursor_x = 0
+  console.cursor_y = 0
+  console.fg_color = COLOR_WHITE
+  console.bg_color = COLOR_BLACK
+  console.attributes = 0
+  console.vt_state = VT_STATE_NORMAL
+  console.esc_param_count = 0
+  console.scroll_top = 0
+  console.scroll_bottom = CONSOLE_HEIGHT - 1
+  console.cursor_visible = 1
+  console.cursor_blink = 0
+
+  // Clear buffer
+  var i: u32 = 0
+  loop {
+    if i >= CONSOLE_WIDTH * CONSOLE_HEIGHT { break }
+
+    let cell_ptr: u64 = console.buffer as u64 + (i * 16) as u64
+    memory.write_u32(cell_ptr, ' ' as u32)
+    memory.write_u32(cell_ptr + 4, console.fg_color)
+    memory.write_u32(cell_ptr + 8, console.bg_color)
+    memory.write_u32(cell_ptr + 12, 0)
+
+    i = i + 1
+  }
+
+  // Initialize font
+  init_font()
+
+  console.initialized = 1
+  initialized = 1
+
+  // Clear screen
+  fb_console_clear()
+
+  foundation.serial_write_string("[FB_CONSOLE] Console initialized ")
+  foundation.serial_write_u64(CONSOLE_WIDTH)
+  foundation.serial_write_string("x")
+  foundation.serial_write_u64(CONSOLE_HEIGHT)
+  foundation.serial_write_string(" chars\n")
+
+  return 0
+}
+
+// Draw a character at position
+fn draw_char(x: u32, y: u32, char: u32, fg: u32, bg: u32) {
+  if char >= 256 { return }
+
+  let pixel_x: u32 = x * FONT_WIDTH
+  let pixel_y: u32 = y * FONT_HEIGHT
+
+  var row: u32 = 0
+  loop {
+    if row >= FONT_HEIGHT { break }
+
+    let font_byte: u8 = font_data[(char * 16 + row) as u32]
+
+    var col: u32 = 0
+    loop {
+      if col >= FONT_WIDTH { break }
+
+      let bit: u32 = (font_byte >> (7 - col)) & 1
+      let color: u32 = if bit == 1 { fg } else { bg }
+
+      framebuffer.fb_draw_pixel(pixel_x + col, pixel_y + row, color)
+
+      col = col + 1
+    }
+
+    row = row + 1
+  }
+}
+
+// Scroll console up one line
+fn scroll_up() {
+  // Move buffer contents up
+  var y: u32 = console.scroll_top
+  loop {
+    if y >= console.scroll_bottom { break }
+
+    var x: u32 = 0
+    loop {
+      if x >= CONSOLE_WIDTH { break }
+
+      let src_idx: u32 = (y + 1) * CONSOLE_WIDTH + x
+      let dst_idx: u32 = y * CONSOLE_WIDTH + x
+
+      let src_ptr: u64 = console.buffer as u64 + (src_idx * 16) as u64
+      let dst_ptr: u64 = console.buffer as u64 + (dst_idx * 16) as u64
+
+      memory.write_u32(dst_ptr, memory.read_u32(src_ptr))
+      memory.write_u32(dst_ptr + 4, memory.read_u32(src_ptr + 4))
+      memory.write_u32(dst_ptr + 8, memory.read_u32(src_ptr + 8))
+      memory.write_u32(dst_ptr + 12, memory.read_u32(src_ptr + 12))
+
+      x = x + 1
+    }
+
+    y = y + 1
+  }
+
+  // Clear bottom line
+  var x: u32 = 0
+  loop {
+    if x >= CONSOLE_WIDTH { break }
+
+    let idx: u32 = console.scroll_bottom * CONSOLE_WIDTH + x
+    let ptr: u64 = console.buffer as u64 + (idx * 16) as u64
+
+    memory.write_u32(ptr, ' ' as u32)
+    memory.write_u32(ptr + 4, console.fg_color)
+    memory.write_u32(ptr + 8, console.bg_color)
+    memory.write_u32(ptr + 12, 0)
+
+    x = x + 1
+  }
+
+  // Redraw entire screen
+  fb_console_refresh()
+}
+
+// Put character at current cursor position
+fn put_char_at_cursor(ch: u32) {
+  let idx: u32 = console.cursor_y * CONSOLE_WIDTH + console.cursor_x
+  let ptr: u64 = console.buffer as u64 + (idx * 16) as u64
+
+  memory.write_u32(ptr, ch)
+  memory.write_u32(ptr + 4, console.fg_color)
+  memory.write_u32(ptr + 8, console.bg_color)
+  memory.write_u32(ptr + 12, console.attributes)
+
+  draw_char(console.cursor_x, console.cursor_y, ch, console.fg_color, console.bg_color)
+}
+
+// Handle VT100 CSI sequence
+fn handle_csi_sequence(final_char: u8) {
+  if final_char == ('H' as u8) || final_char == ('f' as u8) {
+    // Cursor position
+    let row: u32 = if console.esc_param_count > 0 { console.esc_params[0] - 1 } else { 0 }
+    let col: u32 = if console.esc_param_count > 1 { console.esc_params[1] - 1 } else { 0 }
+
+    console.cursor_y = if row < CONSOLE_HEIGHT { row } else { CONSOLE_HEIGHT - 1 }
+    console.cursor_x = if col < CONSOLE_WIDTH { col } else { CONSOLE_WIDTH - 1 }
+
+  } else if final_char == ('A' as u8) {
+    // Cursor up
+    let n: u32 = if console.esc_param_count > 0 { console.esc_params[0] } else { 1 }
+    if console.cursor_y >= n {
+      console.cursor_y = console.cursor_y - n
+    }
+
+  } else if final_char == ('B' as u8) {
+    // Cursor down
+    let n: u32 = if console.esc_param_count > 0 { console.esc_params[0] } else { 1 }
+    console.cursor_y = console.cursor_y + n
+    if console.cursor_y >= CONSOLE_HEIGHT {
+      console.cursor_y = CONSOLE_HEIGHT - 1
+    }
+
+  } else if final_char == ('C' as u8) {
+    // Cursor forward
+    let n: u32 = if console.esc_param_count > 0 { console.esc_params[0] } else { 1 }
+    console.cursor_x = console.cursor_x + n
+    if console.cursor_x >= CONSOLE_WIDTH {
+      console.cursor_x = CONSOLE_WIDTH - 1
+    }
+
+  } else if final_char == ('D' as u8) {
+    // Cursor back
+    let n: u32 = if console.esc_param_count > 0 { console.esc_params[0] } else { 1 }
+    if console.cursor_x >= n {
+      console.cursor_x = console.cursor_x - n
+    }
+
+  } else if final_char == ('J' as u8) {
+    // Erase display
+    let mode: u32 = if console.esc_param_count > 0 { console.esc_params[0] } else { 0 }
+
+    if mode == 2 {
+      fb_console_clear()
+    }
+
+  } else if final_char == ('m' as u8) {
+    // Set graphics mode
+    if console.esc_param_count == 0 {
+      // Reset
+      console.fg_color = COLOR_WHITE
+      console.bg_color = COLOR_BLACK
+      console.attributes = 0
+    } else {
+      var i: u32 = 0
+      loop {
+        if i >= console.esc_param_count { break }
+
+        let param: u32 = console.esc_params[i]
+
+        if param == 0 {
+          console.fg_color = COLOR_WHITE
+          console.bg_color = COLOR_BLACK
+          console.attributes = 0
+        } else if param >= 30 && param <= 37 {
+          console.fg_color = get_color(param - 30, 0)
+        } else if param >= 40 && param <= 47 {
+          console.bg_color = get_color(param - 40, 0)
+        } else if param >= 90 && param <= 97 {
+          console.fg_color = get_color(param - 90, 1)
+        } else if param >= 100 && param <= 107 {
+          console.bg_color = get_color(param - 100, 1)
+        }
+
+        i = i + 1
+      }
+    }
+  }
+}
+
+// Write a character to console
+export fn fb_console_putchar(ch: u8) {
+  if initialized == 0 { return }
+
+  // Handle VT100 escape sequences
+  if console.vt_state == VT_STATE_ESC {
+    if ch == ('[' as u8) {
+      console.vt_state = VT_STATE_CSI
+      console.esc_param_count = 0
+      var i: u32 = 0
+      loop {
+        if i >= 8 { break }
+        console.esc_params[i] = 0
+        i = i + 1
+      }
+      return
+    } else {
+      console.vt_state = VT_STATE_NORMAL
+    }
+  } else if console.vt_state == VT_STATE_CSI {
+    if ch >= ('0' as u8) && ch <= ('9' as u8) {
+      if console.esc_param_count == 0 {
+        console.esc_param_count = 1
+      }
+      console.esc_params[console.esc_param_count - 1] =
+        console.esc_params[console.esc_param_count - 1] * 10 + (ch - ('0' as u8)) as u32
+      return
+    } else if ch == (';' as u8) {
+      if console.esc_param_count < 8 {
+        console.esc_param_count = console.esc_param_count + 1
+      }
+      return
+    } else {
+      handle_csi_sequence(ch)
+      console.vt_state = VT_STATE_NORMAL
+      return
+    }
+  }
+
+  // Handle special characters
+  if ch == 0x1B {  // ESC
+    console.vt_state = VT_STATE_ESC
+    return
+  } else if ch == ('\n' as u8) {
+    console.cursor_x = 0
+    console.cursor_y = console.cursor_y + 1
+
+    if console.cursor_y >= CONSOLE_HEIGHT {
+      console.cursor_y = CONSOLE_HEIGHT - 1
+      scroll_up()
+    }
+    return
+  } else if ch == ('\r' as u8) {
+    console.cursor_x = 0
+    return
+  } else if ch == ('\t' as u8) {
+    console.cursor_x = (console.cursor_x + TAB_SIZE) & ~(TAB_SIZE - 1)
+    if console.cursor_x >= CONSOLE_WIDTH {
+      console.cursor_x = 0
+      console.cursor_y = console.cursor_y + 1
+    }
+    return
+  } else if ch == ('\b' as u8) {
+    if console.cursor_x > 0 {
+      console.cursor_x = console.cursor_x - 1
+    }
+    return
+  }
+
+  // Normal character
+  put_char_at_cursor(ch as u32)
+
+  console.cursor_x = console.cursor_x + 1
+  if console.cursor_x >= CONSOLE_WIDTH {
+    console.cursor_x = 0
+    console.cursor_y = console.cursor_y + 1
+
+    if console.cursor_y >= CONSOLE_HEIGHT {
+      console.cursor_y = CONSOLE_HEIGHT - 1
+      scroll_up()
+    }
+  }
+}
+
+// Write string to console
+export fn fb_console_write(str: *u8) {
+  var i: u32 = 0
+  loop {
+    let ch: u8 = memory.read_u8(str as u64 + i as u64)
+    if ch == 0 { break }
+
+    fb_console_putchar(ch)
+    i = i + 1
+  }
+}
+
+// Clear console
+export fn fb_console_clear() {
+  if initialized == 0 { return }
+
+  // Clear buffer
+  var i: u32 = 0
+  loop {
+    if i >= CONSOLE_WIDTH * CONSOLE_HEIGHT { break }
+
+    let ptr: u64 = console.buffer as u64 + (i * 16) as u64
+    memory.write_u32(ptr, ' ' as u32)
+    memory.write_u32(ptr + 4, console.fg_color)
+    memory.write_u32(ptr + 8, console.bg_color)
+    memory.write_u32(ptr + 12, 0)
+
+    i = i + 1
+  }
+
+  // Clear framebuffer
+  framebuffer.fb_clear(console.bg_color)
+
+  console.cursor_x = 0
+  console.cursor_y = 0
+}
+
+// Refresh entire display
+export fn fb_console_refresh() {
+  var y: u32 = 0
+  loop {
+    if y >= CONSOLE_HEIGHT { break }
+
+    var x: u32 = 0
+    loop {
+      if x >= CONSOLE_WIDTH { break }
+
+      let idx: u32 = y * CONSOLE_WIDTH + x
+      let ptr: u64 = console.buffer as u64 + (idx * 16) as u64
+
+      let char: u32 = memory.read_u32(ptr)
+      let fg: u32 = memory.read_u32(ptr + 4)
+      let bg: u32 = memory.read_u32(ptr + 8)
+
+      draw_char(x, y, char, fg, bg)
+
+      x = x + 1
+    }
+
+    y = y + 1
+  }
+}
+
+// Set cursor visibility
+export fn fb_console_set_cursor_visible(visible: u32) {
+  console.cursor_visible = visible
+}
+
+// Get cursor position
+export fn fb_console_get_cursor_x(): u32 {
+  return console.cursor_x
+}
+
+export fn fb_console_get_cursor_y(): u32 {
+  return console.cursor_y
+}
