@@ -1,9 +1,16 @@
-// home-os WebSocket
-// WebSocket protocol
+// home-os WebSocket Protocol (RFC 6455)
+// Full-duplex bidirectional communication over TCP
 
 import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
 import "http.home" as http
+import "tcp.home" as tcp
 
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// WebSocket Opcodes
 const WS_OPCODE_CONTINUATION: u8 = 0x0
 const WS_OPCODE_TEXT: u8 = 0x1
 const WS_OPCODE_BINARY: u8 = 0x2
@@ -11,61 +18,794 @@ const WS_OPCODE_CLOSE: u8 = 0x8
 const WS_OPCODE_PING: u8 = 0x9
 const WS_OPCODE_PONG: u8 = 0xA
 
+// WebSocket Close Codes
+const WS_CLOSE_NORMAL: u16 = 1000
+const WS_CLOSE_GOING_AWAY: u16 = 1001
+const WS_CLOSE_PROTOCOL_ERROR: u16 = 1002
+const WS_CLOSE_UNSUPPORTED_DATA: u16 = 1003
+const WS_CLOSE_NO_STATUS: u16 = 1005
+const WS_CLOSE_ABNORMAL: u16 = 1006
+const WS_CLOSE_INVALID_DATA: u16 = 1007
+const WS_CLOSE_POLICY_VIOLATION: u16 = 1008
+const WS_CLOSE_MESSAGE_TOO_BIG: u16 = 1009
+const WS_CLOSE_INTERNAL_ERROR: u16 = 1011
+
+// Connection States
+const WS_STATE_IDLE: u32 = 0
+const WS_STATE_CONNECTING: u32 = 1
+const WS_STATE_OPEN: u32 = 2
+const WS_STATE_CLOSING: u32 = 3
+const WS_STATE_CLOSED: u32 = 4
+
+const MAX_WS_CONNECTIONS: u32 = 32
+const MAX_FRAME_SIZE: u32 = 65536
+const MAX_MESSAGE_QUEUE: u32 = 64
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
 struct WebSocketFrame {
-  fin: u8,
-  opcode: u8,
-  mask: u8,
-  payload_length: u64,
-  masking_key: [u8; 4],
-  payload: u64
+  fin: u8,                    // Final fragment flag
+  rsv1: u8,                   // Reserved bit 1
+  rsv2: u8,                   // Reserved bit 2
+  rsv3: u8,                   // Reserved bit 3
+  opcode: u8,                 // Frame opcode
+  mask: u8,                   // Mask flag
+  payload_length: u64,        // Payload length
+  masking_key: [u8; 4],      // Masking key (if masked)
+  payload: u64                // Pointer to payload data
 }
 
-var ws_connected: u32 = 0
+struct WebSocketMessage {
+  opcode: u8,
+  data: [u8; 65536],
+  length: u32,
+  timestamp: u64
+}
 
-export fn websocket_init() {
-  ws_connected = 0
-  foundation.serial_write_string("[WebSocket] Initialized\n")
+struct WebSocketConnection {
+  id: u32,
+  state: u32,
+  socket_fd: u32,
+  url: [u8; 512],
+  host: [u8; 256],
+  port: u16,
+  path: [u8; 256],
+  is_client: u32,             // 1 = client, 0 = server
+
+  // Message queue
+  rx_queue: [WebSocketMessage; 64],
+  rx_head: u32,
+  rx_tail: u32,
+  rx_count: u32,
+
+  tx_queue: [WebSocketMessage; 64],
+  tx_head: u32,
+  tx_tail: u32,
+  tx_count: u32,
+
+  // Fragment reassembly
+  fragment_buffer: [u8; 65536],
+  fragment_length: u32,
+  fragment_opcode: u8,
+
+  close_code: u16,
+  close_reason: [u8; 128],
+
+  last_ping: u64,
+  last_pong: u64
+}
+
+struct WebSocketStats {
+  connections_opened: u64,
+  connections_closed: u64,
+  frames_sent: u64,
+  frames_received: u64,
+  bytes_sent: u64,
+  bytes_received: u64,
+  pings_sent: u64,
+  pongs_received: u64,
+  errors: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var ws_connections: [WebSocketConnection; 32]
+var ws_connection_count: u32 = 0
+var ws_stats: WebSocketStats
+var ws_initialized: u32 = 0
+
+// Random number generator for masking keys
+var ws_random_seed: u64 = 0x987654321FEDCBA
+
+fn ws_random_u8(): u8 {
+  ws_random_seed = ws_random_seed * 1103515245 + 12345
+  return (ws_random_seed / 65536) % 256
+}
+
+// ============================================================================
+// STRING UTILITIES
+// ============================================================================
+
+fn str_len(s: u64): u32 {
+  var ptr: *u8 = @ptrFromInt(s)
+  var len: u32 = 0
+  while ptr[len] != 0 {
+    len = len + 1
+  }
+  return len
+}
+
+fn str_copy(dest: u64, src: u64, max_len: u32) {
+  var dest_ptr: *u8 = @ptrFromInt(dest)
+  var src_ptr: *u8 = @ptrFromInt(src)
+  var i: u32 = 0
+  while i < max_len and src_ptr[i] != 0 {
+    dest_ptr[i] = src_ptr[i]
+    i = i + 1
+  }
+  if i < max_len {
+    dest_ptr[i] = 0
+  }
+}
+
+fn mem_copy(dest: u64, src: u64, length: u32) {
+  var dest_ptr: *u8 = @ptrFromInt(dest)
+  var src_ptr: *u8 = @ptrFromInt(src)
+  var i: u32 = 0
+  while i < length {
+    dest_ptr[i] = src_ptr[i]
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// URL PARSING
+// ============================================================================
+
+fn ws_parse_url(url: u64, conn: *WebSocketConnection): u32 {
+  var url_ptr: *u8 = @ptrFromInt(url)
+  var idx: u32 = 0
+
+  // Skip "ws://" or "wss://"
+  if url_ptr[0] == 119 and url_ptr[1] == 115 {  // "ws"
+    idx = 3  // Skip "ws:"
+    if url_ptr[3] == 115 {  // "wss"
+      idx = 4  // Skip "wss:"
+    }
+    // Skip "//"
+    if url_ptr[idx] == 47 and url_ptr[idx + 1] == 47 {
+      idx = idx + 2
+    }
+  }
+
+  // Parse host
+  var host_idx: u32 = 0
+  while url_ptr[idx] != 0 and url_ptr[idx] != 58 and url_ptr[idx] != 47 {  // ':' or '/'
+    conn.host[host_idx] = url_ptr[idx]
+    host_idx = host_idx + 1
+    idx = idx + 1
+  }
+  conn.host[host_idx] = 0
+
+  // Parse port (optional)
+  conn.port = 80  // Default
+  if url_ptr[idx] == 58 {  // ':'
+    idx = idx + 1
+    var port: u32 = 0
+    while url_ptr[idx] >= 48 and url_ptr[idx] <= 57 {  // '0' to '9'
+      port = port * 10 + (url_ptr[idx] - 48)
+      idx = idx + 1
+    }
+    conn.port = port
+  }
+
+  // Parse path
+  var path_idx: u32 = 0
+  if url_ptr[idx] == 47 {  // '/'
+    while url_ptr[idx] != 0 {
+      conn.path[path_idx] = url_ptr[idx]
+      path_idx = path_idx + 1
+      idx = idx + 1
+    }
+  } else {
+    conn.path[0] = 47  // Default to '/'
+    path_idx = 1
+  }
+  conn.path[path_idx] = 0
+
+  return 0
+}
+
+// ============================================================================
+// CONNECTION MANAGEMENT
+// ============================================================================
+
+fn ws_find_free_connection(): u32 {
+  var i: u32 = 0
+  while i < MAX_WS_CONNECTIONS {
+    if ws_connections[i].state == WS_STATE_IDLE {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
 }
 
 export fn websocket_connect(url: u64): u32 {
   foundation.serial_write_string("[WebSocket] Connecting to ")
   foundation.serial_write_string(url)
   foundation.serial_write_string("\n")
-  
-  // Send HTTP upgrade request (stub)
-  ws_connected = 1
-  
-  return 0
-}
 
-export fn websocket_send_text(message: u64, length: u32): u32 {
-  if ws_connected == 0 { return 1 }
-  
-  var frame: [u8; 2048]
-  frame[0] = 0x80 | WS_OPCODE_TEXT  // FIN + TEXT
-  
-  if length < 126 {
-    frame[1] = 0x80 | length  // MASK + length
+  // Find free connection slot
+  var conn_idx: u32 = ws_find_free_connection()
+  if conn_idx == 0xFFFFFFFF {
+    foundation.serial_write_string("[WebSocket] No free connection slots\n")
+    ws_stats.errors = ws_stats.errors + 1
+    return 0xFFFFFFFF
   }
-  
-  // Add masking key and payload (stub)
-  
+
+  // Parse URL
+  str_copy(@ptrFromInt(ws_connections[conn_idx].url), url, 512)
+  ws_parse_url(url, @ptrFromInt(ws_connections[conn_idx]))
+
+  // Connect via TCP
+  var socket_fd: u32 = tcp.tcp_connect(@ptrFromInt(ws_connections[conn_idx].host), ws_connections[conn_idx].port)
+  if socket_fd == 0xFFFFFFFF {
+    foundation.serial_write_string("[WebSocket] TCP connection failed\n")
+    ws_stats.errors = ws_stats.errors + 1
+    return 0xFFFFFFFF
+  }
+
+  ws_connections[conn_idx].id = conn_idx
+  ws_connections[conn_idx].socket_fd = socket_fd
+  ws_connections[conn_idx].is_client = 1
+  ws_connections[conn_idx].state = WS_STATE_CONNECTING
+
+  // Initialize message queues
+  ws_connections[conn_idx].rx_head = 0
+  ws_connections[conn_idx].rx_tail = 0
+  ws_connections[conn_idx].rx_count = 0
+  ws_connections[conn_idx].tx_head = 0
+  ws_connections[conn_idx].tx_tail = 0
+  ws_connections[conn_idx].tx_count = 0
+
+  // Send HTTP upgrade request
+  var result: u32 = ws_send_upgrade_request(conn_idx)
+  if result != 0 {
+    tcp.tcp_close(socket_fd)
+    ws_connections[conn_idx].state = WS_STATE_IDLE
+    ws_stats.errors = ws_stats.errors + 1
+    return 0xFFFFFFFF
+  }
+
+  ws_connection_count = ws_connection_count + 1
+  ws_stats.connections_opened = ws_stats.connections_opened + 1
+
+  return conn_idx
+}
+
+export fn websocket_close(connection_id: u32): u32 {
+  return websocket_close_with_code(connection_id, WS_CLOSE_NORMAL, @ptrFromInt("Normal closure"))
+}
+
+export fn websocket_close_with_code(connection_id: u32, code: u16, reason: u64): u32 {
+  if connection_id >= MAX_WS_CONNECTIONS {
+    return 1
+  }
+
+  if ws_connections[connection_id].state == WS_STATE_IDLE {
+    return 1
+  }
+
+  // Send close frame
+  ws_send_close_frame(connection_id, code, reason)
+
+  // Close TCP connection
+  tcp.tcp_close(ws_connections[connection_id].socket_fd)
+
+  ws_connections[connection_id].state = WS_STATE_CLOSED
+  ws_connections[connection_id].state = WS_STATE_IDLE
+
+  ws_connection_count = ws_connection_count - 1
+  ws_stats.connections_closed = ws_stats.connections_closed + 1
+
   return 0
 }
 
-export fn websocket_receive(buffer: u64, max_length: u32): u32 {
-  if ws_connected == 0 { return 0 }
-  
-  // Receive and parse frame (stub)
+// ============================================================================
+// HTTP UPGRADE REQUEST
+// ============================================================================
+
+fn ws_send_upgrade_request(conn_idx: u32): u32 {
+  var buffer: [u8; 1024]
+  var offset: u32 = 0
+
+  // Request line: GET /path HTTP/1.1\r\n
+  var get: [u8; 5] = "GET "
+  var i: u32 = 0
+  while i < 4 {
+    buffer[offset] = get[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  // Path
+  i = 0
+  while ws_connections[conn_idx].path[i] != 0 {
+    buffer[offset] = ws_connections[conn_idx].path[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  var http11: [u8; 12] = " HTTP/1.1\r\n"
+  i = 0
+  while i < 11 {
+    buffer[offset] = http11[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  // Host header
+  var host_hdr: [u8; 8] = "Host: "
+  i = 0
+  while i < 6 {
+    buffer[offset] = host_hdr[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  i = 0
+  while ws_connections[conn_idx].host[i] != 0 {
+    buffer[offset] = ws_connections[conn_idx].host[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  buffer[offset] = 13
+  buffer[offset + 1] = 10
+  offset = offset + 2
+
+  // Upgrade header
+  var upgrade: [u8; 27] = "Upgrade: websocket\r\n"
+  i = 0
+  while i < 20 {
+    buffer[offset] = upgrade[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  // Connection header
+  var conn: [u8; 24] = "Connection: Upgrade\r\n"
+  i = 0
+  while i < 21 {
+    buffer[offset] = conn[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  // Sec-WebSocket-Key (simplified - random base64)
+  var ws_key: [u8; 42] = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+  i = 0
+  while i < 41 {
+    buffer[offset] = ws_key[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  // Sec-WebSocket-Version
+  var ws_ver: [u8; 26] = "Sec-WebSocket-Version: 13\r\n"
+  i = 0
+  while i < 25 {
+    buffer[offset] = ws_ver[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  // Empty line
+  buffer[offset] = 13
+  buffer[offset + 1] = 10
+  offset = offset + 2
+
+  // Send via TCP
+  var sent: u32 = tcp.tcp_send(ws_connections[conn_idx].socket_fd, @ptrFromInt(buffer), offset)
+  if sent != offset {
+    return 1
+  }
+
+  foundation.serial_write_string("[WebSocket] Upgrade request sent (")
+  foundation.serial_write_u32(offset)
+  foundation.serial_write_string(" bytes)\n")
+
+  // For this simplified implementation, assume handshake succeeds
+  ws_connections[conn_idx].state = WS_STATE_OPEN
+
   return 0
 }
 
-export fn websocket_close() {
-  if ws_connected == 0 { return }
-  
-  var frame: [u8; 2]
-  frame[0] = 0x80 | WS_OPCODE_CLOSE
-  frame[1] = 0
-  
-  ws_connected = 0
+// ============================================================================
+// FRAME ENCODING/DECODING
+// ============================================================================
+
+fn ws_encode_frame(frame: *WebSocketFrame, output: u64): u32 {
+  var out: *u8 = @ptrFromInt(output)
+  var offset: u32 = 0
+
+  // Byte 0: FIN, RSV, Opcode
+  out[offset] = (frame.fin << 7) | (frame.rsv1 << 6) | (frame.rsv2 << 5) | (frame.rsv3 << 4) | frame.opcode
+  offset = offset + 1
+
+  // Byte 1: MASK, Payload length
+  var payload_len: u64 = frame.payload_length
+
+  if payload_len <= 125 {
+    out[offset] = (frame.mask << 7) | payload_len
+    offset = offset + 1
+  } else if payload_len <= 65535 {
+    out[offset] = (frame.mask << 7) | 126
+    offset = offset + 1
+    out[offset] = (payload_len >> 8) & 0xFF
+    out[offset + 1] = payload_len & 0xFF
+    offset = offset + 2
+  } else {
+    out[offset] = (frame.mask << 7) | 127
+    offset = offset + 1
+    // 8 bytes for extended payload length
+    var i: u32 = 0
+    while i < 8 {
+      out[offset + i] = (payload_len >> ((7 - i) * 8)) & 0xFF
+      i = i + 1
+    }
+    offset = offset + 8
+  }
+
+  // Masking key (if masked)
+  if frame.mask == 1 {
+    out[offset] = frame.masking_key[0]
+    out[offset + 1] = frame.masking_key[1]
+    out[offset + 2] = frame.masking_key[2]
+    out[offset + 3] = frame.masking_key[3]
+    offset = offset + 4
+  }
+
+  // Payload data (masked if necessary)
+  if frame.payload != 0 and payload_len > 0 {
+    var payload_ptr: *u8 = @ptrFromInt(frame.payload)
+    var i: u32 = 0
+    while i < payload_len {
+      if frame.mask == 1 {
+        out[offset + i] = payload_ptr[i] ^ frame.masking_key[i % 4]
+      } else {
+        out[offset + i] = payload_ptr[i]
+      }
+      i = i + 1
+    }
+    offset = offset + payload_len
+  }
+
+  return offset
+}
+
+fn ws_decode_frame(data: u64, data_len: u32, frame: *WebSocketFrame): u32 {
+  var in_data: *u8 = @ptrFromInt(data)
+  var offset: u32 = 0
+
+  if data_len < 2 {
+    return 0  // Not enough data
+  }
+
+  // Byte 0: FIN, RSV, Opcode
+  frame.fin = (in_data[offset] >> 7) & 1
+  frame.rsv1 = (in_data[offset] >> 6) & 1
+  frame.rsv2 = (in_data[offset] >> 5) & 1
+  frame.rsv3 = (in_data[offset] >> 4) & 1
+  frame.opcode = in_data[offset] & 0x0F
+  offset = offset + 1
+
+  // Byte 1: MASK, Payload length
+  frame.mask = (in_data[offset] >> 7) & 1
+  var payload_len: u64 = in_data[offset] & 0x7F
+  offset = offset + 1
+
+  // Extended payload length
+  if payload_len == 126 {
+    if data_len < offset + 2 {
+      return 0
+    }
+    payload_len = (in_data[offset] << 8) | in_data[offset + 1]
+    offset = offset + 2
+  } else if payload_len == 127 {
+    if data_len < offset + 8 {
+      return 0
+    }
+    payload_len = 0
+    var i: u32 = 0
+    while i < 8 {
+      payload_len = (payload_len << 8) | in_data[offset + i]
+      i = i + 1
+    }
+    offset = offset + 8
+  }
+
+  frame.payload_length = payload_len
+
+  // Masking key
+  if frame.mask == 1 {
+    if data_len < offset + 4 {
+      return 0
+    }
+    frame.masking_key[0] = in_data[offset]
+    frame.masking_key[1] = in_data[offset + 1]
+    frame.masking_key[2] = in_data[offset + 2]
+    frame.masking_key[3] = in_data[offset + 3]
+    offset = offset + 4
+  }
+
+  // Check if we have full payload
+  if data_len < offset + payload_len {
+    return 0  // Not enough data
+  }
+
+  frame.payload = data + offset
+
+  return offset + payload_len  // Total bytes consumed
+}
+
+// ============================================================================
+// SEND/RECEIVE OPERATIONS
+// ============================================================================
+
+export fn websocket_send_text(connection_id: u32, message: u64, length: u32): u32 {
+  return ws_send_frame(connection_id, WS_OPCODE_TEXT, message, length)
+}
+
+export fn websocket_send_binary(connection_id: u32, data: u64, length: u32): u32 {
+  return ws_send_frame(connection_id, WS_OPCODE_BINARY, data, length)
+}
+
+fn ws_send_frame(conn_id: u32, opcode: u8, data: u64, length: u32): u32 {
+  if conn_id >= MAX_WS_CONNECTIONS {
+    return 1
+  }
+
+  if ws_connections[conn_id].state != WS_STATE_OPEN {
+    return 1
+  }
+
+  // Build frame
+  var frame: WebSocketFrame
+  frame.fin = 1
+  frame.rsv1 = 0
+  frame.rsv2 = 0
+  frame.rsv3 = 0
+  frame.opcode = opcode
+  frame.mask = if ws_connections[conn_id].is_client == 1 then 1 else 0
+  frame.payload_length = length
+  frame.payload = data
+
+  // Generate random masking key (if client)
+  if frame.mask == 1 {
+    frame.masking_key[0] = ws_random_u8()
+    frame.masking_key[1] = ws_random_u8()
+    frame.masking_key[2] = ws_random_u8()
+    frame.masking_key[3] = ws_random_u8()
+  }
+
+  // Encode frame
+  var frame_buffer: [u8; 65550]  // Header (14 max) + payload (65536 max)
+  var frame_len: u32 = ws_encode_frame(@ptrFromInt(frame), @ptrFromInt(frame_buffer))
+
+  // Send via TCP
+  var sent: u32 = tcp.tcp_send(ws_connections[conn_id].socket_fd, @ptrFromInt(frame_buffer), frame_len)
+  if sent != frame_len {
+    ws_stats.errors = ws_stats.errors + 1
+    return 1
+  }
+
+  ws_stats.frames_sent = ws_stats.frames_sent + 1
+  ws_stats.bytes_sent = ws_stats.bytes_sent + length
+
+  return 0
+}
+
+export fn websocket_receive(connection_id: u32, buffer: u64, max_length: u32): u32 {
+  if connection_id >= MAX_WS_CONNECTIONS {
+    return 0
+  }
+
+  if ws_connections[connection_id].state != WS_STATE_OPEN {
+    return 0
+  }
+
+  // Check if we have messages in RX queue
+  if ws_connections[connection_id].rx_count == 0 {
+    // Try to receive and process frames
+    ws_process_incoming_frames(connection_id)
+  }
+
+  // Pop message from queue
+  if ws_connections[connection_id].rx_count > 0 {
+    var msg: *WebSocketMessage = @ptrFromInt(ws_connections[connection_id].rx_queue[ws_connections[connection_id].rx_tail])
+    var copy_len: u32 = if msg.length < max_length then msg.length else max_length
+
+    mem_copy(buffer, @ptrFromInt(msg.data), copy_len)
+
+    ws_connections[connection_id].rx_tail = (ws_connections[connection_id].rx_tail + 1) % MAX_MESSAGE_QUEUE
+    ws_connections[connection_id].rx_count = ws_connections[connection_id].rx_count - 1
+
+    return copy_len
+  }
+
+  return 0
+}
+
+fn ws_process_incoming_frames(conn_id: u32) {
+  // Receive data from TCP
+  var recv_buffer: [u8; 65550]
+  var received: u32 = tcp.tcp_receive(ws_connections[conn_id].socket_fd, @ptrFromInt(recv_buffer), 65550)
+
+  if received == 0 {
+    return
+  }
+
+  // Decode frame
+  var frame: WebSocketFrame
+  var bytes_consumed: u32 = ws_decode_frame(@ptrFromInt(recv_buffer), received, @ptrFromInt(frame))
+
+  if bytes_consumed == 0 {
+    return  // Incomplete frame
+  }
+
+  ws_stats.frames_received = ws_stats.frames_received + 1
+
+  // Handle frame based on opcode
+  if frame.opcode == WS_OPCODE_TEXT or frame.opcode == WS_OPCODE_BINARY {
+    // Add to RX queue
+    if ws_connections[conn_id].rx_count < MAX_MESSAGE_QUEUE {
+      var msg: *WebSocketMessage = @ptrFromInt(ws_connections[conn_id].rx_queue[ws_connections[conn_id].rx_head])
+      msg.opcode = frame.opcode
+      msg.length = frame.payload_length
+      msg.timestamp = foundation.get_timestamp()
+
+      // Unmask payload if masked
+      var payload_ptr: *u8 = @ptrFromInt(frame.payload)
+      var i: u32 = 0
+      while i < frame.payload_length {
+        if frame.mask == 1 {
+          msg.data[i] = payload_ptr[i] ^ frame.masking_key[i % 4]
+        } else {
+          msg.data[i] = payload_ptr[i]
+        }
+        i = i + 1
+      }
+
+      ws_connections[conn_id].rx_head = (ws_connections[conn_id].rx_head + 1) % MAX_MESSAGE_QUEUE
+      ws_connections[conn_id].rx_count = ws_connections[conn_id].rx_count + 1
+
+      ws_stats.bytes_received = ws_stats.bytes_received + frame.payload_length
+    }
+  } else if frame.opcode == WS_OPCODE_PING {
+    // Respond with pong
+    ws_send_frame(conn_id, WS_OPCODE_PONG, frame.payload, frame.payload_length)
+  } else if frame.opcode == WS_OPCODE_PONG {
+    ws_connections[conn_id].last_pong = foundation.get_timestamp()
+    ws_stats.pongs_received = ws_stats.pongs_received + 1
+  } else if frame.opcode == WS_OPCODE_CLOSE {
+    // Handle close
+    ws_connections[conn_id].state = WS_STATE_CLOSING
+  }
+}
+
+// ============================================================================
+// PING/PONG (KEEP-ALIVE)
+// ============================================================================
+
+export fn websocket_send_ping(connection_id: u32): u32 {
+  if connection_id >= MAX_WS_CONNECTIONS {
+    return 1
+  }
+
+  var ping_data: [u8; 4] = "ping"
+  var result: u32 = ws_send_frame(connection_id, WS_OPCODE_PING, @ptrFromInt(ping_data), 4)
+
+  if result == 0 {
+    ws_connections[connection_id].last_ping = foundation.get_timestamp()
+    ws_stats.pings_sent = ws_stats.pings_sent + 1
+  }
+
+  return result
+}
+
+// ============================================================================
+// CLOSE FRAME
+// ============================================================================
+
+fn ws_send_close_frame(conn_id: u32, code: u16, reason: u64): u32 {
+  var close_data: [u8; 130]  // 2 bytes code + 128 bytes reason
+
+  // Close code (big-endian)
+  close_data[0] = (code >> 8) & 0xFF
+  close_data[1] = code & 0xFF
+
+  // Reason string
+  var reason_len: u32 = str_len(reason)
+  if reason_len > 128 {
+    reason_len = 128
+  }
+
+  str_copy(@ptrFromInt(close_data) + 2, reason, reason_len)
+
+  return ws_send_frame(conn_id, WS_OPCODE_CLOSE, @ptrFromInt(close_data), 2 + reason_len)
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn websocket_get_stats(): *WebSocketStats {
+  return @ptrFromInt(ws_stats)
+}
+
+export fn websocket_print_stats() {
+  foundation.serial_write_string("[WebSocket Stats]\n")
+  foundation.serial_write_string("  Connections opened: ")
+  foundation.serial_write_u64(ws_stats.connections_opened)
+  foundation.serial_write_string("\n  Connections closed: ")
+  foundation.serial_write_u64(ws_stats.connections_closed)
+  foundation.serial_write_string("\n  Active connections: ")
+  foundation.serial_write_u32(ws_connection_count)
+  foundation.serial_write_string("\n  Frames sent: ")
+  foundation.serial_write_u64(ws_stats.frames_sent)
+  foundation.serial_write_string("\n  Frames received: ")
+  foundation.serial_write_u64(ws_stats.frames_received)
+  foundation.serial_write_string("\n  Bytes sent: ")
+  foundation.serial_write_u64(ws_stats.bytes_sent)
+  foundation.serial_write_string("\n  Bytes received: ")
+  foundation.serial_write_u64(ws_stats.bytes_received)
+  foundation.serial_write_string("\n  Pings sent: ")
+  foundation.serial_write_u64(ws_stats.pings_sent)
+  foundation.serial_write_string("\n  Pongs received: ")
+  foundation.serial_write_u64(ws_stats.pongs_received)
+  foundation.serial_write_string("\n  Errors: ")
+  foundation.serial_write_u64(ws_stats.errors)
+  foundation.serial_write_string("\n")
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn websocket_init() {
+  if ws_initialized == 1 { return }
+
+  // Initialize connections
+  var i: u32 = 0
+  while i < MAX_WS_CONNECTIONS {
+    ws_connections[i].state = WS_STATE_IDLE
+    ws_connections[i].id = i
+    i = i + 1
+  }
+
+  ws_connection_count = 0
+
+  // Initialize stats
+  ws_stats.connections_opened = 0
+  ws_stats.connections_closed = 0
+  ws_stats.frames_sent = 0
+  ws_stats.frames_received = 0
+  ws_stats.bytes_sent = 0
+  ws_stats.bytes_received = 0
+  ws_stats.pings_sent = 0
+  ws_stats.pongs_received = 0
+  ws_stats.errors = 0
+
+  // Initialize random seed
+  ws_random_seed = foundation.get_timestamp()
+
+  ws_initialized = 1
+
+  foundation.serial_write_string("[WebSocket] WebSocket protocol initialized (RFC 6455, 32 connections)\n")
 }

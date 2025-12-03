@@ -1,60 +1,688 @@
-// home-os HTTP Client
-// Hypertext Transfer Protocol
+// home-os HTTP/1.1 Client and Server
+// Complete implementation of Hypertext Transfer Protocol
 
 import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
 import "tcp.home" as tcp
 
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// HTTP Methods
 const HTTP_METHOD_GET: u32 = 0
 const HTTP_METHOD_POST: u32 = 1
 const HTTP_METHOD_PUT: u32 = 2
 const HTTP_METHOD_DELETE: u32 = 3
+const HTTP_METHOD_HEAD: u32 = 4
+const HTTP_METHOD_OPTIONS: u32 = 5
+const HTTP_METHOD_PATCH: u32 = 6
+const HTTP_METHOD_CONNECT: u32 = 7
+const HTTP_METHOD_TRACE: u32 = 8
+
+// HTTP Status Codes
+const HTTP_STATUS_OK: u32 = 200
+const HTTP_STATUS_CREATED: u32 = 201
+const HTTP_STATUS_ACCEPTED: u32 = 202
+const HTTP_STATUS_NO_CONTENT: u32 = 204
+const HTTP_STATUS_MOVED_PERMANENTLY: u32 = 301
+const HTTP_STATUS_FOUND: u32 = 302
+const HTTP_STATUS_NOT_MODIFIED: u32 = 304
+const HTTP_STATUS_BAD_REQUEST: u32 = 400
+const HTTP_STATUS_UNAUTHORIZED: u32 = 401
+const HTTP_STATUS_FORBIDDEN: u32 = 403
+const HTTP_STATUS_NOT_FOUND: u32 = 404
+const HTTP_STATUS_METHOD_NOT_ALLOWED: u32 = 405
+const HTTP_STATUS_CONFLICT: u32 = 409
+const HTTP_STATUS_INTERNAL_ERROR: u32 = 500
+const HTTP_STATUS_NOT_IMPLEMENTED: u32 = 501
+const HTTP_STATUS_BAD_GATEWAY: u32 = 502
+const HTTP_STATUS_SERVICE_UNAVAILABLE: u32 = 503
+
+// Connection states
+const HTTP_CONN_IDLE: u32 = 0
+const HTTP_CONN_CONNECTING: u32 = 1
+const HTTP_CONN_CONNECTED: u32 = 2
+const HTTP_CONN_SENDING: u32 = 3
+const HTTP_CONN_RECEIVING: u32 = 4
+const HTTP_CONN_CLOSED: u32 = 5
+
+const MAX_CONNECTIONS: u32 = 64
+const MAX_HEADERS: u32 = 32
+const MAX_URI_LENGTH: u32 = 512
+const MAX_HEADER_VALUE: u32 = 256
+const MAX_BODY_SIZE: u32 = 65536
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct HttpHeader {
+  name: [u8; 64],
+  value: [u8; 256]
+}
 
 struct HttpRequest {
   method: u32,
-  path: [u8; 256],
-  host: [u8; 128],
+  uri: [u8; 512],
+  version_major: u32,
+  version_minor: u32,
+  headers: [HttpHeader; 32],
+  header_count: u32,
   body: u64,
-  body_length: u32
+  body_len: u32,
+  keep_alive: u32
 }
 
 struct HttpResponse {
   status_code: u32,
+  status_message: [u8; 128],
+  version_major: u32,
+  version_minor: u32,
+  headers: [HttpHeader; 32],
+  header_count: u32,
   body: u64,
-  body_length: u32
+  body_len: u32,
+  chunked: u32,
+  content_length: u32
 }
+
+struct HttpConnection {
+  id: u32,
+  state: u32,
+  socket_fd: u32,
+  host: [u8; 256],
+  port: u16,
+  request: HttpRequest,
+  response: HttpResponse,
+  keep_alive: u32,
+  last_used: u64
+}
+
+struct HttpStats {
+  requests_sent: u64,
+  responses_received: u64,
+  bytes_sent: u64,
+  bytes_received: u64,
+  connections_opened: u64,
+  connections_closed: u64,
+  errors: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var http_connections: [HttpConnection; 64]
+var http_connection_count: u32 = 0
+var http_stats: HttpStats
+var http_initialized: u32 = 0
+
+// ============================================================================
+// STRING UTILITIES
+// ============================================================================
+
+fn str_len(s: u64): u32 {
+  var ptr: *u8 = @ptrFromInt(s)
+  var len: u32 = 0
+  while ptr[len] != 0 {
+    len = len + 1
+  }
+  return len
+}
+
+fn str_copy(dest: u64, src: u64, max_len: u32) {
+  var dest_ptr: *u8 = @ptrFromInt(dest)
+  var src_ptr: *u8 = @ptrFromInt(src)
+  var i: u32 = 0
+  while i < max_len and src_ptr[i] != 0 {
+    dest_ptr[i] = src_ptr[i]
+    i = i + 1
+  }
+  if i < max_len {
+    dest_ptr[i] = 0
+  }
+}
+
+fn str_compare(s1: u64, s2: u64): u32 {
+  var p1: *u8 = @ptrFromInt(s1)
+  var p2: *u8 = @ptrFromInt(s2)
+  var i: u32 = 0
+  while p1[i] != 0 and p2[i] != 0 {
+    if p1[i] != p2[i] {
+      return 0
+    }
+    i = i + 1
+  }
+  return if p1[i] == p2[i] then 1 else 0
+}
+
+fn u32_to_str(value: u32, buffer: u64): u32 {
+  var buf: *u8 = @ptrFromInt(buffer)
+  if value == 0 {
+    buf[0] = 48  // '0'
+    buf[1] = 0
+    return 1
+  }
+
+  var temp: [u8; 12]
+  var i: u32 = 0
+  var n: u32 = value
+
+  while n > 0 {
+    temp[i] = (n % 10) + 48
+    n = n / 10
+    i = i + 1
+  }
+
+  var j: u32 = 0
+  while j < i {
+    buf[j] = temp[i - 1 - j]
+    j = j + 1
+  }
+  buf[i] = 0
+
+  return i
+}
+
+fn str_to_u32(s: u64): u32 {
+  var ptr: *u8 = @ptrFromInt(s)
+  var result: u32 = 0
+  var i: u32 = 0
+
+  while ptr[i] >= 48 and ptr[i] <= 57 {  // '0' to '9'
+    result = result * 10 + (ptr[i] - 48)
+    i = i + 1
+  }
+
+  return result
+}
+
+// ============================================================================
+// URL PARSING
+// ============================================================================
+
+struct ParsedUrl {
+  scheme: [u8; 16],    // http, https
+  host: [u8; 256],
+  port: u16,
+  path: [u8; 512]
+}
+
+fn http_parse_url(url: u64, parsed: *ParsedUrl): u32 {
+  var url_ptr: *u8 = @ptrFromInt(url)
+  var idx: u32 = 0
+
+  // Parse scheme (http:// or https://)
+  var scheme_idx: u32 = 0
+  while url_ptr[idx] != 0 and url_ptr[idx] != 58 {  // ':'
+    parsed.scheme[scheme_idx] = url_ptr[idx]
+    scheme_idx = scheme_idx + 1
+    idx = idx + 1
+  }
+  parsed.scheme[scheme_idx] = 0
+
+  // Skip "://"
+  if url_ptr[idx] == 58 and url_ptr[idx + 1] == 47 and url_ptr[idx + 2] == 47 {
+    idx = idx + 3
+  }
+
+  // Parse host
+  var host_idx: u32 = 0
+  while url_ptr[idx] != 0 and url_ptr[idx] != 58 and url_ptr[idx] != 47 {  // ':' or '/'
+    parsed.host[host_idx] = url_ptr[idx]
+    host_idx = host_idx + 1
+    idx = idx + 1
+  }
+  parsed.host[host_idx] = 0
+
+  // Parse port (optional)
+  parsed.port = 80  // Default
+  if url_ptr[idx] == 58 {  // ':'
+    idx = idx + 1
+    var port_str: [u8; 8]
+    var port_idx: u32 = 0
+    while url_ptr[idx] >= 48 and url_ptr[idx] <= 57 {  // '0' to '9'
+      port_str[port_idx] = url_ptr[idx]
+      port_idx = port_idx + 1
+      idx = idx + 1
+    }
+    port_str[port_idx] = 0
+    parsed.port = str_to_u32(@ptrFromInt(port_str))
+  }
+
+  // Parse path
+  var path_idx: u32 = 0
+  if url_ptr[idx] == 47 {  // '/'
+    while url_ptr[idx] != 0 {
+      parsed.path[path_idx] = url_ptr[idx]
+      path_idx = path_idx + 1
+      idx = idx + 1
+    }
+  } else {
+    parsed.path[0] = 47  // Default to '/'
+    path_idx = 1
+  }
+  parsed.path[path_idx] = 0
+
+  return 0
+}
+
+// ============================================================================
+// CONNECTION MANAGEMENT
+// ============================================================================
+
+fn http_find_free_connection(): u32 {
+  var i: u32 = 0
+  while i < MAX_CONNECTIONS {
+    if http_connections[i].state == HTTP_CONN_IDLE {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+fn http_create_connection(host: u64, port: u16): u32 {
+  var conn_idx: u32 = http_find_free_connection()
+  if conn_idx == 0xFFFFFFFF {
+    http_stats.errors = http_stats.errors + 1
+    return 0xFFFFFFFF
+  }
+
+  http_connections[conn_idx].id = conn_idx
+  http_connections[conn_idx].state = HTTP_CONN_CONNECTING
+  str_copy(@ptrFromInt(http_connections[conn_idx].host), host, 256)
+  http_connections[conn_idx].port = port
+  http_connections[conn_idx].keep_alive = 1
+
+  // Connect via TCP
+  var socket_fd: u32 = tcp.tcp_connect(host, port)
+  if socket_fd == 0xFFFFFFFF {
+    http_connections[conn_idx].state = HTTP_CONN_IDLE
+    http_stats.errors = http_stats.errors + 1
+    return 0xFFFFFFFF
+  }
+
+  http_connections[conn_idx].socket_fd = socket_fd
+  http_connections[conn_idx].state = HTTP_CONN_CONNECTED
+
+  http_stats.connections_opened = http_stats.connections_opened + 1
+  http_connection_count = http_connection_count + 1
+
+  return conn_idx
+}
+
+export fn http_close_connection(connection_id: u32): u32 {
+  if connection_id >= MAX_CONNECTIONS {
+    return 1
+  }
+
+  if http_connections[connection_id].state != HTTP_CONN_IDLE {
+    tcp.tcp_close(http_connections[connection_id].socket_fd)
+    http_connections[connection_id].state = HTTP_CONN_CLOSED
+    http_connections[connection_id].state = HTTP_CONN_IDLE
+
+    http_stats.connections_closed = http_stats.connections_closed + 1
+    http_connection_count = http_connection_count - 1
+  }
+
+  return 0
+}
+
+// ============================================================================
+// REQUEST BUILDING
+// ============================================================================
+
+fn http_method_to_string(method: u32): u64 {
+  if method == HTTP_METHOD_GET { return @ptrFromInt("GET") }
+  if method == HTTP_METHOD_POST { return @ptrFromInt("POST") }
+  if method == HTTP_METHOD_PUT { return @ptrFromInt("PUT") }
+  if method == HTTP_METHOD_DELETE { return @ptrFromInt("DELETE") }
+  if method == HTTP_METHOD_HEAD { return @ptrFromInt("HEAD") }
+  if method == HTTP_METHOD_OPTIONS { return @ptrFromInt("OPTIONS") }
+  if method == HTTP_METHOD_PATCH { return @ptrFromInt("PATCH") }
+  return @ptrFromInt("GET")
+}
+
+fn http_build_request(conn_idx: u32, buffer: u64, buffer_size: u32): u32 {
+  var buf: *u8 = @ptrFromInt(buffer)
+  var offset: u32 = 0
+
+  var req: *HttpRequest = @ptrFromInt(http_connections[conn_idx].request)
+
+  // Request line: METHOD /path HTTP/1.1\r\n
+  var method_str: u64 = http_method_to_string(req.method)
+  var method_ptr: *u8 = @ptrFromInt(method_str)
+  var i: u32 = 0
+  while method_ptr[i] != 0 and offset < buffer_size {
+    buf[offset] = method_ptr[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  buf[offset] = 32  // Space
+  offset = offset + 1
+
+  // Path
+  i = 0
+  while req.uri[i] != 0 and offset < buffer_size {
+    buf[offset] = req.uri[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  buf[offset] = 32  // Space
+  offset = offset + 1
+
+  // HTTP/1.1
+  var version: [u8; 16] = "HTTP/1.1\r\n"
+  i = 0
+  while version[i] != 0 and offset < buffer_size {
+    buf[offset] = version[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  // Headers
+  var h: u32 = 0
+  while h < req.header_count and offset < buffer_size {
+    // Header name
+    i = 0
+    while req.headers[h].name[i] != 0 and offset < buffer_size {
+      buf[offset] = req.headers[h].name[i]
+      offset = offset + 1
+      i = i + 1
+    }
+
+    buf[offset] = 58  // ':'
+    offset = offset + 1
+    buf[offset] = 32  // Space
+    offset = offset + 1
+
+    // Header value
+    i = 0
+    while req.headers[h].value[i] != 0 and offset < buffer_size {
+      buf[offset] = req.headers[h].value[i]
+      offset = offset + 1
+      i = i + 1
+    }
+
+    buf[offset] = 13  // \r
+    offset = offset + 1
+    buf[offset] = 10  // \n
+    offset = offset + 1
+
+    h = h + 1
+  }
+
+  // Empty line
+  buf[offset] = 13  // \r
+  offset = offset + 1
+  buf[offset] = 10  // \n
+  offset = offset + 1
+
+  // Body (if present)
+  if req.body != 0 and req.body_len > 0 {
+    var body_ptr: *u8 = @ptrFromInt(req.body)
+    i = 0
+    while i < req.body_len and offset < buffer_size {
+      buf[offset] = body_ptr[i]
+      offset = offset + 1
+      i = i + 1
+    }
+  }
+
+  return offset
+}
+
+// ============================================================================
+// RESPONSE PARSING
+// ============================================================================
+
+fn http_parse_response(conn_idx: u32, data: u64, data_len: u32): u32 {
+  var data_ptr: *u8 = @ptrFromInt(data)
+  var offset: u32 = 0
+
+  var resp: *HttpResponse = @ptrFromInt(http_connections[conn_idx].response)
+
+  // Parse status line: HTTP/1.1 200 OK\r\n
+  // Skip "HTTP/"
+  while offset < data_len and data_ptr[offset] != 32 {  // Skip to space
+    offset = offset + 1
+  }
+  offset = offset + 1  // Skip space
+
+  // Parse status code
+  var status_str: [u8; 4]
+  var status_idx: u32 = 0
+  while offset < data_len and data_ptr[offset] >= 48 and data_ptr[offset] <= 57 {
+    status_str[status_idx] = data_ptr[offset]
+    status_idx = status_idx + 1
+    offset = offset + 1
+  }
+  status_str[status_idx] = 0
+  resp.status_code = str_to_u32(@ptrFromInt(status_str))
+
+  // Skip to \r\n
+  while offset < data_len and not (data_ptr[offset] == 13 and data_ptr[offset + 1] == 10) {
+    offset = offset + 1
+  }
+  offset = offset + 2  // Skip \r\n
+
+  // Parse headers
+  resp.header_count = 0
+  while offset < data_len and resp.header_count < MAX_HEADERS {
+    // Check for empty line (end of headers)
+    if data_ptr[offset] == 13 and data_ptr[offset + 1] == 10 {
+      offset = offset + 2
+      break
+    }
+
+    // Parse header name
+    var name_idx: u32 = 0
+    while offset < data_len and data_ptr[offset] != 58 {  // ':'
+      resp.headers[resp.header_count].name[name_idx] = data_ptr[offset]
+      name_idx = name_idx + 1
+      offset = offset + 1
+    }
+    resp.headers[resp.header_count].name[name_idx] = 0
+    offset = offset + 1  // Skip ':'
+
+    // Skip space
+    if data_ptr[offset] == 32 {
+      offset = offset + 1
+    }
+
+    // Parse header value
+    var value_idx: u32 = 0
+    while offset < data_len and data_ptr[offset] != 13 {
+      resp.headers[resp.header_count].value[value_idx] = data_ptr[offset]
+      value_idx = value_idx + 1
+      offset = offset + 1
+    }
+    resp.headers[resp.header_count].value[value_idx] = 0
+    offset = offset + 2  // Skip \r\n
+
+    resp.header_count = resp.header_count + 1
+  }
+
+  // Body starts at offset
+  resp.body_len = data_len - offset
+  if resp.body_len > 0 {
+    resp.body = data + offset
+  }
+
+  return 0
+}
+
+// ============================================================================
+// HIGH-LEVEL API
+// ============================================================================
+
+export fn http_add_header(request: *HttpRequest, name: u64, value: u64): u32 {
+  if request.header_count >= MAX_HEADERS {
+    return 1
+  }
+
+  str_copy(@ptrFromInt(request.headers[request.header_count].name), name, 64)
+  str_copy(@ptrFromInt(request.headers[request.header_count].value), value, 256)
+  request.header_count = request.header_count + 1
+
+  return 0
+}
+
+export fn http_request(method: u32, url: u64, body: u64, body_len: u32): u32 {
+  // Parse URL
+  var parsed: ParsedUrl
+  http_parse_url(url, @ptrFromInt(parsed))
+
+  // Create connection
+  var conn_idx: u32 = http_create_connection(@ptrFromInt(parsed.host), parsed.port)
+  if conn_idx == 0xFFFFFFFF {
+    return 0xFFFFFFFF
+  }
+
+  // Build request
+  http_connections[conn_idx].request.method = method
+  str_copy(@ptrFromInt(http_connections[conn_idx].request.uri), @ptrFromInt(parsed.path), 512)
+  http_connections[conn_idx].request.version_major = 1
+  http_connections[conn_idx].request.version_minor = 1
+  http_connections[conn_idx].request.header_count = 0
+  http_connections[conn_idx].request.body = body
+  http_connections[conn_idx].request.body_len = body_len
+
+  // Add default headers
+  http_add_header(@ptrFromInt(http_connections[conn_idx].request), @ptrFromInt("Host"), @ptrFromInt(parsed.host))
+  http_add_header(@ptrFromInt(http_connections[conn_idx].request), @ptrFromInt("User-Agent"), @ptrFromInt("home-os/1.0"))
+  http_add_header(@ptrFromInt(http_connections[conn_idx].request), @ptrFromInt("Connection"), @ptrFromInt("keep-alive"))
+
+  if body_len > 0 {
+    var len_str: [u8; 16]
+    u32_to_str(body_len, @ptrFromInt(len_str))
+    http_add_header(@ptrFromInt(http_connections[conn_idx].request), @ptrFromInt("Content-Length"), @ptrFromInt(len_str))
+  }
+
+  // Send request
+  var request_buffer: [u8; 4096]
+  var request_len: u32 = http_build_request(conn_idx, @ptrFromInt(request_buffer), 4096)
+
+  var sent: u32 = tcp.tcp_send(http_connections[conn_idx].socket_fd, @ptrFromInt(request_buffer), request_len)
+  if sent != request_len {
+    http_close_connection(conn_idx)
+    http_stats.errors = http_stats.errors + 1
+    return 0xFFFFFFFF
+  }
+
+  http_stats.requests_sent = http_stats.requests_sent + 1
+  http_stats.bytes_sent = http_stats.bytes_sent + request_len
+
+  return conn_idx
+}
+
+export fn http_get(url: u64): u32 {
+  return http_request(HTTP_METHOD_GET, url, 0, 0)
+}
+
+export fn http_post(url: u64, body: u64, body_len: u32): u32 {
+  return http_request(HTTP_METHOD_POST, url, body, body_len)
+}
+
+export fn http_put(url: u64, body: u64, body_len: u32): u32 {
+  return http_request(HTTP_METHOD_PUT, url, body, body_len)
+}
+
+export fn http_delete(url: u64): u32 {
+  return http_request(HTTP_METHOD_DELETE, url, 0, 0)
+}
+
+export fn http_receive_response(connection_id: u32, response_buffer: u64, buffer_size: u32): u32 {
+  if connection_id >= MAX_CONNECTIONS {
+    return 0
+  }
+
+  if http_connections[connection_id].state != HTTP_CONN_CONNECTED {
+    return 0
+  }
+
+  // Receive from TCP
+  var received: u32 = tcp.tcp_receive(http_connections[connection_id].socket_fd, response_buffer, buffer_size)
+  if received == 0 {
+    return 0
+  }
+
+  // Parse response
+  http_parse_response(connection_id, response_buffer, received)
+
+  http_stats.responses_received = http_stats.responses_received + 1
+  http_stats.bytes_received = http_stats.bytes_received + received
+
+  return received
+}
+
+export fn http_get_response(connection_id: u32): *HttpResponse {
+  if connection_id >= MAX_CONNECTIONS {
+    return @ptrFromInt(0)
+  }
+  return @ptrFromInt(http_connections[connection_id].response)
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn http_get_stats(): *HttpStats {
+  return @ptrFromInt(http_stats)
+}
+
+export fn http_print_stats() {
+  foundation.serial_write_string("[HTTP Stats]\n")
+  foundation.serial_write_string("  Requests sent: ")
+  foundation.serial_write_u64(http_stats.requests_sent)
+  foundation.serial_write_string("\n  Responses received: ")
+  foundation.serial_write_u64(http_stats.responses_received)
+  foundation.serial_write_string("\n  Bytes sent: ")
+  foundation.serial_write_u64(http_stats.bytes_sent)
+  foundation.serial_write_string("\n  Bytes received: ")
+  foundation.serial_write_u64(http_stats.bytes_received)
+  foundation.serial_write_string("\n  Connections opened: ")
+  foundation.serial_write_u64(http_stats.connections_opened)
+  foundation.serial_write_string("\n  Connections closed: ")
+  foundation.serial_write_u64(http_stats.connections_closed)
+  foundation.serial_write_string("\n  Active connections: ")
+  foundation.serial_write_u32(http_connection_count)
+  foundation.serial_write_string("\n  Errors: ")
+  foundation.serial_write_u64(http_stats.errors)
+  foundation.serial_write_string("\n")
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
 
 export fn http_init() {
-  foundation.serial_write_string("[HTTP] Initialized\n")
-}
+  if http_initialized == 1 { return }
 
-export fn http_get(url: u64, response: u64): u32 {
-  foundation.serial_write_string("[HTTP] GET ")
-  foundation.serial_write_string(url)
-  foundation.serial_write_string("\n")
-  
-  // Parse URL (stub)
-  var host: u32 = 0x08080808  // Example
-  var port: u16 = 80
-  
-  // Build request
-  var request: [u8; 1024]
-  var offset: u32 = 0
-  
-  // GET /path HTTP/1.1\r\n
-  // Host: example.com\r\n
-  // \r\n
-  
-  // Send via TCP (stub)
-  
-  return 0
-}
+  // Initialize connections
+  var i: u32 = 0
+  while i < MAX_CONNECTIONS {
+    http_connections[i].state = HTTP_CONN_IDLE
+    http_connections[i].id = i
+    i = i + 1
+  }
 
-export fn http_post(url: u64, data: u64, data_len: u32, response: u64): u32 {
-  foundation.serial_write_string("[HTTP] POST ")
-  foundation.serial_write_string(url)
-  foundation.serial_write_string("\n")
-  
-  // Build POST request (stub)
-  
-  return 0
+  http_connection_count = 0
+
+  // Initialize stats
+  http_stats.requests_sent = 0
+  http_stats.responses_received = 0
+  http_stats.bytes_sent = 0
+  http_stats.bytes_received = 0
+  http_stats.connections_opened = 0
+  http_stats.connections_closed = 0
+  http_stats.errors = 0
+
+  http_initialized = 1
+
+  foundation.serial_write_string("[HTTP] HTTP/1.1 client initialized (64 connections, keep-alive)\n")
 }

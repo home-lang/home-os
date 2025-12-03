@@ -1,0 +1,378 @@
+// home-os VFS - Asynchronous I/O
+// Implements async file I/O using io_uring-style interface
+
+import "foundation.home" as foundation
+import "memory.home" as memory
+import "filesystem.home" as filesystem
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_AIO_REQUESTS: u32 = 128
+const MAX_COMPLETION_QUEUE: u32 = 256
+
+// AIO operation types
+const AIO_OP_READ: u32 = 0
+const AIO_OP_WRITE: u32 = 1
+const AIO_OP_FSYNC: u32 = 2
+const AIO_OP_READV: u32 = 3   // Vectored read
+const AIO_OP_WRITEV: u32 = 4  // Vectored write
+
+// AIO request states
+const AIO_STATE_FREE: u32 = 0
+const AIO_STATE_SUBMITTED: u32 = 1
+const AIO_STATE_IN_PROGRESS: u32 = 2
+const AIO_STATE_COMPLETED: u32 = 3
+const AIO_STATE_ERROR: u32 = 4
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct AioRequest {
+  id: u64,               // Request ID
+  op: u32,               // Operation type
+  fd: u32,               // File descriptor
+  buffer: u64,           // Buffer address
+  length: u64,           // Length of I/O
+  offset: u64,           // File offset
+  state: u32,            // Request state
+  result: i64,           // Result (bytes transferred or -error)
+  user_data: u64         // User data (returned in completion)
+}
+
+struct AioCompletion {
+  id: u64,               // Request ID
+  result: i64,           // Result
+  user_data: u64         // User data from request
+}
+
+struct AioStats {
+  total_requests: u64,
+  completed_requests: u64,
+  failed_requests: u64,
+  read_requests: u64,
+  write_requests: u64,
+  bytes_read: u64,
+  bytes_written: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var aio_requests: [AioRequest; 128]
+var aio_completions: [AioCompletion; 256]
+var next_request_id: u64 = 1
+var completion_head: u32 = 0
+var completion_tail: u32 = 0
+var aio_stats: AioStats
+var aio_initialized: u32 = 0
+
+// ============================================================================
+// REQUEST SUBMISSION
+// ============================================================================
+
+export fn aio_submit_read(fd: u32, buffer: u64, length: u64, offset: u64, user_data: u64): u64 {
+  return aio_submit(AIO_OP_READ, fd, buffer, length, offset, user_data)
+}
+
+export fn aio_submit_write(fd: u32, buffer: u64, length: u64, offset: u64, user_data: u64): u64 {
+  return aio_submit(AIO_OP_WRITE, fd, buffer, length, offset, user_data)
+}
+
+export fn aio_submit(op: u32, fd: u32, buffer: u64, length: u64, offset: u64, user_data: u64): u64 {
+  // Find free request slot
+  var i: u32 = 0
+  while i < MAX_AIO_REQUESTS {
+    if aio_requests[i].state == AIO_STATE_FREE {
+      var req_id: u64 = next_request_id
+      next_request_id = next_request_id + 1
+
+      aio_requests[i].id = req_id
+      aio_requests[i].op = op
+      aio_requests[i].fd = fd
+      aio_requests[i].buffer = buffer
+      aio_requests[i].length = length
+      aio_requests[i].offset = offset
+      aio_requests[i].state = AIO_STATE_SUBMITTED
+      aio_requests[i].result = 0
+      aio_requests[i].user_data = user_data
+
+      aio_stats.total_requests = aio_stats.total_requests + 1
+
+      if op == AIO_OP_READ or op == AIO_OP_READV {
+        aio_stats.read_requests = aio_stats.read_requests + 1
+      } else if op == AIO_OP_WRITE or op == AIO_OP_WRITEV {
+        aio_stats.write_requests = aio_stats.write_requests + 1
+      }
+
+      // Start processing immediately
+      aio_process_request(i)
+
+      return req_id
+    }
+    i = i + 1
+  }
+
+  return 0  // No free slots
+}
+
+// ============================================================================
+// REQUEST PROCESSING
+// ============================================================================
+
+fn aio_process_request(idx: u32) {
+  aio_requests[idx].state = AIO_STATE_IN_PROGRESS
+
+  var result: i64 = 0
+
+  if aio_requests[idx].op == AIO_OP_READ {
+    // Perform read
+    var bytes_read: u64 = filesystem.vfs_read(
+      aio_requests[idx].fd,
+      aio_requests[idx].buffer,
+      aio_requests[idx].length
+    )
+    result = bytes_read
+    aio_stats.bytes_read = aio_stats.bytes_read + bytes_read
+
+  } else if aio_requests[idx].op == AIO_OP_WRITE {
+    // Perform write
+    var bytes_written: u64 = filesystem.vfs_write(
+      aio_requests[idx].fd,
+      aio_requests[idx].buffer,
+      aio_requests[idx].length
+    )
+    result = bytes_written
+    aio_stats.bytes_written = aio_stats.bytes_written + bytes_written
+
+  } else if aio_requests[idx].op == AIO_OP_FSYNC {
+    // Sync file to disk
+    // TODO: Implement fsync
+    result = 0
+
+  } else {
+    result = -1  // Unknown operation
+  }
+
+  // Complete the request
+  aio_requests[idx].result = result
+  if result < 0 {
+    aio_requests[idx].state = AIO_STATE_ERROR
+    aio_stats.failed_requests = aio_stats.failed_requests + 1
+  } else {
+    aio_requests[idx].state = AIO_STATE_COMPLETED
+    aio_stats.completed_requests = aio_stats.completed_requests + 1
+  }
+
+  // Add to completion queue
+  aio_add_completion(aio_requests[idx].id, result, aio_requests[idx].user_data)
+}
+
+// ============================================================================
+// COMPLETION QUEUE
+// ============================================================================
+
+fn aio_add_completion(id: u64, result: i64, user_data: u64) {
+  // Check if queue is full
+  var next_tail: u32 = (completion_tail + 1) % MAX_COMPLETION_QUEUE
+  if next_tail == completion_head {
+    // Queue full, drop oldest completion
+    completion_head = (completion_head + 1) % MAX_COMPLETION_QUEUE
+  }
+
+  aio_completions[completion_tail].id = id
+  aio_completions[completion_tail].result = result
+  aio_completions[completion_tail].user_data = user_data
+
+  completion_tail = next_tail
+}
+
+export fn aio_get_completion(completion: *AioCompletion): u32 {
+  if completion_head == completion_tail {
+    return 0  // Queue empty
+  }
+
+  *completion = aio_completions[completion_head]
+  completion_head = (completion_head + 1) % MAX_COMPLETION_QUEUE
+
+  return 1  // Got completion
+}
+
+export fn aio_peek_completion(): u32 {
+  if completion_head == completion_tail {
+    return 0  // Queue empty
+  }
+  return 1  // Has completions
+}
+
+// ============================================================================
+// REQUEST CANCELLATION
+// ============================================================================
+
+export fn aio_cancel(req_id: u64): u32 {
+  var i: u32 = 0
+  while i < MAX_AIO_REQUESTS {
+    if aio_requests[i].id == req_id {
+      if aio_requests[i].state == AIO_STATE_SUBMITTED {
+        // Can cancel if not started
+        aio_requests[i].state = AIO_STATE_FREE
+        return 0  // Cancelled
+      } else if aio_requests[i].state == AIO_STATE_IN_PROGRESS {
+        // Can't cancel in-progress request
+        return 1  // In progress
+      }
+      return 2  // Already completed
+    }
+    i = i + 1
+  }
+  return 3  // Not found
+}
+
+// ============================================================================
+// REQUEST STATUS
+// ============================================================================
+
+export fn aio_get_status(req_id: u64): u32 {
+  var i: u32 = 0
+  while i < MAX_AIO_REQUESTS {
+    if aio_requests[i].id == req_id {
+      return aio_requests[i].state
+    }
+    i = i + 1
+  }
+  return AIO_STATE_FREE  // Not found
+}
+
+export fn aio_wait(req_id: u64): i64 {
+  // Busy wait for request to complete
+  // TODO: Implement proper blocking wait with scheduler
+
+  var timeout: u32 = 1000000  // Prevent infinite loop
+  var count: u32 = 0
+
+  while count < timeout {
+    var i: u32 = 0
+    while i < MAX_AIO_REQUESTS {
+      if aio_requests[i].id == req_id {
+        if aio_requests[i].state == AIO_STATE_COMPLETED or aio_requests[i].state == AIO_STATE_ERROR {
+          var result: i64 = aio_requests[i].result
+          aio_requests[i].state = AIO_STATE_FREE
+          return result
+        }
+      }
+      i = i + 1
+    }
+    count = count + 1
+  }
+
+  return -1  // Timeout
+}
+
+// ============================================================================
+// BATCH OPERATIONS
+// ============================================================================
+
+export fn aio_submit_batch(requests: *AioRequest, count: u32): u32 {
+  var submitted: u32 = 0
+
+  var i: u32 = 0
+  while i < count {
+    var req: AioRequest = requests[i]
+    var req_id: u64 = aio_submit(req.op, req.fd, req.buffer, req.length, req.offset, req.user_data)
+    if req_id != 0 {
+      submitted = submitted + 1
+    }
+    i = i + 1
+  }
+
+  return submitted
+}
+
+export fn aio_wait_all() {
+  // Wait for all in-flight requests to complete
+  var all_done: u32 = 0
+
+  while all_done == 0 {
+    all_done = 1
+    var i: u32 = 0
+    while i < MAX_AIO_REQUESTS {
+      if aio_requests[i].state == AIO_STATE_SUBMITTED or aio_requests[i].state == AIO_STATE_IN_PROGRESS {
+        all_done = 0
+        // Process any pending requests
+        if aio_requests[i].state == AIO_STATE_SUBMITTED {
+          aio_process_request(i)
+        }
+      }
+      i = i + 1
+    }
+  }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn aio_get_stats(): AioStats {
+  return aio_stats
+}
+
+export fn aio_print_stats() {
+  foundation.serial_write_string("[Async I/O Stats]\n")
+  foundation.serial_write_string("  Total requests: ")
+  foundation.serial_write_u64(aio_stats.total_requests)
+  foundation.serial_write_string("\n  Completed: ")
+  foundation.serial_write_u64(aio_stats.completed_requests)
+  foundation.serial_write_string("\n  Failed: ")
+  foundation.serial_write_u64(aio_stats.failed_requests)
+  foundation.serial_write_string("\n  Read requests: ")
+  foundation.serial_write_u64(aio_stats.read_requests)
+  foundation.serial_write_string("\n  Write requests: ")
+  foundation.serial_write_u64(aio_stats.write_requests)
+  foundation.serial_write_string("\n  Bytes read: ")
+  foundation.serial_write_u64(aio_stats.bytes_read)
+  foundation.serial_write_string("\n  Bytes written: ")
+  foundation.serial_write_u64(aio_stats.bytes_written)
+  foundation.serial_write_string("\n")
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn aio_init() {
+  if aio_initialized == 1 { return }
+
+  var i: u32 = 0
+  while i < MAX_AIO_REQUESTS {
+    aio_requests[i].state = AIO_STATE_FREE
+    aio_requests[i].id = 0
+    i = i + 1
+  }
+
+  i = 0
+  while i < MAX_COMPLETION_QUEUE {
+    aio_completions[i].id = 0
+    aio_completions[i].result = 0
+    aio_completions[i].user_data = 0
+    i = i + 1
+  }
+
+  completion_head = 0
+  completion_tail = 0
+  next_request_id = 1
+
+  aio_stats.total_requests = 0
+  aio_stats.completed_requests = 0
+  aio_stats.failed_requests = 0
+  aio_stats.read_requests = 0
+  aio_stats.write_requests = 0
+  aio_stats.bytes_read = 0
+  aio_stats.bytes_written = 0
+
+  aio_initialized = 1
+
+  foundation.serial_write_string("[Async I/O] Initialized (128 request slots, 256 completions)\n")
+}

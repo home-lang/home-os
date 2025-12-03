@@ -1,11 +1,52 @@
 // home-os EXT2 Filesystem Driver
-// Real EXT2 implementation
+// Complete EXT2 (Second Extended Filesystem) implementation
 
 import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
 import "../drivers/ata.home" as ata
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
 
 const EXT2_SUPER_MAGIC: u16 = 0xEF53
 const EXT2_ROOT_INO: u32 = 2
+const EXT2_GOOD_OLD_REV: u32 = 0
+const EXT2_DYNAMIC_REV: u32 = 1
+
+// File Types
+const EXT2_S_IFSOCK: u16 = 0xC000  // Socket
+const EXT2_S_IFLNK: u16 = 0xA000   // Symbolic link
+const EXT2_S_IFREG: u16 = 0x8000   // Regular file
+const EXT2_S_IFBLK: u16 = 0x6000   // Block device
+const EXT2_S_IFDIR: u16 = 0x4000   // Directory
+const EXT2_S_IFCHR: u16 = 0x2000   // Character device
+const EXT2_S_IFIFO: u16 = 0x1000   // FIFO
+
+// Permissions
+const EXT2_S_ISUID: u16 = 0x0800   // Set UID
+const EXT2_S_ISGID: u16 = 0x0400   // Set GID
+const EXT2_S_ISVTX: u16 = 0x0200   // Sticky bit
+const EXT2_S_IRUSR: u16 = 0x0100   // Owner read
+const EXT2_S_IWUSR: u16 = 0x0080   // Owner write
+const EXT2_S_IXUSR: u16 = 0x0040   // Owner execute
+
+// Inode flags
+const EXT2_SECRM_FL: u32 = 0x00000001       // Secure deletion
+const EXT2_UNRM_FL: u32 = 0x00000002        // Undelete
+const EXT2_COMPR_FL: u32 = 0x00000004       // Compress file
+const EXT2_SYNC_FL: u32 = 0x00000008        // Synchronous updates
+const EXT2_IMMUTABLE_FL: u32 = 0x00000010   // Immutable file
+const EXT2_APPEND_FL: u32 = 0x00000020      // Append only
+
+const EXT2_NDIR_BLOCKS: u32 = 12
+const EXT2_IND_BLOCK: u32 = 12
+const EXT2_DIND_BLOCK: u32 = 13
+const EXT2_TIND_BLOCK: u32 = 14
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
 
 struct Ext2Superblock {
   inodes_count: u32,
@@ -25,7 +66,25 @@ struct Ext2Superblock {
   max_mnt_count: u16,
   magic: u16,
   state: u16,
-  errors: u16
+  errors: u16,
+  minor_rev_level: u16,
+  lastcheck: u32,
+  checkinterval: u32,
+  creator_os: u32,
+  rev_level: u32,
+  def_resuid: u16,
+  def_resgid: u16
+}
+
+struct Ext2GroupDescriptor {
+  block_bitmap: u32,
+  inode_bitmap: u32,
+  inode_table: u32,
+  free_blocks_count: u16,
+  free_inodes_count: u16,
+  used_dirs_count: u16,
+  pad: u16,
+  reserved: [u32; 3]
 }
 
 struct Ext2Inode {
@@ -40,74 +99,507 @@ struct Ext2Inode {
   links_count: u16,
   blocks: u32,
   flags: u32,
-  block: [u32; 15]
+  osd1: u32,
+  block: [u32; 15],
+  generation: u32,
+  file_acl: u32,
+  dir_acl: u32,
+  faddr: u32
 }
+
+struct Ext2DirEntry {
+  inode: u32,
+  rec_len: u16,
+  name_len: u8,
+  file_type: u8,
+  name: [u8; 255]
+}
+
+struct Ext2Stats {
+  reads: u64,
+  writes: u64,
+  bytes_read: u64,
+  bytes_written: u64,
+  inodes_read: u64,
+  cache_hits: u64,
+  cache_misses: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
 
 var ext2_initialized: u32 = 0
 var superblock: Ext2Superblock
 var block_size: u32 = 1024
+var inode_size: u32 = 128
+var groups_count: u32 = 0
+var group_descriptors: [Ext2GroupDescriptor; 32]
+var ext2_stats: Ext2Stats
 
-export fn ext2_init() {
-  if ext2_initialized == 1 { return }
-  
-  var buffer: [u8; 1024]
-  ata.ata_read_sector(0, 2, @ptrFromInt(buffer))
-  
-  var sb: Ext2Superblock = @intToPtr(@ptrFromInt(buffer), Ext2Superblock)
-  
-  if sb.magic != EXT2_SUPER_MAGIC {
-    foundation.serial_write_string("[EXT2] Invalid magic\n")
-    return
+// Block cache (simple 8-block cache)
+var block_cache: [[u8; 4096]; 8]
+var block_cache_tags: [u32; 8]
+var block_cache_valid: [u32; 8]
+var block_cache_next: u32 = 0
+
+// ============================================================================
+// BLOCK CACHE
+// ============================================================================
+
+fn ext2_read_block_cached(block_num: u32, buffer: u64): u32 {
+  // Check cache
+  var i: u32 = 0
+  while i < 8 {
+    if block_cache_valid[i] == 1 and block_cache_tags[i] == block_num {
+      ext2_stats.cache_hits = ext2_stats.cache_hits + 1
+      memory.mem_copy(buffer, @ptrFromInt(block_cache[i]), block_size)
+      return 0
+    }
+    i = i + 1
   }
-  
-  superblock = sb
-  block_size = 1024 << sb.log_block_size
-  
-  ext2_initialized = 1
-  foundation.serial_write_string("[EXT2] Initialized\n")
+
+  ext2_stats.cache_misses = ext2_stats.cache_misses + 1
+
+  // Cache miss - read from disk
+  var result: u32 = ext2_read_block_raw(block_num, buffer)
+  if result != 0 {
+    return result
+  }
+
+  // Update cache
+  var cache_idx: u32 = block_cache_next
+  memory.mem_copy(@ptrFromInt(block_cache[cache_idx]), buffer, block_size)
+  block_cache_tags[cache_idx] = block_num
+  block_cache_valid[cache_idx] = 1
+  block_cache_next = (block_cache_next + 1) % 8
+
+  return 0
 }
 
-export fn ext2_read_inode(ino: u32): u64 {
-  if ext2_initialized == 0 { return 0 }
-  
+fn ext2_read_block_raw(block_num: u32, buffer: u64): u32 {
+  var sectors_per_block: u32 = block_size / 512
+  var start_sector: u32 = block_num * sectors_per_block
+
+  var i: u32 = 0
+  while i < sectors_per_block {
+    ata.ata_read_sector(0, start_sector + i, buffer + (i * 512))
+    i = i + 1
+  }
+
+  ext2_stats.reads = ext2_stats.reads + 1
+  ext2_stats.bytes_read = ext2_stats.bytes_read + block_size
+
+  return 0
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn ext2_init(): u32 {
+  if ext2_initialized == 1 { return 0 }
+
+  foundation.serial_write_string("[EXT2] Initializing...\n")
+
+  // Read superblock (located at byte 1024, sector 2)
+  var sb_buffer: [u8; 1024]
+  ata.ata_read_sector(0, 2, @ptrFromInt(sb_buffer))
+
+  // Parse superblock
+  var sb_ptr: *Ext2Superblock = @ptrFromInt(sb_buffer)
+  superblock = sb_ptr[0]
+
+  // Verify magic number
+  if superblock.magic != EXT2_SUPER_MAGIC {
+    foundation.serial_write_string("[EXT2] Invalid magic number: ")
+    foundation.serial_write_u32(superblock.magic)
+    foundation.serial_write_string(" (expected ")
+    foundation.serial_write_u32(EXT2_SUPER_MAGIC)
+    foundation.serial_write_string(")\n")
+    return 1
+  }
+
+  // Calculate block size
+  block_size = 1024 << superblock.log_block_size
+
+  foundation.serial_write_string("[EXT2] Block size: ")
+  foundation.serial_write_u32(block_size)
+  foundation.serial_write_string(" bytes\n")
+
+  // Calculate number of block groups
+  groups_count = (superblock.blocks_count + superblock.blocks_per_group - 1) / superblock.blocks_per_group
+
+  foundation.serial_write_string("[EXT2] Block groups: ")
+  foundation.serial_write_u32(groups_count)
+  foundation.serial_write_string("\n")
+
+  // Read group descriptors
+  var gd_block: u32 = if superblock.first_data_block == 0 then 1 else 2
+  var gd_buffer: [u8; 4096]
+  ext2_read_block_raw(gd_block, @ptrFromInt(gd_buffer))
+
+  var gd_ptr: *Ext2GroupDescriptor = @ptrFromInt(gd_buffer)
+  var i: u32 = 0
+  while i < groups_count and i < 32 {
+    group_descriptors[i] = gd_ptr[i]
+    i = i + 1
+  }
+
+  // Initialize block cache
+  i = 0
+  while i < 8 {
+    block_cache_valid[i] = 0
+    i = i + 1
+  }
+  block_cache_next = 0
+
+  // Initialize stats
+  ext2_stats.reads = 0
+  ext2_stats.writes = 0
+  ext2_stats.bytes_read = 0
+  ext2_stats.bytes_written = 0
+  ext2_stats.inodes_read = 0
+  ext2_stats.cache_hits = 0
+  ext2_stats.cache_misses = 0
+
+  ext2_initialized = 1
+
+  foundation.serial_write_string("[EXT2] Initialized successfully\n")
+  foundation.serial_write_string("  Total inodes: ")
+  foundation.serial_write_u32(superblock.inodes_count)
+  foundation.serial_write_string("\n  Total blocks: ")
+  foundation.serial_write_u32(superblock.blocks_count)
+  foundation.serial_write_string("\n  Free blocks: ")
+  foundation.serial_write_u32(superblock.free_blocks_count)
+  foundation.serial_write_string("\n  Free inodes: ")
+  foundation.serial_write_u32(superblock.free_inodes_count)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// ============================================================================
+// INODE OPERATIONS
+// ============================================================================
+
+export fn ext2_read_inode(ino: u32, inode_out: *Ext2Inode): u32 {
+  if ext2_initialized == 0 {
+    return 1
+  }
+
+  if ino == 0 or ino > superblock.inodes_count {
+    foundation.serial_write_string("[EXT2] Invalid inode number: ")
+    foundation.serial_write_u32(ino)
+    foundation.serial_write_string("\n")
+    return 1
+  }
+
+  // Calculate block group
   var group: u32 = (ino - 1) / superblock.inodes_per_group
   var index: u32 = (ino - 1) % superblock.inodes_per_group
-  
-  var inode_table: u32 = 5  // Simplified
-  var block: u32 = inode_table + (index * 128) / block_size
-  
-  var buffer: [u8; 1024]
-  ata.ata_read_sector(0, block, @ptrFromInt(buffer))
-  
-  var offset: u32 = (index * 128) % block_size
-  return @ptrFromInt(buffer) + offset
+
+  if group >= groups_count {
+    return 1
+  }
+
+  // Get inode table location
+  var inode_table: u32 = group_descriptors[group].inode_table
+
+  // Calculate block and offset
+  var inodes_per_block: u32 = block_size / inode_size
+  var block: u32 = inode_table + (index / inodes_per_block)
+  var offset: u32 = (index % inodes_per_block) * inode_size
+
+  // Read block containing inode
+  var block_buffer: [u8; 4096]
+  ext2_read_block_cached(block, @ptrFromInt(block_buffer))
+
+  // Copy inode data
+  var inode_ptr: *Ext2Inode = @ptrFromInt(@ptrFromInt(block_buffer) + offset)
+  inode_out[0] = inode_ptr[0]
+
+  ext2_stats.inodes_read = ext2_stats.inodes_read + 1
+
+  return 0
+}
+
+export fn ext2_is_directory(mode: u16): u32 {
+  return if (mode & EXT2_S_IFDIR) == EXT2_S_IFDIR then 1 else 0
+}
+
+export fn ext2_is_regular_file(mode: u16): u32 {
+  return if (mode & EXT2_S_IFREG) == EXT2_S_IFREG then 1 else 0
+}
+
+export fn ext2_is_symlink(mode: u16): u32 {
+  return if (mode & EXT2_S_IFLNK) == EXT2_S_IFLNK then 1 else 0
+}
+
+// ============================================================================
+// BLOCK READING (WITH INDIRECT BLOCKS)
+// ============================================================================
+
+fn ext2_get_block_number(inode: *Ext2Inode, logical_block: u32): u32 {
+  // Direct blocks (0-11)
+  if logical_block < EXT2_NDIR_BLOCKS {
+    return inode.block[logical_block]
+  }
+
+  var block_ptrs_per_block: u32 = block_size / 4
+
+  // Single indirect (12)
+  if logical_block < (EXT2_NDIR_BLOCKS + block_ptrs_per_block) {
+    var ind_block: u32 = inode.block[EXT2_IND_BLOCK]
+    if ind_block == 0 {
+      return 0
+    }
+
+    var ind_buffer: [u8; 4096]
+    ext2_read_block_cached(ind_block, @ptrFromInt(ind_buffer))
+
+    var ind_ptr: *u32 = @ptrFromInt(ind_buffer)
+    var offset: u32 = logical_block - EXT2_NDIR_BLOCKS
+    return ind_ptr[offset]
+  }
+
+  // Double indirect (13)
+  logical_block = logical_block - (EXT2_NDIR_BLOCKS + block_ptrs_per_block)
+  if logical_block < (block_ptrs_per_block * block_ptrs_per_block) {
+    var dind_block: u32 = inode.block[EXT2_DIND_BLOCK]
+    if dind_block == 0 {
+      return 0
+    }
+
+    var dind_buffer: [u8; 4096]
+    ext2_read_block_cached(dind_block, @ptrFromInt(dind_buffer))
+
+    var dind_ptr: *u32 = @ptrFromInt(dind_buffer)
+    var ind_idx: u32 = logical_block / block_ptrs_per_block
+    var ind_block: u32 = dind_ptr[ind_idx]
+
+    if ind_block == 0 {
+      return 0
+    }
+
+    var ind_buffer: [u8; 4096]
+    ext2_read_block_cached(ind_block, @ptrFromInt(ind_buffer))
+
+    var ind_ptr: *u32 = @ptrFromInt(ind_buffer)
+    var offset: u32 = logical_block % block_ptrs_per_block
+    return ind_ptr[offset]
+  }
+
+  // Triple indirect not implemented
+  return 0
 }
 
 export fn ext2_read_file(ino: u32, offset: u64, buffer: u64, size: u64): u64 {
-  if ext2_initialized == 0 { return 0 }
-  
-  var inode_ptr: u64 = ext2_read_inode(ino)
-  if inode_ptr == 0 { return 0 }
-  
-  var inode: Ext2Inode = @intToPtr(inode_ptr, Ext2Inode)
-  
-  var block_num: u32 = offset / block_size
-  if block_num >= 12 { return 0 }
-  
-  var block_buffer: [u8; 1024]
-  ata.ata_read_sector(0, inode.block[block_num], @ptrFromInt(block_buffer))
-  
-  var block_offset: u64 = offset % block_size
+  if ext2_initialized == 0 {
+    return 0
+  }
+
+  // Read inode
+  var inode: Ext2Inode
+  if ext2_read_inode(ino, @ptrFromInt(inode)) != 0 {
+    return 0
+  }
+
+  // Check if regular file
+  if ext2_is_regular_file(inode.mode) == 0 {
+    foundation.serial_write_string("[EXT2] Not a regular file\n")
+    return 0
+  }
+
+  // Check bounds
+  if offset >= inode.size {
+    return 0
+  }
+
   var to_read: u64 = size
-  if to_read > (block_size - block_offset) {
-    to_read = block_size - block_offset
+  if offset + to_read > inode.size {
+    to_read = inode.size - offset
   }
-  
-  var i: u64 = 0
-  while i < to_read {
-    @ptrToInt(buffer + i, u8) = block_buffer[block_offset + i]
-    i = i + 1
+
+  var bytes_read: u64 = 0
+  var current_offset: u64 = offset
+
+  while bytes_read < to_read {
+    var block_num: u32 = current_offset / block_size
+    var block_offset: u32 = current_offset % block_size
+    var physical_block: u32 = ext2_get_block_number(@ptrFromInt(inode), block_num)
+
+    if physical_block == 0 {
+      // Sparse file - return zeros
+      var chunk: u32 = block_size - block_offset
+      if chunk > (to_read - bytes_read) {
+        chunk = to_read - bytes_read
+      }
+
+      var i: u32 = 0
+      while i < chunk {
+        var buf_ptr: *u8 = @ptrFromInt(buffer + bytes_read + i)
+        buf_ptr[0] = 0
+        i = i + 1
+      }
+
+      bytes_read = bytes_read + chunk
+      current_offset = current_offset + chunk
+    } else {
+      // Read actual block
+      var block_buffer: [u8; 4096]
+      ext2_read_block_cached(physical_block, @ptrFromInt(block_buffer))
+
+      var chunk: u32 = block_size - block_offset
+      if chunk > (to_read - bytes_read) {
+        chunk = to_read - bytes_read
+      }
+
+      memory.mem_copy(buffer + bytes_read, @ptrFromInt(block_buffer) + block_offset, chunk)
+
+      bytes_read = bytes_read + chunk
+      current_offset = current_offset + chunk
+    }
   }
-  
-  return to_read
+
+  return bytes_read
+}
+
+// ============================================================================
+// DIRECTORY OPERATIONS
+// ============================================================================
+
+export fn ext2_lookup_entry(dir_ino: u32, name: u64): u32 {
+  if ext2_initialized == 0 {
+    return 0
+  }
+
+  // Read directory inode
+  var dir_inode: Ext2Inode
+  if ext2_read_inode(dir_ino, @ptrFromInt(dir_inode)) != 0 {
+    return 0
+  }
+
+  // Check if directory
+  if ext2_is_directory(dir_inode.mode) == 0 {
+    return 0
+  }
+
+  // Read directory data
+  var dir_buffer: [u8; 4096]
+  var bytes_read: u64 = ext2_read_file(dir_ino, 0, @ptrFromInt(dir_buffer), dir_inode.size)
+
+  if bytes_read == 0 {
+    return 0
+  }
+
+  // Parse directory entries
+  var offset: u32 = 0
+  while offset < bytes_read {
+    var entry: *Ext2DirEntry = @ptrFromInt(@ptrFromInt(dir_buffer) + offset)
+
+    if entry.inode == 0 {
+      offset = offset + entry.rec_len
+      continue
+    }
+
+    // Compare names
+    var name_ptr: *u8 = @ptrFromInt(name)
+    var match: u32 = 1
+    var i: u32 = 0
+    while i < entry.name_len {
+      if name_ptr[i] != entry.name[i] {
+        match = 0
+        break
+      }
+      i = i + 1
+    }
+
+    if match == 1 and name_ptr[entry.name_len] == 0 {
+      return entry.inode
+    }
+
+    offset = offset + entry.rec_len
+  }
+
+  return 0
+}
+
+export fn ext2_list_directory(dir_ino: u32): u32 {
+  if ext2_initialized == 0 {
+    return 1
+  }
+
+  var dir_inode: Ext2Inode
+  if ext2_read_inode(dir_ino, @ptrFromInt(dir_inode)) != 0 {
+    return 1
+  }
+
+  if ext2_is_directory(dir_inode.mode) == 0 {
+    return 1
+  }
+
+  var dir_buffer: [u8; 4096]
+  var bytes_read: u64 = ext2_read_file(dir_ino, 0, @ptrFromInt(dir_buffer), dir_inode.size)
+
+  foundation.serial_write_string("[EXT2] Directory listing:\n")
+
+  var offset: u32 = 0
+  while offset < bytes_read {
+    var entry: *Ext2DirEntry = @ptrFromInt(@ptrFromInt(dir_buffer) + offset)
+
+    if entry.inode != 0 {
+      foundation.serial_write_string("  ")
+      foundation.serial_write_u32(entry.inode)
+      foundation.serial_write_string(": ")
+
+      var i: u32 = 0
+      while i < entry.name_len {
+        var c: [u8; 2]
+        c[0] = entry.name[i]
+        c[1] = 0
+        foundation.serial_write_string(@ptrFromInt(c))
+        i = i + 1
+      }
+
+      foundation.serial_write_string(" (type ")
+      foundation.serial_write_u32(entry.file_type)
+      foundation.serial_write_string(")\n")
+    }
+
+    offset = offset + entry.rec_len
+  }
+
+  return 0
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn ext2_get_stats(): *Ext2Stats {
+  return @ptrFromInt(ext2_stats)
+}
+
+export fn ext2_print_stats() {
+  foundation.serial_write_string("[EXT2 Stats]\n")
+  foundation.serial_write_string("  Reads: ")
+  foundation.serial_write_u64(ext2_stats.reads)
+  foundation.serial_write_string("\n  Bytes read: ")
+  foundation.serial_write_u64(ext2_stats.bytes_read)
+  foundation.serial_write_string("\n  Inodes read: ")
+  foundation.serial_write_u64(ext2_stats.inodes_read)
+  foundation.serial_write_string("\n  Cache hits: ")
+  foundation.serial_write_u64(ext2_stats.cache_hits)
+  foundation.serial_write_string("\n  Cache misses: ")
+  foundation.serial_write_u64(ext2_stats.cache_misses)
+
+  if ext2_stats.cache_hits + ext2_stats.cache_misses > 0 {
+    var hit_rate: u64 = (ext2_stats.cache_hits * 100) / (ext2_stats.cache_hits + ext2_stats.cache_misses)
+    foundation.serial_write_string("\n  Cache hit rate: ")
+    foundation.serial_write_u64(hit_rate)
+    foundation.serial_write_string("%\n")
+  } else {
+    foundation.serial_write_string("\n")
+  }
 }

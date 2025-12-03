@@ -1,10 +1,53 @@
-// home-os NTFS
-// Windows NTFS filesystem (read-only)
+// home-os NTFS Filesystem Driver
+// Windows NTFS filesystem (read-only implementation)
 
 import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
 import "../drivers/ata.home" as ata
 
-const NTFS_MAGIC: u64 = 0x5346544E  // "NTFS"
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const NTFS_SIGNATURE: u64 = 0x5346544E  // "NTFS"
+const NTFS_FILE_MFT: u64 = 0
+const NTFS_FILE_MFTMIRR: u64 = 1
+const NTFS_FILE_LOGFILE: u64 = 2
+const NTFS_FILE_VOLUME: u64 = 3
+const NTFS_FILE_ATTRDEF: u64 = 4
+const NTFS_FILE_ROOT: u64 = 5
+const NTFS_FILE_BITMAP: u64 = 6
+const NTFS_FILE_BOOT: u64 = 7
+
+// MFT Entry Flags
+const NTFS_MFT_IN_USE: u16 = 0x0001
+const NTFS_MFT_IS_DIRECTORY: u16 = 0x0002
+
+// Attribute Types
+const NTFS_ATTR_STANDARD_INFO: u32 = 0x10
+const NTFS_ATTR_ATTRIBUTE_LIST: u32 = 0x20
+const NTFS_ATTR_FILE_NAME: u32 = 0x30
+const NTFS_ATTR_VOLUME_VERSION: u32 = 0x40
+const NTFS_ATTR_SECURITY_DESCRIPTOR: u32 = 0x50
+const NTFS_ATTR_VOLUME_NAME: u32 = 0x60
+const NTFS_ATTR_VOLUME_INFO: u32 = 0x70
+const NTFS_ATTR_DATA: u32 = 0x80
+const NTFS_ATTR_INDEX_ROOT: u32 = 0x90
+const NTFS_ATTR_INDEX_ALLOCATION: u32 = 0xA0
+const NTFS_ATTR_BITMAP: u32 = 0xB0
+const NTFS_ATTR_REPARSE_POINT: u32 = 0xC0
+const NTFS_ATTR_EA_INFO: u32 = 0xD0
+const NTFS_ATTR_EA: u32 = 0xE0
+const NTFS_ATTR_END: u32 = 0xFFFFFFFF
+
+// Attribute Flags
+const NTFS_ATTR_FLAG_COMPRESSED: u16 = 0x0001
+const NTFS_ATTR_FLAG_ENCRYPTED: u16 = 0x4000
+const NTFS_ATTR_FLAG_SPARSE: u16 = 0x8000
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
 
 struct NtfsBootSector {
   jump: [u8; 3],
@@ -23,27 +66,558 @@ struct NtfsBootSector {
   unused5: u32,
   total_sectors: u64,
   mft_cluster: u64,
-  mft_mirror_cluster: u64
+  mft_mirror_cluster: u64,
+  clusters_per_mft_record: i8,
+  reserved1: [u8; 3],
+  clusters_per_index_record: i8,
+  reserved2: [u8; 3],
+  volume_serial: u64,
+  checksum: u32
 }
+
+struct NtfsMftRecord {
+  signature: u32,           // "FILE"
+  update_seq_offset: u16,
+  update_seq_size: u16,
+  log_seq_number: u64,
+  sequence_number: u16,
+  hard_link_count: u16,
+  first_attr_offset: u16,
+  flags: u16,
+  used_size: u32,
+  allocated_size: u32,
+  base_record: u64,
+  next_attr_id: u16,
+  reserved: u16,
+  mft_record_number: u32
+}
+
+struct NtfsAttributeHeader {
+  type_id: u32,
+  length: u32,
+  non_resident: u8,
+  name_length: u8,
+  name_offset: u16,
+  flags: u16,
+  attribute_id: u16
+}
+
+struct NtfsResidentAttribute {
+  header: NtfsAttributeHeader,
+  value_length: u32,
+  value_offset: u16,
+  indexed_flag: u8,
+  padding: u8
+}
+
+struct NtfsNonResidentAttribute {
+  header: NtfsAttributeHeader,
+  start_vcn: u64,
+  end_vcn: u64,
+  runlist_offset: u16,
+  compression_unit: u16,
+  padding: u32,
+  allocated_size: u64,
+  real_size: u64,
+  initialized_size: u64
+}
+
+struct NtfsFileName {
+  parent_directory: u64,
+  creation_time: u64,
+  modification_time: u64,
+  mft_modification_time: u64,
+  access_time: u64,
+  allocated_size: u64,
+  real_size: u64,
+  flags: u32,
+  reparse_value: u32,
+  name_length: u8,
+  name_type: u8
+  // name follows
+}
+
+struct NtfsStats {
+  reads: u64,
+  bytes_read: u64,
+  mft_reads: u64,
+  attr_lookups: u64,
+  cache_hits: u64,
+  cache_misses: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
 
 var ntfs_initialized: u32 = 0
 var boot_sector: NtfsBootSector
+var bytes_per_cluster: u32 = 0
+var bytes_per_mft_record: u32 = 0
+var mft_start_sector: u64 = 0
+var ntfs_stats: NtfsStats
 
-export fn ntfs_init() {
-  if ntfs_initialized == 1 { return }
-  
-  var buffer: [u8; 512]
-  ata.ata_read_sector(0, 0, @ptrFromInt(buffer))
-  
-  boot_sector = @intToPtr(@ptrFromInt(buffer), NtfsBootSector)
-  
-  ntfs_initialized = 1
-  foundation.serial_write_string("[NTFS] Initialized (read-only)\n")
+// MFT record cache (cache 4 MFT records)
+var mft_cache: [[u8; 1024]; 4]
+var mft_cache_tags: [u64; 4]
+var mft_cache_valid: [u32; 4]
+var mft_cache_next: u32 = 0
+
+// ============================================================================
+// STRING UTILITIES
+// ============================================================================
+
+fn ntfs_compare_unicode(name1: u64, len1: u32, name2: u64, len2: u32): u32 {
+  if len1 != len2 {
+    return 0
+  }
+
+  var p1: *u16 = @ptrFromInt(name1)
+  var p2: *u16 = @ptrFromInt(name2)
+  var i: u32 = 0
+  while i < len1 {
+    if p1[i] != p2[i] {
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
 }
 
-export fn ntfs_read_file(path: u64, buffer: u64, size: u32): u32 {
-  if ntfs_initialized == 0 { return 0 }
-  
-  // Read file from MFT (stub)
+fn ntfs_unicode_to_ascii(unicode: u64, len: u32, ascii: u64) {
+  var src: *u16 = @ptrFromInt(unicode)
+  var dst: *u8 = @ptrFromInt(ascii)
+  var i: u32 = 0
+  while i < len {
+    dst[i] = src[i] & 0xFF  // Simple conversion, loses non-ASCII
+    i = i + 1
+  }
+  dst[len] = 0
+}
+
+// ============================================================================
+// CLUSTER/SECTOR OPERATIONS
+// ============================================================================
+
+fn ntfs_cluster_to_sector(cluster: u64): u64 {
+  return cluster * boot_sector.sectors_per_cluster
+}
+
+fn ntfs_read_cluster(cluster: u64, buffer: u64): u32 {
+  var start_sector: u64 = ntfs_cluster_to_sector(cluster)
+  var i: u32 = 0
+  while i < boot_sector.sectors_per_cluster {
+    ata.ata_read_sector(0, start_sector + i, buffer + (i * 512))
+    i = i + 1
+  }
+
+  ntfs_stats.reads = ntfs_stats.reads + 1
+  ntfs_stats.bytes_read = ntfs_stats.bytes_read + bytes_per_cluster
+
+  return 0
+}
+
+// ============================================================================
+// MFT OPERATIONS
+// ============================================================================
+
+fn ntfs_read_mft_record_cached(mft_num: u64, buffer: u64): u32 {
+  // Check cache
+  var i: u32 = 0
+  while i < 4 {
+    if mft_cache_valid[i] == 1 and mft_cache_tags[i] == mft_num {
+      ntfs_stats.cache_hits = ntfs_stats.cache_hits + 1
+      memory.mem_copy(buffer, @ptrFromInt(mft_cache[i]), bytes_per_mft_record)
+      return 0
+    }
+    i = i + 1
+  }
+
+  ntfs_stats.cache_misses = ntfs_stats.cache_misses + 1
+
+  // Read from disk
+  var result: u32 = ntfs_read_mft_record_raw(mft_num, buffer)
+  if result != 0 {
+    return result
+  }
+
+  // Update cache
+  var cache_idx: u32 = mft_cache_next
+  memory.mem_copy(@ptrFromInt(mft_cache[cache_idx]), buffer, bytes_per_mft_record)
+  mft_cache_tags[cache_idx] = mft_num
+  mft_cache_valid[cache_idx] = 1
+  mft_cache_next = (mft_cache_next + 1) % 4
+
+  return 0
+}
+
+fn ntfs_read_mft_record_raw(mft_num: u64, buffer: u64): u32 {
+  // Calculate MFT record position
+  var records_per_cluster: u32 = bytes_per_cluster / bytes_per_mft_record
+  var cluster: u64 = boot_sector.mft_cluster + (mft_num / records_per_cluster)
+  var offset: u32 = (mft_num % records_per_cluster) * bytes_per_mft_record
+
+  // Read cluster containing MFT record
+  var cluster_buffer: [u8; 4096]
+  ntfs_read_cluster(cluster, @ptrFromInt(cluster_buffer))
+
+  // Copy MFT record
+  memory.mem_copy(buffer, @ptrFromInt(cluster_buffer) + offset, bytes_per_mft_record)
+
+  ntfs_stats.mft_reads = ntfs_stats.mft_reads + 1
+
+  return 0
+}
+
+export fn ntfs_read_mft_record(mft_num: u64, buffer: u64): u32 {
+  if ntfs_initialized == 0 {
+    return 1
+  }
+
+  return ntfs_read_mft_record_cached(mft_num, buffer)
+}
+
+// ============================================================================
+// ATTRIBUTE OPERATIONS
+// ============================================================================
+
+fn ntfs_find_attribute(mft_record: u64, attr_type: u32, attr_data: u64): u32 {
+  var mft: *NtfsMftRecord = @ptrFromInt(mft_record)
+
+  // Verify signature
+  if mft.signature != 0x454C4946 {  // "FILE"
+    return 1
+  }
+
+  var offset: u32 = mft.first_attr_offset
+  var max_offset: u32 = mft.used_size
+
+  while offset < max_offset {
+    var attr: *NtfsAttributeHeader = @ptrFromInt(mft_record + offset)
+
+    // Check for end marker
+    if attr.type_id == NTFS_ATTR_END {
+      return 1
+    }
+
+    // Check if this is the attribute we're looking for
+    if attr.type_id == attr_type {
+      memory.mem_copy(attr_data, @ptrFromInt(attr), attr.length)
+      ntfs_stats.attr_lookups = ntfs_stats.attr_lookups + 1
+      return 0
+    }
+
+    offset = offset + attr.length
+  }
+
+  return 1
+}
+
+// ============================================================================
+// DATA READING
+// ============================================================================
+
+export fn ntfs_read_resident_data(attr: u64, buffer: u64, max_size: u32): u32 {
+  var res_attr: *NtfsResidentAttribute = @ptrFromInt(attr)
+
+  var data_size: u32 = res_attr.value_length
+  if data_size > max_size {
+    data_size = max_size
+  }
+
+  var data_ptr: u64 = attr + res_attr.value_offset
+  memory.mem_copy(buffer, data_ptr, data_size)
+
+  return data_size
+}
+
+fn ntfs_decode_runlist(runlist: u64, vcn: u64, cluster_out: *u64, length_out: *u32): u32 {
+  // Simplified runlist decoding
+  // In a full implementation, this would decode the compressed runlist
+  // For now, return error
+  return 1
+}
+
+export fn ntfs_read_nonresident_data(attr: u64, offset: u64, buffer: u64, size: u64): u64 {
+  var nr_attr: *NtfsNonResidentAttribute = @ptrFromInt(attr)
+
+  // Check bounds
+  if offset >= nr_attr.real_size {
+    return 0
+  }
+
+  var to_read: u64 = size
+  if offset + to_read > nr_attr.real_size {
+    to_read = nr_attr.real_size - offset
+  }
+
+  // Decode runlist and read data
+  // This is simplified - full implementation would properly decode runlist
+  var bytes_read: u64 = 0
+
+  // For demonstration, just return 0
+  // Full implementation would:
+  // 1. Decode runlist to get cluster runs
+  // 2. Calculate which run contains the offset
+  // 3. Read clusters from that run
+  // 4. Handle sparse runs (return zeros)
+
+  return bytes_read
+}
+
+// ============================================================================
+// FILE OPERATIONS
+// ============================================================================
+
+export fn ntfs_lookup_file(parent_mft: u64, name: u64): u64 {
+  if ntfs_initialized == 0 {
+    return 0
+  }
+
+  // Read parent directory MFT record
+  var mft_buffer: [u8; 1024]
+  if ntfs_read_mft_record(parent_mft, @ptrFromInt(mft_buffer)) != 0 {
+    return 0
+  }
+
+  // Find $INDEX_ROOT attribute
+  var index_root: [u8; 512]
+  if ntfs_find_attribute(@ptrFromInt(mft_buffer), NTFS_ATTR_INDEX_ROOT, @ptrFromInt(index_root)) != 0 {
+    return 0
+  }
+
+  // Parse index entries (simplified)
+  // Full implementation would parse B+ tree index
+  // For now, return 0
+
+  return 0
+}
+
+export fn ntfs_read_file(mft_num: u64, offset: u64, buffer: u64, size: u64): u64 {
+  if ntfs_initialized == 0 {
+    return 0
+  }
+
+  // Read MFT record
+  var mft_buffer: [u8; 1024]
+  if ntfs_read_mft_record(mft_num, @ptrFromInt(mft_buffer)) != 0 {
+    return 0
+  }
+
+  // Find $DATA attribute
+  var data_attr: [u8; 512]
+  if ntfs_find_attribute(@ptrFromInt(mft_buffer), NTFS_ATTR_DATA, @ptrFromInt(data_attr)) != 0 {
+    return 0
+  }
+
+  var attr_header: *NtfsAttributeHeader = @ptrFromInt(data_attr)
+
+  if attr_header.non_resident == 0 {
+    // Resident data
+    var data_size: u32 = ntfs_read_resident_data(@ptrFromInt(data_attr), buffer, size)
+    return data_size
+  } else {
+    // Non-resident data
+    return ntfs_read_nonresident_data(@ptrFromInt(data_attr), offset, buffer, size)
+  }
+}
+
+export fn ntfs_get_file_size(mft_num: u64): u64 {
+  if ntfs_initialized == 0 {
+    return 0
+  }
+
+  var mft_buffer: [u8; 1024]
+  if ntfs_read_mft_record(mft_num, @ptrFromInt(mft_buffer)) != 0 {
+    return 0
+  }
+
+  var data_attr: [u8; 512]
+  if ntfs_find_attribute(@ptrFromInt(mft_buffer), NTFS_ATTR_DATA, @ptrFromInt(data_attr)) != 0 {
+    return 0
+  }
+
+  var attr_header: *NtfsAttributeHeader = @ptrFromInt(data_attr)
+
+  if attr_header.non_resident == 0 {
+    var res_attr: *NtfsResidentAttribute = @ptrFromInt(data_attr)
+    return res_attr.value_length
+  } else {
+    var nr_attr: *NtfsNonResidentAttribute = @ptrFromInt(data_attr)
+    return nr_attr.real_size
+  }
+}
+
+export fn ntfs_get_file_name(mft_num: u64, name_buffer: u64, max_len: u32): u32 {
+  if ntfs_initialized == 0 {
+    return 0
+  }
+
+  var mft_buffer: [u8; 1024]
+  if ntfs_read_mft_record(mft_num, @ptrFromInt(mft_buffer)) != 0 {
+    return 0
+  }
+
+  var filename_attr: [u8; 512]
+  if ntfs_find_attribute(@ptrFromInt(mft_buffer), NTFS_ATTR_FILE_NAME, @ptrFromInt(filename_attr)) != 0 {
+    return 0
+  }
+
+  // Extract filename
+  var res_attr: *NtfsResidentAttribute = @ptrFromInt(filename_attr)
+  var filename: *NtfsFileName = @ptrFromInt(@ptrFromInt(filename_attr) + res_attr.value_offset)
+
+  // Convert Unicode name to ASCII
+  var unicode_name: u64 = @ptrFromInt(filename) + 66  // Offset to name
+  ntfs_unicode_to_ascii(unicode_name, filename.name_length, name_buffer)
+
+  return filename.name_length
+}
+
+// ============================================================================
+// DIRECTORY LISTING
+// ============================================================================
+
+export fn ntfs_list_directory(mft_num: u64): u32 {
+  if ntfs_initialized == 0 {
+    return 1
+  }
+
+  foundation.serial_write_string("[NTFS] Directory listing for MFT ")
+  foundation.serial_write_u64(mft_num)
+  foundation.serial_write_string(":\n")
+
+  // This is a simplified stub
+  // Full implementation would parse $INDEX_ROOT and $INDEX_ALLOCATION
+
+  foundation.serial_write_string("  [NTFS directory listing not fully implemented]\n")
+
+  return 0
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn ntfs_get_stats(): *NtfsStats {
+  return @ptrFromInt(ntfs_stats)
+}
+
+export fn ntfs_print_stats() {
+  foundation.serial_write_string("[NTFS Stats]\n")
+  foundation.serial_write_string("  Cluster reads: ")
+  foundation.serial_write_u64(ntfs_stats.reads)
+  foundation.serial_write_string("\n  Bytes read: ")
+  foundation.serial_write_u64(ntfs_stats.bytes_read)
+  foundation.serial_write_string("\n  MFT reads: ")
+  foundation.serial_write_u64(ntfs_stats.mft_reads)
+  foundation.serial_write_string("\n  Attribute lookups: ")
+  foundation.serial_write_u64(ntfs_stats.attr_lookups)
+  foundation.serial_write_string("\n  Cache hits: ")
+  foundation.serial_write_u64(ntfs_stats.cache_hits)
+  foundation.serial_write_string("\n  Cache misses: ")
+  foundation.serial_write_u64(ntfs_stats.cache_misses)
+
+  if ntfs_stats.cache_hits + ntfs_stats.cache_misses > 0 {
+    var hit_rate: u64 = (ntfs_stats.cache_hits * 100) / (ntfs_stats.cache_hits + ntfs_stats.cache_misses)
+    foundation.serial_write_string("\n  Cache hit rate: ")
+    foundation.serial_write_u64(hit_rate)
+    foundation.serial_write_string("%\n")
+  } else {
+    foundation.serial_write_string("\n")
+  }
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn ntfs_init(): u32 {
+  if ntfs_initialized == 1 {
+    return 0
+  }
+
+  foundation.serial_write_string("[NTFS] Initializing (read-only)...\n")
+
+  // Read boot sector
+  var boot_buffer: [u8; 512]
+  ata.ata_read_sector(0, 0, @ptrFromInt(boot_buffer))
+
+  // Parse boot sector
+  var bs_ptr: *NtfsBootSector = @ptrFromInt(boot_buffer)
+  boot_sector = bs_ptr[0]
+
+  // Verify OEM ID contains "NTFS"
+  var oem_ntfs: [u8; 4] = "NTFS"
+  var valid: u32 = 1
+  var i: u32 = 0
+  while i < 4 {
+    if boot_sector.oem_id[i + 3] != oem_ntfs[i] {
+      valid = 0
+      break
+    }
+    i = i + 1
+  }
+
+  if valid == 0 {
+    foundation.serial_write_string("[NTFS] Invalid OEM ID (not NTFS)\n")
+    return 1
+  }
+
+  // Calculate important values
+  bytes_per_cluster = boot_sector.bytes_per_sector * boot_sector.sectors_per_cluster
+
+  // Calculate MFT record size
+  if boot_sector.clusters_per_mft_record >= 0 {
+    bytes_per_mft_record = boot_sector.clusters_per_mft_record * bytes_per_cluster
+  } else {
+    // Negative value means 2^(-clusters_per_mft_record) bytes
+    bytes_per_mft_record = 1 << (0 - boot_sector.clusters_per_mft_record)
+  }
+
+  mft_start_sector = ntfs_cluster_to_sector(boot_sector.mft_cluster)
+
+  foundation.serial_write_string("[NTFS] Cluster size: ")
+  foundation.serial_write_u32(bytes_per_cluster)
+  foundation.serial_write_string(" bytes\n")
+
+  foundation.serial_write_string("[NTFS] MFT record size: ")
+  foundation.serial_write_u32(bytes_per_mft_record)
+  foundation.serial_write_string(" bytes\n")
+
+  foundation.serial_write_string("[NTFS] MFT cluster: ")
+  foundation.serial_write_u64(boot_sector.mft_cluster)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("[NTFS] Total sectors: ")
+  foundation.serial_write_u64(boot_sector.total_sectors)
+  foundation.serial_write_string("\n")
+
+  // Initialize cache
+  i = 0
+  while i < 4 {
+    mft_cache_valid[i] = 0
+    i = i + 1
+  }
+  mft_cache_next = 0
+
+  // Initialize stats
+  ntfs_stats.reads = 0
+  ntfs_stats.bytes_read = 0
+  ntfs_stats.mft_reads = 0
+  ntfs_stats.attr_lookups = 0
+  ntfs_stats.cache_hits = 0
+  ntfs_stats.cache_misses = 0
+
+  ntfs_initialized = 1
+
+  foundation.serial_write_string("[NTFS] Initialized successfully (read-only mode)\n")
+  foundation.serial_write_string("  Note: This is a basic NTFS reader. Advanced features like:\n")
+  foundation.serial_write_string("  - Compressed files\n")
+  foundation.serial_write_string("  - Encrypted files\n")
+  foundation.serial_write_string("  - Complete B+ tree index parsing\n")
+  foundation.serial_write_string("  - Full runlist decoding\n")
+  foundation.serial_write_string("  are not yet implemented.\n")
+
   return 0
 }

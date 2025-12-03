@@ -1,0 +1,382 @@
+// home-os VFS - Buffer Cache (Page Cache)
+// Implements caching layer for file system I/O performance
+
+import "foundation.home" as foundation
+import "memory.home" as memory
+import "filesystem.home" as filesystem
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const CACHE_ENTRIES: u32 = 256  // Max cached blocks
+const BLOCK_SIZE: u32 = 4096
+const CACHE_HASH_SIZE: u32 = 64
+
+// Cache entry states
+const CACHE_STATE_FREE: u32 = 0
+const CACHE_STATE_CLEAN: u32 = 1
+const CACHE_STATE_DIRTY: u32 = 2
+const CACHE_STATE_LOCKED: u32 = 3
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct CacheEntry {
+  ino: u32,              // Inode number
+  block_num: u32,        // Block number within file
+  state: u32,            // CACHE_STATE_*
+  data: u64,             // Pointer to cached data (4KB)
+  last_access: u64,      // Timestamp for LRU
+  ref_count: u32,        // Reference count
+  dirty: u32,            // 1 if modified, needs writeback
+  hash_next: u32         // Next entry in hash chain
+}
+
+struct CacheStats {
+  hits: u64,
+  misses: u64,
+  evictions: u64,
+  writebacks: u64,
+  total_reads: u64,
+  total_writes: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var cache_entries: [CacheEntry; 256]
+var cache_hash_table: [u32; 64]  // Hash table heads
+var cache_initialized: u32 = 0
+var cache_stats: CacheStats
+var global_timestamp: u64 = 0
+
+// ============================================================================
+// HASH FUNCTION
+// ============================================================================
+
+fn cache_hash(ino: u32, block_num: u32): u32 {
+  var hash: u32 = ino
+  hash = hash ^ (block_num << 4)
+  hash = hash ^ (block_num >> 2)
+  return hash % CACHE_HASH_SIZE
+}
+
+// ============================================================================
+// CACHE LOOKUP
+// ============================================================================
+
+fn cache_lookup(ino: u32, block_num: u32): u32 {
+  var hash: u32 = cache_hash(ino, block_num)
+  var entry_idx: u32 = cache_hash_table[hash]
+
+  while entry_idx != 0xFFFFFFFF {
+    if cache_entries[entry_idx].ino == ino and cache_entries[entry_idx].block_num == block_num {
+      // Found it!
+      cache_stats.hits = cache_stats.hits + 1
+      cache_entries[entry_idx].last_access = global_timestamp
+      global_timestamp = global_timestamp + 1
+      cache_entries[entry_idx].ref_count = cache_entries[entry_idx].ref_count + 1
+      return entry_idx
+    }
+    entry_idx = cache_entries[entry_idx].hash_next
+  }
+
+  cache_stats.misses = cache_stats.misses + 1
+  return 0xFFFFFFFF
+}
+
+// ============================================================================
+// CACHE EVICTION (LRU)
+// ============================================================================
+
+fn cache_evict(): u32 {
+  var oldest_idx: u32 = 0xFFFFFFFF
+  var oldest_time: u64 = 0xFFFFFFFFFFFFFFFF
+
+  // Find least recently used entry with ref_count == 0
+  var i: u32 = 0
+  while i < CACHE_ENTRIES {
+    if cache_entries[i].state != CACHE_STATE_FREE and cache_entries[i].ref_count == 0 {
+      if cache_entries[i].last_access < oldest_time {
+        oldest_time = cache_entries[i].last_access
+        oldest_idx = i
+      }
+    }
+    i = i + 1
+  }
+
+  if oldest_idx == 0xFFFFFFFF {
+    return 0xFFFFFFFF  // No entries to evict
+  }
+
+  // Writeback if dirty
+  if cache_entries[oldest_idx].dirty == 1 {
+    cache_writeback(oldest_idx)
+  }
+
+  // Remove from hash chain
+  var hash: u32 = cache_hash(cache_entries[oldest_idx].ino, cache_entries[oldest_idx].block_num)
+  var prev_idx: u32 = 0xFFFFFFFF
+  var curr_idx: u32 = cache_hash_table[hash]
+
+  while curr_idx != 0xFFFFFFFF {
+    if curr_idx == oldest_idx {
+      if prev_idx == 0xFFFFFFFF {
+        cache_hash_table[hash] = cache_entries[curr_idx].hash_next
+      } else {
+        cache_entries[prev_idx].hash_next = cache_entries[curr_idx].hash_next
+      }
+      break
+    }
+    prev_idx = curr_idx
+    curr_idx = cache_entries[curr_idx].hash_next
+  }
+
+  // Free the data
+  if cache_entries[oldest_idx].data != 0 {
+    memory.pmm_free_page(cache_entries[oldest_idx].data)
+  }
+
+  cache_entries[oldest_idx].state = CACHE_STATE_FREE
+  cache_entries[oldest_idx].ino = 0
+  cache_stats.evictions = cache_stats.evictions + 1
+
+  return oldest_idx
+}
+
+// ============================================================================
+// CACHE ALLOCATION
+// ============================================================================
+
+fn cache_alloc(ino: u32, block_num: u32): u32 {
+  // Find free entry
+  var entry_idx: u32 = 0xFFFFFFFF
+  var i: u32 = 0
+  while i < CACHE_ENTRIES {
+    if cache_entries[i].state == CACHE_STATE_FREE {
+      entry_idx = i
+      break
+    }
+    i = i + 1
+  }
+
+  // If no free entry, evict one
+  if entry_idx == 0xFFFFFFFF {
+    entry_idx = cache_evict()
+  }
+
+  if entry_idx == 0xFFFFFFFF {
+    return 0xFFFFFFFF  // Failed to allocate
+  }
+
+  // Allocate data block
+  var data_addr: u64 = memory.pmm_alloc_page()
+  if data_addr == 0 {
+    return 0xFFFFFFFF
+  }
+
+  // Initialize entry
+  cache_entries[entry_idx].ino = ino
+  cache_entries[entry_idx].block_num = block_num
+  cache_entries[entry_idx].state = CACHE_STATE_CLEAN
+  cache_entries[entry_idx].data = data_addr
+  cache_entries[entry_idx].last_access = global_timestamp
+  global_timestamp = global_timestamp + 1
+  cache_entries[entry_idx].ref_count = 1
+  cache_entries[entry_idx].dirty = 0
+
+  // Add to hash table
+  var hash: u32 = cache_hash(ino, block_num)
+  cache_entries[entry_idx].hash_next = cache_hash_table[hash]
+  cache_hash_table[hash] = entry_idx
+
+  return entry_idx
+}
+
+// ============================================================================
+// CACHE READ
+// ============================================================================
+
+export fn cache_read_block(ino: u32, block_num: u32, dest: u64): u32 {
+  cache_stats.total_reads = cache_stats.total_reads + 1
+
+  // Check if in cache
+  var entry_idx: u32 = cache_lookup(ino, block_num)
+
+  if entry_idx != 0xFFFFFFFF {
+    // Cache hit - copy from cache
+    memory.memcpy(dest, cache_entries[entry_idx].data, BLOCK_SIZE)
+    cache_entries[entry_idx].ref_count = cache_entries[entry_idx].ref_count - 1
+    return 0
+  }
+
+  // Cache miss - allocate entry
+  entry_idx = cache_alloc(ino, block_num)
+  if entry_idx == 0xFFFFFFFF {
+    return 1  // Failed to allocate cache entry
+  }
+
+  // Read from disk into cache
+  // TODO: Call actual disk read function
+  // For now, just zero the block
+  memory.memset(cache_entries[entry_idx].data, 0, BLOCK_SIZE)
+
+  // Copy to destination
+  memory.memcpy(dest, cache_entries[entry_idx].data, BLOCK_SIZE)
+  cache_entries[entry_idx].ref_count = cache_entries[entry_idx].ref_count - 1
+
+  return 0
+}
+
+// ============================================================================
+// CACHE WRITE
+// ============================================================================
+
+export fn cache_write_block(ino: u32, block_num: u32, src: u64): u32 {
+  cache_stats.total_writes = cache_stats.total_writes + 1
+
+  // Check if in cache
+  var entry_idx: u32 = cache_lookup(ino, block_num)
+
+  if entry_idx == 0xFFFFFFFF {
+    // Allocate new cache entry
+    entry_idx = cache_alloc(ino, block_num)
+    if entry_idx == 0xFFFFFFFF {
+      return 1  // Failed
+    }
+  }
+
+  // Write to cache
+  memory.memcpy(cache_entries[entry_idx].data, src, BLOCK_SIZE)
+  cache_entries[entry_idx].dirty = 1
+  cache_entries[entry_idx].state = CACHE_STATE_DIRTY
+  cache_entries[entry_idx].ref_count = cache_entries[entry_idx].ref_count - 1
+
+  return 0
+}
+
+// ============================================================================
+// WRITEBACK
+// ============================================================================
+
+fn cache_writeback(entry_idx: u32) {
+  if cache_entries[entry_idx].dirty == 0 {
+    return  // Not dirty
+  }
+
+  // TODO: Call actual disk write function
+  // For now, just mark as clean
+
+  cache_entries[entry_idx].dirty = 0
+  cache_entries[entry_idx].state = CACHE_STATE_CLEAN
+  cache_stats.writebacks = cache_stats.writebacks + 1
+}
+
+export fn cache_sync() {
+  // Writeback all dirty blocks
+  var i: u32 = 0
+  while i < CACHE_ENTRIES {
+    if cache_entries[i].state == CACHE_STATE_DIRTY {
+      cache_writeback(i)
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// CACHE INVALIDATION
+// ============================================================================
+
+export fn cache_invalidate_inode(ino: u32) {
+  var i: u32 = 0
+  while i < CACHE_ENTRIES {
+    if cache_entries[i].ino == ino and cache_entries[i].state != CACHE_STATE_FREE {
+      // Writeback if dirty
+      if cache_entries[i].dirty == 1 {
+        cache_writeback(i)
+      }
+
+      // Free the entry
+      if cache_entries[i].data != 0 {
+        memory.pmm_free_page(cache_entries[i].data)
+      }
+      cache_entries[i].state = CACHE_STATE_FREE
+      cache_entries[i].ino = 0
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn cache_get_stats(): CacheStats {
+  return cache_stats
+}
+
+export fn cache_print_stats() {
+  foundation.serial_write_string("[Buffer Cache Stats]\n")
+  foundation.serial_write_string("  Hits: ")
+  foundation.serial_write_u64(cache_stats.hits)
+  foundation.serial_write_string("\n  Misses: ")
+  foundation.serial_write_u64(cache_stats.misses)
+  foundation.serial_write_string("\n  Evictions: ")
+  foundation.serial_write_u64(cache_stats.evictions)
+  foundation.serial_write_string("\n  Writebacks: ")
+  foundation.serial_write_u64(cache_stats.writebacks)
+  foundation.serial_write_string("\n")
+
+  var hit_rate: u64 = 0
+  var total: u64 = cache_stats.hits + cache_stats.misses
+  if total > 0 {
+    hit_rate = (cache_stats.hits * 100) / total
+  }
+  foundation.serial_write_string("  Hit rate: ")
+  foundation.serial_write_u64(hit_rate)
+  foundation.serial_write_string("%\n")
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn cache_init() {
+  if cache_initialized == 1 { return }
+
+  // Initialize hash table
+  var i: u32 = 0
+  while i < CACHE_HASH_SIZE {
+    cache_hash_table[i] = 0xFFFFFFFF
+    i = i + 1
+  }
+
+  // Initialize cache entries
+  i = 0
+  while i < CACHE_ENTRIES {
+    cache_entries[i].state = CACHE_STATE_FREE
+    cache_entries[i].ino = 0
+    cache_entries[i].block_num = 0
+    cache_entries[i].data = 0
+    cache_entries[i].ref_count = 0
+    cache_entries[i].dirty = 0
+    cache_entries[i].hash_next = 0xFFFFFFFF
+    i = i + 1
+  }
+
+  // Initialize stats
+  cache_stats.hits = 0
+  cache_stats.misses = 0
+  cache_stats.evictions = 0
+  cache_stats.writebacks = 0
+  cache_stats.total_reads = 0
+  cache_stats.total_writes = 0
+
+  global_timestamp = 0
+  cache_initialized = 1
+
+  foundation.serial_write_string("[Buffer Cache] Initialized (256 entries, 1MB)\n")
+}

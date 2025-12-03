@@ -1,0 +1,349 @@
+// home-os VFS - File Locking
+// Implements advisory file locking (flock and fcntl-style locks)
+
+import "foundation.home" as foundation
+import "memory.home" as memory
+import "filesystem.home" as filesystem
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_LOCKS: u32 = 512
+
+// Lock types (flock-style)
+const LOCK_NONE: u32 = 0
+const LOCK_SHARED: u32 = 1      // Multiple readers
+const LOCK_EXCLUSIVE: u32 = 2   // Single writer
+
+// fcntl lock types
+const F_RDLCK: u32 = 0   // Shared lock
+const F_WRLCK: u32 = 1   // Exclusive lock
+const F_UNLCK: u32 = 2   // Unlock
+
+// Lock flags
+const LOCK_BLOCKING: u32 = 0
+const LOCK_NONBLOCKING: u32 = 1
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct FileLock {
+  ino: u32,              // Inode being locked
+  pid: u32,              // Process holding lock
+  lock_type: u32,        // LOCK_SHARED or LOCK_EXCLUSIVE
+  start: u64,            // Start offset (for range locks, 0 for whole file)
+  length: u64,           // Length (0 = whole file)
+  active: u32            // 1 if lock is active
+}
+
+struct LockStats {
+  total_locks: u64,
+  shared_locks: u64,
+  exclusive_locks: u64,
+  lock_conflicts: u64,
+  lock_timeouts: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var file_locks: [FileLock; 512]
+var lock_count: u32 = 0
+var lock_stats: LockStats
+var locks_initialized: u32 = 0
+
+// ============================================================================
+// LOCK CHECKING
+// ============================================================================
+
+fn check_lock_conflict(ino: u32, lock_type: u32, start: u64, length: u64): u32 {
+  var i: u32 = 0
+  while i < MAX_LOCKS {
+    if file_locks[i].active == 1 and file_locks[i].ino == ino {
+      // Check if ranges overlap
+      var lock_end: u64 = file_locks[i].start + file_locks[i].length
+      var request_end: u64 = start + length
+
+      // Whole file locks (length == 0)
+      var overlaps: u32 = 0
+      if file_locks[i].length == 0 or length == 0 {
+        overlaps = 1  // Whole file lock always overlaps
+      } else if start < lock_end and request_end > file_locks[i].start {
+        overlaps = 1  // Ranges overlap
+      }
+
+      if overlaps == 1 {
+        // Check for conflict
+        if lock_type == LOCK_EXCLUSIVE or file_locks[i].lock_type == LOCK_EXCLUSIVE {
+          // Exclusive locks conflict with everything
+          lock_stats.lock_conflicts = lock_stats.lock_conflicts + 1
+          return 1  // Conflict
+        }
+        // Shared locks don't conflict with each other
+      }
+    }
+    i = i + 1
+  }
+
+  return 0  // No conflict
+}
+
+// ============================================================================
+// FLOCK-STYLE LOCKING
+// ============================================================================
+
+export fn vfs_flock(fd: u32, operation: u32): u32 {
+  // Get inode from file descriptor
+  // TODO: Map fd to inode
+  var ino: u32 = fd  // Placeholder
+
+  var lock_type: u32 = operation & 0x3
+  var nonblock: u32 = operation & 4  // LOCK_NB flag
+
+  if lock_type == F_UNLCK {
+    // Unlock
+    return vfs_unlock_file(ino, 0)  // PID 0 = current process
+  }
+
+  // Check for conflicts
+  var conflict: u32 = check_lock_conflict(ino, lock_type, 0, 0)
+  if conflict == 1 {
+    if nonblock == 1 {
+      return 1  // EWOULDBLOCK
+    }
+    // TODO: Block until lock available
+    return 1  // For now, fail
+  }
+
+  // Find free lock slot
+  var i: u32 = 0
+  while i < MAX_LOCKS {
+    if file_locks[i].active == 0 {
+      file_locks[i].ino = ino
+      file_locks[i].pid = 0  // TODO: Get current PID
+      file_locks[i].lock_type = lock_type
+      file_locks[i].start = 0
+      file_locks[i].length = 0  // Whole file
+      file_locks[i].active = 1
+
+      lock_count = lock_count + 1
+      lock_stats.total_locks = lock_stats.total_locks + 1
+
+      if lock_type == LOCK_SHARED {
+        lock_stats.shared_locks = lock_stats.shared_locks + 1
+      } else {
+        lock_stats.exclusive_locks = lock_stats.exclusive_locks + 1
+      }
+
+      foundation.serial_write_string("[VFS] File locked (type: ")
+      foundation.serial_write_u32(lock_type)
+      foundation.serial_write_string(")\n")
+
+      return 0
+    }
+    i = i + 1
+  }
+
+  return 1  // No free lock slots
+}
+
+// ============================================================================
+// FCNTL-STYLE RANGE LOCKING
+// ============================================================================
+
+export fn vfs_fcntl_lock(fd: u32, cmd: u32, lock_type: u32, start: u64, length: u64): u32 {
+  // Get inode from file descriptor
+  var ino: u32 = fd  // Placeholder
+
+  if lock_type == F_UNLCK {
+    // Unlock range
+    return vfs_unlock_range(ino, 0, start, length)
+  }
+
+  // Check for conflicts
+  var conflict: u32 = check_lock_conflict(ino, lock_type, start, length)
+  if conflict == 1 {
+    return 1  // EAGAIN
+  }
+
+  // Find free lock slot
+  var i: u32 = 0
+  while i < MAX_LOCKS {
+    if file_locks[i].active == 0 {
+      file_locks[i].ino = ino
+      file_locks[i].pid = 0  // TODO: Get current PID
+      file_locks[i].lock_type = lock_type
+      file_locks[i].start = start
+      file_locks[i].length = length
+      file_locks[i].active = 1
+
+      lock_count = lock_count + 1
+      lock_stats.total_locks = lock_stats.total_locks + 1
+
+      if lock_type == LOCK_SHARED {
+        lock_stats.shared_locks = lock_stats.shared_locks + 1
+      } else {
+        lock_stats.exclusive_locks = lock_stats.exclusive_locks + 1
+      }
+
+      foundation.serial_write_string("[VFS] Range locked (")
+      foundation.serial_write_u64(start)
+      foundation.serial_write_string(" + ")
+      foundation.serial_write_u64(length)
+      foundation.serial_write_string(")\n")
+
+      return 0
+    }
+    i = i + 1
+  }
+
+  return 1  // No free lock slots
+}
+
+// ============================================================================
+// UNLOCK
+// ============================================================================
+
+export fn vfs_unlock_file(ino: u32, pid: u32): u32 {
+  var unlocked: u32 = 0
+
+  var i: u32 = 0
+  while i < MAX_LOCKS {
+    if file_locks[i].active == 1 and file_locks[i].ino == ino {
+      // If pid == 0, unlock all locks for this inode
+      // Otherwise, only unlock locks held by this pid
+      if pid == 0 or file_locks[i].pid == pid {
+        file_locks[i].active = 0
+        lock_count = lock_count - 1
+        unlocked = unlocked + 1
+      }
+    }
+    i = i + 1
+  }
+
+  if unlocked > 0 {
+    foundation.serial_write_string("[VFS] Unlocked ")
+    foundation.serial_write_u32(unlocked)
+    foundation.serial_write_string(" lock(s)\n")
+  }
+
+  return 0
+}
+
+export fn vfs_unlock_range(ino: u32, pid: u32, start: u64, length: u64): u32 {
+  var unlocked: u32 = 0
+
+  var i: u32 = 0
+  while i < MAX_LOCKS {
+    if file_locks[i].active == 1 and file_locks[i].ino == ino {
+      if pid == 0 or file_locks[i].pid == pid {
+        // Check if ranges match
+        if file_locks[i].start == start and file_locks[i].length == length {
+          file_locks[i].active = 0
+          lock_count = lock_count - 1
+          unlocked = unlocked + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  return 0
+}
+
+// ============================================================================
+// LOCK QUERIES
+// ============================================================================
+
+export fn vfs_is_locked(ino: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_LOCKS {
+    if file_locks[i].active == 1 and file_locks[i].ino == ino {
+      return 1
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+export fn vfs_get_lock_type(ino: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_LOCKS {
+    if file_locks[i].active == 1 and file_locks[i].ino == ino {
+      return file_locks[i].lock_type
+    }
+    i = i + 1
+  }
+  return LOCK_NONE
+}
+
+// ============================================================================
+// CLEANUP
+// ============================================================================
+
+export fn vfs_unlock_all_for_process(pid: u32) {
+  var i: u32 = 0
+  while i < MAX_LOCKS {
+    if file_locks[i].active == 1 and file_locks[i].pid == pid {
+      file_locks[i].active = 0
+      lock_count = lock_count - 1
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn vfs_lock_get_stats(): LockStats {
+  return lock_stats
+}
+
+export fn vfs_lock_print_stats() {
+  foundation.serial_write_string("[File Locking Stats]\n")
+  foundation.serial_write_string("  Total locks acquired: ")
+  foundation.serial_write_u64(lock_stats.total_locks)
+  foundation.serial_write_string("\n  Shared locks: ")
+  foundation.serial_write_u64(lock_stats.shared_locks)
+  foundation.serial_write_string("\n  Exclusive locks: ")
+  foundation.serial_write_u64(lock_stats.exclusive_locks)
+  foundation.serial_write_string("\n  Lock conflicts: ")
+  foundation.serial_write_u64(lock_stats.lock_conflicts)
+  foundation.serial_write_string("\n  Active locks: ")
+  foundation.serial_write_u32(lock_count)
+  foundation.serial_write_string("\n")
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn vfs_locking_init() {
+  if locks_initialized == 1 { return }
+
+  var i: u32 = 0
+  while i < MAX_LOCKS {
+    file_locks[i].active = 0
+    file_locks[i].ino = 0
+    file_locks[i].pid = 0
+    file_locks[i].lock_type = LOCK_NONE
+    file_locks[i].start = 0
+    file_locks[i].length = 0
+    i = i + 1
+  }
+
+  lock_count = 0
+  lock_stats.total_locks = 0
+  lock_stats.shared_locks = 0
+  lock_stats.exclusive_locks = 0
+  lock_stats.lock_conflicts = 0
+  lock_stats.lock_timeouts = 0
+
+  locks_initialized = 1
+
+  foundation.serial_write_string("[File Locking] Initialized (512 lock slots)\n")
+}

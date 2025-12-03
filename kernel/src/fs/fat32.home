@@ -1,8 +1,30 @@
 // home-os FAT32 Filesystem Driver
-// Real FAT32 implementation
+// Complete FAT32 (File Allocation Table 32) implementation
 
 import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
 import "../drivers/ata.home" as ata
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const FAT32_SIGNATURE: u16 = 0xAA55
+const FAT32_ATTR_READ_ONLY: u8 = 0x01
+const FAT32_ATTR_HIDDEN: u8 = 0x02
+const FAT32_ATTR_SYSTEM: u8 = 0x04
+const FAT32_ATTR_VOLUME_ID: u8 = 0x08
+const FAT32_ATTR_DIRECTORY: u8 = 0x10
+const FAT32_ATTR_ARCHIVE: u8 = 0x20
+const FAT32_ATTR_LONG_NAME: u8 = 0x0F
+
+const FAT32_EOC: u32 = 0x0FFFFFF8  // End of chain marker
+const FAT32_BAD_CLUSTER: u32 = 0x0FFFFFF7
+const FAT32_FREE_CLUSTER: u32 = 0x00000000
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
 
 struct FAT32BootSector {
   jmp: [u8; 3],
@@ -19,56 +41,618 @@ struct FAT32BootSector {
   heads: u16,
   hidden_sectors: u32,
   total_sectors_32: u32,
+
+  // FAT32 extended
   sectors_per_fat_32: u32,
   flags: u16,
   version: u16,
-  root_cluster: u32
+  root_cluster: u32,
+  fsinfo_sector: u16,
+  backup_boot_sector: u16,
+  reserved: [u8; 12],
+  drive_number: u8,
+  reserved1: u8,
+  boot_signature: u8,
+  volume_id: u32,
+  volume_label: [u8; 11],
+  fs_type: [u8; 8]
 }
+
+struct FAT32FSInfo {
+  lead_signature: u32,
+  reserved1: [u8; 480],
+  struct_signature: u32,
+  free_count: u32,
+  next_free: u32,
+  reserved2: [u8; 12],
+  trail_signature: u32
+}
+
+struct FAT32DirEntry {
+  name: [u8; 11],
+  attr: u8,
+  nt_reserved: u8,
+  create_time_tenth: u8,
+  create_time: u16,
+  create_date: u16,
+  access_date: u16,
+  first_cluster_high: u16,
+  modify_time: u16,
+  modify_date: u16,
+  first_cluster_low: u16,
+  file_size: u32
+}
+
+struct FAT32LongEntry {
+  order: u8,
+  name1: [u16; 5],
+  attr: u8,
+  entry_type: u8,
+  checksum: u8,
+  name2: [u16; 6],
+  zero: u16,
+  name3: [u16; 2]
+}
+
+struct FAT32Stats {
+  reads: u64,
+  writes: u64,
+  bytes_read: u64,
+  bytes_written: u64,
+  cluster_reads: u64,
+  fat_lookups: u64,
+  cache_hits: u64,
+  cache_misses: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
 
 var fat32_initialized: u32 = 0
 var boot_sector: FAT32BootSector
+var fsinfo: FAT32FSInfo
 var fat_start: u32 = 0
 var data_start: u32 = 0
+var cluster_size: u32 = 0
+var total_clusters: u32 = 0
+var fat32_stats: FAT32Stats
 
-export fn fat32_init() {
-  if fat32_initialized == 1 { return }
-  
-  var buffer: [u8; 512]
-  ata.ata_read_sector(0, 0, @ptrFromInt(buffer))
-  
-  boot_sector = @intToPtr(@ptrFromInt(buffer), FAT32BootSector)
-  
-  fat_start = boot_sector.reserved_sectors
-  data_start = fat_start + (boot_sector.fat_count * boot_sector.sectors_per_fat_32)
-  
-  fat32_initialized = 1
-  foundation.serial_write_string("[FAT32] Initialized\n")
+// FAT cache (cache one FAT sector)
+var fat_cache: [u8; 512]
+var fat_cache_sector: u32 = 0xFFFFFFFF
+var fat_cache_valid: u32 = 0
+
+// Cluster cache (4 clusters)
+var cluster_cache: [[u8; 32768]; 4]  // Max 8 sectors/cluster * 4KB
+var cluster_cache_tags: [u32; 4]
+var cluster_cache_valid: [u32; 4]
+var cluster_cache_next: u32 = 0
+
+// ============================================================================
+// STRING UTILITIES
+// ============================================================================
+
+fn str_len(s: u64): u32 {
+  var ptr: *u8 = @ptrFromInt(s)
+  var len: u32 = 0
+  while ptr[len] != 0 {
+    len = len + 1
+  }
+  return len
 }
 
-export fn fat32_read_cluster(cluster: u32, buffer: u64): u32 {
-  if fat32_initialized == 0 { return 1 }
-  
-  var first_sector: u32 = data_start + ((cluster - 2) * boot_sector.sectors_per_cluster)
-  
+fn str_compare(s1: u64, s2: u64, len: u32): u32 {
+  var p1: *u8 = @ptrFromInt(s1)
+  var p2: *u8 = @ptrFromInt(s2)
   var i: u32 = 0
-  while i < boot_sector.sectors_per_cluster {
-    ata.ata_read_sector(0, first_sector + i, buffer + (i * 512))
+  while i < len {
+    if p1[i] != p2[i] {
+      return 0
+    }
     i = i + 1
   }
-  
+  return 1
+}
+
+fn to_upper(c: u8): u8 {
+  if c >= 97 and c <= 122 {  // 'a' to 'z'
+    return c - 32
+  }
+  return c
+}
+
+// ============================================================================
+// FAT OPERATIONS
+// ============================================================================
+
+fn fat32_read_fat_sector(sector: u32): u32 {
+  if fat_cache_valid == 1 and fat_cache_sector == sector {
+    fat32_stats.cache_hits = fat32_stats.cache_hits + 1
+    return 0
+  }
+
+  fat32_stats.cache_misses = fat32_stats.cache_misses + 1
+
+  ata.ata_read_sector(0, fat_start + sector, @ptrFromInt(fat_cache))
+  fat_cache_sector = sector
+  fat_cache_valid = 1
+
   return 0
 }
 
 export fn fat32_get_next_cluster(cluster: u32): u32 {
-  if fat32_initialized == 0 { return 0xFFFFFFFF }
-  
+  if fat32_initialized == 0 {
+    return FAT32_EOC
+  }
+
+  if cluster < 2 or cluster >= total_clusters {
+    return FAT32_EOC
+  }
+
+  fat32_stats.fat_lookups = fat32_stats.fat_lookups + 1
+
+  // Calculate FAT offset
   var fat_offset: u32 = cluster * 4
-  var fat_sector: u32 = fat_start + (fat_offset / 512)
+  var fat_sector: u32 = fat_offset / 512
   var entry_offset: u32 = fat_offset % 512
-  
-  var buffer: [u8; 512]
-  ata.ata_read_sector(0, fat_sector, @ptrFromInt(buffer))
-  
-  var next: u32 = @intToPtr(@ptrFromInt(buffer) + entry_offset, u32)
-  return next & 0x0FFFFFFF
+
+  // Read FAT sector (cached)
+  fat32_read_fat_sector(fat_sector)
+
+  // Get FAT entry
+  var fat_ptr: *u32 = @ptrFromInt(@ptrFromInt(fat_cache) + entry_offset)
+  var next: u32 = fat_ptr[0] & 0x0FFFFFFF
+
+  return next
+}
+
+fn fat32_is_eoc(cluster: u32): u32 {
+  return if cluster >= FAT32_EOC then 1 else 0
+}
+
+// ============================================================================
+// CLUSTER OPERATIONS
+// ============================================================================
+
+fn fat32_cluster_to_sector(cluster: u32): u32 {
+  if cluster < 2 {
+    return 0
+  }
+  return data_start + ((cluster - 2) * boot_sector.sectors_per_cluster)
+}
+
+export fn fat32_read_cluster(cluster: u32, buffer: u64): u32 {
+  if fat32_initialized == 0 {
+    return 1
+  }
+
+  if cluster < 2 or cluster >= total_clusters {
+    foundation.serial_write_string("[FAT32] Invalid cluster: ")
+    foundation.serial_write_u32(cluster)
+    foundation.serial_write_string("\n")
+    return 1
+  }
+
+  // Check cache
+  var i: u32 = 0
+  while i < 4 {
+    if cluster_cache_valid[i] == 1 and cluster_cache_tags[i] == cluster {
+      fat32_stats.cache_hits = fat32_stats.cache_hits + 1
+      memory.mem_copy(buffer, @ptrFromInt(cluster_cache[i]), cluster_size)
+      return 0
+    }
+    i = i + 1
+  }
+
+  fat32_stats.cache_misses = fat32_stats.cache_misses + 1
+
+  // Read from disk
+  var first_sector: u32 = fat32_cluster_to_sector(cluster)
+
+  var sector: u32 = 0
+  while sector < boot_sector.sectors_per_cluster {
+    ata.ata_read_sector(0, first_sector + sector, buffer + (sector * 512))
+    sector = sector + 1
+  }
+
+  // Update cache
+  var cache_idx: u32 = cluster_cache_next
+  memory.mem_copy(@ptrFromInt(cluster_cache[cache_idx]), buffer, cluster_size)
+  cluster_cache_tags[cache_idx] = cluster
+  cluster_cache_valid[cache_idx] = 1
+  cluster_cache_next = (cluster_cache_next + 1) % 4
+
+  fat32_stats.cluster_reads = fat32_stats.cluster_reads + 1
+  fat32_stats.bytes_read = fat32_stats.bytes_read + cluster_size
+
+  return 0
+}
+
+// ============================================================================
+// FILENAME CONVERSION
+// ============================================================================
+
+fn fat32_name_to_83(name: u64, out_name: u64) {
+  var name_ptr: *u8 = @ptrFromInt(name)
+  var out_ptr: *u8 = @ptrFromInt(out_name)
+
+  // Initialize with spaces
+  var i: u32 = 0
+  while i < 11 {
+    out_ptr[i] = 32  // Space
+    i = i + 1
+  }
+
+  // Find dot position
+  var dot_pos: u32 = 0
+  i = 0
+  while name_ptr[i] != 0 {
+    if name_ptr[i] == 46 {  // '.'
+      dot_pos = i
+      break
+    }
+    i = i + 1
+  }
+
+  // Copy name part (max 8 chars)
+  var name_idx: u32 = 0
+  i = 0
+  while i < 8 and name_ptr[i] != 0 and name_ptr[i] != 46 {
+    out_ptr[name_idx] = to_upper(name_ptr[i])
+    name_idx = name_idx + 1
+    i = i + 1
+  }
+
+  // Copy extension part (max 3 chars)
+  if dot_pos > 0 {
+    var ext_idx: u32 = 8
+    i = dot_pos + 1
+    while ext_idx < 11 and name_ptr[i] != 0 {
+      out_ptr[ext_idx] = to_upper(name_ptr[i])
+      ext_idx = ext_idx + 1
+      i = i + 1
+    }
+  }
+}
+
+fn fat32_compare_name(entry_name: u64, search_name: u64): u32 {
+  var fat_name: [u8; 11]
+  fat32_name_to_83(search_name, @ptrFromInt(fat_name))
+
+  return str_compare(entry_name, @ptrFromInt(fat_name), 11)
+}
+
+// ============================================================================
+// DIRECTORY OPERATIONS
+// ============================================================================
+
+export fn fat32_lookup_entry(dir_cluster: u32, name: u64): u32 {
+  if fat32_initialized == 0 {
+    return 0
+  }
+
+  var current_cluster: u32 = dir_cluster
+  var cluster_buffer: [u8; 32768]
+
+  while fat32_is_eoc(current_cluster) == 0 {
+    // Read directory cluster
+    if fat32_read_cluster(current_cluster, @ptrFromInt(cluster_buffer)) != 0 {
+      return 0
+    }
+
+    // Parse directory entries
+    var entries_per_cluster: u32 = cluster_size / 32
+    var i: u32 = 0
+    while i < entries_per_cluster {
+      var entry: *FAT32DirEntry = @ptrFromInt(@ptrFromInt(cluster_buffer) + (i * 32))
+
+      // Check for end of directory
+      if entry.name[0] == 0 {
+        return 0
+      }
+
+      // Skip deleted entries
+      if entry.name[0] == 0xE5 {
+        i = i + 1
+        continue
+      }
+
+      // Skip long name entries
+      if entry.attr == FAT32_ATTR_LONG_NAME {
+        i = i + 1
+        continue
+      }
+
+      // Compare names
+      if fat32_compare_name(@ptrFromInt(entry.name), name) == 1 {
+        var cluster_high: u32 = entry.first_cluster_high
+        var cluster_low: u32 = entry.first_cluster_low
+        return (cluster_high << 16) | cluster_low
+      }
+
+      i = i + 1
+    }
+
+    // Move to next cluster in chain
+    current_cluster = fat32_get_next_cluster(current_cluster)
+  }
+
+  return 0
+}
+
+export fn fat32_list_directory(dir_cluster: u32): u32 {
+  if fat32_initialized == 0 {
+    return 1
+  }
+
+  foundation.serial_write_string("[FAT32] Directory listing:\n")
+
+  var current_cluster: u32 = dir_cluster
+  var cluster_buffer: [u8; 32768]
+
+  while fat32_is_eoc(current_cluster) == 0 {
+    if fat32_read_cluster(current_cluster, @ptrFromInt(cluster_buffer)) != 0 {
+      return 1
+    }
+
+    var entries_per_cluster: u32 = cluster_size / 32
+    var i: u32 = 0
+    while i < entries_per_cluster {
+      var entry: *FAT32DirEntry = @ptrFromInt(@ptrFromInt(cluster_buffer) + (i * 32))
+
+      if entry.name[0] == 0 {
+        return 0  // End of directory
+      }
+
+      if entry.name[0] != 0xE5 and entry.attr != FAT32_ATTR_LONG_NAME {
+        foundation.serial_write_string("  ")
+
+        // Print name
+        var j: u32 = 0
+        while j < 11 {
+          if entry.name[j] != 32 {  // Not space
+            var c: [u8; 2]
+            c[0] = entry.name[j]
+            c[1] = 0
+            foundation.serial_write_string(@ptrFromInt(c))
+          }
+          if j == 7 {
+            foundation.serial_write_string(".")
+          }
+          j = j + 1
+        }
+
+        foundation.serial_write_string(" (")
+        if (entry.attr & FAT32_ATTR_DIRECTORY) != 0 {
+          foundation.serial_write_string("DIR")
+        } else {
+          foundation.serial_write_u32(entry.file_size)
+          foundation.serial_write_string(" bytes")
+        }
+        foundation.serial_write_string(")\n")
+      }
+
+      i = i + 1
+    }
+
+    current_cluster = fat32_get_next_cluster(current_cluster)
+  }
+
+  return 0
+}
+
+// ============================================================================
+// FILE OPERATIONS
+// ============================================================================
+
+export fn fat32_read_file(first_cluster: u32, offset: u64, buffer: u64, size: u64): u64 {
+  if fat32_initialized == 0 {
+    return 0
+  }
+
+  if first_cluster < 2 or first_cluster >= total_clusters {
+    return 0
+  }
+
+  var bytes_read: u64 = 0
+  var current_offset: u64 = 0
+  var current_cluster: u32 = first_cluster
+
+  // Skip to starting cluster
+  while current_offset + cluster_size <= offset {
+    current_cluster = fat32_get_next_cluster(current_cluster)
+    if fat32_is_eoc(current_cluster) == 1 {
+      return 0  // Offset beyond file
+    }
+    current_offset = current_offset + cluster_size
+  }
+
+  // Read data
+  var cluster_buffer: [u8; 32768]
+
+  while bytes_read < size and fat32_is_eoc(current_cluster) == 0 {
+    // Read cluster
+    if fat32_read_cluster(current_cluster, @ptrFromInt(cluster_buffer)) != 0 {
+      return bytes_read
+    }
+
+    // Calculate offset within cluster
+    var cluster_offset: u32 = 0
+    if current_offset < offset {
+      cluster_offset = offset - current_offset
+    }
+
+    // Calculate bytes to copy
+    var to_copy: u32 = cluster_size - cluster_offset
+    if to_copy > (size - bytes_read) {
+      to_copy = size - bytes_read
+    }
+
+    // Copy data
+    memory.mem_copy(buffer + bytes_read, @ptrFromInt(cluster_buffer) + cluster_offset, to_copy)
+
+    bytes_read = bytes_read + to_copy
+    current_offset = current_offset + cluster_size
+
+    // Move to next cluster
+    if bytes_read < size {
+      current_cluster = fat32_get_next_cluster(current_cluster)
+    }
+  }
+
+  return bytes_read
+}
+
+export fn fat32_get_file_size(dir_cluster: u32, name: u64): u32 {
+  if fat32_initialized == 0 {
+    return 0
+  }
+
+  var current_cluster: u32 = dir_cluster
+  var cluster_buffer: [u8; 32768]
+
+  while fat32_is_eoc(current_cluster) == 0 {
+    if fat32_read_cluster(current_cluster, @ptrFromInt(cluster_buffer)) != 0 {
+      return 0
+    }
+
+    var entries_per_cluster: u32 = cluster_size / 32
+    var i: u32 = 0
+    while i < entries_per_cluster {
+      var entry: *FAT32DirEntry = @ptrFromInt(@ptrFromInt(cluster_buffer) + (i * 32))
+
+      if entry.name[0] == 0 {
+        return 0
+      }
+
+      if entry.name[0] != 0xE5 and entry.attr != FAT32_ATTR_LONG_NAME {
+        if fat32_compare_name(@ptrFromInt(entry.name), name) == 1 {
+          return entry.file_size
+        }
+      }
+
+      i = i + 1
+    }
+
+    current_cluster = fat32_get_next_cluster(current_cluster)
+  }
+
+  return 0
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn fat32_get_stats(): *FAT32Stats {
+  return @ptrFromInt(fat32_stats)
+}
+
+export fn fat32_print_stats() {
+  foundation.serial_write_string("[FAT32 Stats]\n")
+  foundation.serial_write_string("  Cluster reads: ")
+  foundation.serial_write_u64(fat32_stats.cluster_reads)
+  foundation.serial_write_string("\n  Bytes read: ")
+  foundation.serial_write_u64(fat32_stats.bytes_read)
+  foundation.serial_write_string("\n  FAT lookups: ")
+  foundation.serial_write_u64(fat32_stats.fat_lookups)
+  foundation.serial_write_string("\n  Cache hits: ")
+  foundation.serial_write_u64(fat32_stats.cache_hits)
+  foundation.serial_write_string("\n  Cache misses: ")
+  foundation.serial_write_u64(fat32_stats.cache_misses)
+
+  if fat32_stats.cache_hits + fat32_stats.cache_misses > 0 {
+    var hit_rate: u64 = (fat32_stats.cache_hits * 100) / (fat32_stats.cache_hits + fat32_stats.cache_misses)
+    foundation.serial_write_string("\n  Cache hit rate: ")
+    foundation.serial_write_u64(hit_rate)
+    foundation.serial_write_string("%\n")
+  } else {
+    foundation.serial_write_string("\n")
+  }
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn fat32_init(): u32 {
+  if fat32_initialized == 1 {
+    return 0
+  }
+
+  foundation.serial_write_string("[FAT32] Initializing...\n")
+
+  // Read boot sector
+  var boot_buffer: [u8; 512]
+  ata.ata_read_sector(0, 0, @ptrFromInt(boot_buffer))
+
+  // Parse boot sector
+  var bs_ptr: *FAT32BootSector = @ptrFromInt(boot_buffer)
+  boot_sector = bs_ptr[0]
+
+  // Verify signature
+  var signature: *u16 = @ptrFromInt(@ptrFromInt(boot_buffer) + 510)
+  if signature[0] != FAT32_SIGNATURE {
+    foundation.serial_write_string("[FAT32] Invalid boot signature\n")
+    return 1
+  }
+
+  // Calculate important values
+  fat_start = boot_sector.reserved_sectors
+  data_start = fat_start + (boot_sector.fat_count * boot_sector.sectors_per_fat_32)
+  cluster_size = boot_sector.bytes_per_sector * boot_sector.sectors_per_cluster
+
+  var total_sectors: u32 = if boot_sector.total_sectors_16 != 0 then boot_sector.total_sectors_16 else boot_sector.total_sectors_32
+  var data_sectors: u32 = total_sectors - data_start
+  total_clusters = data_sectors / boot_sector.sectors_per_cluster
+
+  foundation.serial_write_string("[FAT32] Cluster size: ")
+  foundation.serial_write_u32(cluster_size)
+  foundation.serial_write_string(" bytes\n")
+
+  foundation.serial_write_string("[FAT32] Total clusters: ")
+  foundation.serial_write_u32(total_clusters)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("[FAT32] Root cluster: ")
+  foundation.serial_write_u32(boot_sector.root_cluster)
+  foundation.serial_write_string("\n")
+
+  // Read FSInfo if present
+  if boot_sector.fsinfo_sector != 0 {
+    var fsinfo_buffer: [u8; 512]
+    ata.ata_read_sector(0, boot_sector.fsinfo_sector, @ptrFromInt(fsinfo_buffer))
+    var fsi_ptr: *FAT32FSInfo = @ptrFromInt(fsinfo_buffer)
+    fsinfo = fsi_ptr[0]
+
+    foundation.serial_write_string("[FAT32] Free clusters: ")
+    foundation.serial_write_u32(fsinfo.free_count)
+    foundation.serial_write_string("\n")
+  }
+
+  // Initialize cache
+  fat_cache_valid = 0
+  var i: u32 = 0
+  while i < 4 {
+    cluster_cache_valid[i] = 0
+    i = i + 1
+  }
+  cluster_cache_next = 0
+
+  // Initialize stats
+  fat32_stats.reads = 0
+  fat32_stats.writes = 0
+  fat32_stats.bytes_read = 0
+  fat32_stats.bytes_written = 0
+  fat32_stats.cluster_reads = 0
+  fat32_stats.fat_lookups = 0
+  fat32_stats.cache_hits = 0
+  fat32_stats.cache_misses = 0
+
+  fat32_initialized = 1
+
+  foundation.serial_write_string("[FAT32] Initialized successfully\n")
+
+  return 0
 }

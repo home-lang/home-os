@@ -1,0 +1,416 @@
+// home-os VFS - Large File Support
+// Implements double and triple indirect block addressing for files > 4MB
+
+import "foundation.home" as foundation
+import "memory.home" as memory
+import "filesystem.home" as filesystem
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const BLOCK_SIZE: u32 = 4096
+const PTRS_PER_BLOCK: u32 = 512  // 4096 / 8 = 512 pointers per block
+
+// Maximum file sizes:
+// - 12 direct blocks: 12 * 4KB = 48KB
+// - 1 indirect block: 512 * 4KB = 2MB
+// - 1 double indirect: 512 * 512 * 4KB = 1GB
+// - 1 triple indirect: 512 * 512 * 512 * 4KB = 512GB
+const MAX_FILE_SIZE: u64 = 549755813888  // 512GB
+
+// ============================================================================
+// EXTENDED INODE STRUCTURE
+// ============================================================================
+
+// This extends the base Inode structure from filesystem.home
+export struct InodeExt {
+  double_indirect: u64,  // Double indirect block pointer
+  triple_indirect: u64   // Triple indirect block pointer
+}
+
+// Global table for extended inode data
+var inode_ext_table: [InodeExt; 1024]
+
+// ============================================================================
+// BLOCK CALCULATION
+// ============================================================================
+
+fn calculate_block_offsets(block_num: u32, direct: *u32, indirect: *u32, double_ind: *u32, triple_ind: *u32): u32 {
+  // Which type of block?
+  if block_num < 12 {
+    // Direct block
+    *direct = block_num
+    return 0
+  }
+
+  block_num = block_num - 12
+
+  if block_num < PTRS_PER_BLOCK {
+    // Indirect block
+    *indirect = block_num
+    return 1
+  }
+
+  block_num = block_num - PTRS_PER_BLOCK
+
+  if block_num < (PTRS_PER_BLOCK * PTRS_PER_BLOCK) {
+    // Double indirect
+    *double_ind = block_num / PTRS_PER_BLOCK
+    *indirect = block_num % PTRS_PER_BLOCK
+    return 2
+  }
+
+  block_num = block_num - (PTRS_PER_BLOCK * PTRS_PER_BLOCK)
+
+  // Triple indirect
+  var blocks_per_double: u32 = PTRS_PER_BLOCK * PTRS_PER_BLOCK
+  *triple_ind = block_num / blocks_per_double
+  block_num = block_num % blocks_per_double
+  *double_ind = block_num / PTRS_PER_BLOCK
+  *indirect = block_num % PTRS_PER_BLOCK
+
+  return 3
+}
+
+// ============================================================================
+// READ BLOCK ADDRESS
+// ============================================================================
+
+export fn get_block_address(inode: *filesystem.Inode, ino: u32, block_num: u32): u64 {
+  var direct: u32 = 0
+  var indirect: u32 = 0
+  var double_ind: u32 = 0
+  var triple_ind: u32 = 0
+
+  var level: u32 = calculate_block_offsets(block_num, &direct, &indirect, &double_ind, &triple_ind)
+
+  if level == 0 {
+    // Direct block
+    if direct < 12 {
+      return inode.data_blocks[direct]
+    }
+    return 0
+  }
+
+  if level == 1 {
+    // Indirect block
+    if inode.indirect_block == 0 {
+      return 0
+    }
+
+    var indirect_data: u64 = inode.indirect_block
+    var ptr_addr: u64 = indirect_data + (indirect * 8)
+    return memory.read_u64(ptr_addr)
+  }
+
+  if level == 2 {
+    // Double indirect
+    var ext: InodeExt = inode_ext_table[ino]
+    if ext.double_indirect == 0 {
+      return 0
+    }
+
+    // First level: get indirect block pointer
+    var double_data: u64 = ext.double_indirect
+    var indirect_ptr_addr: u64 = double_data + (double_ind * 8)
+    var indirect_block: u64 = memory.read_u64(indirect_ptr_addr)
+
+    if indirect_block == 0 {
+      return 0
+    }
+
+    // Second level: get data block pointer
+    var data_ptr_addr: u64 = indirect_block + (indirect * 8)
+    return memory.read_u64(data_ptr_addr)
+  }
+
+  if level == 3 {
+    // Triple indirect
+    var ext: InodeExt = inode_ext_table[ino]
+    if ext.triple_indirect == 0 {
+      return 0
+    }
+
+    // First level: get double indirect block pointer
+    var triple_data: u64 = ext.triple_indirect
+    var double_ptr_addr: u64 = triple_data + (triple_ind * 8)
+    var double_block: u64 = memory.read_u64(double_ptr_addr)
+
+    if double_block == 0 {
+      return 0
+    }
+
+    // Second level: get indirect block pointer
+    var indirect_ptr_addr: u64 = double_block + (double_ind * 8)
+    var indirect_block: u64 = memory.read_u64(indirect_ptr_addr)
+
+    if indirect_block == 0 {
+      return 0
+    }
+
+    // Third level: get data block pointer
+    var data_ptr_addr: u64 = indirect_block + (indirect * 8)
+    return memory.read_u64(data_ptr_addr)
+  }
+
+  return 0
+}
+
+// ============================================================================
+// ALLOCATE BLOCK ADDRESS
+// ============================================================================
+
+export fn allocate_block_address(inode: *filesystem.Inode, ino: u32, block_num: u32): u64 {
+  var direct: u32 = 0
+  var indirect: u32 = 0
+  var double_ind: u32 = 0
+  var triple_ind: u32 = 0
+
+  var level: u32 = calculate_block_offsets(block_num, &direct, &indirect, &double_ind, &triple_ind)
+
+  if level == 0 {
+    // Direct block
+    if direct < 12 {
+      if inode.data_blocks[direct] == 0 {
+        var new_block: u64 = memory.pmm_alloc_page()
+        if new_block == 0 { return 0 }
+        inode.data_blocks[direct] = new_block
+        inode.blocks = inode.blocks + 1
+      }
+      return inode.data_blocks[direct]
+    }
+    return 0
+  }
+
+  if level == 1 {
+    // Indirect block
+    if inode.indirect_block == 0 {
+      var new_indirect: u64 = memory.pmm_alloc_page()
+      if new_indirect == 0 { return 0 }
+      memory.memset(new_indirect, 0, BLOCK_SIZE)
+      inode.indirect_block = new_indirect
+      inode.blocks = inode.blocks + 1
+    }
+
+    var indirect_data: u64 = inode.indirect_block
+    var ptr_addr: u64 = indirect_data + (indirect * 8)
+    var block_addr: u64 = memory.read_u64(ptr_addr)
+
+    if block_addr == 0 {
+      block_addr = memory.pmm_alloc_page()
+      if block_addr == 0 { return 0 }
+      memory.write_u64(ptr_addr, block_addr)
+      inode.blocks = inode.blocks + 1
+    }
+
+    return block_addr
+  }
+
+  if level == 2 {
+    // Double indirect
+    var ext: *InodeExt = &inode_ext_table[ino]
+
+    // Allocate double indirect block if needed
+    if ext.double_indirect == 0 {
+      var new_double: u64 = memory.pmm_alloc_page()
+      if new_double == 0 { return 0 }
+      memory.memset(new_double, 0, BLOCK_SIZE)
+      ext.double_indirect = new_double
+      inode.blocks = inode.blocks + 1
+    }
+
+    var double_data: u64 = ext.double_indirect
+    var indirect_ptr_addr: u64 = double_data + (double_ind * 8)
+    var indirect_block: u64 = memory.read_u64(indirect_ptr_addr)
+
+    // Allocate indirect block if needed
+    if indirect_block == 0 {
+      indirect_block = memory.pmm_alloc_page()
+      if indirect_block == 0 { return 0 }
+      memory.memset(indirect_block, 0, BLOCK_SIZE)
+      memory.write_u64(indirect_ptr_addr, indirect_block)
+      inode.blocks = inode.blocks + 1
+    }
+
+    var data_ptr_addr: u64 = indirect_block + (indirect * 8)
+    var block_addr: u64 = memory.read_u64(data_ptr_addr)
+
+    // Allocate data block if needed
+    if block_addr == 0 {
+      block_addr = memory.pmm_alloc_page()
+      if block_addr == 0 { return 0 }
+      memory.write_u64(data_ptr_addr, block_addr)
+      inode.blocks = inode.blocks + 1
+    }
+
+    return block_addr
+  }
+
+  if level == 3 {
+    // Triple indirect
+    var ext: *InodeExt = &inode_ext_table[ino]
+
+    // Allocate triple indirect block if needed
+    if ext.triple_indirect == 0 {
+      var new_triple: u64 = memory.pmm_alloc_page()
+      if new_triple == 0 { return 0 }
+      memory.memset(new_triple, 0, BLOCK_SIZE)
+      ext.triple_indirect = new_triple
+      inode.blocks = inode.blocks + 1
+    }
+
+    var triple_data: u64 = ext.triple_indirect
+    var double_ptr_addr: u64 = triple_data + (triple_ind * 8)
+    var double_block: u64 = memory.read_u64(double_ptr_addr)
+
+    // Allocate double indirect block if needed
+    if double_block == 0 {
+      double_block = memory.pmm_alloc_page()
+      if double_block == 0 { return 0 }
+      memory.memset(double_block, 0, BLOCK_SIZE)
+      memory.write_u64(double_ptr_addr, double_block)
+      inode.blocks = inode.blocks + 1
+    }
+
+    var indirect_ptr_addr: u64 = double_block + (double_ind * 8)
+    var indirect_block: u64 = memory.read_u64(indirect_ptr_addr)
+
+    // Allocate indirect block if needed
+    if indirect_block == 0 {
+      indirect_block = memory.pmm_alloc_page()
+      if indirect_block == 0 { return 0 }
+      memory.memset(indirect_block, 0, BLOCK_SIZE)
+      memory.write_u64(indirect_ptr_addr, indirect_block)
+      inode.blocks = inode.blocks + 1
+    }
+
+    var data_ptr_addr: u64 = indirect_block + (indirect * 8)
+    var block_addr: u64 = memory.read_u64(data_ptr_addr)
+
+    // Allocate data block if needed
+    if block_addr == 0 {
+      block_addr = memory.pmm_alloc_page()
+      if block_addr == 0 { return 0 }
+      memory.write_u64(data_ptr_addr, block_addr)
+      inode.blocks = inode.blocks + 1
+    }
+
+    return block_addr
+  }
+
+  return 0
+}
+
+// ============================================================================
+// FREE ALL BLOCKS
+// ============================================================================
+
+export fn free_all_blocks(inode: *filesystem.Inode, ino: u32) {
+  // Free direct blocks
+  var i: u32 = 0
+  while i < 12 {
+    if inode.data_blocks[i] != 0 {
+      memory.pmm_free_page(inode.data_blocks[i])
+      inode.data_blocks[i] = 0
+    }
+    i = i + 1
+  }
+
+  // Free indirect block
+  if inode.indirect_block != 0 {
+    var indirect_data: u64 = inode.indirect_block
+    var j: u32 = 0
+    while j < PTRS_PER_BLOCK {
+      var ptr_addr: u64 = indirect_data + (j * 8)
+      var block_addr: u64 = memory.read_u64(ptr_addr)
+      if block_addr != 0 {
+        memory.pmm_free_page(block_addr)
+      }
+      j = j + 1
+    }
+    memory.pmm_free_page(inode.indirect_block)
+    inode.indirect_block = 0
+  }
+
+  var ext: *InodeExt = &inode_ext_table[ino]
+
+  // Free double indirect
+  if ext.double_indirect != 0 {
+    var double_data: u64 = ext.double_indirect
+    var j: u32 = 0
+    while j < PTRS_PER_BLOCK {
+      var indirect_ptr_addr: u64 = double_data + (j * 8)
+      var indirect_block: u64 = memory.read_u64(indirect_ptr_addr)
+      if indirect_block != 0 {
+        // Free all blocks in this indirect block
+        var k: u32 = 0
+        while k < PTRS_PER_BLOCK {
+          var data_ptr_addr: u64 = indirect_block + (k * 8)
+          var block_addr: u64 = memory.read_u64(data_ptr_addr)
+          if block_addr != 0 {
+            memory.pmm_free_page(block_addr)
+          }
+          k = k + 1
+        }
+        memory.pmm_free_page(indirect_block)
+      }
+      j = j + 1
+    }
+    memory.pmm_free_page(ext.double_indirect)
+    ext.double_indirect = 0
+  }
+
+  // Free triple indirect
+  if ext.triple_indirect != 0 {
+    var triple_data: u64 = ext.triple_indirect
+    var j: u32 = 0
+    while j < PTRS_PER_BLOCK {
+      var double_ptr_addr: u64 = triple_data + (j * 8)
+      var double_block: u64 = memory.read_u64(double_ptr_addr)
+      if double_block != 0 {
+        // Free all indirect blocks in this double indirect
+        var k: u32 = 0
+        while k < PTRS_PER_BLOCK {
+          var indirect_ptr_addr: u64 = double_block + (k * 8)
+          var indirect_block: u64 = memory.read_u64(indirect_ptr_addr)
+          if indirect_block != 0 {
+            // Free all data blocks
+            var m: u32 = 0
+            while m < PTRS_PER_BLOCK {
+              var data_ptr_addr: u64 = indirect_block + (m * 8)
+              var block_addr: u64 = memory.read_u64(data_ptr_addr)
+              if block_addr != 0 {
+                memory.pmm_free_page(block_addr)
+              }
+              m = m + 1
+            }
+            memory.pmm_free_page(indirect_block)
+          }
+          k = k + 1
+        }
+        memory.pmm_free_page(double_block)
+      }
+      j = j + 1
+    }
+    memory.pmm_free_page(ext.triple_indirect)
+    ext.triple_indirect = 0
+  }
+
+  inode.blocks = 0
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn large_files_init() {
+  var i: u32 = 0
+  while i < 1024 {
+    inode_ext_table[i].double_indirect = 0
+    inode_ext_table[i].triple_indirect = 0
+    i = i + 1
+  }
+
+  foundation.serial_write_string("[Large Files] Initialized (max 512GB per file)\n")
+}

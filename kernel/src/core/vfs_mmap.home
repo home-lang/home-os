@@ -1,0 +1,407 @@
+// home-os VFS - Memory-Mapped Files (mmap)
+// Implements memory-mapped file I/O for efficient file access
+
+import "foundation.home" as foundation
+import "memory.home" as memory
+import "filesystem.home" as filesystem
+import "vfs_permissions.home" as perms
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_MAPPINGS: u32 = 256
+const PAGE_SIZE: u32 = 4096
+
+// mmap protection flags
+const PROT_NONE: u32 = 0
+const PROT_READ: u32 = 1
+const PROT_WRITE: u32 = 2
+const PROT_EXEC: u32 = 4
+
+// mmap flags
+const MAP_SHARED: u32 = 1      // Share changes
+const MAP_PRIVATE: u32 = 2     // Private copy-on-write
+const MAP_FIXED: u32 = 16      // Require specific address
+const MAP_ANONYMOUS: u32 = 32  // No file backing
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct MemoryMapping {
+  ino: u32,              // Inode number (0 for anonymous)
+  file_offset: u64,      // Offset in file
+  virtual_addr: u64,     // Virtual address in process
+  length: u64,           // Size of mapping
+  prot: u32,             // Protection flags
+  flags: u32,            // MAP_* flags
+  pid: u32,              // Process owning mapping
+  active: u32            // 1 if active
+}
+
+struct MmapStats {
+  total_mappings: u64,
+  active_mappings: u32,
+  shared_mappings: u32,
+  private_mappings: u32,
+  anonymous_mappings: u32,
+  total_mapped_bytes: u64,
+  page_faults: u64,
+  cow_faults: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var mappings: [MemoryMapping; 256]
+var mapping_count: u32 = 0
+var mmap_stats: MmapStats
+var mmap_initialized: u32 = 0
+
+// Next virtual address for mappings (user space)
+var next_mmap_addr: u64 = 0x0000400000000000  // Start of mmap region
+
+// ============================================================================
+// MMAP IMPLEMENTATION
+// ============================================================================
+
+export fn vfs_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: u32, offset: u64): u64 {
+  if length == 0 {
+    return 0xFFFFFFFFFFFFFFFF  // Invalid
+  }
+
+  // Round up length to page boundary
+  var page_aligned_length: u64 = ((length + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE
+
+  // Get inode from fd (if not anonymous)
+  var ino: u32 = 0
+  var inode_ptr: u64 = 0
+
+  if (flags & MAP_ANONYMOUS) == 0 {
+    // File-backed mapping
+    // TODO: Get inode from fd
+    ino = fd  // Placeholder
+
+    inode_ptr = filesystem.inode_get(ino)
+    if inode_ptr == 0 {
+      return 0xFFFFFFFFFFFFFFFF  // Invalid file
+    }
+
+    var inode: *filesystem.Inode = @ptrFromInt(inode_ptr)
+
+    // Check permissions
+    if (prot & PROT_READ) != 0 {
+      if perms.can_read(inode, 0, 0) == 0 {
+        return 0xFFFFFFFFFFFFFFFF  // EACCES
+      }
+    }
+
+    if (prot & PROT_WRITE) != 0 and (flags & MAP_SHARED) != 0 {
+      // Shared writable mapping requires write permission
+      if perms.can_write(inode, 0, 0) == 0 {
+        return 0xFFFFFFFFFFFFFFFF  // EACCES
+      }
+    }
+  }
+
+  // Determine virtual address
+  var virtual_addr: u64 = addr
+  if addr == 0 or (flags & MAP_FIXED) == 0 {
+    // Kernel chooses address
+    virtual_addr = next_mmap_addr
+    next_mmap_addr = next_mmap_addr + page_aligned_length
+  }
+
+  // Find free mapping slot
+  var i: u32 = 0
+  while i < MAX_MAPPINGS {
+    if mappings[i].active == 0 {
+      mappings[i].ino = ino
+      mappings[i].file_offset = offset
+      mappings[i].virtual_addr = virtual_addr
+      mappings[i].length = page_aligned_length
+      mappings[i].prot = prot
+      mappings[i].flags = flags
+      mappings[i].pid = 0  // TODO: Get current PID
+      mappings[i].active = 1
+
+      mapping_count = mapping_count + 1
+      mmap_stats.total_mappings = mmap_stats.total_mappings + 1
+      mmap_stats.active_mappings = mapping_count
+      mmap_stats.total_mapped_bytes = mmap_stats.total_mapped_bytes + page_aligned_length
+
+      if (flags & MAP_SHARED) != 0 {
+        mmap_stats.shared_mappings = mmap_stats.shared_mappings + 1
+      } else {
+        mmap_stats.private_mappings = mmap_stats.private_mappings + 1
+      }
+
+      if (flags & MAP_ANONYMOUS) != 0 {
+        mmap_stats.anonymous_mappings = mmap_stats.anonymous_mappings + 1
+      }
+
+      // Allocate physical pages for the mapping
+      var num_pages: u64 = page_aligned_length / PAGE_SIZE
+      var page: u64 = 0
+      while page < num_pages {
+        var phys_addr: u64 = memory.pmm_alloc_page()
+        if phys_addr == 0 {
+          // Failed to allocate, clean up
+          vfs_munmap(virtual_addr, page_aligned_length)
+          return 0xFFFFFFFFFFFFFFFF
+        }
+
+        // TODO: Map physical page to virtual address in page table
+        // For now, just acknowledge allocation
+
+        // If file-backed, read data from file
+        if (flags & MAP_ANONYMOUS) == 0 and inode_ptr != 0 {
+          // TODO: Read page from file at offset
+          // For now, zero the page
+          memory.memset(phys_addr, 0, PAGE_SIZE)
+        } else {
+          // Anonymous mapping - zero the page
+          memory.memset(phys_addr, 0, PAGE_SIZE)
+        }
+
+        page = page + 1
+      }
+
+      foundation.serial_write_string("[mmap] Mapped ")
+      foundation.serial_write_u64(page_aligned_length)
+      foundation.serial_write_string(" bytes at 0x")
+      foundation.serial_write_u64(virtual_addr)
+      foundation.serial_write_string("\n")
+
+      return virtual_addr
+    }
+    i = i + 1
+  }
+
+  return 0xFFFFFFFFFFFFFFFF  // No free slots
+}
+
+// ============================================================================
+// MUNMAP IMPLEMENTATION
+// ============================================================================
+
+export fn vfs_munmap(addr: u64, length: u64): u32 {
+  var page_aligned_length: u64 = ((length + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE
+
+  // Find matching mapping
+  var i: u32 = 0
+  while i < MAX_MAPPINGS {
+    if mappings[i].active == 1 and mappings[i].virtual_addr == addr {
+      // If shared and writable, writeback dirty pages
+      if (mappings[i].flags & MAP_SHARED) != 0 and (mappings[i].prot & PROT_WRITE) != 0 {
+        // TODO: Writeback dirty pages to file
+      }
+
+      // Free physical pages
+      var num_pages: u64 = mappings[i].length / PAGE_SIZE
+      var page: u64 = 0
+      while page < num_pages {
+        // TODO: Unmap and free physical pages
+        page = page + 1
+      }
+
+      mmap_stats.total_mapped_bytes = mmap_stats.total_mapped_bytes - mappings[i].length
+      mappings[i].active = 0
+      mapping_count = mapping_count - 1
+      mmap_stats.active_mappings = mapping_count
+
+      foundation.serial_write_string("[munmap] Unmapped ")
+      foundation.serial_write_u64(mappings[i].length)
+      foundation.serial_write_string(" bytes\n")
+
+      return 0
+    }
+    i = i + 1
+  }
+
+  return 1  // Not found
+}
+
+// ============================================================================
+// MSYNC - Sync mapped region to disk
+// ============================================================================
+
+export fn vfs_msync(addr: u64, length: u64, flags: u32): u32 {
+  // Find mapping
+  var i: u32 = 0
+  while i < MAX_MAPPINGS {
+    if mappings[i].active == 1 and mappings[i].virtual_addr == addr {
+      if (mappings[i].flags & MAP_SHARED) != 0 {
+        // TODO: Writeback dirty pages to file
+        foundation.serial_write_string("[msync] Synced mapping\n")
+        return 0
+      }
+      return 0  // Private mapping, nothing to sync
+    }
+    i = i + 1
+  }
+
+  return 1  // Not found
+}
+
+// ============================================================================
+// MPROTECT - Change protection
+// ============================================================================
+
+export fn vfs_mprotect(addr: u64, length: u64, prot: u32): u32 {
+  // Find mapping
+  var i: u32 = 0
+  while i < MAX_MAPPINGS {
+    if mappings[i].active == 1 and mappings[i].virtual_addr == addr {
+      // TODO: Check if new protection is compatible with file permissions
+
+      mappings[i].prot = prot
+
+      // TODO: Update page table permissions
+
+      foundation.serial_write_string("[mprotect] Changed protection to 0x")
+      foundation.serial_write_u32(prot)
+      foundation.serial_write_string("\n")
+
+      return 0
+    }
+    i = i + 1
+  }
+
+  return 1  // Not found
+}
+
+// ============================================================================
+// PAGE FAULT HANDLER
+// ============================================================================
+
+export fn mmap_handle_page_fault(fault_addr: u64, write_access: u32): u32 {
+  // Find mapping containing fault address
+  var i: u32 = 0
+  while i < MAX_MAPPINGS {
+    if mappings[i].active == 1 {
+      var mapping_end: u64 = mappings[i].virtual_addr + mappings[i].length
+
+      if fault_addr >= mappings[i].virtual_addr and fault_addr < mapping_end {
+        mmap_stats.page_faults = mmap_stats.page_faults + 1
+
+        // Check protection
+        if write_access == 1 and (mappings[i].prot & PROT_WRITE) == 0 {
+          return 1  // Write to read-only mapping
+        }
+
+        // Handle copy-on-write for private mappings
+        if write_access == 1 and (mappings[i].flags & MAP_PRIVATE) != 0 {
+          mmap_stats.cow_faults = mmap_stats.cow_faults + 1
+
+          // TODO: Copy page and update mapping
+          foundation.serial_write_string("[mmap] Copy-on-write fault\n")
+          return 0
+        }
+
+        // Allocate physical page and map it
+        var phys_addr: u64 = memory.pmm_alloc_page()
+        if phys_addr == 0 {
+          return 1  // Out of memory
+        }
+
+        // If file-backed, read data from file
+        if (mappings[i].flags & MAP_ANONYMOUS) == 0 {
+          var page_offset: u64 = (fault_addr - mappings[i].virtual_addr) / PAGE_SIZE
+          var file_offset: u64 = mappings[i].file_offset + (page_offset * PAGE_SIZE)
+
+          // TODO: Read page from file
+          memory.memset(phys_addr, 0, PAGE_SIZE)
+        } else {
+          memory.memset(phys_addr, 0, PAGE_SIZE)
+        }
+
+        // TODO: Map physical page to virtual address
+
+        return 0  // Handled
+      }
+    }
+    i = i + 1
+  }
+
+  return 1  // Not a valid mmap fault
+}
+
+// ============================================================================
+// CLEANUP
+// ============================================================================
+
+export fn mmap_cleanup_process(pid: u32) {
+  var i: u32 = 0
+  while i < MAX_MAPPINGS {
+    if mappings[i].active == 1 and mappings[i].pid == pid {
+      vfs_munmap(mappings[i].virtual_addr, mappings[i].length)
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn mmap_get_stats(): MmapStats {
+  return mmap_stats
+}
+
+export fn mmap_print_stats() {
+  foundation.serial_write_string("[mmap Stats]\n")
+  foundation.serial_write_string("  Total mappings created: ")
+  foundation.serial_write_u64(mmap_stats.total_mappings)
+  foundation.serial_write_string("\n  Active mappings: ")
+  foundation.serial_write_u32(mmap_stats.active_mappings)
+  foundation.serial_write_string("\n  Shared mappings: ")
+  foundation.serial_write_u32(mmap_stats.shared_mappings)
+  foundation.serial_write_string("\n  Private mappings: ")
+  foundation.serial_write_u32(mmap_stats.private_mappings)
+  foundation.serial_write_string("\n  Anonymous mappings: ")
+  foundation.serial_write_u32(mmap_stats.anonymous_mappings)
+  foundation.serial_write_string("\n  Total mapped: ")
+  foundation.serial_write_u64(mmap_stats.total_mapped_bytes)
+  foundation.serial_write_string(" bytes\n  Page faults: ")
+  foundation.serial_write_u64(mmap_stats.page_faults)
+  foundation.serial_write_string("\n  COW faults: ")
+  foundation.serial_write_u64(mmap_stats.cow_faults)
+  foundation.serial_write_string("\n")
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn mmap_init() {
+  if mmap_initialized == 1 { return }
+
+  var i: u32 = 0
+  while i < MAX_MAPPINGS {
+    mappings[i].active = 0
+    mappings[i].ino = 0
+    mappings[i].virtual_addr = 0
+    mappings[i].length = 0
+    mappings[i].prot = 0
+    mappings[i].flags = 0
+    mappings[i].pid = 0
+    i = i + 1
+  }
+
+  mapping_count = 0
+  mmap_stats.total_mappings = 0
+  mmap_stats.active_mappings = 0
+  mmap_stats.shared_mappings = 0
+  mmap_stats.private_mappings = 0
+  mmap_stats.anonymous_mappings = 0
+  mmap_stats.total_mapped_bytes = 0
+  mmap_stats.page_faults = 0
+  mmap_stats.cow_faults = 0
+
+  mmap_initialized = 1
+
+  foundation.serial_write_string("[mmap] Initialized (256 mapping slots)\n")
+}

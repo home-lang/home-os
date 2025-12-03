@@ -3,6 +3,7 @@
 
 import "foundation.home" as foundation
 import "memory.home" as memory
+import "vfs_permissions.home" as perms
 
 // ============================================================================
 // CONSTANTS
@@ -73,13 +74,18 @@ var next_fd: u32 = 3  // 0,1,2 reserved for stdin/stdout/stderr
 
 var fs_initialized: u32 = 0
 
+// Current process UID/GID (for permission checks)
+// TODO: Get these from process structure when implemented
+var current_uid: u32 = 0
+var current_gid: u32 = 0
+
 // ============================================================================
 // INODE MANAGEMENT
 // ============================================================================
 
 fn inode_alloc(file_type: u32, mode: u32): u32 {
   if inode_count >= MAX_INODES { return 0 }
-  
+
   var i: u32 = 0
   while i < MAX_INODES {
     if inode_table[i].ino == 0 {
@@ -91,12 +97,13 @@ fn inode_alloc(file_type: u32, mode: u32): u32 {
       inode.size = 0
       inode.blocks = 0
       inode.link_count = 1
-      inode.uid = 0
-      inode.gid = 0
+      // Set ownership to current user (will be 0 if not set)
+      inode.uid = current_uid
+      inode.gid = current_gid
       inode.atime = 0
       inode.mtime = 0
       inode.ctime = 0
-      
+
       // Clear data blocks
       var j: u32 = 0
       while j < 12 {
@@ -104,16 +111,16 @@ fn inode_alloc(file_type: u32, mode: u32): u32 {
         j = j + 1
       }
       inode.indirect_block = 0
-      
+
       inode_table[i] = inode
       inode_count = inode_count + 1
       next_ino = next_ino + 1
-      
+
       return inode.ino
     }
     i = i + 1
   }
-  
+
   return 0
 }
 
@@ -157,11 +164,41 @@ fn inode_free(ino: u32) {
 export fn vfs_open(path: u64, flags: u32): u32 {
   // Simple implementation: just return a file descriptor
   if open_file_count >= MAX_OPEN_FILES { return 0 }
-  
+
   // For now, create a new inode for each open
   var ino: u32 = inode_alloc(FILE_TYPE_REGULAR, 0o644)
   if ino == 0 { return 0 }
-  
+
+  // Check permissions before opening
+  var inode_ptr: u64 = inode_get(ino)
+  if inode_ptr != 0 {
+    var inode: Inode = @intToPtr(inode_ptr, Inode)
+
+    // Determine required access mode based on flags
+    // O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2
+    var access_mode: u32 = flags & 0x3
+
+    if access_mode == 0 {
+      // Read-only: check read permission
+      if perms.can_read(&inode, current_uid, current_gid) == 0 {
+        inode_free(ino)
+        return 0  // Permission denied
+      }
+    } else if access_mode == 1 {
+      // Write-only: check write permission
+      if perms.can_write(&inode, current_uid, current_gid) == 0 {
+        inode_free(ino)
+        return 0  // Permission denied
+      }
+    } else if access_mode == 2 {
+      // Read-write: check both permissions
+      if perms.can_read(&inode, current_uid, current_gid) == 0 or perms.can_write(&inode, current_uid, current_gid) == 0 {
+        inode_free(ino)
+        return 0  // Permission denied
+      }
+    }
+  }
+
   // Add to open file table
   var i: u32 = 0
   while i < MAX_OPEN_FILES {
@@ -170,17 +207,17 @@ export fn vfs_open(path: u64, flags: u32): u32 {
       open_files[i].offset = 0
       open_files[i].flags = flags
       open_files[i].ref_count = 1
-      
+
       open_file_count = open_file_count + 1
-      
+
       var fd: u32 = next_fd
       next_fd = next_fd + 1
-      
+
       return fd
     }
     i = i + 1
   }
-  
+
   return 0
 }
 
@@ -205,17 +242,23 @@ export fn vfs_close(fd: u32): u32 {
 
 export fn vfs_read(fd: u32, buffer: u64, count: u64): u64 {
   if fd < 3 { return 0 }  // Special handling for stdin
-  
+
   var idx: u32 = fd - 3
   if idx >= MAX_OPEN_FILES { return 0 }
-  
+
   if open_files[idx].ref_count == 0 { return 0 }
-  
+
   var ino: u32 = open_files[idx].ino
   var inode_ptr: u64 = inode_get(ino)
   if inode_ptr == 0 { return 0 }
-  
+
   var inode: Inode = @intToPtr(inode_ptr, Inode)
+
+  // Check read permission
+  if perms.can_read(&inode, current_uid, current_gid) == 0 {
+    return 0  // Permission denied
+  }
+
   var offset: u64 = open_files[idx].offset
   
   // Calculate how much we can read
@@ -272,16 +315,23 @@ export fn vfs_write(fd: u32, buffer: u64, count: u64): u64 {
     }
     return 0
   }
-  
+
   var idx: u32 = fd - 3
   if idx >= MAX_OPEN_FILES { return 0 }
-  
+
   if open_files[idx].ref_count == 0 { return 0 }
-  
+
   var ino: u32 = open_files[idx].ino
   var inode_ptr: u64 = inode_get(ino)
   if inode_ptr == 0 { return 0 }
-  
+
+  var inode: Inode = @intToPtr(inode_ptr, Inode)
+
+  // Check write permission
+  if perms.can_write(&inode, current_uid, current_gid) == 0 {
+    return 0  // Permission denied
+  }
+
   var offset: u64 = open_files[idx].offset
   var bytes_written: u64 = 0
   var block_idx: u32 = offset / BLOCK_SIZE
@@ -289,7 +339,6 @@ export fn vfs_write(fd: u32, buffer: u64, count: u64): u64 {
   
   while bytes_written < count and block_idx < 12 {
     // Allocate block if needed
-    var inode: Inode = @intToPtr(inode_ptr, Inode)
     if inode.data_blocks[block_idx] == 0 {
       var new_block: u64 = memory.pmm_alloc_page()
       if new_block == 0 { break }
@@ -318,7 +367,6 @@ export fn vfs_write(fd: u32, buffer: u64, count: u64): u64 {
   }
   
   // Update inode size and offset
-  var inode: Inode = @intToPtr(inode_ptr, Inode)
   var new_offset: u64 = offset + bytes_written
   if new_offset > inode.size {
     inode.size = new_offset
@@ -359,17 +407,76 @@ export fn vfs_lseek(fd: u32, offset: u64, whence: u32): u64 {
 // ============================================================================
 
 export fn vfs_mkdir(path: u64, mode: u32): u32 {
+  // TODO: Get parent directory inode from path
+  // For now, check if we can write to root directory
+  var root_inode_ptr: u64 = inode_get(1)
+  if root_inode_ptr != 0 {
+    var root: Inode = @intToPtr(root_inode_ptr, Inode)
+    // Need write and execute permission on parent directory
+    if perms.can_write(&root, current_uid, current_gid) == 0 or perms.can_access_directory(&root, current_uid, current_gid) == 0 {
+      return 1  // Permission denied
+    }
+  }
+
   var ino: u32 = inode_alloc(FILE_TYPE_DIRECTORY, mode)
   if ino == 0 { return 1 }
-  
+
+  // Set ownership to current user
+  var inode_ptr: u64 = inode_get(ino)
+  if inode_ptr != 0 {
+    var inode: Inode = @intToPtr(inode_ptr, Inode)
+    inode.uid = current_uid
+    inode.gid = current_gid
+  }
+
   foundation.serial_write_string("[VFS] Created directory\n")
   return 0
 }
 
 export fn vfs_rmdir(path: u64): u32 {
-  // Simple implementation: just acknowledge
+  // TODO: Get directory inode from path
+  // For now, check if we can write to root directory
+  var root_inode_ptr: u64 = inode_get(1)
+  if root_inode_ptr != 0 {
+    var root: Inode = @intToPtr(root_inode_ptr, Inode)
+    // Need write and execute permission on parent directory
+    if perms.can_write(&root, current_uid, current_gid) == 0 or perms.can_access_directory(&root, current_uid, current_gid) == 0 {
+      return 1  // Permission denied
+    }
+  }
+
   foundation.serial_write_string("[VFS] Removed directory\n")
   return 0
+}
+
+// ============================================================================
+// PERMISSION MANAGEMENT
+// ============================================================================
+
+export fn vfs_chmod(path: u64, mode: u32): u32 {
+  // TODO: Get inode from path
+  // For now, just return success
+  foundation.serial_write_string("[VFS] Changed permissions\n")
+  return 0
+}
+
+export fn vfs_chown(path: u64, uid: u32, gid: u32): u32 {
+  // TODO: Get inode from path
+  // For now, check if current user is root
+  if current_uid != 0 {
+    return 1  // Only root can change ownership
+  }
+
+  foundation.serial_write_string("[VFS] Changed ownership\n")
+  return 0
+}
+
+export fn vfs_set_uid(uid: u32) {
+  current_uid = uid
+}
+
+export fn vfs_set_gid(gid: u32) {
+  current_gid = gid
 }
 
 // ============================================================================

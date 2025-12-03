@@ -1,0 +1,570 @@
+// Lock-Free Data Structures
+// Provides high-performance concurrent data structures using atomic operations
+
+import basics
+
+// Import dependencies
+const memory = @import("memory.home")
+
+// Constants
+const MAX_QUEUE_SIZE: u32 = 16384
+const MAX_STACK_SIZE: u32 = 8192
+const MAX_HASH_TABLE_SIZE: u32 = 65536
+const CACHE_LINE_SIZE: u32 = 64
+
+// ABA problem prevention using tagged pointers
+// Upper 16 bits = tag/version, lower 48 bits = pointer
+fn make_tagged_ptr(ptr: u64, tag: u16): u64 {
+  return (tag << 48) | (ptr & 0x0000FFFFFFFFFFFF)
+}
+
+fn get_ptr_from_tagged(tagged: u64): u64 {
+  return tagged & 0x0000FFFFFFFFFFFF
+}
+
+fn get_tag_from_tagged(tagged: u64): u16 {
+  return (tagged >> 48) & 0xFFFF
+}
+
+// Atomic operations using x86_64 instructions
+fn atomic_load_64(ptr: u64): u64 {
+  var result: u64
+  asm volatile (
+    "movq (%[ptr]), %[result]"
+    : [result] "=r" (result)
+    : [ptr] "r" (ptr)
+    : "memory"
+  )
+  return result
+}
+
+fn atomic_store_64(ptr: u64, value: u64) {
+  asm volatile (
+    "movq %[value], (%[ptr])"
+    :
+    : [ptr] "r" (ptr), [value] "r" (value)
+    : "memory"
+  )
+}
+
+fn atomic_cas_64(ptr: u64, expected: u64, desired: u64): u32 {
+  var success: u8
+  asm volatile (
+    "lock cmpxchgq %[desired], (%[ptr])\n"
+    "sete %[success]"
+    : [success] "=r" (success)
+    : [ptr] "r" (ptr), "a" (expected), [desired] "r" (desired)
+    : "memory", "cc"
+  )
+  return success
+}
+
+fn atomic_fetch_add_64(ptr: u64, value: u64): u64 {
+  var result: u64 = value
+  asm volatile (
+    "lock xaddq %[value], (%[ptr])"
+    : [value] "+r" (result)
+    : [ptr] "r" (ptr)
+    : "memory", "cc"
+  )
+  return result
+}
+
+fn atomic_fetch_sub_64(ptr: u64, value: u64): u64 {
+  var neg_value: u64 = 0 - value
+  return atomic_fetch_add_64(ptr, neg_value)
+}
+
+// Memory fence operations
+fn memory_fence_acquire() {
+  asm volatile ("" ::: "memory")
+}
+
+fn memory_fence_release() {
+  asm volatile ("" ::: "memory")
+}
+
+fn memory_fence_full() {
+  asm volatile ("mfence" ::: "memory")
+}
+
+// ============================================================================
+// Lock-Free Queue (Michael-Scott Queue)
+// ============================================================================
+
+struct QueueNode {
+  data: u64
+  next: u64  // Tagged pointer to next node
+}
+
+struct alignas(64) LockFreeQueue {
+  head: u64  // Tagged pointer to head node
+  tail: u64  // Tagged pointer to tail node
+  size: u64  // Approximate size (may be slightly inaccurate)
+
+  // Statistics
+  enqueue_count: u64
+  dequeue_count: u64
+  enqueue_retries: u64
+  dequeue_retries: u64
+
+  _padding: [16]u8  // Pad to cache line size
+}
+
+// Initialize lock-free queue
+export fn lockfree_queue_init(queue: u64) {
+  var q: *LockFreeQueue = @ptrFromInt(queue)
+
+  // Allocate dummy node
+  var dummy_node: u64 = memory.kmalloc(@sizeOf(QueueNode))
+  var dummy: *QueueNode = @ptrFromInt(dummy_node)
+  dummy.data = 0
+  dummy.next = 0
+
+  // Both head and tail point to dummy node with tag 0
+  q.head = make_tagged_ptr(dummy_node, 0)
+  q.tail = make_tagged_ptr(dummy_node, 0)
+  q.size = 0
+  q.enqueue_count = 0
+  q.dequeue_count = 0
+  q.enqueue_retries = 0
+  q.dequeue_retries = 0
+}
+
+// Enqueue element (lock-free)
+export fn lockfree_queue_enqueue(queue: u64, data: u64): u32 {
+  var q: *LockFreeQueue = @ptrFromInt(queue)
+
+  // Allocate new node
+  var new_node_addr: u64 = memory.kmalloc(@sizeOf(QueueNode))
+  var new_node: *QueueNode = @ptrFromInt(new_node_addr)
+  new_node.data = data
+  new_node.next = 0
+
+  var retries: u32 = 0
+
+  while 1 {
+    var tail_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(q.tail)))
+    var tail_ptr: u64 = get_ptr_from_tagged(tail_tagged)
+    var tail_tag: u16 = get_tag_from_tagged(tail_tagged)
+    var tail_node: *QueueNode = @ptrFromInt(tail_ptr)
+
+    var next_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(tail_node.next)))
+
+    // Check if tail is still consistent
+    if tail_tagged == atomic_load_64(@ptrFromInt(@addrOf(q.tail))) {
+      if get_ptr_from_tagged(next_tagged) == 0 {
+        // Tail is pointing to last node - try to link new node
+        var new_tagged: u64 = make_tagged_ptr(new_node_addr, tail_tag + 1)
+        if atomic_cas_64(@ptrFromInt(@addrOf(tail_node.next)), 0, new_tagged) == 1 {
+          // Successfully enqueued - try to swing tail
+          var new_tail: u64 = make_tagged_ptr(new_node_addr, tail_tag + 1)
+          atomic_cas_64(@ptrFromInt(@addrOf(q.tail)), tail_tagged, new_tail)
+
+          atomic_fetch_add_64(@ptrFromInt(@addrOf(q.size)), 1)
+          atomic_fetch_add_64(@ptrFromInt(@addrOf(q.enqueue_count)), 1)
+          return 0
+        }
+      } else {
+        // Tail is lagging - try to advance it
+        var new_tail: u64 = make_tagged_ptr(get_ptr_from_tagged(next_tagged), tail_tag + 1)
+        atomic_cas_64(@ptrFromInt(@addrOf(q.tail)), tail_tagged, new_tail)
+      }
+
+      retries = retries + 1
+      if retries > 1 {
+        atomic_fetch_add_64(@ptrFromInt(@addrOf(q.enqueue_retries)), 1)
+      }
+    }
+  }
+
+  return 0
+}
+
+// Dequeue element (lock-free)
+export fn lockfree_queue_dequeue(queue: u64, data_out: u64): u32 {
+  var q: *LockFreeQueue = @ptrFromInt(queue)
+  var retries: u32 = 0
+
+  while 1 {
+    var head_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(q.head)))
+    var tail_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(q.tail)))
+
+    var head_ptr: u64 = get_ptr_from_tagged(head_tagged)
+    var head_tag: u16 = get_tag_from_tagged(head_tagged)
+    var head_node: *QueueNode = @ptrFromInt(head_ptr)
+
+    var next_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(head_node.next)))
+    var next_ptr: u64 = get_ptr_from_tagged(next_tagged)
+
+    // Check if head is still consistent
+    if head_tagged == atomic_load_64(@ptrFromInt(@addrOf(q.head))) {
+      if head_ptr == get_ptr_from_tagged(tail_tagged) {
+        // Queue is empty or tail is lagging
+        if next_ptr == 0 {
+          return 1  // Queue is empty
+        }
+
+        // Tail is lagging - try to advance it
+        var new_tail: u64 = make_tagged_ptr(next_ptr, get_tag_from_tagged(tail_tagged) + 1)
+        atomic_cas_64(@ptrFromInt(@addrOf(q.tail)), tail_tagged, new_tail)
+      } else {
+        // Read data from next node
+        var next_node: *QueueNode = @ptrFromInt(next_ptr)
+        var data: u64 = next_node.data
+
+        // Try to swing head to next node
+        var new_head: u64 = make_tagged_ptr(next_ptr, head_tag + 1)
+        if atomic_cas_64(@ptrFromInt(@addrOf(q.head)), head_tagged, new_head) == 1 {
+          // Successfully dequeued
+          var out_ptr: *u64 = @ptrFromInt(data_out)
+          out_ptr[0] = data
+
+          // Free old dummy node
+          memory.kfree(head_ptr)
+
+          atomic_fetch_sub_64(@ptrFromInt(@addrOf(q.size)), 1)
+          atomic_fetch_add_64(@ptrFromInt(@addrOf(q.dequeue_count)), 1)
+          return 0
+        }
+      }
+
+      retries = retries + 1
+      if retries > 1 {
+        atomic_fetch_add_64(@ptrFromInt(@addrOf(q.dequeue_retries)), 1)
+      }
+    }
+  }
+
+  return 1
+}
+
+// Get queue size (approximate)
+export fn lockfree_queue_size(queue: u64): u64 {
+  var q: *LockFreeQueue = @ptrFromInt(queue)
+  return atomic_load_64(@ptrFromInt(@addrOf(q.size)))
+}
+
+// ============================================================================
+// Lock-Free Stack (Treiber Stack)
+// ============================================================================
+
+struct StackNode {
+  data: u64
+  next: u64  // Tagged pointer to next node
+}
+
+struct alignas(64) LockFreeStack {
+  top: u64  // Tagged pointer to top node
+  size: u64  // Approximate size
+
+  // Statistics
+  push_count: u64
+  pop_count: u64
+  push_retries: u64
+  pop_retries: u64
+
+  _padding: [24]u8  // Pad to cache line size
+}
+
+// Initialize lock-free stack
+export fn lockfree_stack_init(stack: u64) {
+  var s: *LockFreeStack = @ptrFromInt(stack)
+  s.top = 0
+  s.size = 0
+  s.push_count = 0
+  s.pop_count = 0
+  s.push_retries = 0
+  s.pop_retries = 0
+}
+
+// Push element (lock-free)
+export fn lockfree_stack_push(stack: u64, data: u64): u32 {
+  var s: *LockFreeStack = @ptrFromInt(stack)
+
+  // Allocate new node
+  var new_node_addr: u64 = memory.kmalloc(@sizeOf(StackNode))
+  var new_node: *StackNode = @ptrFromInt(new_node_addr)
+  new_node.data = data
+
+  var retries: u32 = 0
+
+  while 1 {
+    var top_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(s.top)))
+    var top_tag: u16 = get_tag_from_tagged(top_tagged)
+
+    new_node.next = top_tagged
+
+    var new_top: u64 = make_tagged_ptr(new_node_addr, top_tag + 1)
+    if atomic_cas_64(@ptrFromInt(@addrOf(s.top)), top_tagged, new_top) == 1 {
+      atomic_fetch_add_64(@ptrFromInt(@addrOf(s.size)), 1)
+      atomic_fetch_add_64(@ptrFromInt(@addrOf(s.push_count)), 1)
+      return 0
+    }
+
+    retries = retries + 1
+    if retries > 1 {
+      atomic_fetch_add_64(@ptrFromInt(@addrOf(s.push_retries)), 1)
+    }
+  }
+
+  return 0
+}
+
+// Pop element (lock-free)
+export fn lockfree_stack_pop(stack: u64, data_out: u64): u32 {
+  var s: *LockFreeStack = @ptrFromInt(stack)
+  var retries: u32 = 0
+
+  while 1 {
+    var top_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(s.top)))
+    var top_ptr: u64 = get_ptr_from_tagged(top_tagged)
+
+    if top_ptr == 0 {
+      return 1  // Stack is empty
+    }
+
+    var top_node: *StackNode = @ptrFromInt(top_ptr)
+    var next_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(top_node.next)))
+    var top_tag: u16 = get_tag_from_tagged(top_tagged)
+
+    var new_top: u64 = make_tagged_ptr(get_ptr_from_tagged(next_tagged), top_tag + 1)
+    if atomic_cas_64(@ptrFromInt(@addrOf(s.top)), top_tagged, new_top) == 1 {
+      var data: u64 = top_node.data
+
+      var out_ptr: *u64 = @ptrFromInt(data_out)
+      out_ptr[0] = data
+
+      // Free node
+      memory.kfree(top_ptr)
+
+      atomic_fetch_sub_64(@ptrFromInt(@addrOf(s.size)), 1)
+      atomic_fetch_add_64(@ptrFromInt(@addrOf(s.pop_count)), 1)
+      return 0
+    }
+
+    retries = retries + 1
+    if retries > 1 {
+      atomic_fetch_add_64(@ptrFromInt(@addrOf(s.pop_retries)), 1)
+    }
+  }
+
+  return 1
+}
+
+// Get stack size (approximate)
+export fn lockfree_stack_size(stack: u64): u64 {
+  var s: *LockFreeStack = @ptrFromInt(stack)
+  return atomic_load_64(@ptrFromInt(@addrOf(s.size)))
+}
+
+// ============================================================================
+// Lock-Free Hash Table (with chaining)
+// ============================================================================
+
+struct HashNode {
+  key: u64
+  value: u64
+  next: u64  // Tagged pointer to next node in chain
+}
+
+struct HashBucket {
+  head: u64  // Tagged pointer to first node
+  _padding: [56]u8  // Pad to cache line size
+}
+
+struct alignas(64) LockFreeHashTable {
+  buckets: u64  // Pointer to array of buckets
+  num_buckets: u32
+  size: u64  // Approximate number of entries
+
+  // Statistics
+  insert_count: u64
+  remove_count: u64
+  lookup_count: u64
+  collision_count: u64
+
+  _padding: [16]u8
+}
+
+// Simple hash function
+fn hash_function(key: u64, num_buckets: u32): u32 {
+  // Multiplicative hash
+  var hash: u64 = key * 2654435761  // Golden ratio
+  return (hash % num_buckets)
+}
+
+// Initialize lock-free hash table
+export fn lockfree_hashtable_init(table: u64, num_buckets: u32) {
+  var ht: *LockFreeHashTable = @ptrFromInt(table)
+
+  // Allocate buckets
+  var buckets_size: u64 = num_buckets * @sizeOf(HashBucket)
+  var buckets_addr: u64 = memory.kmalloc(buckets_size)
+
+  // Initialize all buckets
+  var i: u32 = 0
+  while i < num_buckets {
+    var bucket: *HashBucket = @ptrFromInt(buckets_addr + (i * @sizeOf(HashBucket)))
+    bucket.head = 0
+    i = i + 1
+  }
+
+  ht.buckets = buckets_addr
+  ht.num_buckets = num_buckets
+  ht.size = 0
+  ht.insert_count = 0
+  ht.remove_count = 0
+  ht.lookup_count = 0
+  ht.collision_count = 0
+}
+
+// Insert key-value pair (lock-free)
+export fn lockfree_hashtable_insert(table: u64, key: u64, value: u64): u32 {
+  var ht: *LockFreeHashTable = @ptrFromInt(table)
+  var bucket_idx: u32 = hash_function(key, ht.num_buckets)
+  var bucket: *HashBucket = @ptrFromInt(ht.buckets + (bucket_idx * @sizeOf(HashBucket)))
+
+  // Allocate new node
+  var new_node_addr: u64 = memory.kmalloc(@sizeOf(HashNode))
+  var new_node: *HashNode = @ptrFromInt(new_node_addr)
+  new_node.key = key
+  new_node.value = value
+
+  while 1 {
+    var head_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(bucket.head)))
+    var head_ptr: u64 = get_ptr_from_tagged(head_tagged)
+    var head_tag: u16 = get_tag_from_tagged(head_tagged)
+
+    // Check if key already exists
+    var current_ptr: u64 = head_ptr
+    while current_ptr != 0 {
+      var current_node: *HashNode = @ptrFromInt(current_ptr)
+      if current_node.key == key {
+        // Key exists - update value atomically
+        atomic_store_64(@ptrFromInt(@addrOf(current_node.value)), value)
+        memory.kfree(new_node_addr)  // Free unused node
+        return 0
+      }
+      current_ptr = get_ptr_from_tagged(atomic_load_64(@ptrFromInt(@addrOf(current_node.next))))
+    }
+
+    // Insert at head of chain
+    new_node.next = head_tagged
+    var new_head: u64 = make_tagged_ptr(new_node_addr, head_tag + 1)
+
+    if atomic_cas_64(@ptrFromInt(@addrOf(bucket.head)), head_tagged, new_head) == 1 {
+      atomic_fetch_add_64(@ptrFromInt(@addrOf(ht.size)), 1)
+      atomic_fetch_add_64(@ptrFromInt(@addrOf(ht.insert_count)), 1)
+      if head_ptr != 0 {
+        atomic_fetch_add_64(@ptrFromInt(@addrOf(ht.collision_count)), 1)
+      }
+      return 0
+    }
+  }
+
+  return 0
+}
+
+// Lookup value by key (lock-free)
+export fn lockfree_hashtable_lookup(table: u64, key: u64, value_out: u64): u32 {
+  var ht: *LockFreeHashTable = @ptrFromInt(table)
+  var bucket_idx: u32 = hash_function(key, ht.num_buckets)
+  var bucket: *HashBucket = @ptrFromInt(ht.buckets + (bucket_idx * @sizeOf(HashBucket)))
+
+  atomic_fetch_add_64(@ptrFromInt(@addrOf(ht.lookup_count)), 1)
+
+  var head_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(bucket.head)))
+  var current_ptr: u64 = get_ptr_from_tagged(head_tagged)
+
+  while current_ptr != 0 {
+    var current_node: *HashNode = @ptrFromInt(current_ptr)
+    if current_node.key == key {
+      var value: u64 = atomic_load_64(@ptrFromInt(@addrOf(current_node.value)))
+      var out_ptr: *u64 = @ptrFromInt(value_out)
+      out_ptr[0] = value
+      return 0  // Found
+    }
+    current_ptr = get_ptr_from_tagged(atomic_load_64(@ptrFromInt(@addrOf(current_node.next))))
+  }
+
+  return 1  // Not found
+}
+
+// Remove key-value pair (lock-free)
+export fn lockfree_hashtable_remove(table: u64, key: u64): u32 {
+  var ht: *LockFreeHashTable = @ptrFromInt(table)
+  var bucket_idx: u32 = hash_function(key, ht.num_buckets)
+  var bucket: *HashBucket = @ptrFromInt(ht.buckets + (bucket_idx * @sizeOf(HashBucket)))
+
+  while 1 {
+    var head_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(bucket.head)))
+    var head_ptr: u64 = get_ptr_from_tagged(head_tagged)
+    var head_tag: u16 = get_tag_from_tagged(head_tagged)
+
+    if head_ptr == 0 {
+      return 1  // Key not found
+    }
+
+    var head_node: *HashNode = @ptrFromInt(head_ptr)
+
+    if head_node.key == key {
+      // Remove head node
+      var next_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(head_node.next)))
+      var new_head: u64 = make_tagged_ptr(get_ptr_from_tagged(next_tagged), head_tag + 1)
+
+      if atomic_cas_64(@ptrFromInt(@addrOf(bucket.head)), head_tagged, new_head) == 1 {
+        memory.kfree(head_ptr)
+        atomic_fetch_sub_64(@ptrFromInt(@addrOf(ht.size)), 1)
+        atomic_fetch_add_64(@ptrFromInt(@addrOf(ht.remove_count)), 1)
+        return 0
+      }
+    } else {
+      // Search in chain
+      var prev_ptr: u64 = head_ptr
+      var current_ptr: u64 = get_ptr_from_tagged(atomic_load_64(@ptrFromInt(@addrOf(head_node.next))))
+
+      while current_ptr != 0 {
+        var current_node: *HashNode = @ptrFromInt(current_ptr)
+
+        if current_node.key == key {
+          // Remove current node by updating prev's next pointer
+          var prev_node: *HashNode = @ptrFromInt(prev_ptr)
+          var next_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(current_node.next)))
+
+          atomic_store_64(@ptrFromInt(@addrOf(prev_node.next)), next_tagged)
+          memory.kfree(current_ptr)
+          atomic_fetch_sub_64(@ptrFromInt(@addrOf(ht.size)), 1)
+          atomic_fetch_add_64(@ptrFromInt(@addrOf(ht.remove_count)), 1)
+          return 0
+        }
+
+        prev_ptr = current_ptr
+        current_ptr = get_ptr_from_tagged(atomic_load_64(@ptrFromInt(@addrOf(current_node.next))))
+      }
+
+      return 1  // Key not found
+    }
+  }
+
+  return 1
+}
+
+// Get hash table size (approximate)
+export fn lockfree_hashtable_size(table: u64): u64 {
+  var ht: *LockFreeHashTable = @ptrFromInt(table)
+  return atomic_load_64(@ptrFromInt(@addrOf(ht.size)))
+}
+
+// Get hash table statistics
+export fn lockfree_hashtable_stats(table: u64, stats_buffer: u64) {
+  var ht: *LockFreeHashTable = @ptrFromInt(table)
+  var stats: *u64 = @ptrFromInt(stats_buffer)
+
+  stats[0] = ht.num_buckets
+  stats[1] = atomic_load_64(@ptrFromInt(@addrOf(ht.size)))
+  stats[2] = atomic_load_64(@ptrFromInt(@addrOf(ht.insert_count)))
+  stats[3] = atomic_load_64(@ptrFromInt(@addrOf(ht.remove_count)))
+  stats[4] = atomic_load_64(@ptrFromInt(@addrOf(ht.lookup_count)))
+  stats[5] = atomic_load_64(@ptrFromInt(@addrOf(ht.collision_count)))
+}

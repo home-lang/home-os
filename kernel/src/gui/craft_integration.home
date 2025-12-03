@@ -1,0 +1,715 @@
+// home-os GUI - Craft UI Integration
+// Complete integration of Craft UI framework with kernel
+
+import "foundation.home" as foundation
+import "memory.home" as memory
+import "vfs_mmap.home" as mmap
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_WINDOWS: u32 = 256
+const MAX_WIDGETS_PER_WINDOW: u32 = 128
+const MAX_EVENT_QUEUE: u32 = 512
+
+// Window flags
+const WINDOW_RESIZABLE: u32 = 1
+const WINDOW_MOVABLE: u32 = 2
+const WINDOW_CLOSABLE: u32 = 4
+const WINDOW_MINIMIZABLE: u32 = 8
+const WINDOW_MAXIMIZABLE: u32 = 16
+const WINDOW_FRAMELESS: u32 = 32
+const WINDOW_TRANSPARENT: u32 = 64
+const WINDOW_ALWAYS_ON_TOP: u32 = 128
+
+// Widget types
+const WIDGET_BUTTON: u32 = 1
+const WIDGET_LABEL: u32 = 2
+const WIDGET_TEXTBOX: u32 = 3
+const WIDGET_CHECKBOX: u32 = 4
+const WIDGET_RADIO: u32 = 5
+const WIDGET_SLIDER: u32 = 6
+const WIDGET_LISTBOX: u32 = 7
+const WIDGET_TREEVIEW: u32 = 8
+const WIDGET_MENUBAR: u32 = 9
+const WIDGET_TOOLBAR: u32 = 10
+const WIDGET_STATUSBAR: u32 = 11
+const WIDGET_PANEL: u32 = 12
+const WIDGET_CANVAS: u32 = 13
+
+// Event types
+const EVENT_NONE: u32 = 0
+const EVENT_MOUSE_MOVE: u32 = 1
+const EVENT_MOUSE_DOWN: u32 = 2
+const EVENT_MOUSE_UP: u32 = 3
+const EVENT_MOUSE_WHEEL: u32 = 4
+const EVENT_KEY_DOWN: u32 = 5
+const EVENT_KEY_UP: u32 = 6
+const EVENT_WINDOW_CLOSE: u32 = 7
+const EVENT_WINDOW_RESIZE: u32 = 8
+const EVENT_WINDOW_MOVE: u32 = 9
+const EVENT_WIDGET_CLICKED: u32 = 10
+const EVENT_WIDGET_CHANGED: u32 = 11
+const EVENT_PAINT: u32 = 12
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct Rectangle {
+  x: i32,
+  y: i32,
+  width: u32,
+  height: u32
+}
+
+struct Color {
+  r: u8,
+  g: u8,
+  b: u8,
+  a: u8
+}
+
+struct Point {
+  x: i32,
+  y: i32
+}
+
+struct Widget {
+  id: u32,
+  type_id: u32,
+  rect: Rectangle,
+  text: [u8; 256],
+  text_len: u32,
+  fg_color: Color,
+  bg_color: Color,
+  visible: u32,
+  enabled: u32,
+  focused: u32,
+  parent_id: u32,
+  data: u64  // Widget-specific data
+}
+
+struct Window {
+  id: u32,
+  title: [u8; 256],
+  title_len: u32,
+  rect: Rectangle,
+  flags: u32,
+  visible: u32,
+  minimized: u32,
+  maximized: u32,
+  focused: u32,
+  framebuffer: u64,  // Pointer to window framebuffer
+  fb_width: u32,
+  fb_height: u32,
+  widget_count: u32,
+  widgets: [u32; 128],  // Widget IDs
+  z_order: u32,
+  pid: u32  // Owning process
+}
+
+struct Event {
+  type_id: u32,
+  window_id: u32,
+  widget_id: u32,
+  mouse_pos: Point,
+  mouse_button: u32,
+  key_code: u32,
+  key_modifiers: u32,
+  timestamp: u64
+}
+
+struct CraftStats {
+  total_windows: u64,
+  active_windows: u32,
+  total_widgets: u64,
+  active_widgets: u32,
+  events_processed: u64,
+  paint_calls: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var windows: [Window; 256]
+var widgets: [Widget; 32768]  // 256 windows * 128 widgets
+var event_queue: [Event; 512]
+var event_head: u32 = 0
+var event_tail: u32 = 0
+var next_window_id: u32 = 1
+var next_widget_id: u32 = 1
+var window_count: u32 = 0
+var widget_count: u32 = 0
+var craft_stats: CraftStats
+var craft_initialized: u32 = 0
+
+// Desktop framebuffer
+var desktop_fb: u64 = 0
+var desktop_width: u32 = 1920
+var desktop_height: u32 = 1080
+var desktop_bpp: u32 = 32
+
+// ============================================================================
+// WINDOW MANAGEMENT
+// ============================================================================
+
+export fn craft_create_window(title: u64, x: i32, y: i32, width: u32, height: u32, flags: u32): u32 {
+  if window_count >= MAX_WINDOWS {
+    return 0
+  }
+
+  // Find free window slot
+  var i: u32 = 0
+  while i < MAX_WINDOWS {
+    if windows[i].id == 0 {
+      var window_id: u32 = next_window_id
+      next_window_id = next_window_id + 1
+
+      windows[i].id = window_id
+      windows[i].rect.x = x
+      windows[i].rect.y = y
+      windows[i].rect.width = width
+      windows[i].rect.height = height
+      windows[i].flags = flags
+      windows[i].visible = 1
+      windows[i].minimized = 0
+      windows[i].maximized = 0
+      windows[i].focused = 0
+      windows[i].widget_count = 0
+      windows[i].z_order = window_count
+      windows[i].pid = 0  // TODO: Get current PID
+
+      // Copy title
+      var title_ptr: *u8 = @ptrFromInt(title)
+      var j: u32 = 0
+      while j < 255 and title_ptr[j] != 0 {
+        windows[i].title[j] = title_ptr[j]
+        j = j + 1
+      }
+      windows[i].title[j] = 0
+      windows[i].title_len = j
+
+      // Allocate framebuffer
+      var fb_size: u32 = width * height * 4  // RGBA
+      windows[i].framebuffer = memory.pmm_alloc_pages((fb_size + 4095) / 4096)
+      windows[i].fb_width = width
+      windows[i].fb_height = height
+
+      if windows[i].framebuffer == 0 {
+        windows[i].id = 0
+        return 0
+      }
+
+      // Clear framebuffer
+      memory.memset(windows[i].framebuffer, 0, fb_size)
+
+      window_count = window_count + 1
+      craft_stats.total_windows = craft_stats.total_windows + 1
+      craft_stats.active_windows = window_count
+
+      foundation.serial_write_string("[Craft] Created window: ")
+      foundation.serial_write_string(title_ptr)
+      foundation.serial_write_string("\n")
+
+      return window_id
+    }
+    i = i + 1
+  }
+
+  return 0
+}
+
+export fn craft_destroy_window(window_id: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_WINDOWS {
+    if windows[i].id == window_id {
+      // Destroy all widgets in window
+      var j: u32 = 0
+      while j < windows[i].widget_count {
+        craft_destroy_widget(windows[i].widgets[j])
+        j = j + 1
+      }
+
+      // Free framebuffer
+      if windows[i].framebuffer != 0 {
+        var fb_size: u32 = windows[i].fb_width * windows[i].fb_height * 4
+        memory.pmm_free_pages(windows[i].framebuffer, (fb_size + 4095) / 4096)
+      }
+
+      windows[i].id = 0
+      window_count = window_count - 1
+      craft_stats.active_windows = window_count
+
+      return 0
+    }
+    i = i + 1
+  }
+
+  return 1
+}
+
+export fn craft_show_window(window_id: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_WINDOWS {
+    if windows[i].id == window_id {
+      windows[i].visible = 1
+      craft_invalidate_window(window_id)
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+export fn craft_hide_window(window_id: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_WINDOWS {
+    if windows[i].id == window_id {
+      windows[i].visible = 0
+      craft_invalidate_window(window_id)
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+export fn craft_move_window(window_id: u32, x: i32, y: i32): u32 {
+  var i: u32 = 0
+  while i < MAX_WINDOWS {
+    if windows[i].id == window_id {
+      windows[i].rect.x = x
+      windows[i].rect.y = y
+      craft_invalidate_window(window_id)
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+export fn craft_resize_window(window_id: u32, width: u32, height: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_WINDOWS {
+    if windows[i].id == window_id {
+      // Free old framebuffer
+      if windows[i].framebuffer != 0 {
+        var old_fb_size: u32 = windows[i].fb_width * windows[i].fb_height * 4
+        memory.pmm_free_pages(windows[i].framebuffer, (old_fb_size + 4095) / 4096)
+      }
+
+      // Allocate new framebuffer
+      var new_fb_size: u32 = width * height * 4
+      windows[i].framebuffer = memory.pmm_alloc_pages((new_fb_size + 4095) / 4096)
+      if windows[i].framebuffer == 0 {
+        return 1
+      }
+
+      memory.memset(windows[i].framebuffer, 0, new_fb_size)
+
+      windows[i].rect.width = width
+      windows[i].rect.height = height
+      windows[i].fb_width = width
+      windows[i].fb_height = height
+
+      craft_invalidate_window(window_id)
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+export fn craft_focus_window(window_id: u32): u32 {
+  // Unfocus all windows
+  var i: u32 = 0
+  while i < MAX_WINDOWS {
+    windows[i].focused = 0
+    i = i + 1
+  }
+
+  // Focus requested window
+  i = 0
+  while i < MAX_WINDOWS {
+    if windows[i].id == window_id {
+      windows[i].focused = 1
+      // Bring to front (highest z-order)
+      windows[i].z_order = 1000
+      return 0
+    }
+    i = i + 1
+  }
+
+  return 1
+}
+
+// ============================================================================
+// WIDGET MANAGEMENT
+// ============================================================================
+
+export fn craft_create_widget(window_id: u32, type_id: u32, x: i32, y: i32, width: u32, height: u32): u32 {
+  if widget_count >= 32768 {
+    return 0
+  }
+
+  // Find window
+  var window_idx: u32 = 0xFFFFFFFF
+  var i: u32 = 0
+  while i < MAX_WINDOWS {
+    if windows[i].id == window_id {
+      window_idx = i
+      break
+    }
+    i = i + 1
+  }
+
+  if window_idx == 0xFFFFFFFF {
+    return 0
+  }
+
+  if windows[window_idx].widget_count >= MAX_WIDGETS_PER_WINDOW {
+    return 0
+  }
+
+  // Find free widget slot
+  i = 0
+  while i < 32768 {
+    if widgets[i].id == 0 {
+      var widget_id: u32 = next_widget_id
+      next_widget_id = next_widget_id + 1
+
+      widgets[i].id = widget_id
+      widgets[i].type_id = type_id
+      widgets[i].rect.x = x
+      widgets[i].rect.y = y
+      widgets[i].rect.width = width
+      widgets[i].rect.height = height
+      widgets[i].visible = 1
+      widgets[i].enabled = 1
+      widgets[i].focused = 0
+      widgets[i].parent_id = window_id
+      widgets[i].text_len = 0
+
+      // Default colors
+      widgets[i].fg_color.r = 0
+      widgets[i].fg_color.g = 0
+      widgets[i].fg_color.b = 0
+      widgets[i].fg_color.a = 255
+
+      widgets[i].bg_color.r = 240
+      widgets[i].bg_color.g = 240
+      widgets[i].bg_color.b = 240
+      widgets[i].bg_color.a = 255
+
+      // Add to window
+      windows[window_idx].widgets[windows[window_idx].widget_count] = widget_id
+      windows[window_idx].widget_count = windows[window_idx].widget_count + 1
+
+      widget_count = widget_count + 1
+      craft_stats.total_widgets = craft_stats.total_widgets + 1
+      craft_stats.active_widgets = widget_count
+
+      return widget_id
+    }
+    i = i + 1
+  }
+
+  return 0
+}
+
+export fn craft_destroy_widget(widget_id: u32): u32 {
+  var i: u32 = 0
+  while i < 32768 {
+    if widgets[i].id == widget_id {
+      widgets[i].id = 0
+      widget_count = widget_count - 1
+      craft_stats.active_widgets = widget_count
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+export fn craft_set_widget_text(widget_id: u32, text: u64): u32 {
+  var i: u32 = 0
+  while i < 32768 {
+    if widgets[i].id == widget_id {
+      var text_ptr: *u8 = @ptrFromInt(text)
+      var j: u32 = 0
+      while j < 255 and text_ptr[j] != 0 {
+        widgets[i].text[j] = text_ptr[j]
+        j = j + 1
+      }
+      widgets[i].text[j] = 0
+      widgets[i].text_len = j
+
+      // Invalidate parent window
+      craft_invalidate_window(widgets[i].parent_id)
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+export fn craft_set_widget_color(widget_id: u32, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u8, bg_g: u8, bg_b: u8): u32 {
+  var i: u32 = 0
+  while i < 32768 {
+    if widgets[i].id == widget_id {
+      widgets[i].fg_color.r = fg_r
+      widgets[i].fg_color.g = fg_g
+      widgets[i].fg_color.b = fg_b
+      widgets[i].bg_color.r = bg_r
+      widgets[i].bg_color.g = bg_g
+      widgets[i].bg_color.b = bg_b
+      craft_invalidate_window(widgets[i].parent_id)
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+// ============================================================================
+// EVENT SYSTEM
+// ============================================================================
+
+export fn craft_push_event(event_type: u32, window_id: u32, widget_id: u32): u32 {
+  var next_tail: u32 = (event_tail + 1) % MAX_EVENT_QUEUE
+  if next_tail == event_head {
+    return 1  // Queue full
+  }
+
+  event_queue[event_tail].type_id = event_type
+  event_queue[event_tail].window_id = window_id
+  event_queue[event_tail].widget_id = widget_id
+  event_queue[event_tail].timestamp = foundation.get_timestamp()
+
+  event_tail = next_tail
+  return 0
+}
+
+export fn craft_pop_event(event: *Event): u32 {
+  if event_head == event_tail {
+    return 0  // Queue empty
+  }
+
+  *event = event_queue[event_head]
+  event_head = (event_head + 1) % MAX_EVENT_QUEUE
+
+  craft_stats.events_processed = craft_stats.events_processed + 1
+  return 1
+}
+
+export fn craft_has_events(): u32 {
+  return if event_head != event_tail { 1 } else { 0 }
+}
+
+// ============================================================================
+// RENDERING
+// ============================================================================
+
+fn craft_invalidate_window(window_id: u32) {
+  craft_push_event(EVENT_PAINT, window_id, 0)
+}
+
+export fn craft_paint_window(window_id: u32) {
+  var i: u32 = 0
+  while i < MAX_WINDOWS {
+    if windows[i].id == window_id and windows[i].visible == 1 {
+      // Paint window background
+      craft_fill_rect(windows[i].framebuffer, windows[i].fb_width, 0, 0, windows[i].fb_width, windows[i].fb_height, 255, 255, 255, 255)
+
+      // Paint all widgets
+      var j: u32 = 0
+      while j < windows[i].widget_count {
+        craft_paint_widget(windows[i].widgets[j], windows[i].framebuffer, windows[i].fb_width)
+        j = j + 1
+      }
+
+      // Composite to desktop
+      craft_composite_window(i)
+
+      craft_stats.paint_calls = craft_stats.paint_calls + 1
+      return
+    }
+    i = i + 1
+  }
+}
+
+fn craft_paint_widget(widget_id: u32, fb: u64, fb_width: u32) {
+  var i: u32 = 0
+  while i < 32768 {
+    if widgets[i].id == widget_id and widgets[i].visible == 1 {
+      // Paint widget background
+      craft_fill_rect(fb, fb_width, widgets[i].rect.x, widgets[i].rect.y, widgets[i].rect.width, widgets[i].rect.height,
+                      widgets[i].bg_color.r, widgets[i].bg_color.g, widgets[i].bg_color.b, widgets[i].bg_color.a)
+
+      // Paint widget-specific content
+      if widgets[i].type_id == WIDGET_BUTTON {
+        craft_paint_button(i, fb, fb_width)
+      } else if widgets[i].type_id == WIDGET_LABEL {
+        craft_paint_label(i, fb, fb_width)
+      }
+      // TODO: Add other widget types
+
+      return
+    }
+    i = i + 1
+  }
+}
+
+fn craft_paint_button(widget_idx: u32, fb: u64, fb_width: u32) {
+  // Draw button border
+  var x: i32 = widgets[widget_idx].rect.x
+  var y: i32 = widgets[widget_idx].rect.y
+  var w: u32 = widgets[widget_idx].rect.width
+  var h: u32 = widgets[widget_idx].rect.height
+
+  craft_draw_rect(fb, fb_width, x, y, w, h, 128, 128, 128, 255)
+
+  // Draw text (centered)
+  // TODO: Implement text rendering
+}
+
+fn craft_paint_label(widget_idx: u32, fb: u64, fb_width: u32) {
+  // Draw text
+  // TODO: Implement text rendering
+}
+
+fn craft_fill_rect(fb: u64, fb_width: u32, x: i32, y: i32, width: u32, height: u32, r: u8, g: u8, b: u8, a: u8) {
+  var row: u32 = 0
+  while row < height {
+    var col: u32 = 0
+    while col < width {
+      var offset: u64 = ((y + row) * fb_width + (x + col)) * 4
+      var pixel: *u8 = @ptrFromInt(fb + offset)
+      pixel[0] = b
+      pixel[1] = g
+      pixel[2] = r
+      pixel[3] = a
+      col = col + 1
+    }
+    row = row + 1
+  }
+}
+
+fn craft_draw_rect(fb: u64, fb_width: u32, x: i32, y: i32, width: u32, height: u32, r: u8, g: u8, b: u8, a: u8) {
+  // Top and bottom
+  craft_fill_rect(fb, fb_width, x, y, width, 1, r, g, b, a)
+  craft_fill_rect(fb, fb_width, x, y + height - 1, width, 1, r, g, b, a)
+
+  // Left and right
+  craft_fill_rect(fb, fb_width, x, y, 1, height, r, g, b, a)
+  craft_fill_rect(fb, fb_width, x + width - 1, y, 1, height, r, g, b, a)
+}
+
+fn craft_composite_window(window_idx: u32) {
+  if desktop_fb == 0 { return }
+
+  var win_x: i32 = windows[window_idx].rect.x
+  var win_y: i32 = windows[window_idx].rect.y
+  var win_w: u32 = windows[window_idx].rect.width
+  var win_h: u32 = windows[window_idx].rect.height
+
+  // Simple blit (no alpha blending for now)
+  var row: u32 = 0
+  while row < win_h and (win_y + row) < desktop_height {
+    var col: u32 = 0
+    while col < win_w and (win_x + col) < desktop_width {
+      var src_offset: u64 = (row * win_w + col) * 4
+      var dst_offset: u64 = ((win_y + row) * desktop_width + (win_x + col)) * 4
+
+      var src_pixel: *u8 = @ptrFromInt(windows[window_idx].framebuffer + src_offset)
+      var dst_pixel: *u8 = @ptrFromInt(desktop_fb + dst_offset)
+
+      dst_pixel[0] = src_pixel[0]
+      dst_pixel[1] = src_pixel[1]
+      dst_pixel[2] = src_pixel[2]
+      dst_pixel[3] = src_pixel[3]
+
+      col = col + 1
+    }
+    row = row + 1
+  }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn craft_get_stats(): CraftStats {
+  return craft_stats
+}
+
+export fn craft_print_stats() {
+  foundation.serial_write_string("[Craft UI Stats]\n")
+  foundation.serial_write_string("  Total windows created: ")
+  foundation.serial_write_u64(craft_stats.total_windows)
+  foundation.serial_write_string("\n  Active windows: ")
+  foundation.serial_write_u32(craft_stats.active_windows)
+  foundation.serial_write_string("\n  Total widgets created: ")
+  foundation.serial_write_u64(craft_stats.total_widgets)
+  foundation.serial_write_string("\n  Active widgets: ")
+  foundation.serial_write_u32(craft_stats.active_widgets)
+  foundation.serial_write_string("\n  Events processed: ")
+  foundation.serial_write_u64(craft_stats.events_processed)
+  foundation.serial_write_string("\n  Paint calls: ")
+  foundation.serial_write_u64(craft_stats.paint_calls)
+  foundation.serial_write_string("\n")
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn craft_init(fb_addr: u64, width: u32, height: u32, bpp: u32) {
+  if craft_initialized == 1 { return }
+
+  desktop_fb = fb_addr
+  desktop_width = width
+  desktop_height = height
+  desktop_bpp = bpp
+
+  // Initialize windows
+  var i: u32 = 0
+  while i < MAX_WINDOWS {
+    windows[i].id = 0
+    i = i + 1
+  }
+
+  // Initialize widgets
+  i = 0
+  while i < 32768 {
+    widgets[i].id = 0
+    i = i + 1
+  }
+
+  event_head = 0
+  event_tail = 0
+  next_window_id = 1
+  next_widget_id = 1
+  window_count = 0
+  widget_count = 0
+
+  craft_stats.total_windows = 0
+  craft_stats.active_windows = 0
+  craft_stats.total_widgets = 0
+  craft_stats.active_widgets = 0
+  craft_stats.events_processed = 0
+  craft_stats.paint_calls = 0
+
+  craft_initialized = 1
+
+  foundation.serial_write_string("[Craft UI] Initialized (")
+  foundation.serial_write_u32(width)
+  foundation.serial_write_string("x")
+  foundation.serial_write_u32(height)
+  foundation.serial_write_string(" @ ")
+  foundation.serial_write_u32(bpp)
+  foundation.serial_write_string("bpp)\n")
+}

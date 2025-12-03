@@ -1,0 +1,523 @@
+// NUMA (Non-Uniform Memory Access) Support
+// Provides NUMA-aware memory allocation and CPU scheduling for multi-socket systems
+
+import basics
+
+// Import dependencies
+const memory = @import("memory.home")
+const acpi = @import("../arch/x86_64/acpi.home")
+
+// Constants
+const MAX_NUMA_NODES: u32 = 32
+const MAX_CPUS_PER_NODE: u32 = 64
+const MAX_MEMORY_RANGES: u32 = 256
+const CACHE_LINE_SIZE: u32 = 64
+
+// NUMA Distance Matrix
+const NUMA_LOCAL_DISTANCE: u32 = 10   // Local node access cost
+const NUMA_REMOTE_DISTANCE: u32 = 20  // Remote node access cost (typical)
+const NUMA_FAR_DISTANCE: u32 = 30     // Far node access cost
+
+// Memory Allocation Policies
+const NUMA_POLICY_DEFAULT: u32 = 0     // Use current node
+const NUMA_POLICY_BIND: u32 = 1        // Bind to specific node(s)
+const NUMA_POLICY_PREFERRED: u32 = 2   // Prefer specific node, fallback allowed
+const NUMA_POLICY_INTERLEAVE: u32 = 3  // Interleave across nodes
+
+// Memory range descriptor
+struct MemoryRange {
+  base_addr: u64
+  size: u64
+  node_id: u32
+  available: u32  // 1 if available for allocation
+}
+
+// NUMA node descriptor
+struct alignas(64) NumaNode {
+  node_id: u32
+  num_cpus: u32
+  cpu_ids: [MAX_CPUS_PER_NODE]u32
+
+  // Memory information
+  total_memory: u64
+  free_memory: u64
+  num_ranges: u32
+  memory_ranges: [MAX_MEMORY_RANGES]MemoryRange
+
+  // Distance to other nodes (indexed by node_id)
+  distance: [MAX_NUMA_NODES]u32
+
+  // Statistics
+  local_allocations: u64
+  remote_allocations: u64
+  allocation_failures: u64
+  migration_count: u64
+
+  _padding: [64]u8  // Prevent false sharing
+}
+
+// NUMA topology state
+struct NumaTopology {
+  num_nodes: u32
+  initialized: u32
+  nodes: [MAX_NUMA_NODES]NumaNode
+
+  // Global statistics
+  total_allocations: u64
+  total_migrations: u64
+  policy_violations: u64
+
+  // Current interleave node (for NUMA_POLICY_INTERLEAVE)
+  interleave_next: u32
+}
+
+var numa_topology: NumaTopology
+
+// CPU to NUMA node mapping
+var cpu_to_node: [256]u32
+
+// ============================================================================
+// NUMA Initialization
+// ============================================================================
+
+// Parse ACPI SRAT (System Resource Affinity Table)
+fn numa_parse_srat() {
+  // In a real implementation, this would parse the ACPI SRAT table
+  // For now, we'll create a simple default topology
+
+  // Check if SRAT is available via ACPI
+  var srat_addr: u64 = acpi.acpi_find_table_by_signature("SRAT")
+
+  if srat_addr == 0 {
+    // No SRAT - assume single NUMA node (UMA system)
+    numa_topology.num_nodes = 1
+    numa_topology.nodes[0].node_id = 0
+    numa_topology.nodes[0].num_cpus = 0
+    numa_topology.nodes[0].total_memory = 0
+    numa_topology.nodes[0].free_memory = 0
+    numa_topology.nodes[0].num_ranges = 0
+    numa_topology.nodes[0].distance[0] = NUMA_LOCAL_DISTANCE
+    return
+  }
+
+  // Parse SRAT entries
+  // SRAT structure: signature(4) + length(4) + revision(1) + checksum(1) + OEMID(6) + ...
+  var srat: *u8 = @ptrFromInt(srat_addr)
+  var srat_length: u32 = @ptrFromInt(srat + 4)[0]
+  var offset: u32 = 48  // Skip header
+
+  var node_count: u32 = 0
+
+  while offset < srat_length and node_count < MAX_NUMA_NODES {
+    var entry_type: u8 = srat[offset]
+    var entry_length: u8 = srat[offset + 1]
+
+    if entry_type == 0 {
+      // Processor Local APIC/SAPIC Affinity Structure
+      var proximity_domain: u32 = srat[offset + 2]
+      var apic_id: u8 = srat[offset + 3]
+
+      // Add CPU to NUMA node
+      if proximity_domain < MAX_NUMA_NODES {
+        var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (proximity_domain * @sizeOf(NumaNode)))
+        if node.num_cpus < MAX_CPUS_PER_NODE {
+          node.cpu_ids[node.num_cpus] = apic_id
+          node.num_cpus = node.num_cpus + 1
+          cpu_to_node[apic_id] = proximity_domain
+        }
+
+        if proximity_domain >= node_count {
+          node_count = proximity_domain + 1
+        }
+      }
+    } else if entry_type == 1 {
+      // Memory Affinity Structure
+      var proximity_domain: u32 = @ptrFromInt(srat + offset + 2)[0]
+      var base_addr_low: u32 = @ptrFromInt(srat + offset + 8)[0]
+      var base_addr_high: u32 = @ptrFromInt(srat + offset + 12)[0]
+      var length_low: u32 = @ptrFromInt(srat + offset + 16)[0]
+      var length_high: u32 = @ptrFromInt(srat + offset + 20)[0]
+
+      var base_addr: u64 = (base_addr_high << 32) | base_addr_low
+      var length: u64 = (length_high << 32) | length_low
+
+      // Add memory range to NUMA node
+      if proximity_domain < MAX_NUMA_NODES {
+        var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (proximity_domain * @sizeOf(NumaNode)))
+        if node.num_ranges < MAX_MEMORY_RANGES {
+          node.memory_ranges[node.num_ranges].base_addr = base_addr
+          node.memory_ranges[node.num_ranges].size = length
+          node.memory_ranges[node.num_ranges].node_id = proximity_domain
+          node.memory_ranges[node.num_ranges].available = 1
+          node.num_ranges = node.num_ranges + 1
+          node.total_memory = node.total_memory + length
+          node.free_memory = node.free_memory + length
+        }
+      }
+    }
+
+    offset = offset + entry_length
+  }
+
+  numa_topology.num_nodes = node_count
+}
+
+// Parse ACPI SLIT (System Locality Information Table)
+fn numa_parse_slit() {
+  var slit_addr: u64 = acpi.acpi_find_table_by_signature("SLIT")
+
+  if slit_addr == 0 {
+    // No SLIT - use default distances
+    var i: u32 = 0
+    while i < numa_topology.num_nodes {
+      var node_i: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (i * @sizeOf(NumaNode)))
+      var j: u32 = 0
+      while j < numa_topology.num_nodes {
+        if i == j {
+          node_i.distance[j] = NUMA_LOCAL_DISTANCE
+        } else {
+          node_i.distance[j] = NUMA_REMOTE_DISTANCE
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+    return
+  }
+
+  // Parse SLIT matrix
+  var slit: *u8 = @ptrFromInt(slit_addr)
+  var num_localities: u64 = @ptrFromInt(slit + 36)[0]
+  var matrix_offset: u32 = 44
+
+  var i: u32 = 0
+  while i < numa_topology.num_nodes and i < num_localities {
+    var node_i: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (i * @sizeOf(NumaNode)))
+    var j: u32 = 0
+    while j < numa_topology.num_nodes and j < num_localities {
+      var distance: u8 = slit[matrix_offset + (i * num_localities) + j]
+      node_i.distance[j] = distance
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+// Initialize NUMA subsystem
+export fn numa_init() {
+  numa_topology.num_nodes = 0
+  numa_topology.initialized = 0
+  numa_topology.total_allocations = 0
+  numa_topology.total_migrations = 0
+  numa_topology.policy_violations = 0
+  numa_topology.interleave_next = 0
+
+  // Initialize all nodes
+  var i: u32 = 0
+  while i < MAX_NUMA_NODES {
+    var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (i * @sizeOf(NumaNode)))
+    node.node_id = i
+    node.num_cpus = 0
+    node.total_memory = 0
+    node.free_memory = 0
+    node.num_ranges = 0
+    node.local_allocations = 0
+    node.remote_allocations = 0
+    node.allocation_failures = 0
+    node.migration_count = 0
+    i = i + 1
+  }
+
+  // Initialize CPU to node mapping
+  i = 0
+  while i < 256 {
+    cpu_to_node[i] = 0
+    i = i + 1
+  }
+
+  // Parse ACPI tables
+  numa_parse_srat()
+  numa_parse_slit()
+
+  numa_topology.initialized = 1
+}
+
+// ============================================================================
+// NUMA-Aware Memory Allocation
+// ============================================================================
+
+// Get NUMA node for current CPU
+export fn numa_current_node(): u32 {
+  // Would get current CPU ID from APIC
+  var cpu_id: u32 = 0  // Placeholder - should call apic.apic_get_id()
+  if cpu_id < 256 {
+    return cpu_to_node[cpu_id]
+  }
+  return 0
+}
+
+// Get NUMA node for specific CPU
+export fn numa_cpu_to_node(cpu_id: u32): u32 {
+  if cpu_id < 256 {
+    return cpu_to_node[cpu_id]
+  }
+  return 0
+}
+
+// Find nearest node with available memory
+fn numa_find_nearest_node(preferred_node: u32, size: u64): u32 {
+  var min_distance: u32 = 0xFFFFFFFF
+  var best_node: u32 = preferred_node
+
+  var i: u32 = 0
+  while i < numa_topology.num_nodes {
+    var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (i * @sizeOf(NumaNode)))
+
+    if node.free_memory >= size {
+      var pref_node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (preferred_node * @sizeOf(NumaNode)))
+      var distance: u32 = pref_node.distance[i]
+
+      if distance < min_distance {
+        min_distance = distance
+        best_node = i
+      }
+    }
+
+    i = i + 1
+  }
+
+  return best_node
+}
+
+// Allocate memory on specific NUMA node
+export fn numa_alloc_on_node(size: u64, node_id: u32): u64 {
+  if node_id >= numa_topology.num_nodes {
+    return 0  // Invalid node
+  }
+
+  var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (node_id * @sizeOf(NumaNode)))
+
+  // Find suitable memory range
+  var i: u32 = 0
+  while i < node.num_ranges {
+    var range: *MemoryRange = @ptrFromInt(@ptrFromInt(@addrOf(node.memory_ranges)) + (i * @sizeOf(MemoryRange)))
+
+    if range.available == 1 and range.size >= size {
+      // Allocate from this range
+      var addr: u64 = range.base_addr
+
+      // Update range
+      range.base_addr = range.base_addr + size
+      range.size = range.size - size
+
+      // Update node statistics
+      node.free_memory = node.free_memory - size
+      node.local_allocations = node.local_allocations + 1
+      numa_topology.total_allocations = numa_topology.total_allocations + 1
+
+      return addr
+    }
+
+    i = i + 1
+  }
+
+  // No suitable range found
+  node.allocation_failures = node.allocation_failures + 1
+  return 0
+}
+
+// Allocate memory using NUMA policy
+export fn numa_alloc(size: u64, policy: u32, preferred_node: u32): u64 {
+  if numa_topology.initialized == 0 {
+    return memory.kmalloc(size)  // Fallback to regular allocation
+  }
+
+  var addr: u64 = 0
+
+  if policy == NUMA_POLICY_DEFAULT {
+    // Allocate on current node
+    var node_id: u32 = numa_current_node()
+    addr = numa_alloc_on_node(size, node_id)
+
+    if addr == 0 {
+      // Fallback to nearest node
+      var nearest: u32 = numa_find_nearest_node(node_id, size)
+      addr = numa_alloc_on_node(size, nearest)
+
+      if addr != 0 {
+        var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (node_id * @sizeOf(NumaNode)))
+        node.remote_allocations = node.remote_allocations + 1
+      }
+    }
+  } else if policy == NUMA_POLICY_BIND {
+    // Must allocate on specified node
+    addr = numa_alloc_on_node(size, preferred_node)
+
+    if addr == 0 {
+      numa_topology.policy_violations = numa_topology.policy_violations + 1
+    }
+  } else if policy == NUMA_POLICY_PREFERRED {
+    // Try preferred node first, then fallback
+    addr = numa_alloc_on_node(size, preferred_node)
+
+    if addr == 0 {
+      var nearest: u32 = numa_find_nearest_node(preferred_node, size)
+      addr = numa_alloc_on_node(size, nearest)
+    }
+  } else if policy == NUMA_POLICY_INTERLEAVE {
+    // Round-robin across all nodes
+    var start_node: u32 = numa_topology.interleave_next
+    numa_topology.interleave_next = (numa_topology.interleave_next + 1) % numa_topology.num_nodes
+
+    var attempts: u32 = 0
+    while attempts < numa_topology.num_nodes {
+      var try_node: u32 = (start_node + attempts) % numa_topology.num_nodes
+      addr = numa_alloc_on_node(size, try_node)
+
+      if addr != 0 {
+        break
+      }
+
+      attempts = attempts + 1
+    }
+  }
+
+  return addr
+}
+
+// Free NUMA-allocated memory
+export fn numa_free(addr: u64, size: u64) {
+  // Find which node this memory belongs to
+  var i: u32 = 0
+  while i < numa_topology.num_nodes {
+    var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (i * @sizeOf(NumaNode)))
+
+    var j: u32 = 0
+    while j < node.num_ranges {
+      var range: *MemoryRange = @ptrFromInt(@ptrFromInt(@addrOf(node.memory_ranges)) + (j * @sizeOf(MemoryRange)))
+
+      // Check if address falls within original range boundaries
+      var range_start: u64 = range.base_addr
+      var range_end: u64 = range.base_addr + range.size
+
+      if addr >= range_start - size and addr < range_end + size {
+        // Return memory to this range
+        node.free_memory = node.free_memory + size
+
+        // Note: In a real implementation, we'd merge adjacent free ranges
+        return
+      }
+
+      j = j + 1
+    }
+
+    i = i + 1
+  }
+
+  // Fallback to regular free
+  memory.kfree(addr)
+}
+
+// ============================================================================
+// NUMA-Aware Task Migration
+// ============================================================================
+
+// Migrate process/thread to NUMA node
+export fn numa_migrate_task(task_id: u64, target_node: u32): u32 {
+  if target_node >= numa_topology.num_nodes {
+    return 1  // Invalid node
+  }
+
+  var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (target_node * @sizeOf(NumaNode)))
+
+  if node.num_cpus == 0 {
+    return 2  // Node has no CPUs
+  }
+
+  // In a real implementation, this would:
+  // 1. Reschedule task to run on a CPU in target_node
+  // 2. Migrate task's memory pages to target_node
+  // 3. Update task's NUMA policy
+
+  node.migration_count = node.migration_count + 1
+  numa_topology.total_migrations = numa_topology.total_migrations + 1
+
+  return 0
+}
+
+// Get optimal node for task based on memory access patterns
+export fn numa_get_optimal_node(task_id: u64): u32 {
+  // In a real implementation, this would analyze the task's memory access patterns
+  // For now, return current node
+  return numa_current_node()
+}
+
+// ============================================================================
+// NUMA Information and Statistics
+// ============================================================================
+
+// Get number of NUMA nodes
+export fn numa_get_num_nodes(): u32 {
+  return numa_topology.num_nodes
+}
+
+// Get node information
+export fn numa_get_node_info(node_id: u32, info_buffer: u64): u32 {
+  if node_id >= numa_topology.num_nodes {
+    return 1
+  }
+
+  var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (node_id * @sizeOf(NumaNode)))
+  var info: *u64 = @ptrFromInt(info_buffer)
+
+  info[0] = node.node_id
+  info[1] = node.num_cpus
+  info[2] = node.total_memory
+  info[3] = node.free_memory
+  info[4] = node.local_allocations
+  info[5] = node.remote_allocations
+  info[6] = node.allocation_failures
+  info[7] = node.migration_count
+
+  return 0
+}
+
+// Get distance between two nodes
+export fn numa_get_distance(from_node: u32, to_node: u32): u32 {
+  if from_node >= numa_topology.num_nodes or to_node >= numa_topology.num_nodes {
+    return 0xFFFFFFFF
+  }
+
+  var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (from_node * @sizeOf(NumaNode)))
+  return node.distance[to_node]
+}
+
+// Get global NUMA statistics
+export fn numa_get_global_stats(stats_buffer: u64) {
+  var stats: *u64 = @ptrFromInt(stats_buffer)
+
+  stats[0] = numa_topology.num_nodes
+  stats[1] = numa_topology.total_allocations
+  stats[2] = numa_topology.total_migrations
+  stats[3] = numa_topology.policy_violations
+
+  // Calculate total and free memory across all nodes
+  var total_mem: u64 = 0
+  var free_mem: u64 = 0
+
+  var i: u32 = 0
+  while i < numa_topology.num_nodes {
+    var node: *NumaNode = @ptrFromInt(@ptrFromInt(@addrOf(numa_topology.nodes)) + (i * @sizeOf(NumaNode)))
+    total_mem = total_mem + node.total_memory
+    free_mem = free_mem + node.free_memory
+    i = i + 1
+  }
+
+  stats[4] = total_mem
+  stats[5] = free_mem
+}
+
+// Check if system is NUMA
+export fn numa_is_available(): u32 {
+  return if numa_topology.num_nodes > 1 then 1 else 0
+}

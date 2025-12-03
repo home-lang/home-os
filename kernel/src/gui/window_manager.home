@@ -1,0 +1,542 @@
+// home-os GUI - Advanced Window Manager
+// Tiling, floating, and virtual desktop support
+
+import "foundation.home" as foundation
+import "memory.home" as memory
+import "craft_integration.home" as craft
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_WORKSPACES: u32 = 10
+const MAX_TILING_LAYOUTS: u32 = 5
+
+// Window manager modes
+const WM_MODE_FLOATING: u32 = 0
+const WM_MODE_TILING: u32 = 1
+const WM_MODE_FULLSCREEN: u32 = 2
+
+// Tiling layouts
+const LAYOUT_HORIZONTAL: u32 = 0  // Side by side
+const LAYOUT_VERTICAL: u32 = 1    // Stacked
+const LAYOUT_GRID: u32 = 2        // Grid layout
+const LAYOUT_MASTER: u32 = 3      // Master + stack
+const LAYOUT_SPIRAL: u32 = 4      // Fibonacci spiral
+
+// Keyboard shortcuts
+const KEY_MOD_SUPER: u32 = 1  // Windows/Command key
+const KEY_MOD_ALT: u32 = 2
+const KEY_MOD_CTRL: u32 = 4
+const KEY_MOD_SHIFT: u32 = 8
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct Workspace {
+  id: u32,
+  name: [u8; 64],
+  name_len: u32,
+  window_ids: [u32; 256],
+  window_count: u32,
+  layout: u32,
+  active: u32
+}
+
+struct WindowManagerConfig {
+  mode: u32,
+  default_layout: u32,
+  window_gap: u32,
+  border_width: u32,
+  border_color_active: u32,
+  border_color_inactive: u32,
+  snap_threshold: u32,
+  virtual_desktops_enabled: u32
+}
+
+struct TilingState {
+  master_window_id: u32,
+  master_width_ratio: u32,  // Percentage (0-100)
+  stack_window_ids: [u32; 255],
+  stack_count: u32
+}
+
+struct WindowManagerStats {
+  window_moves: u64,
+  window_resizes: u64,
+  workspace_switches: u64,
+  layout_changes: u64,
+  snap_events: u64
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var workspaces: [Workspace; 10]
+var current_workspace: u32 = 0
+var workspace_count: u32 = 1
+var wm_config: WindowManagerConfig
+var tiling_state: TilingState
+var wm_stats: WindowManagerStats
+var wm_initialized: u32 = 0
+
+// Screen dimensions
+var screen_width: u32 = 1920
+var screen_height: u32 = 1080
+
+// ============================================================================
+// WORKSPACE MANAGEMENT
+// ============================================================================
+
+export fn wm_create_workspace(name: u64): u32 {
+  if workspace_count >= MAX_WORKSPACES {
+    return 0
+  }
+
+  var workspace_id: u32 = workspace_count
+
+  var name_ptr: *u8 = @ptrFromInt(name)
+  var i: u32 = 0
+  while i < 63 and name_ptr[i] != 0 {
+    workspaces[workspace_id].name[i] = name_ptr[i]
+    i = i + 1
+  }
+  workspaces[workspace_id].name[i] = 0
+  workspaces[workspace_id].name_len = i
+
+  workspaces[workspace_id].id = workspace_id
+  workspaces[workspace_id].window_count = 0
+  workspaces[workspace_id].layout = wm_config.default_layout
+  workspaces[workspace_id].active = 0
+
+  workspace_count = workspace_count + 1
+
+  foundation.serial_write_string("[WM] Created workspace: ")
+  foundation.serial_write_string(name_ptr)
+  foundation.serial_write_string("\n")
+
+  return workspace_id
+}
+
+export fn wm_switch_workspace(workspace_id: u32): u32 {
+  if workspace_id >= workspace_count {
+    return 1
+  }
+
+  // Hide windows from current workspace
+  var i: u32 = 0
+  while i < workspaces[current_workspace].window_count {
+    craft.craft_hide_window(workspaces[current_workspace].window_ids[i])
+    i = i + 1
+  }
+
+  workspaces[current_workspace].active = 0
+
+  // Show windows from new workspace
+  current_workspace = workspace_id
+  workspaces[current_workspace].active = 1
+
+  i = 0
+  while i < workspaces[current_workspace].window_count {
+    craft.craft_show_window(workspaces[current_workspace].window_ids[i])
+    i = i + 1
+  }
+
+  wm_stats.workspace_switches = wm_stats.workspace_switches + 1
+
+  foundation.serial_write_string("[WM] Switched to workspace ")
+  foundation.serial_write_u32(workspace_id)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+export fn wm_add_window_to_workspace(workspace_id: u32, window_id: u32): u32 {
+  if workspace_id >= workspace_count {
+    return 1
+  }
+
+  if workspaces[workspace_id].window_count >= 256 {
+    return 1
+  }
+
+  workspaces[workspace_id].window_ids[workspaces[workspace_id].window_count] = window_id
+  workspaces[workspace_id].window_count = workspaces[workspace_id].window_count + 1
+
+  // Apply layout
+  wm_apply_layout(workspace_id)
+
+  return 0
+}
+
+export fn wm_remove_window_from_workspace(workspace_id: u32, window_id: u32): u32 {
+  if workspace_id >= workspace_count {
+    return 1
+  }
+
+  var i: u32 = 0
+  var found: u32 = 0
+  while i < workspaces[workspace_id].window_count {
+    if found == 1 {
+      workspaces[workspace_id].window_ids[i - 1] = workspaces[workspace_id].window_ids[i]
+    } else if workspaces[workspace_id].window_ids[i] == window_id {
+      found = 1
+    }
+    i = i + 1
+  }
+
+  if found == 1 {
+    workspaces[workspace_id].window_count = workspaces[workspace_id].window_count - 1
+    wm_apply_layout(workspace_id)
+  }
+
+  return if found == 1 { 0 } else { 1 }
+}
+
+// ============================================================================
+// TILING LAYOUTS
+// ============================================================================
+
+export fn wm_set_layout(workspace_id: u32, layout: u32): u32 {
+  if workspace_id >= workspace_count {
+    return 1
+  }
+
+  workspaces[workspace_id].layout = layout
+  wm_apply_layout(workspace_id)
+  wm_stats.layout_changes = wm_stats.layout_changes + 1
+
+  return 0
+}
+
+fn wm_apply_layout(workspace_id: u32) {
+  if workspace_id >= workspace_count {
+    return
+  }
+
+  var layout: u32 = workspaces[workspace_id].layout
+  var win_count: u32 = workspaces[workspace_id].window_count
+
+  if win_count == 0 {
+    return
+  }
+
+  if layout == LAYOUT_HORIZONTAL {
+    wm_layout_horizontal(workspace_id)
+  } else if layout == LAYOUT_VERTICAL {
+    wm_layout_vertical(workspace_id)
+  } else if layout == LAYOUT_GRID {
+    wm_layout_grid(workspace_id)
+  } else if layout == LAYOUT_MASTER {
+    wm_layout_master(workspace_id)
+  } else if layout == LAYOUT_SPIRAL {
+    wm_layout_spiral(workspace_id)
+  }
+}
+
+fn wm_layout_horizontal(workspace_id: u32) {
+  var win_count: u32 = workspaces[workspace_id].window_count
+  var win_width: u32 = (screen_width - (win_count + 1) * wm_config.window_gap) / win_count
+
+  var i: u32 = 0
+  while i < win_count {
+    var x: i32 = (wm_config.window_gap + i * (win_width + wm_config.window_gap))
+    var y: i32 = wm_config.window_gap
+    var width: u32 = win_width
+    var height: u32 = screen_height - 2 * wm_config.window_gap
+
+    craft.craft_move_window(workspaces[workspace_id].window_ids[i], x, y)
+    craft.craft_resize_window(workspaces[workspace_id].window_ids[i], width, height)
+
+    i = i + 1
+  }
+}
+
+fn wm_layout_vertical(workspace_id: u32) {
+  var win_count: u32 = workspaces[workspace_id].window_count
+  var win_height: u32 = (screen_height - (win_count + 1) * wm_config.window_gap) / win_count
+
+  var i: u32 = 0
+  while i < win_count {
+    var x: i32 = wm_config.window_gap
+    var y: i32 = (wm_config.window_gap + i * (win_height + wm_config.window_gap))
+    var width: u32 = screen_width - 2 * wm_config.window_gap
+    var height: u32 = win_height
+
+    craft.craft_move_window(workspaces[workspace_id].window_ids[i], x, y)
+    craft.craft_resize_window(workspaces[workspace_id].window_ids[i], width, height)
+
+    i = i + 1
+  }
+}
+
+fn wm_layout_grid(workspace_id: u32) {
+  var win_count: u32 = workspaces[workspace_id].window_count
+
+  // Calculate grid dimensions
+  var cols: u32 = 1
+  var rows: u32 = 1
+
+  if win_count <= 4 {
+    cols = 2
+    rows = (win_count + 1) / 2
+  } else {
+    cols = 3
+    rows = (win_count + 2) / 3
+  }
+
+  var win_width: u32 = (screen_width - (cols + 1) * wm_config.window_gap) / cols
+  var win_height: u32 = (screen_height - (rows + 1) * wm_config.window_gap) / rows
+
+  var i: u32 = 0
+  while i < win_count {
+    var col: u32 = i % cols
+    var row: u32 = i / cols
+
+    var x: i32 = (wm_config.window_gap + col * (win_width + wm_config.window_gap))
+    var y: i32 = (wm_config.window_gap + row * (win_height + wm_config.window_gap))
+
+    craft.craft_move_window(workspaces[workspace_id].window_ids[i], x, y)
+    craft.craft_resize_window(workspaces[workspace_id].window_ids[i], win_width, win_height)
+
+    i = i + 1
+  }
+}
+
+fn wm_layout_master(workspace_id: u32) {
+  var win_count: u32 = workspaces[workspace_id].window_count
+
+  if win_count == 0 {
+    return
+  }
+
+  var master_width: u32 = (screen_width * tiling_state.master_width_ratio) / 100
+
+  // Master window (first window)
+  craft.craft_move_window(workspaces[workspace_id].window_ids[0], wm_config.window_gap, wm_config.window_gap)
+  craft.craft_resize_window(workspaces[workspace_id].window_ids[0],
+                           master_width - 2 * wm_config.window_gap,
+                           screen_height - 2 * wm_config.window_gap)
+
+  // Stack windows
+  if win_count > 1 {
+    var stack_count: u32 = win_count - 1
+    var stack_width: u32 = screen_width - master_width - 2 * wm_config.window_gap
+    var stack_height: u32 = (screen_height - (stack_count + 1) * wm_config.window_gap) / stack_count
+
+    var i: u32 = 1
+    while i < win_count {
+      var x: i32 = master_width + wm_config.window_gap
+      var y: i32 = (wm_config.window_gap + (i - 1) * (stack_height + wm_config.window_gap))
+
+      craft.craft_move_window(workspaces[workspace_id].window_ids[i], x, y)
+      craft.craft_resize_window(workspaces[workspace_id].window_ids[i], stack_width, stack_height)
+
+      i = i + 1
+    }
+  }
+}
+
+fn wm_layout_spiral(workspace_id: u32) {
+  // Fibonacci spiral layout (simplified)
+  var win_count: u32 = workspaces[workspace_id].window_count
+
+  if win_count == 0 {
+    return
+  }
+
+  // First window takes half the screen
+  craft.craft_move_window(workspaces[workspace_id].window_ids[0], 0, 0)
+  craft.craft_resize_window(workspaces[workspace_id].window_ids[0], screen_width / 2, screen_height)
+
+  // Subsequent windows split remaining space
+  var i: u32 = 1
+  var x: i32 = screen_width / 2
+  var y: i32 = 0
+  var w: u32 = screen_width / 2
+  var h: u32 = screen_height
+
+  while i < win_count {
+    if i % 2 == 1 {
+      h = h / 2
+    } else {
+      w = w / 2
+      x = x + w
+    }
+
+    craft.craft_move_window(workspaces[workspace_id].window_ids[i], x, y)
+    craft.craft_resize_window(workspaces[workspace_id].window_ids[i], w, h)
+
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// WINDOW SNAPPING
+// ============================================================================
+
+export fn wm_snap_window(window_id: u32, edge: u32): u32 {
+  // Edge: 0=left, 1=right, 2=top, 3=bottom
+  // 4=top-left, 5=top-right, 6=bottom-left, 7=bottom-right
+
+  var half_width: u32 = screen_width / 2
+  var half_height: u32 = screen_height / 2
+
+  if edge == 0 {
+    // Snap left
+    craft.craft_move_window(window_id, 0, 0)
+    craft.craft_resize_window(window_id, half_width, screen_height)
+  } else if edge == 1 {
+    // Snap right
+    craft.craft_move_window(window_id, half_width, 0)
+    craft.craft_resize_window(window_id, half_width, screen_height)
+  } else if edge == 2 {
+    // Snap top
+    craft.craft_move_window(window_id, 0, 0)
+    craft.craft_resize_window(window_id, screen_width, half_height)
+  } else if edge == 3 {
+    // Snap bottom
+    craft.craft_move_window(window_id, 0, half_height)
+    craft.craft_resize_window(window_id, screen_width, half_height)
+  } else if edge == 4 {
+    // Top-left quarter
+    craft.craft_move_window(window_id, 0, 0)
+    craft.craft_resize_window(window_id, half_width, half_height)
+  } else if edge == 5 {
+    // Top-right quarter
+    craft.craft_move_window(window_id, half_width, 0)
+    craft.craft_resize_window(window_id, half_width, half_height)
+  } else if edge == 6 {
+    // Bottom-left quarter
+    craft.craft_move_window(window_id, 0, half_height)
+    craft.craft_resize_window(window_id, half_width, half_height)
+  } else if edge == 7 {
+    // Bottom-right quarter
+    craft.craft_move_window(window_id, half_width, half_height)
+    craft.craft_resize_window(window_id, half_width, half_height)
+  }
+
+  wm_stats.snap_events = wm_stats.snap_events + 1
+  return 0
+}
+
+// ============================================================================
+// KEYBOARD SHORTCUTS
+// ============================================================================
+
+export fn wm_handle_shortcut(key_code: u32, modifiers: u32): u32 {
+  // Super + 1-9: Switch workspace
+  if (modifiers & KEY_MOD_SUPER) != 0 and key_code >= ('1' as u32) and key_code <= ('9' as u32) {
+    var workspace_id: u32 = key_code - ('1' as u32)
+    return wm_switch_workspace(workspace_id)
+  }
+
+  // Super + H: Horizontal layout
+  if (modifiers & KEY_MOD_SUPER) != 0 and key_code == ('H' as u32) {
+    return wm_set_layout(current_workspace, LAYOUT_HORIZONTAL)
+  }
+
+  // Super + V: Vertical layout
+  if (modifiers & KEY_MOD_SUPER) != 0 and key_code == ('V' as u32) {
+    return wm_set_layout(current_workspace, LAYOUT_VERTICAL)
+  }
+
+  // Super + G: Grid layout
+  if (modifiers & KEY_MOD_SUPER) != 0 and key_code == ('G' as u32) {
+    return wm_set_layout(current_workspace, LAYOUT_GRID)
+  }
+
+  // Super + M: Master layout
+  if (modifiers & KEY_MOD_SUPER) != 0 and key_code == ('M' as u32) {
+    return wm_set_layout(current_workspace, LAYOUT_MASTER)
+  }
+
+  return 1  // Not handled
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn wm_get_stats(): WindowManagerStats {
+  return wm_stats
+}
+
+export fn wm_print_stats() {
+  foundation.serial_write_string("[Window Manager Stats]\n")
+  foundation.serial_write_string("  Window moves: ")
+  foundation.serial_write_u64(wm_stats.window_moves)
+  foundation.serial_write_string("\n  Window resizes: ")
+  foundation.serial_write_u64(wm_stats.window_resizes)
+  foundation.serial_write_string("\n  Workspace switches: ")
+  foundation.serial_write_u64(wm_stats.workspace_switches)
+  foundation.serial_write_string("\n  Layout changes: ")
+  foundation.serial_write_u64(wm_stats.layout_changes)
+  foundation.serial_write_string("\n  Snap events: ")
+  foundation.serial_write_u64(wm_stats.snap_events)
+  foundation.serial_write_string("\n")
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn wm_init(width: u32, height: u32) {
+  if wm_initialized == 1 { return }
+
+  screen_width = width
+  screen_height = height
+
+  // Initialize workspaces
+  var i: u32 = 0
+  while i < MAX_WORKSPACES {
+    workspaces[i].id = 0
+    workspaces[i].window_count = 0
+    workspaces[i].active = 0
+    i = i + 1
+  }
+
+  // Create default workspace
+  current_workspace = 0
+  workspaces[0].id = 0
+  workspaces[0].window_count = 0
+  workspaces[0].layout = LAYOUT_MASTER
+  workspaces[0].active = 1
+  workspace_count = 1
+
+  var default_name: [u8; 8] = ['D', 'e', 'f', 'a', 'u', 'l', 't', 0]
+  i = 0
+  while i < 7 {
+    workspaces[0].name[i] = default_name[i]
+    i = i + 1
+  }
+  workspaces[0].name_len = 7
+
+  // Config
+  wm_config.mode = WM_MODE_TILING
+  wm_config.default_layout = LAYOUT_MASTER
+  wm_config.window_gap = 10
+  wm_config.border_width = 2
+  wm_config.border_color_active = 0xFF0000FF  // Blue
+  wm_config.border_color_inactive = 0xFF808080  // Gray
+  wm_config.snap_threshold = 20
+  wm_config.virtual_desktops_enabled = 1
+
+  // Tiling state
+  tiling_state.master_window_id = 0
+  tiling_state.master_width_ratio = 60  // 60% for master
+  tiling_state.stack_count = 0
+
+  // Stats
+  wm_stats.window_moves = 0
+  wm_stats.window_resizes = 0
+  wm_stats.workspace_switches = 0
+  wm_stats.layout_changes = 0
+  wm_stats.snap_events = 0
+
+  wm_initialized = 1
+
+  foundation.serial_write_string("[Window Manager] Initialized (tiling mode, master layout)\n")
+}

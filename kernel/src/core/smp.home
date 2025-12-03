@@ -1,0 +1,498 @@
+// SMP (Symmetric Multi-Processing) Support with Per-CPU Run Queues
+// Provides scalable multi-processor support with lock-free per-CPU scheduling
+
+import basics
+
+// Import dependencies
+const memory = @import("memory.home")
+const process = @import("process.home")
+const apic = @import("../arch/x86_64/apic.home")
+
+// Constants
+const MAX_CPUS: u32 = 256
+const MAX_TASKS_PER_CPU: u32 = 4096
+const RUNQUEUE_PRIORITY_LEVELS: u32 = 140  // Standard Linux priority levels (0-139)
+const CACHE_LINE_SIZE: u32 = 64
+
+// CPU States
+const CPU_STATE_OFFLINE: u32 = 0
+const CPU_STATE_BOOTING: u32 = 1
+const CPU_STATE_ONLINE: u32 = 2
+const CPU_STATE_IDLE: u32 = 3
+const CPU_STATE_HALTED: u32 = 4
+
+// Task States
+const TASK_STATE_RUNNABLE: u32 = 0
+const TASK_STATE_RUNNING: u32 = 1
+const TASK_STATE_BLOCKED: u32 = 2
+const TASK_STATE_ZOMBIE: u32 = 3
+
+// Load Balancing
+const LOAD_BALANCE_INTERVAL: u64 = 1000  // Milliseconds
+const LOAD_IMBALANCE_THRESHOLD: u32 = 25  // Percentage difference
+
+// Task structure (simplified - references process.home)
+struct Task {
+  pid: u32
+  state: u32
+  priority: u32
+  time_slice: u32
+  cpu_affinity: u64  // Bitmask of allowed CPUs
+  last_cpu: u32
+  vruntime: u64  // Virtual runtime (for CFS-style scheduling)
+  next: u64  // Pointer to next task in queue
+}
+
+// Per-Priority Run Queue (lock-free linked list)
+struct PriorityQueue {
+  head: u64  // Atomic pointer to first task
+  tail: u64  // Atomic pointer to last task
+  count: u32  // Number of tasks in this priority level
+  _padding: [52]u8  // Pad to cache line size
+}
+
+// Per-CPU Run Queue (cache-aligned to prevent false sharing)
+struct alignas(64) CPURunQueue {
+  cpu_id: u32
+  state: u32  // CPU_STATE_*
+  current_task: u64  // Pointer to currently running task
+  idle_task: u64  // Pointer to idle task
+
+  // Multi-level priority queues
+  priority_queues: [RUNQUEUE_PRIORITY_LEVELS]PriorityQueue
+
+  // Statistics
+  total_tasks: u32
+  running_tasks: u32
+  load_weight: u64  // Total load (sum of task weights)
+
+  // Load balancing
+  last_balance_time: u64
+  migration_pending: u32
+
+  // Tick accounting
+  tick_count: u64
+  idle_time: u64
+  user_time: u64
+  kernel_time: u64
+
+  // Cache-line padding to prevent false sharing
+  _padding: [64]u8
+}
+
+// Global SMP state
+struct SMPState {
+  num_cpus: u32
+  boot_cpu: u32
+  online_cpus: u32
+  cpu_bitmap: u64  // Bitmask of online CPUs (up to 64 CPUs)
+
+  // Per-CPU run queues (aligned to prevent false sharing)
+  run_queues: [MAX_CPUS]CPURunQueue
+
+  // Global statistics
+  total_tasks: u32
+  context_switches: u64
+  load_balance_count: u64
+  migration_count: u64
+
+  // Initialization flag
+  initialized: u32
+}
+
+var smp_state: SMPState
+
+// Atomic operations (using Home's built-in atomics)
+fn atomic_load(ptr: u64): u64 {
+  var result: u64
+  asm volatile (
+    "movq (%[ptr]), %[result]"
+    : [result] "=r" (result)
+    : [ptr] "r" (ptr)
+    : "memory"
+  )
+  return result
+}
+
+fn atomic_store(ptr: u64, value: u64) {
+  asm volatile (
+    "movq %[value], (%[ptr])"
+    :
+    : [ptr] "r" (ptr), [value] "r" (value)
+    : "memory"
+  )
+}
+
+fn atomic_compare_exchange(ptr: u64, expected: u64, desired: u64): u32 {
+  var success: u8
+  asm volatile (
+    "lock cmpxchgq %[desired], (%[ptr])\n"
+    "sete %[success]"
+    : [success] "=r" (success)
+    : [ptr] "r" (ptr), "a" (expected), [desired] "r" (desired)
+    : "memory", "cc"
+  )
+  return success
+}
+
+fn atomic_fetch_add(ptr: u64, value: u64): u64 {
+  var result: u64
+  asm volatile (
+    "lock xaddq %[value], (%[ptr])"
+    : [value] "+r" (result)
+    : [ptr] "r" (ptr)
+    : "memory", "cc"
+  )
+  return result
+}
+
+// Get current CPU ID (from APIC ID)
+fn smp_current_cpu(): u32 {
+  return apic.apic_get_id()
+}
+
+// Get current CPU's run queue
+fn smp_current_runqueue(): *CPURunQueue {
+  var cpu_id: u32 = smp_current_cpu()
+  return @ptrFromInt(@ptrFromInt(@addrOf(smp_state.run_queues)) + (cpu_id * @sizeOf(CPURunQueue)))
+}
+
+// Initialize SMP system
+export fn smp_init(num_cpus: u32) {
+  smp_state.num_cpus = num_cpus
+  smp_state.boot_cpu = smp_current_cpu()
+  smp_state.online_cpus = 1
+  smp_state.cpu_bitmap = 1 << smp_state.boot_cpu
+  smp_state.total_tasks = 0
+  smp_state.context_switches = 0
+  smp_state.load_balance_count = 0
+  smp_state.migration_count = 0
+
+  // Initialize all CPU run queues
+  var i: u32 = 0
+  while i < MAX_CPUS {
+    var rq: *CPURunQueue = @ptrFromInt(@ptrFromInt(@addrOf(smp_state.run_queues)) + (i * @sizeOf(CPURunQueue)))
+    rq.cpu_id = i
+    rq.state = CPU_STATE_OFFLINE
+    rq.current_task = 0
+    rq.idle_task = 0
+    rq.total_tasks = 0
+    rq.running_tasks = 0
+    rq.load_weight = 0
+    rq.last_balance_time = 0
+    rq.migration_pending = 0
+    rq.tick_count = 0
+    rq.idle_time = 0
+    rq.user_time = 0
+    rq.kernel_time = 0
+
+    // Initialize all priority queues
+    var prio: u32 = 0
+    while prio < RUNQUEUE_PRIORITY_LEVELS {
+      rq.priority_queues[prio].head = 0
+      rq.priority_queues[prio].tail = 0
+      rq.priority_queues[prio].count = 0
+      prio = prio + 1
+    }
+
+    i = i + 1
+  }
+
+  // Mark boot CPU as online
+  var boot_rq: *CPURunQueue = @ptrFromInt(@ptrFromInt(@addrOf(smp_state.run_queues)) + (smp_state.boot_cpu * @sizeOf(CPURunQueue)))
+  boot_rq.state = CPU_STATE_ONLINE
+
+  smp_state.initialized = 1
+}
+
+// Bring a CPU online
+export fn smp_bring_cpu_online(cpu_id: u32): u32 {
+  if cpu_id >= smp_state.num_cpus {
+    return 1  // Invalid CPU ID
+  }
+
+  var rq: *CPURunQueue = @ptrFromInt(@ptrFromInt(@addrOf(smp_state.run_queues)) + (cpu_id * @sizeOf(CPURunQueue)))
+
+  if rq.state != CPU_STATE_OFFLINE {
+    return 2  // CPU already online or booting
+  }
+
+  rq.state = CPU_STATE_BOOTING
+
+  // Send INIT-SIPI-SIPI sequence via APIC
+  apic.apic_send_init_ipi(cpu_id)
+
+  // CPU will call smp_cpu_online() when it's ready
+  return 0
+}
+
+// Called by AP (Application Processor) when it comes online
+export fn smp_cpu_online() {
+  var cpu_id: u32 = smp_current_cpu()
+  var rq: *CPURunQueue = smp_current_runqueue()
+
+  rq.state = CPU_STATE_ONLINE
+
+  // Update global state atomically
+  atomic_fetch_add(@ptrFromInt(@addrOf(smp_state.online_cpus)), 1)
+
+  var old_bitmap: u64 = smp_state.cpu_bitmap
+  smp_state.cpu_bitmap = old_bitmap | (1 << cpu_id)
+}
+
+// Add task to run queue (lock-free)
+export fn smp_enqueue_task(task_ptr: u64, cpu_id: u32) {
+  var task: *Task = @ptrFromInt(task_ptr)
+  var rq: *CPURunQueue = @ptrFromInt(@ptrFromInt(@addrOf(smp_state.run_queues)) + (cpu_id * @sizeOf(CPURunQueue)))
+
+  var priority: u32 = task.priority
+  if priority >= RUNQUEUE_PRIORITY_LEVELS {
+    priority = RUNQUEUE_PRIORITY_LEVELS - 1
+  }
+
+  var pq: *PriorityQueue = @ptrFromInt(@ptrFromInt(@addrOf(rq.priority_queues)) + (priority * @sizeOf(PriorityQueue)))
+
+  // Mark task as runnable
+  task.state = TASK_STATE_RUNNABLE
+  task.next = 0
+
+  // Lock-free enqueue using CAS
+  while 1 {
+    var tail: u64 = atomic_load(@ptrFromInt(@addrOf(pq.tail)))
+
+    if tail == 0 {
+      // Queue is empty - try to set both head and tail
+      if atomic_compare_exchange(@ptrFromInt(@addrOf(pq.head)), 0, task_ptr) == 1 {
+        atomic_store(@ptrFromInt(@addrOf(pq.tail)), task_ptr)
+        pq.count = pq.count + 1
+        rq.total_tasks = rq.total_tasks + 1
+        return
+      }
+    } else {
+      // Queue has tasks - append to tail
+      var tail_task: *Task = @ptrFromInt(tail)
+      if atomic_compare_exchange(@ptrFromInt(@addrOf(tail_task.next)), 0, task_ptr) == 1 {
+        atomic_store(@ptrFromInt(@addrOf(pq.tail)), task_ptr)
+        pq.count = pq.count + 1
+        rq.total_tasks = rq.total_tasks + 1
+        return
+      }
+    }
+  }
+}
+
+// Remove task from run queue (lock-free)
+export fn smp_dequeue_task(cpu_id: u32): u64 {
+  var rq: *CPURunQueue = @ptrFromInt(@ptrFromInt(@addrOf(smp_state.run_queues)) + (cpu_id * @sizeOf(CPURunQueue)))
+
+  // Find highest priority non-empty queue
+  var prio: u32 = 0
+  while prio < RUNQUEUE_PRIORITY_LEVELS {
+    var pq: *PriorityQueue = @ptrFromInt(@ptrFromInt(@addrOf(rq.priority_queues)) + (prio * @sizeOf(PriorityQueue)))
+
+    if pq.count > 0 {
+      // Try to dequeue from this priority level
+      while 1 {
+        var head: u64 = atomic_load(@ptrFromInt(@addrOf(pq.head)))
+
+        if head == 0 {
+          break  // Queue became empty - try next priority
+        }
+
+        var head_task: *Task = @ptrFromInt(head)
+        var next: u64 = atomic_load(@ptrFromInt(@addrOf(head_task.next)))
+
+        if atomic_compare_exchange(@ptrFromInt(@addrOf(pq.head)), head, next) == 1 {
+          // Successfully dequeued
+          if next == 0 {
+            // Queue is now empty
+            atomic_store(@ptrFromInt(@addrOf(pq.tail)), 0)
+          }
+
+          pq.count = pq.count - 1
+          rq.total_tasks = rq.total_tasks - 1
+          head_task.state = TASK_STATE_RUNNING
+          return head
+        }
+      }
+    }
+
+    prio = prio + 1
+  }
+
+  return 0  // No runnable tasks
+}
+
+// Schedule next task on current CPU
+export fn smp_schedule() {
+  var cpu_id: u32 = smp_current_cpu()
+  var rq: *CPURunQueue = smp_current_runqueue()
+
+  var current_task: u64 = rq.current_task
+  var next_task: u64 = smp_dequeue_task(cpu_id)
+
+  if next_task == 0 {
+    // No tasks available - switch to idle task
+    next_task = rq.idle_task
+    rq.state = CPU_STATE_IDLE
+  } else {
+    rq.state = CPU_STATE_ONLINE
+    rq.running_tasks = rq.running_tasks + 1
+  }
+
+  if current_task != next_task {
+    // Context switch required
+    rq.current_task = next_task
+    smp_state.context_switches = smp_state.context_switches + 1
+
+    // Re-enqueue current task if it's still runnable
+    if current_task != 0 and current_task != rq.idle_task {
+      var current: *Task = @ptrFromInt(current_task)
+      if current.state == TASK_STATE_RUNNING {
+        current.state = TASK_STATE_RUNNABLE
+        smp_enqueue_task(current_task, cpu_id)
+      }
+    }
+
+    // Perform context switch (call into process.home)
+    process.process_switch_context(current_task, next_task)
+  }
+}
+
+// Load balancing - migrate tasks from overloaded CPUs
+export fn smp_balance_load(current_time: u64) {
+  var cpu_id: u32 = smp_current_cpu()
+  var rq: *CPURunQueue = smp_current_runqueue()
+
+  // Only balance periodically
+  if current_time - rq.last_balance_time < LOAD_BALANCE_INTERVAL {
+    return
+  }
+
+  rq.last_balance_time = current_time
+  smp_state.load_balance_count = smp_state.load_balance_count + 1
+
+  // Find most loaded and least loaded CPUs
+  var max_load: u32 = rq.total_tasks
+  var max_cpu: u32 = cpu_id
+  var min_load: u32 = rq.total_tasks
+  var min_cpu: u32 = cpu_id
+
+  var i: u32 = 0
+  while i < smp_state.num_cpus {
+    if (smp_state.cpu_bitmap & (1 << i)) != 0 {
+      var other_rq: *CPURunQueue = @ptrFromInt(@ptrFromInt(@addrOf(smp_state.run_queues)) + (i * @sizeOf(CPURunQueue)))
+
+      if other_rq.state == CPU_STATE_ONLINE {
+        if other_rq.total_tasks > max_load {
+          max_load = other_rq.total_tasks
+          max_cpu = i
+        }
+        if other_rq.total_tasks < min_load {
+          min_load = other_rq.total_tasks
+          min_cpu = i
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  // Calculate load imbalance
+  if max_load > min_load {
+    var diff: u32 = max_load - min_load
+    var imbalance: u32 = (diff * 100) / max_load
+
+    if imbalance >= LOAD_IMBALANCE_THRESHOLD and max_cpu != min_cpu {
+      // Migrate tasks from max_cpu to min_cpu
+      smp_migrate_tasks(max_cpu, min_cpu, diff / 2)
+    }
+  }
+}
+
+// Migrate tasks between CPUs
+fn smp_migrate_tasks(from_cpu: u32, to_cpu: u32, count: u32) {
+  var migrated: u32 = 0
+
+  while migrated < count {
+    var task: u64 = smp_dequeue_task(from_cpu)
+    if task == 0 {
+      break  // No more tasks to migrate
+    }
+
+    var task_ptr: *Task = @ptrFromInt(task)
+
+    // Check CPU affinity
+    if (task_ptr.cpu_affinity & (1 << to_cpu)) != 0 {
+      // Task can run on target CPU
+      task_ptr.last_cpu = to_cpu
+      smp_enqueue_task(task, to_cpu)
+      migrated = migrated + 1
+      smp_state.migration_count = smp_state.migration_count + 1
+    } else {
+      // Task cannot run on target CPU - re-enqueue on source CPU
+      smp_enqueue_task(task, from_cpu)
+    }
+  }
+}
+
+// Timer tick handler (called on each CPU)
+export fn smp_tick() {
+  var cpu_id: u32 = smp_current_cpu()
+  var rq: *CPURunQueue = smp_current_runqueue()
+
+  rq.tick_count = rq.tick_count + 1
+
+  // Update time accounting
+  if rq.current_task == 0 or rq.current_task == rq.idle_task {
+    rq.idle_time = rq.idle_time + 1
+  } else {
+    var task: *Task = @ptrFromInt(rq.current_task)
+    // Update task time slice and vruntime
+    if task.time_slice > 0 {
+      task.time_slice = task.time_slice - 1
+    }
+    task.vruntime = task.vruntime + 1
+  }
+
+  // Trigger scheduling if time slice expired
+  var current: *Task = @ptrFromInt(rq.current_task)
+  if rq.current_task != 0 and current.time_slice == 0 {
+    smp_schedule()
+  }
+
+  // Periodic load balancing
+  if rq.tick_count % 100 == 0 {
+    smp_balance_load(rq.tick_count)
+  }
+}
+
+// Get CPU statistics
+export fn smp_get_stats(cpu_id: u32, stats_buffer: u64) {
+  if cpu_id >= smp_state.num_cpus {
+    return
+  }
+
+  var rq: *CPURunQueue = @ptrFromInt(@ptrFromInt(@addrOf(smp_state.run_queues)) + (cpu_id * @sizeOf(CPURunQueue)))
+
+  // Copy statistics to user buffer
+  var stats: *u64 = @ptrFromInt(stats_buffer)
+  stats[0] = cpu_id
+  stats[1] = rq.state
+  stats[2] = rq.total_tasks
+  stats[3] = rq.running_tasks
+  stats[4] = rq.tick_count
+  stats[5] = rq.idle_time
+  stats[6] = rq.user_time
+  stats[7] = rq.kernel_time
+}
+
+// Get global SMP statistics
+export fn smp_get_global_stats(stats_buffer: u64) {
+  var stats: *u64 = @ptrFromInt(stats_buffer)
+  stats[0] = smp_state.num_cpus
+  stats[1] = smp_state.online_cpus
+  stats[2] = smp_state.total_tasks
+  stats[3] = smp_state.context_switches
+  stats[4] = smp_state.load_balance_count
+  stats[5] = smp_state.migration_count
+}
