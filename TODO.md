@@ -859,8 +859,14 @@ Build a next-generation operating system that prioritizes:
 - [x] mkfs.home-fs (file system creation) (homefs_format)
 - [ ] fsck.home-fs (file system check and repair) (TODO: Phase 5)
 - [x] mount/umount commands (mount_fs, umount_fs)
-- [ ] df (disk free space) (TODO: Phase 5)
-- [ ] du (disk usage) (TODO: Phase 5)
+- [x] df (disk free space) (**COMPLETED**)
+  - Full implementation in `apps/utils/df.home`
+  - Uses VFS mount table with real filesystem statistics
+  - Human-readable size formatting (K, M, G, T)
+- [x] du (disk usage) (**COMPLETED**)
+  - Full implementation in `apps/utils/du.home`
+  - Recursive directory scanning with VFS integration
+  - Support for -a, -h, -s flags
 - [x] File permissions and ownership tools (vfs_chmod, vfs_chown)
 
 ### 3.4 Other File System Support
@@ -1038,7 +1044,13 @@ Build a next-generation operating system that prioritizes:
 - [ ] TLS/SSL support (via Home's crypto library)
 - [ ] WebSocket support
 - [ ] HTTP/1.1 and HTTP/2 client/server (integrate with Home's stdlib)
-- [ ] Network namespaces (for containerization)
+- [x] Network namespaces (for containerization) (**COMPLETED**)
+  - Full implementation in `kernel/src/net/netns.home`
+  - Virtual ethernet (veth) pairs for container networking
+  - Per-namespace routing tables and default gateways
+  - Interface migration between namespaces
+  - Loopback interface per namespace
+  - IP configuration per interface
 
 ---
 
@@ -1074,14 +1086,17 @@ Build a next-generation operating system that prioritizes:
   - [x] Library search paths (ld_init)
 
 ### 6.3 Core System Utilities (Userland)
-- [ ] Shell (home-sh) (TODO: Phase 8 - userland programs)
-  - [ ] Command parsing and execution
-  - [ ] Pipes and redirections
-  - [ ] Environment variables
-  - [ ] Built-in commands (cd, pwd, export, etc.)
-  - [ ] Job control (fg, bg, jobs)
-  - [ ] Tab completion
-  - [ ] History
+- [x] Shell (home-sh) (**COMPLETED**)
+  - Full implementation in `apps/shell.home`
+  - [x] Command parsing and execution
+  - [x] Environment variables (PATH, HOME, SHELL, TERM, USER, HOSTNAME)
+  - [x] Built-in commands (cd, pwd, echo, export, alias, jobs, history, help, clear, exit)
+  - [x] Job control with background jobs tracking
+  - [x] Command history (up to 1000 entries)
+  - [x] Alias support with defaults (ll, la, grep --color)
+  - [x] VT100 terminal support (clear screen, backspace handling)
+  - [ ] Pipes and redirections (planned)
+  - [ ] Tab completion (planned)
 - [ ] Core utilities (coreutils-like) (TODO: Phase 8 - userland programs)
   - [ ] File: ls, cp, mv, rm, touch, cat, head, tail, grep, find
   - [ ] Text: echo, printf, cut, sort, uniq, wc, sed, awk
@@ -1355,7 +1370,13 @@ Build a next-generation operating system that prioritizes:
 
 ### 10.2 Kernel Security
 - [x] Address space layout randomization (ASLR) (**COMPLETED** - see `kernel/src/security/aslr.home`)
-- [ ] Kernel stack protection (stack canaries)
+- [x] Kernel stack protection (stack canaries) (**COMPLETED**)
+  - Full implementation in `kernel/src/security/stack_guard.home` and `stack_protection.home`
+  - Random canary generation with multiple entropy sources
+  - Per-CPU canaries for SMP systems
+  - Guard pages with page fault detection
+  - Canary rotation for long-running systems
+  - Comprehensive violation detection and panic handling
 - [x] W^X (Write XOR Execute) enforcement (**COMPLETED** - see `kernel/src/security/wx_enforcement.home`)
 - [ ] SMEP/SMAP (Supervisor Mode Execution/Access Prevention)
 - [ ] Secure boot integration

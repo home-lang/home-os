@@ -1,0 +1,548 @@
+// home-os Network Namespaces
+// Network isolation for containers with virtual interfaces and routing
+
+import "../core/foundation.home" as foundation
+import "../container/namespaces.home" as namespaces
+import "tcp.home" as tcp
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_NETNS: u32 = 64
+const MAX_VETH_PAIRS: u32 = 128
+const MAX_INTERFACES_PER_NS: u32 = 16
+const MAX_ROUTES_PER_NS: u32 = 64
+
+// Interface types
+const IF_TYPE_LOOPBACK: u32 = 1
+const IF_TYPE_VETH: u32 = 2
+const IF_TYPE_BRIDGE: u32 = 3
+const IF_TYPE_PHYSICAL: u32 = 4
+
+// Interface flags
+const IF_FLAG_UP: u32 = 1 << 0
+const IF_FLAG_BROADCAST: u32 = 1 << 1
+const IF_FLAG_LOOPBACK: u32 = 1 << 2
+const IF_FLAG_PROMISC: u32 = 1 << 3
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct NetInterface {
+  name: [u8; 16],
+  if_type: u32,
+  flags: u32,
+  mtu: u32,
+  ip_addr: u32,
+  netmask: u32,
+  mac_addr: [u8; 6],
+  rx_bytes: u64,
+  tx_bytes: u64,
+  rx_packets: u64,
+  tx_packets: u64,
+  peer_idx: u32,    // For veth: index of peer interface
+  ns_id: u32,       // Owning namespace
+  active: u32
+}
+
+struct Route {
+  dest: u32,
+  gateway: u32,
+  netmask: u32,
+  if_idx: u32,
+  metric: u32,
+  active: u32
+}
+
+struct NetworkNamespace {
+  id: u32,
+  parent_ns: u32,
+  interfaces: [u32; 16],  // Interface indices
+  interface_count: u32,
+  routes: [Route; 64],
+  route_count: u32,
+  default_gateway: u32,
+  loopback_idx: u32,
+  active: u32
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var net_namespaces: [NetworkNamespace; 64]
+var netns_count: u32 = 0
+var netns_initialized: u32 = 0
+
+var interfaces: [NetInterface; 256]
+var interface_count: u32 = 0
+
+var current_netns: u32 = 0  // Per-process, would be in process struct
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn netns_init() {
+  if netns_initialized == 1 { return }
+
+  // Clear all namespaces
+  var i: u32 = 0
+  while i < MAX_NETNS {
+    net_namespaces[i].active = 0
+    i = i + 1
+  }
+
+  // Clear all interfaces
+  i = 0
+  while i < 256 {
+    interfaces[i].active = 0
+    i = i + 1
+  }
+
+  // Create default (init) network namespace
+  var init_ns: u32 = netns_create_internal(0)
+  if init_ns != 0 {
+    foundation.serial_write_string("[NetNS] ERROR: Failed to create init namespace\n")
+    return
+  }
+
+  netns_initialized = 1
+  foundation.serial_write_string("[NetNS] Network namespaces initialized\n")
+}
+
+fn netns_create_internal(parent: u32): u32 {
+  if netns_count >= MAX_NETNS { return 0xFFFFFFFF }
+
+  var ns_id: u32 = netns_count
+
+  net_namespaces[ns_id].id = ns_id
+  net_namespaces[ns_id].parent_ns = parent
+  net_namespaces[ns_id].interface_count = 0
+  net_namespaces[ns_id].route_count = 0
+  net_namespaces[ns_id].default_gateway = 0
+  net_namespaces[ns_id].active = 1
+
+  // Create loopback interface for this namespace
+  var lo_idx: u32 = create_loopback(ns_id)
+  net_namespaces[ns_id].loopback_idx = lo_idx
+
+  netns_count = netns_count + 1
+
+  return ns_id
+}
+
+// ============================================================================
+// NAMESPACE MANAGEMENT
+// ============================================================================
+
+// Create a new network namespace
+export fn netns_create(): u32 {
+  var ns_id: u32 = netns_create_internal(current_netns)
+  if ns_id == 0xFFFFFFFF {
+    return ns_id
+  }
+
+  foundation.serial_write_string("[NetNS] Created namespace ")
+  foundation.serial_write_u32(ns_id)
+  foundation.serial_write_string("\n")
+
+  return ns_id
+}
+
+// Enter a network namespace
+export fn netns_enter(ns_id: u32): u32 {
+  if ns_id >= netns_count { return 1 }
+  if net_namespaces[ns_id].active == 0 { return 1 }
+
+  current_netns = ns_id
+
+  foundation.serial_write_string("[NetNS] Entered namespace ")
+  foundation.serial_write_u32(ns_id)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Get current network namespace
+export fn netns_current(): u32 {
+  return current_netns
+}
+
+// Destroy a network namespace
+export fn netns_destroy(ns_id: u32): u32 {
+  if ns_id == 0 { return 1 }  // Cannot destroy init namespace
+  if ns_id >= netns_count { return 1 }
+  if net_namespaces[ns_id].active == 0 { return 1 }
+
+  // Remove all interfaces
+  var i: u32 = 0
+  while i < net_namespaces[ns_id].interface_count {
+    var if_idx: u32 = net_namespaces[ns_id].interfaces[i]
+    interfaces[if_idx].active = 0
+    i = i + 1
+  }
+
+  net_namespaces[ns_id].active = 0
+  net_namespaces[ns_id].interface_count = 0
+  net_namespaces[ns_id].route_count = 0
+
+  foundation.serial_write_string("[NetNS] Destroyed namespace ")
+  foundation.serial_write_u32(ns_id)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// ============================================================================
+// INTERFACE MANAGEMENT
+// ============================================================================
+
+// Create loopback interface
+fn create_loopback(ns_id: u32): u32 {
+  if interface_count >= 256 { return 0xFFFFFFFF }
+
+  var idx: u32 = interface_count
+
+  interfaces[idx].name[0] = 'l'
+  interfaces[idx].name[1] = 'o'
+  interfaces[idx].name[2] = 0
+  interfaces[idx].if_type = IF_TYPE_LOOPBACK
+  interfaces[idx].flags = IF_FLAG_UP | IF_FLAG_LOOPBACK
+  interfaces[idx].mtu = 65536
+  interfaces[idx].ip_addr = 0x7F000001  // 127.0.0.1
+  interfaces[idx].netmask = 0xFF000000  // 255.0.0.0
+  interfaces[idx].ns_id = ns_id
+  interfaces[idx].active = 1
+
+  // Add to namespace
+  if net_namespaces[ns_id].interface_count < MAX_INTERFACES_PER_NS {
+    net_namespaces[ns_id].interfaces[net_namespaces[ns_id].interface_count] = idx
+    net_namespaces[ns_id].interface_count = net_namespaces[ns_id].interface_count + 1
+  }
+
+  interface_count = interface_count + 1
+
+  return idx
+}
+
+// Create a veth pair (virtual ethernet)
+export fn netns_create_veth(name1: *u8, ns1: u32, name2: *u8, ns2: u32): u32 {
+  if interface_count + 2 > 256 { return 1 }
+  if ns1 >= netns_count or ns2 >= netns_count { return 1 }
+
+  var idx1: u32 = interface_count
+  var idx2: u32 = interface_count + 1
+
+  // First interface
+  copy_name(name1, &interfaces[idx1].name)
+  interfaces[idx1].if_type = IF_TYPE_VETH
+  interfaces[idx1].flags = IF_FLAG_UP | IF_FLAG_BROADCAST
+  interfaces[idx1].mtu = 1500
+  interfaces[idx1].ip_addr = 0
+  interfaces[idx1].netmask = 0
+  interfaces[idx1].peer_idx = idx2
+  interfaces[idx1].ns_id = ns1
+  interfaces[idx1].active = 1
+  generate_mac(&interfaces[idx1].mac_addr, idx1)
+
+  // Second interface (peer)
+  copy_name(name2, &interfaces[idx2].name)
+  interfaces[idx2].if_type = IF_TYPE_VETH
+  interfaces[idx2].flags = IF_FLAG_UP | IF_FLAG_BROADCAST
+  interfaces[idx2].mtu = 1500
+  interfaces[idx2].ip_addr = 0
+  interfaces[idx2].netmask = 0
+  interfaces[idx2].peer_idx = idx1
+  interfaces[idx2].ns_id = ns2
+  interfaces[idx2].active = 1
+  generate_mac(&interfaces[idx2].mac_addr, idx2)
+
+  // Add to namespaces
+  add_interface_to_ns(ns1, idx1)
+  add_interface_to_ns(ns2, idx2)
+
+  interface_count = interface_count + 2
+
+  foundation.serial_write_string("[NetNS] Created veth pair: ")
+  foundation.serial_write_string(name1)
+  foundation.serial_write_string(" <-> ")
+  foundation.serial_write_string(name2)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+fn copy_name(src: *u8, dst: *[u8; 16]) {
+  var i: u32 = 0
+  while i < 15 {
+    dst[i] = src[i]
+    if src[i] == 0 { break }
+    i = i + 1
+  }
+  dst[i] = 0
+}
+
+fn generate_mac(mac: *[u8; 6], seed: u32) {
+  mac[0] = 0x02  // Locally administered
+  mac[1] = 0x00
+  mac[2] = @intCast((seed >> 24) & 0xFF)
+  mac[3] = @intCast((seed >> 16) & 0xFF)
+  mac[4] = @intCast((seed >> 8) & 0xFF)
+  mac[5] = @intCast(seed & 0xFF)
+}
+
+fn add_interface_to_ns(ns_id: u32, if_idx: u32) {
+  if net_namespaces[ns_id].interface_count < MAX_INTERFACES_PER_NS {
+    net_namespaces[ns_id].interfaces[net_namespaces[ns_id].interface_count] = if_idx
+    net_namespaces[ns_id].interface_count = net_namespaces[ns_id].interface_count + 1
+  }
+}
+
+// Move interface to another namespace
+export fn netns_move_interface(if_name: *u8, dest_ns: u32): u32 {
+  if dest_ns >= netns_count { return 1 }
+
+  // Find interface by name in current namespace
+  var if_idx: u32 = find_interface_by_name(current_netns, if_name)
+  if if_idx == 0xFFFFFFFF { return 1 }
+
+  // Don't allow moving loopback
+  if interfaces[if_idx].if_type == IF_TYPE_LOOPBACK { return 1 }
+
+  // Remove from current namespace
+  remove_interface_from_ns(current_netns, if_idx)
+
+  // Add to destination namespace
+  interfaces[if_idx].ns_id = dest_ns
+  add_interface_to_ns(dest_ns, if_idx)
+
+  foundation.serial_write_string("[NetNS] Moved interface to namespace ")
+  foundation.serial_write_u32(dest_ns)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+fn find_interface_by_name(ns_id: u32, name: *u8): u32 {
+  var i: u32 = 0
+  while i < net_namespaces[ns_id].interface_count {
+    var if_idx: u32 = net_namespaces[ns_id].interfaces[i]
+    if compare_names(&interfaces[if_idx].name, name) {
+      return if_idx
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+fn compare_names(a: *[u8; 16], b: *u8): bool {
+  var i: u32 = 0
+  while i < 16 {
+    if a[i] != b[i] { return false }
+    if a[i] == 0 { return true }
+    i = i + 1
+  }
+  return true
+}
+
+fn remove_interface_from_ns(ns_id: u32, if_idx: u32) {
+  var i: u32 = 0
+  while i < net_namespaces[ns_id].interface_count {
+    if net_namespaces[ns_id].interfaces[i] == if_idx {
+      // Shift remaining interfaces
+      var j: u32 = i
+      while j < net_namespaces[ns_id].interface_count - 1 {
+        net_namespaces[ns_id].interfaces[j] = net_namespaces[ns_id].interfaces[j + 1]
+        j = j + 1
+      }
+      net_namespaces[ns_id].interface_count = net_namespaces[ns_id].interface_count - 1
+      return
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// IP CONFIGURATION
+// ============================================================================
+
+// Set IP address on interface
+export fn netns_set_ip(if_name: *u8, ip_addr: u32, netmask: u32): u32 {
+  var if_idx: u32 = find_interface_by_name(current_netns, if_name)
+  if if_idx == 0xFFFFFFFF { return 1 }
+
+  interfaces[if_idx].ip_addr = ip_addr
+  interfaces[if_idx].netmask = netmask
+
+  foundation.serial_write_string("[NetNS] Set IP on ")
+  foundation.serial_write_string(if_name)
+  foundation.serial_write_string(": ")
+  print_ip(ip_addr)
+  foundation.serial_write_string("/")
+  print_ip(netmask)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+fn print_ip(ip: u32) {
+  foundation.serial_write_u32((ip >> 24) & 0xFF)
+  foundation.serial_write_string(".")
+  foundation.serial_write_u32((ip >> 16) & 0xFF)
+  foundation.serial_write_string(".")
+  foundation.serial_write_u32((ip >> 8) & 0xFF)
+  foundation.serial_write_string(".")
+  foundation.serial_write_u32(ip & 0xFF)
+}
+
+// ============================================================================
+// ROUTING
+// ============================================================================
+
+// Add route to current namespace
+export fn netns_add_route(dest: u32, gateway: u32, netmask: u32, if_name: *u8): u32 {
+  var ns: *NetworkNamespace = &net_namespaces[current_netns]
+  if ns.route_count >= MAX_ROUTES_PER_NS { return 1 }
+
+  var if_idx: u32 = find_interface_by_name(current_netns, if_name)
+  if if_idx == 0xFFFFFFFF { return 1 }
+
+  var route: *Route = &ns.routes[ns.route_count]
+  route.dest = dest
+  route.gateway = gateway
+  route.netmask = netmask
+  route.if_idx = if_idx
+  route.metric = 100
+  route.active = 1
+
+  ns.route_count = ns.route_count + 1
+
+  foundation.serial_write_string("[NetNS] Added route: ")
+  print_ip(dest)
+  foundation.serial_write_string(" via ")
+  print_ip(gateway)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Set default gateway
+export fn netns_set_default_gw(gateway: u32): u32 {
+  net_namespaces[current_netns].default_gateway = gateway
+
+  foundation.serial_write_string("[NetNS] Default gateway: ")
+  print_ip(gateway)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// Route lookup for packet forwarding
+export fn netns_route_lookup(dest_ip: u32): u32 {
+  var ns: *NetworkNamespace = &net_namespaces[current_netns]
+
+  // Find most specific route
+  var best_match: u32 = 0xFFFFFFFF
+  var best_prefix_len: u32 = 0
+
+  var i: u32 = 0
+  while i < ns.route_count {
+    if ns.routes[i].active == 1 {
+      var masked_dest: u32 = dest_ip & ns.routes[i].netmask
+      if masked_dest == ns.routes[i].dest {
+        var prefix_len: u32 = count_bits(ns.routes[i].netmask)
+        if prefix_len > best_prefix_len {
+          best_prefix_len = prefix_len
+          best_match = i
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  if best_match != 0xFFFFFFFF {
+    return ns.routes[best_match].gateway
+  }
+
+  // Return default gateway
+  return ns.default_gateway
+}
+
+fn count_bits(n: u32): u32 {
+  var count: u32 = 0
+  var val: u32 = n
+  while val != 0 {
+    count = count + (val & 1)
+    val = val >> 1
+  }
+  return count
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn netns_print_info() {
+  foundation.serial_write_string("\n=== Network Namespace Info ===\n")
+  foundation.serial_write_string("Current namespace: ")
+  foundation.serial_write_u32(current_netns)
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("Total namespaces: ")
+  foundation.serial_write_u32(netns_count)
+  foundation.serial_write_string("\n\n")
+
+  foundation.serial_write_string("Interfaces in current namespace:\n")
+  var ns: *NetworkNamespace = &net_namespaces[current_netns]
+  var i: u32 = 0
+  while i < ns.interface_count {
+    var if_idx: u32 = ns.interfaces[i]
+    var iface: *NetInterface = &interfaces[if_idx]
+
+    foundation.serial_write_string("  ")
+    foundation.serial_write_string(&iface.name[0])
+    foundation.serial_write_string(": ")
+    print_ip(iface.ip_addr)
+    foundation.serial_write_string("/")
+    print_ip(iface.netmask)
+    foundation.serial_write_string(" (")
+    if iface.if_type == IF_TYPE_LOOPBACK {
+      foundation.serial_write_string("loopback")
+    } else if iface.if_type == IF_TYPE_VETH {
+      foundation.serial_write_string("veth")
+    } else {
+      foundation.serial_write_string("other")
+    }
+    foundation.serial_write_string(")\n")
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("\nRoutes:\n")
+  i = 0
+  while i < ns.route_count {
+    if ns.routes[i].active == 1 {
+      foundation.serial_write_string("  ")
+      print_ip(ns.routes[i].dest)
+      foundation.serial_write_string(" via ")
+      print_ip(ns.routes[i].gateway)
+      foundation.serial_write_string("\n")
+    }
+    i = i + 1
+  }
+
+  if ns.default_gateway != 0 {
+    foundation.serial_write_string("  default via ")
+    print_ip(ns.default_gateway)
+    foundation.serial_write_string("\n")
+  }
+
+  foundation.serial_write_string("\n")
+}
+
+// Get namespace count
+export fn netns_get_count(): u32 {
+  return netns_count
+}
