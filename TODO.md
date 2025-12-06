@@ -35,6 +35,251 @@
 
 ---
 
+## Canonical Strategic TODO (Merged from TODO-UPDATES.md)
+
+> **Last Analysis**: November 24, 2025  
+> **Purpose**: This section is the **authoritative, code-informed roadmap** for HomeOS as a minimal, Linux-class OS built entirely in Home and optimized for low-end hardware (Raspberry Pi and similar).  
+> The long 18-phase roadmap further below is now **legacy vision**; its individual checkboxes are historical and may not accurately reflect the current implementation.
+
+### Status Snapshot
+
+- ✅ **Kernel foundations solid**
+  - 210+ kernel modules in `kernel/src/**` written in Home
+  - Process management and VFS audited as **production-ready**  
+    - See `docs/audits/process-management-audit.md` and `docs/audits/vfs-audit.md`
+- ✅ **Drivers**
+  - ~60 hardware drivers in `kernel/src/drivers/**` (storage, input, network, USB, video, GPIO, sensors, etc.)
+  - Real SD/eMMC, NVMe, RAID, GPIO, I2C, SPI, USB{UHCI,EHCI,XHCI}, VirtIO, WiFi/Bluetooth (CYW43455) drivers
+- ✅ **Networking**
+  - 16+ protocols in `kernel/src/net/**` (TCP, UDP, IPv6, ICMP, ARP, DHCP, DNS, HTTP, TLS, WebSocket, MQTT, CoAP, NFS, SMB, NFC, QoS, Netfilter)
+- ✅ **File systems**
+  - Native VFS + home FS stack with advanced features (buffer cache, async I/O, mmap, xattr, links, locking, large files)  
+  - Audited as **world-class** in `docs/audits/vfs-audit.md`
+- ✅ **Userspace & tooling**
+  - `apps/shell.home` – full shell with history, env, aliases, jobs
+  - `apps/init/init.home` – structured init process (services, runlevels, mounts)
+  - 80+ utilities in `apps/utils/**` plus GUI apps (browser, file manager, editor, sysmon, terminal, etc.)
+- ✅ **Performance & power modules exist**
+  - `kernel/src/mm/{zram,slab,pool,swap,memcg,vmalloc}.home`
+  - `kernel/src/perf/{async_io,boot_opt,profiler,zero_copy,rcu,cache_opt,hugepages,memory_compression}.home`
+  - `kernel/src/power/{cpufreq,thermal,power,pm}.home`
+- ⚠️ **Remaining stubs & gaps**
+  - Capability system (`kernel/src/security/caps.home`) is still largely stubbed
+  - Some higher-level integrations (init syscalls, DNS resolver, parts of security hardening) are partial
+
+The rest of this section focuses on **improvements that matter most** for a minimal, dependency-free, high-performance OS that runs great on Pi-class devices.
+
+---
+
+### 🎯 Priority 1: Performance Foundation (Low-End First)
+
+#### P1.1 Memory Efficiency (Target: <128MB headless, <256MB GUI)
+
+- [x] **ZRAM compressed swap** – implemented
+  - Implementation: `kernel/src/mm/zram.home` (compressed RAM block device, RLE/LZ4-style)
+  - [ ] Tune ZRAM size and compression for Pi 3/4/5 under 24h stress tests (swap thrash, page-in latency, power usage)
+- [x] **Memory pools & slab allocator** – implemented
+  - Implementations: `kernel/src/mm/pool.home`, `kernel/src/mm/slab.home`, `kernel/src/mm/memcg.home`
+  - [ ] Benchmark fragmentation and cache hit rates on real workloads
+  - [ ] Add per-CPU slab caches and/or magazine layer if not already present, focused on hot kernel objects
+- [ ] **Kernel memory footprint audit & profiles**
+  - [ ] Systematically audit static allocations in `kernel/src/**`
+  - [ ] Introduce build profiles: `minimal-headless`, `server`, `desktop` with feature flags
+  - [ ] Default Pi images should omit non-essential drivers (e.g. enterprise storage, exotic devices)
+- [ ] **Tight integration with memcg/swap**
+  - Files: `kernel/src/mm/{memcg,swap}.home`
+  - [ ] Enforce per-service/process memory limits
+  - [ ] Surface memory pressure + OOM events to userspace (e.g. `apps/sysmon.home`)
+
+#### P1.2 Boot Time Optimization (Target: <3s to shell on Pi 4/5)
+
+- [x] **Boot timing & profiling hooks exist**
+  - Implementations: `kernel/src/perf/boot_opt.home`, `kernel/src/perf/profiler.home`
+  - [ ] Emit a boot timeline (serial + `/proc/boot_timing`) broken down by phase: MM, drivers, VFS, net, userspace
+- [ ] **Parallel driver and service initialization**
+  - [ ] Build explicit init dependency graph for `kernel/src/drivers/**` and core subsystems
+  - [ ] Parallelize independent init paths, especially storage, input, networking, and display
+  - [ ] Ensure deterministic ordering for security-critical components (security, fs, netfilter)
+- [ ] **Headless vs GUI boot profiles**
+  - [ ] Headless profile: skip Craft, browser, compositor, heavy drivers by default
+  - [ ] GUI profile: load only minimal set needed for Craft desktop + terminal + browser
+  - [ ] Add a simple boot config knob (kernel cmdline or config file) to select profile
+- [ ] **Initramfs / image optimization**
+  - [ ] Minimize initramfs contents for Pi SD images
+  - [ ] Compress kernel modules and drop debug symbols in release builds
+  - [ ] Provide a `minimal-pi.img` optimized for SD-card performance
+
+#### P1.3 I/O Performance (SD-Card-Centric)
+
+- [x] **Async I/O (io_uring-like interface)** – implemented
+  - Implementation: `kernel/src/perf/async_io.home`
+  - [ ] Expose async I/O via syscalls + libc wrappers and add tests (unit + integration) for file and network I/O
+- [x] **Generic SD/MMC + BCM EMMC2 drivers** – implemented
+  - `kernel/src/drivers/sdmmc.home` – generic SD/MMC/SDIO controller with DMA
+  - `kernel/src/drivers/bcm_emmc.home` – Pi 4/5 EMMC2 host controller
+  - [ ] Benchmark single/multi-block throughput and latency across Pi 3/4/5
+  - [ ] Tune request queues, DMA burst sizes, and error handling for SD wear and latency
+- [ ] **Block-layer optimizations**
+  - [ ] Request merging tuned for flash (avoid pathological random workloads)
+  - [ ] Read-ahead and write-behind integrated with the VFS page cache
+  - [ ] Simple I/O scheduler optimized for SD + NVMe (no external deps)
+
+---
+
+### 🎯 Priority 2: Raspberry Pi First-Class Support
+
+#### P2.1 Hardware Bring-Up (Pi 4/5/3 B+)
+
+- [x] **Pi 5 bring-up path**
+  - Code: `kernel/src/rpi/rpi5_main.home`, `rpi5/config.txt`, `rpi5/cmdline.txt`, `docs/RASPBERRY_PI_5.md`
+  - [ ] Run and document full hardware matrix on real Pi 5 (USB3, PCIe, NVMe, HDMI, WiFi/BT, GPIO, camera, audio)
+- [x] **BCM2711/2712 SD/eMMC controllers** – implemented (see P1.3)
+  - [ ] Verify high-speed modes (SDR104) and error corner cases
+- [x] **WiFi/Bluetooth driver for Pi**
+  - Drivers: `kernel/src/drivers/{wifi.home,bluetooth.home,bluetooth_hci.home,cyw43455.home}`
+  - [ ] Confirm end-to-end connectivity (associate, DHCP, TLS HTTP) on Pi 4/5
+- [ ] **Pi 3 B+ support (1GB, low-end)**
+  - [ ] Minimal boot path and basic peripherals (UART, GPIO, SD, Ethernet, WiFi)
+  - [ ] Very small default image tuned for 1GB RAM
+
+#### P2.2 ARM64 Kernel Completeness
+
+- [x] **Exception & timer infrastructure on ARM64**
+  - Files: `kernel/src/arch/aarch64/**`, `kernel/src/rpi/**`
+  - [ ] Ensure identical semantics across x86-64 and ARM64 for signals, traps, and timers
+- [ ] **Device tree parsing & auto-discovery**
+  - [ ] Treat DTB as first-class hardware description: probe drivers from DT compatible strings
+  - [ ] Add debug tooling to dump parsed DTB for troubleshooting
+
+#### P2.3 Thermal & Power Management (Critical for Pi)
+
+- [x] **CPU frequency scaling (DVFS)** – implemented
+  - Implementation: `kernel/src/power/cpufreq.home`
+  - [ ] Provide simple policies exposed to userspace (`performance`, `powersave`, `ondemand`)
+- [x] **Thermal monitoring & throttling** – implemented
+  - Implementation: `kernel/src/power/thermal.home`
+  - [ ] Integrate with cpufreq for smooth throttling and expose metrics via `/proc`/`/sys`
+- [ ] **Peripheral power management**
+  - [ ] USB selective suspend, display blanking, clock gating of idle peripherals
+
+---
+
+### 🎯 Priority 3: Developer Experience (DX)
+
+#### P3.1 Build System Modernization
+
+- [ ] **Unified build entrypoint**
+  - Current: `zig build`, `kernel/build.home`, multiple shell scripts in `scripts/`
+  - [ ] One canonical command (`home build` or `./scripts/build.home`) for all targets (x86-64, Pi 3/4/5)
+  - [ ] Cross-compilation support baked into build config (no external toolchain logic scattered in scripts)
+- [ ] **Configurable feature sets**
+  - [ ] `menuconfig`-style TUI or simple TOML/JSON for enabling/disabling subsystems
+  - [ ] Build-time toggles for: GUI, network stack, container features, advanced FS, debug tooling
+- [ ] **CI/CD pipeline**
+  - [ ] Automated builds for x86-64 + ARM64
+  - [ ] QEMU-based smoke tests (boot + basic shell + fs + net)
+  - [ ] Boot time regression tracking and perf dashboards
+
+#### P3.2 Debugging & Profiling
+
+- [x] **GDB remote stub** – implemented
+  - Implementation: `kernel/src/debug/gdb.home` (RSP over serial)
+  - [ ] Wire into exception paths on both x86-64 and ARM64 and document usage in `docs/`
+- [x] **Panic & memleak tooling** – implemented
+  - Files: `kernel/src/debug/{panic.home,memleak.home,memory_audit.home,profiler.home}`
+  - [ ] Standardize panic output format and add basic crash-dump-to-storage support
+- [ ] **End-to-end perf tooling**
+  - [ ] Easy pipeline: collect profiles → generate flamegraphs → compare against baselines
+
+#### P3.3 Documentation & Architecture
+
+- [ ] **Keep audits and docs current with code**
+  - [ ] Extend the audit pattern from process/VFS to networking, security, power, and drivers
+  - [ ] Auto-generate syscall & driver reference docs from `.home` sources
+
+---
+
+### 🎯 Priority 4: Real Implementation vs Stubs
+
+Some modules are complete, others still contain explicit stubs. Focus areas:
+
+#### P4.1 Kernel Core
+
+- [x] **Process subsystem verified**
+  - Implementation: `kernel/src/core/process.home`
+  - Audit: `docs/audits/process-management-audit.md` (rated production-ready)
+- [x] **VFS + core filesystem verified**
+  - Implementation: `kernel/src/core/filesystem.home` and friends under `kernel/src/fs/**`
+  - Audit: `docs/audits/vfs-audit.md` (rated production-ready, world-class)
+- [x] **Syscall layer wired to real implementations**
+  - Implementation: `kernel/src/sys/syscall.home` dispatching to process, filesystem, memory
+  - [ ] Extend syscall set and semantics toward POSIX where useful, without bloating minimal builds
+
+#### P4.2 Security Modules & Capabilities
+
+- [ ] **Capability system (caps)**
+  - File: `kernel/src/security/caps.home` still contains stubbed functions (`caps_set`, `caps_drop`)
+  - [ ] Implement real per-process capability sets and enforcement in syscalls and sensitive paths
+  - [ ] Integrate with audit logging (`kernel/src/security/audit.home`)
+- [ ] **Seccomp / syscall filtering**
+  - [ ] Implement seccomp-like filters for sandboxed processes (optional, but important for containers)
+
+#### P4.3 Networking & DNS
+
+- [ ] **DNS resolver completion**
+  - File: `kernel/src/net/dns.home` still has stubbed query/send logic
+  - [ ] Implement real UDP-based resolution, retries, caching, and `/etc/resolv.conf` integration
+- [ ] **Network stack verification on real hardware**
+  - [ ] Ping, HTTP, TLS, and WebSocket end-to-end tests on Pi and x86-64
+
+---
+
+### 🎯 Priority 5: Essential Applications & UX
+
+- [x] **Shell (hsh) is featureful**
+  - Implementation: `apps/shell.home` (jobs, history, aliases, env, builtins)
+  - [ ] Harden parsing, quoting, and error handling; add focused tests for pipelines and redirections
+- [x] **Init process exists**
+  - Implementation: `apps/init/init.home` (runlevels, services, mounts)
+  - [ ] Replace stub syscall wrappers with real ones and validate service supervision under failures
+- [ ] **Core utilities verification**
+  - 80+ utilities in `apps/utils/**` (e.g. `ls.home`, `cat.home`, `cp.home`, `ps.home`, `top.home`)
+  - [ ] Create a utility test suite that runs on every image build (basic correctness + performance)
+
+---
+
+### 🎯 Priority 6: Security Hardening
+
+- [ ] **Audit all raw pointer and unsafe patterns**
+  - [ ] Systematically scan for `@ptrFromInt` / low-level pointer use and ensure bounds checking
+- [x] **VFS permissions & xattrs** – implemented
+  - Already covered by VFS audit; ensure enforcement is applied for all filesystems that hook into VFS
+- [ ] **Process isolation & sandboxing**
+  - [ ] Enforce SMEP/SMAP (x86-64) and PAN/PXN (ARM64) where available
+  - [ ] Build a simple container-like sandbox (namespaces + seccomp-lite + cgroup-like limits) without pulling external runtimes
+
+---
+
+### 🎯 Priority 7: GUI & Craft Integration (After Kernel Is Solid)
+
+- [x] **Craft integration libraries present**
+  - Files: `kernel/src/lib/craft_lib.home`, plus GUI apps in `apps/desktop`, `apps/browser.home`, `apps/filemanager.home`, etc.
+  - [ ] Verify end-to-end: from boot → compositor → window manager → core GUI apps on Pi 4/5
+- [ ] **Framebuffer console polish**
+  - [ ] Ensure `fb_console` path (`kernel/src/drivers/fb_console.home`) gives a fast, low-CPU text console suitable for headless-ish setups
+
+---
+
+### 🎯 Priority 8: Testing, Metrics & Targets
+
+- [x] **Basic test harnesses exist**
+  - Files: `tests/{unit,system,integration}/`, `tests/run-tests.sh`
+  - [ ] Expand coverage for drivers, networking, and apps; add Pi hardware-in-the-loop jobs
+- [ ] **Performance & stability targets (Pi-first)**
+  - Keep and refine the tables from the original `TODO-UPDATES.md` for boot time, RAM usage, uptime, and compatibility; enforce them via automated tests over time.
+
+---
+
 ## Project Vision
 
 Build a next-generation operating system that prioritizes:
@@ -92,6 +337,11 @@ Build a next-generation operating system that prioritizes:
 - Documentation, installers, community ready
 
 ---
+
+> **Legacy Roadmap Notice**  
+> The following 18-phase plan was written early in the project as an aspirational 78-week roadmap.  
+> Many items were marked complete well before real implementations existed, and others have since been replaced by better designs.  
+> **Do not treat these checkboxes as authoritative implementation status** – use the *Canonical Strategic TODO* section above for current priorities and truth.
 
 ## Phase 1: Foundation & Bootloader (Weeks 1-4)
 
