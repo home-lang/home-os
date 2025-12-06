@@ -96,6 +96,189 @@ var scheduler_count: u32 = 0
 var current_jiffies: u64 = 0
 
 // ============================================================================
+// Request Pool
+// ============================================================================
+
+const MAX_REQUEST_POOL: u32 = 256
+var request_pool: [MAX_REQUEST_POOL]ScheduledRequest = undefined
+var request_pool_bitmap: [32]u8 = undefined  // 256 / 8 = 32 bytes
+var request_pool_initialized: u32 = 0
+
+fn init_request_pool() void {
+    if (request_pool_initialized == 1) return
+
+    var i: u32 = 0
+    while (i < 32) {
+        request_pool_bitmap[i] = 0
+        i += 1
+    }
+
+    request_pool_initialized = 1
+}
+
+fn alloc_scheduled_request() *ScheduledRequest {
+    init_request_pool()
+
+    var i: u32 = 0
+    while (i < MAX_REQUEST_POOL) {
+        var byte_idx: u32 = i / 8
+        var bit_idx: u32 = i % 8
+
+        if ((request_pool_bitmap[byte_idx] & (@as(u8, 1) << @truncate(bit_idx, u3))) == 0) {
+            // Found free slot
+            request_pool_bitmap[byte_idx] = request_pool_bitmap[byte_idx] | (@as(u8, 1) << @truncate(bit_idx, u3))
+            return &request_pool[i]
+        }
+        i += 1
+    }
+
+    return null
+}
+
+fn free_scheduled_request(req: *ScheduledRequest) void {
+    var idx: u64 = (@intFromPtr(req) - @intFromPtr(&request_pool[0])) / @sizeOf(ScheduledRequest)
+    if (idx < MAX_REQUEST_POOL) {
+        var byte_idx: u32 = @truncate(idx / 8, u32)
+        var bit_idx: u32 = @truncate(idx % 8, u32)
+        request_pool_bitmap[byte_idx] = request_pool_bitmap[byte_idx] & ~(@as(u8, 1) << @truncate(bit_idx, u3))
+    }
+}
+
+// ============================================================================
+// Block Layer Interface
+// ============================================================================
+
+// ATA PIO ports
+const ATA_DATA: u16 = 0x1F0
+const ATA_SECTOR_COUNT: u16 = 0x1F2
+const ATA_LBA_LOW: u16 = 0x1F3
+const ATA_LBA_MID: u16 = 0x1F4
+const ATA_LBA_HIGH: u16 = 0x1F5
+const ATA_DRIVE_HEAD: u16 = 0x1F6
+const ATA_COMMAND: u16 = 0x1F7
+const ATA_STATUS: u16 = 0x1F7
+
+const ATA_CMD_READ: u8 = 0x20
+const ATA_CMD_WRITE: u8 = 0x30
+
+const ATA_STATUS_BSY: u8 = 0x80
+const ATA_STATUS_DRQ: u8 = 0x08
+const ATA_STATUS_ERR: u8 = 0x01
+
+fn outb(port: u16, value: u8) void {
+    asm volatile ("outb %[val], %[port]"
+        :
+        : [val] "{al}" (value), [port] "N{dx}" (port)
+    )
+}
+
+fn inb(port: u16) u8 {
+    return asm volatile ("inb %[port], %[result]"
+        : [result] "={al}" (-> u8)
+        : [port] "N{dx}" (port)
+    )
+}
+
+fn wait_ata_ready() void {
+    var timeout: u32 = 0
+    while (timeout < 100000) {
+        var status: u8 = inb(ATA_STATUS)
+        if ((status & ATA_STATUS_BSY) == 0) return
+        timeout += 1
+    }
+}
+
+fn wait_ata_drq() u32 {
+    var timeout: u32 = 0
+    while (timeout < 100000) {
+        var status: u8 = inb(ATA_STATUS)
+        if ((status & ATA_STATUS_ERR) != 0) return 1
+        if ((status & ATA_STATUS_DRQ) != 0) return 0
+        timeout += 1
+    }
+    return 1
+}
+
+fn dispatch_to_block_layer(device_id: u32, req_type: u32, block_start: u64, block_count: u32, buffer: u64) u32 {
+    wait_ata_ready()
+
+    // Select drive and set LBA mode
+    outb(ATA_DRIVE_HEAD, 0xE0 | @truncate((block_start >> 24) & 0x0F, u8))
+
+    // Set sector count and LBA
+    outb(ATA_SECTOR_COUNT, @truncate(block_count, u8))
+    outb(ATA_LBA_LOW, @truncate(block_start & 0xFF, u8))
+    outb(ATA_LBA_MID, @truncate((block_start >> 8) & 0xFF, u8))
+    outb(ATA_LBA_HIGH, @truncate((block_start >> 16) & 0xFF, u8))
+
+    if (req_type == request_merge.REQ_TYPE_READ) {
+        // Issue read command
+        outb(ATA_COMMAND, ATA_CMD_READ)
+
+        var buf_ptr: *u16 = @ptrFromInt(buffer)
+        var sector: u32 = 0
+
+        while (sector < block_count) {
+            if (wait_ata_drq() != 0) {
+                serial.write_string("[IO Scheduler] Read error\n")
+                return 1
+            }
+
+            // Read 256 words (512 bytes)
+            var word: u32 = 0
+            while (word < 256) {
+                buf_ptr[sector * 256 + word] = @as(u16, inb(ATA_DATA)) | (@as(u16, inb(ATA_DATA)) << 8)
+                word += 1
+            }
+
+            sector += 1
+        }
+    } else {
+        // Issue write command
+        outb(ATA_COMMAND, ATA_CMD_WRITE)
+
+        var buf_ptr: *u16 = @ptrFromInt(buffer)
+        var sector: u32 = 0
+
+        while (sector < block_count) {
+            if (wait_ata_drq() != 0) {
+                serial.write_string("[IO Scheduler] Write error\n")
+                return 1
+            }
+
+            // Write 256 words (512 bytes)
+            var word: u32 = 0
+            while (word < 256) {
+                var data: u16 = buf_ptr[sector * 256 + word]
+                outb(ATA_DATA, @truncate(data & 0xFF, u8))
+                outb(ATA_DATA, @truncate((data >> 8) & 0xFF, u8))
+                word += 1
+            }
+
+            sector += 1
+        }
+    }
+
+    return 0
+}
+
+// Dispatch completed request to block layer
+export fn io_scheduler_dispatch_request(req: *ScheduledRequest) u32 {
+    var result: u32 = dispatch_to_block_layer(
+        0,  // device_id (would get from request context)
+        req.base.req_type,
+        req.base.block_start,
+        req.base.block_count,
+        req.base.buffer
+    )
+
+    // Free the request back to pool
+    free_scheduled_request(req)
+
+    return result
+}
+
+// ============================================================================
 // Initialization
 // ============================================================================
 
@@ -265,14 +448,39 @@ export fn io_scheduler_submit(
 
     // For NOOP scheduler, just pass through to request merge layer
     if (ctx.algorithm == SCHED_NOOP) {
-        // TODO: Direct dispatch to block layer
+        // Direct dispatch to block layer - submit immediately
+        var result: u32 = dispatch_to_block_layer(ctx.device_id, req_type, block_start, block_count, buffer)
         ctx.total_requests += 1
-        return 0
+        return result
     }
 
-    // Allocate scheduled request
-    // In real implementation, would use slab allocator
-    var req: *ScheduledRequest = @ptrFromInt(0)  // Placeholder for allocation
+    // Allocate scheduled request from pool
+    var req: *ScheduledRequest = alloc_scheduled_request()
+    if (req == null) {
+        serial.write_string("[IO Scheduler] Request allocation failed\n")
+        return 1
+    }
+
+    // Initialize request
+    req.base.req_type = req_type
+    req.base.block_start = block_start
+    req.base.block_count = block_count
+    req.base.buffer = buffer
+    req.deadline_jiffies = current_jiffies + (if (req_type == request_merge.REQ_TYPE_READ) ctx.read_deadline else ctx.write_deadline)
+    req.submit_jiffies = current_jiffies
+    req.priority = priority
+    req.batch_id = 0
+    req.next_prio = null
+    req.next_fifo = null
+
+    // Insert into appropriate queue
+    if (req_type == request_merge.REQ_TYPE_READ) {
+        insert_sorted(&ctx.read_queue, req)
+        insert_fifo(&ctx.read_fifo, req)
+    } else {
+        insert_sorted(&ctx.write_queue, req)
+        insert_fifo(&ctx.write_fifo, req)
+    }
 
     // Check flash optimizations for writes
     if (req_type == request_merge.REQ_TYPE_WRITE and (ctx.flash_opts & FLASH_OPT_BATCH_WRITES) != 0) {

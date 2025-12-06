@@ -1,0 +1,781 @@
+// home-os VFS - Path Resolution
+// Full implementation of path resolution for all file operations
+// This is the core missing piece that many VFS operations depend on
+
+import "foundation.home" as foundation
+import "memory.home" as memory
+import "filesystem.home" as filesystem
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_PATH_LEN: u32 = 4096
+const MAX_PATH_COMPONENTS: u32 = 128
+const MAX_SYMLINK_DEPTH: u32 = 40
+
+// Path resolution flags
+const RESOLVE_NO_FOLLOW: u32 = 1        // Don't follow final symlink
+const RESOLVE_CREATE: u32 = 2           // Create if doesn't exist
+const RESOLVE_PARENT: u32 = 4           // Resolve to parent directory
+const RESOLVE_NO_XDEV: u32 = 8          // Don't cross mount points
+const RESOLVE_BENEATH: u32 = 16         // Resolve must stay beneath start
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct PathComponent {
+    name: [u8; 256],
+    name_len: u32,
+    inode: u32,
+    file_type: u32,
+}
+
+struct ResolvedPath {
+    inode: u32,
+    parent_inode: u32,
+    file_type: u32,
+    mount_id: u32,
+    final_component: [u8; 256],
+    final_len: u32,
+    full_path: [u8; 4096],
+    full_len: u32,
+    error: u32,
+}
+
+struct PathContext {
+    start_inode: u32,       // Starting directory (usually cwd or root)
+    root_inode: u32,        // Root of filesystem for this resolution
+    uid: u32,               // User performing resolution
+    gid: u32,               // Group
+    flags: u32,             // Resolution flags
+    symlink_depth: u32,     // Current symlink nesting depth
+}
+
+// Directory entry cache for fast lookups
+const DENTRY_CACHE_SIZE: u32 = 256
+
+struct DentryCacheEntry {
+    parent_inode: u32,
+    name_hash: u32,
+    name: [u8; 64],
+    name_len: u32,
+    child_inode: u32,
+    file_type: u32,
+    valid: u32,
+}
+
+var dentry_cache: [DentryCacheEntry; 256]
+var dentry_cache_hits: u64 = 0
+var dentry_cache_misses: u64 = 0
+
+// Current working directory per process (simplified: single global for now)
+var current_working_dir: u32 = 1  // Start at root
+var current_working_path: [u8; 4096]
+var current_working_path_len: u32 = 1  // "/"
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn vfs_path_init() {
+    // Initialize dentry cache
+    var i: u32 = 0
+    while i < DENTRY_CACHE_SIZE {
+        dentry_cache[i].valid = 0
+        dentry_cache[i].parent_inode = 0
+        dentry_cache[i].child_inode = 0
+        i = i + 1
+    }
+
+    // Set current working directory to root
+    current_working_dir = 1
+    current_working_path[0] = '/'
+    current_working_path[1] = 0
+    current_working_path_len = 1
+
+    foundation.serial_write_string("[VFS Path] Initialized\n")
+}
+
+// ============================================================================
+// STRING UTILITIES
+// ============================================================================
+
+fn string_hash(name: *u8, len: u32): u32 {
+    var hash: u32 = 5381
+    var i: u32 = 0
+    while i < len {
+        hash = ((hash << 5) + hash) + @as(u32, name[i])
+        i = i + 1
+    }
+    return hash
+}
+
+fn string_equal(a: *u8, a_len: u32, b: *u8, b_len: u32): u32 {
+    if a_len != b_len { return 0 }
+
+    var i: u32 = 0
+    while i < a_len {
+        if a[i] != b[i] { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn string_copy(dst: *u8, src: *u8, max_len: u32): u32 {
+    var i: u32 = 0
+    while i < max_len - 1 and src[i] != 0 {
+        dst[i] = src[i]
+        i = i + 1
+    }
+    dst[i] = 0
+    return i
+}
+
+// ============================================================================
+// DENTRY CACHE
+// ============================================================================
+
+fn dentry_cache_lookup(parent_inode: u32, name: *u8, name_len: u32): u32 {
+    var hash = string_hash(name, name_len)
+    var idx = hash % DENTRY_CACHE_SIZE
+
+    // Linear probing
+    var tries: u32 = 0
+    while tries < 8 {
+        var entry = &dentry_cache[(idx + tries) % DENTRY_CACHE_SIZE]
+        if entry.valid == 1 and entry.parent_inode == parent_inode {
+            if string_equal(&entry.name[0], entry.name_len, name, name_len) == 1 {
+                dentry_cache_hits = dentry_cache_hits + 1
+                return entry.child_inode
+            }
+        }
+        tries = tries + 1
+    }
+
+    dentry_cache_misses = dentry_cache_misses + 1
+    return 0
+}
+
+fn dentry_cache_insert(parent_inode: u32, name: *u8, name_len: u32, child_inode: u32, file_type: u32) {
+    var hash = string_hash(name, name_len)
+    var idx = hash % DENTRY_CACHE_SIZE
+
+    // Find free slot (linear probing)
+    var tries: u32 = 0
+    while tries < 8 {
+        var entry = &dentry_cache[(idx + tries) % DENTRY_CACHE_SIZE]
+        if entry.valid == 0 {
+            entry.parent_inode = parent_inode
+            entry.name_hash = hash
+            entry.name_len = if name_len > 63 { 63 } else { name_len }
+
+            var i: u32 = 0
+            while i < entry.name_len {
+                entry.name[i] = name[i]
+                i = i + 1
+            }
+
+            entry.child_inode = child_inode
+            entry.file_type = file_type
+            entry.valid = 1
+            return
+        }
+        tries = tries + 1
+    }
+
+    // Cache full, evict oldest entry at idx
+    var entry = &dentry_cache[idx]
+    entry.parent_inode = parent_inode
+    entry.name_hash = hash
+    entry.name_len = if name_len > 63 { 63 } else { name_len }
+
+    var i: u32 = 0
+    while i < entry.name_len {
+        entry.name[i] = name[i]
+        i = i + 1
+    }
+
+    entry.child_inode = child_inode
+    entry.file_type = file_type
+    entry.valid = 1
+}
+
+fn dentry_cache_invalidate(inode: u32) {
+    var i: u32 = 0
+    while i < DENTRY_CACHE_SIZE {
+        if dentry_cache[i].valid == 1 {
+            if dentry_cache[i].child_inode == inode or dentry_cache[i].parent_inode == inode {
+                dentry_cache[i].valid = 0
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// DIRECTORY LOOKUP
+// ============================================================================
+
+// Look up a single component in a directory
+fn lookup_in_directory(parent_inode: u32, name: *u8, name_len: u32, result: *PathComponent): u32 {
+    // First check dentry cache
+    var cached = dentry_cache_lookup(parent_inode, name, name_len)
+    if cached != 0 {
+        result.inode = cached
+        // Copy name
+        var i: u32 = 0
+        while i < name_len {
+            result.name[i] = name[i]
+            i = i + 1
+        }
+        result.name_len = name_len
+        // Get file type from inode
+        var inode_ptr = filesystem.inode_get(cached)
+        if inode_ptr != 0 {
+            var inode: *filesystem.Inode = @ptrFromInt(inode_ptr)
+            result.file_type = inode.file_type
+        }
+        return 0
+    }
+
+    // Cache miss - scan directory entries
+    var parent_ptr = filesystem.inode_get(parent_inode)
+    if parent_ptr == 0 { return 1 }  // Parent not found
+
+    var parent: *filesystem.Inode = @ptrFromInt(parent_ptr)
+
+    // Check if parent is a directory
+    if parent.file_type != 2 { return 1 }  // Not a directory
+
+    // Read directory data blocks
+    var block_idx: u32 = 0
+    while block_idx < 12 {
+        var block_addr = parent.data_blocks[block_idx]
+        if block_addr == 0 { break }
+
+        // Scan directory entries in this block
+        var offset: u32 = 0
+        while offset < 4096 {
+            var entry: *DirEntryBlock = @ptrFromInt(block_addr + offset)
+            if entry.inode == 0 { break }
+
+            // Compare names
+            if entry.name_len == name_len {
+                var matches: u32 = 1
+                var i: u32 = 0
+                while i < name_len {
+                    if entry.name[i] != name[i] {
+                        matches = 0
+                        break
+                    }
+                    i = i + 1
+                }
+
+                if matches == 1 {
+                    result.inode = entry.inode
+                    var j: u32 = 0
+                    while j < name_len {
+                        result.name[j] = name[j]
+                        j = j + 1
+                    }
+                    result.name_len = name_len
+
+                    // Get file type
+                    var child_ptr = filesystem.inode_get(entry.inode)
+                    if child_ptr != 0 {
+                        var child: *filesystem.Inode = @ptrFromInt(child_ptr)
+                        result.file_type = child.file_type
+                    }
+
+                    // Add to cache
+                    dentry_cache_insert(parent_inode, name, name_len, entry.inode, result.file_type)
+
+                    return 0
+                }
+            }
+
+            offset = offset + 272  // Size of directory entry
+        }
+
+        block_idx = block_idx + 1
+    }
+
+    return 1  // Not found
+}
+
+// Directory entry structure on disk
+struct DirEntryBlock {
+    inode: u32,
+    name_len: u32,
+    name: [u8; 256],
+    padding: [u8; 8],
+}
+
+// ============================================================================
+// PATH PARSING
+// ============================================================================
+
+// Parse a path into components
+fn parse_path(path: *u8, components: *[PathComponent; 128], num_components: *u32): u32 {
+    var comp_idx: u32 = 0
+    var path_idx: u32 = 0
+    var comp_start: u32 = 0
+
+    // Skip leading slashes
+    while path[path_idx] == '/' {
+        path_idx = path_idx + 1
+    }
+
+    while path[path_idx] != 0 and comp_idx < MAX_PATH_COMPONENTS {
+        comp_start = path_idx
+
+        // Find end of component
+        while path[path_idx] != 0 and path[path_idx] != '/' {
+            path_idx = path_idx + 1
+        }
+
+        var comp_len = path_idx - comp_start
+        if comp_len > 0 {
+            // Copy component name
+            var i: u32 = 0
+            while i < comp_len and i < 255 {
+                components[comp_idx].name[i] = path[comp_start + i]
+                i = i + 1
+            }
+            components[comp_idx].name[i] = 0
+            components[comp_idx].name_len = comp_len
+            components[comp_idx].inode = 0
+            components[comp_idx].file_type = 0
+
+            comp_idx = comp_idx + 1
+        }
+
+        // Skip trailing slashes
+        while path[path_idx] == '/' {
+            path_idx = path_idx + 1
+        }
+    }
+
+    num_components.* = comp_idx
+    return 0
+}
+
+// ============================================================================
+// CORE PATH RESOLUTION
+// ============================================================================
+
+// Main path resolution function
+export fn resolve_path(path: u64, ctx: *PathContext, result: *ResolvedPath): u32 {
+    var path_str: *u8 = @ptrFromInt(path)
+
+    // Initialize result
+    result.inode = 0
+    result.parent_inode = 0
+    result.file_type = 0
+    result.mount_id = 0
+    result.final_len = 0
+    result.full_len = 0
+    result.error = 0
+
+    // Determine starting point
+    var current_inode: u32 = ctx.start_inode
+    if path_str[0] == '/' {
+        current_inode = ctx.root_inode
+    }
+
+    // Handle empty path
+    if path_str[0] == 0 {
+        result.inode = current_inode
+        var inode_ptr = filesystem.inode_get(current_inode)
+        if inode_ptr != 0 {
+            var inode: *filesystem.Inode = @ptrFromInt(inode_ptr)
+            result.file_type = inode.file_type
+        }
+        return 0
+    }
+
+    // Parse path into components
+    var components: [PathComponent; 128]
+    var num_components: u32 = 0
+    parse_path(path_str, &components, &num_components)
+
+    if num_components == 0 {
+        // Path was just "/" or empty
+        result.inode = current_inode
+        var inode_ptr = filesystem.inode_get(current_inode)
+        if inode_ptr != 0 {
+            var inode: *filesystem.Inode = @ptrFromInt(inode_ptr)
+            result.file_type = inode.file_type
+        }
+        return 0
+    }
+
+    // Resolve each component
+    var parent_inode: u32 = current_inode
+    var i: u32 = 0
+    var last_component = if (ctx.flags & RESOLVE_PARENT) != 0 { num_components - 1 } else { num_components }
+
+    while i < last_component {
+        var comp = &components[i]
+
+        // Handle special entries
+        if comp.name_len == 1 and comp.name[0] == '.' {
+            // "." - stay in current directory
+            i = i + 1
+            continue
+        }
+
+        if comp.name_len == 2 and comp.name[0] == '.' and comp.name[1] == '.' {
+            // ".." - go to parent
+            // Check if we're at root or would escape RESOLVE_BENEATH
+            if current_inode == ctx.root_inode {
+                // At root, stay here
+                i = i + 1
+                continue
+            }
+
+            // Look up parent inode (stored in directory entry)
+            var parent_result: PathComponent
+            if lookup_in_directory(current_inode, "..".ptr, 2, &parent_result) == 0 {
+                parent_inode = current_inode
+                current_inode = parent_result.inode
+            }
+            i = i + 1
+            continue
+        }
+
+        // Check execute permission on current directory
+        var dir_ptr = filesystem.inode_get(current_inode)
+        if dir_ptr == 0 {
+            result.error = 2  // ENOENT
+            return 1
+        }
+
+        var dir: *filesystem.Inode = @ptrFromInt(dir_ptr)
+
+        // Must be a directory to traverse
+        if dir.file_type != 2 {
+            result.error = 20  // ENOTDIR
+            return 1
+        }
+
+        // Check execute permission (search permission)
+        if !has_execute_permission(dir, ctx.uid, ctx.gid) {
+            result.error = 13  // EACCES
+            return 1
+        }
+
+        // Look up component
+        if lookup_in_directory(current_inode, &comp.name[0], comp.name_len, comp) != 0 {
+            // Component not found
+            if i == num_components - 1 and (ctx.flags & RESOLVE_CREATE) != 0 {
+                // Last component and CREATE flag - caller will create
+                result.parent_inode = current_inode
+                var j: u32 = 0
+                while j < comp.name_len {
+                    result.final_component[j] = comp.name[j]
+                    j = j + 1
+                }
+                result.final_len = comp.name_len
+                result.error = 2  // ENOENT but with parent set
+                return 1
+            }
+            result.error = 2  // ENOENT
+            return 1
+        }
+
+        // Check if this is a symlink
+        if comp.file_type == 3 and (i < num_components - 1 or (ctx.flags & RESOLVE_NO_FOLLOW) == 0) {
+            // Need to follow symlink
+            if ctx.symlink_depth >= MAX_SYMLINK_DEPTH {
+                result.error = 40  // ELOOP
+                return 1
+            }
+
+            // Read symlink target
+            var link_target: [u8; 4096]
+            if read_symlink(comp.inode, &link_target[0], 4096) == 0 {
+                result.error = 5  // EIO
+                return 1
+            }
+
+            // Recursive resolution with incremented depth
+            var new_ctx: PathContext
+            new_ctx.root_inode = ctx.root_inode
+            new_ctx.uid = ctx.uid
+            new_ctx.gid = ctx.gid
+            new_ctx.flags = ctx.flags
+            new_ctx.symlink_depth = ctx.symlink_depth + 1
+
+            if link_target[0] == '/' {
+                new_ctx.start_inode = ctx.root_inode
+            } else {
+                new_ctx.start_inode = current_inode
+            }
+
+            var link_result: ResolvedPath
+            if resolve_path(@ptrToInt(&link_target[0]), &new_ctx, &link_result) != 0 {
+                result.error = link_result.error
+                return 1
+            }
+
+            parent_inode = link_result.parent_inode
+            current_inode = link_result.inode
+        } else {
+            parent_inode = current_inode
+            current_inode = comp.inode
+        }
+
+        i = i + 1
+    }
+
+    // Build result
+    result.inode = current_inode
+    result.parent_inode = parent_inode
+
+    var final_ptr = filesystem.inode_get(current_inode)
+    if final_ptr != 0 {
+        var final: *filesystem.Inode = @ptrFromInt(final_ptr)
+        result.file_type = final.file_type
+    }
+
+    // Copy final component name
+    if num_components > 0 {
+        var last = &components[num_components - 1]
+        var j: u32 = 0
+        while j < last.name_len {
+            result.final_component[j] = last.name[j]
+            j = j + 1
+        }
+        result.final_len = last.name_len
+    }
+
+    // Copy full resolved path
+    result.full_len = string_copy(&result.full_path[0], path_str, MAX_PATH_LEN)
+
+    return 0
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn has_execute_permission(inode: *filesystem.Inode, uid: u32, gid: u32): bool {
+    // Root can always execute directories
+    if uid == 0 { return true }
+
+    var mode = inode.mode
+
+    // Check owner
+    if inode.uid == uid {
+        return (mode & 0o100) != 0
+    }
+
+    // Check group
+    if inode.gid == gid {
+        return (mode & 0o010) != 0
+    }
+
+    // Check others
+    return (mode & 0o001) != 0
+}
+
+fn read_symlink(inode: u32, buffer: *u8, max_len: u32): u32 {
+    var inode_ptr = filesystem.inode_get(inode)
+    if inode_ptr == 0 { return 0 }
+
+    var ino: *filesystem.Inode = @ptrFromInt(inode_ptr)
+
+    if ino.file_type != 3 { return 0 }  // Not a symlink
+
+    var data_block = ino.data_blocks[0]
+    if data_block == 0 { return 0 }
+
+    var len = if ino.size > max_len - 1 { max_len - 1 } else { @truncate(ino.size) }
+
+    memory.memcpy(@ptrToInt(buffer), data_block, len)
+    buffer[len] = 0
+
+    return len
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+// High-level lookup: path -> inode
+export fn vfs_lookup(path: u64, uid: u32, gid: u32): u32 {
+    var ctx: PathContext
+    ctx.start_inode = current_working_dir
+    ctx.root_inode = 1  // Root inode
+    ctx.uid = uid
+    ctx.gid = gid
+    ctx.flags = 0
+    ctx.symlink_depth = 0
+
+    var result: ResolvedPath
+    if resolve_path(path, &ctx, &result) != 0 {
+        return 0
+    }
+
+    return result.inode
+}
+
+// Lookup without following final symlink
+export fn vfs_lstat_lookup(path: u64, uid: u32, gid: u32): u32 {
+    var ctx: PathContext
+    ctx.start_inode = current_working_dir
+    ctx.root_inode = 1
+    ctx.uid = uid
+    ctx.gid = gid
+    ctx.flags = RESOLVE_NO_FOLLOW
+    ctx.symlink_depth = 0
+
+    var result: ResolvedPath
+    if resolve_path(path, &ctx, &result) != 0 {
+        return 0
+    }
+
+    return result.inode
+}
+
+// Lookup parent directory and get final component
+export fn vfs_parent_lookup(path: u64, uid: u32, gid: u32, final_name: *u8, final_len: *u32): u32 {
+    var ctx: PathContext
+    ctx.start_inode = current_working_dir
+    ctx.root_inode = 1
+    ctx.uid = uid
+    ctx.gid = gid
+    ctx.flags = RESOLVE_PARENT
+    ctx.symlink_depth = 0
+
+    var result: ResolvedPath
+    if resolve_path(path, &ctx, &result) != 0 {
+        if result.parent_inode != 0 {
+            // File doesn't exist but parent does
+            var i: u32 = 0
+            while i < result.final_len {
+                final_name[i] = result.final_component[i]
+                i = i + 1
+            }
+            final_len.* = result.final_len
+            return result.parent_inode
+        }
+        return 0
+    }
+
+    var i: u32 = 0
+    while i < result.final_len {
+        final_name[i] = result.final_component[i]
+        i = i + 1
+    }
+    final_len.* = result.final_len
+
+    return result.parent_inode
+}
+
+// ============================================================================
+// WORKING DIRECTORY
+// ============================================================================
+
+export fn vfs_chdir(path: u64, uid: u32, gid: u32): u32 {
+    var inode = vfs_lookup(path, uid, gid)
+    if inode == 0 { return 1 }
+
+    var inode_ptr = filesystem.inode_get(inode)
+    if inode_ptr == 0 { return 1 }
+
+    var ino: *filesystem.Inode = @ptrFromInt(inode_ptr)
+
+    // Must be a directory
+    if ino.file_type != 2 { return 1 }
+
+    // Must have execute permission
+    if !has_execute_permission(ino, uid, gid) { return 1 }
+
+    current_working_dir = inode
+
+    // Update current working path string
+    var path_str: *u8 = @ptrFromInt(path)
+    current_working_path_len = string_copy(&current_working_path[0], path_str, MAX_PATH_LEN)
+
+    return 0
+}
+
+export fn vfs_getcwd(buffer: *u8, max_len: u32): u32 {
+    var len = if current_working_path_len > max_len - 1 { max_len - 1 } else { current_working_path_len }
+
+    var i: u32 = 0
+    while i < len {
+        buffer[i] = current_working_path[i]
+        i = i + 1
+    }
+    buffer[i] = 0
+
+    return len
+}
+
+export fn vfs_get_cwd_inode(): u32 {
+    return current_working_dir
+}
+
+// ============================================================================
+// CANONICAL PATH
+// ============================================================================
+
+// Resolve path and return canonical absolute path
+export fn vfs_realpath(path: u64, resolved: *u8, max_len: u32, uid: u32, gid: u32): u32 {
+    var ctx: PathContext
+    ctx.start_inode = current_working_dir
+    ctx.root_inode = 1
+    ctx.uid = uid
+    ctx.gid = gid
+    ctx.flags = 0
+    ctx.symlink_depth = 0
+
+    var result: ResolvedPath
+    if resolve_path(path, &ctx, &result) != 0 {
+        return 0
+    }
+
+    // Build canonical path by walking from inode back to root
+    // For now, just copy the resolved path
+    var len = if result.full_len > max_len - 1 { max_len - 1 } else { result.full_len }
+
+    var i: u32 = 0
+    while i < len {
+        resolved[i] = result.full_path[i]
+        i = i + 1
+    }
+    resolved[i] = 0
+
+    return len
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn vfs_path_get_cache_stats(hits: *u64, misses: *u64) {
+    hits.* = dentry_cache_hits
+    misses.* = dentry_cache_misses
+}
+
+export fn vfs_path_print_stats() {
+    foundation.serial_write_string("[VFS Path] Cache stats:\n")
+    foundation.serial_write_string("  Hits: ")
+    foundation.serial_write_u64(dentry_cache_hits)
+    foundation.serial_write_string("\n  Misses: ")
+    foundation.serial_write_u64(dentry_cache_misses)
+    foundation.serial_write_string("\n")
+
+    var hit_rate: u64 = 0
+    if dentry_cache_hits + dentry_cache_misses > 0 {
+        hit_rate = (dentry_cache_hits * 100) / (dentry_cache_hits + dentry_cache_misses)
+    }
+    foundation.serial_write_string("  Hit rate: ")
+    foundation.serial_write_u64(hit_rate)
+    foundation.serial_write_string("%\n")
+}

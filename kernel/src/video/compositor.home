@@ -395,13 +395,122 @@ export fn compositor_add_display(x: i32, y: i32, width: u32, height: u32, frameb
     compositor.displays[id].width = width
     compositor.displays[id].height = height
     compositor.displays[id].framebuffer = framebuffer as *volatile u32
+    compositor.displays[id].backbuffer = gpu.gpu_allocate_surface(width, height)
     compositor.displays[id].refresh_rate = 60
     compositor.displays[id].active = 1
     compositor.displays[id].primary = 0
     compositor.display_count = compositor.display_count + 1
 
     compositor.full_redraw_needed = 1
+
+    foundation.serial_write_string("[Compositor] Added display ")
+    foundation.serial_write_u32(id)
+    foundation.serial_write_string(" at (")
+    foundation.serial_write_i32(x)
+    foundation.serial_write_string(", ")
+    foundation.serial_write_i32(y)
+    foundation.serial_write_string(") ")
+    foundation.serial_write_u32(width)
+    foundation.serial_write_string("x")
+    foundation.serial_write_u32(height)
+    foundation.serial_write_string("\n")
+
     return id
+}
+
+export fn compositor_remove_display(display_id: u32) {
+    if display_id >= compositor.display_count {
+        return
+    }
+
+    // Can't remove primary display
+    if compositor.displays[display_id].primary == 1 {
+        foundation.serial_write_string("[Compositor] Cannot remove primary display\n")
+        return
+    }
+
+    // Free backbuffer
+    if compositor.displays[display_id].backbuffer != null {
+        gpu.gpu_free_surface(compositor.displays[display_id].backbuffer)
+    }
+
+    // Mark as inactive
+    compositor.displays[display_id].active = 0
+
+    foundation.serial_write_string("[Compositor] Removed display ")
+    foundation.serial_write_u32(display_id)
+    foundation.serial_write_string("\n")
+
+    compositor.full_redraw_needed = 1
+}
+
+export fn compositor_set_display_position(display_id: u32, x: i32, y: i32) {
+    if display_id >= compositor.display_count {
+        return
+    }
+
+    compositor.displays[display_id].x = x
+    compositor.displays[display_id].y = y
+    compositor.full_redraw_needed = 1
+}
+
+// Find which display contains a point in virtual screen space
+fn find_display_for_point(x: i32, y: i32): u32 {
+    var i: u32 = 0
+    while i < compositor.display_count {
+        if compositor.displays[i].active == 0 {
+            i = i + 1
+            continue
+        }
+
+        let display: *Display = &compositor.displays[i]
+        if x >= display.x and x < display.x + display.width as i32 and
+           y >= display.y and y < display.y + display.height as i32 {
+            return i
+        }
+        i = i + 1
+    }
+
+    // Default to primary display
+    return 0
+}
+
+// Find which display a window primarily belongs to
+fn find_display_for_window(win: *Window): u32 {
+    // Use window center to determine display
+    let center_x: i32 = win.x + win.width as i32 / 2
+    let center_y: i32 = win.y + win.height as i32 / 2
+
+    return find_display_for_point(center_x, center_y)
+}
+
+// Get total virtual screen bounds across all displays
+export fn compositor_get_virtual_bounds(x: *i32, y: *i32, width: *u32, height: *u32) {
+    var min_x: i32 = 0
+    var min_y: i32 = 0
+    var max_x: i32 = 0
+    var max_y: i32 = 0
+
+    var i: u32 = 0
+    while i < compositor.display_count {
+        if compositor.displays[i].active == 0 {
+            i = i + 1
+            continue
+        }
+
+        let display: *Display = &compositor.displays[i]
+        if display.x < min_x { min_x = display.x }
+        if display.y < min_y { min_y = display.y }
+        if display.x + display.width as i32 > max_x { max_x = display.x + display.width as i32 }
+        if display.y + display.height as i32 > max_y { max_y = display.y + display.height as i32 }
+
+        i = i + 1
+    }
+
+    *x = min_x
+    *y = min_y
+    *width = (max_x - min_x) as u32
+    *height = (max_y - min_y) as u32
 }
 
 // ============================================================================
@@ -1422,38 +1531,282 @@ export fn compositor_render() {
     let delta_time: f32 = 1.0 / 60.0  // Assume 60 FPS
     update_animations(delta_time)
 
-    if compositor.full_redraw_needed == 1 {
-        // Full screen redraw
-        var full_rect: Rect
-        full_rect.x = 0
-        full_rect.y = 0
-        full_rect.width = compositor.displays[0].width
-        full_rect.height = compositor.displays[0].height
-
-        composite_region(&full_rect)
-    } else {
-        // Partial redraw - only dirty regions
-        var i: u32 = 0
-        while i < compositor.dirty_count {
-            if compositor.dirty_regions[i].active == 1 {
-                composite_region(&compositor.dirty_regions[i].rect)
-            }
-            i = i + 1
+    // Render to each display
+    var display_idx: u32 = 0
+    while display_idx < compositor.display_count {
+        if compositor.displays[display_idx].active == 0 {
+            display_idx = display_idx + 1
+            continue
         }
+
+        render_to_display(display_idx)
+        display_idx = display_idx + 1
     }
 
     clear_dirty_regions()
 
-    // VSync and present
+    // VSync and present all displays
     if compositor.vsync_enabled == 1 {
-        // Wait for vertical blank (actual implementation would use hardware)
-        // For now, this is a placeholder
+        gpu.gpu_wait_vsync()
     }
 
-    // Copy backbuffer to frontbuffer (present)
-    gpu.gpu_present()
+    // Copy backbuffers to frontbuffers (present)
+    display_idx = 0
+    while display_idx < compositor.display_count {
+        if compositor.displays[display_idx].active == 1 {
+            present_display(display_idx)
+        }
+        display_idx = display_idx + 1
+    }
 
     compositor.frame_count = compositor.frame_count + 1
+}
+
+fn render_to_display(display_idx: u32) {
+    let display: *Display = &compositor.displays[display_idx]
+
+    if compositor.full_redraw_needed == 1 {
+        // Full display redraw
+        var full_rect: Rect
+        full_rect.x = display.x
+        full_rect.y = display.y
+        full_rect.width = display.width
+        full_rect.height = display.height
+
+        composite_region_to_display(&full_rect, display_idx)
+    } else {
+        // Partial redraw - only dirty regions that intersect this display
+        var i: u32 = 0
+        while i < compositor.dirty_count {
+            if compositor.dirty_regions[i].active == 1 {
+                var display_rect: Rect
+                display_rect.x = display.x
+                display_rect.y = display.y
+                display_rect.width = display.width
+                display_rect.height = display.height
+
+                var intersect: Rect
+                if rect_intersect(&compositor.dirty_regions[i].rect, &display_rect, &intersect) == 1 {
+                    composite_region_to_display(&intersect, display_idx)
+                }
+            }
+            i = i + 1
+        }
+    }
+}
+
+fn composite_region_to_display(region: *Rect, display_idx: u32) {
+    let display: *Display = &compositor.displays[display_idx]
+    let target: *volatile u32 = display.backbuffer
+    let target_width: u32 = display.width
+    let target_height: u32 = display.height
+
+    // Transform region from virtual coordinates to display-local coordinates
+    var clip: Rect
+    clip.x = region.x - display.x
+    clip.y = region.y - display.y
+    clip.width = region.width
+    clip.height = region.height
+
+    // Clamp to display bounds
+    if clip.x < 0 {
+        clip.width = clip.width - (-clip.x) as u32
+        clip.x = 0
+    }
+    if clip.y < 0 {
+        clip.height = clip.height - (-clip.y) as u32
+        clip.y = 0
+    }
+    if clip.x + clip.width as i32 > target_width as i32 {
+        clip.width = (target_width as i32 - clip.x) as u32
+    }
+    if clip.y + clip.height as i32 > target_height as i32 {
+        clip.height = (target_height as i32 - clip.y) as u32
+    }
+
+    if clip.width == 0 or clip.height == 0 {
+        return
+    }
+
+    // Draw desktop background (adjusted for this display's position)
+    draw_desktop_display(&clip, target, target_width, target_height, display_idx)
+
+    // Draw windows in z-order (back to front)
+    var i: u32 = 0
+    while i < compositor.window_count {
+        let slot: u32 = compositor.z_order_list[i]
+        let win: *Window = &compositor.windows[slot]
+
+        if (win.flags & WINDOW_FLAG_VISIBLE) == 0 {
+            i = i + 1
+            continue
+        }
+
+        // Transform window coordinates to display-local
+        var win_rect: Rect
+        win_rect.x = win.x - display.x
+        win_rect.y = win.y - display.y
+        win_rect.width = win.width
+        win_rect.height = win.height
+
+        // Expand for decoration
+        if (win.flags & WINDOW_FLAG_DECORATED) != 0 {
+            win_rect.x = win_rect.x - WINDOW_BORDER_WIDTH as i32
+            win_rect.y = win_rect.y - WINDOW_TITLEBAR_HEIGHT as i32 - WINDOW_BORDER_WIDTH as i32
+            win_rect.width = win_rect.width + WINDOW_BORDER_WIDTH * 2
+            win_rect.height = win_rect.height + WINDOW_TITLEBAR_HEIGHT + WINDOW_BORDER_WIDTH * 2
+        }
+
+        // Expand for shadow
+        if compositor.shadows_enabled == 1 and (win.flags & WINDOW_FLAG_NO_SHADOW) == 0 {
+            win_rect.width = win_rect.width + SHADOW_SIZE
+            win_rect.height = win_rect.height + SHADOW_SIZE
+        }
+
+        var intersect: Rect
+        if rect_intersect(&win_rect, &clip, &intersect) == 1 {
+            let opacity: u8 = get_animation_opacity(win)
+
+            // Create display-local clip region for window rendering
+            var display_clip: Rect
+            display_clip.x = clip.x
+            display_clip.y = clip.y
+            display_clip.width = clip.width
+            display_clip.height = clip.height
+
+            // Offset window for this display
+            var display_win: Window = *win
+            display_win.x = win.x - display.x
+            display_win.y = win.y - display.y
+
+            // Draw shadow first
+            draw_window_shadow(&display_win, target, target_width, target_height, &display_clip)
+
+            // Draw decoration
+            draw_window_decoration(&display_win, target, target_width, target_height, &display_clip)
+
+            // Draw content
+            draw_window_content(&display_win, target, target_width, target_height, &display_clip, opacity)
+        }
+
+        i = i + 1
+    }
+
+    // Draw cursor (only on the display containing it)
+    let cursor_display: u32 = find_display_for_point(compositor.mouse_x, compositor.mouse_y)
+    if cursor_display == display_idx {
+        var cursor_clip: Rect
+        cursor_clip.x = compositor.mouse_x - display.x
+        cursor_clip.y = compositor.mouse_y - display.y
+        cursor_clip.width = 16
+        cursor_clip.height = 16
+
+        draw_cursor_at(target, target_width, target_height, cursor_clip.x, cursor_clip.y, &clip)
+    }
+}
+
+fn draw_desktop_display(clip: *Rect, target: *volatile u32, target_width: u32, target_height: u32, display_idx: u32) {
+    let display: *Display = &compositor.displays[display_idx]
+
+    // Draw wallpaper if set, otherwise solid color
+    if compositor.wallpaper_buffer != null and compositor.wallpaper_width > 0 {
+        // Draw wallpaper (scaled to each display)
+        var y: i32 = clip.y
+        while y < clip.y + clip.height as i32 {
+            if y >= 0 and y < target_height as i32 {
+                let src_y: u32 = (y as u32 * compositor.wallpaper_height) / target_height
+                var x: i32 = clip.x
+                while x < clip.x + clip.width as i32 {
+                    if x >= 0 and x < target_width as i32 {
+                        let src_x: u32 = (x as u32 * compositor.wallpaper_width) / target_width
+                        let src_idx: u32 = src_y * compositor.wallpaper_width + src_x
+                        target[y as u32 * target_width + x as u32] = compositor.wallpaper_buffer[src_idx]
+                    }
+                    x = x + 1
+                }
+            }
+            y = y + 1
+        }
+    } else {
+        // Solid color with gradient
+        var y: i32 = clip.y
+        while y < clip.y + clip.height as i32 {
+            if y >= 0 and y < target_height as i32 {
+                let gradient: u32 = (y as u32 * 20) / target_height
+                let desktop_r: u32 = ((compositor.desktop_color >> 16) & 0xFF) - gradient
+                let desktop_g: u32 = ((compositor.desktop_color >> 8) & 0xFF) - gradient
+                let desktop_b: u32 = (compositor.desktop_color & 0xFF) - gradient
+                let row_color: u32 = 0xFF000000 | (desktop_r << 16) | (desktop_g << 8) | desktop_b
+
+                var x: i32 = clip.x
+                while x < clip.x + clip.width as i32 {
+                    if x >= 0 and x < target_width as i32 {
+                        target[y as u32 * target_width + x as u32] = row_color
+                    }
+                    x = x + 1
+                }
+            }
+            y = y + 1
+        }
+    }
+}
+
+fn draw_cursor_at(target: *volatile u32, target_width: u32, target_height: u32, cursor_x: i32, cursor_y: i32, clip: *Rect) {
+    // Simple arrow cursor
+    let cursor_data: [u32; 16] = [
+        0b1000000000000000,
+        0b1100000000000000,
+        0b1110000000000000,
+        0b1111000000000000,
+        0b1111100000000000,
+        0b1111110000000000,
+        0b1111111000000000,
+        0b1111111100000000,
+        0b1111111110000000,
+        0b1111100000000000,
+        0b1101100000000000,
+        0b1000110000000000,
+        0b0000110000000000,
+        0b0000011000000000,
+        0b0000011000000000,
+        0b0000000000000000
+    ]
+
+    var cy: u32 = 0
+    while cy < 16 {
+        let row: u32 = cursor_data[cy]
+        let screen_y: i32 = cursor_y + cy as i32
+
+        if screen_y >= clip.y and screen_y < clip.y + clip.height as i32 and screen_y >= 0 and screen_y < target_height as i32 {
+            var cx: u32 = 0
+            while cx < 16 {
+                if (row & (0x8000 >> cx)) != 0 {
+                    let screen_x: i32 = cursor_x + cx as i32
+                    if screen_x >= clip.x and screen_x < clip.x + clip.width as i32 and screen_x >= 0 and screen_x < target_width as i32 {
+                        target[screen_y as u32 * target_width + screen_x as u32] = 0xFFFFFFFF
+                    }
+                }
+                cx = cx + 1
+            }
+        }
+        cy = cy + 1
+    }
+}
+
+fn present_display(display_idx: u32) {
+    let display: *Display = &compositor.displays[display_idx]
+
+    if display.framebuffer == null or display.backbuffer == null {
+        return
+    }
+
+    // Copy backbuffer to framebuffer
+    let size: u32 = display.width * display.height
+    var i: u32 = 0
+    while i < size {
+        display.framebuffer[i] = display.backbuffer[i]
+        i = i + 1
+    }
 }
 
 export fn compositor_force_redraw() {

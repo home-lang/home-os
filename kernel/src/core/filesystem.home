@@ -147,7 +147,7 @@ fn inode_free(ino: u32) {
         }
         j = j + 1
       }
-      
+
       // Mark as free
       inode_table[i].ino = 0
       inode_count = inode_count - 1
@@ -155,6 +155,286 @@ fn inode_free(ino: u32) {
     }
     i = i + 1
   }
+}
+
+// Find index in inode_table for a given inode number
+fn inode_find(ino: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_INODES {
+    if inode_table[i].ino == ino {
+      return i
+    }
+    i = i + 1
+  }
+  return MAX_INODES  // Not found
+}
+
+// Look up path and return inode number
+// Simple implementation: parse path components and traverse directory tree
+fn inode_lookup(path: u64): u32 {
+  var path_str: *u8 = @ptrFromInt(path)
+
+  // Empty path or null
+  if path_str == null { return 0 }
+  if path_str[0] == 0 { return 0 }
+
+  // Root path
+  if path_str[0] == '/' and path_str[1] == 0 {
+    return 1  // Root inode is always 1
+  }
+
+  // Start at root
+  var current_ino: u32 = 1
+  var pos: u32 = 0
+
+  // Skip leading slash
+  if path_str[0] == '/' {
+    pos = 1
+  }
+
+  // Parse each path component
+  var component: [u8; 256]
+  var comp_len: u32 = 0
+
+  while path_str[pos] != 0 {
+    // Extract component
+    comp_len = 0
+    while path_str[pos] != 0 and path_str[pos] != '/' and comp_len < 255 {
+      component[comp_len] = path_str[pos]
+      comp_len = comp_len + 1
+      pos = pos + 1
+    }
+    component[comp_len] = 0
+
+    // Skip trailing slash
+    if path_str[pos] == '/' {
+      pos = pos + 1
+    }
+
+    // Look up component in current directory
+    if comp_len > 0 {
+      var found_ino: u32 = dir_lookup(current_ino, &component, comp_len)
+      if found_ino == 0 {
+        return 0  // Component not found
+      }
+      current_ino = found_ino
+    }
+  }
+
+  return current_ino
+}
+
+// Look up a name in a directory inode
+fn dir_lookup(dir_ino: u32, name: *[u8; 256], name_len: u32): u32 {
+  var dir_idx: u32 = inode_find(dir_ino)
+  if dir_idx >= MAX_INODES { return 0 }
+
+  // Check if it's a directory
+  if inode_table[dir_idx].file_type != FILE_TYPE_DIRECTORY {
+    return 0
+  }
+
+  // Read directory data blocks and search for entry
+  // Each directory entry: 4 bytes ino + 4 bytes name_len + name
+  var block_idx: u32 = 0
+  while block_idx < 12 {
+    var block_addr: u64 = inode_table[dir_idx].data_blocks[block_idx]
+    if block_addr == 0 {
+      block_idx = block_idx + 1
+      continue
+    }
+
+    // Scan entries in this block
+    var offset: u32 = 0
+    while offset < BLOCK_SIZE {
+      var entry_ptr: *u8 = @ptrFromInt(block_addr + offset)
+
+      // Read entry ino
+      var entry_ino: u32 = @ptrCast(*u32, entry_ptr).*
+      if entry_ino == 0 {
+        offset = offset + 8  // Skip empty entry
+        continue
+      }
+
+      // Read entry name length
+      var entry_name_len: u32 = @ptrCast(*u32, entry_ptr + 4).*
+      if entry_name_len == 0 or entry_name_len > 255 {
+        offset = offset + 8 + entry_name_len
+        continue
+      }
+
+      // Compare names
+      if entry_name_len == name_len {
+        var matches: u32 = 1
+        var i: u32 = 0
+        while i < name_len {
+          if entry_ptr[8 + i] != name[i] {
+            matches = 0
+            break
+          }
+          i = i + 1
+        }
+        if matches == 1 {
+          return entry_ino
+        }
+      }
+
+      // Move to next entry (8 byte header + name, aligned to 4 bytes)
+      var entry_size: u32 = 8 + entry_name_len
+      entry_size = (entry_size + 3) & ~3  // Align to 4 bytes
+      offset = offset + entry_size
+    }
+
+    block_idx = block_idx + 1
+  }
+
+  return 0  // Not found
+}
+
+// Add entry to directory
+export fn dir_add_entry(dir_ino: u32, name: *[u8; 256], name_len: u32, entry_ino: u32): u32 {
+  var dir_idx: u32 = inode_find(dir_ino)
+  if dir_idx >= MAX_INODES { return 1 }
+
+  // Check if it's a directory
+  if inode_table[dir_idx].file_type != FILE_TYPE_DIRECTORY {
+    return 1
+  }
+
+  // Find space in directory for new entry
+  var entry_size: u32 = 8 + name_len
+  entry_size = (entry_size + 3) & ~3  // Align to 4 bytes
+
+  var block_idx: u32 = 0
+  while block_idx < 12 {
+    var block_addr: u64 = inode_table[dir_idx].data_blocks[block_idx]
+
+    // Allocate new block if needed
+    if block_addr == 0 {
+      block_addr = memory.pmm_alloc_page()
+      if block_addr == 0 { return 1 }
+      inode_table[dir_idx].data_blocks[block_idx] = block_addr
+      inode_table[dir_idx].blocks = inode_table[dir_idx].blocks + 1
+
+      // Clear the new block
+      var clear_ptr: *u8 = @ptrFromInt(block_addr)
+      var i: u32 = 0
+      while i < BLOCK_SIZE {
+        clear_ptr[i] = 0
+        i = i + 1
+      }
+    }
+
+    // Find free space in this block
+    var offset: u32 = 0
+    while offset + entry_size <= BLOCK_SIZE {
+      var entry_ptr: *u8 = @ptrFromInt(block_addr + offset)
+      var existing_ino: u32 = @ptrCast(*u32, entry_ptr).*
+
+      if existing_ino == 0 {
+        // Found free slot, write entry
+        @ptrCast(*u32, entry_ptr).* = entry_ino
+        @ptrCast(*u32, entry_ptr + 4).* = name_len
+
+        var i: u32 = 0
+        while i < name_len {
+          entry_ptr[8 + i] = name[i]
+          i = i + 1
+        }
+
+        // Update directory size
+        var new_end: u64 = @as(u64, block_idx) * BLOCK_SIZE + offset + entry_size
+        if new_end > inode_table[dir_idx].size {
+          inode_table[dir_idx].size = new_end
+        }
+
+        return 0  // Success
+      }
+
+      // Skip to next entry
+      var existing_name_len: u32 = @ptrCast(*u32, entry_ptr + 4).*
+      var skip_size: u32 = 8 + existing_name_len
+      skip_size = (skip_size + 3) & ~3
+      offset = offset + skip_size
+    }
+
+    block_idx = block_idx + 1
+  }
+
+  return 1  // No space
+}
+
+// Remove entry from directory
+export fn dir_remove_entry(dir_ino: u32, name: *[u8; 256], name_len: u32): u32 {
+  var dir_idx: u32 = inode_find(dir_ino)
+  if dir_idx >= MAX_INODES { return 1 }
+
+  // Search and remove
+  var block_idx: u32 = 0
+  while block_idx < 12 {
+    var block_addr: u64 = inode_table[dir_idx].data_blocks[block_idx]
+    if block_addr == 0 {
+      block_idx = block_idx + 1
+      continue
+    }
+
+    var offset: u32 = 0
+    while offset < BLOCK_SIZE {
+      var entry_ptr: *u8 = @ptrFromInt(block_addr + offset)
+      var entry_ino: u32 = @ptrCast(*u32, entry_ptr).*
+
+      if entry_ino == 0 {
+        offset = offset + 8
+        continue
+      }
+
+      var entry_name_len: u32 = @ptrCast(*u32, entry_ptr + 4).*
+
+      if entry_name_len == name_len {
+        var matches: u32 = 1
+        var i: u32 = 0
+        while i < name_len {
+          if entry_ptr[8 + i] != name[i] {
+            matches = 0
+            break
+          }
+          i = i + 1
+        }
+        if matches == 1 {
+          // Found it - mark as deleted
+          @ptrCast(*u32, entry_ptr).* = 0
+          return 0
+        }
+      }
+
+      var entry_size: u32 = 8 + entry_name_len
+      entry_size = (entry_size + 3) & ~3
+      offset = offset + entry_size
+    }
+
+    block_idx = block_idx + 1
+  }
+
+  return 1  // Not found
+}
+
+// Export inode table access for hash table integration
+export fn get_inode_table_ptr(): u64 {
+  return @intFromPtr(&inode_table)
+}
+
+export fn get_inode_at_index(idx: u32): u64 {
+  if idx >= MAX_INODES { return 0 }
+  if inode_table[idx].ino == 0 { return 0 }
+  return @intFromPtr(&inode_table[idx])
+}
+
+export fn get_inode_count(): u32 {
+  return inode_count
+}
+
+export fn get_max_inodes(): u32 {
+  return MAX_INODES
 }
 
 // ============================================================================
@@ -760,6 +1040,141 @@ export fn vfs_get_tree_size(path: u64): u64 {
   }
 
   return total
+}
+
+// ============================================================================
+// POSITIONED READ/WRITE (pread/pwrite)
+// ============================================================================
+
+export fn vfs_pread(fd: u32, buffer: u64, count: u64, offset: u64): u64 {
+  if fd < 3 { return 0 }
+
+  var idx: u32 = fd - 3
+  if idx >= MAX_OPEN_FILES { return 0 }
+
+  if open_files[idx].ref_count == 0 { return 0 }
+
+  var ino: u32 = open_files[idx].ino
+  var inode_ptr: u64 = inode_get(ino)
+  if inode_ptr == 0 { return 0 }
+
+  var inode: Inode = @intToPtr(inode_ptr, Inode)
+
+  // Check read permission
+  if perms.can_read(&inode, current_uid, current_gid) == 0 {
+    return 0
+  }
+
+  // Calculate how much we can read
+  var available: u64 = 0
+  if offset < inode.size {
+    available = inode.size - offset
+  }
+  var to_read: u64 = count
+  if to_read > available { to_read = available }
+
+  // Read from data blocks
+  var bytes_read: u64 = 0
+  var block_idx: u32 = @truncate(offset / BLOCK_SIZE, u32)
+  var block_offset: u32 = @truncate(offset % BLOCK_SIZE, u32)
+
+  while bytes_read < to_read and block_idx < 12 {
+    var block_addr: u64 = inode.data_blocks[block_idx]
+    if block_addr == 0 { break }
+
+    var bytes_in_block: u64 = BLOCK_SIZE - block_offset
+    if bytes_in_block > (to_read - bytes_read) {
+      bytes_in_block = to_read - bytes_read
+    }
+
+    // Copy data
+    var src: u64 = block_addr + block_offset
+    var dst: u64 = buffer + bytes_read
+    var i: u64 = 0
+    while i < bytes_in_block {
+      @ptrToInt(dst + i, u8) = @intToPtr(src + i, u8)
+      i = i + 1
+    }
+
+    bytes_read = bytes_read + bytes_in_block
+    block_idx = block_idx + 1
+    block_offset = 0
+  }
+
+  return bytes_read
+}
+
+export fn vfs_pwrite(fd: u32, buffer: u64, count: u64, offset: u64): u64 {
+  if fd < 3 { return 0 }
+
+  var idx: u32 = fd - 3
+  if idx >= MAX_OPEN_FILES { return 0 }
+
+  if open_files[idx].ref_count == 0 { return 0 }
+
+  var ino: u32 = open_files[idx].ino
+  var inode_ptr: u64 = inode_get(ino)
+  if inode_ptr == 0 { return 0 }
+
+  var inode: Inode = @intToPtr(inode_ptr, Inode)
+
+  // Check write permission
+  if perms.can_write(&inode, current_uid, current_gid) == 0 {
+    return 0
+  }
+
+  var bytes_written: u64 = 0
+  var block_idx: u32 = @truncate(offset / BLOCK_SIZE, u32)
+  var block_offset: u32 = @truncate(offset % BLOCK_SIZE, u32)
+
+  while bytes_written < count and block_idx < 12 {
+    // Allocate block if needed
+    if inode.data_blocks[block_idx] == 0 {
+      var new_block: u64 = memory.pmm_alloc_page()
+      if new_block == 0 { break }
+      inode.data_blocks[block_idx] = new_block
+      inode.blocks = inode.blocks + 1
+    }
+
+    var block_addr: u64 = inode.data_blocks[block_idx]
+    var bytes_in_block: u64 = BLOCK_SIZE - block_offset
+    if bytes_in_block > (count - bytes_written) {
+      bytes_in_block = count - bytes_written
+    }
+
+    // Copy data
+    var src: u64 = buffer + bytes_written
+    var dst: u64 = block_addr + block_offset
+    var i: u64 = 0
+    while i < bytes_in_block {
+      @ptrToInt(dst + i, u8) = @intToPtr(src + i, u8)
+      i = i + 1
+    }
+
+    bytes_written = bytes_written + bytes_in_block
+    block_idx = block_idx + 1
+    block_offset = 0
+  }
+
+  // Update inode size if needed
+  var new_end: u64 = offset + bytes_written
+  if new_end > inode.size {
+    inode.size = new_end
+  }
+
+  return bytes_written
+}
+
+// Get inode number from file descriptor
+export fn vfs_get_inode(fd: u32): u32 {
+  if fd < 3 { return 0 }
+
+  var idx: u32 = fd - 3
+  if idx >= MAX_OPEN_FILES { return 0 }
+
+  if open_files[idx].ref_count == 0 { return 0 }
+
+  return open_files[idx].ino
 }
 
 // ============================================================================

@@ -1,9 +1,10 @@
 // Virtual Memory Manager for home-os
-// 4-level page table implementation for x86-64
+// Full 4-level page table implementation for x86-64
 // Based on Home's kernel package: ~/Code/home/packages/kernel/src/paging.zig
 
 import cpu from "./os/cpu.home"
 import serial from "./serial.home"
+import pmm from "./pmm.home"
 
 // Constants
 let PAGE_SIZE: usize = 4096
@@ -58,11 +59,130 @@ packed struct VirtualAddress: u64 {
 // Kernel address space starts at higher half
 let KERNEL_BASE: u64 = 0xFFFFFFFF80000000
 
-// Page tables (will be allocated properly later)
+// Root PML4 table (kernel's page table root)
 let pml4: PageTable align(4096) = undefined
-let pdpt: PageTable align(4096) = undefined
-let pd: PageTable align(4096) = undefined
-let pt: PageTable align(4096) = undefined
+
+// Page table pool for dynamic allocation
+const MAX_PAGE_TABLES: usize = 1024
+var page_table_pool: [MAX_PAGE_TABLES]PageTable align(4096) = undefined
+var page_table_bitmap: [MAX_PAGE_TABLES / 8]u8 = undefined
+var page_tables_used: usize = 0
+
+// Statistics
+struct VMMStats {
+    pages_mapped: u64,
+    pages_unmapped: u64,
+    page_tables_allocated: u64,
+    page_faults: u64,
+    tlb_flushes: u64,
+}
+var vmm_stats: VMMStats = undefined
+
+// ============================================================================
+// EMPTY PAGE FLAGS (reusable)
+// ============================================================================
+
+fn emptyPageFlags(): PageFlags {
+    return PageFlags {
+        present: false,
+        writable: false,
+        user: false,
+        write_through: false,
+        cache_disable: false,
+        accessed: false,
+        dirty: false,
+        huge: false,
+        global: false,
+        available1: 0,
+        address: 0,
+        available2: 0,
+        no_execute: false,
+    }
+}
+
+// ============================================================================
+// PAGE TABLE POOL MANAGEMENT
+// ============================================================================
+
+fn allocPageTable(): *PageTable {
+    // Find free page table in pool
+    let i: usize = 0
+    loop {
+        if i >= MAX_PAGE_TABLES {
+            break
+        }
+
+        let byte_idx = i / 8
+        let bit_idx = i % 8
+        let mask: u8 = 1 << bit_idx
+
+        if (page_table_bitmap[byte_idx] & mask) == 0 {
+            // Found free page table
+            page_table_bitmap[byte_idx] = page_table_bitmap[byte_idx] | mask
+            page_tables_used = page_tables_used + 1
+            vmm_stats.page_tables_allocated = vmm_stats.page_tables_allocated + 1
+
+            // Zero out the page table
+            let pt = &page_table_pool[i]
+            let j: usize = 0
+            loop {
+                if j >= 512 {
+                    break
+                }
+                pt.entries[j].flags = emptyPageFlags()
+                j = j + 1
+            }
+
+            return pt
+        }
+
+        i = i + 1
+    }
+
+    // No free page tables - try to allocate from PMM
+    let phys_addr = pmm.alloc_page()
+    if phys_addr == 0 {
+        serial.writeString("VMM: FATAL - Out of page tables!\n")
+        return null
+    }
+
+    // Zero the new page table
+    let pt: *PageTable = @ptrFromInt(phys_addr)
+    let j: usize = 0
+    loop {
+        if j >= 512 {
+            break
+        }
+        pt.entries[j].flags = emptyPageFlags()
+        j = j + 1
+    }
+
+    vmm_stats.page_tables_allocated = vmm_stats.page_tables_allocated + 1
+    return pt
+}
+
+fn freePageTable(pt: *PageTable) {
+    let addr = @intFromPtr(pt)
+    let pool_start = @intFromPtr(&page_table_pool[0])
+    let pool_end = pool_start + (MAX_PAGE_TABLES * 4096)
+
+    if addr >= pool_start and addr < pool_end {
+        // In pool - mark as free
+        let idx = (addr - pool_start) / 4096
+        let byte_idx = idx / 8
+        let bit_idx = idx % 8
+        let mask: u8 = 1 << bit_idx
+        page_table_bitmap[byte_idx] = page_table_bitmap[byte_idx] & (~mask)
+        page_tables_used = page_tables_used - 1
+    } else {
+        // Allocated from PMM - free it
+        pmm.free_page(addr)
+    }
+}
+
+// ============================================================================
+// PAGE ENTRY HELPERS
+// ============================================================================
 
 // Create a page table entry
 fn createPageEntry(phys_addr: u64, writable: bool, user: bool, no_exec: bool): PageFlags {
@@ -107,91 +227,177 @@ fn getPhysicalAddress(flags: PageFlags): u64 {
     return @as(u64, flags.address) << 12
 }
 
+// ============================================================================
+// 4-LEVEL PAGE TABLE WALKING
+// ============================================================================
+
+// Get or create PDPT for a given PML4 index
+fn getOrCreatePDPT(pml4_idx: u9, user: bool): *PageTable {
+    if pml4.entries[pml4_idx].flags.present {
+        return @ptrFromInt(getPhysicalAddress(pml4.entries[pml4_idx].flags))
+    }
+
+    // Allocate new PDPT
+    let pdpt = allocPageTable()
+    if pdpt == null {
+        return null
+    }
+
+    let pdpt_addr = @intFromPtr(pdpt)
+    pml4.entries[pml4_idx].flags = createPageEntry(pdpt_addr, true, user, false)
+
+    return pdpt
+}
+
+// Get or create PD for a given PDPT index
+fn getOrCreatePD(pdpt: *PageTable, pdpt_idx: u9, user: bool): *PageTable {
+    if pdpt.entries[pdpt_idx].flags.present {
+        if pdpt.entries[pdpt_idx].flags.huge {
+            // This is a 1GB huge page, can't get PD
+            return null
+        }
+        return @ptrFromInt(getPhysicalAddress(pdpt.entries[pdpt_idx].flags))
+    }
+
+    // Allocate new PD
+    let pd = allocPageTable()
+    if pd == null {
+        return null
+    }
+
+    let pd_addr = @intFromPtr(pd)
+    pdpt.entries[pdpt_idx].flags = createPageEntry(pd_addr, true, user, false)
+
+    return pd
+}
+
+// Get or create PT for a given PD index
+fn getOrCreatePT(pd: *PageTable, pd_idx: u9, user: bool): *PageTable {
+    if pd.entries[pd_idx].flags.present {
+        if pd.entries[pd_idx].flags.huge {
+            // This is a 2MB huge page, can't get PT
+            return null
+        }
+        return @ptrFromInt(getPhysicalAddress(pd.entries[pd_idx].flags))
+    }
+
+    // Allocate new PT
+    let pt = allocPageTable()
+    if pt == null {
+        return null
+    }
+
+    let pt_addr = @intFromPtr(pt)
+    pd.entries[pd_idx].flags = createPageEntry(pt_addr, true, user, false)
+
+    return pt
+}
+
+// Walk page tables and return the PTE for a virtual address
+fn walkPageTables(virt_addr: u64, create: bool, user: bool): *PageTableEntry {
+    let vaddr: VirtualAddress = @bitCast(virt_addr)
+
+    // Level 4: PML4
+    let pdpt = if create {
+        getOrCreatePDPT(vaddr.pml4_index, user)
+    } else {
+        if pml4.entries[vaddr.pml4_index].flags.present {
+            @ptrFromInt(getPhysicalAddress(pml4.entries[vaddr.pml4_index].flags))
+        } else {
+            null
+        }
+    }
+
+    if pdpt == null {
+        return null
+    }
+
+    // Level 3: PDPT
+    if pdpt.entries[vaddr.pdpt_index].flags.present and pdpt.entries[vaddr.pdpt_index].flags.huge {
+        // 1GB huge page - return PDPT entry
+        return &pdpt.entries[vaddr.pdpt_index]
+    }
+
+    let pd = if create {
+        getOrCreatePD(pdpt, vaddr.pdpt_index, user)
+    } else {
+        if pdpt.entries[vaddr.pdpt_index].flags.present {
+            @ptrFromInt(getPhysicalAddress(pdpt.entries[vaddr.pdpt_index].flags))
+        } else {
+            null
+        }
+    }
+
+    if pd == null {
+        return null
+    }
+
+    // Level 2: PD
+    if pd.entries[vaddr.pd_index].flags.present and pd.entries[vaddr.pd_index].flags.huge {
+        // 2MB huge page - return PD entry
+        return &pd.entries[vaddr.pd_index]
+    }
+
+    let pt = if create {
+        getOrCreatePT(pd, vaddr.pd_index, user)
+    } else {
+        if pd.entries[vaddr.pd_index].flags.present {
+            @ptrFromInt(getPhysicalAddress(pd.entries[vaddr.pd_index].flags))
+        } else {
+            null
+        }
+    }
+
+    if pt == null {
+        return null
+    }
+
+    // Level 1: PT
+    return &pt.entries[vaddr.pt_index]
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
 // Initialize virtual memory manager
 export fn init() {
     serial.writeString("Initializing Virtual Memory Manager...\n")
 
-    // Zero out all page tables
-    let i = 0
+    // Initialize statistics
+    vmm_stats.pages_mapped = 0
+    vmm_stats.pages_unmapped = 0
+    vmm_stats.page_tables_allocated = 0
+    vmm_stats.page_faults = 0
+    vmm_stats.tlb_flushes = 0
+
+    // Initialize page table pool bitmap
+    let i: usize = 0
+    loop {
+        if i >= MAX_PAGE_TABLES / 8 {
+            break
+        }
+        page_table_bitmap[i] = 0
+        i = i + 1
+    }
+    page_tables_used = 0
+
+    // Zero out PML4
+    i = 0
     loop {
         if i >= 512 {
             break
         }
-        pml4.entries[i] = PageTableEntry {
-            flags: PageFlags {
-                present: false,
-                writable: false,
-                user: false,
-                write_through: false,
-                cache_disable: false,
-                accessed: false,
-                dirty: false,
-                huge: false,
-                global: false,
-                available1: 0,
-                address: 0,
-                available2: 0,
-                no_execute: false,
-            }
-        }
-        pdpt.entries[i] = PageTableEntry {
-            flags: PageFlags {
-                present: false,
-                writable: false,
-                user: false,
-                write_through: false,
-                cache_disable: false,
-                accessed: false,
-                dirty: false,
-                huge: false,
-                global: false,
-                available1: 0,
-                address: 0,
-                available2: 0,
-                no_execute: false,
-            }
-        }
-        pd.entries[i] = PageTableEntry {
-            flags: PageFlags {
-                present: false,
-                writable: false,
-                user: false,
-                write_through: false,
-                cache_disable: false,
-                accessed: false,
-                dirty: false,
-                huge: false,
-                global: false,
-                available1: 0,
-                address: 0,
-                available2: 0,
-                no_execute: false,
-            }
-        }
-        pt.entries[i] = PageTableEntry {
-            flags: PageFlags {
-                present: false,
-                writable: false,
-                user: false,
-                write_through: false,
-                cache_disable: false,
-                accessed: false,
-                dirty: false,
-                huge: false,
-                global: false,
-                available1: 0,
-                address: 0,
-                available2: 0,
-                no_execute: false,
-            }
-        }
+        pml4.entries[i].flags = emptyPageFlags()
         i = i + 1
     }
 
     serial.writeString("VMM: Page tables zeroed\n")
 
-    // Set up identity mapping for first 4MB (for kernel)
-    // This maps virtual 0x0 - 0x400000 to physical 0x0 - 0x400000
+    // Detect huge page support
+    detectHugePageSupport()
+
+    // Set up identity mapping for first 16MB (for kernel)
     mapKernelSpace()
 
     serial.writeString("VMM: Kernel space mapped\n")
@@ -205,120 +411,235 @@ export fn init() {
     cpu.write_cr3(pml4_addr)
 
     serial.writeString("VMM initialized successfully!\n")
+    printStats()
 }
 
-// Map kernel space (identity mapping for first 4MB)
+// Map kernel space (identity mapping for first 16MB)
 fn mapKernelSpace() {
-    // Link PML4[0] -> PDPT
-    let pdpt_addr = @intFromPtr(&pdpt)
-    pml4.entries[0].flags = createPageEntry(pdpt_addr, true, false, false)
+    // Map first 16MB with identity mapping
+    // Use 2MB huge pages if supported for efficiency
 
-    // Link PDPT[0] -> PD
-    let pd_addr = @intFromPtr(&pd)
-    pdpt.entries[0].flags = createPageEntry(pd_addr, true, false, false)
+    if huge_pages_2m_supported {
+        // Use 2MB huge pages (8 pages for 16MB)
+        let i: u64 = 0
+        loop {
+            if i >= 8 {
+                break
+            }
+            let addr = i * PAGE_SIZE_2M
+            mapHugePage2M(addr, addr, true, false)
+            i = i + 1
+        }
+        serial.writeString("VMM: Mapped 16MB using 2MB huge pages\n")
+    } else {
+        // Use 4KB pages (4096 pages for 16MB)
+        let i: u64 = 0
+        loop {
+            if i >= 4096 {
+                break
+            }
+            let addr = i * PAGE_SIZE
+            mapPage(addr, addr, true, false)
+            i = i + 1
+        }
+        serial.writeString("VMM: Mapped 16MB using 4KB pages\n")
+    }
+}
 
-    // Link PD[0] -> PT
-    let pt_addr = @intFromPtr(&pt)
-    pd.entries[0].flags = createPageEntry(pt_addr, true, false, false)
+// ============================================================================
+// PAGE MAPPING (Full 4-level implementation)
+// ============================================================================
 
-    // Map first 2MB (512 pages * 4KB = 2MB) with identity mapping
-    let i = 0
+// Map a virtual address to a physical address
+export fn mapPage(virt_addr: u64, phys_addr: u64, writable: bool, user: bool): bool {
+    // Walk page tables, creating intermediate tables as needed
+    let pte = walkPageTables(virt_addr, true, user)
+
+    if pte == null {
+        serial.writeString("VMM: Failed to map page - could not walk page tables\n")
+        return false
+    }
+
+    // Check if already mapped
+    if pte.flags.present {
+        serial.writeString("VMM: Warning - remapping existing page at ")
+        serial.writeHex(virt_addr)
+        serial.writeString("\n")
+    }
+
+    // Set up the page table entry
+    pte.flags = createPageEntry(phys_addr, writable, user, false)
+
+    // Invalidate TLB for this address
+    cpu.invlpg(virt_addr)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+    vmm_stats.pages_mapped = vmm_stats.pages_mapped + 1
+
+    return true
+}
+
+// Map a page with no-execute flag
+export fn mapPageNX(virt_addr: u64, phys_addr: u64, writable: bool, user: bool): bool {
+    let pte = walkPageTables(virt_addr, true, user)
+
+    if pte == null {
+        return false
+    }
+
+    pte.flags = createPageEntry(phys_addr, writable, user, true)
+
+    cpu.invlpg(virt_addr)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+    vmm_stats.pages_mapped = vmm_stats.pages_mapped + 1
+
+    return true
+}
+
+// Unmap a virtual address
+export fn unmapPage(virt_addr: u64): bool {
+    let pte = walkPageTables(virt_addr, false, false)
+
+    if pte == null or !pte.flags.present {
+        return false  // Not mapped
+    }
+
+    // Clear the page table entry
+    pte.flags = emptyPageFlags()
+
+    // Invalidate TLB for this address
+    cpu.invlpg(virt_addr)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+    vmm_stats.pages_unmapped = vmm_stats.pages_unmapped + 1
+
+    return true
+}
+
+// Get physical address for a virtual address (full 4-level walk)
+export fn getPhysicalAddr(virt_addr: u64): u64 {
+    let vaddr: VirtualAddress = @bitCast(virt_addr)
+    let pte = walkPageTables(virt_addr, false, false)
+
+    if pte == null or !pte.flags.present {
+        return 0  // Page not present
+    }
+
+    let phys_base = getPhysicalAddress(pte.flags)
+
+    // Determine page size to calculate offset
+    if pte.flags.huge {
+        // Could be 1GB or 2MB huge page
+        // Check which level we're at based on address alignment
+        if (phys_base & (PAGE_SIZE_1G - 1)) == 0 {
+            // 1GB page
+            return phys_base | (virt_addr & (PAGE_SIZE_1G - 1))
+        } else {
+            // 2MB page
+            return phys_base | (virt_addr & (PAGE_SIZE_2M - 1))
+        }
+    }
+
+    // 4KB page
+    return phys_base | @as(u64, vaddr.offset)
+}
+
+// Check if a virtual address is mapped
+export fn isMapped(virt_addr: u64): bool {
+    let pte = walkPageTables(virt_addr, false, false)
+    return pte != null and pte.flags.present
+}
+
+// Get page flags for a virtual address
+export fn getPageFlags(virt_addr: u64): PageFlags {
+    let pte = walkPageTables(virt_addr, false, false)
+    if pte == null {
+        return emptyPageFlags()
+    }
+    return pte.flags
+}
+
+// Modify page flags
+export fn setPageFlags(virt_addr: u64, writable: bool, user: bool, no_exec: bool): bool {
+    let pte = walkPageTables(virt_addr, false, false)
+
+    if pte == null or !pte.flags.present {
+        return false
+    }
+
+    let phys_addr = getPhysicalAddress(pte.flags)
+    pte.flags = PageFlags {
+        present: true,
+        writable: writable,
+        user: user,
+        write_through: pte.flags.write_through,
+        cache_disable: pte.flags.cache_disable,
+        accessed: pte.flags.accessed,
+        dirty: pte.flags.dirty,
+        huge: pte.flags.huge,
+        global: pte.flags.global,
+        available1: pte.flags.available1,
+        address: @truncate(phys_addr >> 12),
+        available2: pte.flags.available2,
+        no_execute: no_exec,
+    }
+
+    cpu.invlpg(virt_addr)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+
+    return true
+}
+
+// ============================================================================
+// RANGE MAPPING
+// ============================================================================
+
+// Map a contiguous range of pages
+export fn mapRange(virt_start: u64, phys_start: u64, num_pages: u64, writable: bool, user: bool): bool {
+    let i: u64 = 0
     loop {
-        if i >= 512 {
+        if i >= num_pages {
             break
         }
-        let phys_addr = i * PAGE_SIZE
-        pt.entries[i].flags = createPageEntry(phys_addr, true, false, false)
+
+        let virt = virt_start + (i * PAGE_SIZE)
+        let phys = phys_start + (i * PAGE_SIZE)
+
+        if !mapPage(virt, phys, writable, user) {
+            // Rollback on failure
+            let j: u64 = 0
+            loop {
+                if j >= i {
+                    break
+                }
+                unmapPage(virt_start + (j * PAGE_SIZE))
+                j = j + 1
+            }
+            return false
+        }
+
+        i = i + 1
+    }
+
+    return true
+}
+
+// Unmap a contiguous range of pages
+export fn unmapRange(virt_start: u64, num_pages: u64) {
+    let i: u64 = 0
+    loop {
+        if i >= num_pages {
+            break
+        }
+        unmapPage(virt_start + (i * PAGE_SIZE))
         i = i + 1
     }
 }
 
-// Map a virtual address to a physical address
-export fn mapPage(virt_addr: u64, phys_addr: u64, writable: bool, user: bool) {
-    // Decompose virtual address
-    let vaddr: VirtualAddress = @bitCast(virt_addr)
-
-    // For now, we only support mapping in the first PML4 entry
-    // TODO: Implement full 4-level page table walking and allocation
-
-    serial.writeString("VMM: Mapping virtual ")
-    serial.writeHex(virt_addr)
-    serial.writeString(" to physical ")
-    serial.writeHex(phys_addr)
-    serial.writeString("\n")
-
-    // Create page entry
-    let entry = createPageEntry(phys_addr, writable, user, false)
-
-    // Set the page table entry
-    // This is simplified - in a real implementation, we'd walk the page tables
-    let pt_index = vaddr.pt_index
-    pt.entries[pt_index].flags = entry
-
-    // Invalidate TLB for this address
-    cpu.invlpg(virt_addr)
-}
-
-// Unmap a virtual address
-export fn unmapPage(virt_addr: u64) {
-    let vaddr: VirtualAddress = @bitCast(virt_addr)
-    let pt_index = vaddr.pt_index
-
-    // Clear the page table entry
-    pt.entries[pt_index].flags = PageFlags {
-        present: false,
-        writable: false,
-        user: false,
-        write_through: false,
-        cache_disable: false,
-        accessed: false,
-        dirty: false,
-        huge: false,
-        global: false,
-        available1: 0,
-        address: 0,
-        available2: 0,
-        no_execute: false,
-    }
-
-    // Invalidate TLB for this address
-    cpu.invlpg(virt_addr)
-}
-
-// Get physical address for a virtual address
-export fn getPhysicalAddr(virt_addr: u64): u64 {
-    let vaddr: VirtualAddress = @bitCast(virt_addr)
-    let pt_index = vaddr.pt_index
-
-    let entry = pt.entries[pt_index].flags
-    if !entry.present {
-        return 0  // Page not present
-    }
-
-    let phys_base = getPhysicalAddress(entry)
-    return phys_base + vaddr.offset
-}
-
-// Align address down to page boundary
-export fn alignDown(addr: u64): u64 {
-    return addr & ~(PAGE_SIZE - 1)
-}
-
-// Align address up to page boundary
-export fn alignUp(addr: u64): u64 {
-    return (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
-}
-
 // ============================================================================
-// Huge Page Support (2MB and 1GB)
+// HUGE PAGE SUPPORT (2MB and 1GB)
 // ============================================================================
 
 // Detect huge page support via CPUID
 export fn detectHugePageSupport() {
-    // CPUID leaf 0x01: EDX bit 3 = PSE (Page Size Extension, 2MB pages)
-    // CPUID leaf 0x80000001: EDX bit 26 = PDPE1GB (1GB pages)
-
-    // Check PSE for 2MB pages
     let eax: u32 = undefined
     let ebx: u32 = undefined
     let ecx: u32 = undefined
@@ -327,7 +648,6 @@ export fn detectHugePageSupport() {
     cpu.cpuid(0x01, &eax, &ebx, &ecx, &edx)
     huge_pages_2m_supported = (edx & (1 << 3)) != 0  // PSE bit
 
-    // Check extended features for 1GB pages
     cpu.cpuid(0x80000001, &eax, &ebx, &ecx, &edx)
     huge_pages_1g_supported = (edx & (1 << 26)) != 0  // PDPE1GB bit
 
@@ -337,8 +657,7 @@ export fn detectHugePageSupport() {
     serial.writeString(if huge_pages_1g_supported { "supported\n" } else { "not supported\n" })
 }
 
-// Map a 2MB huge page (virtual must be 2MB aligned, physical must be 2MB aligned)
-// Uses PD entry with PS bit set, skipping the PT level
+// Map a 2MB huge page
 export fn mapHugePage2M(virt_addr: u64, phys_addr: u64, writable: bool, user: bool): bool {
     if !huge_pages_2m_supported {
         serial.writeString("VMM: 2MB huge pages not supported\n")
@@ -346,49 +665,36 @@ export fn mapHugePage2M(virt_addr: u64, phys_addr: u64, writable: bool, user: bo
     }
 
     // Verify alignment
-    if (virt_addr & (PAGE_SIZE_2M - 1)) != 0 {
-        serial.writeString("VMM: Virtual address not 2MB aligned\n")
-        return false
-    }
-    if (phys_addr & (PAGE_SIZE_2M - 1)) != 0 {
-        serial.writeString("VMM: Physical address not 2MB aligned\n")
+    if (virt_addr & (PAGE_SIZE_2M - 1)) != 0 or (phys_addr & (PAGE_SIZE_2M - 1)) != 0 {
+        serial.writeString("VMM: Address not 2MB aligned\n")
         return false
     }
 
     let vaddr: VirtualAddress = @bitCast(virt_addr)
 
-    serial.writeString("VMM: Mapping 2MB huge page: virt=")
-    serial.writeHex(virt_addr)
-    serial.writeString(" -> phys=")
-    serial.writeHex(phys_addr)
-    serial.writeString("\n")
-
-    // For 2MB huge page: PD entry points directly to physical page with PS bit set
-    // PT level is skipped (vaddr.pt_index becomes part of page offset)
-    let pd_index = vaddr.pd_index
-
-    // Ensure PML4 and PDPT are set up
-    if !pml4.entries[vaddr.pml4_index].flags.present {
-        let pdpt_addr = @intFromPtr(&pdpt)
-        pml4.entries[vaddr.pml4_index].flags = createPageEntry(pdpt_addr, true, user, false)
+    // Get or create PDPT
+    let pdpt = getOrCreatePDPT(vaddr.pml4_index, user)
+    if pdpt == null {
+        return false
     }
 
-    if !pdpt.entries[vaddr.pdpt_index].flags.present {
-        let pd_addr = @intFromPtr(&pd)
-        pdpt.entries[vaddr.pdpt_index].flags = createPageEntry(pd_addr, true, user, false)
+    // Get or create PD
+    let pd = getOrCreatePD(pdpt, vaddr.pdpt_index, user)
+    if pd == null {
+        return false
     }
 
     // Set PD entry as huge page (PS bit = 1)
-    pd.entries[pd_index].flags = createHugePageEntry(phys_addr, writable, user, false)
+    pd.entries[vaddr.pd_index].flags = createHugePageEntry(phys_addr, writable, user, false)
 
-    // Invalidate TLB for entire 2MB range
     cpu.invlpg(virt_addr)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+    vmm_stats.pages_mapped = vmm_stats.pages_mapped + 512  // 2MB = 512 * 4KB
 
     return true
 }
 
-// Map a 1GB huge page (virtual must be 1GB aligned, physical must be 1GB aligned)
-// Uses PDPT entry with PS bit set, skipping PD and PT levels
+// Map a 1GB huge page
 export fn mapHugePage1G(virt_addr: u64, phys_addr: u64, writable: bool, user: bool): bool {
     if !huge_pages_1g_supported {
         serial.writeString("VMM: 1GB huge pages not supported\n")
@@ -396,113 +702,250 @@ export fn mapHugePage1G(virt_addr: u64, phys_addr: u64, writable: bool, user: bo
     }
 
     // Verify alignment
-    if (virt_addr & (PAGE_SIZE_1G - 1)) != 0 {
-        serial.writeString("VMM: Virtual address not 1GB aligned\n")
-        return false
-    }
-    if (phys_addr & (PAGE_SIZE_1G - 1)) != 0 {
-        serial.writeString("VMM: Physical address not 1GB aligned\n")
+    if (virt_addr & (PAGE_SIZE_1G - 1)) != 0 or (phys_addr & (PAGE_SIZE_1G - 1)) != 0 {
+        serial.writeString("VMM: Address not 1GB aligned\n")
         return false
     }
 
     let vaddr: VirtualAddress = @bitCast(virt_addr)
 
-    serial.writeString("VMM: Mapping 1GB huge page: virt=")
-    serial.writeHex(virt_addr)
-    serial.writeString(" -> phys=")
-    serial.writeHex(phys_addr)
-    serial.writeString("\n")
-
-    // For 1GB huge page: PDPT entry points directly to physical page with PS bit set
-    // PD and PT levels are skipped
-    let pdpt_index = vaddr.pdpt_index
-
-    // Ensure PML4 is set up
-    if !pml4.entries[vaddr.pml4_index].flags.present {
-        let pdpt_addr = @intFromPtr(&pdpt)
-        pml4.entries[vaddr.pml4_index].flags = createPageEntry(pdpt_addr, true, user, false)
+    // Get or create PDPT
+    let pdpt = getOrCreatePDPT(vaddr.pml4_index, user)
+    if pdpt == null {
+        return false
     }
 
     // Set PDPT entry as 1GB huge page (PS bit = 1)
-    pdpt.entries[pdpt_index].flags = createHugePageEntry(phys_addr, writable, user, false)
+    pdpt.entries[vaddr.pdpt_index].flags = createHugePageEntry(phys_addr, writable, user, false)
 
-    // Invalidate TLB
     cpu.invlpg(virt_addr)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+    vmm_stats.pages_mapped = vmm_stats.pages_mapped + 262144  // 1GB = 262144 * 4KB
 
     return true
 }
 
 // Unmap a 2MB huge page
-export fn unmapHugePage2M(virt_addr: u64) {
+export fn unmapHugePage2M(virt_addr: u64): bool {
     let vaddr: VirtualAddress = @bitCast(virt_addr)
-    let pd_index = vaddr.pd_index
 
-    pd.entries[pd_index].flags = PageFlags {
-        present: false,
-        writable: false,
-        user: false,
-        write_through: false,
-        cache_disable: false,
-        accessed: false,
-        dirty: false,
-        huge: false,
-        global: false,
-        available1: 0,
-        address: 0,
-        available2: 0,
-        no_execute: false,
+    // Walk to PD level
+    if !pml4.entries[vaddr.pml4_index].flags.present {
+        return false
     }
 
+    let pdpt: *PageTable = @ptrFromInt(getPhysicalAddress(pml4.entries[vaddr.pml4_index].flags))
+    if !pdpt.entries[vaddr.pdpt_index].flags.present {
+        return false
+    }
+
+    let pd: *PageTable = @ptrFromInt(getPhysicalAddress(pdpt.entries[vaddr.pdpt_index].flags))
+    if !pd.entries[vaddr.pd_index].flags.present or !pd.entries[vaddr.pd_index].flags.huge {
+        return false
+    }
+
+    pd.entries[vaddr.pd_index].flags = emptyPageFlags()
     cpu.invlpg(virt_addr)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+    vmm_stats.pages_unmapped = vmm_stats.pages_unmapped + 512
+
+    return true
 }
 
 // Unmap a 1GB huge page
-export fn unmapHugePage1G(virt_addr: u64) {
+export fn unmapHugePage1G(virt_addr: u64): bool {
     let vaddr: VirtualAddress = @bitCast(virt_addr)
-    let pdpt_index = vaddr.pdpt_index
 
-    pdpt.entries[pdpt_index].flags = PageFlags {
-        present: false,
-        writable: false,
-        user: false,
-        write_through: false,
-        cache_disable: false,
-        accessed: false,
-        dirty: false,
-        huge: false,
-        global: false,
-        available1: 0,
-        address: 0,
-        available2: 0,
-        no_execute: false,
+    if !pml4.entries[vaddr.pml4_index].flags.present {
+        return false
     }
 
+    let pdpt: *PageTable = @ptrFromInt(getPhysicalAddress(pml4.entries[vaddr.pml4_index].flags))
+    if !pdpt.entries[vaddr.pdpt_index].flags.present or !pdpt.entries[vaddr.pdpt_index].flags.huge {
+        return false
+    }
+
+    pdpt.entries[vaddr.pdpt_index].flags = emptyPageFlags()
     cpu.invlpg(virt_addr)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+    vmm_stats.pages_unmapped = vmm_stats.pages_unmapped + 262144
+
+    return true
 }
 
-// Get page size info for an address
-export fn getPageSize(virt_addr: u64): usize {
-    let vaddr: VirtualAddress = @bitCast(virt_addr)
+// ============================================================================
+// ADDRESS SPACE MANAGEMENT
+// ============================================================================
 
-    // Check if PDPT entry is a 1GB huge page
-    if pdpt.entries[vaddr.pdpt_index].flags.present {
-        if pdpt.entries[vaddr.pdpt_index].flags.huge {
-            return PAGE_SIZE_1G
-        }
+// Create a new address space (new PML4)
+export fn createAddressSpace(): u64 {
+    let new_pml4 = allocPageTable()
+    if new_pml4 == null {
+        return 0
     }
 
-    // Check if PD entry is a 2MB huge page
-    if pd.entries[vaddr.pd_index].flags.present {
-        if pd.entries[vaddr.pd_index].flags.huge {
-            return PAGE_SIZE_2M
+    // Copy kernel mappings (higher half)
+    let i: usize = 256  // Upper half starts at index 256
+    loop {
+        if i >= 512 {
+            break
         }
+        new_pml4.entries[i] = pml4.entries[i]
+        i = i + 1
     }
 
-    // Default 4KB page
-    return PAGE_SIZE
+    return @intFromPtr(new_pml4)
 }
 
-// Align address to 2MB boundary
+// Switch to a different address space
+export fn switchAddressSpace(pml4_addr: u64) {
+    cpu.write_cr3(pml4_addr)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+}
+
+// Get current address space
+export fn getCurrentAddressSpace(): u64 {
+    return cpu.read_cr3()
+}
+
+// Destroy an address space
+export fn destroyAddressSpace(pml4_addr: u64) {
+    // Don't destroy kernel PML4
+    if pml4_addr == @intFromPtr(&pml4) {
+        return
+    }
+
+    let target_pml4: *PageTable = @ptrFromInt(pml4_addr)
+
+    // Free user-space page tables (lower half only)
+    let i: usize = 0
+    loop {
+        if i >= 256 {
+            break
+        }
+
+        if target_pml4.entries[i].flags.present {
+            let pdpt: *PageTable = @ptrFromInt(getPhysicalAddress(target_pml4.entries[i].flags))
+
+            let j: usize = 0
+            loop {
+                if j >= 512 {
+                    break
+                }
+
+                if pdpt.entries[j].flags.present and !pdpt.entries[j].flags.huge {
+                    let pd: *PageTable = @ptrFromInt(getPhysicalAddress(pdpt.entries[j].flags))
+
+                    let k: usize = 0
+                    loop {
+                        if k >= 512 {
+                            break
+                        }
+
+                        if pd.entries[k].flags.present and !pd.entries[k].flags.huge {
+                            let pt: *PageTable = @ptrFromInt(getPhysicalAddress(pd.entries[k].flags))
+                            freePageTable(pt)
+                        }
+                        k = k + 1
+                    }
+                    freePageTable(pd)
+                }
+                j = j + 1
+            }
+            freePageTable(pdpt)
+        }
+        i = i + 1
+    }
+
+    freePageTable(target_pml4)
+}
+
+// ============================================================================
+// TLB MANAGEMENT
+// ============================================================================
+
+// Flush entire TLB
+export fn flushTLB() {
+    let cr3 = cpu.read_cr3()
+    cpu.write_cr3(cr3)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+}
+
+// Flush TLB for a specific address
+export fn flushTLBPage(virt_addr: u64) {
+    cpu.invlpg(virt_addr)
+    vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + 1
+}
+
+// Flush TLB for a range
+export fn flushTLBRange(virt_start: u64, num_pages: u64) {
+    if num_pages > 32 {
+        // More efficient to flush entire TLB
+        flushTLB()
+    } else {
+        let i: u64 = 0
+        loop {
+            if i >= num_pages {
+                break
+            }
+            cpu.invlpg(virt_start + (i * PAGE_SIZE))
+            i = i + 1
+        }
+        vmm_stats.tlb_flushes = vmm_stats.tlb_flushes + num_pages
+    }
+}
+
+// ============================================================================
+// PAGE FAULT HANDLING
+// ============================================================================
+
+export fn handlePageFault(fault_addr: u64, error_code: u64) {
+    vmm_stats.page_faults = vmm_stats.page_faults + 1
+
+    serial.writeString("VMM: Page fault at ")
+    serial.writeHex(fault_addr)
+    serial.writeString(" error=")
+    serial.writeHex(error_code)
+    serial.writeString("\n")
+
+    // Decode error code
+    let present = (error_code & 1) != 0
+    let write = (error_code & 2) != 0
+    let user = (error_code & 4) != 0
+    let reserved = (error_code & 8) != 0
+    let instruction_fetch = (error_code & 16) != 0
+
+    if reserved {
+        serial.writeString("VMM: Reserved bit violation\n")
+    }
+
+    if !present {
+        // Page not present - could implement demand paging here
+        serial.writeString("VMM: Page not present\n")
+    } else if write {
+        // Write to read-only page - could implement copy-on-write here
+        serial.writeString("VMM: Write to read-only page\n")
+    } else if user and instruction_fetch {
+        // Instruction fetch from NX page
+        serial.writeString("VMM: Execute on NX page\n")
+    }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// Align address down to page boundary
+export fn alignDown(addr: u64): u64 {
+    return addr & ~@as(u64, PAGE_SIZE - 1)
+}
+
+// Align address up to page boundary
+export fn alignUp(addr: u64): u64 {
+    return (addr + PAGE_SIZE - 1) & ~@as(u64, PAGE_SIZE - 1)
+}
+
+// Align to 2MB boundary
 export fn alignDown2M(addr: u64): u64 {
     return addr & ~@as(u64, PAGE_SIZE_2M - 1)
 }
@@ -511,7 +954,7 @@ export fn alignUp2M(addr: u64): u64 {
     return (addr + PAGE_SIZE_2M - 1) & ~@as(u64, PAGE_SIZE_2M - 1)
 }
 
-// Align address to 1GB boundary
+// Align to 1GB boundary
 export fn alignDown1G(addr: u64): u64 {
     return addr & ~@as(u64, PAGE_SIZE_1G - 1)
 }
@@ -520,11 +963,60 @@ export fn alignUp1G(addr: u64): u64 {
     return (addr + PAGE_SIZE_1G - 1) & ~@as(u64, PAGE_SIZE_1G - 1)
 }
 
-// Check if huge pages are available
+// Get page size for an address
+export fn getPageSize(virt_addr: u64): usize {
+    let pte = walkPageTables(virt_addr, false, false)
+
+    if pte == null or !pte.flags.present {
+        return 0
+    }
+
+    if pte.flags.huge {
+        // Need to determine if it's 2MB or 1GB
+        let vaddr: VirtualAddress = @bitCast(virt_addr)
+
+        // Check if it's at PDPT level (1GB) or PD level (2MB)
+        if pml4.entries[vaddr.pml4_index].flags.present {
+            let pdpt: *PageTable = @ptrFromInt(getPhysicalAddress(pml4.entries[vaddr.pml4_index].flags))
+            if pdpt.entries[vaddr.pdpt_index].flags.huge {
+                return PAGE_SIZE_1G
+            }
+        }
+        return PAGE_SIZE_2M
+    }
+
+    return PAGE_SIZE
+}
+
 export fn supports2MPages(): bool {
     return huge_pages_2m_supported
 }
 
 export fn supports1GPages(): bool {
     return huge_pages_1g_supported
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn printStats() {
+    serial.writeString("\n=== VMM Statistics ===\n")
+    serial.writeString("Pages mapped: ")
+    serial.writeHex(vmm_stats.pages_mapped)
+    serial.writeString("\nPages unmapped: ")
+    serial.writeHex(vmm_stats.pages_unmapped)
+    serial.writeString("\nPage tables allocated: ")
+    serial.writeHex(vmm_stats.page_tables_allocated)
+    serial.writeString("\nPage faults: ")
+    serial.writeHex(vmm_stats.page_faults)
+    serial.writeString("\nTLB flushes: ")
+    serial.writeHex(vmm_stats.tlb_flushes)
+    serial.writeString("\nPage tables in use: ")
+    serial.writeHex(page_tables_used)
+    serial.writeString("\n=======================\n\n")
+}
+
+export fn getStats(): VMMStats {
+    return vmm_stats
 }

@@ -1,57 +1,1068 @@
-// home-os Completely Fair Scheduler
-// CFS implementation
+// home-os Completely Fair Scheduler (CFS)
+// Full implementation with red-black tree and virtual runtime tracking
+// Based on Linux CFS design
 
 import "../core/foundation.home" as foundation
 
-const SCHED_NORMAL: u32 = 0
-const SCHED_FIFO: u32 = 1
-const SCHED_RR: u32 = 2
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Scheduling policies
+const SCHED_NORMAL: u32 = 0    // Regular fair scheduling
+const SCHED_FIFO: u32 = 1      // Real-time FIFO
+const SCHED_RR: u32 = 2        // Real-time round-robin
+const SCHED_BATCH: u32 = 3     // CPU-intensive batch
+const SCHED_IDLE: u32 = 5      // Very low priority
+
+// Nice value range (-20 to +19)
+const NICE_MIN: i32 = -20
+const NICE_MAX: i32 = 19
+const DEFAULT_NICE: i32 = 0
+
+// Time constants (in nanoseconds)
+const NSEC_PER_MSEC: u64 = 1000000
+const NSEC_PER_SEC: u64 = 1000000000
+
+// CFS constants
+const SCHED_LATENCY_NS: u64 = 6000000        // 6ms target latency
+const MIN_GRANULARITY_NS: u64 = 750000       // 0.75ms minimum slice
+const WAKEUP_GRANULARITY_NS: u64 = 1000000   // 1ms wakeup granularity
+
+// Maximum tasks
+const MAX_TASKS: u32 = 256
+
+// ============================================================================
+// RED-BLACK TREE NODE
+// ============================================================================
+
+const RB_RED: u8 = 0
+const RB_BLACK: u8 = 1
+
+struct RBNode {
+    left: u32,       // Index of left child (0xFFFFFFFF = null)
+    right: u32,      // Index of right child
+    parent: u32,     // Index of parent
+    color: u8,       // RB_RED or RB_BLACK
+    task_idx: u32,   // Index into task array
+}
+
+// ============================================================================
+// SCHEDULING ENTITY
+// ============================================================================
 
 struct SchedEntity {
-  vruntime: u64,
-  weight: u32,
-  on_rq: u32
+    // Virtual runtime (key for red-black tree)
+    vruntime: u64,
+
+    // Execution tracking
+    exec_start: u64,         // When this entity started running
+    sum_exec_runtime: u64,   // Total runtime
+    prev_sum_exec_runtime: u64,
+
+    // Priority and weight
+    load_weight: u32,        // Derived from nice value
+    inv_weight: u32,         // Inverse weight for calculations
+
+    // State
+    on_rq: bool,             // Currently on run queue
+
+    // RB tree node index
+    rb_node_idx: u32,
 }
 
-struct RunQueue {
-  nr_running: u32,
-  min_vruntime: u64,
-  curr: u32
+// ============================================================================
+// TASK STRUCTURE
+// ============================================================================
+
+const TASK_RUNNING: u32 = 0
+const TASK_INTERRUPTIBLE: u32 = 1
+const TASK_UNINTERRUPTIBLE: u32 = 2
+const TASK_ZOMBIE: u32 = 4
+const TASK_STOPPED: u32 = 8
+
+struct Task {
+    pid: u32,
+    state: u32,
+    policy: u32,
+    prio: i32,           // Static priority (nice value)
+
+    // Scheduling entity
+    se: SchedEntity,
+
+    // Task is valid/allocated
+    valid: bool,
+
+    // Name for debugging
+    name: [32]u8,
 }
 
-var runqueue: RunQueue
-var cfs_initialized: u32 = 0
+// ============================================================================
+// RUN QUEUE
+// ============================================================================
+
+struct CfsRunQueue {
+    // Red-black tree of runnable tasks
+    rb_root: u32,        // Root node index (0xFFFFFFFF = empty)
+    rb_leftmost: u32,    // Leftmost node (minimum vruntime)
+
+    // Statistics
+    nr_running: u32,     // Number of runnable tasks
+    load_weight: u64,    // Total load weight
+    min_vruntime: u64,   // Minimum vruntime in the tree
+
+    // Current task
+    curr: u32,           // Currently running task index
+
+    // Clock
+    clock: u64,          // Run queue clock (nanoseconds)
+    clock_task: u64,     // Task clock
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var tasks: [256]Task = undefined
+var rb_nodes: [256]RBNode = undefined
+var runqueue: CfsRunQueue = undefined
+var cfs_initialized: bool = false
+
+// Nice-to-weight lookup table (approximation of 1.25^(-nice))
+// Index 0 = nice -20, index 39 = nice +19
+const NICE_TO_WEIGHT: [40]u32 = [
+    88761, 71755, 56483, 46273, 36291,  // -20 to -16
+    29154, 23254, 18705, 14949, 11916,  // -15 to -11
+    9548,  7620,  6100,  4904,  3906,   // -10 to -6
+    3121,  2501,  1991,  1586,  1277,   // -5 to -1
+    1024,  820,   655,   526,   423,    // 0 to 4
+    335,   272,   215,   172,   137,    // 5 to 9
+    110,   87,    70,    56,    45,     // 10 to 14
+    36,    29,    23,    18,    15,     // 15 to 19
+]
+
+// Inverse weights for division optimization
+const NICE_TO_INVWEIGHT: [40]u32 = [
+    48388,  59856,  76040,  92818,  118348,  // -20 to -16
+    147320, 184698, 229616, 287308, 360437,  // -15 to -11
+    449829, 563644, 704093, 875809, 1099582, // -10 to -6
+    1376151,1717300,2157191,2708050,3363326, // -5 to -1
+    4194304,5237765,6557202,8165337,10153587,// 0 to 4
+    12820798,15790321,19976592,24970740,31350126,// 5 to 9
+    39045157,49367440,61356676,76695844,95443717,// 10 to 14
+    119304647,148102320,186737708,238609294,286331153,// 15 to 19
+]
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
 
 export fn cfs_init() {
-  runqueue.nr_running = 0
-  runqueue.min_vruntime = 0
-  runqueue.curr = 0
-  cfs_initialized = 1
-  foundation.serial_write_string("[CFS] Completely Fair Scheduler initialized\n")
+    if cfs_initialized {
+        return
+    }
+
+    foundation.serial_write_string("[CFS] Initializing Completely Fair Scheduler\n")
+
+    // Initialize run queue
+    runqueue.rb_root = 0xFFFFFFFF
+    runqueue.rb_leftmost = 0xFFFFFFFF
+    runqueue.nr_running = 0
+    runqueue.load_weight = 0
+    runqueue.min_vruntime = 0
+    runqueue.curr = 0xFFFFFFFF
+    runqueue.clock = 0
+    runqueue.clock_task = 0
+
+    // Initialize tasks
+    let i: u32 = 0
+    loop {
+        if i >= MAX_TASKS {
+            break
+        }
+        tasks[i].valid = false
+        tasks[i].pid = 0
+        tasks[i].state = TASK_ZOMBIE
+        tasks[i].se.on_rq = false
+        tasks[i].se.rb_node_idx = 0xFFFFFFFF
+
+        rb_nodes[i].left = 0xFFFFFFFF
+        rb_nodes[i].right = 0xFFFFFFFF
+        rb_nodes[i].parent = 0xFFFFFFFF
+        rb_nodes[i].color = RB_RED
+        rb_nodes[i].task_idx = 0xFFFFFFFF
+
+        i = i + 1
+    }
+
+    cfs_initialized = true
+    foundation.serial_write_string("[CFS] Completely Fair Scheduler initialized\n")
 }
 
-export fn cfs_enqueue(task_id: u32, weight: u32) {
-  runqueue.nr_running = runqueue.nr_running + 1
+// ============================================================================
+// WEIGHT CALCULATIONS
+// ============================================================================
+
+fn nice_to_weight_index(nice: i32): u32 {
+    // Convert nice (-20 to +19) to index (0 to 39)
+    return @intCast(@as(i32, nice) + 20)
 }
 
-export fn cfs_dequeue(task_id: u32) {
-  if runqueue.nr_running > 0 {
-    runqueue.nr_running = runqueue.nr_running - 1
-  }
+fn get_weight(nice: i32): u32 {
+    let idx = nice_to_weight_index(nice)
+    if idx >= 40 {
+        return 1024  // Default weight
+    }
+    return NICE_TO_WEIGHT[idx]
 }
+
+fn get_inv_weight(nice: i32): u32 {
+    let idx = nice_to_weight_index(nice)
+    if idx >= 40 {
+        return 4194304  // Default inverse weight
+    }
+    return NICE_TO_INVWEIGHT[idx]
+}
+
+// ============================================================================
+// VRUNTIME CALCULATIONS
+// ============================================================================
+
+// Calculate delta execution weighted by priority
+// delta_exec_weighted = delta_exec * (NICE_0_LOAD / weight)
+fn calc_delta_fair(delta_exec: u64, weight: u32, inv_weight: u32): u64 {
+    if weight == 1024 {
+        // Nice 0, no scaling needed
+        return delta_exec
+    }
+
+    // Use inverse weight for efficient multiplication instead of division
+    // delta_exec * (2^22 / weight) >> 22
+    let scaled = (delta_exec * @as(u64, inv_weight)) >> 22
+    return scaled
+}
+
+// ============================================================================
+// RED-BLACK TREE OPERATIONS
+// ============================================================================
+
+fn rb_is_red(node_idx: u32): bool {
+    if node_idx == 0xFFFFFFFF {
+        return false
+    }
+    return rb_nodes[node_idx].color == RB_RED
+}
+
+fn rb_is_black(node_idx: u32): bool {
+    if node_idx == 0xFFFFFFFF {
+        return true  // Null nodes are black
+    }
+    return rb_nodes[node_idx].color == RB_BLACK
+}
+
+fn rb_set_red(node_idx: u32) {
+    if node_idx != 0xFFFFFFFF {
+        rb_nodes[node_idx].color = RB_RED
+    }
+}
+
+fn rb_set_black(node_idx: u32) {
+    if node_idx != 0xFFFFFFFF {
+        rb_nodes[node_idx].color = RB_BLACK
+    }
+}
+
+fn rb_left_rotate(node_idx: u32) {
+    let right_idx = rb_nodes[node_idx].right
+    if right_idx == 0xFFFFFFFF {
+        return
+    }
+
+    // Move right's left subtree to node's right
+    rb_nodes[node_idx].right = rb_nodes[right_idx].left
+    if rb_nodes[right_idx].left != 0xFFFFFFFF {
+        rb_nodes[rb_nodes[right_idx].left].parent = node_idx
+    }
+
+    // Update parent pointer
+    rb_nodes[right_idx].parent = rb_nodes[node_idx].parent
+    if rb_nodes[node_idx].parent == 0xFFFFFFFF {
+        runqueue.rb_root = right_idx
+    } else if node_idx == rb_nodes[rb_nodes[node_idx].parent].left {
+        rb_nodes[rb_nodes[node_idx].parent].left = right_idx
+    } else {
+        rb_nodes[rb_nodes[node_idx].parent].right = right_idx
+    }
+
+    // Put node on right's left
+    rb_nodes[right_idx].left = node_idx
+    rb_nodes[node_idx].parent = right_idx
+}
+
+fn rb_right_rotate(node_idx: u32) {
+    let left_idx = rb_nodes[node_idx].left
+    if left_idx == 0xFFFFFFFF {
+        return
+    }
+
+    // Move left's right subtree to node's left
+    rb_nodes[node_idx].left = rb_nodes[left_idx].right
+    if rb_nodes[left_idx].right != 0xFFFFFFFF {
+        rb_nodes[rb_nodes[left_idx].right].parent = node_idx
+    }
+
+    // Update parent pointer
+    rb_nodes[left_idx].parent = rb_nodes[node_idx].parent
+    if rb_nodes[node_idx].parent == 0xFFFFFFFF {
+        runqueue.rb_root = left_idx
+    } else if node_idx == rb_nodes[rb_nodes[node_idx].parent].right {
+        rb_nodes[rb_nodes[node_idx].parent].right = left_idx
+    } else {
+        rb_nodes[rb_nodes[node_idx].parent].left = left_idx
+    }
+
+    // Put node on left's right
+    rb_nodes[left_idx].right = node_idx
+    rb_nodes[node_idx].parent = left_idx
+}
+
+fn rb_insert_fixup(node_idx: u32) {
+    var z = node_idx
+
+    loop {
+        let parent = rb_nodes[z].parent
+        if parent == 0xFFFFFFFF or rb_is_black(parent) {
+            break
+        }
+
+        let grandparent = rb_nodes[parent].parent
+        if grandparent == 0xFFFFFFFF {
+            break
+        }
+
+        if parent == rb_nodes[grandparent].left {
+            let uncle = rb_nodes[grandparent].right
+
+            if rb_is_red(uncle) {
+                // Case 1: Uncle is red
+                rb_set_black(parent)
+                rb_set_black(uncle)
+                rb_set_red(grandparent)
+                z = grandparent
+            } else {
+                if z == rb_nodes[parent].right {
+                    // Case 2: Uncle is black, z is right child
+                    z = parent
+                    rb_left_rotate(z)
+                }
+                // Case 3: Uncle is black, z is left child
+                let new_parent = rb_nodes[z].parent
+                let new_grandparent = rb_nodes[new_parent].parent
+                rb_set_black(new_parent)
+                rb_set_red(new_grandparent)
+                rb_right_rotate(new_grandparent)
+            }
+        } else {
+            // Mirror case: parent is right child
+            let uncle = rb_nodes[grandparent].left
+
+            if rb_is_red(uncle) {
+                rb_set_black(parent)
+                rb_set_black(uncle)
+                rb_set_red(grandparent)
+                z = grandparent
+            } else {
+                if z == rb_nodes[parent].left {
+                    z = parent
+                    rb_right_rotate(z)
+                }
+                let new_parent = rb_nodes[z].parent
+                let new_grandparent = rb_nodes[new_parent].parent
+                rb_set_black(new_parent)
+                rb_set_red(new_grandparent)
+                rb_left_rotate(new_grandparent)
+            }
+        }
+    }
+
+    rb_set_black(runqueue.rb_root)
+}
+
+fn rb_insert(task_idx: u32) {
+    let se = &tasks[task_idx].se
+    let vruntime = se.vruntime
+    let node_idx = task_idx  // Use task index as node index
+
+    // Initialize node
+    rb_nodes[node_idx].left = 0xFFFFFFFF
+    rb_nodes[node_idx].right = 0xFFFFFFFF
+    rb_nodes[node_idx].color = RB_RED
+    rb_nodes[node_idx].task_idx = task_idx
+    se.rb_node_idx = node_idx
+
+    // Find insertion point
+    var parent: u32 = 0xFFFFFFFF
+    var curr = runqueue.rb_root
+    var leftmost = true
+
+    loop {
+        if curr == 0xFFFFFFFF {
+            break
+        }
+
+        parent = curr
+        let curr_task_idx = rb_nodes[curr].task_idx
+        let curr_vruntime = tasks[curr_task_idx].se.vruntime
+
+        if vruntime < curr_vruntime {
+            curr = rb_nodes[curr].left
+        } else {
+            curr = rb_nodes[curr].right
+            leftmost = false
+        }
+    }
+
+    // Insert node
+    rb_nodes[node_idx].parent = parent
+    if parent == 0xFFFFFFFF {
+        runqueue.rb_root = node_idx
+    } else if vruntime < tasks[rb_nodes[parent].task_idx].se.vruntime {
+        rb_nodes[parent].left = node_idx
+    } else {
+        rb_nodes[parent].right = node_idx
+    }
+
+    // Update leftmost
+    if leftmost {
+        runqueue.rb_leftmost = node_idx
+    }
+
+    // Fix up the tree
+    rb_insert_fixup(node_idx)
+}
+
+fn rb_find_minimum(node_idx: u32): u32 {
+    var curr = node_idx
+    loop {
+        if curr == 0xFFFFFFFF {
+            break
+        }
+        if rb_nodes[curr].left == 0xFFFFFFFF {
+            break
+        }
+        curr = rb_nodes[curr].left
+    }
+    return curr
+}
+
+fn rb_transplant(u_idx: u32, v_idx: u32) {
+    if rb_nodes[u_idx].parent == 0xFFFFFFFF {
+        runqueue.rb_root = v_idx
+    } else if u_idx == rb_nodes[rb_nodes[u_idx].parent].left {
+        rb_nodes[rb_nodes[u_idx].parent].left = v_idx
+    } else {
+        rb_nodes[rb_nodes[u_idx].parent].right = v_idx
+    }
+    if v_idx != 0xFFFFFFFF {
+        rb_nodes[v_idx].parent = rb_nodes[u_idx].parent
+    }
+}
+
+fn rb_delete_fixup(node_idx: u32, parent_idx: u32) {
+    var x = node_idx
+    var parent = parent_idx
+
+    loop {
+        if x == runqueue.rb_root or (x != 0xFFFFFFFF and rb_is_black(x)) == false {
+            break
+        }
+
+        if x == rb_nodes[parent].left {
+            var sibling = rb_nodes[parent].right
+
+            if rb_is_red(sibling) {
+                rb_set_black(sibling)
+                rb_set_red(parent)
+                rb_left_rotate(parent)
+                sibling = rb_nodes[parent].right
+            }
+
+            if sibling == 0xFFFFFFFF {
+                x = parent
+                parent = rb_nodes[x].parent
+                continue
+            }
+
+            if rb_is_black(rb_nodes[sibling].left) and rb_is_black(rb_nodes[sibling].right) {
+                rb_set_red(sibling)
+                x = parent
+                parent = rb_nodes[x].parent
+            } else {
+                if rb_is_black(rb_nodes[sibling].right) {
+                    rb_set_black(rb_nodes[sibling].left)
+                    rb_set_red(sibling)
+                    rb_right_rotate(sibling)
+                    sibling = rb_nodes[parent].right
+                }
+                rb_nodes[sibling].color = rb_nodes[parent].color
+                rb_set_black(parent)
+                rb_set_black(rb_nodes[sibling].right)
+                rb_left_rotate(parent)
+                x = runqueue.rb_root
+                break
+            }
+        } else {
+            // Mirror case
+            var sibling = rb_nodes[parent].left
+
+            if rb_is_red(sibling) {
+                rb_set_black(sibling)
+                rb_set_red(parent)
+                rb_right_rotate(parent)
+                sibling = rb_nodes[parent].left
+            }
+
+            if sibling == 0xFFFFFFFF {
+                x = parent
+                parent = rb_nodes[x].parent
+                continue
+            }
+
+            if rb_is_black(rb_nodes[sibling].right) and rb_is_black(rb_nodes[sibling].left) {
+                rb_set_red(sibling)
+                x = parent
+                parent = rb_nodes[x].parent
+            } else {
+                if rb_is_black(rb_nodes[sibling].left) {
+                    rb_set_black(rb_nodes[sibling].right)
+                    rb_set_red(sibling)
+                    rb_left_rotate(sibling)
+                    sibling = rb_nodes[parent].left
+                }
+                rb_nodes[sibling].color = rb_nodes[parent].color
+                rb_set_black(parent)
+                rb_set_black(rb_nodes[sibling].left)
+                rb_right_rotate(parent)
+                x = runqueue.rb_root
+                break
+            }
+        }
+    }
+
+    if x != 0xFFFFFFFF {
+        rb_set_black(x)
+    }
+}
+
+fn rb_delete(node_idx: u32) {
+    if node_idx == 0xFFFFFFFF {
+        return
+    }
+
+    // Update leftmost if needed
+    if node_idx == runqueue.rb_leftmost {
+        if rb_nodes[node_idx].right != 0xFFFFFFFF {
+            runqueue.rb_leftmost = rb_find_minimum(rb_nodes[node_idx].right)
+        } else {
+            runqueue.rb_leftmost = rb_nodes[node_idx].parent
+        }
+    }
+
+    var y = node_idx
+    var y_original_color = rb_nodes[y].color
+    var x: u32 = 0xFFFFFFFF
+    var x_parent: u32 = 0xFFFFFFFF
+
+    if rb_nodes[node_idx].left == 0xFFFFFFFF {
+        x = rb_nodes[node_idx].right
+        x_parent = rb_nodes[node_idx].parent
+        rb_transplant(node_idx, rb_nodes[node_idx].right)
+    } else if rb_nodes[node_idx].right == 0xFFFFFFFF {
+        x = rb_nodes[node_idx].left
+        x_parent = rb_nodes[node_idx].parent
+        rb_transplant(node_idx, rb_nodes[node_idx].left)
+    } else {
+        y = rb_find_minimum(rb_nodes[node_idx].right)
+        y_original_color = rb_nodes[y].color
+        x = rb_nodes[y].right
+
+        if rb_nodes[y].parent == node_idx {
+            x_parent = y
+        } else {
+            x_parent = rb_nodes[y].parent
+            rb_transplant(y, rb_nodes[y].right)
+            rb_nodes[y].right = rb_nodes[node_idx].right
+            rb_nodes[rb_nodes[y].right].parent = y
+        }
+
+        rb_transplant(node_idx, y)
+        rb_nodes[y].left = rb_nodes[node_idx].left
+        rb_nodes[rb_nodes[y].left].parent = y
+        rb_nodes[y].color = rb_nodes[node_idx].color
+    }
+
+    if y_original_color == RB_BLACK {
+        rb_delete_fixup(x, x_parent)
+    }
+
+    // Clear the deleted node
+    rb_nodes[node_idx].left = 0xFFFFFFFF
+    rb_nodes[node_idx].right = 0xFFFFFFFF
+    rb_nodes[node_idx].parent = 0xFFFFFFFF
+}
+
+// ============================================================================
+// TASK MANAGEMENT
+// ============================================================================
+
+export fn cfs_create_task(pid: u32, nice: i32): u32 {
+    // Find free task slot
+    let i: u32 = 0
+    loop {
+        if i >= MAX_TASKS {
+            break
+        }
+        if !tasks[i].valid {
+            // Initialize task
+            tasks[i].valid = true
+            tasks[i].pid = pid
+            tasks[i].state = TASK_RUNNING
+            tasks[i].policy = SCHED_NORMAL
+            tasks[i].prio = nice
+
+            // Initialize scheduling entity
+            tasks[i].se.vruntime = runqueue.min_vruntime
+            tasks[i].se.exec_start = 0
+            tasks[i].se.sum_exec_runtime = 0
+            tasks[i].se.prev_sum_exec_runtime = 0
+            tasks[i].se.load_weight = get_weight(nice)
+            tasks[i].se.inv_weight = get_inv_weight(nice)
+            tasks[i].se.on_rq = false
+            tasks[i].se.rb_node_idx = 0xFFFFFFFF
+
+            foundation.serial_write_string("[CFS] Created task ")
+            foundation.serial_write_u32(pid)
+            foundation.serial_write_string(" nice=")
+            foundation.serial_write_i32(nice)
+            foundation.serial_write_string(" weight=")
+            foundation.serial_write_u32(tasks[i].se.load_weight)
+            foundation.serial_write_string("\n")
+
+            return i
+        }
+        i = i + 1
+    }
+
+    foundation.serial_write_string("[CFS] ERROR: No free task slots\n")
+    return 0xFFFFFFFF
+}
+
+export fn cfs_destroy_task(task_idx: u32) {
+    if task_idx >= MAX_TASKS or !tasks[task_idx].valid {
+        return
+    }
+
+    // Remove from run queue if on it
+    if tasks[task_idx].se.on_rq {
+        cfs_dequeue(task_idx)
+    }
+
+    tasks[task_idx].valid = false
+    tasks[task_idx].state = TASK_ZOMBIE
+}
+
+// ============================================================================
+// ENQUEUE / DEQUEUE
+// ============================================================================
+
+export fn cfs_enqueue(task_idx: u32, weight: u32) {
+    if task_idx >= MAX_TASKS or !tasks[task_idx].valid {
+        return
+    }
+
+    let se = &tasks[task_idx].se
+    if se.on_rq {
+        return  // Already on run queue
+    }
+
+    // Place new task at min_vruntime to give it fair chance
+    if se.vruntime < runqueue.min_vruntime {
+        se.vruntime = runqueue.min_vruntime
+    }
+
+    // Insert into red-black tree
+    rb_insert(task_idx)
+
+    se.on_rq = true
+    runqueue.nr_running = runqueue.nr_running + 1
+    runqueue.load_weight = runqueue.load_weight + @as(u64, se.load_weight)
+
+    foundation.serial_write_string("[CFS] Enqueued task ")
+    foundation.serial_write_u32(tasks[task_idx].pid)
+    foundation.serial_write_string(" vruntime=")
+    foundation.serial_write_u64(se.vruntime)
+    foundation.serial_write_string("\n")
+}
+
+export fn cfs_dequeue(task_idx: u32) {
+    if task_idx >= MAX_TASKS or !tasks[task_idx].valid {
+        return
+    }
+
+    let se = &tasks[task_idx].se
+    if !se.on_rq {
+        return  // Not on run queue
+    }
+
+    // Remove from red-black tree
+    rb_delete(se.rb_node_idx)
+
+    se.on_rq = false
+    se.rb_node_idx = 0xFFFFFFFF
+
+    if runqueue.nr_running > 0 {
+        runqueue.nr_running = runqueue.nr_running - 1
+    }
+    if runqueue.load_weight >= @as(u64, se.load_weight) {
+        runqueue.load_weight = runqueue.load_weight - @as(u64, se.load_weight)
+    }
+}
+
+// ============================================================================
+// PICK NEXT TASK
+// ============================================================================
 
 export fn cfs_pick_next(): u32 {
-  if runqueue.nr_running == 0 { return 0xFFFFFFFF }
-  
-  // Simple round-robin for now
-  runqueue.curr = (runqueue.curr + 1) % runqueue.nr_running
-  return runqueue.curr
+    if runqueue.nr_running == 0 {
+        return 0xFFFFFFFF  // No runnable tasks
+    }
+
+    // The leftmost node has the smallest vruntime
+    if runqueue.rb_leftmost == 0xFFFFFFFF {
+        return 0xFFFFFFFF
+    }
+
+    let task_idx = rb_nodes[runqueue.rb_leftmost].task_idx
+    return task_idx
 }
+
+// ============================================================================
+// SCHEDULER TICK
+// ============================================================================
 
 export fn cfs_tick() {
-  runqueue.min_vruntime = runqueue.min_vruntime + 1
+    // Update clock
+    runqueue.clock = runqueue.clock + NSEC_PER_MSEC
+
+    if runqueue.curr == 0xFFFFFFFF or runqueue.curr >= MAX_TASKS {
+        return
+    }
+
+    let se = &tasks[runqueue.curr].se
+
+    // Calculate delta execution time
+    let now = runqueue.clock
+    let delta_exec = now - se.exec_start
+
+    if delta_exec <= 0 {
+        return
+    }
+
+    // Update runtime statistics
+    se.sum_exec_runtime = se.sum_exec_runtime + delta_exec
+    se.exec_start = now
+
+    // Update vruntime (weighted by priority)
+    let delta_vruntime = calc_delta_fair(delta_exec, se.load_weight, se.inv_weight)
+    se.vruntime = se.vruntime + delta_vruntime
+
+    // Update min_vruntime
+    if se.vruntime > runqueue.min_vruntime {
+        // Walk the tree to find new minimum
+        if runqueue.rb_leftmost != 0xFFFFFFFF {
+            let leftmost_task = rb_nodes[runqueue.rb_leftmost].task_idx
+            let leftmost_vruntime = tasks[leftmost_task].se.vruntime
+
+            if leftmost_vruntime > runqueue.min_vruntime {
+                runqueue.min_vruntime = leftmost_vruntime
+            }
+        } else {
+            runqueue.min_vruntime = se.vruntime
+        }
+    }
+
+    // Check if preemption is needed
+    check_preempt_tick()
 }
 
+fn check_preempt_tick() {
+    if runqueue.nr_running <= 1 {
+        return
+    }
+
+    let curr_idx = runqueue.curr
+    if curr_idx == 0xFFFFFFFF {
+        return
+    }
+
+    let curr_se = &tasks[curr_idx].se
+
+    // Calculate ideal runtime for this task
+    let period = calc_period()
+    let slice = calc_slice(curr_se.load_weight, period)
+
+    // Check if current task has run longer than its fair share
+    let runtime = curr_se.sum_exec_runtime - curr_se.prev_sum_exec_runtime
+    if runtime >= slice {
+        // Time to reschedule
+        cfs_need_resched(curr_idx)
+    }
+}
+
+fn calc_period(): u64 {
+    // Calculate scheduling period based on number of tasks
+    let nr = runqueue.nr_running
+    if nr <= 1 {
+        return SCHED_LATENCY_NS
+    }
+
+    // If many tasks, extend period to ensure minimum granularity
+    let period = nr * MIN_GRANULARITY_NS
+    if period < SCHED_LATENCY_NS {
+        return SCHED_LATENCY_NS
+    }
+    return period
+}
+
+fn calc_slice(weight: u32, period: u64): u64 {
+    // Calculate this task's slice of the period
+    if runqueue.load_weight == 0 {
+        return period
+    }
+
+    let slice = (period * @as(u64, weight)) / runqueue.load_weight
+    if slice < MIN_GRANULARITY_NS {
+        return MIN_GRANULARITY_NS
+    }
+    return slice
+}
+
+fn cfs_need_resched(task_idx: u32) {
+    // Mark task as needing reschedule
+    // In a real implementation, this would set a flag checked on kernel exit
+    foundation.serial_write_string("[CFS] Task ")
+    foundation.serial_write_u32(tasks[task_idx].pid)
+    foundation.serial_write_string(" needs resched\n")
+}
+
+// ============================================================================
+// CONTEXT SWITCH
+// ============================================================================
+
+export fn cfs_switch_to(next_idx: u32) {
+    let prev_idx = runqueue.curr
+
+    // Put previous task back in tree if still runnable
+    if prev_idx != 0xFFFFFFFF and prev_idx < MAX_TASKS {
+        let prev_se = &tasks[prev_idx].se
+        prev_se.prev_sum_exec_runtime = prev_se.sum_exec_runtime
+
+        if tasks[prev_idx].state == TASK_RUNNING and !prev_se.on_rq {
+            cfs_enqueue(prev_idx, prev_se.load_weight)
+        }
+    }
+
+    // Remove next task from tree
+    if next_idx != 0xFFFFFFFF and next_idx < MAX_TASKS {
+        let next_se = &tasks[next_idx].se
+
+        if next_se.on_rq {
+            cfs_dequeue(next_idx)
+        }
+
+        next_se.exec_start = runqueue.clock
+        runqueue.curr = next_idx
+    }
+}
+
+// ============================================================================
+// NICE VALUE CHANGES
+// ============================================================================
+
+export fn cfs_set_nice(task_idx: u32, nice: i32) {
+    if task_idx >= MAX_TASKS or !tasks[task_idx].valid {
+        return
+    }
+
+    // Clamp nice value
+    var clamped_nice = nice
+    if clamped_nice < NICE_MIN {
+        clamped_nice = NICE_MIN
+    }
+    if clamped_nice > NICE_MAX {
+        clamped_nice = NICE_MAX
+    }
+
+    let se = &tasks[task_idx].se
+    let was_on_rq = se.on_rq
+
+    // Remove from run queue to update weight
+    if was_on_rq {
+        cfs_dequeue(task_idx)
+    }
+
+    // Update priority and weight
+    tasks[task_idx].prio = clamped_nice
+    se.load_weight = get_weight(clamped_nice)
+    se.inv_weight = get_inv_weight(clamped_nice)
+
+    // Re-enqueue with new weight
+    if was_on_rq {
+        cfs_enqueue(task_idx, se.load_weight)
+    }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
 export fn cfs_get_load(): u32 {
-  return runqueue.nr_running
+    return runqueue.nr_running
+}
+
+export fn cfs_get_min_vruntime(): u64 {
+    return runqueue.min_vruntime
+}
+
+export fn cfs_get_task_vruntime(task_idx: u32): u64 {
+    if task_idx >= MAX_TASKS or !tasks[task_idx].valid {
+        return 0
+    }
+    return tasks[task_idx].se.vruntime
+}
+
+export fn cfs_get_task_runtime(task_idx: u32): u64 {
+    if task_idx >= MAX_TASKS or !tasks[task_idx].valid {
+        return 0
+    }
+    return tasks[task_idx].se.sum_exec_runtime
+}
+
+export fn cfs_print_stats() {
+    foundation.serial_write_string("\n=== CFS Statistics ===\n")
+    foundation.serial_write_string("Running tasks: ")
+    foundation.serial_write_u32(runqueue.nr_running)
+    foundation.serial_write_string("\nTotal load: ")
+    foundation.serial_write_u64(runqueue.load_weight)
+    foundation.serial_write_string("\nMin vruntime: ")
+    foundation.serial_write_u64(runqueue.min_vruntime)
+    foundation.serial_write_string("\nClock: ")
+    foundation.serial_write_u64(runqueue.clock)
+    foundation.serial_write_string(" ns\n")
+
+    // Print per-task info
+    let i: u32 = 0
+    loop {
+        if i >= MAX_TASKS {
+            break
+        }
+        if tasks[i].valid and tasks[i].se.on_rq {
+            foundation.serial_write_string("  Task ")
+            foundation.serial_write_u32(tasks[i].pid)
+            foundation.serial_write_string(": vruntime=")
+            foundation.serial_write_u64(tasks[i].se.vruntime)
+            foundation.serial_write_string(" runtime=")
+            foundation.serial_write_u64(tasks[i].se.sum_exec_runtime)
+            foundation.serial_write_string(" weight=")
+            foundation.serial_write_u32(tasks[i].se.load_weight)
+            foundation.serial_write_string("\n")
+        }
+        i = i + 1
+    }
+
+    foundation.serial_write_string("======================\n\n")
+}
+
+// ============================================================================
+// WAKEUP
+// ============================================================================
+
+export fn cfs_wake_up(task_idx: u32) {
+    if task_idx >= MAX_TASKS or !tasks[task_idx].valid {
+        return
+    }
+
+    if tasks[task_idx].state != TASK_RUNNING {
+        tasks[task_idx].state = TASK_RUNNING
+    }
+
+    let se = &tasks[task_idx].se
+
+    // Place waking task at a fair vruntime
+    // Give it a slight boost to be responsive
+    if se.vruntime < runqueue.min_vruntime {
+        se.vruntime = runqueue.min_vruntime
+    }
+
+    // Subtract wakeup granularity for responsiveness
+    if se.vruntime > WAKEUP_GRANULARITY_NS {
+        se.vruntime = se.vruntime - WAKEUP_GRANULARITY_NS
+    }
+
+    if !se.on_rq {
+        cfs_enqueue(task_idx, se.load_weight)
+    }
+
+    // Check if we should preempt current task
+    check_preempt_wakeup(task_idx)
+}
+
+fn check_preempt_wakeup(task_idx: u32) {
+    if runqueue.curr == 0xFFFFFFFF {
+        return
+    }
+
+    let curr_se = &tasks[runqueue.curr].se
+    let wake_se = &tasks[task_idx].se
+
+    // If waking task has much smaller vruntime, preempt
+    if wake_se.vruntime + WAKEUP_GRANULARITY_NS < curr_se.vruntime {
+        cfs_need_resched(runqueue.curr)
+    }
+}
+
+// ============================================================================
+// SLEEP
+// ============================================================================
+
+export fn cfs_sleep(task_idx: u32) {
+    if task_idx >= MAX_TASKS or !tasks[task_idx].valid {
+        return
+    }
+
+    tasks[task_idx].state = TASK_INTERRUPTIBLE
+
+    if tasks[task_idx].se.on_rq {
+        cfs_dequeue(task_idx)
+    }
+}
+
+// ============================================================================
+// YIELD
+// ============================================================================
+
+export fn cfs_yield(task_idx: u32) {
+    if task_idx >= MAX_TASKS or !tasks[task_idx].valid {
+        return
+    }
+
+    let se = &tasks[task_idx].se
+
+    // Advance vruntime to effectively yield time slice
+    let period = calc_period()
+    let slice = calc_slice(se.load_weight, period)
+    se.vruntime = se.vruntime + slice
+
+    // Force reschedule
+    cfs_need_resched(task_idx)
 }

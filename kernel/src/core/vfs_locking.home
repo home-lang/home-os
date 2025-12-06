@@ -95,27 +95,60 @@ fn check_lock_conflict(ino: u32, lock_type: u32, start: u64, length: u64): u32 {
 // FLOCK-STYLE LOCKING
 // ============================================================================
 
+// Wait queue for blocking locks
+struct LockWaiter {
+  ino: u32,
+  pid: u32,
+  lock_type: u32,
+  start: u64,
+  length: u64,
+  waiting: u32
+}
+
+var lock_waiters: [LockWaiter; 64]
+var waiter_count: u32 = 0
+
+// Current process ID (will be set by scheduler)
+var current_pid: u32 = 0
+
+export fn set_current_pid(pid: u32) {
+  current_pid = pid
+}
+
 export fn vfs_flock(fd: u32, operation: u32): u32 {
-  // Get inode from file descriptor
-  // TODO: Map fd to inode
-  var ino: u32 = fd  // Placeholder
+  // Get inode from file descriptor using vfs_get_inode
+  var ino: u32 = filesystem.vfs_get_inode(fd)
+  if ino == 0 {
+    foundation.serial_write_string("[VFS Lock] Invalid file descriptor\n")
+    return 1  // EBADF
+  }
 
   var lock_type: u32 = operation & 0x3
-  var nonblock: u32 = operation & 4  // LOCK_NB flag
+  var nonblock: u32 = (operation >> 2) & 1  // LOCK_NB flag
 
   if lock_type == F_UNLCK {
-    // Unlock
-    return vfs_unlock_file(ino, 0)  // PID 0 = current process
+    // Unlock and wake up waiters
+    var result: u32 = vfs_unlock_file(ino, current_pid)
+    wake_up_waiters(ino)
+    return result
   }
 
   // Check for conflicts
   var conflict: u32 = check_lock_conflict(ino, lock_type, 0, 0)
   if conflict == 1 {
     if nonblock == 1 {
-      return 1  // EWOULDBLOCK
+      return 11  // EWOULDBLOCK/EAGAIN
     }
-    // TODO: Block until lock available
-    return 1  // For now, fail
+
+    // Add to wait queue and block
+    var wait_result: u32 = add_to_wait_queue(ino, current_pid, lock_type, 0, 0)
+    if wait_result != 0 {
+      lock_stats.lock_timeouts = lock_stats.lock_timeouts + 1
+      return 1  // Failed to wait
+    }
+
+    // When woken up, try again (caller should retry)
+    return 0
   }
 
   // Find free lock slot
@@ -123,7 +156,7 @@ export fn vfs_flock(fd: u32, operation: u32): u32 {
   while i < MAX_LOCKS {
     if file_locks[i].active == 0 {
       file_locks[i].ino = ino
-      file_locks[i].pid = 0  // TODO: Get current PID
+      file_locks[i].pid = current_pid
       file_locks[i].lock_type = lock_type
       file_locks[i].start = 0
       file_locks[i].length = 0  // Whole file
@@ -151,22 +184,91 @@ export fn vfs_flock(fd: u32, operation: u32): u32 {
 }
 
 // ============================================================================
+// WAIT QUEUE MANAGEMENT
+// ============================================================================
+
+fn add_to_wait_queue(ino: u32, pid: u32, lock_type: u32, start: u64, length: u64): u32 {
+  var i: u32 = 0
+  while i < 64 {
+    if lock_waiters[i].waiting == 0 {
+      lock_waiters[i].ino = ino
+      lock_waiters[i].pid = pid
+      lock_waiters[i].lock_type = lock_type
+      lock_waiters[i].start = start
+      lock_waiters[i].length = length
+      lock_waiters[i].waiting = 1
+      waiter_count = waiter_count + 1
+
+      foundation.serial_write_string("[VFS Lock] Process ")
+      foundation.serial_write_u32(pid)
+      foundation.serial_write_string(" waiting for lock on inode ")
+      foundation.serial_write_u32(ino)
+      foundation.serial_write_string("\n")
+
+      return 0
+    }
+    i = i + 1
+  }
+  return 1  // Wait queue full
+}
+
+fn wake_up_waiters(ino: u32) {
+  var i: u32 = 0
+  while i < 64 {
+    if lock_waiters[i].waiting == 1 and lock_waiters[i].ino == ino {
+      // Check if this waiter can now acquire the lock
+      var conflict: u32 = check_lock_conflict(ino, lock_waiters[i].lock_type,
+                                               lock_waiters[i].start,
+                                               lock_waiters[i].length)
+      if conflict == 0 {
+        // Wake up this waiter
+        lock_waiters[i].waiting = 0
+        waiter_count = waiter_count - 1
+
+        foundation.serial_write_string("[VFS Lock] Waking up process ")
+        foundation.serial_write_u32(lock_waiters[i].pid)
+        foundation.serial_write_string("\n")
+
+        // TODO: Actually wake up the process via scheduler
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn remove_from_wait_queue(pid: u32) {
+  var i: u32 = 0
+  while i < 64 {
+    if lock_waiters[i].waiting == 1 and lock_waiters[i].pid == pid {
+      lock_waiters[i].waiting = 0
+      waiter_count = waiter_count - 1
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
 // FCNTL-STYLE RANGE LOCKING
 // ============================================================================
 
 export fn vfs_fcntl_lock(fd: u32, cmd: u32, lock_type: u32, start: u64, length: u64): u32 {
   // Get inode from file descriptor
-  var ino: u32 = fd  // Placeholder
+  var ino: u32 = filesystem.vfs_get_inode(fd)
+  if ino == 0 {
+    return 1  // EBADF
+  }
 
   if lock_type == F_UNLCK {
-    // Unlock range
-    return vfs_unlock_range(ino, 0, start, length)
+    // Unlock range and wake waiters
+    var result: u32 = vfs_unlock_range(ino, current_pid, start, length)
+    wake_up_waiters(ino)
+    return result
   }
 
   // Check for conflicts
   var conflict: u32 = check_lock_conflict(ino, lock_type, start, length)
   if conflict == 1 {
-    return 1  // EAGAIN
+    return 11  // EAGAIN
   }
 
   // Find free lock slot
@@ -174,7 +276,7 @@ export fn vfs_fcntl_lock(fd: u32, cmd: u32, lock_type: u32, start: u64, length: 
   while i < MAX_LOCKS {
     if file_locks[i].active == 0 {
       file_locks[i].ino = ino
-      file_locks[i].pid = 0  // TODO: Get current PID
+      file_locks[i].pid = current_pid
       file_locks[i].lock_type = lock_type
       file_locks[i].start = start
       file_locks[i].length = length
@@ -201,6 +303,51 @@ export fn vfs_fcntl_lock(fd: u32, cmd: u32, lock_type: u32, start: u64, length: 
   }
 
   return 1  // No free lock slots
+}
+
+// Test if a lock can be acquired without actually acquiring it
+export fn vfs_test_lock(fd: u32, lock_type: u32, start: u64, length: u64): u32 {
+  var ino: u32 = filesystem.vfs_get_inode(fd)
+  if ino == 0 {
+    return 1
+  }
+
+  return check_lock_conflict(ino, lock_type, start, length)
+}
+
+// Get information about who holds a lock
+export fn vfs_get_lock_info(fd: u32, start: u64, length: u64, holder_pid: *u32, holder_type: *u32): u32 {
+  var ino: u32 = filesystem.vfs_get_inode(fd)
+  if ino == 0 {
+    return 1
+  }
+
+  var i: u32 = 0
+  while i < MAX_LOCKS {
+    if file_locks[i].active == 1 and file_locks[i].ino == ino {
+      // Check if ranges overlap
+      var lock_end: u64 = file_locks[i].start + file_locks[i].length
+      var request_end: u64 = start + length
+
+      var overlaps: u32 = 0
+      if file_locks[i].length == 0 or length == 0 {
+        overlaps = 1
+      } else if start < lock_end and request_end > file_locks[i].start {
+        overlaps = 1
+      }
+
+      if overlaps == 1 {
+        holder_pid.* = file_locks[i].pid
+        holder_type.* = file_locks[i].lock_type
+        return 0
+      }
+    }
+    i = i + 1
+  }
+
+  holder_pid.* = 0
+  holder_type.* = LOCK_NONE
+  return 0
 }
 
 // ============================================================================

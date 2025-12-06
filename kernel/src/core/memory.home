@@ -538,6 +538,426 @@ export fn kcalloc(count: u64, size: u64): u64 {
 }
 
 // ============================================================================
+// MEMORY UTILITIES
+// ============================================================================
+
+export fn memset(addr: u64, value: u8, size: u64) {
+  var ptr: *u8 = @ptrFromInt(addr)
+  var i: u64 = 0
+  while i < size {
+    ptr[i] = value
+    i = i + 1
+  }
+}
+
+export fn memcpy(dst: u64, src: u64, size: u64) {
+  var d: *u8 = @ptrFromInt(dst)
+  var s: *u8 = @ptrFromInt(src)
+  var i: u64 = 0
+  while i < size {
+    d[i] = s[i]
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// PER-PROCESS ADDRESS SPACE MANAGEMENT
+// ============================================================================
+
+const MAX_PROCESSES: u32 = 256
+const PAGE_COW: u64 = 1 << 9  // Copy-on-write flag
+
+// Per-process PML4 table pointers
+var process_pml4: [u64; 256]
+var process_pml4_initialized: u32 = 0
+
+fn init_process_pml4() {
+  if process_pml4_initialized == 1 { return }
+
+  var i: u32 = 0
+  while i < MAX_PROCESSES {
+    process_pml4[i] = 0
+    i = i + 1
+  }
+
+  // Process 0 uses kernel PML4
+  process_pml4[0] = vmm_pml4
+
+  process_pml4_initialized = 1
+}
+
+// Create address space for a new process
+export fn vmm_create_address_space(pid: u32): u64 {
+  init_process_pml4()
+
+  if pid >= MAX_PROCESSES { return 0 }
+
+  // Allocate PML4 for this process
+  var pml4: u64 = pmm_alloc_page()
+  if pml4 == 0 { return 0 }
+
+  // Clear PML4
+  memset(pml4, 0, PAGE_SIZE)
+
+  // Copy kernel mappings (upper half)
+  var kernel_pml4: u64 = vmm_pml4
+  var i: u32 = 256
+  while i < 512 {
+    var src_entry: u64 = @intToPtr(kernel_pml4 + i * 8, u64)
+    if src_entry != 0 {
+      @ptrToInt(pml4 + i * 8, u64) = src_entry
+    }
+    i = i + 1
+  }
+
+  process_pml4[pid] = pml4
+  return pml4
+}
+
+// Get PML4 for a process
+fn get_process_pml4(pid: u32): u64 {
+  init_process_pml4()
+
+  if pid >= MAX_PROCESSES { return vmm_pml4 }
+  if process_pml4[pid] == 0 { return vmm_pml4 }
+  return process_pml4[pid]
+}
+
+// Map page in a process's address space
+export fn vmm_map_page_process(pid: u32, virt: u64, phys: u64, prot: u32): u32 {
+  var pml4: u64 = get_process_pml4(pid)
+
+  // Convert protection flags
+  var flags: u64 = PAGE_PRESENT
+  if (prot & 2) != 0 {  // PROT_WRITE
+    flags = flags | PAGE_WRITE
+  }
+  if (prot & 4) == 0 {  // Not PROT_EXEC (NX bit)
+    // NX bit would be set here if supported
+  }
+  flags = flags | PAGE_USER
+
+  var pml4_index: u32 = @truncate((virt >> 39) & 0x1FF, u32)
+  var pdpt_index: u32 = @truncate((virt >> 30) & 0x1FF, u32)
+  var pd_index: u32 = @truncate((virt >> 21) & 0x1FF, u32)
+  var pt_index: u32 = @truncate((virt >> 12) & 0x1FF, u32)
+
+  // Get or create PDPT
+  var pml4_entry_addr: u64 = pml4 + (pml4_index * 8)
+  var pdpt: u64 = @intToPtr(pml4_entry_addr, u64) & ~0xFFF
+
+  if pdpt == 0 {
+    pdpt = pmm_alloc_page()
+    if pdpt == 0 { return 1 }
+    memset(pdpt, 0, PAGE_SIZE)
+    @ptrToInt(pml4_entry_addr, u64) = pdpt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER
+  }
+
+  // Get or create PD
+  var pdpt_entry_addr: u64 = pdpt + (pdpt_index * 8)
+  var pd: u64 = @intToPtr(pdpt_entry_addr, u64) & ~0xFFF
+
+  if pd == 0 {
+    pd = pmm_alloc_page()
+    if pd == 0 { return 1 }
+    memset(pd, 0, PAGE_SIZE)
+    @ptrToInt(pdpt_entry_addr, u64) = pd | PAGE_PRESENT | PAGE_WRITE | PAGE_USER
+  }
+
+  // Get or create PT
+  var pd_entry_addr: u64 = pd + (pd_index * 8)
+  var pt: u64 = @intToPtr(pd_entry_addr, u64) & ~0xFFF
+
+  if pt == 0 {
+    pt = pmm_alloc_page()
+    if pt == 0 { return 1 }
+    memset(pt, 0, PAGE_SIZE)
+    @ptrToInt(pd_entry_addr, u64) = pt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER
+  }
+
+  // Map page
+  var pt_entry_addr: u64 = pt + (pt_index * 8)
+  @ptrToInt(pt_entry_addr, u64) = phys | flags
+
+  // Flush TLB if this is the current address space
+  if pid == 0 or pml4 == vmm_pml4 {
+    asm volatile ("invlpg (%[virt])"
+      :
+      : [virt] "r" (virt)
+    )
+  }
+
+  return 0
+}
+
+// Unmap page in a process's address space
+export fn vmm_unmap_page_process(pid: u32, virt: u64) {
+  var pml4: u64 = get_process_pml4(pid)
+
+  var pml4_index: u32 = @truncate((virt >> 39) & 0x1FF, u32)
+  var pdpt_index: u32 = @truncate((virt >> 30) & 0x1FF, u32)
+  var pd_index: u32 = @truncate((virt >> 21) & 0x1FF, u32)
+  var pt_index: u32 = @truncate((virt >> 12) & 0x1FF, u32)
+
+  var pml4_entry_addr: u64 = pml4 + (pml4_index * 8)
+  var pdpt: u64 = @intToPtr(pml4_entry_addr, u64) & ~0xFFF
+  if pdpt == 0 { return }
+
+  var pdpt_entry_addr: u64 = pdpt + (pdpt_index * 8)
+  var pd: u64 = @intToPtr(pdpt_entry_addr, u64) & ~0xFFF
+  if pd == 0 { return }
+
+  var pd_entry_addr: u64 = pd + (pd_index * 8)
+  var pt: u64 = @intToPtr(pd_entry_addr, u64) & ~0xFFF
+  if pt == 0 { return }
+
+  var pt_entry_addr: u64 = pt + (pt_index * 8)
+  @ptrToInt(pt_entry_addr, u64) = 0
+
+  // Flush TLB if this is the current address space
+  if pid == 0 or pml4 == vmm_pml4 {
+    asm volatile ("invlpg (%[virt])"
+      :
+      : [virt] "r" (virt)
+    )
+  }
+}
+
+// Get physical address for a virtual address in a process
+export fn vmm_get_physical(pid: u32, virt: u64): u64 {
+  var pml4: u64 = get_process_pml4(pid)
+
+  var pml4_index: u32 = @truncate((virt >> 39) & 0x1FF, u32)
+  var pdpt_index: u32 = @truncate((virt >> 30) & 0x1FF, u32)
+  var pd_index: u32 = @truncate((virt >> 21) & 0x1FF, u32)
+  var pt_index: u32 = @truncate((virt >> 12) & 0x1FF, u32)
+
+  var pml4_entry_addr: u64 = pml4 + (pml4_index * 8)
+  var pml4_entry: u64 = @intToPtr(pml4_entry_addr, u64)
+  if (pml4_entry & PAGE_PRESENT) == 0 { return 0 }
+
+  var pdpt: u64 = pml4_entry & ~0xFFF
+  var pdpt_entry: u64 = @intToPtr(pdpt + pdpt_index * 8, u64)
+  if (pdpt_entry & PAGE_PRESENT) == 0 { return 0 }
+
+  var pd: u64 = pdpt_entry & ~0xFFF
+  var pd_entry: u64 = @intToPtr(pd + pd_index * 8, u64)
+  if (pd_entry & PAGE_PRESENT) == 0 { return 0 }
+
+  var pt: u64 = pd_entry & ~0xFFF
+  var pt_entry: u64 = @intToPtr(pt + pt_index * 8, u64)
+  if (pt_entry & PAGE_PRESENT) == 0 { return 0 }
+
+  return (pt_entry & ~0xFFF) + (virt & 0xFFF)
+}
+
+// Set page protection
+export fn vmm_set_protection(pid: u32, virt: u64, prot: u32) {
+  var pml4: u64 = get_process_pml4(pid)
+
+  var pml4_index: u32 = @truncate((virt >> 39) & 0x1FF, u32)
+  var pdpt_index: u32 = @truncate((virt >> 30) & 0x1FF, u32)
+  var pd_index: u32 = @truncate((virt >> 21) & 0x1FF, u32)
+  var pt_index: u32 = @truncate((virt >> 12) & 0x1FF, u32)
+
+  var pml4_entry: u64 = @intToPtr(pml4 + pml4_index * 8, u64)
+  if (pml4_entry & PAGE_PRESENT) == 0 { return }
+
+  var pdpt: u64 = pml4_entry & ~0xFFF
+  var pdpt_entry: u64 = @intToPtr(pdpt + pdpt_index * 8, u64)
+  if (pdpt_entry & PAGE_PRESENT) == 0 { return }
+
+  var pd: u64 = pdpt_entry & ~0xFFF
+  var pd_entry: u64 = @intToPtr(pd + pd_index * 8, u64)
+  if (pd_entry & PAGE_PRESENT) == 0 { return }
+
+  var pt: u64 = pd_entry & ~0xFFF
+  var pt_entry_addr: u64 = pt + pt_index * 8
+  var pt_entry: u64 = @intToPtr(pt_entry_addr, u64)
+  if (pt_entry & PAGE_PRESENT) == 0 { return }
+
+  // Get physical address
+  var phys: u64 = pt_entry & ~0xFFF
+
+  // Build new flags
+  var flags: u64 = PAGE_PRESENT | PAGE_USER
+  if (prot & 2) != 0 {  // PROT_WRITE
+    flags = flags | PAGE_WRITE
+  }
+
+  // Update entry
+  @ptrToInt(pt_entry_addr, u64) = phys | flags
+
+  // Flush TLB
+  if pid == 0 or pml4 == vmm_pml4 {
+    asm volatile ("invlpg (%[virt])"
+      :
+      : [virt] "r" (virt)
+    )
+  }
+}
+
+// Set copy-on-write for a page
+export fn vmm_set_cow(pid: u32, virt: u64) {
+  var pml4: u64 = get_process_pml4(pid)
+
+  var pml4_index: u32 = @truncate((virt >> 39) & 0x1FF, u32)
+  var pdpt_index: u32 = @truncate((virt >> 30) & 0x1FF, u32)
+  var pd_index: u32 = @truncate((virt >> 21) & 0x1FF, u32)
+  var pt_index: u32 = @truncate((virt >> 12) & 0x1FF, u32)
+
+  var pml4_entry: u64 = @intToPtr(pml4 + pml4_index * 8, u64)
+  if (pml4_entry & PAGE_PRESENT) == 0 { return }
+
+  var pdpt: u64 = pml4_entry & ~0xFFF
+  var pdpt_entry: u64 = @intToPtr(pdpt + pdpt_index * 8, u64)
+  if (pdpt_entry & PAGE_PRESENT) == 0 { return }
+
+  var pd: u64 = pdpt_entry & ~0xFFF
+  var pd_entry: u64 = @intToPtr(pd + pd_index * 8, u64)
+  if (pd_entry & PAGE_PRESENT) == 0 { return }
+
+  var pt: u64 = pd_entry & ~0xFFF
+  var pt_entry_addr: u64 = pt + pt_index * 8
+  var pt_entry: u64 = @intToPtr(pt_entry_addr, u64)
+  if (pt_entry & PAGE_PRESENT) == 0 { return }
+
+  // Set COW flag and remove write permission
+  pt_entry = pt_entry | PAGE_COW
+  pt_entry = pt_entry & ~PAGE_WRITE
+
+  @ptrToInt(pt_entry_addr, u64) = pt_entry
+
+  // Flush TLB
+  if pid == 0 or pml4 == vmm_pml4 {
+    asm volatile ("invlpg (%[virt])"
+      :
+      : [virt] "r" (virt)
+    )
+  }
+}
+
+// Handle COW page fault
+export fn vmm_handle_cow(pid: u32, virt: u64): u32 {
+  var pml4: u64 = get_process_pml4(pid)
+
+  var pml4_index: u32 = @truncate((virt >> 39) & 0x1FF, u32)
+  var pdpt_index: u32 = @truncate((virt >> 30) & 0x1FF, u32)
+  var pd_index: u32 = @truncate((virt >> 21) & 0x1FF, u32)
+  var pt_index: u32 = @truncate((virt >> 12) & 0x1FF, u32)
+
+  var pml4_entry: u64 = @intToPtr(pml4 + pml4_index * 8, u64)
+  if (pml4_entry & PAGE_PRESENT) == 0 { return 1 }
+
+  var pdpt: u64 = pml4_entry & ~0xFFF
+  var pdpt_entry: u64 = @intToPtr(pdpt + pdpt_index * 8, u64)
+  if (pdpt_entry & PAGE_PRESENT) == 0 { return 1 }
+
+  var pd: u64 = pdpt_entry & ~0xFFF
+  var pd_entry: u64 = @intToPtr(pd + pd_index * 8, u64)
+  if (pd_entry & PAGE_PRESENT) == 0 { return 1 }
+
+  var pt: u64 = pd_entry & ~0xFFF
+  var pt_entry_addr: u64 = pt + pt_index * 8
+  var pt_entry: u64 = @intToPtr(pt_entry_addr, u64)
+  if (pt_entry & PAGE_PRESENT) == 0 { return 1 }
+
+  // Check if this is a COW page
+  if (pt_entry & PAGE_COW) == 0 {
+    return 1  // Not a COW fault
+  }
+
+  var old_phys: u64 = pt_entry & ~0xFFF
+
+  // Allocate new page
+  var new_phys: u64 = pmm_alloc_page()
+  if new_phys == 0 { return 1 }
+
+  // Copy contents
+  memcpy(new_phys, old_phys, PAGE_SIZE)
+
+  // Map with write permission, clear COW flag
+  var flags: u64 = PAGE_PRESENT | PAGE_WRITE | PAGE_USER
+  @ptrToInt(pt_entry_addr, u64) = new_phys | flags
+
+  // Flush TLB
+  asm volatile ("invlpg (%[virt])"
+    :
+    : [virt] "r" (virt)
+  )
+
+  return 0
+}
+
+// Switch to a process's address space
+export fn vmm_switch_address_space(pid: u32) {
+  var pml4: u64 = get_process_pml4(pid)
+  if pml4 == 0 { return }
+
+  asm volatile ("mov %[pml4], %%cr3"
+    :
+    : [pml4] "r" (pml4)
+  )
+}
+
+// Free a process's address space
+export fn vmm_free_address_space(pid: u32) {
+  if pid >= MAX_PROCESSES { return }
+  if pid == 0 { return }  // Never free kernel address space
+
+  var pml4: u64 = process_pml4[pid]
+  if pml4 == 0 { return }
+
+  // Free user-space page tables (entries 0-255)
+  var pml4_idx: u32 = 0
+  while pml4_idx < 256 {
+    var pml4_entry: u64 = @intToPtr(pml4 + pml4_idx * 8, u64)
+    if (pml4_entry & PAGE_PRESENT) != 0 {
+      var pdpt: u64 = pml4_entry & ~0xFFF
+
+      var pdpt_idx: u32 = 0
+      while pdpt_idx < 512 {
+        var pdpt_entry: u64 = @intToPtr(pdpt + pdpt_idx * 8, u64)
+        if (pdpt_entry & PAGE_PRESENT) != 0 {
+          var pd: u64 = pdpt_entry & ~0xFFF
+
+          var pd_idx: u32 = 0
+          while pd_idx < 512 {
+            var pd_entry: u64 = @intToPtr(pd + pd_idx * 8, u64)
+            if (pd_entry & PAGE_PRESENT) != 0 {
+              var pt: u64 = pd_entry & ~0xFFF
+
+              // Free page table entries
+              var pt_idx: u32 = 0
+              while pt_idx < 512 {
+                var pt_entry: u64 = @intToPtr(pt + pt_idx * 8, u64)
+                if (pt_entry & PAGE_PRESENT) != 0 {
+                  var phys: u64 = pt_entry & ~0xFFF
+                  pmm_free_page(phys)
+                }
+                pt_idx = pt_idx + 1
+              }
+
+              pmm_free_page(pt)
+            }
+            pd_idx = pd_idx + 1
+          }
+
+          pmm_free_page(pd)
+        }
+        pdpt_idx = pdpt_idx + 1
+      }
+
+      pmm_free_page(pdpt)
+    }
+    pml4_idx = pml4_idx + 1
+  }
+
+  pmm_free_page(pml4)
+  process_pml4[pid] = 0
+}
+
+// ============================================================================
 // INITIALIZATION
 // ============================================================================
 
@@ -545,6 +965,7 @@ export fn memory_init(memory_size: u64) {
   pmm_init(memory_size)
   vmm_init()
   heap_init()
-  
+  init_process_pml4()
+
   foundation.serial_write_string("[Memory] Initialized\n")
 }

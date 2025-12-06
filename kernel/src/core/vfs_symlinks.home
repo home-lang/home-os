@@ -77,9 +77,19 @@ export fn vfs_symlink(target: u64, linkpath: u64, uid: u32, gid: u32): u32 {
 // ============================================================================
 
 export fn vfs_readlink(linkpath: u64, buffer: u64, bufsize: u32): u32 {
-  // TODO: Get inode from linkpath
-  // For now, just return error
-  return 0xFFFFFFFF
+  // Get inode from linkpath using path resolution
+  var ino: u32 = filesystem.inode_lookup(linkpath)
+  if ino == 0 {
+    return 0xFFFFFFFF  // ENOENT
+  }
+
+  var inode_ptr: u64 = filesystem.inode_get(ino)
+  if inode_ptr == 0 {
+    return 0xFFFFFFFF
+  }
+
+  var inode: *filesystem.Inode = @ptrFromInt(inode_ptr)
+  return vfs_readlink_inode(inode, buffer, bufsize)
 }
 
 export fn vfs_readlink_inode(inode: *filesystem.Inode, buffer: u64, bufsize: u32): u32 {
@@ -111,7 +121,7 @@ export fn vfs_readlink_inode(inode: *filesystem.Inode, buffer: u64, bufsize: u32
 // SYMLINK FOLLOWING
 // ============================================================================
 
-fn follow_symlink_internal(inode: *filesystem.Inode, resolved_path: u64, depth: u32): u32 {
+fn follow_symlink_internal(inode: *filesystem.Inode, current_dir: u64, resolved_path: u64, depth: u32): u32 {
   if depth > MAX_SYMLINK_DEPTH {
     foundation.serial_write_string("[VFS] Symlink loop detected\n")
     return 1  // Too many symlinks (ELOOP)
@@ -123,38 +133,119 @@ fn follow_symlink_internal(inode: *filesystem.Inode, resolved_path: u64, depth: 
 
   // Read the symlink target
   var target_buffer: [u8; 4096]
-  var target_len: u32 = vfs_readlink_inode(inode, @ptrFromInt(&target_buffer), 4096)
+  var target_len: u32 = vfs_readlink_inode(inode, @intFromPtr(&target_buffer), 4096)
 
   if target_len == 0xFFFFFFFF {
     return 1  // Failed to read symlink
   }
 
-  // Copy target to resolved_path
-  memory.memcpy(resolved_path, @ptrFromInt(&target_buffer), target_len)
-  var resolved_ptr: *u8 = @ptrFromInt(resolved_path)
-  resolved_ptr[target_len] = 0
+  // Check if target is absolute or relative
+  if target_buffer[0] == '/' {
+    // Absolute path - use directly
+    memory.memcpy(resolved_path, @intFromPtr(&target_buffer), target_len)
+    var resolved_ptr: *u8 = @ptrFromInt(resolved_path)
+    resolved_ptr[target_len] = 0
+  } else {
+    // Relative path - combine with current directory
+    var resolved_ptr: *u8 = @ptrFromInt(resolved_path)
+    var cur_dir_ptr: *u8 = @ptrFromInt(current_dir)
 
-  // TODO: If target is absolute, use it directly
-  // TODO: If target is relative, combine with current directory
-  // TODO: Recursively resolve if target is also a symlink
+    // Copy current directory
+    var pos: u32 = 0
+    while cur_dir_ptr[pos] != 0 and pos < 4096 {
+      resolved_ptr[pos] = cur_dir_ptr[pos]
+      pos = pos + 1
+    }
+
+    // Add separator if needed
+    if pos > 0 and resolved_ptr[pos - 1] != '/' {
+      resolved_ptr[pos] = '/'
+      pos = pos + 1
+    }
+
+    // Append target
+    var i: u32 = 0
+    while i < target_len and pos < 4095 {
+      resolved_ptr[pos] = target_buffer[i]
+      pos = pos + 1
+      i = i + 1
+    }
+    resolved_ptr[pos] = 0
+  }
+
+  // Check if resolved path is also a symlink
+  var resolved_ino: u32 = filesystem.inode_lookup(resolved_path)
+  if resolved_ino != 0 {
+    var resolved_inode_ptr: u64 = filesystem.inode_get(resolved_ino)
+    if resolved_inode_ptr != 0 {
+      var resolved_inode: *filesystem.Inode = @ptrFromInt(resolved_inode_ptr)
+      if resolved_inode.file_type == FILE_TYPE_SYMLINK {
+        // Recursively resolve
+        return follow_symlink_internal(resolved_inode, current_dir, resolved_path, depth + 1)
+      }
+    }
+  }
 
   return 0
 }
 
 export fn follow_symlink(linkpath: u64, resolved_path: u64): u32 {
-  // TODO: Get inode from linkpath
-  // For now, just copy linkpath to resolved_path
-  var i: u32 = 0
-  var src_ptr: *u8 = @ptrFromInt(linkpath)
-  var dst_ptr: *u8 = @ptrFromInt(resolved_path)
-
-  while src_ptr[i] != 0 and i < MAX_SYMLINK_LEN {
-    dst_ptr[i] = src_ptr[i]
-    i = i + 1
+  // Get inode from linkpath
+  var ino: u32 = filesystem.inode_lookup(linkpath)
+  if ino == 0 {
+    // Path doesn't exist, just copy it
+    var i: u32 = 0
+    var src_ptr: *u8 = @ptrFromInt(linkpath)
+    var dst_ptr: *u8 = @ptrFromInt(resolved_path)
+    while src_ptr[i] != 0 and i < MAX_SYMLINK_LEN {
+      dst_ptr[i] = src_ptr[i]
+      i = i + 1
+    }
+    dst_ptr[i] = 0
+    return 0
   }
-  dst_ptr[i] = 0
 
-  return 0
+  var inode_ptr: u64 = filesystem.inode_get(ino)
+  if inode_ptr == 0 {
+    return 1
+  }
+
+  var inode: *filesystem.Inode = @ptrFromInt(inode_ptr)
+
+  // If not a symlink, just return the path
+  if inode.file_type != FILE_TYPE_SYMLINK {
+    var i: u32 = 0
+    var src_ptr: *u8 = @ptrFromInt(linkpath)
+    var dst_ptr: *u8 = @ptrFromInt(resolved_path)
+    while src_ptr[i] != 0 and i < MAX_SYMLINK_LEN {
+      dst_ptr[i] = src_ptr[i]
+      i = i + 1
+    }
+    dst_ptr[i] = 0
+    return 0
+  }
+
+  // Get parent directory for relative path resolution
+  var parent_dir: [u8; 4096]
+  var linkpath_ptr: *u8 = @ptrFromInt(linkpath)
+  var last_slash: u32 = 0
+  var j: u32 = 0
+  while linkpath_ptr[j] != 0 and j < 4095 {
+    if linkpath_ptr[j] == '/' {
+      last_slash = j
+    }
+    parent_dir[j] = linkpath_ptr[j]
+    j = j + 1
+  }
+
+  if last_slash > 0 {
+    parent_dir[last_slash] = 0
+  } else {
+    parent_dir[0] = '/'
+    parent_dir[1] = 0
+  }
+
+  return follow_symlink_internal(inode, @intFromPtr(&parent_dir), resolved_path, 0)
 }
 
 // ============================================================================
@@ -169,38 +260,223 @@ export fn is_symlink(inode: *filesystem.Inode): u32 {
 // SYMLINK UTILITIES
 // ============================================================================
 
+// File stat structure
+struct FileStat {
+  ino: u32,
+  mode: u32,
+  nlink: u32,
+  uid: u32,
+  gid: u32,
+  size: u64,
+  atime: u64,
+  mtime: u64,
+  ctime: u64,
+  file_type: u32
+}
+
 export fn vfs_lstat(path: u64, stat_buf: u64): u32 {
   // Like stat() but doesn't follow symlinks
-  // TODO: Implement when path resolution is complete
+  var ino: u32 = filesystem.inode_lookup(path)
+  if ino == 0 {
+    return 1  // ENOENT
+  }
+
+  var inode_ptr: u64 = filesystem.inode_get(ino)
+  if inode_ptr == 0 {
+    return 1
+  }
+
+  var inode: *filesystem.Inode = @ptrFromInt(inode_ptr)
+  var stat: *FileStat = @ptrFromInt(stat_buf)
+
+  stat.ino = inode.ino
+  stat.mode = inode.mode
+  stat.nlink = inode.link_count
+  stat.uid = inode.uid
+  stat.gid = inode.gid
+  stat.size = inode.size
+  stat.atime = inode.atime
+  stat.mtime = inode.mtime
+  stat.ctime = inode.ctime
+  stat.file_type = inode.file_type
+
   return 0
+}
+
+export fn vfs_stat(path: u64, stat_buf: u64): u32 {
+  // Like lstat() but follows symlinks
+  var resolved: [u8; 4096]
+  var result: u32 = vfs_realpath(path, @intFromPtr(&resolved))
+  if result != 0 {
+    return result
+  }
+
+  return vfs_lstat(@intFromPtr(&resolved), stat_buf)
 }
 
 export fn vfs_realpath(path: u64, resolved: u64): u32 {
   // Resolve all symlinks and return canonical absolute path
-  // TODO: Implement full path resolution with symlink following
-
-  var depth: u32 = 0
-  var current_path: [u8; 4096]
-
-  // Copy input path
-  var i: u32 = 0
   var path_ptr: *u8 = @ptrFromInt(path)
-  while path_ptr[i] != 0 and i < 4096 {
-    current_path[i] = path_ptr[i]
-    i = i + 1
-  }
-  current_path[i] = 0
-
-  // TODO: For each component in path:
-  //   1. Check if it's a symlink
-  //   2. If yes, read target and replace
-  //   3. Increment depth and check MAX_SYMLINK_DEPTH
-  //   4. Continue with next component
-
-  // For now, just copy path to resolved
-  memory.memcpy(resolved, @ptrFromInt(&current_path), i)
   var resolved_ptr: *u8 = @ptrFromInt(resolved)
-  resolved_ptr[i] = 0
+
+  // Start with empty resolved path
+  var resolved_len: u32 = 0
+
+  // Make path absolute
+  if path_ptr[0] != '/' {
+    // TODO: prepend current working directory
+    resolved_ptr[0] = '/'
+    resolved_len = 1
+  }
+
+  // Parse and resolve each component
+  var pos: u32 = 0
+  var depth: u32 = 0
+
+  while path_ptr[pos] != 0 and depth < MAX_SYMLINK_DEPTH {
+    // Skip leading slashes
+    while path_ptr[pos] == '/' {
+      pos = pos + 1
+    }
+
+    if path_ptr[pos] == 0 { break }
+
+    // Extract component
+    var component: [u8; 256]
+    var comp_len: u32 = 0
+    while path_ptr[pos] != 0 and path_ptr[pos] != '/' and comp_len < 255 {
+      component[comp_len] = path_ptr[pos]
+      comp_len = comp_len + 1
+      pos = pos + 1
+    }
+    component[comp_len] = 0
+
+    // Handle . and ..
+    if comp_len == 1 and component[0] == '.' {
+      // Current directory - skip
+      continue
+    }
+
+    if comp_len == 2 and component[0] == '.' and component[1] == '.' {
+      // Parent directory - remove last component
+      if resolved_len > 1 {
+        resolved_len = resolved_len - 1
+        while resolved_len > 0 and resolved_ptr[resolved_len - 1] != '/' {
+          resolved_len = resolved_len - 1
+        }
+        if resolved_len == 0 {
+          resolved_len = 1
+        }
+      }
+      continue
+    }
+
+    // Add separator if needed
+    if resolved_len > 1 or (resolved_len == 1 and resolved_ptr[0] != '/') {
+      resolved_ptr[resolved_len] = '/'
+      resolved_len = resolved_len + 1
+    } else if resolved_len == 0 {
+      resolved_ptr[0] = '/'
+      resolved_len = 1
+    }
+
+    // Append component
+    var i: u32 = 0
+    while i < comp_len and resolved_len < 4095 {
+      resolved_ptr[resolved_len] = component[i]
+      resolved_len = resolved_len + 1
+      i = i + 1
+    }
+    resolved_ptr[resolved_len] = 0
+
+    // Check if this path is a symlink
+    var ino: u32 = filesystem.inode_lookup(resolved)
+    if ino != 0 {
+      var inode_ptr: u64 = filesystem.inode_get(ino)
+      if inode_ptr != 0 {
+        var inode: *filesystem.Inode = @ptrFromInt(inode_ptr)
+
+        if inode.file_type == FILE_TYPE_SYMLINK {
+          depth = depth + 1
+
+          // Read symlink target
+          var target: [u8; 4096]
+          var target_len: u32 = vfs_readlink_inode(inode, @intFromPtr(&target), 4096)
+
+          if target_len == 0xFFFFFFFF {
+            return 1  // Failed to read symlink
+          }
+
+          if target[0] == '/' {
+            // Absolute symlink - replace resolved path
+            var j: u32 = 0
+            while j < target_len {
+              resolved_ptr[j] = target[j]
+              j = j + 1
+            }
+            resolved_len = target_len
+          } else {
+            // Relative symlink - remove current component and append target
+            // Go back to parent
+            resolved_len = resolved_len - comp_len
+            if resolved_len > 0 and resolved_ptr[resolved_len - 1] == '/' {
+              resolved_len = resolved_len - 1
+            }
+
+            // Append target
+            if resolved_len > 0 {
+              resolved_ptr[resolved_len] = '/'
+              resolved_len = resolved_len + 1
+            }
+
+            var j: u32 = 0
+            while j < target_len and resolved_len < 4095 {
+              resolved_ptr[resolved_len] = target[j]
+              resolved_len = resolved_len + 1
+              j = j + 1
+            }
+          }
+          resolved_ptr[resolved_len] = 0
+
+          // Restart from beginning of the resolved path with remaining original path
+          // Append remaining path
+          while path_ptr[pos] != 0 and resolved_len < 4095 {
+            resolved_ptr[resolved_len] = path_ptr[pos]
+            resolved_len = resolved_len + 1
+            pos = pos + 1
+          }
+          resolved_ptr[resolved_len] = 0
+
+          // Copy resolved back to path for next iteration
+          pos = 0
+          var k: u32 = 0
+          var temp_path: [u8; 4096]
+          while k < resolved_len {
+            temp_path[k] = resolved_ptr[k]
+            k = k + 1
+          }
+          temp_path[k] = 0
+
+          // Reset and restart with new path
+          path_ptr = @ptrFromInt(@intFromPtr(&temp_path))
+          resolved_len = 0
+          continue
+        }
+      }
+    }
+  }
+
+  if depth >= MAX_SYMLINK_DEPTH {
+    foundation.serial_write_string("[VFS] Too many symlinks in path\n")
+    return 1  // ELOOP
+  }
+
+  // Ensure null termination
+  if resolved_len == 0 {
+    resolved_ptr[0] = '/'
+    resolved_len = 1
+  }
+  resolved_ptr[resolved_len] = 0
 
   return 0
 }
