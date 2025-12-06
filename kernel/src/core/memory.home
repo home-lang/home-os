@@ -301,11 +301,240 @@ export fn kmalloc(size: u64): u64 {
 
 export fn kfree(ptr: u64) {
   if ptr == 0 { return }
-  
+
   var block: u64 = ptr - @sizeOf(HeapBlock)
   @ptrToInt(block + 8, u32) = 0  // Mark as free
-  
-  // TODO: Coalesce adjacent free blocks
+
+  // Coalesce adjacent free blocks
+  coalesce_free_blocks()
+}
+
+// Coalesce adjacent free blocks to reduce fragmentation
+fn coalesce_free_blocks() {
+  var current: u64 = heap_head
+
+  while current != 0 {
+    var current_size: u64 = @intToPtr(current, u64)
+    var current_used: u32 = @intToPtr(current + 8, u32)
+    var current_next: u64 = @intToPtr(current + 12, u64)
+
+    // If current block is free, try to merge with next block
+    if current_used == 0 and current_next != 0 {
+      var next_used: u32 = @intToPtr(current_next + 8, u32)
+
+      // If next block is also free, merge them
+      if next_used == 0 {
+        var next_size: u64 = @intToPtr(current_next, u64)
+        var next_next: u64 = @intToPtr(current_next + 12, u64)
+
+        // Merge: current absorbs next
+        var new_size: u64 = current_size + @sizeOf(HeapBlock) + next_size
+        @ptrToInt(current, u64) = new_size
+        @ptrToInt(current + 12, u64) = next_next
+
+        // Don't advance - check if we can merge more
+        continue
+      }
+    }
+
+    current = current_next
+  }
+}
+
+// Get heap statistics
+export fn heap_get_stats(total: *u64, used: *u64, free: *u64, largest_free: *u64) {
+  var total_size: u64 = 0
+  var used_size: u64 = 0
+  var free_size: u64 = 0
+  var max_free: u64 = 0
+
+  var current: u64 = heap_head
+
+  while current != 0 {
+    var block_size: u64 = @intToPtr(current, u64)
+    var block_used: u32 = @intToPtr(current + 8, u32)
+    var block_next: u64 = @intToPtr(current + 12, u64)
+
+    total_size = total_size + block_size + @sizeOf(HeapBlock)
+
+    if block_used == 1 {
+      used_size = used_size + block_size
+    } else {
+      free_size = free_size + block_size
+      if block_size > max_free {
+        max_free = block_size
+      }
+    }
+
+    current = block_next
+  }
+
+  @ptrToInt(total, u64) = total_size
+  @ptrToInt(used, u64) = used_size
+  @ptrToInt(free, u64) = free_size
+  @ptrToInt(largest_free, u64) = max_free
+}
+
+// Compact heap by moving used blocks together
+export fn heap_compact() {
+  // First, coalesce all free blocks
+  coalesce_free_blocks()
+
+  // Note: Full compaction would require updating all pointers
+  // which is complex without garbage collection. This basic
+  // implementation just merges free blocks.
+
+  foundation.serial_write_string("[Heap] Compacted\n")
+}
+
+// Check heap integrity
+export fn heap_check(): u32 {
+  var current: u64 = heap_head
+  var prev: u64 = 0
+  var block_count: u32 = 0
+
+  while current != 0 {
+    var block_size: u64 = @intToPtr(current, u64)
+    var block_used: u32 = @intToPtr(current + 8, u32)
+    var block_next: u64 = @intToPtr(current + 12, u64)
+
+    // Validate block
+    if block_size == 0 {
+      foundation.serial_write_string("[Heap] ERROR: Zero-size block at ")
+      foundation.serial_write_hex(current)
+      foundation.serial_write_string("\n")
+      return 1
+    }
+
+    if block_used != 0 and block_used != 1 {
+      foundation.serial_write_string("[Heap] ERROR: Invalid used flag at ")
+      foundation.serial_write_hex(current)
+      foundation.serial_write_string("\n")
+      return 2
+    }
+
+    // Check for cycles
+    if block_next != 0 and block_next <= current {
+      foundation.serial_write_string("[Heap] ERROR: Backward/cycle link at ")
+      foundation.serial_write_hex(current)
+      foundation.serial_write_string("\n")
+      return 3
+    }
+
+    // Check block boundaries
+    var expected_next: u64 = current + @sizeOf(HeapBlock) + block_size
+    if block_next != 0 and block_next != expected_next {
+      // Blocks don't have to be contiguous, but check for overlap
+      if block_next < expected_next {
+        foundation.serial_write_string("[Heap] ERROR: Overlapping blocks at ")
+        foundation.serial_write_hex(current)
+        foundation.serial_write_string("\n")
+        return 4
+      }
+    }
+
+    prev = current
+    current = block_next
+    block_count = block_count + 1
+
+    // Prevent infinite loop
+    if block_count > 1000000 {
+      foundation.serial_write_string("[Heap] ERROR: Too many blocks (possible cycle)\n")
+      return 5
+    }
+  }
+
+  return 0  // Heap OK
+}
+
+// Reallocate memory (resize allocation)
+export fn krealloc(ptr: u64, new_size: u64): u64 {
+  if ptr == 0 {
+    return kmalloc(new_size)
+  }
+
+  if new_size == 0 {
+    kfree(ptr)
+    return 0
+  }
+
+  var block: u64 = ptr - @sizeOf(HeapBlock)
+  var old_size: u64 = @intToPtr(block, u64)
+
+  // If new size fits in current block, just return
+  var aligned_new: u64 = (new_size + 7) & ~7
+  if aligned_new <= old_size {
+    return ptr
+  }
+
+  // Check if we can expand into next block
+  var next: u64 = @intToPtr(block + 12, u64)
+  if next != 0 {
+    var next_used: u32 = @intToPtr(next + 8, u32)
+    if next_used == 0 {
+      var next_size: u64 = @intToPtr(next, u64)
+      var combined: u64 = old_size + @sizeOf(HeapBlock) + next_size
+
+      if combined >= aligned_new {
+        // Merge with next block
+        var next_next: u64 = @intToPtr(next + 12, u64)
+        @ptrToInt(block, u64) = combined
+        @ptrToInt(block + 12, u64) = next_next
+
+        // Split if there's enough space left
+        if combined >= aligned_new + @sizeOf(HeapBlock) + 64 {
+          var new_block: u64 = block + @sizeOf(HeapBlock) + aligned_new
+          @ptrToInt(new_block, u64) = combined - aligned_new - @sizeOf(HeapBlock)
+          @ptrToInt(new_block + 8, u32) = 0
+          @ptrToInt(new_block + 12, u64) = next_next
+
+          @ptrToInt(block, u64) = aligned_new
+          @ptrToInt(block + 12, u64) = new_block
+        }
+
+        return ptr
+      }
+    }
+  }
+
+  // Need to allocate new block and copy
+  var new_ptr: u64 = kmalloc(new_size)
+  if new_ptr == 0 {
+    return 0
+  }
+
+  // Copy old data
+  var copy_size: u64 = old_size
+  if new_size < copy_size {
+    copy_size = new_size
+  }
+
+  var i: u64 = 0
+  while i < copy_size {
+    @ptrToInt(new_ptr + i, u8) = @intToPtr(ptr + i, u8)
+    i = i + 1
+  }
+
+  // Free old block
+  kfree(ptr)
+
+  return new_ptr
+}
+
+// Allocate zeroed memory
+export fn kcalloc(count: u64, size: u64): u64 {
+  var total: u64 = count * size
+  var ptr: u64 = kmalloc(total)
+
+  if ptr != 0 {
+    var i: u64 = 0
+    while i < total {
+      @ptrToInt(ptr + i, u8) = 0
+      i = i + 1
+    }
+  }
+
+  return ptr
 }
 
 // ============================================================================

@@ -1,35 +1,810 @@
 // home-os Scanner Driver
-// Document scanning
+// USB and parallel port scanner support with SANE-like interface
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
 
+// ============================================================================
+// SCANNER TYPES AND MODES
+// ============================================================================
+
+const SCANNER_TYPE_NONE: u32 = 0
+const SCANNER_TYPE_USB: u32 = 1
+const SCANNER_TYPE_PARALLEL: u32 = 2
+const SCANNER_TYPE_SCSI: u32 = 3
+
+const SCANNER_MODE_LINEART: u32 = 0   // 1-bit black/white
+const SCANNER_MODE_GRAY: u32 = 1      // 8-bit grayscale
+const SCANNER_MODE_COLOR: u32 = 2     // 24-bit RGB
+
+const SCANNER_STATUS_IDLE: u32 = 0
+const SCANNER_STATUS_WARMING: u32 = 1
+const SCANNER_STATUS_SCANNING: u32 = 2
+const SCANNER_STATUS_DONE: u32 = 3
+const SCANNER_STATUS_ERROR: u32 = 4
+
+// ============================================================================
+// DPI CONSTANTS
+// ============================================================================
+
+const SCANNER_DPI_75: u32 = 75
 const SCANNER_DPI_150: u32 = 150
 const SCANNER_DPI_300: u32 = 300
 const SCANNER_DPI_600: u32 = 600
+const SCANNER_DPI_1200: u32 = 1200
+const SCANNER_DPI_2400: u32 = 2400
 
+// ============================================================================
+// USB SCANNER CLASS (Image Class)
+// ============================================================================
+
+const USB_CLASS_IMAGE: u8 = 0x06
+const USB_SUBCLASS_STILL_IMAGE: u8 = 0x01
+const USB_PROTOCOL_BULK_ONLY: u8 = 0x01
+
+// USB Still Image commands (PTP-like)
+const USB_SCAN_GET_DEVICE_STATUS: u16 = 0x0001
+const USB_SCAN_GET_CAPABILITIES: u16 = 0x0002
+const USB_SCAN_START_SCAN: u16 = 0x0010
+const USB_SCAN_ABORT_SCAN: u16 = 0x0011
+const USB_SCAN_GET_DATA: u16 = 0x0012
+const USB_SCAN_SET_PARAMETERS: u16 = 0x0020
+
+// ============================================================================
+// PARALLEL PORT SCANNER (EPP/ECP)
+// ============================================================================
+
+const LPT1_BASE: u16 = 0x378
+const LPT2_BASE: u16 = 0x278
+
+const LPT_DATA: u16 = 0x00      // Data register
+const LPT_STATUS: u16 = 0x01    // Status register
+const LPT_CONTROL: u16 = 0x02   // Control register
+const LPT_EPP_ADDR: u16 = 0x03  // EPP Address
+const LPT_EPP_DATA: u16 = 0x04  // EPP Data
+
+// Status register bits
+const LPT_STATUS_BUSY: u8 = 0x80
+const LPT_STATUS_ACK: u8 = 0x40
+const LPT_STATUS_PAPER_OUT: u8 = 0x20
+const LPT_STATUS_SELECT: u8 = 0x10
+const LPT_STATUS_ERROR: u8 = 0x08
+
+// Control register bits
+const LPT_CTRL_STROBE: u8 = 0x01
+const LPT_CTRL_AUTOFEED: u8 = 0x02
+const LPT_CTRL_INIT: u8 = 0x04
+const LPT_CTRL_SELECT: u8 = 0x08
+const LPT_CTRL_IRQ_EN: u8 = 0x10
+const LPT_CTRL_BIDIR: u8 = 0x20
+
+// ============================================================================
+// SCAN PARAMETERS
+// ============================================================================
+
+struct ScanParameters {
+  x_offset: u32,     // Left margin in pixels
+  y_offset: u32,     // Top margin in pixels
+  width: u32,        // Scan width in pixels
+  height: u32,       // Scan height in pixels
+  dpi_x: u32,        // Horizontal resolution
+  dpi_y: u32,        // Vertical resolution
+  mode: u32,         // Scan mode (lineart/gray/color)
+  depth: u32,        // Bits per channel (1, 8, 16)
+  brightness: i32,   // Brightness adjustment (-100 to 100)
+  contrast: i32,     // Contrast adjustment (-100 to 100)
+  gamma: u32         // Gamma * 100 (100 = 1.0)
+}
+
+struct ScannerInfo {
+  vendor_id: u16,
+  product_id: u16,
+  vendor_name: [32]u8,
+  model_name: [64]u8,
+  max_width: u32,    // Max scan width in pixels at 300dpi
+  max_height: u32,   // Max scan height in pixels at 300dpi
+  min_dpi: u32,
+  max_dpi: u32,
+  color_support: u32,
+  duplex_support: u32
+}
+
+// ============================================================================
+// DRIVER STATE
+// ============================================================================
+
+var scanner_type: u32 = SCANNER_TYPE_NONE
 var scanner_initialized: u32 = 0
+var scanner_status: u32 = SCANNER_STATUS_IDLE
 var scanner_dpi: u32 = SCANNER_DPI_300
+var scanner_mode: u32 = SCANNER_MODE_COLOR
+
+// Current parameters
+var current_params: ScanParameters
+var scanner_info: ScannerInfo
+
+// USB scanner state
+var usb_address: u8 = 0
+var usb_endpoint_in: u8 = 0
+var usb_endpoint_out: u8 = 0
+var usb_control_endpoint: u8 = 0
+
+// Parallel scanner state
+var lpt_base: u16 = LPT1_BASE
+var parallel_scanner_id: u32 = 0
+
+// Scan buffer
+var scan_buffer: u64 = 0
+var scan_buffer_size: u32 = 0
+var scan_bytes_read: u32 = 0
+var scan_total_bytes: u32 = 0
+var scan_line_width: u32 = 0
+var scan_current_line: u32 = 0
+
+// Callback for scan progress
+var progress_callback: fn(u32, u32) = null
+
+// ============================================================================
+// PORT I/O HELPERS
+// ============================================================================
+
+fn outb(port: u16, value: u8) {
+  asm volatile ("outb %[value], %[port]"
+    :
+    : [value] "a" (value), [port] "Nd" (port)
+  )
+}
+
+fn inb(port: u16): u8 {
+  var result: u8 = 0
+  asm volatile ("inb %[port], %[result]"
+    : [result] "=a" (result)
+    : [port] "Nd" (port)
+  )
+  return result
+}
+
+fn io_wait() {
+  outb(0x80, 0)
+}
+
+// ============================================================================
+// USB SCANNER IMPLEMENTATION
+// ============================================================================
+
+fn usb_control_transfer(request_type: u8, request: u8, value: u16, index: u16, data: u64, length: u16): u32 {
+  // This would interface with the USB host controller
+  // Simplified implementation - actual USB stack required
+  return 0
+}
+
+fn usb_bulk_transfer(endpoint: u8, data: u64, length: u32): u32 {
+  // Bulk transfer via USB host controller
+  // Returns bytes transferred
+  return 0
+}
+
+fn usb_scanner_get_status(): u32 {
+  var status: [4]u8
+  usb_control_transfer(0xA1, 0x00, 0, 0, @ptrToInt(&status), 4)
+  return status[0]
+}
+
+fn usb_scanner_get_capabilities() {
+  var caps: [256]u8
+  usb_control_transfer(0xA1, 0x01, 0, 0, @ptrToInt(&caps), 256)
+
+  // Parse capabilities
+  scanner_info.max_width = caps[4] | (caps[5] << 8) | (caps[6] << 16) | (caps[7] << 24)
+  scanner_info.max_height = caps[8] | (caps[9] << 8) | (caps[10] << 16) | (caps[11] << 24)
+  scanner_info.min_dpi = caps[12] | (caps[13] << 8)
+  scanner_info.max_dpi = caps[14] | (caps[15] << 8)
+  scanner_info.color_support = caps[16]
+  scanner_info.duplex_support = caps[17]
+}
+
+fn usb_scanner_set_parameters(): u32 {
+  var params: [32]u8
+
+  // Pack parameters
+  params[0] = current_params.x_offset & 0xFF
+  params[1] = (current_params.x_offset >> 8) & 0xFF
+  params[2] = (current_params.x_offset >> 16) & 0xFF
+  params[3] = (current_params.x_offset >> 24) & 0xFF
+
+  params[4] = current_params.y_offset & 0xFF
+  params[5] = (current_params.y_offset >> 8) & 0xFF
+  params[6] = (current_params.y_offset >> 16) & 0xFF
+  params[7] = (current_params.y_offset >> 24) & 0xFF
+
+  params[8] = current_params.width & 0xFF
+  params[9] = (current_params.width >> 8) & 0xFF
+  params[10] = (current_params.width >> 16) & 0xFF
+  params[11] = (current_params.width >> 24) & 0xFF
+
+  params[12] = current_params.height & 0xFF
+  params[13] = (current_params.height >> 8) & 0xFF
+  params[14] = (current_params.height >> 16) & 0xFF
+  params[15] = (current_params.height >> 24) & 0xFF
+
+  params[16] = current_params.dpi_x & 0xFF
+  params[17] = (current_params.dpi_x >> 8) & 0xFF
+
+  params[18] = current_params.dpi_y & 0xFF
+  params[19] = (current_params.dpi_y >> 8) & 0xFF
+
+  params[20] = current_params.mode
+  params[21] = current_params.depth
+
+  return usb_control_transfer(0x21, 0x20, 0, 0, @ptrToInt(&params), 32)
+}
+
+fn usb_scanner_start(): u32 {
+  var cmd: [4]u8 = [0x10, 0x00, 0x00, 0x00]  // Start scan command
+  return usb_control_transfer(0x21, 0x10, 0, 0, @ptrToInt(&cmd), 4)
+}
+
+fn usb_scanner_abort(): u32 {
+  var cmd: [4]u8 = [0x11, 0x00, 0x00, 0x00]  // Abort scan command
+  return usb_control_transfer(0x21, 0x11, 0, 0, @ptrToInt(&cmd), 4)
+}
+
+fn usb_scanner_read_data(buffer: u64, max_length: u32): u32 {
+  return usb_bulk_transfer(usb_endpoint_in, buffer, max_length)
+}
+
+fn usb_scanner_init(address: u8, ep_in: u8, ep_out: u8): u32 {
+  usb_address = address
+  usb_endpoint_in = ep_in
+  usb_endpoint_out = ep_out
+
+  // Get device capabilities
+  usb_scanner_get_capabilities()
+
+  scanner_type = SCANNER_TYPE_USB
+  foundation.serial_write_string("[Scanner] USB scanner initialized\n")
+
+  return 0
+}
+
+// ============================================================================
+// PARALLEL PORT SCANNER IMPLEMENTATION
+// ============================================================================
+
+fn lpt_wait_ready(): u32 {
+  var timeout: u32 = 100000
+  while timeout > 0 {
+    var status: u8 = inb(lpt_base + LPT_STATUS)
+    if (status & LPT_STATUS_BUSY) == 0 {
+      return 0
+    }
+    timeout = timeout - 1
+  }
+  return 1  // Timeout
+}
+
+fn lpt_write_byte(data: u8) {
+  lpt_wait_ready()
+  outb(lpt_base + LPT_DATA, data)
+
+  // Strobe
+  var ctrl: u8 = inb(lpt_base + LPT_CONTROL)
+  outb(lpt_base + LPT_CONTROL, ctrl | LPT_CTRL_STROBE)
+  io_wait()
+  outb(lpt_base + LPT_CONTROL, ctrl & ~LPT_CTRL_STROBE)
+}
+
+fn lpt_read_byte(): u8 {
+  lpt_wait_ready()
+
+  // Enable bidirectional mode
+  var ctrl: u8 = inb(lpt_base + LPT_CONTROL)
+  outb(lpt_base + LPT_CONTROL, ctrl | LPT_CTRL_BIDIR)
+
+  var data: u8 = inb(lpt_base + LPT_DATA)
+
+  outb(lpt_base + LPT_CONTROL, ctrl & ~LPT_CTRL_BIDIR)
+
+  return data
+}
+
+fn lpt_write_command(cmd: u8, data: u64, length: u32) {
+  lpt_write_byte(cmd)
+  lpt_write_byte(length & 0xFF)
+  lpt_write_byte((length >> 8) & 0xFF)
+
+  var i: u32 = 0
+  while i < length {
+    lpt_write_byte(@intToPtr(data + i, u8))
+    i = i + 1
+  }
+}
+
+fn lpt_read_response(buffer: u64, max_length: u32): u32 {
+  // Read response header
+  var cmd: u8 = lpt_read_byte()
+  var len_low: u8 = lpt_read_byte()
+  var len_high: u8 = lpt_read_byte()
+  var length: u32 = len_low | (len_high << 8)
+
+  if length > max_length {
+    length = max_length
+  }
+
+  var i: u32 = 0
+  while i < length {
+    @ptrToInt(buffer + i, u8) = lpt_read_byte()
+    i = i + 1
+  }
+
+  return length
+}
+
+fn lpt_scanner_detect(): u32 {
+  // Try to detect scanner on parallel port
+  // Send identification command
+
+  // Reset scanner
+  var ctrl: u8 = inb(lpt_base + LPT_CONTROL)
+  outb(lpt_base + LPT_CONTROL, ctrl & ~LPT_CTRL_INIT)
+  io_wait()
+  outb(lpt_base + LPT_CONTROL, ctrl | LPT_CTRL_INIT)
+
+  // Wait for scanner to respond
+  var timeout: u32 = 10000
+  while timeout > 0 {
+    var status: u8 = inb(lpt_base + LPT_STATUS)
+    if (status & LPT_STATUS_SELECT) != 0 {
+      return 1  // Scanner detected
+    }
+    timeout = timeout - 1
+  }
+
+  return 0
+}
+
+fn lpt_scanner_init(base: u16): u32 {
+  lpt_base = base
+
+  if lpt_scanner_detect() == 0 {
+    return 1  // No scanner found
+  }
+
+  // Get scanner info
+  var info_buffer: [256]u8
+  lpt_write_command(0x01, 0, 0)  // Get info command
+  lpt_read_response(@ptrToInt(&info_buffer), 256)
+
+  scanner_type = SCANNER_TYPE_PARALLEL
+  foundation.serial_write_string("[Scanner] Parallel scanner initialized\n")
+
+  return 0
+}
+
+// ============================================================================
+// GAMMA CORRECTION
+// ============================================================================
+
+fn apply_gamma(value: u8, gamma: u32): u8 {
+  // gamma is in hundredths (100 = 1.0)
+  // Output = (Input / 255) ^ (1/gamma) * 255
+
+  if gamma == 100 {
+    return value
+  }
+
+  var normalized: u32 = (value * 1000) / 255
+  var result: u32 = 0
+
+  // Simplified power function using lookup table approach
+  if gamma < 100 {
+    // gamma < 1.0 - brighten
+    result = 255 - ((255 - value) * gamma) / 100
+  } else {
+    // gamma > 1.0 - darken
+    result = (value * 100) / gamma
+  }
+
+  if result > 255 { result = 255 }
+  return result
+}
+
+fn apply_brightness_contrast(value: u8, brightness: i32, contrast: i32): u8 {
+  var result: i32 = value
+
+  // Apply brightness (-100 to 100)
+  result = result + (brightness * 255) / 100
+
+  // Apply contrast (-100 to 100)
+  var factor: i32 = (100 + contrast) * 259 / ((259 - contrast) * 100 + 1)
+  result = ((result - 128) * factor) / 100 + 128
+
+  if result < 0 { result = 0 }
+  if result > 255 { result = 255 }
+
+  return result
+}
+
+// ============================================================================
+// SCAN DATA PROCESSING
+// ============================================================================
+
+fn process_scan_line(raw_data: u64, processed_data: u64, width: u32) {
+  var bytes_per_pixel: u32 = 1
+  if current_params.mode == SCANNER_MODE_COLOR {
+    bytes_per_pixel = 3
+  }
+
+  var i: u32 = 0
+  while i < width * bytes_per_pixel {
+    var value: u8 = @intToPtr(raw_data + i, u8)
+
+    // Apply image adjustments
+    value = apply_brightness_contrast(value, current_params.brightness, current_params.contrast)
+    value = apply_gamma(value, current_params.gamma)
+
+    @ptrToInt(processed_data + i, u8) = value
+    i = i + 1
+  }
+}
+
+fn convert_lineart_to_gray(lineart: u64, gray: u64, width: u32) {
+  var byte_width: u32 = (width + 7) / 8
+
+  var i: u32 = 0
+  while i < width {
+    var byte_idx: u32 = i / 8
+    var bit_idx: u32 = 7 - (i % 8)
+    var bit: u8 = (@intToPtr(lineart + byte_idx, u8) >> bit_idx) & 1
+
+    @ptrToInt(gray + i, u8) = bit * 255
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
 
 export fn scanner_init() {
   if scanner_initialized == 1 { return }
-  
+
+  // Set default parameters
+  current_params.x_offset = 0
+  current_params.y_offset = 0
+  current_params.width = 2550   // 8.5" at 300 DPI
+  current_params.height = 3300  // 11" at 300 DPI
+  current_params.dpi_x = SCANNER_DPI_300
+  current_params.dpi_y = SCANNER_DPI_300
+  current_params.mode = SCANNER_MODE_COLOR
+  current_params.depth = 8
+  current_params.brightness = 0
+  current_params.contrast = 0
+  current_params.gamma = 100
+
+  // Set default scanner info
+  scanner_info.max_width = 2550
+  scanner_info.max_height = 14400  // Legal size
+  scanner_info.min_dpi = 75
+  scanner_info.max_dpi = 600
+  scanner_info.color_support = 1
+  scanner_info.duplex_support = 0
+
   scanner_dpi = SCANNER_DPI_300
   scanner_initialized = 1
   foundation.serial_write_string("[Scanner] Initialized\n")
 }
 
-export fn scanner_set_dpi(dpi: u32) {
+export fn scanner_init_usb(address: u8, ep_in: u8, ep_out: u8): u32 {
+  if scanner_initialized == 0 {
+    scanner_init()
+  }
+
+  return usb_scanner_init(address, ep_in, ep_out)
+}
+
+export fn scanner_init_parallel(base: u16): u32 {
+  if scanner_initialized == 0 {
+    scanner_init()
+  }
+
+  return lpt_scanner_init(base)
+}
+
+export fn scanner_set_dpi(dpi: u32): u32 {
+  if dpi < scanner_info.min_dpi or dpi > scanner_info.max_dpi {
+    return 1  // Invalid DPI
+  }
+
   scanner_dpi = dpi
+  current_params.dpi_x = dpi
+  current_params.dpi_y = dpi
+
+  return 0
+}
+
+export fn scanner_get_dpi(): u32 {
+  return scanner_dpi
+}
+
+export fn scanner_set_mode(mode: u32): u32 {
+  if mode > SCANNER_MODE_COLOR {
+    return 1
+  }
+
+  scanner_mode = mode
+  current_params.mode = mode
+
+  if mode == SCANNER_MODE_LINEART {
+    current_params.depth = 1
+  } else {
+    current_params.depth = 8
+  }
+
+  return 0
+}
+
+export fn scanner_get_mode(): u32 {
+  return scanner_mode
+}
+
+export fn scanner_set_area(x: u32, y: u32, width: u32, height: u32): u32 {
+  // Convert from inches * 100 to pixels at current DPI
+  current_params.x_offset = (x * scanner_dpi) / 100
+  current_params.y_offset = (y * scanner_dpi) / 100
+  current_params.width = (width * scanner_dpi) / 100
+  current_params.height = (height * scanner_dpi) / 100
+
+  // Validate bounds
+  if current_params.x_offset + current_params.width > scanner_info.max_width {
+    current_params.width = scanner_info.max_width - current_params.x_offset
+  }
+  if current_params.y_offset + current_params.height > scanner_info.max_height {
+    current_params.height = scanner_info.max_height - current_params.y_offset
+  }
+
+  return 0
+}
+
+export fn scanner_set_brightness(brightness: i32): u32 {
+  if brightness < -100 or brightness > 100 {
+    return 1
+  }
+  current_params.brightness = brightness
+  return 0
+}
+
+export fn scanner_set_contrast(contrast: i32): u32 {
+  if contrast < -100 or contrast > 100 {
+    return 1
+  }
+  current_params.contrast = contrast
+  return 0
+}
+
+export fn scanner_set_gamma(gamma: u32): u32 {
+  if gamma < 10 or gamma > 1000 {
+    return 1  // 0.1 to 10.0
+  }
+  current_params.gamma = gamma
+  return 0
+}
+
+export fn scanner_get_image_size(): u32 {
+  var bytes_per_pixel: u32 = 1
+  if current_params.mode == SCANNER_MODE_LINEART {
+    bytes_per_pixel = 0  // Will calculate differently
+  } else if current_params.mode == SCANNER_MODE_COLOR {
+    bytes_per_pixel = 3
+  }
+
+  if current_params.mode == SCANNER_MODE_LINEART {
+    return ((current_params.width + 7) / 8) * current_params.height
+  }
+
+  return current_params.width * current_params.height * bytes_per_pixel
 }
 
 export fn scanner_scan(buffer: u64, width: u32, height: u32): u32 {
   if scanner_initialized == 0 { return 0 }
-  
+
+  scanner_status = SCANNER_STATUS_SCANNING
+
   foundation.serial_write_string("[Scanner] Scanning at ")
+  foundation.serial_write_dec(scanner_dpi)
   foundation.serial_write_string(" DPI\n")
-  
-  // Scan document (stub)
-  var size: u32 = width * height * 3
-  return size
+
+  // Calculate buffer requirements
+  var bytes_per_pixel: u32 = 1
+  if current_params.mode == SCANNER_MODE_COLOR {
+    bytes_per_pixel = 3
+  }
+
+  scan_line_width = width * bytes_per_pixel
+  scan_total_bytes = scan_line_width * height
+  scan_buffer = buffer
+  scan_buffer_size = scan_total_bytes
+  scan_bytes_read = 0
+  scan_current_line = 0
+
+  // Configure scanner
+  if scanner_type == SCANNER_TYPE_USB {
+    usb_scanner_set_parameters()
+    usb_scanner_start()
+  } else if scanner_type == SCANNER_TYPE_PARALLEL {
+    var params: [16]u8
+    params[0] = width & 0xFF
+    params[1] = (width >> 8) & 0xFF
+    params[2] = height & 0xFF
+    params[3] = (height >> 8) & 0xFF
+    params[4] = scanner_dpi & 0xFF
+    params[5] = (scanner_dpi >> 8) & 0xFF
+    params[6] = current_params.mode
+    lpt_write_command(0x10, @ptrToInt(&params), 7)
+  }
+
+  // Read scan data
+  var raw_line_buffer: u64 = memory.kmalloc(scan_line_width)
+
+  while scan_current_line < height {
+    var bytes_read: u32 = 0
+
+    if scanner_type == SCANNER_TYPE_USB {
+      bytes_read = usb_scanner_read_data(raw_line_buffer, scan_line_width)
+    } else if scanner_type == SCANNER_TYPE_PARALLEL {
+      bytes_read = lpt_read_response(raw_line_buffer, scan_line_width)
+    } else {
+      // Software simulation for testing
+      var i: u32 = 0
+      while i < scan_line_width {
+        // Generate test pattern
+        var gray: u8 = ((scan_current_line + i) * 255) / (height + width)
+        @ptrToInt(raw_line_buffer + i, u8) = gray
+        i = i + 1
+      }
+      bytes_read = scan_line_width
+    }
+
+    if bytes_read == 0 {
+      scanner_status = SCANNER_STATUS_ERROR
+      memory.kfree(raw_line_buffer)
+      return scan_bytes_read
+    }
+
+    // Process and copy line
+    var dest_offset: u64 = buffer + (scan_current_line * scan_line_width)
+    process_scan_line(raw_line_buffer, dest_offset, width)
+
+    scan_bytes_read = scan_bytes_read + bytes_read
+    scan_current_line = scan_current_line + 1
+
+    // Call progress callback
+    if progress_callback != null {
+      progress_callback(scan_current_line, height)
+    }
+  }
+
+  memory.kfree(raw_line_buffer)
+
+  scanner_status = SCANNER_STATUS_DONE
+  return scan_bytes_read
+}
+
+export fn scanner_abort() {
+  if scanner_status != SCANNER_STATUS_SCANNING {
+    return
+  }
+
+  if scanner_type == SCANNER_TYPE_USB {
+    usb_scanner_abort()
+  } else if scanner_type == SCANNER_TYPE_PARALLEL {
+    lpt_write_command(0x11, 0, 0)  // Abort command
+  }
+
+  scanner_status = SCANNER_STATUS_IDLE
+  foundation.serial_write_string("[Scanner] Scan aborted\n")
+}
+
+export fn scanner_get_status(): u32 {
+  return scanner_status
+}
+
+export fn scanner_get_progress(): u32 {
+  if scan_total_bytes == 0 {
+    return 0
+  }
+  return (scan_bytes_read * 100) / scan_total_bytes
+}
+
+export fn scanner_set_progress_callback(callback: fn(u32, u32)) {
+  progress_callback = callback
+}
+
+export fn scanner_get_info(info: *ScannerInfo) {
+  @memcpy(@ptrToInt(info), @ptrToInt(&scanner_info), @sizeOf(ScannerInfo))
+}
+
+export fn scanner_get_max_width(): u32 {
+  return scanner_info.max_width
+}
+
+export fn scanner_get_max_height(): u32 {
+  return scanner_info.max_height
+}
+
+export fn scanner_supports_color(): u32 {
+  return scanner_info.color_support
+}
+
+export fn scanner_supports_duplex(): u32 {
+  return scanner_info.duplex_support
+}
+
+export fn scanner_get_type(): u32 {
+  return scanner_type
+}
+
+// Preview scan at lower resolution
+export fn scanner_preview(buffer: u64, width: u32, height: u32): u32 {
+  // Save current settings
+  var saved_dpi: u32 = scanner_dpi
+  var saved_mode: u32 = scanner_mode
+
+  // Set preview settings
+  scanner_set_dpi(SCANNER_DPI_75)
+
+  var result: u32 = scanner_scan(buffer, width, height)
+
+  // Restore settings
+  scanner_set_dpi(saved_dpi)
+  scanner_mode = saved_mode
+  current_params.mode = saved_mode
+
+  return result
+}
+
+// Scan to grayscale even if scanner is in color mode
+export fn scanner_scan_grayscale(buffer: u64, width: u32, height: u32): u32 {
+  if current_params.mode == SCANNER_MODE_COLOR {
+    // Allocate color buffer
+    var color_buffer: u64 = memory.kmalloc(width * height * 3)
+    if color_buffer == 0 {
+      return 0
+    }
+
+    // Scan in color
+    var result: u32 = scanner_scan(color_buffer, width, height)
+
+    // Convert to grayscale
+    var i: u32 = 0
+    while i < width * height {
+      var r: u32 = @intToPtr(color_buffer + (i * 3), u8)
+      var g: u32 = @intToPtr(color_buffer + (i * 3) + 1, u8)
+      var b: u32 = @intToPtr(color_buffer + (i * 3) + 2, u8)
+
+      // Luminance formula: 0.299R + 0.587G + 0.114B
+      var gray: u32 = (r * 77 + g * 150 + b * 29) / 256
+      @ptrToInt(buffer + i, u8) = gray
+
+      i = i + 1
+    }
+
+    memory.kfree(color_buffer)
+    return result / 3
+  }
+
+  return scanner_scan(buffer, width, height)
+}
+
+// Calibrate scanner (scanner-specific)
+export fn scanner_calibrate(): u32 {
+  if scanner_type == SCANNER_TYPE_USB {
+    var cmd: [4]u8 = [0x30, 0x00, 0x00, 0x00]  // Calibrate command
+    return usb_control_transfer(0x21, 0x30, 0, 0, @ptrToInt(&cmd), 4)
+  } else if scanner_type == SCANNER_TYPE_PARALLEL {
+    lpt_write_command(0x30, 0, 0)
+    return 0
+  }
+
+  return 1  // No scanner to calibrate
 }

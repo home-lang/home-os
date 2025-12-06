@@ -1,10 +1,39 @@
-// home-os XFS
-// XFS filesystem (basic support)
+// home-os XFS Filesystem
+// XFS read-only support - Full Implementation
+// Based on XFS Algorithms & Data Structures documentation
 
 import "../core/foundation.home" as foundation
 import "../drivers/ata.home" as ata
 
-const XFS_MAGIC: u32 = 0x58465342  // "XFSB"
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const XFS_MAGIC: u32 = 0x58465342  // "XFSB" (big-endian)
+
+// Inode format flags
+const XFS_DINODE_FMT_DEV: u8 = 0
+const XFS_DINODE_FMT_LOCAL: u8 = 1
+const XFS_DINODE_FMT_EXTENTS: u8 = 2
+const XFS_DINODE_FMT_BTREE: u8 = 3
+
+// Directory entry sizes
+const XFS_DIR3_DATA_MAGIC: u32 = 0x58444433  // "XDD3"
+const XFS_DIR2_DATA_MAGIC: u32 = 0x58443244  // "XD2D"
+
+// File types
+const XFS_DIR3_FT_UNKNOWN: u8 = 0
+const XFS_DIR3_FT_REG_FILE: u8 = 1
+const XFS_DIR3_FT_DIR: u8 = 2
+const XFS_DIR3_FT_CHRDEV: u8 = 3
+const XFS_DIR3_FT_BLKDEV: u8 = 4
+const XFS_DIR3_FT_FIFO: u8 = 5
+const XFS_DIR3_FT_SOCK: u8 = 6
+const XFS_DIR3_FT_SYMLINK: u8 = 7
+
+// ============================================================================
+// ON-DISK STRUCTURES
+// ============================================================================
 
 struct XfsSuperblock {
   magicnum: u32,
@@ -14,32 +43,595 @@ struct XfsSuperblock {
   rextents: u64,
   uuid: [u8; 16],
   logstart: u64,
-  rootino: u64
+  rootino: u64,
+  rbmino: u64,
+  rsumino: u64,
+  rextsize: u32,
+  agblocks: u32,
+  agcount: u32,
+  rbmblocks: u32,
+  logblocks: u32,
+  versionnum: u16,
+  sectsize: u16,
+  inodesize: u16,
+  inopblock: u16,
+  fname: [u8; 12],
+  blocklog: u8,
+  sectlog: u8,
+  inodelog: u8,
+  inopblog: u8,
+  agblklog: u8,
+  rextslog: u8,
+  inprogress: u8,
+  imax_pct: u8,
+  icount: u64,
+  ifree: u64,
+  fdblocks: u64,
+  frextents: u64
 }
+
+// Allocation Group Header
+struct XfsAgf {
+  magicnum: u32,
+  versionnum: u32,
+  seqno: u32,
+  length: u32,
+  roots: [u32; 2],
+  spare0: u32,
+  levels: [u32; 2],
+  spare1: u32,
+  flfirst: u32,
+  fllast: u32,
+  flcount: u32,
+  freeblks: u32,
+  longest: u32
+}
+
+// Inode Core (on-disk)
+struct XfsDinodeCore {
+  magic: u16,
+  mode: u16,
+  version: u8,
+  format: u8,
+  onlink: u16,
+  uid: u32,
+  gid: u32,
+  nlink: u32,
+  projid: u16,
+  projid_hi: u16,
+  pad: [u8; 6],
+  flushiter: u16,
+  atime_sec: u32,
+  atime_nsec: u32,
+  mtime_sec: u32,
+  mtime_nsec: u32,
+  ctime_sec: u32,
+  ctime_nsec: u32,
+  size: u64,
+  nblocks: u64,
+  extsize: u32,
+  nextents: u32,
+  anextents: u16,
+  forkoff: u8,
+  aformat: u8,
+  dmevmask: u32,
+  dmstate: u16,
+  flags: u16,
+  gen: u32
+}
+
+// Extent record (packed 128 bits)
+struct XfsBmbtRec {
+  l0: u64,
+  l1: u64
+}
+
+// Directory entry
+struct XfsDir2DataEntry {
+  inumber: u64,
+  namelen: u8
+  // name follows
+  // tag (u16) follows name at aligned offset
+}
+
+// ============================================================================
+// IN-MEMORY STRUCTURES
+// ============================================================================
+
+struct XfsExtent {
+  startoff: u64,   // Logical file offset in blocks
+  startblock: u64, // Physical block address
+  blockcount: u32, // Number of blocks
+  flag: u8         // Extent state flag
+}
+
+struct XfsInodeInfo {
+  ino: u64,
+  mode: u16,
+  size: u64,
+  nblocks: u64,
+  format: u8,
+  extents: [XfsExtent; 32],  // Cache some extents
+  nextents: u32
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
 
 var xfs_initialized: u32 = 0
 var superblock: XfsSuperblock
+var block_size: u32 = 0
+var inode_size: u32 = 0
+var ag_blocks: u32 = 0
+var inodes_per_block: u32 = 0
 
-export fn xfs_init() {
-  if xfs_initialized == 1 { return }
-  
-  var buffer: [u8; 512]
-  ata.ata_read_sector(0, 0, @ptrFromInt(buffer))
-  
-  superblock = @intToPtr(@ptrFromInt(buffer), XfsSuperblock)
-  
-  if superblock.magicnum != XFS_MAGIC {
-    foundation.serial_write_string("[XFS] Invalid magic\n")
-    return
-  }
-  
-  xfs_initialized = 1
-  foundation.serial_write_string("[XFS] Initialized\n")
+// Buffer for disk I/O
+var io_buffer: [u8; 4096]
+
+// Statistics
+var reads_count: u64 = 0
+var inodes_read: u64 = 0
+
+// ============================================================================
+// BYTE SWAPPING (XFS is big-endian)
+// ============================================================================
+
+fn bswap16(val: u16): u16 {
+  return ((val >> 8) & 0xFF) | ((val << 8) & 0xFF00)
 }
 
-export fn xfs_read_file(path: u64, buffer: u64, size: u32): u32 {
-  if xfs_initialized == 0 { return 0 }
-  
-  // Read file (stub)
+fn bswap32(val: u32): u32 {
+  return ((val >> 24) & 0xFF) |
+         ((val >> 8) & 0xFF00) |
+         ((val << 8) & 0xFF0000) |
+         ((val << 24) & 0xFF000000)
+}
+
+fn bswap64(val: u64): u64 {
+  var low: u32 = @intCast(val & 0xFFFFFFFF)
+  var high: u32 = @intCast((val >> 32) & 0xFFFFFFFF)
+  return (@as(u64, bswap32(low)) << 32) | @as(u64, bswap32(high))
+}
+
+// ============================================================================
+// DISK I/O
+// ============================================================================
+
+fn read_block(block_num: u64, buffer: *u8): u32 {
+  var sectors_per_block: u32 = block_size / 512
+  var start_sector: u64 = block_num * sectors_per_block
+
+  var i: u32 = 0
+  while i < sectors_per_block {
+    var sector: u32 = @intCast(start_sector + i)
+    if ata.ata_read_sector(0, sector, @ptrFromInt(@intFromPtr(buffer) + (i * 512))) != 0 {
+      return 1
+    }
+    i = i + 1
+  }
+
+  reads_count = reads_count + 1
   return 0
+}
+
+// ============================================================================
+// EXTENT PARSING
+// ============================================================================
+
+fn parse_extent(rec: *XfsBmbtRec, extent: *XfsExtent) {
+  // XFS extents are packed into 128 bits
+  // l0: [63:0] = startoff[54:0] (55 bits) | startblock[52:0] (53 bits partial)
+  // l1: [63:0] = startblock (continued) | blockcount[21:0] (22 bits) | flag[1:0]
+
+  var l0: u64 = bswap64(rec.l0)
+  var l1: u64 = bswap64(rec.l1)
+
+  extent.flag = @intCast((l0 >> 63) & 0x1)
+  extent.startoff = (l0 >> 9) & 0x3FFFFFFFFFFFF  // 54 bits
+  extent.startblock = ((l0 & 0x1FF) << 43) | ((l1 >> 21) & 0x7FFFFFFFFFF)
+  extent.blockcount = @intCast(l1 & 0x1FFFFF)
+}
+
+// ============================================================================
+// INODE OPERATIONS
+// ============================================================================
+
+fn inode_to_agno(ino: u64): u32 {
+  return @intCast(ino >> (superblock.agblklog + superblock.inopblog))
+}
+
+fn inode_to_agino(ino: u64): u32 {
+  var mask: u64 = (@as(u64, 1) << (superblock.agblklog + superblock.inopblog)) - 1
+  return @intCast(ino & mask)
+}
+
+fn inode_to_block(ino: u64): u64 {
+  var agno: u32 = inode_to_agno(ino)
+  var agino: u32 = inode_to_agino(ino)
+  var ag_block: u32 = agino >> superblock.inopblog
+  return (@as(u64, agno) * ag_blocks) + ag_block
+}
+
+fn inode_offset_in_block(ino: u64): u32 {
+  var agino: u32 = inode_to_agino(ino)
+  return (agino & (inodes_per_block - 1)) * inode_size
+}
+
+fn read_inode(ino: u64, info: *XfsInodeInfo): u32 {
+  var block: u64 = inode_to_block(ino)
+  var offset: u32 = inode_offset_in_block(ino)
+
+  if read_block(block, @ptrFromInt(@intFromPtr(&io_buffer))) != 0 {
+    return 1
+  }
+
+  var core: *XfsDinodeCore = @ptrFromInt(@intFromPtr(&io_buffer) + offset)
+
+  // Verify magic
+  if bswap16(core.magic) != 0x494E {  // "IN"
+    foundation.serial_write_string("[XFS] Invalid inode magic\n")
+    return 1
+  }
+
+  info.ino = ino
+  info.mode = bswap16(core.mode)
+  info.size = bswap64(core.size)
+  info.nblocks = bswap64(core.nblocks)
+  info.format = core.format
+  info.nextents = bswap32(core.nextents)
+
+  // Parse extents if format is EXTENTS
+  if info.format == XFS_DINODE_FMT_EXTENTS {
+    var data_ptr: *u8 = @ptrFromInt(@intFromPtr(&io_buffer) + offset + 176)  // After core
+    var i: u32 = 0
+    while i < info.nextents and i < 32 {
+      var rec: *XfsBmbtRec = @ptrFromInt(@intFromPtr(data_ptr) + (i * 16))
+      parse_extent(rec, &info.extents[i])
+      i = i + 1
+    }
+  }
+
+  inodes_read = inodes_read + 1
+  return 0
+}
+
+// ============================================================================
+// FILE OPERATIONS
+// ============================================================================
+
+fn find_extent_for_offset(info: *XfsInodeInfo, file_block: u64, extent: *XfsExtent): u32 {
+  var i: u32 = 0
+  while i < info.nextents and i < 32 {
+    var ext: *XfsExtent = &info.extents[i]
+    if file_block >= ext.startoff and file_block < ext.startoff + ext.blockcount {
+      extent.startoff = ext.startoff
+      extent.startblock = ext.startblock
+      extent.blockcount = ext.blockcount
+      extent.flag = ext.flag
+      return 0
+    }
+    i = i + 1
+  }
+  return 1  // Not found
+}
+
+fn read_file_data(info: *XfsInodeInfo, offset: u64, buffer: *u8, size: u32): u32 {
+  if offset >= info.size { return 0 }
+
+  var remaining: u32 = size
+  if offset + remaining > info.size {
+    remaining = @intCast(info.size - offset)
+  }
+
+  var bytes_read: u32 = 0
+  var current_offset: u64 = offset
+
+  while bytes_read < remaining {
+    var file_block: u64 = current_offset / block_size
+    var block_offset: u32 = @intCast(current_offset % block_size)
+
+    var extent: XfsExtent
+    if find_extent_for_offset(info, file_block, &extent) != 0 {
+      break  // No extent for this offset (sparse file or error)
+    }
+
+    var extent_offset: u64 = file_block - extent.startoff
+    var phys_block: u64 = extent.startblock + extent_offset
+
+    if read_block(phys_block, @ptrFromInt(@intFromPtr(&io_buffer))) != 0 {
+      break
+    }
+
+    var to_copy: u32 = block_size - block_offset
+    if to_copy > remaining - bytes_read {
+      to_copy = remaining - bytes_read
+    }
+
+    // Copy data
+    var i: u32 = 0
+    while i < to_copy {
+      @ptrFromInt(@intFromPtr(buffer) + bytes_read + i).* = io_buffer[block_offset + i]
+      i = i + 1
+    }
+
+    bytes_read = bytes_read + to_copy
+    current_offset = current_offset + to_copy
+  }
+
+  return bytes_read
+}
+
+// ============================================================================
+// DIRECTORY OPERATIONS
+// ============================================================================
+
+fn lookup_in_dir(dir_info: *XfsInodeInfo, name: *u8, name_len: u32, found_ino: *u64): u32 {
+  // For local format directories, data is inline
+  if dir_info.format == XFS_DINODE_FMT_LOCAL {
+    // Read inode block again to get inline data
+    var block: u64 = inode_to_block(dir_info.ino)
+    var offset: u32 = inode_offset_in_block(dir_info.ino)
+
+    if read_block(block, @ptrFromInt(@intFromPtr(&io_buffer))) != 0 {
+      return 1
+    }
+
+    // Inline directory data starts after inode core
+    var data_ptr: *u8 = @ptrFromInt(@intFromPtr(&io_buffer) + offset + 176)
+    var data_end: u64 = @intFromPtr(&io_buffer) + offset + inode_size
+
+    // Parse short-form directory
+    var count: u8 = data_ptr.*
+    var parent: u64 = 0
+    var entry_ptr: *u8 = @ptrFromInt(@intFromPtr(data_ptr) + 6)  // Skip header
+
+    var i: u32 = 0
+    while i < count {
+      var entry_namelen: u8 = entry_ptr.*
+      var entry_offset: u8 = @ptrFromInt(@intFromPtr(entry_ptr) + 1).*
+      var entry_name: *u8 = @ptrFromInt(@intFromPtr(entry_ptr) + 2)
+
+      // Compare names
+      if entry_namelen == name_len {
+        var match: u32 = 1
+        var j: u32 = 0
+        while j < name_len {
+          if @ptrFromInt(@intFromPtr(entry_name) + j).* != @ptrFromInt(@intFromPtr(name) + j).* {
+            match = 0
+            break
+          }
+          j = j + 1
+        }
+
+        if match != 0 {
+          // Get inode number
+          var ino_ptr: *u8 = @ptrFromInt(@intFromPtr(entry_name) + entry_namelen)
+          found_ino.* = 0
+          j = 0
+          while j < 8 {
+            found_ino.* = (found_ino.* << 8) | @as(u64, @ptrFromInt(@intFromPtr(ino_ptr) + j).*)
+            j = j + 1
+          }
+          return 0
+        }
+      }
+
+      entry_ptr = @ptrFromInt(@intFromPtr(entry_name) + entry_namelen + 8)
+      i = i + 1
+    }
+  }
+
+  // For extent-based directories
+  if dir_info.format == XFS_DINODE_FMT_EXTENTS {
+    var block_idx: u32 = 0
+    while block_idx < dir_info.nextents and block_idx < 32 {
+      var extent: *XfsExtent = &dir_info.extents[block_idx]
+
+      var b: u32 = 0
+      while b < extent.blockcount {
+        var phys_block: u64 = extent.startblock + b
+
+        if read_block(phys_block, @ptrFromInt(@intFromPtr(&io_buffer))) != 0 {
+          return 1
+        }
+
+        // Check directory block magic
+        var magic: u32 = (@as(u32, io_buffer[0]) << 24) |
+                         (@as(u32, io_buffer[1]) << 16) |
+                         (@as(u32, io_buffer[2]) << 8) |
+                         @as(u32, io_buffer[3])
+
+        var header_size: u32 = 16  // v2 header
+        if magic == XFS_DIR3_DATA_MAGIC {
+          header_size = 64  // v3 header
+        }
+
+        // Parse directory entries
+        var ptr: u32 = header_size
+        while ptr < block_size - 8 {
+          var entry: *XfsDir2DataEntry = @ptrFromInt(@intFromPtr(&io_buffer) + ptr)
+          var entry_ino: u64 = bswap64(entry.inumber)
+
+          if entry_ino == 0 {
+            // Free space entry
+            var free_len: u16 = (@as(u16, io_buffer[ptr + 8]) << 8) | @as(u16, io_buffer[ptr + 9])
+            ptr = ptr + bswap16(free_len)
+            continue
+          }
+
+          if entry.namelen == name_len {
+            var entry_name: *u8 = @ptrFromInt(@intFromPtr(&io_buffer) + ptr + 9)
+            var match: u32 = 1
+            var j: u32 = 0
+            while j < name_len {
+              if @ptrFromInt(@intFromPtr(entry_name) + j).* != @ptrFromInt(@intFromPtr(name) + j).* {
+                match = 0
+                break
+              }
+              j = j + 1
+            }
+
+            if match != 0 {
+              found_ino.* = entry_ino
+              return 0
+            }
+          }
+
+          // Move to next entry (aligned)
+          var entry_len: u32 = 9 + entry.namelen + 1 + 2  // header + name + ftype + tag
+          entry_len = (entry_len + 7) & 0xFFFFFFF8  // Align to 8
+          ptr = ptr + entry_len
+        }
+
+        b = b + 1
+      }
+
+      block_idx = block_idx + 1
+    }
+  }
+
+  return 1  // Not found
+}
+
+// ============================================================================
+// PATH RESOLUTION
+// ============================================================================
+
+fn resolve_path(path: *u8, info: *XfsInodeInfo): u32 {
+  // Start from root inode
+  if read_inode(superblock.rootino, info) != 0 {
+    return 1
+  }
+
+  // Skip leading /
+  var ptr: *u8 = path
+  if ptr.* == 47 {  // '/'
+    ptr = @ptrFromInt(@intFromPtr(ptr) + 1)
+  }
+
+  // Empty path = root
+  if ptr.* == 0 {
+    return 0
+  }
+
+  while ptr.* != 0 {
+    // Find end of component
+    var start: *u8 = ptr
+    var len: u32 = 0
+    while ptr.* != 0 and ptr.* != 47 {
+      len = len + 1
+      ptr = @ptrFromInt(@intFromPtr(ptr) + 1)
+    }
+
+    if len == 0 {
+      if ptr.* == 47 {
+        ptr = @ptrFromInt(@intFromPtr(ptr) + 1)
+      }
+      continue
+    }
+
+    // Lookup component
+    var found_ino: u64 = 0
+    if lookup_in_dir(info, start, len, &found_ino) != 0 {
+      return 1  // Not found
+    }
+
+    // Read new inode
+    if read_inode(found_ino, info) != 0 {
+      return 1
+    }
+
+    // Skip /
+    if ptr.* == 47 {
+      ptr = @ptrFromInt(@intFromPtr(ptr) + 1)
+    }
+  }
+
+  return 0
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+export fn xfs_init(): u32 {
+  if xfs_initialized == 1 { return 0 }
+
+  // Read superblock (sector 0)
+  if ata.ata_read_sector(0, 0, @ptrFromInt(@intFromPtr(&io_buffer))) != 0 {
+    foundation.serial_write_string("[XFS] Failed to read superblock\n")
+    return 1
+  }
+
+  // Copy and byte-swap superblock fields
+  var sb_ptr: *XfsSuperblock = @ptrFromInt(@intFromPtr(&io_buffer))
+
+  superblock.magicnum = bswap32(sb_ptr.magicnum)
+
+  if superblock.magicnum != XFS_MAGIC {
+    foundation.serial_write_string("[XFS] Invalid magic number\n")
+    return 1
+  }
+
+  superblock.blocksize = bswap32(sb_ptr.blocksize)
+  superblock.dblocks = bswap64(sb_ptr.dblocks)
+  superblock.rootino = bswap64(sb_ptr.rootino)
+  superblock.agblocks = bswap32(sb_ptr.agblocks)
+  superblock.agcount = bswap32(sb_ptr.agcount)
+  superblock.inodesize = bswap16(sb_ptr.inodesize)
+  superblock.inopblock = bswap16(sb_ptr.inopblock)
+  superblock.blocklog = sb_ptr.blocklog
+  superblock.agblklog = sb_ptr.agblklog
+  superblock.inopblog = sb_ptr.inopblog
+
+  block_size = superblock.blocksize
+  inode_size = superblock.inodesize
+  ag_blocks = superblock.agblocks
+  inodes_per_block = superblock.inopblock
+
+  xfs_initialized = 1
+
+  foundation.serial_write_string("[XFS] Initialized - block_size=")
+  foundation.serial_write_hex(block_size)
+  foundation.serial_write_string(", inode_size=")
+  foundation.serial_write_hex(inode_size)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+export fn xfs_read_file(path: *u8, buffer: *u8, size: u32): u32 {
+  if xfs_initialized == 0 { return 0 }
+
+  var info: XfsInodeInfo
+  if resolve_path(path, &info) != 0 {
+    return 0  // Not found
+  }
+
+  // Check if it's a regular file
+  if (info.mode & 0xF000) != 0x8000 {
+    return 0  // Not a regular file
+  }
+
+  return read_file_data(&info, 0, buffer, size)
+}
+
+export fn xfs_stat(path: *u8, size: *u64, mode: *u16): u32 {
+  if xfs_initialized == 0 { return 1 }
+
+  var info: XfsInodeInfo
+  if resolve_path(path, &info) != 0 {
+    return 1
+  }
+
+  size.* = info.size
+  mode.* = info.mode
+
+  return 0
+}
+
+export fn xfs_get_stats(reads: *u64, inodes: *u64) {
+  reads.* = reads_count
+  inodes.* = inodes_read
 }

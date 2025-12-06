@@ -1,43 +1,672 @@
-// home-os Watchdog Timer
-// System watchdog
+// home-os Watchdog Timer Driver
+// Hardware watchdog support with multiple backends
 
 import "../core/foundation.home" as foundation
 
-const WATCHDOG_TIMEOUT: u32 = 60  // 60 seconds
+// ============================================================================
+// WATCHDOG TYPES
+// ============================================================================
 
+const WATCHDOG_TYPE_NONE: u32 = 0
+const WATCHDOG_TYPE_I6300ESB: u32 = 1   // Intel 6300ESB (common in servers)
+const WATCHDOG_TYPE_ICH: u32 = 2         // Intel ICH TCO watchdog
+const WATCHDOG_TYPE_SOFT: u32 = 3        // Software watchdog (fallback)
+const WATCHDOG_TYPE_ACPI: u32 = 4        // ACPI watchdog
+const WATCHDOG_TYPE_SP5100: u32 = 5      // AMD SP5100 (common in AMD systems)
+
+// ============================================================================
+// INTEL 6300ESB WATCHDOG REGISTERS (PCI device)
+// ============================================================================
+
+const I6300ESB_TIMER1_REG: u16 = 0x00    // Timer 1 value
+const I6300ESB_TIMER2_REG: u16 = 0x04    // Timer 2 value
+const I6300ESB_GINTSR_REG: u16 = 0x08    // General Interrupt Status Register
+const I6300ESB_RELOAD_REG: u16 = 0x0C    // Reload register
+const I6300ESB_CONFIG_REG: u16 = 0x10    // Configuration register
+const I6300ESB_LOCK_REG: u16 = 0x18      // Lock register
+
+// Config register bits
+const I6300ESB_CONFIG_ENABLE: u32 = 0x02
+const I6300ESB_CONFIG_INT_TYPE_MASK: u32 = 0x0C
+const I6300ESB_CONFIG_INT_IRQ: u32 = 0x00
+const I6300ESB_CONFIG_INT_SMI: u32 = 0x04
+const I6300ESB_CONFIG_INT_DISABLED: u32 = 0x08
+const I6300ESB_CONFIG_INT_NMI: u32 = 0x0C
+
+// Lock register values
+const I6300ESB_UNLOCK1: u8 = 0x80
+const I6300ESB_UNLOCK2: u8 = 0x86
+
+// ============================================================================
+// INTEL ICH TCO WATCHDOG REGISTERS
+// ============================================================================
+
+const TCO_RLD: u16 = 0x00       // TCO Timer Reload
+const TCO1_STS: u16 = 0x04      // TCO1 Status Register
+const TCO2_STS: u16 = 0x06      // TCO2 Status Register
+const TCO1_CNT: u16 = 0x08      // TCO1 Control Register
+const TCO2_CNT: u16 = 0x0A      // TCO2 Control Register
+const TCO_MESSAGE1: u16 = 0x0C  // TCO Message 1
+const TCO_MESSAGE2: u16 = 0x0D  // TCO Message 2
+const TCO_WDSTATUS: u16 = 0x0E  // TCO Watchdog Status
+const TCO_TMR: u16 = 0x12       // TCO Timer Initial Value
+
+// TCO1_CNT bits
+const TCO_TMR_HALT: u16 = 0x0800  // TCO Timer Halt
+const TCO_LOCK: u16 = 0x1000      // Lock TCO registers
+const TCO_NMI2SMI_EN: u16 = 0x2000
+const TCO_NMI_NOW: u16 = 0x0100
+
+// TCO1_STS bits
+const TCO_TIMEOUT: u16 = 0x0008   // TCO Timeout occurred
+
+// ============================================================================
+// AMD SP5100 WATCHDOG REGISTERS
+// ============================================================================
+
+const SP5100_WDT_CONTROL: u16 = 0x00
+const SP5100_WDT_COUNT: u16 = 0x04
+const SP5100_WDT_TRIGGER: u16 = 0x08
+
+const SP5100_WDT_START: u32 = 0x01
+const SP5100_WDT_STOP: u32 = 0x02
+const SP5100_WDT_TRIGGER_VALUE: u32 = 0xFF
+
+// ============================================================================
+// KEYBOARD CONTROLLER RESET (Fallback)
+// ============================================================================
+
+const KBC_DATA_PORT: u16 = 0x60
+const KBC_STATUS_PORT: u16 = 0x64
+const KBC_COMMAND_PORT: u16 = 0x64
+
+const KBC_STATUS_OUTPUT_FULL: u8 = 0x01
+const KBC_STATUS_INPUT_FULL: u8 = 0x02
+
+const KBC_CMD_RESET_CPU: u8 = 0xFE  // Pulse reset line
+
+// ============================================================================
+// ACPI RESET (Alternative)
+// ============================================================================
+
+const ACPI_RESET_REG: u16 = 0x0CF9
+const ACPI_RESET_VALUE: u8 = 0x06
+
+// ============================================================================
+// DRIVER STATE
+// ============================================================================
+
+const DEFAULT_TIMEOUT: u32 = 60  // 60 seconds default
+const MIN_TIMEOUT: u32 = 1
+const MAX_TIMEOUT: u32 = 3600    // 1 hour max
+
+var watchdog_type: u32 = WATCHDOG_TYPE_NONE
 var watchdog_enabled: u32 = 0
 var watchdog_counter: u32 = 0
+var watchdog_timeout: u32 = DEFAULT_TIMEOUT
+var watchdog_initialized: u32 = 0
+
+// Hardware base addresses
+var watchdog_base: u64 = 0
+var tco_base: u16 = 0
+var pmc_base: u16 = 0
+
+// Soft watchdog state
+var soft_watchdog_ticks: u32 = 0
+var soft_watchdog_last_kick: u64 = 0
+
+// Callback for pre-reset actions
+var pre_reset_callback: fn() = null
+
+// ============================================================================
+// PORT I/O HELPERS
+// ============================================================================
+
+fn outb(port: u16, value: u8) {
+  asm volatile ("outb %[value], %[port]"
+    :
+    : [value] "a" (value), [port] "Nd" (port)
+  )
+}
+
+fn outw(port: u16, value: u16) {
+  asm volatile ("outw %[value], %[port]"
+    :
+    : [value] "a" (value), [port] "Nd" (port)
+  )
+}
+
+fn outl(port: u16, value: u32) {
+  asm volatile ("outl %[value], %[port]"
+    :
+    : [value] "a" (value), [port] "Nd" (port)
+  )
+}
+
+fn inb(port: u16): u8 {
+  var result: u8 = 0
+  asm volatile ("inb %[port], %[result]"
+    : [result] "=a" (result)
+    : [port] "Nd" (port)
+  )
+  return result
+}
+
+fn inw(port: u16): u16 {
+  var result: u16 = 0
+  asm volatile ("inw %[port], %[result]"
+    : [result] "=a" (result)
+    : [port] "Nd" (port)
+  )
+  return result
+}
+
+fn inl(port: u16): u32 {
+  var result: u32 = 0
+  asm volatile ("inl %[port], %[result]"
+    : [result] "=a" (result)
+    : [port] "Nd" (port)
+  )
+  return result
+}
+
+fn io_wait() {
+  outb(0x80, 0)
+}
+
+// MMIO helpers
+fn mmio_read32(addr: u64): u32 {
+  return @volatile_load(@intToPtr(addr, *volatile u32))
+}
+
+fn mmio_write32(addr: u64, value: u32) {
+  @volatile_store(@intToPtr(addr, *volatile u32), value)
+}
+
+fn mmio_write8(addr: u64, value: u8) {
+  @volatile_store(@intToPtr(addr, *volatile u8), value)
+}
+
+// ============================================================================
+// INTEL 6300ESB WATCHDOG IMPLEMENTATION
+// ============================================================================
+
+fn i6300esb_unlock() {
+  // Unlock sequence required before modifying registers
+  mmio_write8(watchdog_base + I6300ESB_LOCK_REG, I6300ESB_UNLOCK1)
+  mmio_write8(watchdog_base + I6300ESB_LOCK_REG, I6300ESB_UNLOCK2)
+}
+
+fn i6300esb_lock() {
+  // Lock to prevent accidental changes
+  mmio_write8(watchdog_base + I6300ESB_LOCK_REG, 0x00)
+}
+
+fn i6300esb_set_timeout(seconds: u32) {
+  // Timer runs at 1MHz, each tick is 1us
+  // Timeout value = seconds * 1000000
+  var ticks: u32 = seconds * 1000000
+
+  i6300esb_unlock()
+
+  // Timer 1 = first stage (generates interrupt/NMI)
+  mmio_write32(watchdog_base + I6300ESB_TIMER1_REG, ticks / 2)
+
+  // Timer 2 = second stage (system reset)
+  mmio_write32(watchdog_base + I6300ESB_TIMER2_REG, ticks / 2)
+
+  i6300esb_lock()
+}
+
+fn i6300esb_start() {
+  i6300esb_unlock()
+
+  // Configure: enable watchdog, interrupt disabled (reset only)
+  var config: u32 = mmio_read32(watchdog_base + I6300ESB_CONFIG_REG)
+  config = config | I6300ESB_CONFIG_ENABLE
+  config = (config & ~I6300ESB_CONFIG_INT_TYPE_MASK) | I6300ESB_CONFIG_INT_DISABLED
+  mmio_write32(watchdog_base + I6300ESB_CONFIG_REG, config)
+
+  // Reload timer
+  mmio_write32(watchdog_base + I6300ESB_RELOAD_REG, 0x01)
+
+  i6300esb_lock()
+}
+
+fn i6300esb_stop() {
+  i6300esb_unlock()
+
+  var config: u32 = mmio_read32(watchdog_base + I6300ESB_CONFIG_REG)
+  config = config & ~I6300ESB_CONFIG_ENABLE
+  mmio_write32(watchdog_base + I6300ESB_CONFIG_REG, config)
+
+  i6300esb_lock()
+}
+
+fn i6300esb_kick() {
+  i6300esb_unlock()
+  mmio_write32(watchdog_base + I6300ESB_RELOAD_REG, 0x01)
+  i6300esb_lock()
+}
+
+fn i6300esb_init(base: u64): u32 {
+  watchdog_base = base
+
+  i6300esb_set_timeout(watchdog_timeout)
+
+  foundation.serial_write_string("[Watchdog] Intel 6300ESB initialized\n")
+  return 0
+}
+
+// ============================================================================
+// INTEL ICH TCO WATCHDOG IMPLEMENTATION
+// ============================================================================
+
+fn tco_read16(offset: u16): u16 {
+  return inw(tco_base + offset)
+}
+
+fn tco_write16(offset: u16, value: u16) {
+  outw(tco_base + offset, value)
+}
+
+fn tco_set_timeout(seconds: u32) {
+  // TCO timer ticks at 0.6 second intervals
+  var ticks: u16 = (seconds * 10) / 6
+  if ticks < 2 { ticks = 2 }
+  if ticks > 1023 { ticks = 1023 }
+
+  // Write timeout value
+  tco_write16(TCO_TMR, ticks)
+}
+
+fn tco_start() {
+  // Clear previous timeout status
+  var status: u16 = tco_read16(TCO1_STS)
+  tco_write16(TCO1_STS, status | TCO_TIMEOUT)
+
+  // Un-halt TCO timer
+  var cnt: u16 = tco_read16(TCO1_CNT)
+  cnt = cnt & ~TCO_TMR_HALT
+  tco_write16(TCO1_CNT, cnt)
+}
+
+fn tco_stop() {
+  // Halt TCO timer
+  var cnt: u16 = tco_read16(TCO1_CNT)
+  cnt = cnt | TCO_TMR_HALT
+  tco_write16(TCO1_CNT, cnt)
+}
+
+fn tco_kick() {
+  // Reload TCO timer
+  outw(tco_base + TCO_RLD, 0x01)
+}
+
+fn tco_init(base: u16): u32 {
+  tco_base = base
+
+  // Stop timer first
+  tco_stop()
+
+  // Set timeout
+  tco_set_timeout(watchdog_timeout)
+
+  foundation.serial_write_string("[Watchdog] Intel TCO initialized at 0x")
+  foundation.serial_write_hex(base)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// ============================================================================
+// AMD SP5100 WATCHDOG IMPLEMENTATION
+// ============================================================================
+
+fn sp5100_set_timeout(seconds: u32) {
+  // SP5100 uses seconds directly
+  outl(watchdog_base + SP5100_WDT_COUNT, seconds)
+}
+
+fn sp5100_start() {
+  outl(watchdog_base + SP5100_WDT_CONTROL, SP5100_WDT_START)
+}
+
+fn sp5100_stop() {
+  outl(watchdog_base + SP5100_WDT_CONTROL, SP5100_WDT_STOP)
+}
+
+fn sp5100_kick() {
+  outl(watchdog_base + SP5100_WDT_TRIGGER, SP5100_WDT_TRIGGER_VALUE)
+}
+
+fn sp5100_init(base: u64): u32 {
+  watchdog_base = base
+
+  sp5100_stop()
+  sp5100_set_timeout(watchdog_timeout)
+
+  foundation.serial_write_string("[Watchdog] AMD SP5100 initialized\n")
+  return 0
+}
+
+// ============================================================================
+// SOFTWARE WATCHDOG (FALLBACK)
+// ============================================================================
+
+fn soft_watchdog_start() {
+  soft_watchdog_ticks = watchdog_timeout
+}
+
+fn soft_watchdog_stop() {
+  soft_watchdog_ticks = 0
+}
+
+fn soft_watchdog_kick() {
+  soft_watchdog_ticks = watchdog_timeout
+}
+
+fn soft_watchdog_check() {
+  // Called from timer interrupt (every second)
+  if watchdog_enabled == 0 { return }
+
+  if soft_watchdog_ticks > 0 {
+    soft_watchdog_ticks = soft_watchdog_ticks - 1
+  }
+
+  if soft_watchdog_ticks == 0 {
+    // Timeout - trigger reset
+    foundation.serial_write_string("[Watchdog] SOFTWARE TIMEOUT! Rebooting...\n")
+    watchdog_trigger_reset()
+  }
+}
+
+// ============================================================================
+// SYSTEM RESET METHODS
+// ============================================================================
+
+fn reset_via_keyboard() {
+  // Wait for keyboard controller ready
+  var timeout: u32 = 10000
+  while timeout > 0 {
+    if (inb(KBC_STATUS_PORT) & KBC_STATUS_INPUT_FULL) == 0 {
+      break
+    }
+    timeout = timeout - 1
+  }
+
+  // Send reset command
+  outb(KBC_COMMAND_PORT, KBC_CMD_RESET_CPU)
+}
+
+fn reset_via_acpi() {
+  // ACPI reset via port 0xCF9
+  outb(ACPI_RESET_REG, 0x02)  // Enable reset
+  io_wait()
+  outb(ACPI_RESET_REG, ACPI_RESET_VALUE)  // Trigger reset
+}
+
+fn reset_via_triple_fault() {
+  // Load invalid IDT and trigger interrupt
+  var null_idt: [6]u8 = [0, 0, 0, 0, 0, 0]
+
+  asm volatile ("lidt (%[idt])\nint $0"
+    :
+    : [idt] "r" (&null_idt)
+  )
+}
+
+export fn watchdog_trigger_reset() {
+  // Call pre-reset callback if set
+  if pre_reset_callback != null {
+    pre_reset_callback()
+  }
+
+  foundation.serial_write_string("[Watchdog] Attempting system reset...\n")
+
+  // Disable interrupts
+  asm volatile ("cli")
+
+  // Try keyboard controller reset first
+  reset_via_keyboard()
+
+  // Wait a bit
+  var delay: u32 = 1000000
+  while delay > 0 {
+    delay = delay - 1
+  }
+
+  // Try ACPI reset
+  reset_via_acpi()
+
+  // Wait more
+  delay = 1000000
+  while delay > 0 {
+    delay = delay - 1
+  }
+
+  // Last resort: triple fault
+  reset_via_triple_fault()
+
+  // Should never reach here
+  loop {
+    asm volatile ("hlt")
+  }
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
 
 export fn watchdog_init() {
-  watchdog_enabled = 0
-  watchdog_counter = 0
+  if watchdog_initialized == 1 { return }
+
+  // Try to detect hardware watchdog
+  // In a real implementation, this would enumerate PCI devices
+  // For now, we default to software watchdog
+
+  watchdog_type = WATCHDOG_TYPE_SOFT
+  foundation.serial_write_string("[Watchdog] Using software watchdog\n")
+
+  watchdog_initialized = 1
   foundation.serial_write_string("[Watchdog] Initialized\n")
 }
 
+export fn watchdog_init_i6300esb(base: u64): u32 {
+  if watchdog_initialized == 1 and watchdog_type != WATCHDOG_TYPE_NONE {
+    return 1  // Already initialized with different type
+  }
+
+  var result: u32 = i6300esb_init(base)
+  if result == 0 {
+    watchdog_type = WATCHDOG_TYPE_I6300ESB
+    watchdog_initialized = 1
+  }
+  return result
+}
+
+export fn watchdog_init_tco(base: u16): u32 {
+  if watchdog_initialized == 1 and watchdog_type != WATCHDOG_TYPE_NONE {
+    return 1
+  }
+
+  var result: u32 = tco_init(base)
+  if result == 0 {
+    watchdog_type = WATCHDOG_TYPE_ICH
+    watchdog_initialized = 1
+  }
+  return result
+}
+
+export fn watchdog_init_sp5100(base: u64): u32 {
+  if watchdog_initialized == 1 and watchdog_type != WATCHDOG_TYPE_NONE {
+    return 1
+  }
+
+  var result: u32 = sp5100_init(base)
+  if result == 0 {
+    watchdog_type = WATCHDOG_TYPE_SP5100
+    watchdog_initialized = 1
+  }
+  return result
+}
+
 export fn watchdog_enable() {
+  if watchdog_initialized == 0 {
+    watchdog_init()
+  }
+
+  watchdog_counter = watchdog_timeout
+
+  if watchdog_type == WATCHDOG_TYPE_I6300ESB {
+    i6300esb_start()
+  } else if watchdog_type == WATCHDOG_TYPE_ICH {
+    tco_start()
+  } else if watchdog_type == WATCHDOG_TYPE_SP5100 {
+    sp5100_start()
+  } else if watchdog_type == WATCHDOG_TYPE_SOFT {
+    soft_watchdog_start()
+  }
+
   watchdog_enabled = 1
-  watchdog_counter = WATCHDOG_TIMEOUT
-  foundation.serial_write_string("[Watchdog] Enabled\n")
+  foundation.serial_write_string("[Watchdog] Enabled with ")
+  foundation.serial_write_dec(watchdog_timeout)
+  foundation.serial_write_string(" second timeout\n")
 }
 
 export fn watchdog_disable() {
+  if watchdog_type == WATCHDOG_TYPE_I6300ESB {
+    i6300esb_stop()
+  } else if watchdog_type == WATCHDOG_TYPE_ICH {
+    tco_stop()
+  } else if watchdog_type == WATCHDOG_TYPE_SP5100 {
+    sp5100_stop()
+  } else if watchdog_type == WATCHDOG_TYPE_SOFT {
+    soft_watchdog_stop()
+  }
+
   watchdog_enabled = 0
   foundation.serial_write_string("[Watchdog] Disabled\n")
 }
 
 export fn watchdog_kick() {
-  if watchdog_enabled == 1 {
-    watchdog_counter = WATCHDOG_TIMEOUT
+  if watchdog_enabled == 0 { return }
+
+  watchdog_counter = watchdog_timeout
+
+  if watchdog_type == WATCHDOG_TYPE_I6300ESB {
+    i6300esb_kick()
+  } else if watchdog_type == WATCHDOG_TYPE_ICH {
+    tco_kick()
+  } else if watchdog_type == WATCHDOG_TYPE_SP5100 {
+    sp5100_kick()
+  } else if watchdog_type == WATCHDOG_TYPE_SOFT {
+    soft_watchdog_kick()
   }
 }
 
+export fn watchdog_set_timeout(seconds: u32): u32 {
+  if seconds < MIN_TIMEOUT or seconds > MAX_TIMEOUT {
+    return 1  // Invalid timeout
+  }
+
+  watchdog_timeout = seconds
+
+  // Update hardware if enabled
+  if watchdog_enabled == 1 {
+    if watchdog_type == WATCHDOG_TYPE_I6300ESB {
+      i6300esb_set_timeout(seconds)
+    } else if watchdog_type == WATCHDOG_TYPE_ICH {
+      tco_set_timeout(seconds)
+    } else if watchdog_type == WATCHDOG_TYPE_SP5100 {
+      sp5100_set_timeout(seconds)
+    }
+  }
+
+  return 0
+}
+
+export fn watchdog_get_timeout(): u32 {
+  return watchdog_timeout
+}
+
+export fn watchdog_get_remaining(): u32 {
+  return watchdog_counter
+}
+
+export fn watchdog_is_enabled(): u32 {
+  return watchdog_enabled
+}
+
+export fn watchdog_get_type(): u32 {
+  return watchdog_type
+}
+
+export fn watchdog_set_pre_reset_callback(callback: fn()) {
+  pre_reset_callback = callback
+}
+
+// Called from timer interrupt every second
 export fn watchdog_tick() {
   if watchdog_enabled == 0 { return }
-  
+
   if watchdog_counter > 0 {
     watchdog_counter = watchdog_counter - 1
-  } else {
-    foundation.serial_write_string("[Watchdog] TIMEOUT! Rebooting...\n")
-    // Trigger system reboot
   }
+
+  // For software watchdog, handle timeout
+  if watchdog_type == WATCHDOG_TYPE_SOFT {
+    soft_watchdog_check()
+  }
+
+  // For hardware watchdogs, the hardware handles timeout
+  // but we track counter for get_remaining()
+  if watchdog_counter == 0 and watchdog_type == WATCHDOG_TYPE_SOFT {
+    foundation.serial_write_string("[Watchdog] TIMEOUT! Rebooting...\n")
+    watchdog_trigger_reset()
+  }
+}
+
+// Test if watchdog caused last reboot
+export fn watchdog_caused_reboot(): u32 {
+  if watchdog_type == WATCHDOG_TYPE_ICH {
+    // Check TCO status register
+    var status: u16 = tco_read16(TCO2_STS)
+    if (status & 0x04) != 0 {
+      return 1  // Second timeout occurred (reset)
+    }
+  }
+  // Other watchdogs would need specific status checks
+  return 0
+}
+
+// Clear watchdog reboot status
+export fn watchdog_clear_status() {
+  if watchdog_type == WATCHDOG_TYPE_ICH {
+    // Clear TCO status bits
+    tco_write16(TCO1_STS, 0xFF)
+    tco_write16(TCO2_STS, 0xFF)
+  }
+}
+
+// Emergency stop - used during controlled shutdown
+export fn watchdog_emergency_stop() {
+  // Disable interrupts to prevent race conditions
+  asm volatile ("cli")
+
+  // Stop watchdog regardless of type
+  if watchdog_type == WATCHDOG_TYPE_I6300ESB {
+    i6300esb_stop()
+  } else if watchdog_type == WATCHDOG_TYPE_ICH {
+    tco_stop()
+  } else if watchdog_type == WATCHDOG_TYPE_SP5100 {
+    sp5100_stop()
+  }
+
+  watchdog_enabled = 0
+  soft_watchdog_ticks = 0
+
+  asm volatile ("sti")
+
+  foundation.serial_write_string("[Watchdog] Emergency stop\n")
 }
