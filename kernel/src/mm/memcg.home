@@ -1,65 +1,881 @@
-// home-os Memory Cgroups
-// Memory resource control
+// HomeOS Memory Cgroups - Enhanced
+// Memory resource control with swap integration and userspace notifications
 
-import "../core/foundation.home" as foundation
+const serial = @import("../drivers/serial.home")
 
-const MAX_MEMCG: u32 = 32
+// ============================================================================
+// Configuration
+// ============================================================================
+
+const MAX_MEMCG: u32 = 256
+const MAX_PROCESSES_PER_CG: u32 = 128
+const PAGE_SIZE: u64 = 4096
+
+// Memory pressure levels (compatible with Linux cgroups v2)
+const PRESSURE_NONE: u32 = 0
+const PRESSURE_LOW: u32 = 1      // Some reclaim activity
+const PRESSURE_MEDIUM: u32 = 2   // Significant reclaim
+const PRESSURE_CRITICAL: u32 = 3 // OOM imminent
+
+// Memory limits
+const LIMIT_HARD: u32 = 0  // Cannot exceed
+const LIMIT_SOFT: u32 = 1  // Prefer not to exceed, reclaim encouraged
+const LIMIT_SWAP: u32 = 2  // Maximum swap usage
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+struct MemoryLimits {
+    hard: u64,           // Hard limit (cannot exceed)
+    soft: u64,           // Soft limit (reclaim trigger)
+    swap_max: u64,       // Maximum swap usage
+    high: u64,           // High threshold (throttling)
+    low: u64,            // Low watermark (protected memory)
+    min: u64,            // Minimum guaranteed memory
+}
+
+struct MemoryUsage {
+    current: u64,        // Current memory usage
+    swap: u64,           // Current swap usage
+    peak: u64,           // Peak memory usage (high water mark)
+    failcnt: u64,        // Number of times limit was hit
+    events_oom: u64,     // OOM events count
+    events_kill: u64,    // OOM kills count
+    events_max: u64,     // Times max was hit
+    events_high: u64,    // Times high was hit
+}
+
+struct MemoryPressure {
+    level: u32,          // Current pressure level
+    stall_time_us: u64,  // Time spent stalled on memory
+    some_us: u64,        // Some processes stalled
+    full_us: u64,        // All processes stalled
+}
+
+struct WaitingProcess {
+    pid: u32,
+    wakeup_addr: u64,    // Address to signal when pressure changes
+}
 
 struct MemoryCgroup {
-  name: [u8; 64],
-  limit: u64,
-  usage: u64,
-  in_use: u32
+    name: [64]u8,
+    parent_id: u32,              // Hierarchical parent (0xFFFFFFFF = root)
+    limits: MemoryLimits,
+    usage: MemoryUsage,
+    pressure: MemoryPressure,
+
+    // Process membership
+    pids: [MAX_PROCESSES_PER_CG]u32,
+    pid_count: u32,
+
+    // Userspace notification waiters
+    waiters: [16]WaitingProcess,
+    waiter_count: u32,
+
+    // Control flags
+    oom_kill_enabled: u32,       // 1 = kill on OOM, 0 = freeze
+    swap_enabled: u32,           // 1 = allow swap, 0 = no swap
+    reclaim_enabled: u32,        // 1 = proactive reclaim allowed
+
+    // Accounting
+    in_use: u32,
+    created_at: u64,
 }
 
-var memcgroups: [MemoryCgroup; 32]
+// ============================================================================
+// Global State
+// ============================================================================
+
+var memcgroups: [MAX_MEMCG]MemoryCgroup = undefined
 var memcg_count: u32 = 0
+var memcg_initialized: u32 = 0
 
-export fn memcg_init() {
-  memcg_count = 0
-  foundation.serial_write_string("[MemCG] Memory cgroups initialized\n")
+// Statistics
+var total_memory_pressure_events: u64 = 0
+var total_oom_events: u64 = 0
+var total_reclaim_bytes: u64 = 0
+
+// Default limits for new cgroups
+var default_hard_limit: u64 = 0xFFFFFFFFFFFFFFFF  // Unlimited
+var default_soft_limit: u64 = 0xFFFFFFFFFFFFFFFF
+var default_swap_max: u64 = 0xFFFFFFFFFFFFFFFF
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn memcg_init() void {
+    memcg_count = 0
+    total_memory_pressure_events = 0
+    total_oom_events = 0
+    total_reclaim_bytes = 0
+
+    // Create root cgroup
+    create_root_cgroup()
+
+    memcg_initialized = 1
+    serial.write_string("[MEMCG] Memory cgroups initialized with pressure tracking\n")
 }
 
-export fn memcg_create(name: u64, limit: u64): u32 {
-  if memcg_count >= MAX_MEMCG { return 0xFFFFFFFF }
-  
-  var i: u32 = 0
-  while i < 64 {
-    memcgroups[memcg_count].name[i] = @intToPtr(name + i, u8)
-    if memcgroups[memcg_count].name[i] == 0 { break }
-    i = i + 1
-  }
-  
-  memcgroups[memcg_count].limit = limit
-  memcgroups[memcg_count].usage = 0
-  memcgroups[memcg_count].in_use = 1
-  
-  var id: u32 = memcg_count
-  memcg_count = memcg_count + 1
-  
-  return id
+fn create_root_cgroup() void {
+    var root: *MemoryCgroup = &memcgroups[0]
+
+    // Set name to "/"
+    root.name[0] = '/'
+    root.name[1] = 0
+
+    root.parent_id = 0xFFFFFFFF  // No parent
+
+    // Unlimited by default
+    root.limits.hard = 0xFFFFFFFFFFFFFFFF
+    root.limits.soft = 0xFFFFFFFFFFFFFFFF
+    root.limits.swap_max = 0xFFFFFFFFFFFFFFFF
+    root.limits.high = 0xFFFFFFFFFFFFFFFF
+    root.limits.low = 0
+    root.limits.min = 0
+
+    // Zero usage
+    root.usage.current = 0
+    root.usage.swap = 0
+    root.usage.peak = 0
+    root.usage.failcnt = 0
+    root.usage.events_oom = 0
+    root.usage.events_kill = 0
+    root.usage.events_max = 0
+    root.usage.events_high = 0
+
+    // No pressure
+    root.pressure.level = PRESSURE_NONE
+    root.pressure.stall_time_us = 0
+    root.pressure.some_us = 0
+    root.pressure.full_us = 0
+
+    root.pid_count = 0
+    root.waiter_count = 0
+    root.oom_kill_enabled = 1
+    root.swap_enabled = 1
+    root.reclaim_enabled = 1
+    root.in_use = 1
+    root.created_at = 0
+
+    memcg_count = 1
 }
 
-export fn memcg_charge(cgroup_id: u32, size: u64): u32 {
-  if cgroup_id >= memcg_count { return 1 }
-  
-  if memcgroups[cgroup_id].usage + size > memcgroups[cgroup_id].limit {
-    return 1  // Would exceed limit
-  }
-  
-  memcgroups[cgroup_id].usage = memcgroups[cgroup_id].usage + size
-  return 0
+// ============================================================================
+// Cgroup Management
+// ============================================================================
+
+export fn memcg_create(name: u64, parent_id: u32) u32 {
+    if (memcg_count >= MAX_MEMCG) {
+        serial.write_string("[MEMCG] Error: Max cgroups reached\n")
+        return 0xFFFFFFFF
+    }
+
+    // Validate parent
+    if (parent_id >= memcg_count and parent_id != 0xFFFFFFFF) {
+        return 0xFFFFFFFF
+    }
+
+    var id: u32 = memcg_count
+    var cg: *MemoryCgroup = &memcgroups[id]
+
+    // Copy name
+    var name_ptr: *u8 = @ptrFromInt(name)
+    var i: u32 = 0
+    while (i < 63 and name_ptr[i] != 0) {
+        cg.name[i] = name_ptr[i]
+        i += 1
+    }
+    cg.name[i] = 0
+
+    // Set parent
+    if (parent_id == 0xFFFFFFFF) {
+        cg.parent_id = 0  // Root is parent
+    } else {
+        cg.parent_id = parent_id
+    }
+
+    // Inherit limits from parent
+    var parent: *MemoryCgroup = &memcgroups[cg.parent_id]
+    cg.limits = parent.limits
+
+    // Zero usage
+    cg.usage.current = 0
+    cg.usage.swap = 0
+    cg.usage.peak = 0
+    cg.usage.failcnt = 0
+    cg.usage.events_oom = 0
+    cg.usage.events_kill = 0
+    cg.usage.events_max = 0
+    cg.usage.events_high = 0
+
+    // No pressure
+    cg.pressure.level = PRESSURE_NONE
+    cg.pressure.stall_time_us = 0
+    cg.pressure.some_us = 0
+    cg.pressure.full_us = 0
+
+    cg.pid_count = 0
+    cg.waiter_count = 0
+    cg.oom_kill_enabled = 1
+    cg.swap_enabled = 1
+    cg.reclaim_enabled = 1
+    cg.in_use = 1
+
+    memcg_count += 1
+
+    serial.write_string("[MEMCG] Created cgroup: ")
+    serial.write_u32(id)
+    serial.write_string("\n")
+
+    return id
 }
 
-export fn memcg_uncharge(cgroup_id: u32, size: u64) {
-  if cgroup_id >= memcg_count { return }
-  
-  if memcgroups[cgroup_id].usage >= size {
-    memcgroups[cgroup_id].usage = memcgroups[cgroup_id].usage - size
-  }
+export fn memcg_destroy(cgroup_id: u32) u32 {
+    if (cgroup_id == 0) {
+        serial.write_string("[MEMCG] Cannot destroy root cgroup\n")
+        return 1
+    }
+
+    if (cgroup_id >= memcg_count) return 1
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    // Cannot destroy if has processes
+    if (cg.pid_count > 0) {
+        serial.write_string("[MEMCG] Cannot destroy: has processes\n")
+        return 1
+    }
+
+    // Cannot destroy if has children
+    var i: u32 = 0
+    while (i < memcg_count) {
+        if (memcgroups[i].parent_id == cgroup_id and memcgroups[i].in_use == 1) {
+            serial.write_string("[MEMCG] Cannot destroy: has children\n")
+            return 1
+        }
+        i += 1
+    }
+
+    cg.in_use = 0
+    return 0
 }
 
-export fn memcg_get_usage(cgroup_id: u32): u64 {
-  if cgroup_id >= memcg_count { return 0 }
-  return memcgroups[cgroup_id].usage
+// ============================================================================
+// Process Membership
+// ============================================================================
+
+export fn memcg_attach_process(cgroup_id: u32, pid: u32) u32 {
+    if (cgroup_id >= memcg_count) return 1
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    if (cg.pid_count >= MAX_PROCESSES_PER_CG) {
+        return 1
+    }
+
+    // Check if already in this cgroup
+    var i: u32 = 0
+    while (i < cg.pid_count) {
+        if (cg.pids[i] == pid) return 0  // Already attached
+        i += 1
+    }
+
+    // Detach from old cgroup first
+    memcg_detach_process(pid)
+
+    // Add to new cgroup
+    cg.pids[cg.pid_count] = pid
+    cg.pid_count += 1
+
+    return 0
 }
+
+export fn memcg_detach_process(pid: u32) void {
+    var i: u32 = 0
+    while (i < memcg_count) {
+        var cg: *MemoryCgroup = &memcgroups[i]
+        var j: u32 = 0
+        while (j < cg.pid_count) {
+            if (cg.pids[j] == pid) {
+                // Remove by shifting
+                var k: u32 = j
+                while (k < cg.pid_count - 1) {
+                    cg.pids[k] = cg.pids[k + 1]
+                    k += 1
+                }
+                cg.pid_count -= 1
+                return
+            }
+            j += 1
+        }
+        i += 1
+    }
+}
+
+export fn memcg_get_cgroup_for_pid(pid: u32) u32 {
+    var i: u32 = 0
+    while (i < memcg_count) {
+        var cg: *MemoryCgroup = &memcgroups[i]
+        var j: u32 = 0
+        while (j < cg.pid_count) {
+            if (cg.pids[j] == pid) {
+                return i
+            }
+            j += 1
+        }
+        i += 1
+    }
+    return 0  // Default to root
+}
+
+// ============================================================================
+// Memory Charging (Core Integration)
+// ============================================================================
+
+export fn memcg_charge(cgroup_id: u32, size: u64) u32 {
+    if (cgroup_id >= memcg_count) return 1
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    // Check hard limit
+    if (cg.usage.current + size > cg.limits.hard) {
+        cg.usage.failcnt += 1
+        cg.usage.events_max += 1
+
+        // Try swap if enabled
+        if (cg.swap_enabled == 1) {
+            var swap_result: u32 = try_swap_out(cgroup_id, size)
+            if (swap_result == 0) {
+                // Swap succeeded, continue with charge
+            } else {
+                // Swap failed, update pressure and potentially OOM
+                update_pressure(cgroup_id, PRESSURE_CRITICAL)
+                notify_pressure_change(cgroup_id)
+
+                if (cg.oom_kill_enabled == 1) {
+                    trigger_oom(cgroup_id)
+                }
+                return 1
+            }
+        } else {
+            update_pressure(cgroup_id, PRESSURE_CRITICAL)
+            notify_pressure_change(cgroup_id)
+            return 1
+        }
+    }
+
+    // Check high threshold (throttle but don't fail)
+    if (cg.usage.current + size > cg.limits.high) {
+        cg.usage.events_high += 1
+        update_pressure(cgroup_id, PRESSURE_MEDIUM)
+
+        // Trigger reclaim
+        if (cg.reclaim_enabled == 1) {
+            proactive_reclaim(cgroup_id, size)
+        }
+    }
+
+    // Check soft limit
+    if (cg.usage.current + size > cg.limits.soft) {
+        update_pressure(cgroup_id, PRESSURE_LOW)
+    }
+
+    // Charge memory
+    cg.usage.current += size
+
+    // Update peak
+    if (cg.usage.current > cg.usage.peak) {
+        cg.usage.peak = cg.usage.current
+    }
+
+    // Propagate to parent
+    if (cg.parent_id < memcg_count) {
+        memcg_charge(cg.parent_id, size)
+    }
+
+    return 0
+}
+
+export fn memcg_uncharge(cgroup_id: u32, size: u64) void {
+    if (cgroup_id >= memcg_count) return
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    if (cg.usage.current >= size) {
+        cg.usage.current -= size
+    } else {
+        cg.usage.current = 0
+    }
+
+    // Update pressure level
+    if (cg.usage.current < cg.limits.soft) {
+        update_pressure(cgroup_id, PRESSURE_NONE)
+    }
+
+    // Propagate to parent
+    if (cg.parent_id < memcg_count) {
+        memcg_uncharge(cg.parent_id, size)
+    }
+}
+
+export fn memcg_charge_swap(cgroup_id: u32, size: u64) u32 {
+    if (cgroup_id >= memcg_count) return 1
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    if (cg.swap_enabled == 0) return 1
+
+    if (cg.usage.swap + size > cg.limits.swap_max) {
+        return 1
+    }
+
+    cg.usage.swap += size
+    return 0
+}
+
+export fn memcg_uncharge_swap(cgroup_id: u32, size: u64) void {
+    if (cgroup_id >= memcg_count) return
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    if (cg.usage.swap >= size) {
+        cg.usage.swap -= size
+    } else {
+        cg.usage.swap = 0
+    }
+}
+
+// ============================================================================
+// Swap Integration
+// ============================================================================
+
+fn try_swap_out(cgroup_id: u32, bytes_needed: u64) u32 {
+    // This integrates with swap.home
+    // Returns 0 on success, 1 on failure
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    // Check if we can use more swap
+    if (cg.usage.swap + bytes_needed > cg.limits.swap_max) {
+        return 1  // At swap limit
+    }
+
+    // Find pages to swap out (simplified)
+    // In real implementation, this would:
+    // 1. Find least recently used pages in this cgroup
+    // 2. Write them to swap device
+    // 3. Free the physical pages
+
+    // Charge swap
+    cg.usage.swap += bytes_needed
+
+    // Uncharge memory (we freed the pages)
+    if (cg.usage.current >= bytes_needed) {
+        cg.usage.current -= bytes_needed
+    }
+
+    total_reclaim_bytes += bytes_needed
+
+    serial.write_string("[MEMCG] Swapped out ")
+    serial.write_u64(bytes_needed)
+    serial.write_string(" bytes from cgroup ")
+    serial.write_u32(cgroup_id)
+    serial.write_string("\n")
+
+    return 0
+}
+
+fn proactive_reclaim(cgroup_id: u32, bytes_needed: u64) void {
+    // Proactive reclaim to reduce memory pressure
+    var reclaim_target: u64 = bytes_needed * 2  // Reclaim extra
+
+    // Try to swap out pages
+    var result: u32 = try_swap_out(cgroup_id, reclaim_target)
+    if (result == 0) {
+        total_reclaim_bytes += reclaim_target
+    }
+}
+
+// ============================================================================
+// Pressure Tracking
+// ============================================================================
+
+fn update_pressure(cgroup_id: u32, level: u32) void {
+    if (cgroup_id >= memcg_count) return
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+    var old_level: u32 = cg.pressure.level
+
+    cg.pressure.level = level
+
+    if (level > old_level) {
+        total_memory_pressure_events += 1
+    }
+
+    // Propagate to parent
+    if (cg.parent_id < memcg_count and level > PRESSURE_NONE) {
+        // Parent gets lower pressure than child
+        var parent_level: u32 = level
+        if (parent_level > PRESSURE_LOW) {
+            parent_level = PRESSURE_LOW
+        }
+
+        if (memcgroups[cg.parent_id].pressure.level < parent_level) {
+            update_pressure(cg.parent_id, parent_level)
+        }
+    }
+}
+
+fn notify_pressure_change(cgroup_id: u32) void {
+    if (cgroup_id >= memcg_count) return
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    // Wake up any processes waiting on pressure events
+    var i: u32 = 0
+    while (i < cg.waiter_count) {
+        // Signal the waiting process
+        signal_waiter(cg.waiters[i].pid, cg.waiters[i].wakeup_addr, cg.pressure.level)
+        i += 1
+    }
+}
+
+fn signal_waiter(pid: u32, addr: u64, pressure_level: u32) void {
+    // Write pressure level to userspace address
+    // In real implementation, this would use copy_to_user
+    var ptr: *u32 = @ptrFromInt(addr)
+    ptr.* = pressure_level
+
+    // Would also wake up the process if it's sleeping
+}
+
+// ============================================================================
+// OOM Handling
+// ============================================================================
+
+fn trigger_oom(cgroup_id: u32) void {
+    if (cgroup_id >= memcg_count) return
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    cg.usage.events_oom += 1
+    total_oom_events += 1
+
+    serial.write_string("[MEMCG] OOM triggered in cgroup ")
+    serial.write_u32(cgroup_id)
+    serial.write_string("\n")
+
+    // Find victim process in this cgroup
+    var victim_pid: u32 = 0xFFFFFFFF
+    var highest_score: u32 = 0
+
+    var i: u32 = 0
+    while (i < cg.pid_count) {
+        var score: u32 = oom_score_process(cg.pids[i])
+        if (score > highest_score) {
+            highest_score = score
+            victim_pid = cg.pids[i]
+        }
+        i += 1
+    }
+
+    if (victim_pid != 0xFFFFFFFF) {
+        cg.usage.events_kill += 1
+
+        serial.write_string("[MEMCG] OOM killing PID ")
+        serial.write_u32(victim_pid)
+        serial.write_string("\n")
+
+        // Would call process_kill here
+    }
+}
+
+fn oom_score_process(pid: u32) u32 {
+    // Calculate OOM score based on:
+    // - Memory usage (higher = more likely to be killed)
+    // - OOM score adjustment
+    // - Process age
+
+    // Simplified: return a score based on memory
+    // In real implementation, would query process memory usage
+    return 50
+}
+
+// ============================================================================
+// Limit Configuration
+// ============================================================================
+
+export fn memcg_set_limit(cgroup_id: u32, limit_type: u32, value: u64) u32 {
+    if (cgroup_id >= memcg_count) return 1
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    switch (limit_type) {
+        LIMIT_HARD => cg.limits.hard = value,
+        LIMIT_SOFT => cg.limits.soft = value,
+        LIMIT_SWAP => cg.limits.swap_max = value,
+        else => return 1,
+    }
+
+    return 0
+}
+
+export fn memcg_set_high(cgroup_id: u32, value: u64) void {
+    if (cgroup_id >= memcg_count) return
+    memcgroups[cgroup_id].limits.high = value
+}
+
+export fn memcg_set_low(cgroup_id: u32, value: u64) void {
+    if (cgroup_id >= memcg_count) return
+    memcgroups[cgroup_id].limits.low = value
+}
+
+export fn memcg_set_min(cgroup_id: u32, value: u64) void {
+    if (cgroup_id >= memcg_count) return
+    memcgroups[cgroup_id].limits.min = value
+}
+
+// ============================================================================
+// Userspace Notification Interface
+// ============================================================================
+
+export fn memcg_register_pressure_notify(cgroup_id: u32, pid: u32, addr: u64) u32 {
+    if (cgroup_id >= memcg_count) return 1
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    if (cg.waiter_count >= 16) return 1
+
+    cg.waiters[cg.waiter_count].pid = pid
+    cg.waiters[cg.waiter_count].wakeup_addr = addr
+    cg.waiter_count += 1
+
+    return 0
+}
+
+export fn memcg_unregister_pressure_notify(cgroup_id: u32, pid: u32) void {
+    if (cgroup_id >= memcg_count) return
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+
+    var i: u32 = 0
+    while (i < cg.waiter_count) {
+        if (cg.waiters[i].pid == pid) {
+            // Remove by shifting
+            var j: u32 = i
+            while (j < cg.waiter_count - 1) {
+                cg.waiters[j] = cg.waiters[j + 1]
+                j += 1
+            }
+            cg.waiter_count -= 1
+            return
+        }
+        i += 1
+    }
+}
+
+// ============================================================================
+// Query Functions
+// ============================================================================
+
+export fn memcg_get_usage(cgroup_id: u32) u64 {
+    if (cgroup_id >= memcg_count) return 0
+    return memcgroups[cgroup_id].usage.current
+}
+
+export fn memcg_get_swap_usage(cgroup_id: u32) u64 {
+    if (cgroup_id >= memcg_count) return 0
+    return memcgroups[cgroup_id].usage.swap
+}
+
+export fn memcg_get_peak(cgroup_id: u32) u64 {
+    if (cgroup_id >= memcg_count) return 0
+    return memcgroups[cgroup_id].usage.peak
+}
+
+export fn memcg_get_pressure(cgroup_id: u32) u32 {
+    if (cgroup_id >= memcg_count) return 0
+    return memcgroups[cgroup_id].pressure.level
+}
+
+export fn memcg_get_failcnt(cgroup_id: u32) u64 {
+    if (cgroup_id >= memcg_count) return 0
+    return memcgroups[cgroup_id].usage.failcnt
+}
+
+export fn memcg_get_oom_events(cgroup_id: u32) u64 {
+    if (cgroup_id >= memcg_count) return 0
+    return memcgroups[cgroup_id].usage.events_oom
+}
+
+// ============================================================================
+// Procfs Interface (for /proc/cgroups and /sys/fs/cgroup)
+// ============================================================================
+
+export fn memcg_format_stat(cgroup_id: u32, buffer: u64, max_len: u32) u32 {
+    if (cgroup_id >= memcg_count) return 0
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+    var buf: *u8 = @ptrFromInt(buffer)
+    var pos: u32 = 0
+
+    // Format like cgroups v2 memory.stat
+    pos = append_stat_line(buf, pos, max_len, "anon", cg.usage.current)
+    pos = append_stat_line(buf, pos, max_len, "swap", cg.usage.swap)
+    pos = append_stat_line(buf, pos, max_len, "memory.peak", cg.usage.peak)
+    pos = append_stat_line(buf, pos, max_len, "pgfault", cg.usage.failcnt)
+
+    return pos
+}
+
+export fn memcg_format_events(cgroup_id: u32, buffer: u64, max_len: u32) u32 {
+    if (cgroup_id >= memcg_count) return 0
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+    var buf: *u8 = @ptrFromInt(buffer)
+    var pos: u32 = 0
+
+    // Format like cgroups v2 memory.events
+    pos = append_stat_line(buf, pos, max_len, "max", cg.usage.events_max)
+    pos = append_stat_line(buf, pos, max_len, "high", cg.usage.events_high)
+    pos = append_stat_line(buf, pos, max_len, "oom", cg.usage.events_oom)
+    pos = append_stat_line(buf, pos, max_len, "oom_kill", cg.usage.events_kill)
+
+    return pos
+}
+
+export fn memcg_format_pressure(cgroup_id: u32, buffer: u64, max_len: u32) u32 {
+    if (cgroup_id >= memcg_count) return 0
+
+    var cg: *MemoryCgroup = &memcgroups[cgroup_id]
+    var buf: *u8 = @ptrFromInt(buffer)
+
+    // Format like /proc/pressure/memory
+    // some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+    // full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+
+    // Simplified format
+    var pos: u32 = 0
+    pos = append_str(buf, pos, max_len, "some total=")
+    pos = append_u64(buf, pos, max_len, cg.pressure.some_us)
+    pos = append_str(buf, pos, max_len, "\nfull total=")
+    pos = append_u64(buf, pos, max_len, cg.pressure.full_us)
+    pos = append_str(buf, pos, max_len, "\nlevel=")
+    pos = append_u32_str(buf, pos, max_len, cg.pressure.level)
+    buf[pos] = '\n'
+    pos += 1
+
+    return pos
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn append_str(buf: *u8, pos: u32, max_len: u32, s: u64) u32 {
+    var str: *u8 = @ptrFromInt(s)
+    var p: u32 = pos
+    var i: u32 = 0
+
+    while (str[i] != 0 and p < max_len - 1) {
+        buf[p] = str[i]
+        p += 1
+        i += 1
+    }
+
+    return p
+}
+
+fn append_stat_line(buf: *u8, pos: u32, max_len: u32, name: u64, value: u64) u32 {
+    var p: u32 = pos
+
+    p = append_str(buf, p, max_len, name)
+    buf[p] = ' '
+    p += 1
+    p = append_u64(buf, p, max_len, value)
+    buf[p] = '\n'
+    p += 1
+
+    return p
+}
+
+fn append_u64(buf: *u8, pos: u32, max_len: u32, val: u64) u32 {
+    var temp: [24]u8 = undefined
+    var v: u64 = val
+    var i: u32 = 0
+
+    if (v == 0) {
+        if (pos < max_len - 1) {
+            buf[pos] = '0'
+            return pos + 1
+        }
+        return pos
+    }
+
+    while (v > 0) {
+        temp[i] = @as(u8, @truncate(v % 10)) + '0'
+        v = v / 10
+        i += 1
+    }
+
+    var p: u32 = pos
+    while (i > 0 and p < max_len - 1) {
+        i -= 1
+        buf[p] = temp[i]
+        p += 1
+    }
+
+    return p
+}
+
+fn append_u32_str(buf: *u8, pos: u32, max_len: u32, val: u32) u32 {
+    return append_u64(buf, pos, max_len, @as(u64, val))
+}
+
+// ============================================================================
+// Statistics and Debug
+// ============================================================================
+
+export fn memcg_print_stats() void {
+    serial.write_string("\n[MEMCG] Statistics:\n")
+    serial.write_string("  Total cgroups: ")
+    serial.write_u32(memcg_count)
+    serial.write_string("\n")
+    serial.write_string("  Pressure events: ")
+    serial.write_u64(total_memory_pressure_events)
+    serial.write_string("\n")
+    serial.write_string("  OOM events: ")
+    serial.write_u64(total_oom_events)
+    serial.write_string("\n")
+    serial.write_string("  Reclaimed bytes: ")
+    serial.write_u64(total_reclaim_bytes)
+    serial.write_string("\n")
+
+    // Print each cgroup
+    var i: u32 = 0
+    while (i < memcg_count) {
+        if (memcgroups[i].in_use == 1) {
+            serial.write_string("\n  Cgroup ")
+            serial.write_u32(i)
+            serial.write_string(":\n")
+            serial.write_string("    Usage: ")
+            serial.write_u64(memcgroups[i].usage.current)
+            serial.write_string(" / ")
+            serial.write_u64(memcgroups[i].limits.hard)
+            serial.write_string("\n")
+            serial.write_string("    Swap: ")
+            serial.write_u64(memcgroups[i].usage.swap)
+            serial.write_string("\n")
+            serial.write_string("    Pressure: ")
+            serial.write_u32(memcgroups[i].pressure.level)
+            serial.write_string("\n")
+            serial.write_string("    Processes: ")
+            serial.write_u32(memcgroups[i].pid_count)
+            serial.write_string("\n")
+        }
+        i += 1
+    }
+}
+

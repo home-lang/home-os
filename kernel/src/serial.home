@@ -1,24 +1,51 @@
 // Serial port driver for home-os
-// COM1 serial port at 0x3F8
+// COM1 serial port at 0x3F8 with interrupt-driven receive
 
 // COM1 port base address
 let PORT: u16 = 0x3F8
+let IRQ_COM1: u8 = 4   // IRQ4 for COM1
 
 // Port offsets
 let DATA: u16 = 0      // Data register (DLAB=0)
 let IER: u16 = 1       // Interrupt Enable Register (DLAB=0)
 let DLL: u16 = 0       // Divisor Latch Low (DLAB=1)
 let DLH: u16 = 1       // Divisor Latch High (DLAB=1)
-let IIR: u16 = 2       // Interrupt Identification Register
+let IIR: u16 = 2       // Interrupt Identification Register / FIFO Control
+let FCR: u16 = 2       // FIFO Control Register (write-only)
 let LCR: u16 = 3       // Line Control Register
 let MCR: u16 = 4       // Modem Control Register
 let LSR: u16 = 5       // Line Status Register
 let MSR: u16 = 6       // Modem Status Register
 let SCRATCH: u16 = 7   // Scratch Register
 
+// Interrupt Enable Register bits
+let IER_RX_AVAILABLE: u8 = 1 << 0   // Received data available
+let IER_TX_EMPTY: u8 = 1 << 1       // Transmitter holding register empty
+let IER_LINE_STATUS: u8 = 1 << 2    // Receiver line status
+let IER_MODEM_STATUS: u8 = 1 << 3   // Modem status
+
 // Line Status Register bits
 let LSR_DATA_READY: u8 = 1 << 0
+let LSR_OVERRUN_ERROR: u8 = 1 << 1
+let LSR_PARITY_ERROR: u8 = 1 << 2
+let LSR_FRAMING_ERROR: u8 = 1 << 3
+let LSR_BREAK_INTERRUPT: u8 = 1 << 4
 let LSR_TRANSMIT_EMPTY: u8 = 1 << 5
+let LSR_TX_EMPTY: u8 = 1 << 6
+let LSR_FIFO_ERROR: u8 = 1 << 7
+
+// Interrupt Identification Register bits
+let IIR_NO_INTERRUPT: u8 = 1 << 0
+let IIR_ID_MASK: u8 = 0x0E
+
+// Receive buffer (circular buffer)
+let RX_BUFFER_SIZE: usize = 256
+var rx_buffer: [256]u8 = [_]u8{0} ** 256
+var rx_head: usize = 0
+var rx_tail: usize = 0
+var rx_count: usize = 0
+var rx_overflow_count: u32 = 0
+var rx_interrupts_enabled: bool = false
 
 // I/O port operations
 inline fn outb(port: u16, value: u8) {
@@ -149,4 +176,219 @@ export fn writeDec(value: u64) {
         i = i - 1
         writeChar(buf[i])
     }
+}
+
+// ============================================================================
+// Interrupt-Driven Receive
+// ============================================================================
+
+// Enable receive interrupts (called after IRQ handler is registered)
+export fn enableReceiveInterrupts() {
+    // Enable received data available interrupt
+    let current_ier = inb(PORT + IER)
+    outb(PORT + IER, current_ier | IER_RX_AVAILABLE)
+
+    // Make sure MCR has OUT2 set (required for interrupts on PC)
+    let current_mcr = inb(PORT + MCR)
+    outb(PORT + MCR, current_mcr | 0x08)  // OUT2 bit
+
+    rx_interrupts_enabled = true
+    writeString("[Serial] Receive interrupts enabled\n")
+}
+
+// Disable receive interrupts
+export fn disableReceiveInterrupts() {
+    let current_ier = inb(PORT + IER)
+    outb(PORT + IER, current_ier & ~IER_RX_AVAILABLE)
+    rx_interrupts_enabled = false
+}
+
+// Check if data is ready to receive
+fn isDataReady(): bool {
+    return (inb(PORT + LSR) & LSR_DATA_READY) != 0
+}
+
+// IRQ4 handler - called from interrupt handler
+// This reads all available bytes from the serial port
+export fn handleInterrupt() {
+    // Read IIR to check interrupt type
+    let iir = inb(PORT + IIR)
+
+    // Check if interrupt is pending (bit 0 clear means pending)
+    if (iir & IIR_NO_INTERRUPT) != 0 {
+        return
+    }
+
+    // Process all available data
+    loop {
+        if !isDataReady() {
+            break
+        }
+
+        let byte = inb(PORT + DATA)
+
+        // Add to circular buffer
+        if rx_count < RX_BUFFER_SIZE {
+            rx_buffer[rx_head] = byte
+            rx_head = (rx_head + 1) % RX_BUFFER_SIZE
+            rx_count = rx_count + 1
+        } else {
+            // Buffer overflow - drop byte and record
+            rx_overflow_count = rx_overflow_count + 1
+        }
+    }
+}
+
+// Read a single byte from receive buffer (non-blocking)
+// Returns -1 if no data available
+export fn readByte(): i32 {
+    if rx_count == 0 {
+        return -1
+    }
+
+    let byte = rx_buffer[rx_tail]
+    rx_tail = (rx_tail + 1) % RX_BUFFER_SIZE
+    rx_count = rx_count - 1
+
+    return @as(i32, byte)
+}
+
+// Read a single byte (blocking - waits until data available)
+export fn readByteBlocking(): u8 {
+    // Wait for data
+    loop {
+        if rx_count > 0 {
+            break
+        }
+        // Could add a timeout here
+        asm volatile ("pause")  // CPU hint for spin-wait
+    }
+
+    let byte = rx_buffer[rx_tail]
+    rx_tail = (rx_tail + 1) % RX_BUFFER_SIZE
+    rx_count = rx_count - 1
+
+    return byte
+}
+
+// Read up to n bytes into buffer, returns actual bytes read
+export fn readBytes(buf: []u8, n: usize): usize {
+    let bytes_read: usize = 0
+    let to_read = if n < rx_count { n } else { rx_count }
+
+    loop {
+        if bytes_read >= to_read {
+            break
+        }
+
+        buf[bytes_read] = rx_buffer[rx_tail]
+        rx_tail = (rx_tail + 1) % RX_BUFFER_SIZE
+        bytes_read = bytes_read + 1
+    }
+
+    rx_count = rx_count - bytes_read
+    return bytes_read
+}
+
+// Read a line (up to newline or buffer full)
+// Returns number of bytes read (including newline if present)
+export fn readLine(buf: []u8, max_len: usize): usize {
+    let bytes_read: usize = 0
+
+    loop {
+        if bytes_read >= max_len {
+            break
+        }
+
+        // Wait for a byte
+        loop {
+            if rx_count > 0 {
+                break
+            }
+            asm volatile ("pause")
+        }
+
+        let byte = rx_buffer[rx_tail]
+        rx_tail = (rx_tail + 1) % RX_BUFFER_SIZE
+        rx_count = rx_count - 1
+
+        buf[bytes_read] = byte
+        bytes_read = bytes_read + 1
+
+        // Check for newline
+        if byte == '\n' or byte == '\r' {
+            break
+        }
+    }
+
+    return bytes_read
+}
+
+// Check how many bytes are available to read
+export fn available(): usize {
+    return rx_count
+}
+
+// Check if receive buffer is empty
+export fn isEmpty(): bool {
+    return rx_count == 0
+}
+
+// Check if receive buffer is full
+export fn isFull(): bool {
+    return rx_count >= RX_BUFFER_SIZE
+}
+
+// Clear receive buffer
+export fn clearBuffer() {
+    rx_head = 0
+    rx_tail = 0
+    rx_count = 0
+}
+
+// Get overflow count (number of dropped bytes)
+export fn getOverflowCount(): u32 {
+    return rx_overflow_count
+}
+
+// Reset overflow counter
+export fn resetOverflowCount() {
+    rx_overflow_count = 0
+}
+
+// Check if receive interrupts are enabled
+export fn isReceiveInterruptEnabled(): bool {
+    return rx_interrupts_enabled
+}
+
+// Print receive buffer status
+export fn printStatus() {
+    writeString("[Serial] RX buffer: ")
+    writeDec(rx_count)
+    writeString("/")
+    writeDec(RX_BUFFER_SIZE)
+    writeString(" bytes, overflows: ")
+    writeDec(rx_overflow_count)
+    writeString(", interrupts: ")
+    writeString(if rx_interrupts_enabled { "enabled" } else { "disabled" })
+    writeString("\n")
+}
+
+// Polling-based read (for use before interrupts are set up)
+export fn readBytePolling(): i32 {
+    if !isDataReady() {
+        return -1
+    }
+    return @as(i32, inb(PORT + DATA))
+}
+
+// Blocking polling read
+export fn readBytePollingBlocking(): u8 {
+    loop {
+        if isDataReady() {
+            break
+        }
+        asm volatile ("pause")
+    }
+    return inb(PORT + DATA)
 }

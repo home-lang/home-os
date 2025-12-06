@@ -1,50 +1,823 @@
-// home-os Swap Management
-// Virtual memory swapping
+// HomeOS Swap Management - Enhanced
+// Virtual memory swapping with memcg integration
 
-import "../core/foundation.home" as foundation
-import "../core/memory.home" as memory
+const serial = @import("../drivers/serial.home")
 
-const SWAP_SIZE: u64 = 1024 * 1024 * 1024  // 1GB
-const PAGE_SIZE: u32 = 4096
+// ============================================================================
+// Configuration
+// ============================================================================
 
+const PAGE_SIZE: u64 = 4096
+const SWAP_SLOT_SIZE: u64 = PAGE_SIZE
+const MAX_SWAP_DEVICES: u32 = 4
+const MAX_SWAP_PAGES: u32 = 262144  // 1GB / 4KB = 262144 pages
+
+// Swap entry flags
+const SWAP_ENTRY_USED: u32 = 1
+const SWAP_ENTRY_DIRTY: u32 = 2
+const SWAP_ENTRY_WRITEBACK: u32 = 4
+const SWAP_ENTRY_BAD: u32 = 8
+
+// Swap device types
+const SWAP_TYPE_FILE: u32 = 0
+const SWAP_TYPE_PARTITION: u32 = 1
+const SWAP_TYPE_ZRAM: u32 = 2  // Compressed RAM
+
+// Swap priority
+const SWAP_PRIORITY_DEFAULT: i32 = -1
+const SWAP_PRIORITY_MAX: i32 = 32767
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+struct SwapEntry {
+    flags: u32,
+    page_addr: u64,      // Original page physical address
+    owner_pid: u32,      // Process that owns this page
+    owner_cgroup: u32,   // Memory cgroup
+    access_count: u32,   // For swap slot ordering
+}
+
+struct SwapDevice {
+    device_path: [64]u8,
+    device_type: u32,
+    priority: i32,
+    total_slots: u32,
+    used_slots: u32,
+    bad_slots: u32,
+    base_address: u64,      // Device base (or file offset)
+    active: u32,
+}
+
+struct SwapStats {
+    total_pages: u64,
+    used_pages: u64,
+    free_pages: u64,
+    reads: u64,
+    writes: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+    failed_reads: u64,
+    failed_writes: u64,
+}
+
+// Per-cgroup swap tracking
+struct CgroupSwapInfo {
+    cgroup_id: u32,
+    swap_limit: u64,
+    swap_used: u64,
+    swap_high: u64,       // Throttling threshold
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var swap_entries: [MAX_SWAP_PAGES]SwapEntry = undefined
+var swap_devices: [MAX_SWAP_DEVICES]SwapDevice = undefined
+var device_count: u32 = 0
+
+var swap_stats: SwapStats = undefined
 var swap_initialized: u32 = 0
-var swap_device: u64 = 0
-var swap_used: u64 = 0
 
-export fn swap_init(device: u64) {
-  if swap_initialized == 1 { return }
-  
-  swap_device = device
-  swap_used = 0
-  swap_initialized = 1
-  foundation.serial_write_string("[Swap] Initialized (1GB)\n")
+// Free slot tracking (simple bitmap-like approach)
+var free_head: u32 = 0  // First free slot index
+
+// Cgroup swap tracking
+const MAX_CGROUP_SWAP: u32 = 256
+var cgroup_swap: [MAX_CGROUP_SWAP]CgroupSwapInfo = undefined
+var cgroup_swap_count: u32 = 0
+
+// Writeback state
+var writeback_running: u32 = 0
+var writeback_pending: u32 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn swap_init() void {
+    if (swap_initialized == 1) return
+
+    // Initialize entries
+    var i: u32 = 0
+    while (i < MAX_SWAP_PAGES) {
+        swap_entries[i].flags = 0
+        swap_entries[i].page_addr = 0
+        swap_entries[i].owner_pid = 0
+        swap_entries[i].owner_cgroup = 0
+        swap_entries[i].access_count = 0
+        i += 1
+    }
+
+    // Initialize devices
+    i = 0
+    while (i < MAX_SWAP_DEVICES) {
+        swap_devices[i].active = 0
+        swap_devices[i].total_slots = 0
+        swap_devices[i].used_slots = 0
+        swap_devices[i].bad_slots = 0
+        i += 1
+    }
+
+    device_count = 0
+
+    // Initialize stats
+    swap_stats.total_pages = 0
+    swap_stats.used_pages = 0
+    swap_stats.free_pages = 0
+    swap_stats.reads = 0
+    swap_stats.writes = 0
+    swap_stats.read_bytes = 0
+    swap_stats.write_bytes = 0
+    swap_stats.failed_reads = 0
+    swap_stats.failed_writes = 0
+
+    free_head = 0
+    cgroup_swap_count = 0
+    writeback_running = 0
+    writeback_pending = 0
+
+    swap_initialized = 1
+    serial.write_string("[SWAP] Swap subsystem initialized\n")
 }
 
-export fn swap_out_page(page: u64): u64 {
-  if swap_initialized == 0 { return 0 }
-  
-  var offset: u64 = swap_used
-  swap_used = swap_used + PAGE_SIZE
-  
-  // Write page to swap device (stub)
-  foundation.serial_write_string("[Swap] Page swapped out\n")
-  
-  return offset
+// ============================================================================
+// Device Management
+// ============================================================================
+
+export fn swap_add_device(path: u64, device_type: u32, size: u64, priority: i32) u32 {
+    if (device_count >= MAX_SWAP_DEVICES) {
+        serial.write_string("[SWAP] Error: Max swap devices reached\n")
+        return 0xFFFFFFFF
+    }
+
+    var dev: *SwapDevice = &swap_devices[device_count]
+
+    // Copy path
+    var path_ptr: *u8 = @ptrFromInt(path)
+    var i: u32 = 0
+    while (i < 63 and path_ptr[i] != 0) {
+        dev.device_path[i] = path_ptr[i]
+        i += 1
+    }
+    dev.device_path[i] = 0
+
+    dev.device_type = device_type
+    dev.priority = priority
+    dev.total_slots = @as(u32, @truncate(size / SWAP_SLOT_SIZE))
+    dev.used_slots = 0
+    dev.bad_slots = 0
+    dev.base_address = 0  // Would be set when device is opened
+    dev.active = 1
+
+    // Update stats
+    swap_stats.total_pages += dev.total_slots
+    swap_stats.free_pages += dev.total_slots
+
+    var id: u32 = device_count
+    device_count += 1
+
+    serial.write_string("[SWAP] Added swap device ")
+    serial.write_u32(id)
+    serial.write_string(" (")
+    serial.write_u64(size / 1024 / 1024)
+    serial.write_string(" MB, priority ")
+    serial.write_u32(@as(u32, @intCast(priority + 32768)))  // Make positive for display
+    serial.write_string(")\n")
+
+    return id
 }
 
-export fn swap_in_page(offset: u64, page: u64): u32 {
-  if swap_initialized == 0 { return 1 }
-  
-  // Read page from swap device (stub)
-  foundation.serial_write_string("[Swap] Page swapped in\n")
-  
-  return 0
+export fn swap_remove_device(device_id: u32) u32 {
+    if (device_id >= device_count) return 1
+
+    var dev: *SwapDevice = &swap_devices[device_id]
+
+    // Cannot remove if pages are still in use
+    if (dev.used_slots > 0) {
+        serial.write_string("[SWAP] Cannot remove: pages still in use\n")
+        return 1
+    }
+
+    dev.active = 0
+    swap_stats.total_pages -= dev.total_slots
+    swap_stats.free_pages -= (dev.total_slots - dev.used_slots)
+
+    serial.write_string("[SWAP] Removed swap device ")
+    serial.write_u32(device_id)
+    serial.write_string("\n")
+
+    return 0
 }
 
-export fn swap_get_usage(): u64 {
-  return swap_used
+// ============================================================================
+// Swap Out (Memory -> Swap)
+// ============================================================================
+
+export fn swap_out_page(page_addr: u64, pid: u32, cgroup_id: u32) u64 {
+    if (swap_initialized == 0) return 0
+
+    // Check cgroup swap limit
+    if (cgroup_id != 0xFFFFFFFF) {
+        var cg_info: *CgroupSwapInfo = get_or_create_cgroup_info(cgroup_id)
+        if (cg_info != null) {
+            if (cg_info.swap_used + PAGE_SIZE > cg_info.swap_limit) {
+                serial.write_string("[SWAP] Cgroup swap limit reached\n")
+                return 0
+            }
+        }
+    }
+
+    // Find free slot (priority-based selection)
+    var slot: u32 = find_best_swap_slot()
+    if (slot == 0xFFFFFFFF) {
+        serial.write_string("[SWAP] No free swap slots\n")
+        return 0
+    }
+
+    // Mark slot as used
+    swap_entries[slot].flags = SWAP_ENTRY_USED | SWAP_ENTRY_DIRTY
+    swap_entries[slot].page_addr = page_addr
+    swap_entries[slot].owner_pid = pid
+    swap_entries[slot].owner_cgroup = cgroup_id
+    swap_entries[slot].access_count = 0
+
+    // Write to swap device
+    var result: u32 = write_to_swap_device(slot, page_addr)
+    if (result != 0) {
+        // Write failed
+        swap_entries[slot].flags = 0
+        swap_stats.failed_writes += 1
+        return 0
+    }
+
+    // Clear dirty flag after successful write
+    swap_entries[slot].flags = SWAP_ENTRY_USED
+
+    // Update stats
+    swap_stats.used_pages += 1
+    swap_stats.free_pages -= 1
+    swap_stats.writes += 1
+    swap_stats.write_bytes += PAGE_SIZE
+
+    // Update cgroup tracking
+    if (cgroup_id != 0xFFFFFFFF) {
+        var cg_info2: *CgroupSwapInfo = get_cgroup_info(cgroup_id)
+        if (cg_info2 != null) {
+            cg_info2.swap_used += PAGE_SIZE
+        }
+    }
+
+    // Return swap entry offset (can be stored in PTE)
+    return @as(u64, slot) * SWAP_SLOT_SIZE
 }
 
-export fn swap_get_free(): u64 {
-  return SWAP_SIZE - swap_used
+fn find_best_swap_slot() u32 {
+    // Find free slot, preferring higher priority devices
+    var best_device: i32 = -1
+    var best_priority: i32 = -32768
+
+    // Find highest priority device with free slots
+    var i: u32 = 0
+    while (i < device_count) {
+        if (swap_devices[i].active == 1 and
+            swap_devices[i].used_slots < swap_devices[i].total_slots) {
+            if (swap_devices[i].priority > best_priority) {
+                best_priority = swap_devices[i].priority
+                best_device = @as(i32, @intCast(i))
+            }
+        }
+        i += 1
+    }
+
+    if (best_device < 0) return 0xFFFFFFFF
+
+    // Find free slot in that device
+    var dev: *SwapDevice = &swap_devices[@as(u32, @intCast(best_device))]
+    var slot_offset: u32 = 0
+
+    // Calculate base slot for this device
+    var base_slot: u32 = 0
+    i = 0
+    while (i < @as(u32, @intCast(best_device))) {
+        base_slot += swap_devices[i].total_slots
+        i += 1
+    }
+
+    // Find free slot
+    i = 0
+    while (i < dev.total_slots) {
+        var slot: u32 = base_slot + i
+        if (slot < MAX_SWAP_PAGES and swap_entries[slot].flags == 0) {
+            dev.used_slots += 1
+            return slot
+        }
+        i += 1
+    }
+
+    return 0xFFFFFFFF
 }
+
+fn write_to_swap_device(slot: u32, page_addr: u64) u32 {
+    // Find which device owns this slot
+    var device_id: u32 = 0
+    var slot_count: u32 = 0
+    while (device_id < device_count) {
+        if (slot < slot_count + swap_devices[device_id].total_slots) {
+            break
+        }
+        slot_count += swap_devices[device_id].total_slots
+        device_id += 1
+    }
+
+    if (device_id >= device_count) return 1
+
+    var dev: *SwapDevice = &swap_devices[device_id]
+    var local_slot: u32 = slot - slot_count
+
+    // Write based on device type
+    switch (dev.device_type) {
+        SWAP_TYPE_ZRAM => {
+            // Compressed RAM - would compress and store in memory
+            return zram_write(dev, local_slot, page_addr)
+        },
+        SWAP_TYPE_PARTITION, SWAP_TYPE_FILE => {
+            // Disk write
+            return disk_write(dev, local_slot, page_addr)
+        },
+        else => return 1,
+    }
+}
+
+fn zram_write(dev: *SwapDevice, slot: u32, page_addr: u64) u32 {
+    // Placeholder for zram compression
+    // Would compress page and store in allocated memory
+    return 0
+}
+
+fn disk_write(dev: *SwapDevice, slot: u32, page_addr: u64) u32 {
+    // Placeholder for disk I/O
+    // Would write page to disk at offset
+    return 0
+}
+
+// ============================================================================
+// Swap In (Swap -> Memory)
+// ============================================================================
+
+export fn swap_in_page(swap_offset: u64, dest_addr: u64) u32 {
+    if (swap_initialized == 0) return 1
+
+    var slot: u32 = @as(u32, @truncate(swap_offset / SWAP_SLOT_SIZE))
+
+    if (slot >= MAX_SWAP_PAGES) return 1
+    if (swap_entries[slot].flags & SWAP_ENTRY_USED == 0) return 1
+
+    // Read from swap device
+    var result: u32 = read_from_swap_device(slot, dest_addr)
+    if (result != 0) {
+        swap_stats.failed_reads += 1
+        return 1
+    }
+
+    // Update stats
+    swap_stats.reads += 1
+    swap_stats.read_bytes += PAGE_SIZE
+
+    // Increment access count (for swap slot reordering)
+    swap_entries[slot].access_count += 1
+
+    return 0
+}
+
+export fn swap_free_page(swap_offset: u64) void {
+    var slot: u32 = @as(u32, @truncate(swap_offset / SWAP_SLOT_SIZE))
+
+    if (slot >= MAX_SWAP_PAGES) return
+    if (swap_entries[slot].flags & SWAP_ENTRY_USED == 0) return
+
+    // Update cgroup tracking
+    var cgroup_id: u32 = swap_entries[slot].owner_cgroup
+    if (cgroup_id != 0xFFFFFFFF) {
+        var cg_info: *CgroupSwapInfo = get_cgroup_info(cgroup_id)
+        if (cg_info != null) {
+            if (cg_info.swap_used >= PAGE_SIZE) {
+                cg_info.swap_used -= PAGE_SIZE
+            }
+        }
+    }
+
+    // Mark slot as free
+    swap_entries[slot].flags = 0
+    swap_entries[slot].page_addr = 0
+    swap_entries[slot].owner_pid = 0
+    swap_entries[slot].owner_cgroup = 0
+
+    // Update device used count
+    update_device_used_count(slot, false)
+
+    // Update stats
+    swap_stats.used_pages -= 1
+    swap_stats.free_pages += 1
+}
+
+fn read_from_swap_device(slot: u32, dest_addr: u64) u32 {
+    // Find device and read
+    var device_id: u32 = 0
+    var slot_count: u32 = 0
+    while (device_id < device_count) {
+        if (slot < slot_count + swap_devices[device_id].total_slots) {
+            break
+        }
+        slot_count += swap_devices[device_id].total_slots
+        device_id += 1
+    }
+
+    if (device_id >= device_count) return 1
+
+    var dev: *SwapDevice = &swap_devices[device_id]
+    var local_slot: u32 = slot - slot_count
+
+    switch (dev.device_type) {
+        SWAP_TYPE_ZRAM => return zram_read(dev, local_slot, dest_addr),
+        SWAP_TYPE_PARTITION, SWAP_TYPE_FILE => return disk_read(dev, local_slot, dest_addr),
+        else => return 1,
+    }
+}
+
+fn zram_read(dev: *SwapDevice, slot: u32, dest_addr: u64) u32 {
+    // Placeholder for zram decompression
+    return 0
+}
+
+fn disk_read(dev: *SwapDevice, slot: u32, dest_addr: u64) u32 {
+    // Placeholder for disk I/O
+    return 0
+}
+
+fn update_device_used_count(slot: u32, increment: bool) void {
+    var device_id: u32 = 0
+    var slot_count: u32 = 0
+    while (device_id < device_count) {
+        if (slot < slot_count + swap_devices[device_id].total_slots) {
+            if (increment) {
+                swap_devices[device_id].used_slots += 1
+            } else {
+                if (swap_devices[device_id].used_slots > 0) {
+                    swap_devices[device_id].used_slots -= 1
+                }
+            }
+            return
+        }
+        slot_count += swap_devices[device_id].total_slots
+        device_id += 1
+    }
+}
+
+// ============================================================================
+// Cgroup Integration
+// ============================================================================
+
+fn get_or_create_cgroup_info(cgroup_id: u32) *CgroupSwapInfo {
+    // Search existing
+    var i: u32 = 0
+    while (i < cgroup_swap_count) {
+        if (cgroup_swap[i].cgroup_id == cgroup_id) {
+            return &cgroup_swap[i]
+        }
+        i += 1
+    }
+
+    // Create new
+    if (cgroup_swap_count >= MAX_CGROUP_SWAP) {
+        return null
+    }
+
+    var info: *CgroupSwapInfo = &cgroup_swap[cgroup_swap_count]
+    info.cgroup_id = cgroup_id
+    info.swap_limit = 0xFFFFFFFFFFFFFFFF  // Unlimited by default
+    info.swap_used = 0
+    info.swap_high = 0xFFFFFFFFFFFFFFFF
+
+    cgroup_swap_count += 1
+    return info
+}
+
+fn get_cgroup_info(cgroup_id: u32) *CgroupSwapInfo {
+    var i: u32 = 0
+    while (i < cgroup_swap_count) {
+        if (cgroup_swap[i].cgroup_id == cgroup_id) {
+            return &cgroup_swap[i]
+        }
+        i += 1
+    }
+    return null
+}
+
+export fn swap_set_cgroup_limit(cgroup_id: u32, limit: u64) void {
+    var info: *CgroupSwapInfo = get_or_create_cgroup_info(cgroup_id)
+    if (info != null) {
+        info.swap_limit = limit
+    }
+}
+
+export fn swap_set_cgroup_high(cgroup_id: u32, high: u64) void {
+    var info: *CgroupSwapInfo = get_or_create_cgroup_info(cgroup_id)
+    if (info != null) {
+        info.swap_high = high
+    }
+}
+
+export fn swap_get_cgroup_usage(cgroup_id: u32) u64 {
+    var info: *CgroupSwapInfo = get_cgroup_info(cgroup_id)
+    if (info != null) {
+        return info.swap_used
+    }
+    return 0
+}
+
+// ============================================================================
+// Reclaim Interface (for memcg integration)
+// ============================================================================
+
+export fn swap_reclaim_pages(cgroup_id: u32, count: u32) u32 {
+    // Called by memcg to swap out pages from a cgroup
+    // Returns number of pages successfully swapped
+
+    var reclaimed: u32 = 0
+
+    // In real implementation, would iterate through pages owned by cgroup
+    // and swap them out
+
+    serial.write_string("[SWAP] Reclaim request for cgroup ")
+    serial.write_u32(cgroup_id)
+    serial.write_string(": ")
+    serial.write_u32(count)
+    serial.write_string(" pages\n")
+
+    return reclaimed
+}
+
+export fn swap_shrink(target_free: u32) u32 {
+    // Called when swap space is low
+    // Try to free swap slots by swapping pages back in
+
+    var freed: u32 = 0
+
+    // Would implement swap slot reclaim here
+
+    return freed
+}
+
+// ============================================================================
+// Writeback Control
+// ============================================================================
+
+export fn swap_start_writeback() void {
+    if (writeback_running == 1) return
+
+    writeback_running = 1
+    writeback_pending = 0
+
+    // Would start async writeback thread
+    serial.write_string("[SWAP] Writeback started\n")
+}
+
+export fn swap_stop_writeback() void {
+    writeback_running = 0
+    serial.write_string("[SWAP] Writeback stopped\n")
+}
+
+fn writeback_tick() void {
+    if (writeback_running == 0) return
+
+    // Write out dirty pages
+    var i: u32 = 0
+    while (i < MAX_SWAP_PAGES) {
+        if (swap_entries[i].flags & SWAP_ENTRY_DIRTY != 0 and
+            swap_entries[i].flags & SWAP_ENTRY_WRITEBACK == 0) {
+
+            swap_entries[i].flags = swap_entries[i].flags | SWAP_ENTRY_WRITEBACK
+
+            // Write page
+            var result: u32 = write_to_swap_device(i, swap_entries[i].page_addr)
+            if (result == 0) {
+                // Clear dirty and writeback flags
+                swap_entries[i].flags = swap_entries[i].flags & ~(SWAP_ENTRY_DIRTY | SWAP_ENTRY_WRITEBACK)
+            } else {
+                swap_entries[i].flags = swap_entries[i].flags & ~SWAP_ENTRY_WRITEBACK
+            }
+        }
+        i += 1
+    }
+}
+
+// ============================================================================
+// Query Functions
+// ============================================================================
+
+export fn swap_get_total() u64 {
+    return swap_stats.total_pages * PAGE_SIZE
+}
+
+export fn swap_get_used() u64 {
+    return swap_stats.used_pages * PAGE_SIZE
+}
+
+export fn swap_get_free() u64 {
+    return swap_stats.free_pages * PAGE_SIZE
+}
+
+export fn swap_get_device_count() u32 {
+    return device_count
+}
+
+export fn swap_is_enabled() u32 {
+    return if (device_count > 0) @as(u32, 1) else @as(u32, 0)
+}
+
+// ============================================================================
+// Procfs Interface
+// ============================================================================
+
+export fn swap_format_stat(buffer: u64, max_len: u32) u32 {
+    var buf: *u8 = @ptrFromInt(buffer)
+    var pos: u32 = 0
+
+    pos = append_str(buf, pos, max_len, "Total:     ")
+    pos = append_kb(buf, pos, max_len, swap_stats.total_pages * PAGE_SIZE)
+    pos = append_str(buf, pos, max_len, " kB\nUsed:      ")
+    pos = append_kb(buf, pos, max_len, swap_stats.used_pages * PAGE_SIZE)
+    pos = append_str(buf, pos, max_len, " kB\nFree:      ")
+    pos = append_kb(buf, pos, max_len, swap_stats.free_pages * PAGE_SIZE)
+    pos = append_str(buf, pos, max_len, " kB\nReads:     ")
+    pos = append_u64(buf, pos, max_len, swap_stats.reads)
+    pos = append_str(buf, pos, max_len, "\nWrites:    ")
+    pos = append_u64(buf, pos, max_len, swap_stats.writes)
+    pos = append_str(buf, pos, max_len, "\nFailed R:  ")
+    pos = append_u64(buf, pos, max_len, swap_stats.failed_reads)
+    pos = append_str(buf, pos, max_len, "\nFailed W:  ")
+    pos = append_u64(buf, pos, max_len, swap_stats.failed_writes)
+    pos = append_str(buf, pos, max_len, "\n")
+
+    return pos
+}
+
+export fn swap_format_devices(buffer: u64, max_len: u32) u32 {
+    var buf: *u8 = @ptrFromInt(buffer)
+    var pos: u32 = 0
+
+    pos = append_str(buf, pos, max_len, "Filename\t\t\tType\t\tSize\t\tUsed\t\tPriority\n")
+
+    var i: u32 = 0
+    while (i < device_count) {
+        var dev: *SwapDevice = &swap_devices[i]
+        if (dev.active == 1) {
+            // Device name (simplified)
+            pos = append_str(buf, pos, max_len, "/dev/swap")
+            pos = append_u32_str(buf, pos, max_len, i)
+            pos = append_str(buf, pos, max_len, "\t\t")
+
+            // Type
+            switch (dev.device_type) {
+                SWAP_TYPE_FILE => pos = append_str(buf, pos, max_len, "file"),
+                SWAP_TYPE_PARTITION => pos = append_str(buf, pos, max_len, "partition"),
+                SWAP_TYPE_ZRAM => pos = append_str(buf, pos, max_len, "zram"),
+                else => pos = append_str(buf, pos, max_len, "unknown"),
+            }
+            pos = append_str(buf, pos, max_len, "\t\t")
+
+            // Size
+            pos = append_kb(buf, pos, max_len, @as(u64, dev.total_slots) * PAGE_SIZE)
+            pos = append_str(buf, pos, max_len, "\t\t")
+
+            // Used
+            pos = append_kb(buf, pos, max_len, @as(u64, dev.used_slots) * PAGE_SIZE)
+            pos = append_str(buf, pos, max_len, "\t\t")
+
+            // Priority
+            pos = append_u32_str(buf, pos, max_len, @as(u32, @intCast(dev.priority + 32768)))
+            pos = append_str(buf, pos, max_len, "\n")
+        }
+        i += 1
+    }
+
+    return pos
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn append_str(buf: *u8, pos: u32, max_len: u32, s: u64) u32 {
+    var str: *u8 = @ptrFromInt(s)
+    var p: u32 = pos
+    var i: u32 = 0
+
+    while (str[i] != 0 and p < max_len - 1) {
+        buf[p] = str[i]
+        p += 1
+        i += 1
+    }
+
+    return p
+}
+
+fn append_u64(buf: *u8, pos: u32, max_len: u32, val: u64) u32 {
+    var temp: [24]u8 = undefined
+    var v: u64 = val
+    var i: u32 = 0
+
+    if (v == 0) {
+        if (pos < max_len - 1) {
+            buf[pos] = '0'
+            return pos + 1
+        }
+        return pos
+    }
+
+    while (v > 0) {
+        temp[i] = @as(u8, @truncate(v % 10)) + '0'
+        v = v / 10
+        i += 1
+    }
+
+    var p: u32 = pos
+    while (i > 0 and p < max_len - 1) {
+        i -= 1
+        buf[p] = temp[i]
+        p += 1
+    }
+
+    return p
+}
+
+fn append_u32_str(buf: *u8, pos: u32, max_len: u32, val: u32) u32 {
+    return append_u64(buf, pos, max_len, @as(u64, val))
+}
+
+fn append_kb(buf: *u8, pos: u32, max_len: u32, bytes: u64) u32 {
+    return append_u64(buf, pos, max_len, bytes / 1024)
+}
+
+// ============================================================================
+// Statistics and Debug
+// ============================================================================
+
+export fn swap_print_stats() void {
+    serial.write_string("\n[SWAP] Statistics:\n")
+    serial.write_string("  Devices: ")
+    serial.write_u32(device_count)
+    serial.write_string("\n")
+    serial.write_string("  Total: ")
+    serial.write_u64(swap_stats.total_pages * PAGE_SIZE / 1024)
+    serial.write_string(" KB\n")
+    serial.write_string("  Used: ")
+    serial.write_u64(swap_stats.used_pages * PAGE_SIZE / 1024)
+    serial.write_string(" KB\n")
+    serial.write_string("  Free: ")
+    serial.write_u64(swap_stats.free_pages * PAGE_SIZE / 1024)
+    serial.write_string(" KB\n")
+    serial.write_string("  Reads: ")
+    serial.write_u64(swap_stats.reads)
+    serial.write_string("\n")
+    serial.write_string("  Writes: ")
+    serial.write_u64(swap_stats.writes)
+    serial.write_string("\n")
+
+    // Per-device stats
+    var i: u32 = 0
+    while (i < device_count) {
+        if (swap_devices[i].active == 1) {
+            serial.write_string("\n  Device ")
+            serial.write_u32(i)
+            serial.write_string(":\n")
+            serial.write_string("    Slots: ")
+            serial.write_u32(swap_devices[i].used_slots)
+            serial.write_string("/")
+            serial.write_u32(swap_devices[i].total_slots)
+            serial.write_string("\n")
+            serial.write_string("    Priority: ")
+            serial.write_u32(@as(u32, @intCast(swap_devices[i].priority + 32768)))
+            serial.write_string("\n")
+        }
+        i += 1
+    }
+
+    // Cgroup tracking
+    if (cgroup_swap_count > 0) {
+        serial.write_string("\n  Cgroup swap usage:\n")
+        i = 0
+        while (i < cgroup_swap_count) {
+            serial.write_string("    Cgroup ")
+            serial.write_u32(cgroup_swap[i].cgroup_id)
+            serial.write_string(": ")
+            serial.write_u64(cgroup_swap[i].swap_used / 1024)
+            serial.write_string(" KB\n")
+            i += 1
+        }
+    }
+}
+

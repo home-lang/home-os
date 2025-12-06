@@ -1,12 +1,20 @@
 // home-os Netfilter
-// Packet filtering and firewall
+// Packet filtering and firewall with audit integration
 
 import "../core/foundation.home" as foundation
+import "../security/audit.home" as audit
 
 const NF_DROP: u32 = 0
 const NF_ACCEPT: u32 = 1
 
 const MAX_RULES: u32 = 128
+
+// Audit event subtypes for netfilter
+const NF_AUDIT_RULE_ADD: u32 = 1
+const NF_AUDIT_RULE_DELETE: u32 = 2
+const NF_AUDIT_PACKET_DROP: u32 = 3
+const NF_AUDIT_PACKET_ACCEPT: u32 = 4
+const NF_AUDIT_STATE_CHANGE: u32 = 5
 
 struct FirewallRule {
   src_ip: u32,
@@ -15,12 +23,17 @@ struct FirewallRule {
   dst_port: u16,
   protocol: u8,
   action: u32,
-  enabled: u32
+  enabled: u32,
+  hit_count: u64
 }
 
 var rules: [FirewallRule; 128]
 var rule_count: u32 = 0
 var netfilter_enabled: u32 = 0
+var audit_drops: u32 = 1        // Log dropped packets (default: yes)
+var audit_accepts: u32 = 0      // Log accepted packets (default: no, too verbose)
+var total_drops: u64 = 0
+var total_accepts: u64 = 0
 
 export fn netfilter_init() {
   rule_count = 0
@@ -30,41 +43,139 @@ export fn netfilter_init() {
 
 export fn netfilter_add_rule(src_ip: u32, dst_ip: u32, protocol: u8, action: u32): u32 {
   if rule_count >= MAX_RULES { return 0xFFFFFFFF }
-  
+
   rules[rule_count].src_ip = src_ip
   rules[rule_count].dst_ip = dst_ip
   rules[rule_count].protocol = protocol
   rules[rule_count].action = action
   rules[rule_count].enabled = 1
-  
+  rules[rule_count].hit_count = 0
+
   var id: u32 = rule_count
   rule_count = rule_count + 1
-  
+
+  // Audit log the rule addition
+  var rule_data: u64 = (@as(u64, src_ip) << 32) | @as(u64, dst_ip)
+  audit.audit_log_network(0, 0, rule_data, (NF_AUDIT_RULE_ADD << 16) | @as(u32, protocol),
+                          if action == NF_DROP { -1 } else { 0 })
+
+  foundation.serial_write_string("[Netfilter] Rule added: ")
+  foundation.serial_write_hex(id)
+  foundation.serial_write_string(" action=")
+  foundation.serial_write_string(if action == NF_DROP { "DROP" } else { "ACCEPT" })
+  foundation.serial_write_string("\n")
+
   return id
 }
 
 export fn netfilter_check_packet(src_ip: u32, dst_ip: u32, protocol: u8): u32 {
   if netfilter_enabled == 0 { return NF_ACCEPT }
-  
+
   var i: u32 = 0
   while i < rule_count {
     if rules[i].enabled == 1 {
       if (rules[i].src_ip == 0 or rules[i].src_ip == src_ip) and
          (rules[i].dst_ip == 0 or rules[i].dst_ip == dst_ip) and
          (rules[i].protocol == 0 or rules[i].protocol == protocol) {
-        return rules[i].action
+        // Update hit count
+        rules[i].hit_count = rules[i].hit_count + 1
+
+        var action: u32 = rules[i].action
+        var pkt_addr: u64 = (@as(u64, src_ip) << 32) | @as(u64, dst_ip)
+
+        if action == NF_DROP {
+          total_drops = total_drops + 1
+          // Audit log dropped packets
+          if audit_drops == 1 {
+            audit.audit_log_network(0, 0, pkt_addr,
+                                    (NF_AUDIT_PACKET_DROP << 16) | @as(u32, protocol), -1)
+          }
+        } else {
+          total_accepts = total_accepts + 1
+          // Optionally audit accepted packets
+          if audit_accepts == 1 {
+            audit.audit_log_network(0, 0, pkt_addr,
+                                    (NF_AUDIT_PACKET_ACCEPT << 16) | @as(u32, protocol), 0)
+          }
+        }
+
+        return action
       }
     }
     i = i + 1
   }
-  
+
+  total_accepts = total_accepts + 1
   return NF_ACCEPT
 }
 
 export fn netfilter_enable() {
   netfilter_enabled = 1
+  // Audit log state change
+  audit.audit_log_network(0, 0, 0, (NF_AUDIT_STATE_CHANGE << 16) | 1, 0)
+  foundation.serial_write_string("[Netfilter] Enabled\n")
 }
 
 export fn netfilter_disable() {
   netfilter_enabled = 0
+  // Audit log state change
+  audit.audit_log_network(0, 0, 0, (NF_AUDIT_STATE_CHANGE << 16) | 0, 0)
+  foundation.serial_write_string("[Netfilter] Disabled\n")
+}
+
+// Delete a rule by ID
+export fn netfilter_delete_rule(rule_id: u32): u32 {
+  if rule_id >= rule_count { return 0 }
+
+  // Audit log the deletion
+  var rule_data: u64 = (@as(u64, rules[rule_id].src_ip) << 32) | @as(u64, rules[rule_id].dst_ip)
+  audit.audit_log_network(0, 0, rule_data,
+                          (NF_AUDIT_RULE_DELETE << 16) | @as(u32, rules[rule_id].protocol), 0)
+
+  // Mark rule as disabled (or shift rules)
+  rules[rule_id].enabled = 0
+
+  foundation.serial_write_string("[Netfilter] Rule deleted: ")
+  foundation.serial_write_hex(rule_id)
+  foundation.serial_write_string("\n")
+
+  return 1
+}
+
+// Configure audit logging
+export fn netfilter_set_audit_drops(enabled: u32) {
+  audit_drops = enabled
+}
+
+export fn netfilter_set_audit_accepts(enabled: u32) {
+  audit_accepts = enabled
+}
+
+// Statistics
+export fn netfilter_get_total_drops(): u64 {
+  return total_drops
+}
+
+export fn netfilter_get_total_accepts(): u64 {
+  return total_accepts
+}
+
+export fn netfilter_get_rule_hits(rule_id: u32): u64 {
+  if rule_id >= rule_count { return 0 }
+  return rules[rule_id].hit_count
+}
+
+export fn netfilter_print_stats() {
+  foundation.serial_write_string("\n[Netfilter] Statistics:\n")
+  foundation.serial_write_string("  Rules: ")
+  foundation.serial_write_hex(rule_count)
+  foundation.serial_write_string("\n  Total drops: ")
+  foundation.serial_write_hex(@truncate(total_drops, u32))
+  foundation.serial_write_string("\n  Total accepts: ")
+  foundation.serial_write_hex(@truncate(total_accepts, u32))
+  foundation.serial_write_string("\n  Audit drops: ")
+  foundation.serial_write_string(if audit_drops == 1 { "ON" } else { "OFF" })
+  foundation.serial_write_string("\n  Audit accepts: ")
+  foundation.serial_write_string(if audit_accepts == 1 { "ON" } else { "OFF" })
+  foundation.serial_write_string("\n")
 }

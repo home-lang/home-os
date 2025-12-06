@@ -1,0 +1,822 @@
+// HomeOS Shell Parser - Hardened parsing for hsh
+// Handles: quoting, escapes, pipelines, redirections, variables
+// This module provides robust parsing that the main shell uses
+
+const serial = @import("../kernel/src/drivers/serial.home")
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+const MAX_TOKENS: u32 = 256
+const MAX_TOKEN_LEN: u32 = 1024
+const MAX_PIPELINE_STAGES: u32 = 16
+const MAX_REDIRECTIONS: u32 = 8
+
+// Token types
+const TOKEN_WORD: u32 = 0          // Regular word/argument
+const TOKEN_PIPE: u32 = 1          // |
+const TOKEN_AND: u32 = 2           // &&
+const TOKEN_OR: u32 = 3            // ||
+const TOKEN_SEMICOLON: u32 = 4     // ;
+const TOKEN_BACKGROUND: u32 = 5    // &
+const TOKEN_REDIR_OUT: u32 = 6     // >
+const TOKEN_REDIR_APPEND: u32 = 7  // >>
+const TOKEN_REDIR_IN: u32 = 8      // <
+const TOKEN_REDIR_HEREDOC: u32 = 9 // <<
+const TOKEN_NEWLINE: u32 = 10      // \n
+const TOKEN_EOF: u32 = 11          // End of input
+
+// Parse errors
+const PARSE_OK: u32 = 0
+const PARSE_ERR_UNTERMINATED_QUOTE: u32 = 1
+const PARSE_ERR_UNTERMINATED_ESCAPE: u32 = 2
+const PARSE_ERR_EMPTY_PIPE: u32 = 3
+const PARSE_ERR_INVALID_REDIR: u32 = 4
+const PARSE_ERR_TOO_MANY_TOKENS: u32 = 5
+const PARSE_ERR_TOKEN_TOO_LONG: u32 = 6
+const PARSE_ERR_SYNTAX: u32 = 7
+
+// Quoting states
+const QUOTE_NONE: u32 = 0
+const QUOTE_SINGLE: u32 = 1        // Inside '...'
+const QUOTE_DOUBLE: u32 = 2        // Inside "..."
+const QUOTE_ESCAPE: u32 = 3        // After backslash
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+struct Token {
+    token_type: u32,
+    value: [MAX_TOKEN_LEN]u8,
+    length: u32,
+    quoted: u32,           // Was this token quoted?
+    line: u32,             // Line number for error reporting
+    column: u32,           // Column number for error reporting
+}
+
+struct Redirection {
+    redir_type: u32,       // TOKEN_REDIR_*
+    fd: u32,               // File descriptor (0=stdin, 1=stdout, 2=stderr)
+    target: [256]u8,       // Filename or heredoc delimiter
+}
+
+struct Command {
+    argv: [64]*u8,         // Argument pointers
+    argc: u32,             // Argument count
+    redirections: [MAX_REDIRECTIONS]Redirection,
+    redir_count: u32,
+    background: u32,       // Run in background?
+}
+
+struct Pipeline {
+    commands: [MAX_PIPELINE_STAGES]Command,
+    stage_count: u32,
+}
+
+struct ParseResult {
+    error_code: u32,
+    error_line: u32,
+    error_column: u32,
+    error_message: [256]u8,
+    tokens: [MAX_TOKENS]Token,
+    token_count: u32,
+}
+
+// ============================================================================
+// Lexer State
+// ============================================================================
+
+struct LexerState {
+    input: *u8,
+    pos: u32,
+    length: u32,
+    line: u32,
+    column: u32,
+    quote_state: u32,
+    escape_next: u32,
+}
+
+var lexer: LexerState = undefined
+var parse_result: ParseResult = undefined
+
+// ============================================================================
+// Character Classification
+// ============================================================================
+
+fn is_whitespace(c: u8) u32 {
+    return if (c == ' ' or c == '\t' or c == '\r') @as(u32, 1) else @as(u32, 0)
+}
+
+fn is_operator_char(c: u8) u32 {
+    return if (c == '|' or c == '&' or c == ';' or c == '<' or c == '>') @as(u32, 1) else @as(u32, 0)
+}
+
+fn is_quote_char(c: u8) u32 {
+    return if (c == '\'' or c == '"' or c == '\\') @as(u32, 1) else @as(u32, 0)
+}
+
+fn is_word_char(c: u8) u32 {
+    // Not whitespace, not operator, not quote, not null, not newline
+    if (c == 0) return 0
+    if (is_whitespace(c) == 1) return 0
+    if (is_operator_char(c) == 1) return 0
+    if (c == '\n') return 0
+    return 1
+}
+
+// ============================================================================
+// Lexer Functions
+// ============================================================================
+
+fn lexer_init(input: *u8, length: u32) void {
+    lexer.input = input
+    lexer.pos = 0
+    lexer.length = length
+    lexer.line = 1
+    lexer.column = 1
+    lexer.quote_state = QUOTE_NONE
+    lexer.escape_next = 0
+}
+
+fn lexer_peek() u8 {
+    if (lexer.pos >= lexer.length) return 0
+    return lexer.input[lexer.pos]
+}
+
+fn lexer_peek_ahead(n: u32) u8 {
+    if (lexer.pos + n >= lexer.length) return 0
+    return lexer.input[lexer.pos + n]
+}
+
+fn lexer_advance() u8 {
+    if (lexer.pos >= lexer.length) return 0
+    var c: u8 = lexer.input[lexer.pos]
+    lexer.pos += 1
+
+    if (c == '\n') {
+        lexer.line += 1
+        lexer.column = 1
+    } else {
+        lexer.column += 1
+    }
+
+    return c
+}
+
+fn lexer_skip_whitespace() void {
+    while (lexer.pos < lexer.length) {
+        var c: u8 = lexer_peek()
+        if (is_whitespace(c) == 1) {
+            lexer_advance()
+        } else if (c == '#') {
+            // Skip comment to end of line
+            while (lexer.pos < lexer.length and lexer_peek() != '\n') {
+                lexer_advance()
+            }
+        } else {
+            break
+        }
+    }
+}
+
+// ============================================================================
+// Token Reading
+// ============================================================================
+
+fn read_quoted_string(token: *Token, quote_char: u8) u32 {
+    // Consume opening quote
+    lexer_advance()
+    token.quoted = 1
+
+    var in_double: u32 = if (quote_char == '"') @as(u32, 1) else @as(u32, 0)
+
+    while (lexer.pos < lexer.length) {
+        var c: u8 = lexer_peek()
+
+        if (c == quote_char) {
+            // Closing quote
+            lexer_advance()
+            return PARSE_OK
+        }
+
+        if (c == 0 or (c == '\n' and in_double == 0)) {
+            // Unterminated quote
+            return PARSE_ERR_UNTERMINATED_QUOTE
+        }
+
+        // Handle escapes in double quotes
+        if (in_double == 1 and c == '\\') {
+            var next: u8 = lexer_peek_ahead(1)
+            // In double quotes, only certain escapes are special
+            if (next == '"' or next == '\\' or next == '$' or next == '`' or next == '\n') {
+                lexer_advance()  // Skip backslash
+                c = lexer_advance()  // Get escaped char
+                if (c == '\n') continue  // Line continuation
+            } else {
+                // Keep the backslash
+                if (token.length < MAX_TOKEN_LEN - 1) {
+                    token.value[token.length] = c
+                    token.length += 1
+                    lexer_advance()
+                } else {
+                    return PARSE_ERR_TOKEN_TOO_LONG
+                }
+                continue
+            }
+        } else {
+            c = lexer_advance()
+        }
+
+        // Add character to token
+        if (token.length < MAX_TOKEN_LEN - 1) {
+            token.value[token.length] = c
+            token.length += 1
+        } else {
+            return PARSE_ERR_TOKEN_TOO_LONG
+        }
+    }
+
+    return PARSE_ERR_UNTERMINATED_QUOTE
+}
+
+fn read_word_token(token: *Token) u32 {
+    while (lexer.pos < lexer.length) {
+        var c: u8 = lexer_peek()
+
+        // Check for end of word
+        if (is_whitespace(c) == 1 or is_operator_char(c) == 1 or c == '\n' or c == 0) {
+            break
+        }
+
+        // Handle quotes within word
+        if (c == '\'' or c == '"') {
+            var result: u32 = read_quoted_string(token, c)
+            if (result != PARSE_OK) return result
+            continue
+        }
+
+        // Handle escapes
+        if (c == '\\') {
+            lexer_advance()  // Skip backslash
+            var next: u8 = lexer_peek()
+            if (next == '\n') {
+                // Line continuation
+                lexer_advance()
+                continue
+            }
+            if (next == 0) {
+                return PARSE_ERR_UNTERMINATED_ESCAPE
+            }
+            c = lexer_advance()
+        } else {
+            c = lexer_advance()
+        }
+
+        // Add character to token
+        if (token.length < MAX_TOKEN_LEN - 1) {
+            token.value[token.length] = c
+            token.length += 1
+        } else {
+            return PARSE_ERR_TOKEN_TOO_LONG
+        }
+    }
+
+    return PARSE_OK
+}
+
+fn read_operator_token(token: *Token) u32 {
+    var c: u8 = lexer_advance()
+    token.value[0] = c
+    token.length = 1
+
+    switch (c) {
+        '|' => {
+            if (lexer_peek() == '|') {
+                lexer_advance()
+                token.value[1] = '|'
+                token.length = 2
+                token.token_type = TOKEN_OR
+            } else {
+                token.token_type = TOKEN_PIPE
+            }
+        },
+        '&' => {
+            if (lexer_peek() == '&') {
+                lexer_advance()
+                token.value[1] = '&'
+                token.length = 2
+                token.token_type = TOKEN_AND
+            } else {
+                token.token_type = TOKEN_BACKGROUND
+            }
+        },
+        ';' => {
+            token.token_type = TOKEN_SEMICOLON
+        },
+        '>' => {
+            if (lexer_peek() == '>') {
+                lexer_advance()
+                token.value[1] = '>'
+                token.length = 2
+                token.token_type = TOKEN_REDIR_APPEND
+            } else {
+                token.token_type = TOKEN_REDIR_OUT
+            }
+        },
+        '<' => {
+            if (lexer_peek() == '<') {
+                lexer_advance()
+                token.value[1] = '<'
+                token.length = 2
+                token.token_type = TOKEN_REDIR_HEREDOC
+            } else {
+                token.token_type = TOKEN_REDIR_IN
+            }
+        },
+        else => {},
+    }
+
+    token.value[token.length] = 0
+    return PARSE_OK
+}
+
+fn next_token() u32 {
+    if (parse_result.token_count >= MAX_TOKENS) {
+        return PARSE_ERR_TOO_MANY_TOKENS
+    }
+
+    lexer_skip_whitespace()
+
+    var token: *Token = &parse_result.tokens[parse_result.token_count]
+    token.length = 0
+    token.quoted = 0
+    token.line = lexer.line
+    token.column = lexer.column
+
+    var c: u8 = lexer_peek()
+
+    if (c == 0) {
+        token.token_type = TOKEN_EOF
+        parse_result.token_count += 1
+        return PARSE_OK
+    }
+
+    if (c == '\n') {
+        lexer_advance()
+        token.token_type = TOKEN_NEWLINE
+        token.value[0] = '\n'
+        token.value[1] = 0
+        token.length = 1
+        parse_result.token_count += 1
+        return PARSE_OK
+    }
+
+    if (is_operator_char(c) == 1) {
+        var result: u32 = read_operator_token(token)
+        if (result != PARSE_OK) return result
+        parse_result.token_count += 1
+        return PARSE_OK
+    }
+
+    // Must be a word token
+    token.token_type = TOKEN_WORD
+
+    // Check for quotes at start
+    if (c == '\'' or c == '"') {
+        var result: u32 = read_quoted_string(token, c)
+        if (result != PARSE_OK) return result
+        // Continue reading if more word follows
+        c = lexer_peek()
+        if (is_word_char(c) == 1 or c == '\'' or c == '"') {
+            result = read_word_token(token)
+            if (result != PARSE_OK) return result
+        }
+    } else {
+        var result: u32 = read_word_token(token)
+        if (result != PARSE_OK) return result
+    }
+
+    token.value[token.length] = 0
+    parse_result.token_count += 1
+    return PARSE_OK
+}
+
+// ============================================================================
+// Tokenize Full Input
+// ============================================================================
+
+export fn shell_tokenize(input: *u8, length: u32) *ParseResult {
+    // Initialize parse result
+    parse_result.error_code = PARSE_OK
+    parse_result.error_line = 0
+    parse_result.error_column = 0
+    parse_result.error_message[0] = 0
+    parse_result.token_count = 0
+
+    // Initialize lexer
+    lexer_init(input, length)
+
+    // Tokenize
+    while (lexer.pos < lexer.length) {
+        var result: u32 = next_token()
+
+        if (result != PARSE_OK) {
+            parse_result.error_code = result
+            parse_result.error_line = lexer.line
+            parse_result.error_column = lexer.column
+            set_error_message(result)
+            return &parse_result
+        }
+
+        // Check for EOF
+        if (parse_result.token_count > 0) {
+            var last: *Token = &parse_result.tokens[parse_result.token_count - 1]
+            if (last.token_type == TOKEN_EOF) break
+        }
+    }
+
+    return &parse_result
+}
+
+fn set_error_message(code: u32) void {
+    switch (code) {
+        PARSE_ERR_UNTERMINATED_QUOTE => {
+            copy_str(&parse_result.error_message[0], "Unterminated quote")
+        },
+        PARSE_ERR_UNTERMINATED_ESCAPE => {
+            copy_str(&parse_result.error_message[0], "Unterminated escape sequence")
+        },
+        PARSE_ERR_EMPTY_PIPE => {
+            copy_str(&parse_result.error_message[0], "Empty pipe segment")
+        },
+        PARSE_ERR_INVALID_REDIR => {
+            copy_str(&parse_result.error_message[0], "Invalid redirection")
+        },
+        PARSE_ERR_TOO_MANY_TOKENS => {
+            copy_str(&parse_result.error_message[0], "Too many tokens")
+        },
+        PARSE_ERR_TOKEN_TOO_LONG => {
+            copy_str(&parse_result.error_message[0], "Token too long")
+        },
+        PARSE_ERR_SYNTAX => {
+            copy_str(&parse_result.error_message[0], "Syntax error")
+        },
+        else => {
+            copy_str(&parse_result.error_message[0], "Unknown error")
+        },
+    }
+}
+
+// ============================================================================
+// Pipeline Parsing
+// ============================================================================
+
+var current_pipeline: Pipeline = undefined
+var pipeline_error: u32 = PARSE_OK
+
+export fn shell_parse_pipeline(result: *ParseResult) *Pipeline {
+    pipeline_error = PARSE_OK
+
+    current_pipeline.stage_count = 0
+
+    var token_idx: u32 = 0
+    var current_cmd: *Command = &current_pipeline.commands[0]
+    current_cmd.argc = 0
+    current_cmd.redir_count = 0
+    current_cmd.background = 0
+
+    while (token_idx < result.token_count) {
+        var token: *Token = &result.tokens[token_idx]
+
+        switch (token.token_type) {
+            TOKEN_EOF => break,
+
+            TOKEN_NEWLINE, TOKEN_SEMICOLON => {
+                // End of command
+                if (current_cmd.argc > 0 or current_cmd.redir_count > 0) {
+                    current_pipeline.stage_count += 1
+                }
+                break
+            },
+
+            TOKEN_PIPE => {
+                // End current command, start new one
+                if (current_cmd.argc == 0) {
+                    pipeline_error = PARSE_ERR_EMPTY_PIPE
+                    return &current_pipeline
+                }
+
+                current_pipeline.stage_count += 1
+                if (current_pipeline.stage_count >= MAX_PIPELINE_STAGES) {
+                    pipeline_error = PARSE_ERR_TOO_MANY_TOKENS
+                    return &current_pipeline
+                }
+
+                current_cmd = &current_pipeline.commands[current_pipeline.stage_count]
+                current_cmd.argc = 0
+                current_cmd.redir_count = 0
+                current_cmd.background = 0
+            },
+
+            TOKEN_BACKGROUND => {
+                current_cmd.background = 1
+            },
+
+            TOKEN_REDIR_IN, TOKEN_REDIR_OUT, TOKEN_REDIR_APPEND, TOKEN_REDIR_HEREDOC => {
+                // Parse redirection
+                if (token_idx + 1 >= result.token_count) {
+                    pipeline_error = PARSE_ERR_INVALID_REDIR
+                    return &current_pipeline
+                }
+
+                token_idx += 1
+                var target_token: *Token = &result.tokens[token_idx]
+
+                if (target_token.token_type != TOKEN_WORD) {
+                    pipeline_error = PARSE_ERR_INVALID_REDIR
+                    return &current_pipeline
+                }
+
+                if (current_cmd.redir_count >= MAX_REDIRECTIONS) {
+                    pipeline_error = PARSE_ERR_TOO_MANY_TOKENS
+                    return &current_pipeline
+                }
+
+                var redir: *Redirection = &current_cmd.redirections[current_cmd.redir_count]
+                redir.redir_type = token.token_type
+
+                // Determine fd
+                switch (token.token_type) {
+                    TOKEN_REDIR_IN, TOKEN_REDIR_HEREDOC => redir.fd = 0,
+                    TOKEN_REDIR_OUT, TOKEN_REDIR_APPEND => redir.fd = 1,
+                    else => redir.fd = 1,
+                }
+
+                // Copy target
+                copy_str_n(&redir.target[0], &target_token.value[0], 255)
+
+                current_cmd.redir_count += 1
+            },
+
+            TOKEN_WORD => {
+                // Add argument
+                if (current_cmd.argc < 63) {
+                    current_cmd.argv[current_cmd.argc] = &token.value[0]
+                    current_cmd.argc += 1
+                }
+            },
+
+            else => {},
+        }
+
+        token_idx += 1
+    }
+
+    // Finalize last command
+    if (current_cmd.argc > 0 or current_cmd.redir_count > 0) {
+        current_pipeline.stage_count += 1
+    }
+
+    return &current_pipeline
+}
+
+export fn shell_get_pipeline_error() u32 {
+    return pipeline_error
+}
+
+// ============================================================================
+// Variable Expansion
+// ============================================================================
+
+export fn shell_expand_variables(input: *u8, output: *u8, max_len: u32, getenv_fn: fn(*u8) *u8) u32 {
+    var in_pos: u32 = 0
+    var out_pos: u32 = 0
+    var in_single_quote: u32 = 0
+
+    while (input[in_pos] != 0 and out_pos < max_len - 1) {
+        var c: u8 = input[in_pos]
+
+        // Track single quotes (no expansion inside)
+        if (c == '\'') {
+            in_single_quote = if (in_single_quote == 1) @as(u32, 0) else @as(u32, 1)
+            output[out_pos] = c
+            out_pos += 1
+            in_pos += 1
+            continue
+        }
+
+        // Check for variable
+        if (c == '$' and in_single_quote == 0) {
+            in_pos += 1
+            var var_name: [128]u8 = undefined
+            var var_len: u32 = 0
+
+            // Check for ${...} or $var
+            if (input[in_pos] == '{') {
+                in_pos += 1
+                while (input[in_pos] != '}' and input[in_pos] != 0 and var_len < 127) {
+                    var_name[var_len] = input[in_pos]
+                    var_len += 1
+                    in_pos += 1
+                }
+                if (input[in_pos] == '}') in_pos += 1
+            } else {
+                // Simple variable name (alphanumeric + underscore)
+                while (is_var_char(input[in_pos]) == 1 and var_len < 127) {
+                    var_name[var_len] = input[in_pos]
+                    var_len += 1
+                    in_pos += 1
+                }
+            }
+
+            var_name[var_len] = 0
+
+            // Look up variable
+            if (var_len > 0) {
+                var value: *u8 = getenv_fn(&var_name[0])
+                if (value != null) {
+                    var i: u32 = 0
+                    while (value[i] != 0 and out_pos < max_len - 1) {
+                        output[out_pos] = value[i]
+                        out_pos += 1
+                        i += 1
+                    }
+                }
+            } else {
+                // Literal $
+                output[out_pos] = '$'
+                out_pos += 1
+            }
+            continue
+        }
+
+        // Regular character
+        output[out_pos] = c
+        out_pos += 1
+        in_pos += 1
+    }
+
+    output[out_pos] = 0
+    return out_pos
+}
+
+fn is_var_char(c: u8) u32 {
+    if (c >= 'a' and c <= 'z') return 1
+    if (c >= 'A' and c <= 'Z') return 1
+    if (c >= '0' and c <= '9') return 1
+    if (c == '_') return 1
+    return 0
+}
+
+// ============================================================================
+// Validation Functions
+// ============================================================================
+
+export fn shell_validate_command(input: *u8, length: u32) u32 {
+    var result: *ParseResult = shell_tokenize(input, length)
+
+    if (result.error_code != PARSE_OK) {
+        return result.error_code
+    }
+
+    // Check for empty pipes
+    var i: u32 = 0
+    var last_was_pipe: u32 = 0
+
+    while (i < result.token_count) {
+        var token: *Token = &result.tokens[i]
+
+        if (token.token_type == TOKEN_PIPE) {
+            if (last_was_pipe == 1 or i == 0) {
+                return PARSE_ERR_EMPTY_PIPE
+            }
+            last_was_pipe = 1
+        } else if (token.token_type == TOKEN_WORD) {
+            last_was_pipe = 0
+        }
+
+        i += 1
+    }
+
+    if (last_was_pipe == 1) {
+        return PARSE_ERR_EMPTY_PIPE
+    }
+
+    return PARSE_OK
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn copy_str(dest: *u8, src: *u8) void {
+    var i: u32 = 0
+    while (src[i] != 0) {
+        dest[i] = src[i]
+        i += 1
+    }
+    dest[i] = 0
+}
+
+fn copy_str_n(dest: *u8, src: *u8, max: u32) void {
+    var i: u32 = 0
+    while (src[i] != 0 and i < max) {
+        dest[i] = src[i]
+        i += 1
+    }
+    dest[i] = 0
+}
+
+// ============================================================================
+// Debug Output
+// ============================================================================
+
+export fn shell_print_tokens(result: *ParseResult) void {
+    serial.write_string("[PARSER] Token dump:\n")
+
+    var i: u32 = 0
+    while (i < result.token_count) {
+        var token: *Token = &result.tokens[i]
+
+        serial.write_string("  [")
+        serial.write_u32(i)
+        serial.write_string("] ")
+
+        switch (token.token_type) {
+            TOKEN_WORD => serial.write_string("WORD"),
+            TOKEN_PIPE => serial.write_string("PIPE"),
+            TOKEN_AND => serial.write_string("AND"),
+            TOKEN_OR => serial.write_string("OR"),
+            TOKEN_SEMICOLON => serial.write_string("SEMI"),
+            TOKEN_BACKGROUND => serial.write_string("BG"),
+            TOKEN_REDIR_OUT => serial.write_string("REDIR>"),
+            TOKEN_REDIR_APPEND => serial.write_string("REDIR>>"),
+            TOKEN_REDIR_IN => serial.write_string("REDIR<"),
+            TOKEN_REDIR_HEREDOC => serial.write_string("HEREDOC"),
+            TOKEN_NEWLINE => serial.write_string("NEWLINE"),
+            TOKEN_EOF => serial.write_string("EOF"),
+            else => serial.write_string("UNKNOWN"),
+        }
+
+        serial.write_string(": \"")
+        serial.write_string(&token.value[0])
+        serial.write_string("\"")
+
+        if (token.quoted == 1) {
+            serial.write_string(" (quoted)")
+        }
+
+        serial.write_string(" at ")
+        serial.write_u32(token.line)
+        serial.write_string(":")
+        serial.write_u32(token.column)
+        serial.write_string("\n")
+
+        i += 1
+    }
+}
+
+export fn shell_print_pipeline(pipeline: *Pipeline) void {
+    serial.write_string("[PARSER] Pipeline with ")
+    serial.write_u32(pipeline.stage_count)
+    serial.write_string(" stage(s):\n")
+
+    var i: u32 = 0
+    while (i < pipeline.stage_count) {
+        var cmd: *Command = &pipeline.commands[i]
+
+        serial.write_string("  Stage ")
+        serial.write_u32(i)
+        serial.write_string(": ")
+
+        var j: u32 = 0
+        while (j < cmd.argc) {
+            serial.write_string(cmd.argv[j])
+            if (j < cmd.argc - 1) serial.write_string(" ")
+            j += 1
+        }
+
+        if (cmd.background == 1) {
+            serial.write_string(" &")
+        }
+
+        serial.write_string("\n")
+
+        // Print redirections
+        j = 0
+        while (j < cmd.redir_count) {
+            var redir: *Redirection = &cmd.redirections[j]
+            serial.write_string("    Redir: fd=")
+            serial.write_u32(redir.fd)
+            serial.write_string(" -> ")
+            serial.write_string(&redir.target[0])
+            serial.write_string("\n")
+            j += 1
+        }
+
+        i += 1
+    }
+}
+

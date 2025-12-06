@@ -7,8 +7,16 @@ import serial from "./serial.home"
 
 // Constants
 let PAGE_SIZE: usize = 4096
+let PAGE_SIZE_2M: usize = 2097152      // 2MB = 512 * 4KB
+let PAGE_SIZE_1G: usize = 1073741824   // 1GB = 512 * 2MB
 let PAGE_SHIFT: usize = 12
+let PAGE_SHIFT_2M: usize = 21
+let PAGE_SHIFT_1G: usize = 30
 let ENTRIES_PER_TABLE: usize = 512
+
+// Feature detection flags
+var huge_pages_2m_supported: bool = false
+var huge_pages_1g_supported: bool = false
 
 // Page Table Entry Flags (64-bit)
 packed struct PageFlags: u64 {
@@ -67,6 +75,25 @@ fn createPageEntry(phys_addr: u64, writable: bool, user: bool, no_exec: bool): P
         accessed: false,
         dirty: false,
         huge: false,
+        global: false,
+        available1: 0,
+        address: @truncate(phys_addr >> 12),
+        available2: 0,
+        no_execute: no_exec,
+    }
+}
+
+// Create a huge page entry (2MB or 1GB)
+fn createHugePageEntry(phys_addr: u64, writable: bool, user: bool, no_exec: bool): PageFlags {
+    return PageFlags {
+        present: true,
+        writable: writable,
+        user: user,
+        write_through: false,
+        cache_disable: false,
+        accessed: false,
+        dirty: false,
+        huge: true,  // PS bit set for huge page
         global: false,
         available1: 0,
         address: @truncate(phys_addr >> 12),
@@ -280,4 +307,224 @@ export fn alignDown(addr: u64): u64 {
 // Align address up to page boundary
 export fn alignUp(addr: u64): u64 {
     return (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+}
+
+// ============================================================================
+// Huge Page Support (2MB and 1GB)
+// ============================================================================
+
+// Detect huge page support via CPUID
+export fn detectHugePageSupport() {
+    // CPUID leaf 0x01: EDX bit 3 = PSE (Page Size Extension, 2MB pages)
+    // CPUID leaf 0x80000001: EDX bit 26 = PDPE1GB (1GB pages)
+
+    // Check PSE for 2MB pages
+    let eax: u32 = undefined
+    let ebx: u32 = undefined
+    let ecx: u32 = undefined
+    let edx: u32 = undefined
+
+    cpu.cpuid(0x01, &eax, &ebx, &ecx, &edx)
+    huge_pages_2m_supported = (edx & (1 << 3)) != 0  // PSE bit
+
+    // Check extended features for 1GB pages
+    cpu.cpuid(0x80000001, &eax, &ebx, &ecx, &edx)
+    huge_pages_1g_supported = (edx & (1 << 26)) != 0  // PDPE1GB bit
+
+    serial.writeString("VMM: 2MB huge pages: ")
+    serial.writeString(if huge_pages_2m_supported { "supported\n" } else { "not supported\n" })
+    serial.writeString("VMM: 1GB huge pages: ")
+    serial.writeString(if huge_pages_1g_supported { "supported\n" } else { "not supported\n" })
+}
+
+// Map a 2MB huge page (virtual must be 2MB aligned, physical must be 2MB aligned)
+// Uses PD entry with PS bit set, skipping the PT level
+export fn mapHugePage2M(virt_addr: u64, phys_addr: u64, writable: bool, user: bool): bool {
+    if !huge_pages_2m_supported {
+        serial.writeString("VMM: 2MB huge pages not supported\n")
+        return false
+    }
+
+    // Verify alignment
+    if (virt_addr & (PAGE_SIZE_2M - 1)) != 0 {
+        serial.writeString("VMM: Virtual address not 2MB aligned\n")
+        return false
+    }
+    if (phys_addr & (PAGE_SIZE_2M - 1)) != 0 {
+        serial.writeString("VMM: Physical address not 2MB aligned\n")
+        return false
+    }
+
+    let vaddr: VirtualAddress = @bitCast(virt_addr)
+
+    serial.writeString("VMM: Mapping 2MB huge page: virt=")
+    serial.writeHex(virt_addr)
+    serial.writeString(" -> phys=")
+    serial.writeHex(phys_addr)
+    serial.writeString("\n")
+
+    // For 2MB huge page: PD entry points directly to physical page with PS bit set
+    // PT level is skipped (vaddr.pt_index becomes part of page offset)
+    let pd_index = vaddr.pd_index
+
+    // Ensure PML4 and PDPT are set up
+    if !pml4.entries[vaddr.pml4_index].flags.present {
+        let pdpt_addr = @intFromPtr(&pdpt)
+        pml4.entries[vaddr.pml4_index].flags = createPageEntry(pdpt_addr, true, user, false)
+    }
+
+    if !pdpt.entries[vaddr.pdpt_index].flags.present {
+        let pd_addr = @intFromPtr(&pd)
+        pdpt.entries[vaddr.pdpt_index].flags = createPageEntry(pd_addr, true, user, false)
+    }
+
+    // Set PD entry as huge page (PS bit = 1)
+    pd.entries[pd_index].flags = createHugePageEntry(phys_addr, writable, user, false)
+
+    // Invalidate TLB for entire 2MB range
+    cpu.invlpg(virt_addr)
+
+    return true
+}
+
+// Map a 1GB huge page (virtual must be 1GB aligned, physical must be 1GB aligned)
+// Uses PDPT entry with PS bit set, skipping PD and PT levels
+export fn mapHugePage1G(virt_addr: u64, phys_addr: u64, writable: bool, user: bool): bool {
+    if !huge_pages_1g_supported {
+        serial.writeString("VMM: 1GB huge pages not supported\n")
+        return false
+    }
+
+    // Verify alignment
+    if (virt_addr & (PAGE_SIZE_1G - 1)) != 0 {
+        serial.writeString("VMM: Virtual address not 1GB aligned\n")
+        return false
+    }
+    if (phys_addr & (PAGE_SIZE_1G - 1)) != 0 {
+        serial.writeString("VMM: Physical address not 1GB aligned\n")
+        return false
+    }
+
+    let vaddr: VirtualAddress = @bitCast(virt_addr)
+
+    serial.writeString("VMM: Mapping 1GB huge page: virt=")
+    serial.writeHex(virt_addr)
+    serial.writeString(" -> phys=")
+    serial.writeHex(phys_addr)
+    serial.writeString("\n")
+
+    // For 1GB huge page: PDPT entry points directly to physical page with PS bit set
+    // PD and PT levels are skipped
+    let pdpt_index = vaddr.pdpt_index
+
+    // Ensure PML4 is set up
+    if !pml4.entries[vaddr.pml4_index].flags.present {
+        let pdpt_addr = @intFromPtr(&pdpt)
+        pml4.entries[vaddr.pml4_index].flags = createPageEntry(pdpt_addr, true, user, false)
+    }
+
+    // Set PDPT entry as 1GB huge page (PS bit = 1)
+    pdpt.entries[pdpt_index].flags = createHugePageEntry(phys_addr, writable, user, false)
+
+    // Invalidate TLB
+    cpu.invlpg(virt_addr)
+
+    return true
+}
+
+// Unmap a 2MB huge page
+export fn unmapHugePage2M(virt_addr: u64) {
+    let vaddr: VirtualAddress = @bitCast(virt_addr)
+    let pd_index = vaddr.pd_index
+
+    pd.entries[pd_index].flags = PageFlags {
+        present: false,
+        writable: false,
+        user: false,
+        write_through: false,
+        cache_disable: false,
+        accessed: false,
+        dirty: false,
+        huge: false,
+        global: false,
+        available1: 0,
+        address: 0,
+        available2: 0,
+        no_execute: false,
+    }
+
+    cpu.invlpg(virt_addr)
+}
+
+// Unmap a 1GB huge page
+export fn unmapHugePage1G(virt_addr: u64) {
+    let vaddr: VirtualAddress = @bitCast(virt_addr)
+    let pdpt_index = vaddr.pdpt_index
+
+    pdpt.entries[pdpt_index].flags = PageFlags {
+        present: false,
+        writable: false,
+        user: false,
+        write_through: false,
+        cache_disable: false,
+        accessed: false,
+        dirty: false,
+        huge: false,
+        global: false,
+        available1: 0,
+        address: 0,
+        available2: 0,
+        no_execute: false,
+    }
+
+    cpu.invlpg(virt_addr)
+}
+
+// Get page size info for an address
+export fn getPageSize(virt_addr: u64): usize {
+    let vaddr: VirtualAddress = @bitCast(virt_addr)
+
+    // Check if PDPT entry is a 1GB huge page
+    if pdpt.entries[vaddr.pdpt_index].flags.present {
+        if pdpt.entries[vaddr.pdpt_index].flags.huge {
+            return PAGE_SIZE_1G
+        }
+    }
+
+    // Check if PD entry is a 2MB huge page
+    if pd.entries[vaddr.pd_index].flags.present {
+        if pd.entries[vaddr.pd_index].flags.huge {
+            return PAGE_SIZE_2M
+        }
+    }
+
+    // Default 4KB page
+    return PAGE_SIZE
+}
+
+// Align address to 2MB boundary
+export fn alignDown2M(addr: u64): u64 {
+    return addr & ~@as(u64, PAGE_SIZE_2M - 1)
+}
+
+export fn alignUp2M(addr: u64): u64 {
+    return (addr + PAGE_SIZE_2M - 1) & ~@as(u64, PAGE_SIZE_2M - 1)
+}
+
+// Align address to 1GB boundary
+export fn alignDown1G(addr: u64): u64 {
+    return addr & ~@as(u64, PAGE_SIZE_1G - 1)
+}
+
+export fn alignUp1G(addr: u64): u64 {
+    return (addr + PAGE_SIZE_1G - 1) & ~@as(u64, PAGE_SIZE_1G - 1)
+}
+
+// Check if huge pages are available
+export fn supports2MPages(): bool {
+    return huge_pages_2m_supported
+}
+
+export fn supports1GPages(): bool {
+    return huge_pages_1g_supported
 }

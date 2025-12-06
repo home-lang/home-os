@@ -1,7 +1,8 @@
 // home-os Kernel - Capability-Based Security
-// Fine-grained permissions system
+// Fine-grained permissions system with audit integration
 
-import "../core/foundation.home" as foundation
+const serial = @import("../drivers/serial.home")
+const audit = @import("audit.home")
 
 // Capability bits
 const CAP_CHOWN: u64 = 1 << 0
@@ -83,80 +84,160 @@ export fn capabilities_init() {
   foundation.serial_write_string("[Capabilities] Initialized\n")
 }
 
+// Audit control: which events to log
+var audit_cap_checks: u32 = 1       // Log capability check failures
+var audit_cap_changes: u32 = 1      // Log capability modifications
+var audit_cap_grants: u32 = 0       // Log successful capability grants (verbose)
+
+// Statistics
+var cap_check_count: u64 = 0
+var cap_denial_count: u64 = 0
+
 export fn cap_has_capability(pid: u32, cap: u64): u32 {
-  if pid >= MAX_PROCESSES { return 0 }
-  
-  if (process_capabilities[pid].effective & cap) != 0 {
+    if (pid >= MAX_PROCESSES) return 0
+
+    cap_check_count += 1
+
+    if ((process_capabilities[pid].effective & cap) != 0) {
+        return 1
+    }
+    return 0
+}
+
+export fn cap_check_capability(pid: u32, cap: u64) u32 {
+    if (cap_has_capability(pid, cap) == 0) {
+        cap_denial_count += 1
+
+        // Log to serial
+        serial.write_string("[CAPS] Permission denied: PID=")
+        serial.write_u32(pid)
+        serial.write_string(" cap=0x")
+        serial.write_hex(@as(u32, @truncate(cap)))
+        serial.write_string("\n")
+
+        // Log to audit system
+        if (audit_cap_checks == 1) {
+            audit.audit_log_capability(pid, get_uid_for_pid(pid), cap, -1)
+        }
+
+        return 0
+    }
+
+    // Optionally log successful checks (verbose mode)
+    if (audit_cap_grants == 1) {
+        audit.audit_log_capability(pid, get_uid_for_pid(pid), cap, 0)
+    }
+
     return 1
-  }
-  return 0
 }
 
-export fn cap_check_capability(pid: u32, cap: u64): u32 {
-  if cap_has_capability(pid, cap) == 0 {
-    foundation.serial_write_string("[Capabilities] Permission denied for PID ")
-    foundation.serial_write_hex(pid)
-    foundation.serial_write_string(" capability 0x")
-    foundation.serial_write_hex(@truncate(cap, u32))
-    foundation.serial_write_string("\n")
-    return 0
-  }
-  return 1
+// Get UID for a process (would integrate with process module)
+fn get_uid_for_pid(pid: u32) u32 {
+    // Placeholder: would look up from process table
+    // For now, return 0 for PID 0-1, and pid for others
+    if (pid <= 1) return 0
+    return pid
 }
 
-export fn cap_add_capability(pid: u32, cap: u64): u32 {
-  if pid >= MAX_PROCESSES { return 0 }
-  
-  // Can only add if in permitted set
-  if (process_capabilities[pid].permitted & cap) == 0 {
-    return 0
-  }
-  
-  process_capabilities[pid].effective = process_capabilities[pid].effective | cap
-  return 1
+export fn cap_add_capability(pid: u32, cap: u64) u32 {
+    if (pid >= MAX_PROCESSES) return 0
+
+    // Can only add if in permitted set
+    if ((process_capabilities[pid].permitted & cap) == 0) {
+        // Log failed attempt
+        if (audit_cap_changes == 1) {
+            audit.audit_log_capability(pid, get_uid_for_pid(pid), cap, -1)
+        }
+        return 0
+    }
+
+    process_capabilities[pid].effective = process_capabilities[pid].effective | cap
+
+    // Log capability grant
+    if (audit_cap_changes == 1) {
+        audit.audit_log_capability(pid, get_uid_for_pid(pid), cap, 1)
+    }
+
+    return 1
 }
 
-export fn cap_remove_capability(pid: u32, cap: u64): u32 {
-  if pid >= MAX_PROCESSES { return 0 }
-  
-  process_capabilities[pid].effective = process_capabilities[pid].effective & ~cap
-  return 1
+export fn cap_remove_capability(pid: u32, cap: u64) u32 {
+    if (pid >= MAX_PROCESSES) return 0
+
+    process_capabilities[pid].effective = process_capabilities[pid].effective & ~cap
+
+    // Log capability removal
+    if (audit_cap_changes == 1) {
+        audit.audit_log_capability(pid, get_uid_for_pid(pid), cap, 2)  // 2 = removed
+    }
+
+    return 1
 }
 
-export fn cap_set_permitted(pid: u32, caps: u64): u32 {
-  if pid >= MAX_PROCESSES { return 0 }
-  
-  // Can only set capabilities within bounding set
-  caps = caps & process_capabilities[pid].bounding
-  
-  process_capabilities[pid].permitted = caps
-  return 1
+export fn cap_set_permitted(pid: u32, caps: u64) u32 {
+    if (pid >= MAX_PROCESSES) return 0
+
+    var old_caps: u64 = process_capabilities[pid].permitted
+
+    // Can only set capabilities within bounding set
+    var new_caps: u64 = caps & process_capabilities[pid].bounding
+
+    process_capabilities[pid].permitted = new_caps
+
+    // Log significant changes
+    if (audit_cap_changes == 1 and old_caps != new_caps) {
+        audit.audit_log_capability(pid, get_uid_for_pid(pid), new_caps, 3)  // 3 = permitted changed
+    }
+
+    return 1
 }
 
-export fn cap_set_inheritable(pid: u32, caps: u64): u32 {
-  if pid >= MAX_PROCESSES { return 0 }
-  
-  process_capabilities[pid].inheritable = caps
-  return 1
+export fn cap_set_inheritable(pid: u32, caps: u64) u32 {
+    if (pid >= MAX_PROCESSES) return 0
+
+    var old_caps: u64 = process_capabilities[pid].inheritable
+    process_capabilities[pid].inheritable = caps
+
+    // Log changes
+    if (audit_cap_changes == 1 and old_caps != caps) {
+        audit.audit_log_capability(pid, get_uid_for_pid(pid), caps, 4)  // 4 = inheritable changed
+    }
+
+    return 1
 }
 
-export fn cap_set_bounding(pid: u32, caps: u64): u32 {
-  if pid >= MAX_PROCESSES { return 0 }
-  
-  // Bounding set can only be reduced
-  process_capabilities[pid].bounding = process_capabilities[pid].bounding & caps
-  return 1
+export fn cap_set_bounding(pid: u32, caps: u64) u32 {
+    if (pid >= MAX_PROCESSES) return 0
+
+    var old_bounding: u64 = process_capabilities[pid].bounding
+
+    // Bounding set can only be reduced
+    process_capabilities[pid].bounding = process_capabilities[pid].bounding & caps
+
+    // Log bounding set reduction
+    if (audit_cap_changes == 1 and old_bounding != process_capabilities[pid].bounding) {
+        audit.audit_log_capability(pid, get_uid_for_pid(pid), process_capabilities[pid].bounding, 5)  // 5 = bounding changed
+    }
+
+    return 1
 }
 
-export fn cap_set_ambient(pid: u32, caps: u64): u32 {
-  if pid >= MAX_PROCESSES { return 0 }
-  
-  // Ambient must be subset of permitted and inheritable
-  caps = caps & process_capabilities[pid].permitted
-  caps = caps & process_capabilities[pid].inheritable
-  
-  process_capabilities[pid].ambient = caps
-  return 1
+export fn cap_set_ambient(pid: u32, caps: u64) u32 {
+    if (pid >= MAX_PROCESSES) return 0
+
+    // Ambient must be subset of permitted and inheritable
+    var new_ambient: u64 = caps & process_capabilities[pid].permitted
+    new_ambient = new_ambient & process_capabilities[pid].inheritable
+
+    var old_ambient: u64 = process_capabilities[pid].ambient
+    process_capabilities[pid].ambient = new_ambient
+
+    // Log changes
+    if (audit_cap_changes == 1 and old_ambient != new_ambient) {
+        audit.audit_log_capability(pid, get_uid_for_pid(pid), new_ambient, 6)  // 6 = ambient changed
+    }
+
+    return 1
 }
 
 export fn cap_get_effective(pid: u32): u64 {
@@ -199,42 +280,105 @@ export fn cap_exec(pid: u32): u32 {
   return 1
 }
 
-export fn cap_drop_all(pid: u32): u32 {
-  if pid >= MAX_PROCESSES { return 0 }
-  
-  process_capabilities[pid].effective = 0
-  process_capabilities[pid].permitted = 0
-  process_capabilities[pid].inheritable = 0
-  process_capabilities[pid].ambient = 0
-  
-  return 1
-}
+export fn cap_drop_all(pid: u32) u32 {
+    if (pid >= MAX_PROCESSES) return 0
 
-export fn cap_is_privileged(pid: u32): u32 {
-  if pid >= MAX_PROCESSES { return 0 }
-  
-  // Process is privileged if it has any capabilities
-  if process_capabilities[pid].effective != 0 {
+    var old_effective: u64 = process_capabilities[pid].effective
+
+    process_capabilities[pid].effective = 0
+    process_capabilities[pid].permitted = 0
+    process_capabilities[pid].inheritable = 0
+    process_capabilities[pid].ambient = 0
+
+    // Log capability drop (significant security event)
+    if (audit_cap_changes == 1 and old_effective != 0) {
+        audit.audit_log_capability(pid, get_uid_for_pid(pid), 0, 7)  // 7 = all dropped
+    }
+
     return 1
-  }
-  return 0
 }
 
-export fn cap_print_capabilities(pid: u32) {
-  if pid >= MAX_PROCESSES { return }
-  
-  foundation.serial_write_string("[Capabilities] PID ")
-  foundation.serial_write_hex(pid)
-  foundation.serial_write_string(":\n")
-  foundation.serial_write_string("  Effective: 0x")
-  foundation.serial_write_hex(@truncate(process_capabilities[pid].effective, u32))
-  foundation.serial_write_string("\n  Permitted: 0x")
-  foundation.serial_write_hex(@truncate(process_capabilities[pid].permitted, u32))
-  foundation.serial_write_string("\n  Inheritable: 0x")
-  foundation.serial_write_hex(@truncate(process_capabilities[pid].inheritable, u32))
-  foundation.serial_write_string("\n  Bounding: 0x")
-  foundation.serial_write_hex(@truncate(process_capabilities[pid].bounding, u32))
-  foundation.serial_write_string("\n  Ambient: 0x")
-  foundation.serial_write_hex(@truncate(process_capabilities[pid].ambient, u32))
-  foundation.serial_write_string("\n")
+export fn cap_is_privileged(pid: u32) u32 {
+    if (pid >= MAX_PROCESSES) return 0
+
+    // Process is privileged if it has any capabilities
+    if (process_capabilities[pid].effective != 0) {
+        return 1
+    }
+    return 0
+}
+
+export fn cap_print_capabilities(pid: u32) void {
+    if (pid >= MAX_PROCESSES) return
+
+    serial.write_string("[CAPS] PID ")
+    serial.write_u32(pid)
+    serial.write_string(":\n")
+    serial.write_string("  Effective: 0x")
+    serial.write_hex(@as(u32, @truncate(process_capabilities[pid].effective)))
+    serial.write_string("\n  Permitted: 0x")
+    serial.write_hex(@as(u32, @truncate(process_capabilities[pid].permitted)))
+    serial.write_string("\n  Inheritable: 0x")
+    serial.write_hex(@as(u32, @truncate(process_capabilities[pid].inheritable)))
+    serial.write_string("\n  Bounding: 0x")
+    serial.write_hex(@as(u32, @truncate(process_capabilities[pid].bounding)))
+    serial.write_string("\n  Ambient: 0x")
+    serial.write_hex(@as(u32, @truncate(process_capabilities[pid].ambient)))
+    serial.write_string("\n")
+}
+
+// ============================================================================
+// Audit Control Functions
+// ============================================================================
+
+export fn cap_set_audit_checks(enabled: u32) void {
+    audit_cap_checks = enabled
+}
+
+export fn cap_set_audit_changes(enabled: u32) void {
+    audit_cap_changes = enabled
+}
+
+export fn cap_set_audit_grants(enabled: u32) void {
+    audit_cap_grants = enabled
+}
+
+// ============================================================================
+// Statistics Functions
+// ============================================================================
+
+export fn cap_get_check_count() u64 {
+    return cap_check_count
+}
+
+export fn cap_get_denial_count() u64 {
+    return cap_denial_count
+}
+
+export fn cap_print_stats() void {
+    serial.write_string("\n[CAPS] Statistics:\n")
+    serial.write_string("  Total checks: ")
+    serial.write_u64(cap_check_count)
+    serial.write_string("\n")
+    serial.write_string("  Denials: ")
+    serial.write_u64(cap_denial_count)
+    serial.write_string("\n")
+    serial.write_string("  Denial rate: ")
+    if (cap_check_count > 0) {
+        var rate: u64 = (cap_denial_count * 100) / cap_check_count
+        serial.write_u64(rate)
+        serial.write_string("%")
+    } else {
+        serial.write_string("N/A")
+    }
+    serial.write_string("\n")
+    serial.write_string("  Audit checks: ")
+    serial.write_string(if (audit_cap_checks == 1) "ON" else "OFF")
+    serial.write_string("\n")
+    serial.write_string("  Audit changes: ")
+    serial.write_string(if (audit_cap_changes == 1) "ON" else "OFF")
+    serial.write_string("\n")
+    serial.write_string("  Audit grants: ")
+    serial.write_string(if (audit_cap_grants == 1) "ON" else "OFF")
+    serial.write_string("\n")
 }

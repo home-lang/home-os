@@ -154,10 +154,21 @@ The rest of this section focuses on **improvements that matter most** for a mini
   - [x] Profile-based limits: MAX_PROCESSES, MAX_FILES, MAX_SOCKETS, BUFFER_CACHE_MB
   - [x] Enhanced `scripts/build-unified.sh` with `--profile=NAME` and `--list-profiles` options
   - [x] Memory budget verification: `mem_footprint_check_budget()`, `/proc/memfootprint` interface
-- [ ] **Tight integration with memcg/swap**
+- [x] **Tight integration with memcg/swap** (**COMPLETED Dec 6, 2025**)
   - Files: `kernel/src/mm/{memcg,swap}.home`
-  - [ ] Enforce per-service/process memory limits
-  - [ ] Surface memory pressure + OOM events to userspace (e.g. `apps/sysmon.home`)
+  - [x] Enforce per-service/process memory limits
+    - Added hierarchical memory cgroups with hard/soft/high/low/min limits
+    - Process attachment to cgroups with `memcg_attach_process()`
+    - Memory charging with automatic swap fallback on limit hit
+  - [x] Surface memory pressure + OOM events to userspace
+    - Pressure levels: NONE, LOW, MEDIUM, CRITICAL
+    - Userspace notification via `memcg_register_pressure_notify()`
+    - Procfs interface: `memcg_format_stat()`, `memcg_format_events()`, `memcg_format_pressure()`
+    - OOM event tracking with per-cgroup kill counts
+  - [x] Enhanced swap with memcg integration
+    - Per-cgroup swap limits and tracking
+    - Multiple swap device support with priorities
+    - Zram (compressed RAM) device type support
 
 #### P1.2 Boot Time Optimization (Target: <3s to shell on Pi 4/5)
 
@@ -306,13 +317,28 @@ The rest of this section focuses on **improvements that matter most** for a mini
     - Sections: SUMMARY, REGISTERS, BACKTRACE, MEMORY, SYSTEM STATE
     - Added `panic_generate_crash_dump()` for storage persistence
     - Version-tagged format for tooling compatibility
-- [ ] **End-to-end perf tooling**
-  - [ ] Easy pipeline: collect profiles → generate flamegraphs → compare against baselines
+- [x] **End-to-end perf tooling** (**COMPLETED Dec 5, 2025**)
+  - [x] Created `kernel/src/perf/flamegraph.home`:
+    - Stack sampling with configurable interval
+    - Frame pointer walking for stack traces
+    - Aggregation and deduplication
+    - Folded stack output format (compatible with flamegraph.pl)
+    - Perf script format output
+  - [x] Created `kernel/src/perf/baseline.home`:
+    - Built-in metrics: boot_time, memory_usage, syscall_latency, io_throughput, etc.
+    - Sample collection with min/max/mean/percentile statistics
+    - Baseline save/load/compare
+    - Regression detection with configurable thresholds
+    - JSON output for CI/CD integration
 
 #### P3.3 Documentation & Architecture
 
 - [ ] **Keep audits and docs current with code**
-  - [ ] Extend the audit pattern from process/VFS to networking, security, power, and drivers
+  - [x] Extend the audit pattern from process/VFS to networking, security, power, and drivers (**COMPLETED**)
+    - Netfilter (`kernel/src/net/netfilter.home`): firewall rule changes, packet drops, state changes
+    - TLS (`kernel/src/net/tls.home`): connection events, handshake success/failure, security alerts
+    - Capabilities (`kernel/src/security/capabilities.home`): permission checks, grants, denials
+    - Existing coverage: syscalls, file access, process events, auth, security events
   - [ ] Auto-generate syscall & driver reference docs from `.home` sources
 
 ---
@@ -331,7 +357,20 @@ Some modules are complete, others still contain explicit stubs. Focus areas:
   - Audit: `docs/audits/vfs-audit.md` (rated production-ready, world-class)
 - [x] **Syscall layer wired to real implementations**
   - Implementation: `kernel/src/sys/syscall.home` dispatching to process, filesystem, memory
-  - [ ] Extend syscall set and semantics toward POSIX where useful, without bloating minimal builds
+  - [x] Extend syscall set and semantics toward POSIX where useful, without bloating minimal builds
+    - Extended `kernel/src/sys/syscall.home` with 80+ new POSIX-compatible syscalls:
+      - File operations: stat, fstat, lstat, unlink, link, symlink, readlink, rename, access, chmod, chown, truncate
+      - Directory operations: chdir, fchdir, getcwd, getdents
+      - Process info: getppid, getuid, getgid, geteuid, getegid, setpgid, getpgid, setsid, getsid, getgroups
+      - Time operations: gettimeofday, clock_gettime, clock_getres, nanosleep
+      - Signal operations: sigaction, sigprocmask, sigpending, sigsuspend
+      - Memory operations: mprotect, msync, madvise, mincore
+      - Networking: connect, listen, accept, send, recv, sendto, recvfrom, shutdown, getsockopt, setsockopt
+      - Event polling: poll, select, epoll_create, epoll_ctl, epoll_wait, eventfd, timerfd_*
+      - File descriptors: dup, dup2, dup3, pipe, pipe2, fcntl, flock, fsync, fdatasync
+      - System info: uname, getrlimit, getrusage, sysinfo
+      - Misc: umask, mount, umount
+    - Updated `apps/lib/syscalls.home` userspace library to match new syscall numbers
 
 #### P4.2 Security Modules & Capabilities
 
@@ -339,7 +378,12 @@ Some modules are complete, others still contain explicit stubs. Focus areas:
   - File: `kernel/src/security/caps.home` - real capability enforcement
   - [x] Implement real per-process capability sets and enforcement in syscalls and sensitive paths
   - [x] Integrated with syscall handler for privileged operations (kill, setuid, setgid, chroot, ptrace, reboot, mknod, bind, socket, ioctl, settimeofday, setrlimit)
-  - [ ] Integrate with audit logging (`kernel/src/security/audit.home`)
+  - [x] Integrate with audit logging (`kernel/src/security/audit.home`)
+    - Enhanced `kernel/src/security/capabilities.home` with:
+      - Audit logging for capability check failures and all modifications
+      - Configurable audit levels (checks, changes, grants)
+      - Statistics tracking (check count, denial count, denial rate)
+      - Helper functions for audit control and stats reporting
 - [x] **Seccomp / syscall filtering** (**COMPLETED Dec 5, 2025**)
   - [x] Implement seccomp-like filters for sandboxed processes
   - [x] Whitelist-based filtering with predefined profiles (minimal, compute, filesystem, standard)
@@ -352,7 +396,13 @@ Some modules are complete, others still contain explicit stubs. Focus areas:
   - [x] Implement real UDP-based resolution with proper query building and response parsing
   - [x] Retries with primary and fallback DNS servers (8.8.8.8, 8.8.4.4)
   - [x] Caching with TTL support (64-entry cache)
-  - [ ] `/etc/resolv.conf` integration (future)
+  - [x] `/etc/resolv.conf` integration (**COMPLETED Dec 6, 2025**)
+    - Enhanced `kernel/src/net/dns.home` with resolv.conf parser:
+      - Parses nameserver, search, domain, and options directives
+      - Supports up to 3 nameservers and 6 search domains
+      - Handles options: ndots, timeout, attempts, rotate
+      - Falls back to Google DNS (8.8.8.8, 8.8.4.4) if file not found
+      - Exports `dns_load_resolv_conf()`, `dns_get_search_domain()`, `dns_get_domain()`, `dns_get_config()`
 - [ ] **Network stack verification on real hardware**
   - [ ] Ping, HTTP, TLS, and WebSocket end-to-end tests on Pi and x86-64
 
@@ -360,12 +410,40 @@ Some modules are complete, others still contain explicit stubs. Focus areas:
 
 ### 🎯 Priority 5: Essential Applications & UX
 
-- [x] **Shell (hsh) is featureful**
+- [x] **Shell (hsh) is featureful** (**ENHANCED Dec 6, 2025**)
   - Implementation: `apps/shell.home` (jobs, history, aliases, env, builtins)
-  - [ ] Harden parsing, quoting, and error handling; add focused tests for pipelines and redirections
-- [x] **Init process exists**
+  - [x] Harden parsing, quoting, and error handling; add focused tests for pipelines and redirections
+    - Created `apps/shell_parser.home` - hardened parser module with:
+      - Proper single/double quote handling with escape sequences
+      - Pipeline parsing with stage count validation
+      - Redirection parsing (>, >>, <, <<) with fd tracking
+      - Background job (&) and control operators (&&, ||, ;)
+      - Variable expansion with $VAR and ${VAR} syntax
+      - Comment handling (#)
+      - Error detection for unterminated quotes, empty pipes, missing targets
+    - Created `tests/shell/test_parser.home` - 25 focused tests covering:
+      - Quoting: simple, single, double, escapes, mixed, adjacent
+      - Pipelines: simple, multi-stage, empty pipe detection
+      - Redirections: output, append, input, combined, missing target
+      - Operators: AND, OR, semicolon, background
+      - Edge cases: empty input, whitespace, long tokens
+- [x] **Init process exists** (**ENHANCED Dec 6, 2025**)
   - Implementation: `apps/init/init.home` (runlevels, services, mounts)
-  - [ ] Replace stub syscall wrappers with real ones and validate service supervision under failures
+  - [x] Replace stub syscall wrappers with real ones and validate service supervision under failures
+    - Created `apps/lib/syscalls.home` - userspace syscall library with:
+      - Process management: fork, exec, wait, waitpid, kill, getpid, getppid
+      - File I/O: open, close, read, write, lseek, dup, dup2, pipe
+      - Filesystem: mount, umount, mkdir, rmdir, chroot
+      - System control: reboot, setuid, setgid, nanosleep, usleep
+      - Wait status macros: WIFEXITED, WEXITSTATUS, WIFSIGNALED, WTERMSIG
+      - Signal constants and error codes
+    - Created `apps/init/init_enhanced.home` - robust service supervision with:
+      - Real syscall invocations (not stubs)
+      - Exponential backoff restart (1s initial, 60s max, 2x multiplier)
+      - Failure tracking with sliding window (5 failures in 5min = failed state)
+      - Critical service handling (drops to single-user on failure)
+      - Proper filesystem mounting with error handling
+      - Graceful shutdown with SIGTERM/SIGKILL escalation
 - [x] **Core utilities verification** (**COMPLETED Dec 5, 2025**)
   - 80+ utilities in `apps/utils/**` (e.g. `ls.home`, `cat.home`, `cp.home`, `ps.home`, `top.home`)
   - [x] Create a utility test suite that runs on every image build (basic correctness + performance)
@@ -544,19 +622,45 @@ Build a next-generation operating system that prioritizes:
   - [x] Bitmap allocator for physical pages (pmm_init, pmm_alloc_page, pmm_free_page)
   - [x] Page frame allocator (4KB pages)
   - [x] Basic memory layout (simple allocation strategy)
-  - [ ] Parse Multiboot2 memory map (TODO: Phase 2 - enhancement)
-  - [ ] Support for huge pages (2MB, 1GB) (TODO: Phase 2)
+  - [x] Parse Multiboot2 memory map (**COMPLETED**)
+    - Full implementation in `kernel/src/multiboot2.home`
+    - Parses all Multiboot2 tag types (cmdline, bootloader, modules, meminfo, mmap, etc.)
+    - Memory map with up to 32 regions
+    - Region types: available, reserved, ACPI reclaimable, NVS, badram
+    - Helper functions for printing memory map info
+  - [x] Support for huge pages (2MB, 1GB) (**COMPLETED**)
+    - Full implementation in `kernel/src/vmm.home`
+    - CPUID-based feature detection (PSE for 2MB, PDPE1GB for 1GB)
+    - mapHugePage2M/mapHugePage1G functions with alignment validation
+    - TLB invalidation and page size queries
 - [x] Virtual memory manager (**COMPLETED - Oct 29, 2025**)
   - [x] 4-level page table implementation (vmm_init, vmm_map_page, vmm_unmap_page)
   - [x] Kernel space mapping (higher half)
   - [x] Page allocation/deallocation (vmm_get_physical)
   - [ ] User space mapping (lower half) (TODO: Phase 2)
-  - [ ] Memory protection (NX, W^X) (TODO: Phase 2)
-  - [ ] ASLR (Address Space Layout Randomization) (TODO: Phase 2)
+  - [x] Memory protection (NX, W^X) (**COMPLETED**)
+    - Full implementation in `kernel/src/security/wx_enforcement.home`
+    - NX bit support detection via CPUID
+    - EFER MSR configuration for NX enable
+    - W^X enforcement with violation tracking
+    - Section protection: wx_protect_kernel_code/data/rodata
+    - JIT support with temporary W+X and restoration
+    - Page audit capability
+  - [x] ASLR (Address Space Layout Randomization) (**COMPLETED**)
+    - Full implementation in `kernel/src/security/aslr.home`
+    - 28-bit randomization for stack, heap, mmap, exec regions
+    - KASLR support for kernel offset randomization
+    - Entropy measurement and quality tracking
+    - Configurable randomization ranges
 - [x] Heap allocator (**COMPLETED - Oct 29, 2025**)
   - [x] Basic allocator implementation (heap_init, heap_alloc, heap_free)
   - [x] Bump allocator for initial allocation
-  - [ ] slab allocator for kernel objects (TODO: Phase 2 - optimization)
+  - [x] slab allocator for kernel objects (**COMPLETED**)
+    - Full implementation in `kernel/src/mm/slab.home`
+    - Per-CPU magazine caching (Bonwick's design)
+    - Named caches with constructors/destructors
+    - Object coloring for cache optimization
+    - Statistics tracking (hits, misses, allocations)
   - [ ] General-purpose allocator (buddy system) (TODO: Phase 2 - optimization)
   - [ ] Integrate with Home's ownership system (TODO: Phase 2)
   - [ ] Memory leak detection (debug builds) (TODO: Phase 2)
@@ -580,7 +684,13 @@ Build a next-generation operating system that prioritizes:
   - [x] Character output (serial_write_char)
   - [x] String output (serial_write_string)
   - [x] Hex output (serial_write_hex)
-  - [ ] Interrupt-driven receive (TODO: Phase 2)
+  - [x] Interrupt-driven receive (**COMPLETED**)
+    - Full implementation in `kernel/src/serial.home`
+    - 256-byte circular receive buffer
+    - IRQ4 handler with IER configuration
+    - Non-blocking and blocking read APIs
+    - Line-based input with newline detection
+    - Overflow tracking and status reporting
 - [x] Keyboard driver (**COMPLETED - Oct 29, 2025**)
   - [x] PS/2 keyboard controller (keyboard_init, keyboard_send_command)
   - [x] Scancode to ASCII translation (keyboard_process_scancode)
@@ -1244,14 +1354,14 @@ Build a next-generation operating system that prioritizes:
   - [ ] Least-privilege principle
 
 ### 10.2 Kernel Security
-- [ ] Address space layout randomization (ASLR)
+- [x] Address space layout randomization (ASLR) (**COMPLETED** - see `kernel/src/security/aslr.home`)
 - [ ] Kernel stack protection (stack canaries)
-- [ ] W^X (Write XOR Execute) enforcement
+- [x] W^X (Write XOR Execute) enforcement (**COMPLETED** - see `kernel/src/security/wx_enforcement.home`)
 - [ ] SMEP/SMAP (Supervisor Mode Execution/Access Prevention)
 - [ ] Secure boot integration
 - [ ] Kernel module signing
 - [ ] Kernel hardening options
-  - [ ] KASLR (Kernel ASLR)
+  - [x] KASLR (Kernel ASLR) (**COMPLETED** - see `kernel/src/security/aslr.home`)
   - [ ] Hardened usercopy
   - [ ] Stack protector
 

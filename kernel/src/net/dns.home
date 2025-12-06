@@ -1,7 +1,8 @@
 // home-os DNS Client
-// Domain Name System resolver with caching
+// Domain Name System resolver with caching and /etc/resolv.conf support
 
 import "../core/foundation.home" as foundation
+import "../core/filesystem.home" as filesystem
 import "udp.home" as udp
 
 // DNS record types
@@ -60,12 +61,421 @@ const DNS_CACHE_SIZE: u32 = 64
 const DNS_MAX_PACKET_SIZE: u32 = 512
 
 // State
-var dns_server: u32 = 0x08080808  // 8.8.8.8 (Google DNS)
-var dns_server_alt: u32 = 0x08080404  // 8.8.4.4 (Google DNS alt)
+var dns_server: u32 = 0x08080808  // 8.8.8.8 (Google DNS) - default
+var dns_server_alt: u32 = 0x08080404  // 8.8.4.4 (Google DNS alt) - default
 var dns_query_id: u16 = 0x1234
 var dns_cache: [DnsCacheEntry; 64]
 var dns_cache_initialized: u32 = 0
 var dns_current_time: u32 = 0
+
+// /etc/resolv.conf support
+const DNS_MAX_SERVERS: u32 = 3
+const DNS_MAX_SEARCH_DOMAINS: u32 = 6
+const DNS_MAX_DOMAIN_LEN: u32 = 256
+
+// DNS server list (populated from resolv.conf)
+var dns_servers: [u32; 3]
+var dns_server_count: u32 = 0
+
+// Search domains (populated from resolv.conf)
+var dns_search_domains: [256][256]u8  // Up to 6 search domains, 256 chars each
+var dns_search_count: u32 = 0
+
+// Domain suffix (populated from resolv.conf)
+var dns_domain: [256]u8
+var dns_domain_set: u32 = 0
+
+// resolv.conf options
+var dns_ndots: u32 = 1        // Number of dots before absolute lookup
+var dns_timeout: u32 = 5      // Query timeout in seconds
+var dns_attempts: u32 = 2     // Number of attempts per server
+var dns_rotate: u32 = 0       // Rotate through nameservers
+
+// Track which server to use next (for rotate option)
+var dns_current_server: u32 = 0
+
+// ============================================================================
+// /etc/resolv.conf Parser
+// ============================================================================
+
+// Parse an IP address from string (e.g., "8.8.8.8" -> 0x08080808)
+fn dns_parse_ip(str: u64): u32 {
+  var ptr: u64 = str
+  var result: u32 = 0
+  var octet: u32 = 0
+  var octet_count: u32 = 0
+
+  var c: u8 = @ptrLoad(ptr, u8)
+  while c != 0 and c != '\n' and c != ' ' and c != '\t' {
+    if c >= '0' and c <= '9' {
+      octet = octet * 10 + (c - '0')
+    } else if c == '.' {
+      result = (result << 8) | (octet & 0xFF)
+      octet = 0
+      octet_count = octet_count + 1
+    }
+    ptr = ptr + 1
+    c = @ptrLoad(ptr, u8)
+  }
+
+  // Add final octet
+  if octet_count == 3 {
+    result = (result << 8) | (octet & 0xFF)
+    return result
+  }
+
+  return 0  // Invalid IP
+}
+
+// Skip whitespace
+fn dns_skip_whitespace(str: u64): u64 {
+  var ptr: u64 = str
+  var c: u8 = @ptrLoad(ptr, u8)
+  while c == ' ' or c == '\t' {
+    ptr = ptr + 1
+    c = @ptrLoad(ptr, u8)
+  }
+  return ptr
+}
+
+// Check if line starts with keyword
+fn dns_starts_with(str: u64, keyword: u64, keyword_len: u32): u32 {
+  var i: u32 = 0
+  while i < keyword_len {
+    var c1: u8 = @ptrLoad(str + i, u8)
+    var c2: u8 = @ptrLoad(keyword + i, u8)
+    if c1 != c2 {
+      return 0
+    }
+    i = i + 1
+  }
+  // Check for whitespace or end after keyword
+  var next: u8 = @ptrLoad(str + keyword_len, u8)
+  if next == ' ' or next == '\t' or next == '\n' or next == 0 {
+    return 1
+  }
+  return 0
+}
+
+// Copy string until whitespace or newline
+fn dns_copy_string(src: u64, dst: u64, max_len: u32): u32 {
+  var i: u32 = 0
+  var c: u8 = @ptrLoad(src + i, u8)
+  while c != 0 and c != '\n' and c != ' ' and c != '\t' and i < max_len - 1 {
+    @ptrStore(dst + i, u8, c)
+    i = i + 1
+    c = @ptrLoad(src + i, u8)
+  }
+  @ptrStore(dst + i, u8, 0)
+  return i
+}
+
+// Parse a single line from resolv.conf
+fn dns_parse_resolv_line(line: u64) {
+  var ptr: u64 = dns_skip_whitespace(line)
+  var c: u8 = @ptrLoad(ptr, u8)
+
+  // Skip empty lines and comments
+  if c == 0 or c == '\n' or c == '#' or c == ';' {
+    return
+  }
+
+  // Check for "nameserver" directive
+  if dns_starts_with(ptr, @ptrFromString("nameserver"), 10) == 1 {
+    ptr = dns_skip_whitespace(ptr + 10)
+    var ip: u32 = dns_parse_ip(ptr)
+    if ip != 0 and dns_server_count < DNS_MAX_SERVERS {
+      dns_servers[dns_server_count] = ip
+      dns_server_count = dns_server_count + 1
+      foundation.serial_write_string("[DNS] Added nameserver: ")
+      dns_print_ip(ip)
+      foundation.serial_write_string("\n")
+    }
+    return
+  }
+
+  // Check for "search" directive
+  if dns_starts_with(ptr, @ptrFromString("search"), 6) == 1 {
+    ptr = dns_skip_whitespace(ptr + 6)
+
+    // Parse multiple search domains
+    while dns_search_count < DNS_MAX_SEARCH_DOMAINS {
+      var c: u8 = @ptrLoad(ptr, u8)
+      if c == 0 or c == '\n' or c == '#' {
+        break
+      }
+
+      var domain_ptr: u64 = @ptrFromInt(&dns_search_domains[dns_search_count])
+      var len: u32 = dns_copy_string(ptr, domain_ptr, DNS_MAX_DOMAIN_LEN)
+
+      if len > 0 {
+        dns_search_count = dns_search_count + 1
+        foundation.serial_write_string("[DNS] Added search domain: ")
+        foundation.serial_write_ptr(domain_ptr)
+        foundation.serial_write_string("\n")
+      }
+
+      // Skip to next domain
+      ptr = ptr + len
+      ptr = dns_skip_whitespace(ptr)
+    }
+    return
+  }
+
+  // Check for "domain" directive
+  if dns_starts_with(ptr, @ptrFromString("domain"), 6) == 1 {
+    ptr = dns_skip_whitespace(ptr + 6)
+    var len: u32 = dns_copy_string(ptr, @ptrFromInt(&dns_domain), DNS_MAX_DOMAIN_LEN)
+    if len > 0 {
+      dns_domain_set = 1
+      foundation.serial_write_string("[DNS] Set domain: ")
+      foundation.serial_write_ptr(@ptrFromInt(&dns_domain))
+      foundation.serial_write_string("\n")
+    }
+    return
+  }
+
+  // Check for "options" directive
+  if dns_starts_with(ptr, @ptrFromString("options"), 7) == 1 {
+    ptr = dns_skip_whitespace(ptr + 7)
+
+    // Parse options
+    while true {
+      var c: u8 = @ptrLoad(ptr, u8)
+      if c == 0 or c == '\n' or c == '#' {
+        break
+      }
+
+      // Check for ndots:N
+      if dns_starts_with(ptr, @ptrFromString("ndots:"), 6) == 1 {
+        ptr = ptr + 6
+        var n: u32 = 0
+        c = @ptrLoad(ptr, u8)
+        while c >= '0' and c <= '9' {
+          n = n * 10 + (c - '0')
+          ptr = ptr + 1
+          c = @ptrLoad(ptr, u8)
+        }
+        if n > 0 and n <= 15 {
+          dns_ndots = n
+        }
+      }
+
+      // Check for timeout:N
+      if dns_starts_with(ptr, @ptrFromString("timeout:"), 8) == 1 {
+        ptr = ptr + 8
+        var n: u32 = 0
+        c = @ptrLoad(ptr, u8)
+        while c >= '0' and c <= '9' {
+          n = n * 10 + (c - '0')
+          ptr = ptr + 1
+          c = @ptrLoad(ptr, u8)
+        }
+        if n > 0 and n <= 30 {
+          dns_timeout = n
+        }
+      }
+
+      // Check for attempts:N
+      if dns_starts_with(ptr, @ptrFromString("attempts:"), 9) == 1 {
+        ptr = ptr + 9
+        var n: u32 = 0
+        c = @ptrLoad(ptr, u8)
+        while c >= '0' and c <= '9' {
+          n = n * 10 + (c - '0')
+          ptr = ptr + 1
+          c = @ptrLoad(ptr, u8)
+        }
+        if n > 0 and n <= 5 {
+          dns_attempts = n
+        }
+      }
+
+      // Check for rotate
+      if dns_starts_with(ptr, @ptrFromString("rotate"), 6) == 1 {
+        dns_rotate = 1
+        ptr = ptr + 6
+      }
+
+      ptr = dns_skip_whitespace(ptr)
+
+      // Skip unknown option
+      c = @ptrLoad(ptr, u8)
+      while c != 0 and c != '\n' and c != ' ' and c != '\t' {
+        ptr = ptr + 1
+        c = @ptrLoad(ptr, u8)
+      }
+      ptr = dns_skip_whitespace(ptr)
+    }
+    return
+  }
+}
+
+// Read and parse /etc/resolv.conf
+export fn dns_load_resolv_conf(): u32 {
+  foundation.serial_write_string("[DNS] Loading /etc/resolv.conf\n")
+
+  // Reset state
+  dns_server_count = 0
+  dns_search_count = 0
+  dns_domain_set = 0
+
+  // Open file
+  var path: u64 = @ptrFromString("/etc/resolv.conf")
+  var fd: u32 = filesystem.vfs_open(path, 0)  // O_RDONLY
+
+  if fd == 0 or fd == 0xFFFFFFFF {
+    foundation.serial_write_string("[DNS] No /etc/resolv.conf found, using defaults\n")
+    // Use hardcoded defaults
+    dns_servers[0] = 0x08080808  // 8.8.8.8
+    dns_servers[1] = 0x08080404  // 8.8.4.4
+    dns_server_count = 2
+    return 0
+  }
+
+  // Read file
+  var buffer: [4096]u8
+  var bytes_read: u64 = filesystem.vfs_read(fd, @ptrFromInt(&buffer), 4095)
+  buffer[bytes_read] = 0  // Null terminate
+
+  filesystem.vfs_close(fd)
+
+  // Parse line by line
+  var line_start: u64 = @ptrFromInt(&buffer)
+  var i: u64 = 0
+  while i < bytes_read {
+    var c: u8 = buffer[i]
+    if c == '\n' {
+      buffer[i] = 0  // Null terminate line
+      dns_parse_resolv_line(line_start)
+      line_start = @ptrFromInt(&buffer) + i + 1
+    }
+    i = i + 1
+  }
+
+  // Parse final line if no trailing newline
+  if line_start < @ptrFromInt(&buffer) + bytes_read {
+    dns_parse_resolv_line(line_start)
+  }
+
+  // If no nameservers found, use defaults
+  if dns_server_count == 0 {
+    foundation.serial_write_string("[DNS] No nameservers in resolv.conf, using defaults\n")
+    dns_servers[0] = 0x08080808
+    dns_servers[1] = 0x08080404
+    dns_server_count = 2
+  }
+
+  // Update legacy dns_server and dns_server_alt for compatibility
+  dns_server = dns_servers[0]
+  if dns_server_count > 1 {
+    dns_server_alt = dns_servers[1]
+  }
+
+  foundation.serial_write_string("[DNS] Loaded ")
+  foundation.serial_write_hex(dns_server_count)
+  foundation.serial_write_string(" nameservers, ")
+  foundation.serial_write_hex(dns_search_count)
+  foundation.serial_write_string(" search domains\n")
+
+  return 1
+}
+
+// Get current active DNS server (respects rotate option)
+fn dns_get_server(): u32 {
+  if dns_server_count == 0 {
+    return 0x08080808  // Fallback
+  }
+
+  var server: u32 = dns_servers[dns_current_server]
+
+  if dns_rotate == 1 {
+    dns_current_server = (dns_current_server + 1) % dns_server_count
+  }
+
+  return server
+}
+
+// Check if hostname needs search domain appended
+fn dns_needs_search(hostname: u64): u32 {
+  // Count dots in hostname
+  var ptr: u64 = hostname
+  var dots: u32 = 0
+  var c: u8 = @ptrLoad(ptr, u8)
+
+  while c != 0 {
+    if c == '.' {
+      dots = dots + 1
+    }
+    ptr = ptr + 1
+    c = @ptrLoad(ptr, u8)
+  }
+
+  // If dots >= ndots, treat as absolute
+  return dots < dns_ndots
+}
+
+// Get search domain by index
+export fn dns_get_search_domain(index: u32, buf: u64, buf_len: u32): u32 {
+  if index >= dns_search_count {
+    return 0
+  }
+
+  var src: u64 = @ptrFromInt(&dns_search_domains[index])
+  var i: u32 = 0
+  var c: u8 = @ptrLoad(src + i, u8)
+
+  while c != 0 and i < buf_len - 1 {
+    @ptrStore(buf + i, u8, c)
+    i = i + 1
+    c = @ptrLoad(src + i, u8)
+  }
+  @ptrStore(buf + i, u8, 0)
+
+  return i
+}
+
+// Get configured domain suffix
+export fn dns_get_domain(buf: u64, buf_len: u32): u32 {
+  if dns_domain_set == 0 {
+    return 0
+  }
+
+  var src: u64 = @ptrFromInt(&dns_domain)
+  var i: u32 = 0
+  var c: u8 = @ptrLoad(src + i, u8)
+
+  while c != 0 and i < buf_len - 1 {
+    @ptrStore(buf + i, u8, c)
+    i = i + 1
+    c = @ptrLoad(src + i, u8)
+  }
+  @ptrStore(buf + i, u8, 0)
+
+  return i
+}
+
+// Get DNS statistics
+export fn dns_get_config(out_servers: u64, out_search: u64): u32 {
+  // Copy server count and addresses to output
+  if out_servers != 0 {
+    var ptr: *u32 = @ptrFromInt(out_servers)
+    ptr[0] = dns_server_count
+    var i: u32 = 0
+    while i < dns_server_count and i < DNS_MAX_SERVERS {
+      ptr[i + 1] = dns_servers[i]
+      i = i + 1
+    }
+  }
+
+  // Copy search domain count to output
+  if out_search != 0 {
+    var ptr: *u32 = @ptrFromInt(out_search)
+    ptr[0] = dns_search_count
+  }
+
+  return dns_server_count
+}
 
 export fn dns_init() {
   // Initialize cache
@@ -75,7 +485,18 @@ export fn dns_init() {
     i = i + 1
   }
   dns_cache_initialized = 1
-  foundation.serial_write_string("[DNS] Initialized with server 8.8.8.8\n")
+
+  // Initialize server list with defaults
+  dns_servers[0] = 0x08080808  // 8.8.8.8
+  dns_servers[1] = 0x08080404  // 8.8.4.4
+  dns_server_count = 2
+
+  // Try to load /etc/resolv.conf (will use defaults if not found)
+  dns_load_resolv_conf()
+
+  foundation.serial_write_string("[DNS] Initialized with ")
+  foundation.serial_write_hex(dns_server_count)
+  foundation.serial_write_string(" nameserver(s)\n")
 }
 
 export fn dns_set_server(server_ip: u32) {

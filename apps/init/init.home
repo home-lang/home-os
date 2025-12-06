@@ -1,437 +1,746 @@
-// home-os Init Process (PID 1)
-// The first userspace process that manages system initialization
-// Responsible for starting services, mounting filesystems, and reaping orphaned processes
+// HomeOS Init Process (PID 1)
+// The first userspace process - manages system initialization and service supervision
+// Implements robust restart policies with exponential backoff and failure tracking
 
-import "../../kernel/src/core/foundation.home" as foundation
+const syscalls = @import("../lib/syscalls.home")
+const serial = @import("../../kernel/src/drivers/serial.home")
 
-// Init configuration
+// ============================================================================
+// Configuration
+// ============================================================================
+
 const MAX_SERVICES: u32 = 64
 const MAX_RUNLEVELS: u32 = 7
-const CONFIG_PATH: *u8 = "/etc/inittab"
+const CONFIG_PATH: u64 = @intFromPtr("/etc/inittab")
 
-// Runlevels
-const RUNLEVEL_HALT: u32 = 0
-const RUNLEVEL_SINGLE: u32 = 1
-const RUNLEVEL_MULTI_NO_NET: u32 = 2
-const RUNLEVEL_MULTI: u32 = 3
-const RUNLEVEL_UNUSED: u32 = 4
-const RUNLEVEL_MULTI_GUI: u32 = 5
-const RUNLEVEL_REBOOT: u32 = 6
+// Service restart policy
+const RESTART_DELAY_INITIAL_MS: u32 = 1000   // 1 second
+const RESTART_DELAY_MAX_MS: u32 = 60000      // 1 minute
+const RESTART_DELAY_MULTIPLIER: u32 = 2      // Exponential backoff
 
-// Service states
+// Service failure thresholds
+const FAILURE_WINDOW_SEC: u64 = 300          // 5 minute window
+const FAILURE_THRESHOLD: u32 = 5             // 5 failures in window = failed state
+
+// ============================================================================
+// Runlevels (SysV-style)
+// ============================================================================
+
+const RUNLEVEL_HALT: u32 = 0        // System halt
+const RUNLEVEL_SINGLE: u32 = 1      // Single-user mode
+const RUNLEVEL_MULTI_NO_NET: u32 = 2 // Multi-user without networking
+const RUNLEVEL_MULTI: u32 = 3       // Multi-user with networking
+const RUNLEVEL_UNUSED: u32 = 4      // Reserved
+const RUNLEVEL_MULTI_GUI: u32 = 5   // Multi-user with GUI
+const RUNLEVEL_REBOOT: u32 = 6      // System reboot
+
+// ============================================================================
+// Service States and Types
+// ============================================================================
+
 const SERVICE_STATE_STOPPED: u32 = 0
 const SERVICE_STATE_STARTING: u32 = 1
 const SERVICE_STATE_RUNNING: u32 = 2
 const SERVICE_STATE_STOPPING: u32 = 3
 const SERVICE_STATE_FAILED: u32 = 4
+const SERVICE_STATE_BACKOFF: u32 = 5  // Waiting before restart
 
-// Service types
-const SERVICE_TYPE_ONCE: u32 = 0      // Run once at boot
-const SERVICE_TYPE_RESPAWN: u32 = 1   // Restart if dies
-const SERVICE_TYPE_WAIT: u32 = 2      // Wait for completion
-const SERVICE_TYPE_ONDEMAND: u32 = 3  // Start on demand
+const SERVICE_TYPE_ONCE: u32 = 0       // Run once at boot
+const SERVICE_TYPE_RESPAWN: u32 = 1    // Restart if dies
+const SERVICE_TYPE_WAIT: u32 = 2       // Wait for completion before continuing
+const SERVICE_TYPE_ONDEMAND: u32 = 3   // Start on demand
+const SERVICE_TYPE_CRITICAL: u32 = 4   // System cannot run without this
 
-// Service definition
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+struct ServiceFailure {
+    timestamp: u64,
+    exit_code: i32,
+    signal: u32,
+}
+
 struct Service {
-  name: [64]u8
-  command: [256]u8
-  runlevels: u32          // Bitmask of runlevels
-  type_: u32
-  state: u32
-  pid: u32
-  restart_count: u32
-  max_restarts: u32
-  enabled: u32
+    name: [64]u8,
+    command: [256]u8,
+    runlevels: u32,           // Bitmask of runlevels
+    service_type: u32,
+    state: u32,
+    pid: i32,
+
+    // Restart tracking
+    restart_count: u32,
+    max_restarts: u32,
+    current_backoff_ms: u32,
+
+    // Failure tracking (circular buffer)
+    failures: [16]ServiceFailure,
+    failure_count: u32,
+    failure_index: u32,
+
+    // Timing
+    start_time: u64,
+    stop_time: u64,
+
+    // Supervision options
+    restart_on_abort: u32,    // Restart even on SIGABRT
+    notify_socket: [128]u8,   // For sd_notify style readiness
+    ready: u32,               // Service reported ready
+
+    enabled: u32,
 }
 
-// Init state
 struct InitState {
-  current_runlevel: u32
-  target_runlevel: u32
-  services: [MAX_SERVICES]Service
-  num_services: u32
-  initialized: u32
-  shutdown_requested: u32
+    current_runlevel: u32,
+    target_runlevel: u32,
+    services: [MAX_SERVICES]Service,
+    num_services: u32,
+    initialized: u32,
+    shutdown_requested: u32,
+    reboot_requested: u32,
+    boot_time: u64,
 }
 
-var init_state: InitState
+// ============================================================================
+// Global State
+// ============================================================================
 
-// Syscall wrappers
-fn syscall_fork(): u32 {
-  // Would invoke fork() syscall
-  return 0
+var init_state: InitState = undefined
+var monotonic_time: u64 = 0
+
+// ============================================================================
+// Time Utilities
+// ============================================================================
+
+fn get_monotonic_time() u64 {
+    return monotonic_time
 }
 
-fn syscall_exec(path: *u8, argv: **u8): u32 {
-  // Would invoke execve() syscall
-  return 0
+fn advance_time_ms(ms: u32) void {
+    monotonic_time += ms
 }
 
-fn syscall_wait(status: *u32): u32 {
-  // Would invoke wait() syscall
-  return 0
-}
+// ============================================================================
+// Initialization
+// ============================================================================
 
-fn syscall_kill(pid: u32, signal: u32): u32 {
-  // Would invoke kill() syscall
-  return 0
-}
+export fn init_initialize() void {
+    serial.write_string("[INIT] Starting HomeOS init (PID 1)...\n")
 
-fn syscall_reboot(cmd: u32): u32 {
-  // Would invoke reboot() syscall
-  return 0
-}
+    init_state.current_runlevel = RUNLEVEL_SINGLE
+    init_state.target_runlevel = RUNLEVEL_MULTI
+    init_state.num_services = 0
+    init_state.shutdown_requested = 0
+    init_state.reboot_requested = 0
+    init_state.boot_time = get_monotonic_time()
 
-fn syscall_mount(source: *u8, target: *u8, fstype: *u8, flags: u32): u32 {
-  // Would invoke mount() syscall
-  return 0
-}
-
-fn syscall_sleep(seconds: u32) {
-  // Would invoke nanosleep() syscall
-}
-
-// Initialize init process
-fn init_initialize() {
-  foundation.serial_write_string("[INIT] Starting init process (PID 1)...\n")
-
-  init_state.current_runlevel = RUNLEVEL_SINGLE
-  init_state.target_runlevel = RUNLEVEL_MULTI
-  init_state.num_services = 0
-  init_state.shutdown_requested = 0
-
-  // Initialize service table
-  var i: u32 = 0
-  loop {
-    if i >= MAX_SERVICES { break }
-
-    init_state.services[i].enabled = 0
-    init_state.services[i].state = SERVICE_STATE_STOPPED
-    init_state.services[i].pid = 0
-    init_state.services[i].restart_count = 0
-
-    i = i + 1
-  }
-
-  init_state.initialized = 1
-
-  foundation.serial_write_string("[INIT] Init process initialized\n")
-}
-
-// Mount essential filesystems
-fn mount_filesystems() {
-  foundation.serial_write_string("[INIT] Mounting filesystems...\n")
-
-  // Mount /proc
-  syscall_mount("proc", "/proc", "proc", 0)
-  foundation.serial_write_string("[INIT] Mounted /proc\n")
-
-  // Mount /sys
-  syscall_mount("sysfs", "/sys", "sysfs", 0)
-  foundation.serial_write_string("[INIT] Mounted /sys\n")
-
-  // Mount /dev
-  syscall_mount("devtmpfs", "/dev", "devtmpfs", 0)
-  foundation.serial_write_string("[INIT] Mounted /dev\n")
-
-  // Mount /tmp
-  syscall_mount("tmpfs", "/tmp", "tmpfs", 0)
-  foundation.serial_write_string("[INIT] Mounted /tmp\n")
-
-  foundation.serial_write_string("[INIT] Filesystems mounted\n")
-}
-
-// Register a service
-fn register_service(name: *u8, command: *u8, runlevels: u32, type_: u32, max_restarts: u32) {
-  if init_state.num_services >= MAX_SERVICES {
-    foundation.serial_write_string("[INIT] Maximum services reached\n")
-    return
-  }
-
-  let idx: u32 = init_state.num_services
-  let service: *Service = &init_state.services[idx]
-
-  // Copy name
-  var i: u32 = 0
-  loop {
-    if i >= 64 { break }
-    let ch: u8 = foundation.read_u8(name as u64 + i as u64)
-    service.name[i] = ch
-    if ch == 0 { break }
-    i = i + 1
-  }
-
-  // Copy command
-  i = 0
-  loop {
-    if i >= 256 { break }
-    let ch: u8 = foundation.read_u8(command as u64 + i as u64)
-    service.command[i] = ch
-    if ch == 0 { break }
-    i = i + 1
-  }
-
-  service.runlevels = runlevels
-  service.type_ = type_
-  service.state = SERVICE_STATE_STOPPED
-  service.pid = 0
-  service.restart_count = 0
-  service.max_restarts = max_restarts
-  service.enabled = 1
-
-  init_state.num_services = init_state.num_services + 1
-
-  foundation.serial_write_string("[INIT] Registered service: ")
-  foundation.serial_write_string(name)
-  foundation.serial_write_string("\n")
-}
-
-// Start a service
-fn start_service(idx: u32) {
-  if idx >= init_state.num_services { return }
-
-  let service: *Service = &init_state.services[idx]
-
-  if service.state == SERVICE_STATE_RUNNING {
-    return
-  }
-
-  foundation.serial_write_string("[INIT] Starting service: ")
-  foundation.serial_write_string(&service.name[0] as *u8)
-  foundation.serial_write_string("\n")
-
-  service.state = SERVICE_STATE_STARTING
-
-  // Fork child process
-  let pid: u32 = syscall_fork()
-
-  if pid == 0 {
-    // Child process - exec service
-    syscall_exec(&service.command[0] as *u8, 0)
-    // If exec fails, exit
-    return
-  }
-
-  // Parent process
-  service.pid = pid
-  service.state = SERVICE_STATE_RUNNING
-
-  foundation.serial_write_string("[INIT] Service started with PID ")
-  foundation.serial_write_u64(pid)
-  foundation.serial_write_string("\n")
-}
-
-// Stop a service
-fn stop_service(idx: u32) {
-  if idx >= init_state.num_services { return }
-
-  let service: *Service = &init_state.services[idx]
-
-  if service.state != SERVICE_STATE_RUNNING {
-    return
-  }
-
-  foundation.serial_write_string("[INIT] Stopping service: ")
-  foundation.serial_write_string(&service.name[0] as *u8)
-  foundation.serial_write_string("\n")
-
-  service.state = SERVICE_STATE_STOPPING
-
-  // Send SIGTERM
-  syscall_kill(service.pid, 15)
-
-  // Wait a bit
-  syscall_sleep(2)
-
-  // Send SIGKILL if still running
-  syscall_kill(service.pid, 9)
-
-  service.state = SERVICE_STATE_STOPPED
-  service.pid = 0
-
-  foundation.serial_write_string("[INIT] Service stopped\n")
-}
-
-// Change runlevel
-fn change_runlevel(new_level: u32) {
-  if new_level >= MAX_RUNLEVELS { return }
-
-  foundation.serial_write_string("[INIT] Changing runlevel: ")
-  foundation.serial_write_u64(init_state.current_runlevel)
-  foundation.serial_write_string(" -> ")
-  foundation.serial_write_u64(new_level)
-  foundation.serial_write_string("\n")
-
-  init_state.target_runlevel = new_level
-
-  // Stop services not in new runlevel
-  var i: u32 = 0
-  loop {
-    if i >= init_state.num_services { break }
-
-    let service: *Service = &init_state.services[i]
-    let in_new_level: u32 = (service.runlevels >> new_level) & 1
-    let in_old_level: u32 = (service.runlevels >> init_state.current_runlevel) & 1
-
-    if in_old_level == 1 && in_new_level == 0 {
-      stop_service(i)
+    // Initialize service table
+    var i: u32 = 0
+    while (i < MAX_SERVICES) {
+        init_state.services[i].enabled = 0
+        init_state.services[i].state = SERVICE_STATE_STOPPED
+        init_state.services[i].pid = -1
+        init_state.services[i].restart_count = 0
+        init_state.services[i].failure_count = 0
+        init_state.services[i].failure_index = 0
+        init_state.services[i].current_backoff_ms = RESTART_DELAY_INITIAL_MS
+        init_state.services[i].ready = 0
+        i += 1
     }
 
-    i = i + 1
-  }
-
-  // Start services in new runlevel
-  i = 0
-  loop {
-    if i >= init_state.num_services { break }
-
-    let service: *Service = &init_state.services[i]
-    let in_new_level: u32 = (service.runlevels >> new_level) & 1
-
-    if in_new_level == 1 && service.state != SERVICE_STATE_RUNNING {
-      start_service(i)
-    }
-
-    i = i + 1
-  }
-
-  init_state.current_runlevel = new_level
-
-  foundation.serial_write_string("[INIT] Runlevel change complete\n")
+    init_state.initialized = 1
+    serial.write_string("[INIT] Init process initialized\n")
 }
 
-// Handle child process exit
-fn handle_child_exit(pid: u32, status: u32) {
-  // Find service with this PID
-  var i: u32 = 0
-  loop {
-    if i >= init_state.num_services { break }
+// ============================================================================
+// Filesystem Mounting
+// ============================================================================
 
-    let service: *Service = &init_state.services[i]
+fn mount_filesystems() void {
+    serial.write_string("[INIT] Mounting essential filesystems...\n")
 
-    if service.pid == pid {
-      foundation.serial_write_string("[INIT] Service ")
-      foundation.serial_write_string(&service.name[0] as *u8)
-      foundation.serial_write_string(" exited with status ")
-      foundation.serial_write_u64(status)
-      foundation.serial_write_string("\n")
+    // Mount /proc
+    var ret: i32 = syscalls.sys_mount("proc", "/proc", "proc", 0, 0)
+    if (ret < 0) {
+        serial.write_string("[INIT] Warning: Failed to mount /proc\n")
+    } else {
+        serial.write_string("[INIT] Mounted /proc\n")
+    }
 
-      service.state = SERVICE_STATE_STOPPED
-      service.pid = 0
+    // Mount /sys
+    ret = syscalls.sys_mount("sysfs", "/sys", "sysfs", 0, 0)
+    if (ret < 0) {
+        serial.write_string("[INIT] Warning: Failed to mount /sys\n")
+    } else {
+        serial.write_string("[INIT] Mounted /sys\n")
+    }
 
-      // Respawn if needed
-      if service.type_ == SERVICE_TYPE_RESPAWN {
-        service.restart_count = service.restart_count + 1
+    // Mount /dev
+    ret = syscalls.sys_mount("devtmpfs", "/dev", "devtmpfs", 0, 0)
+    if (ret < 0) {
+        serial.write_string("[INIT] Warning: Failed to mount /dev\n")
+    } else {
+        serial.write_string("[INIT] Mounted /dev\n")
+    }
 
-        if service.max_restarts == 0 || service.restart_count < service.max_restarts {
-          foundation.serial_write_string("[INIT] Respawning service (attempt ")
-          foundation.serial_write_u64(service.restart_count)
-          foundation.serial_write_string(")\n")
+    // Create and mount /dev/pts
+    _ = syscalls.sys_mkdir("/dev/pts", 0o755)
+    ret = syscalls.sys_mount("devpts", "/dev/pts", "devpts", 0, 0)
+    if (ret == 0) {
+        serial.write_string("[INIT] Mounted /dev/pts\n")
+    }
 
-          start_service(i)
-        } else {
-          foundation.serial_write_string("[INIT] Max restart count reached\n")
-          service.state = SERVICE_STATE_FAILED
+    // Mount /tmp
+    ret = syscalls.sys_mount("tmpfs", "/tmp", "tmpfs", 0, 0)
+    if (ret < 0) {
+        serial.write_string("[INIT] Warning: Failed to mount /tmp\n")
+    } else {
+        serial.write_string("[INIT] Mounted /tmp\n")
+    }
+
+    // Create and mount /run
+    _ = syscalls.sys_mkdir("/run", 0o755)
+    ret = syscalls.sys_mount("tmpfs", "/run", "tmpfs", 0, 0)
+    if (ret == 0) {
+        serial.write_string("[INIT] Mounted /run\n")
+    }
+
+    serial.write_string("[INIT] Essential filesystems mounted\n")
+}
+
+// ============================================================================
+// String Utilities
+// ============================================================================
+
+fn copy_string(dest: *u8, src: *u8, max_len: u32) void {
+    var i: u32 = 0
+    while (i < max_len and src[i] != 0) {
+        dest[i] = src[i]
+        i += 1
+    }
+    dest[i] = 0
+}
+
+// ============================================================================
+// Service Registration
+// ============================================================================
+
+export fn register_service(
+    name: *u8,
+    command: *u8,
+    runlevels: u32,
+    service_type: u32,
+    max_restarts: u32
+) u32 {
+    if (init_state.num_services >= MAX_SERVICES) {
+        serial.write_string("[INIT] Error: Maximum services reached\n")
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = init_state.num_services
+    var service: *Service = &init_state.services[idx]
+
+    copy_string(&service.name[0], name, 63)
+    copy_string(&service.command[0], command, 255)
+
+    service.runlevels = runlevels
+    service.service_type = service_type
+    service.state = SERVICE_STATE_STOPPED
+    service.pid = -1
+    service.restart_count = 0
+    service.max_restarts = max_restarts
+    service.current_backoff_ms = RESTART_DELAY_INITIAL_MS
+    service.failure_count = 0
+    service.failure_index = 0
+    service.restart_on_abort = 0
+    service.ready = 0
+    service.enabled = 1
+
+    init_state.num_services += 1
+
+    serial.write_string("[INIT] Registered service: ")
+    serial.write_string(name)
+    serial.write_string("\n")
+
+    return idx
+}
+
+// ============================================================================
+// Service Control
+// ============================================================================
+
+export fn start_service(idx: u32) i32 {
+    if (idx >= init_state.num_services) return syscalls.EINVAL
+
+    var service: *Service = &init_state.services[idx]
+
+    if (service.state == SERVICE_STATE_RUNNING) {
+        return 0
+    }
+
+    serial.write_string("[INIT] Starting service: ")
+    serial.write_string(&service.name[0])
+    serial.write_string("\n")
+
+    service.state = SERVICE_STATE_STARTING
+    service.start_time = get_monotonic_time()
+
+    var pid: i32 = syscalls.sys_fork()
+
+    if (pid < 0) {
+        serial.write_string("[INIT] Error: Fork failed\n")
+        service.state = SERVICE_STATE_FAILED
+        return pid
+    }
+
+    if (pid == 0) {
+        // Child process
+        var argv: [64]*u8 = undefined
+        var argc: u32 = parse_command_line(&service.command[0], &argv[0])
+        argv[argc] = 0
+
+        if (argc > 0) {
+            _ = syscalls.sys_execve(argv[0], &argv[0], 0)
         }
-      }
 
-      return
+        serial.write_string("[INIT] Error: Exec failed\n")
+        syscalls.sys_exit(127)
     }
 
-    i = i + 1
-  }
+    // Parent
+    service.pid = pid
+    service.state = SERVICE_STATE_RUNNING
+    service.ready = if (service.service_type == SERVICE_TYPE_ONCE) @as(u32, 1) else @as(u32, 0)
 
-  foundation.serial_write_string("[INIT] Reaped orphaned process ")
-  foundation.serial_write_u64(pid)
-  foundation.serial_write_string("\n")
+    serial.write_string("[INIT] Service started with PID ")
+    serial.write_u32(@as(u32, @intCast(pid)))
+    serial.write_string("\n")
+
+    // Wait for TYPE_WAIT services
+    if (service.service_type == SERVICE_TYPE_WAIT) {
+        var status: i32 = 0
+        _ = syscalls.sys_waitpid(pid, &status, 0)
+        handle_service_exit(idx, status)
+    }
+
+    return 0
 }
 
-// Main init loop
-fn init_main_loop() {
-  foundation.serial_write_string("[INIT] Entering main loop\n")
+export fn stop_service(idx: u32) i32 {
+    if (idx >= init_state.num_services) return syscalls.EINVAL
 
-  loop {
-    // Wait for child process to exit
-    var status: u32 = 0
-    let pid: u32 = syscall_wait(&status)
+    var service: *Service = &init_state.services[idx]
 
-    if pid > 0 {
-      handle_child_exit(pid, status)
+    if (service.state != SERVICE_STATE_RUNNING and
+        service.state != SERVICE_STATE_STARTING) {
+        return 0
     }
 
-    // Check for shutdown
-    if init_state.shutdown_requested == 1 {
-      foundation.serial_write_string("[INIT] Shutdown requested\n")
-      break
+    serial.write_string("[INIT] Stopping service: ")
+    serial.write_string(&service.name[0])
+    serial.write_string("\n")
+
+    service.state = SERVICE_STATE_STOPPING
+    service.stop_time = get_monotonic_time()
+
+    if (service.pid > 0) {
+        // Send SIGTERM
+        var ret: i32 = syscalls.sys_kill(service.pid, syscalls.SIGTERM)
+        if (ret < 0) {
+            serial.write_string("[INIT] Warning: Failed to send SIGTERM\n")
+        }
+
+        // Wait up to 5 seconds
+        var waited: u32 = 0
+        while (waited < 5000) {
+            var status: i32 = 0
+            var wpid: i32 = syscalls.sys_waitpid(service.pid, &status, syscalls.WNOHANG)
+
+            if (wpid == service.pid) {
+                service.state = SERVICE_STATE_STOPPED
+                service.pid = -1
+                serial.write_string("[INIT] Service stopped gracefully\n")
+                return 0
+            }
+
+            _ = syscalls.sys_usleep(100000)
+            waited += 100
+        }
+
+        // Force kill
+        serial.write_string("[INIT] Sending SIGKILL\n")
+        _ = syscalls.sys_kill(service.pid, syscalls.SIGKILL)
+
+        var status: i32 = 0
+        _ = syscalls.sys_waitpid(service.pid, &status, 0)
     }
 
-    // Check for runlevel change
-    if init_state.target_runlevel != init_state.current_runlevel {
-      change_runlevel(init_state.target_runlevel)
-    }
-  }
+    service.state = SERVICE_STATE_STOPPED
+    service.pid = -1
+    serial.write_string("[INIT] Service stopped\n")
+
+    return 0
 }
 
-// Shutdown system
-fn init_shutdown() {
-  foundation.serial_write_string("[INIT] Shutting down system...\n")
+// ============================================================================
+// Failure Tracking and Supervision
+// ============================================================================
 
-  // Change to runlevel 0 (halt) or 6 (reboot)
-  change_runlevel(RUNLEVEL_HALT)
+fn record_failure(service: *Service, exit_code: i32, signal: u32) void {
+    var failure: *ServiceFailure = &service.failures[service.failure_index]
+    failure.timestamp = get_monotonic_time()
+    failure.exit_code = exit_code
+    failure.signal = signal
 
-  // Stop all remaining services
-  var i: u32 = 0
-  loop {
-    if i >= init_state.num_services { break }
-
-    if init_state.services[i].state == SERVICE_STATE_RUNNING {
-      stop_service(i)
+    service.failure_index = (service.failure_index + 1) % 16
+    if (service.failure_count < 16) {
+        service.failure_count += 1
     }
-
-    i = i + 1
-  }
-
-  // Sync filesystems
-  foundation.serial_write_string("[INIT] Syncing filesystems...\n")
-
-  // Unmount filesystems
-  foundation.serial_write_string("[INIT] Unmounting filesystems...\n")
-
-  foundation.serial_write_string("[INIT] Shutdown complete\n")
 }
 
-// Main entry point
-export fn main(): u32 {
-  foundation.serial_write_string("\n")
-  foundation.serial_write_string("========================================\n")
-  foundation.serial_write_string("  home-os Init Process (PID 1)\n")
-  foundation.serial_write_string("========================================\n")
-  foundation.serial_write_string("\n")
+fn count_recent_failures(service: *Service) u32 {
+    var current_time: u64 = get_monotonic_time()
+    var window_start: u64 = if (current_time > FAILURE_WINDOW_SEC * 1000)
+        current_time - FAILURE_WINDOW_SEC * 1000
+    else
+        0
 
-  // Initialize init
-  init_initialize()
+    var count: u32 = 0
+    var i: u32 = 0
+    while (i < service.failure_count) {
+        if (service.failures[i].timestamp >= window_start) {
+            count += 1
+        }
+        i += 1
+    }
 
-  // Mount filesystems
-  mount_filesystems()
+    return count
+}
 
-  // Register essential services
-  register_service("udevd", "/sbin/udevd", 0b00111110, SERVICE_TYPE_RESPAWN, 5)
-  register_service("syslogd", "/sbin/syslogd", 0b00111110, SERVICE_TYPE_RESPAWN, 5)
-  register_service("network", "/etc/init.d/network start", 0b00111000, SERVICE_TYPE_ONCE, 0)
-  register_service("sshd", "/usr/sbin/sshd", 0b00111000, SERVICE_TYPE_RESPAWN, 3)
-  register_service("getty", "/sbin/getty ttyS0", 0b00111110, SERVICE_TYPE_RESPAWN, 0)
+fn should_respawn(service: *Service) u32 {
+    if (service.service_type != SERVICE_TYPE_RESPAWN and
+        service.service_type != SERVICE_TYPE_CRITICAL) {
+        return 0
+    }
 
-  // Start default runlevel
-  change_runlevel(RUNLEVEL_MULTI)
+    var in_runlevel: u32 = (service.runlevels >> init_state.current_runlevel) & 1
+    if (in_runlevel == 0) {
+        return 0
+    }
 
-  // Enter main loop
-  init_main_loop()
+    if (service.max_restarts > 0 and service.restart_count >= service.max_restarts) {
+        serial.write_string("[INIT] Max restarts reached\n")
+        service.state = SERVICE_STATE_FAILED
+        return 0
+    }
 
-  // Shutdown
-  init_shutdown()
+    var recent_failures: u32 = count_recent_failures(service)
+    if (recent_failures >= FAILURE_THRESHOLD) {
+        serial.write_string("[INIT] Failure threshold reached\n")
+        service.state = SERVICE_STATE_FAILED
+        return 0
+    }
 
-  // Reboot or halt
-  syscall_reboot(if init_state.current_runlevel == RUNLEVEL_REBOOT { 1 } else { 0 })
+    return 1
+}
 
-  return 0
+fn schedule_restart(service: *Service, idx: u32) void {
+    service.state = SERVICE_STATE_BACKOFF
+    service.restart_count += 1
+
+    serial.write_string("[INIT] Scheduling restart in ")
+    serial.write_u32(service.current_backoff_ms)
+    serial.write_string("ms (attempt ")
+    serial.write_u32(service.restart_count)
+    serial.write_string(")\n")
+
+    _ = syscalls.sys_usleep(@as(u64, service.current_backoff_ms) * 1000)
+
+    // Exponential backoff
+    service.current_backoff_ms *= RESTART_DELAY_MULTIPLIER
+    if (service.current_backoff_ms > RESTART_DELAY_MAX_MS) {
+        service.current_backoff_ms = RESTART_DELAY_MAX_MS
+    }
+
+    _ = start_service(idx)
+}
+
+fn handle_service_exit(idx: u32, status: i32) void {
+    if (idx >= init_state.num_services) return
+
+    var service: *Service = &init_state.services[idx]
+
+    serial.write_string("[INIT] Service ")
+    serial.write_string(&service.name[0])
+
+    if (syscalls.WIFEXITED(status) == 1) {
+        var exit_code: i32 = syscalls.WEXITSTATUS(status)
+        serial.write_string(" exited with code ")
+        serial.write_u32(@as(u32, @intCast(exit_code)))
+        serial.write_string("\n")
+
+        if (exit_code != 0) {
+            record_failure(service, exit_code, 0)
+        }
+    } else if (syscalls.WIFSIGNALED(status) == 1) {
+        var sig: i32 = syscalls.WTERMSIG(status)
+        serial.write_string(" killed by signal ")
+        serial.write_u32(@as(u32, @intCast(sig)))
+        serial.write_string("\n")
+
+        record_failure(service, -1, @as(u32, @intCast(sig)))
+    }
+
+    service.state = SERVICE_STATE_STOPPED
+    service.pid = -1
+
+    if (should_respawn(service) == 1) {
+        schedule_restart(service, idx)
+    } else if (service.service_type == SERVICE_TYPE_CRITICAL) {
+        serial.write_string("[INIT] CRITICAL: Essential service failed!\n")
+        handle_critical_failure(idx)
+    }
+}
+
+fn handle_critical_failure(idx: u32) void {
+    serial.write_string("[INIT] Critical failure - dropping to single-user mode\n")
+    init_state.target_runlevel = RUNLEVEL_SINGLE
+}
+
+// ============================================================================
+// Runlevel Management
+// ============================================================================
+
+fn change_runlevel(new_level: u32) void {
+    if (new_level >= MAX_RUNLEVELS) return
+
+    serial.write_string("[INIT] Changing runlevel: ")
+    serial.write_u32(init_state.current_runlevel)
+    serial.write_string(" -> ")
+    serial.write_u32(new_level)
+    serial.write_string("\n")
+
+    // Stop services not in new runlevel
+    var i: u32 = 0
+    while (i < init_state.num_services) {
+        var service: *Service = &init_state.services[i]
+        if (service.enabled == 0) {
+            i += 1
+            continue
+        }
+
+        var in_new_level: u32 = (service.runlevels >> new_level) & 1
+        var in_old_level: u32 = (service.runlevels >> init_state.current_runlevel) & 1
+
+        if (in_old_level == 1 and in_new_level == 0) {
+            _ = stop_service(i)
+        }
+
+        i += 1
+    }
+
+    // Start services in new runlevel
+    i = 0
+    while (i < init_state.num_services) {
+        var service: *Service = &init_state.services[i]
+        if (service.enabled == 0) {
+            i += 1
+            continue
+        }
+
+        var in_new_level: u32 = (service.runlevels >> new_level) & 1
+
+        if (in_new_level == 1 and service.state == SERVICE_STATE_STOPPED) {
+            _ = start_service(i)
+        }
+
+        i += 1
+    }
+
+    init_state.current_runlevel = new_level
+    serial.write_string("[INIT] Runlevel change complete\n")
+}
+
+// ============================================================================
+// Child Reaping (PID 1's job)
+// ============================================================================
+
+fn reap_children() void {
+    while (true) {
+        var status: i32 = 0
+        var pid: i32 = syscalls.sys_waitpid(-1, &status, syscalls.WNOHANG)
+
+        if (pid <= 0) break
+
+        var found: u32 = 0
+        var i: u32 = 0
+        while (i < init_state.num_services) {
+            if (init_state.services[i].pid == pid) {
+                handle_service_exit(i, status)
+                found = 1
+                break
+            }
+            i += 1
+        }
+
+        if (found == 0) {
+            serial.write_string("[INIT] Reaped orphaned process ")
+            serial.write_u32(@as(u32, @intCast(pid)))
+            serial.write_string("\n")
+        }
+    }
+}
+
+// ============================================================================
+// Main Loop
+// ============================================================================
+
+fn init_main_loop() void {
+    serial.write_string("[INIT] Entering main loop\n")
+
+    while (true) {
+        reap_children()
+
+        if (init_state.shutdown_requested == 1) {
+            serial.write_string("[INIT] Shutdown requested\n")
+            break
+        }
+
+        if (init_state.target_runlevel != init_state.current_runlevel) {
+            change_runlevel(init_state.target_runlevel)
+        }
+
+        _ = syscalls.sys_usleep(100000)  // 100ms
+        advance_time_ms(100)
+    }
+}
+
+// ============================================================================
+// Shutdown
+// ============================================================================
+
+fn init_shutdown() void {
+    serial.write_string("[INIT] Shutting down system...\n")
+
+    var i: u32 = 0
+    while (i < init_state.num_services) {
+        if (init_state.services[i].state == SERVICE_STATE_RUNNING or
+            init_state.services[i].state == SERVICE_STATE_STARTING) {
+            _ = stop_service(i)
+        }
+        i += 1
+    }
+
+    serial.write_string("[INIT] Syncing filesystems...\n")
+
+    serial.write_string("[INIT] Unmounting filesystems...\n")
+    _ = syscalls.sys_umount("/tmp")
+    _ = syscalls.sys_umount("/run")
+    _ = syscalls.sys_umount("/dev/pts")
+    _ = syscalls.sys_umount("/dev")
+    _ = syscalls.sys_umount("/sys")
+    _ = syscalls.sys_umount("/proc")
+
+    serial.write_string("[INIT] Shutdown complete\n")
+}
+
+// ============================================================================
+// Command Line Parsing
+// ============================================================================
+
+fn parse_command_line(cmdline: *u8, argv: **u8) u32 {
+    var argc: u32 = 0
+    var in_word: u32 = 0
+    var i: u32 = 0
+
+    while (cmdline[i] != 0) {
+        if (cmdline[i] == ' ' or cmdline[i] == '\t') {
+            if (in_word == 1) {
+                cmdline[i] = 0
+                in_word = 0
+            }
+        } else {
+            if (in_word == 0) {
+                if (argc < 63) {
+                    argv[argc] = &cmdline[i]
+                    argc += 1
+                }
+                in_word = 1
+            }
+        }
+        i += 1
+    }
+
+    return argc
+}
+
+// ============================================================================
+// External API for Service Control
+// ============================================================================
+
+export fn init_request_shutdown() void {
+    init_state.shutdown_requested = 1
+}
+
+export fn init_request_reboot() void {
+    init_state.reboot_requested = 1
+    init_state.shutdown_requested = 1
+}
+
+export fn init_set_runlevel(level: u32) i32 {
+    if (level >= MAX_RUNLEVELS) return syscalls.EINVAL
+    init_state.target_runlevel = level
+    return 0
+}
+
+export fn init_get_runlevel() u32 {
+    return init_state.current_runlevel
+}
+
+export fn init_get_service_count() u32 {
+    return init_state.num_services
+}
+
+export fn init_get_service_state(idx: u32) u32 {
+    if (idx >= init_state.num_services) return SERVICE_STATE_STOPPED
+    return init_state.services[idx].state
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+export fn main() i32 {
+    serial.write_string("\n")
+    serial.write_string("========================================\n")
+    serial.write_string("  HomeOS Init Process (PID 1)\n")
+    serial.write_string("========================================\n")
+    serial.write_string("\n")
+
+    init_initialize()
+    mount_filesystems()
+
+    // Register essential services
+    // Bitmask: 0b00111110 = runlevels 1-5
+    _ = register_service("udevd", "/sbin/udevd --daemon", 0b00111110, SERVICE_TYPE_RESPAWN, 10)
+    _ = register_service("syslogd", "/sbin/syslogd -n", 0b00111110, SERVICE_TYPE_CRITICAL, 0)
+    _ = register_service("network", "/etc/init.d/network start", 0b00111000, SERVICE_TYPE_WAIT, 0)
+    _ = register_service("sshd", "/usr/sbin/sshd -D", 0b00111000, SERVICE_TYPE_RESPAWN, 5)
+    _ = register_service("getty-tty1", "/sbin/getty 38400 tty1", 0b00111110, SERVICE_TYPE_RESPAWN, 0)
+    _ = register_service("getty-ttyS0", "/sbin/getty 115200 ttyS0", 0b00111110, SERVICE_TYPE_RESPAWN, 0)
+
+    change_runlevel(RUNLEVEL_MULTI)
+    init_main_loop()
+    init_shutdown()
+
+    if (init_state.reboot_requested == 1) {
+        serial.write_string("[INIT] Rebooting...\n")
+        _ = syscalls.sys_reboot(syscalls.LINUX_REBOOT_CMD_RESTART)
+    } else {
+        serial.write_string("[INIT] Halting...\n")
+        _ = syscalls.sys_reboot(syscalls.LINUX_REBOOT_CMD_HALT)
+    }
+
+    return 0
 }
