@@ -1,195 +1,867 @@
 // home-os Kernel - Namespaces
-// Process isolation for containers
+// Linux-style namespace isolation for containers
 
 import "../core/foundation.home" as foundation
 
-// Namespace types
-const NS_PID: u32 = 1 << 0
-const NS_MOUNT: u32 = 1 << 1
-const NS_NETWORK: u32 = 1 << 2
-const NS_UTS: u32 = 1 << 3
-const NS_IPC: u32 = 1 << 4
-const NS_USER: u32 = 1 << 5
-const NS_CGROUP: u32 = 1 << 6
+// Namespace types (bitmask flags)
+const NS_PID: u32 = 1 << 0       // PID namespace
+const NS_MOUNT: u32 = 1 << 1    // Mount namespace
+const NS_NETWORK: u32 = 1 << 2  // Network namespace
+const NS_UTS: u32 = 1 << 3      // Hostname/domain namespace
+const NS_IPC: u32 = 1 << 4      // IPC namespace (semaphores, message queues, shared memory)
+const NS_USER: u32 = 1 << 5     // User namespace (UID/GID mapping)
+const NS_CGROUP: u32 = 1 << 6   // Cgroup namespace
+const NS_TIME: u32 = 1 << 7     // Time namespace (Linux 5.6+)
+const NS_ALL: u32 = 0xFF        // All namespaces
 
-const MAX_NAMESPACES: u32 = 256
+// Clone flags for unshare/clone
+const CLONE_NEWNS: u32 = 0x00020000      // New mount namespace
+const CLONE_NEWUTS: u32 = 0x04000000     // New UTS namespace
+const CLONE_NEWIPC: u32 = 0x08000000     // New IPC namespace
+const CLONE_NEWUSER: u32 = 0x10000000    // New user namespace
+const CLONE_NEWPID: u32 = 0x20000000     // New PID namespace
+const CLONE_NEWNET: u32 = 0x40000000     // New network namespace
+const CLONE_NEWCGROUP: u32 = 0x02000000  // New cgroup namespace
+const CLONE_NEWTIME: u32 = 0x00000080    // New time namespace
 
-struct Namespace {
-  id: u32,
-  types: u32,
-  pid_offset: u32,
-  hostname: [u8; 64],
-  domainname: [u8; 64],
-  root_uid: u32,
-  root_gid: u32,
-  active: u32
+const MAX_NAMESPACES: u32 = 1024
+const MAX_PROCESSES_PER_NS: u32 = 4096
+const MAX_UID_MAPPINGS: u32 = 5
+const MAX_MOUNTS_PER_NS: u32 = 256
+
+// UID/GID mapping entry
+struct IdMapping {
+  inside_id: u32,    // ID inside namespace
+  outside_id: u32,   // ID in parent namespace
+  count: u32,        // Number of IDs mapped
+  valid: u32
 }
 
-var namespaces: [Namespace; 256]
+// Mount entry for mount namespace
+struct MountEntry {
+  source: [u8; 128],
+  target: [u8; 128],
+  fs_type: [u8; 32],
+  flags: u32,
+  valid: u32
+}
+
+// Network namespace state
+struct NetNamespace {
+  loopback_up: u32,
+  veth_count: u32,
+  route_count: u32,
+  iptables_rules: u32
+}
+
+// IPC namespace state
+struct IpcNamespace {
+  shm_tot: u64,           // Total shared memory
+  sem_tot: u32,           // Total semaphore arrays
+  msg_tot: u32,           // Total message queues
+  shm_ctlmax: u64,        // Max shared memory segment
+  shm_ctlall: u64,        // Max total shared memory
+  sem_ctlmni: u32,        // Max semaphore arrays
+  sem_ctlmsl: u32,        // Max semaphores per array
+  msg_ctlmnb: u32,        // Max bytes per message queue
+  msg_ctlmni: u32         // Max message queues
+}
+
+// Time namespace offsets
+struct TimeNamespace {
+  boottime_sec: i64,      // Boot time offset
+  boottime_nsec: i64,
+  monotonic_sec: i64,     // Monotonic time offset
+  monotonic_nsec: i64
+}
+
+// Full namespace structure
+struct Namespace {
+  id: u32,
+  types: u32,                    // Which namespaces are enabled
+  parent_ns: u32,                // Parent namespace ID
+
+  // PID namespace
+  pid_offset: u32,               // PID offset for this namespace
+  next_pid: u32,                 // Next PID to allocate
+  init_pid: u32,                 // PID 1 in this namespace
+
+  // UTS namespace
+  hostname: [u8; 64],
+  domainname: [u8; 64],
+
+  // User namespace
+  uid_mappings: [IdMapping; 5],
+  gid_mappings: [IdMapping; 5],
+  uid_mapping_count: u32,
+  gid_mapping_count: u32,
+  owner_uid: u32,                // UID that created this namespace
+  owner_gid: u32,
+
+  // Mount namespace
+  mounts: [MountEntry; 256],
+  mount_count: u32,
+  root_mount: u32,               // Root mount index
+
+  // Network namespace
+  net_ns: NetNamespace,
+
+  // IPC namespace
+  ipc_ns: IpcNamespace,
+
+  // Time namespace
+  time_ns: TimeNamespace,
+
+  // Process tracking
+  processes: [u32; 4096],
+  process_count: u32,
+
+  // Reference counting
+  ref_count: u32,
+  active: u32,
+
+  // Flags
+  allow_setgroups: u32,          // Allow setgroups in user namespace
+  deny_setgroups: u32
+}
+
+// Namespace handle for processes
+struct NamespaceSet {
+  pid_ns: u32,
+  mount_ns: u32,
+  net_ns: u32,
+  uts_ns: u32,
+  ipc_ns: u32,
+  user_ns: u32,
+  cgroup_ns: u32,
+  time_ns: u32
+}
+
+var namespaces: [Namespace; 1024]
 var namespace_count: u32 = 0
 var namespace_initialized: u32 = 0
 
+// Per-process namespace set
+var process_ns: [NamespaceSet; 4096]
+
+// Statistics
+struct NamespaceStats {
+  total_created: u64,
+  total_destroyed: u64,
+  pid_ns_count: u32,
+  mount_ns_count: u32,
+  net_ns_count: u32,
+  uts_ns_count: u32,
+  ipc_ns_count: u32,
+  user_ns_count: u32,
+  cgroup_ns_count: u32,
+  time_ns_count: u32
+}
+
+var ns_stats: NamespaceStats
+
 export fn namespace_init() {
   if namespace_initialized == 1 { return }
-  
+
   namespace_count = 0
-  
-  // Create root namespace
+
+  // Clear stats
+  ns_stats.total_created = 0
+  ns_stats.total_destroyed = 0
+  ns_stats.pid_ns_count = 0
+  ns_stats.mount_ns_count = 0
+  ns_stats.net_ns_count = 0
+  ns_stats.uts_ns_count = 0
+  ns_stats.ipc_ns_count = 0
+  ns_stats.user_ns_count = 0
+  ns_stats.cgroup_ns_count = 0
+  ns_stats.time_ns_count = 0
+
+  // Create root namespace (global)
   namespace_create_root()
-  
+
   namespace_initialized = 1
-  foundation.serial_write_string("[Namespaces] Initialized\n")
+  foundation.serial_write_string("[Namespaces] Subsystem initialized\n")
 }
 
 fn namespace_create_root(): u32 {
   var ns_id: u32 = namespace_count
-  
+
   namespaces[ns_id].id = ns_id
-  namespaces[ns_id].types = 0xFFFFFFFF  // All types
+  namespaces[ns_id].types = NS_ALL
+  namespaces[ns_id].parent_ns = 0xFFFFFFFF  // No parent
+
+  // PID namespace
   namespaces[ns_id].pid_offset = 0
-  namespaces[ns_id].root_uid = 0
-  namespaces[ns_id].root_gid = 0
+  namespaces[ns_id].next_pid = 1
+  namespaces[ns_id].init_pid = 1
+
+  // UTS namespace
+  namespace_set_string(namespaces[ns_id].hostname, "home-os", 64)
+  namespace_set_string(namespaces[ns_id].domainname, "local", 64)
+
+  // User namespace - root maps to root
+  namespaces[ns_id].uid_mappings[0].inside_id = 0
+  namespaces[ns_id].uid_mappings[0].outside_id = 0
+  namespaces[ns_id].uid_mappings[0].count = 65536
+  namespaces[ns_id].uid_mappings[0].valid = 1
+  namespaces[ns_id].uid_mapping_count = 1
+
+  namespaces[ns_id].gid_mappings[0].inside_id = 0
+  namespaces[ns_id].gid_mappings[0].outside_id = 0
+  namespaces[ns_id].gid_mappings[0].count = 65536
+  namespaces[ns_id].gid_mappings[0].valid = 1
+  namespaces[ns_id].gid_mapping_count = 1
+
+  namespaces[ns_id].owner_uid = 0
+  namespaces[ns_id].owner_gid = 0
+  namespaces[ns_id].allow_setgroups = 1
+  namespaces[ns_id].deny_setgroups = 0
+
+  // Mount namespace - setup root mount
+  namespace_set_string(namespaces[ns_id].mounts[0].source, "rootfs", 128)
+  namespace_set_string(namespaces[ns_id].mounts[0].target, "/", 128)
+  namespace_set_string(namespaces[ns_id].mounts[0].fs_type, "rootfs", 32)
+  namespaces[ns_id].mounts[0].flags = 0
+  namespaces[ns_id].mounts[0].valid = 1
+  namespaces[ns_id].mount_count = 1
+  namespaces[ns_id].root_mount = 0
+
+  // Network namespace - setup loopback
+  namespaces[ns_id].net_ns.loopback_up = 1
+  namespaces[ns_id].net_ns.veth_count = 0
+  namespaces[ns_id].net_ns.route_count = 0
+  namespaces[ns_id].net_ns.iptables_rules = 0
+
+  // IPC namespace - default limits
+  namespaces[ns_id].ipc_ns.shm_tot = 0
+  namespaces[ns_id].ipc_ns.sem_tot = 0
+  namespaces[ns_id].ipc_ns.msg_tot = 0
+  namespaces[ns_id].ipc_ns.shm_ctlmax = 33554432  // 32 MB
+  namespaces[ns_id].ipc_ns.shm_ctlall = 268435456 // 256 MB
+  namespaces[ns_id].ipc_ns.sem_ctlmni = 32000
+  namespaces[ns_id].ipc_ns.sem_ctlmsl = 32000
+  namespaces[ns_id].ipc_ns.msg_ctlmnb = 16384
+  namespaces[ns_id].ipc_ns.msg_ctlmni = 32000
+
+  // Time namespace - no offset
+  namespaces[ns_id].time_ns.boottime_sec = 0
+  namespaces[ns_id].time_ns.boottime_nsec = 0
+  namespaces[ns_id].time_ns.monotonic_sec = 0
+  namespaces[ns_id].time_ns.monotonic_nsec = 0
+
+  namespaces[ns_id].process_count = 0
+  namespaces[ns_id].ref_count = 1
   namespaces[ns_id].active = 1
-  
-  // Set hostname
-  var hostname: u64 = @ptrFromInt("home-os")
-  var i: u32 = 0
-  while i < 63 {
-    var ch: u8 = @intToPtr(hostname + i, u8)
-    namespaces[ns_id].hostname[i] = ch
-    if ch == 0 { break }
-    i = i + 1
-  }
-  
+
   namespace_count = namespace_count + 1
-  
+  ns_stats.total_created = ns_stats.total_created + 1
+
   return ns_id
 }
 
-export fn namespace_create(): u32 {
+// Create a new namespace with specified types
+export fn namespace_create(types: u32, parent_ns: u32): u32 {
   if namespace_count >= MAX_NAMESPACES { return 0xFFFFFFFF }
-  
+  if parent_ns >= namespace_count && parent_ns != 0xFFFFFFFF { return 0xFFFFFFFF }
+
   var ns_id: u32 = namespace_count
-  
+  var parent: u32 = parent_ns
+  if parent == 0xFFFFFFFF { parent = 0 }  // Use root as default parent
+
   namespaces[ns_id].id = ns_id
-  namespaces[ns_id].types = NS_PID | NS_MOUNT | NS_NETWORK | NS_UTS | NS_IPC
-  namespaces[ns_id].pid_offset = ns_id * 10000  // Offset PIDs
-  namespaces[ns_id].root_uid = 0
-  namespaces[ns_id].root_gid = 0
-  namespaces[ns_id].active = 1
-  
-  // Default hostname
-  var hostname: u64 = @ptrFromInt("container")
-  var i: u32 = 0
-  while i < 63 {
-    var ch: u8 = @intToPtr(hostname + i, u8)
-    namespaces[ns_id].hostname[i] = ch
-    if ch == 0 { break }
-    i = i + 1
+  namespaces[ns_id].types = types
+  namespaces[ns_id].parent_ns = parent
+
+  // PID namespace - new PID space if NS_PID
+  if (types & NS_PID) != 0 {
+    namespaces[ns_id].pid_offset = ns_id * 100000
+    namespaces[ns_id].next_pid = 1
+    namespaces[ns_id].init_pid = 0  // Not set yet
+    ns_stats.pid_ns_count = ns_stats.pid_ns_count + 1
+  } else {
+    // Inherit from parent
+    namespaces[ns_id].pid_offset = namespaces[parent].pid_offset
+    namespaces[ns_id].next_pid = namespaces[parent].next_pid
+    namespaces[ns_id].init_pid = namespaces[parent].init_pid
   }
-  
+
+  // UTS namespace
+  if (types & NS_UTS) != 0 {
+    namespace_set_string(namespaces[ns_id].hostname, "container", 64)
+    namespace_set_string(namespaces[ns_id].domainname, "local", 64)
+    ns_stats.uts_ns_count = ns_stats.uts_ns_count + 1
+  } else {
+    // Copy from parent
+    namespace_copy_string(namespaces[ns_id].hostname, namespaces[parent].hostname, 64)
+    namespace_copy_string(namespaces[ns_id].domainname, namespaces[parent].domainname, 64)
+  }
+
+  // User namespace
+  if (types & NS_USER) != 0 {
+    // New user namespace - initially no mappings
+    namespaces[ns_id].uid_mapping_count = 0
+    namespaces[ns_id].gid_mapping_count = 0
+    namespaces[ns_id].owner_uid = 0  // Will be set by caller
+    namespaces[ns_id].owner_gid = 0
+    namespaces[ns_id].allow_setgroups = 0
+    namespaces[ns_id].deny_setgroups = 1  // Deny by default in new user ns
+    ns_stats.user_ns_count = ns_stats.user_ns_count + 1
+  } else {
+    // Inherit from parent
+    var i: u32 = 0
+    while i < namespaces[parent].uid_mapping_count {
+      namespaces[ns_id].uid_mappings[i] = namespaces[parent].uid_mappings[i]
+      i = i + 1
+    }
+    namespaces[ns_id].uid_mapping_count = namespaces[parent].uid_mapping_count
+
+    i = 0
+    while i < namespaces[parent].gid_mapping_count {
+      namespaces[ns_id].gid_mappings[i] = namespaces[parent].gid_mappings[i]
+      i = i + 1
+    }
+    namespaces[ns_id].gid_mapping_count = namespaces[parent].gid_mapping_count
+    namespaces[ns_id].allow_setgroups = namespaces[parent].allow_setgroups
+    namespaces[ns_id].deny_setgroups = namespaces[parent].deny_setgroups
+  }
+
+  // Mount namespace
+  if (types & NS_MOUNT) != 0 {
+    // Copy mounts from parent (copy-on-write semantics in real impl)
+    var i: u32 = 0
+    while i < namespaces[parent].mount_count {
+      namespaces[ns_id].mounts[i] = namespaces[parent].mounts[i]
+      i = i + 1
+    }
+    namespaces[ns_id].mount_count = namespaces[parent].mount_count
+    namespaces[ns_id].root_mount = namespaces[parent].root_mount
+    ns_stats.mount_ns_count = ns_stats.mount_ns_count + 1
+  } else {
+    namespaces[ns_id].mount_count = namespaces[parent].mount_count
+    namespaces[ns_id].root_mount = namespaces[parent].root_mount
+  }
+
+  // Network namespace
+  if (types & NS_NETWORK) != 0 {
+    // New network namespace - only loopback
+    namespaces[ns_id].net_ns.loopback_up = 0  // Not up until configured
+    namespaces[ns_id].net_ns.veth_count = 0
+    namespaces[ns_id].net_ns.route_count = 0
+    namespaces[ns_id].net_ns.iptables_rules = 0
+    ns_stats.net_ns_count = ns_stats.net_ns_count + 1
+  } else {
+    namespaces[ns_id].net_ns = namespaces[parent].net_ns
+  }
+
+  // IPC namespace
+  if (types & NS_IPC) != 0 {
+    // Fresh IPC namespace
+    namespaces[ns_id].ipc_ns.shm_tot = 0
+    namespaces[ns_id].ipc_ns.sem_tot = 0
+    namespaces[ns_id].ipc_ns.msg_tot = 0
+    // Copy limits from parent
+    namespaces[ns_id].ipc_ns.shm_ctlmax = namespaces[parent].ipc_ns.shm_ctlmax
+    namespaces[ns_id].ipc_ns.shm_ctlall = namespaces[parent].ipc_ns.shm_ctlall
+    namespaces[ns_id].ipc_ns.sem_ctlmni = namespaces[parent].ipc_ns.sem_ctlmni
+    namespaces[ns_id].ipc_ns.sem_ctlmsl = namespaces[parent].ipc_ns.sem_ctlmsl
+    namespaces[ns_id].ipc_ns.msg_ctlmnb = namespaces[parent].ipc_ns.msg_ctlmnb
+    namespaces[ns_id].ipc_ns.msg_ctlmni = namespaces[parent].ipc_ns.msg_ctlmni
+    ns_stats.ipc_ns_count = ns_stats.ipc_ns_count + 1
+  } else {
+    namespaces[ns_id].ipc_ns = namespaces[parent].ipc_ns
+  }
+
+  // Cgroup namespace
+  if (types & NS_CGROUP) != 0 {
+    ns_stats.cgroup_ns_count = ns_stats.cgroup_ns_count + 1
+  }
+
+  // Time namespace
+  if (types & NS_TIME) != 0 {
+    namespaces[ns_id].time_ns.boottime_sec = 0
+    namespaces[ns_id].time_ns.boottime_nsec = 0
+    namespaces[ns_id].time_ns.monotonic_sec = 0
+    namespaces[ns_id].time_ns.monotonic_nsec = 0
+    ns_stats.time_ns_count = ns_stats.time_ns_count + 1
+  } else {
+    namespaces[ns_id].time_ns = namespaces[parent].time_ns
+  }
+
+  namespaces[ns_id].process_count = 0
+  namespaces[ns_id].ref_count = 1
+  namespaces[ns_id].active = 1
+
   namespace_count = namespace_count + 1
-  
+  ns_stats.total_created = ns_stats.total_created + 1
+
   foundation.serial_write_string("[Namespaces] Created namespace ")
   foundation.serial_write_hex(ns_id)
+  foundation.serial_write_string(" types=")
+  foundation.serial_write_hex(types)
   foundation.serial_write_string("\n")
-  
+
   return ns_id
 }
 
-export fn namespace_enter(ns_id: u32): u32 {
+// Clone namespace from existing with specified new types
+export fn namespace_clone(flags: u32, parent_ns: u32): u32 {
+  var types: u32 = 0
+
+  if (flags & CLONE_NEWPID) != 0 { types = types | NS_PID }
+  if (flags & CLONE_NEWNS) != 0 { types = types | NS_MOUNT }
+  if (flags & CLONE_NEWNET) != 0 { types = types | NS_NETWORK }
+  if (flags & CLONE_NEWUTS) != 0 { types = types | NS_UTS }
+  if (flags & CLONE_NEWIPC) != 0 { types = types | NS_IPC }
+  if (flags & CLONE_NEWUSER) != 0 { types = types | NS_USER }
+  if (flags & CLONE_NEWCGROUP) != 0 { types = types | NS_CGROUP }
+  if (flags & CLONE_NEWTIME) != 0 { types = types | NS_TIME }
+
+  return namespace_create(types, parent_ns)
+}
+
+// Enter a namespace (setns equivalent)
+export fn namespace_enter(ns_id: u32, ns_type: u32): u32 {
   if ns_id >= namespace_count { return 0 }
-  
-  foundation.serial_write_string("[Namespaces] Entering namespace ")
+  if namespaces[ns_id].active == 0 { return 0 }
+
+  // Check if namespace has the requested type
+  if (namespaces[ns_id].types & ns_type) == 0 {
+    return 0
+  }
+
+  namespaces[ns_id].ref_count = namespaces[ns_id].ref_count + 1
+
+  foundation.serial_write_string("[Namespaces] Process entered namespace ")
   foundation.serial_write_hex(ns_id)
   foundation.serial_write_string("\n")
-  
-  // Set current namespace for process
-  foundation.process_set_namespace(ns_id)
-  
+
   return 1
 }
 
-export fn namespace_set_hostname(ns_id: u32, hostname: u64): u32 {
+// Leave a namespace
+export fn namespace_leave(ns_id: u32): u32 {
   if ns_id >= namespace_count { return 0 }
-  
+
+  if namespaces[ns_id].ref_count > 0 {
+    namespaces[ns_id].ref_count = namespaces[ns_id].ref_count - 1
+  }
+
+  return 1
+}
+
+// Unshare namespaces (create new ones for current process)
+export fn namespace_unshare(flags: u32, current_ns: u32): u32 {
+  return namespace_clone(flags, current_ns)
+}
+
+// Set hostname in UTS namespace
+export fn namespace_set_hostname(ns_id: u32, hostname: u64, len: u32): u32 {
+  if ns_id >= namespace_count { return 0 }
+  if (namespaces[ns_id].types & NS_UTS) == 0 { return 0 }
+
+  var max_len: u32 = len
+  if max_len > 63 { max_len = 63 }
+
   var i: u32 = 0
-  while i < 63 {
-    var ch: u8 = @intToPtr(hostname + i, u8)
-    namespaces[ns_id].hostname[i] = ch
-    if ch == 0 { break }
+  while i < max_len {
+    namespaces[ns_id].hostname[i] = @intToPtr(hostname + i, u8)
     i = i + 1
   }
-  namespaces[ns_id].hostname[i] = 0
-  
+  namespaces[ns_id].hostname[max_len] = 0
+
   return 1
 }
 
-export fn namespace_get_hostname(ns_id: u32, hostname_out: u64): u32 {
+// Get hostname from UTS namespace
+export fn namespace_get_hostname(ns_id: u32, hostname_out: u64, max_len: u32): u32 {
   if ns_id >= namespace_count { return 0 }
-  
+
   var i: u32 = 0
-  while i < 64 {
+  while i < max_len && i < 64 {
     @intToPtr(hostname_out + i, u8) = namespaces[ns_id].hostname[i]
     if namespaces[ns_id].hostname[i] == 0 { break }
     i = i + 1
   }
-  
+
+  return i
+}
+
+// Set domainname in UTS namespace
+export fn namespace_set_domainname(ns_id: u32, domainname: u64, len: u32): u32 {
+  if ns_id >= namespace_count { return 0 }
+  if (namespaces[ns_id].types & NS_UTS) == 0 { return 0 }
+
+  var max_len: u32 = len
+  if max_len > 63 { max_len = 63 }
+
+  var i: u32 = 0
+  while i < max_len {
+    namespaces[ns_id].domainname[i] = @intToPtr(domainname + i, u8)
+    i = i + 1
+  }
+  namespaces[ns_id].domainname[max_len] = 0
+
   return 1
 }
 
-export fn namespace_map_pid(ns_id: u32, global_pid: u32): u32 {
-  if ns_id >= namespace_count { return global_pid }
-  
-  // Map global PID to namespace PID
-  if global_pid < namespaces[ns_id].pid_offset {
-    return global_pid
+// Add UID mapping to user namespace
+export fn namespace_add_uid_map(ns_id: u32, inside_id: u32, outside_id: u32, count: u32): u32 {
+  if ns_id >= namespace_count { return 0 }
+  if (namespaces[ns_id].types & NS_USER) == 0 { return 0 }
+  if namespaces[ns_id].uid_mapping_count >= MAX_UID_MAPPINGS { return 0 }
+
+  var idx: u32 = namespaces[ns_id].uid_mapping_count
+  namespaces[ns_id].uid_mappings[idx].inside_id = inside_id
+  namespaces[ns_id].uid_mappings[idx].outside_id = outside_id
+  namespaces[ns_id].uid_mappings[idx].count = count
+  namespaces[ns_id].uid_mappings[idx].valid = 1
+  namespaces[ns_id].uid_mapping_count = namespaces[ns_id].uid_mapping_count + 1
+
+  return 1
+}
+
+// Add GID mapping to user namespace
+export fn namespace_add_gid_map(ns_id: u32, inside_id: u32, outside_id: u32, count: u32): u32 {
+  if ns_id >= namespace_count { return 0 }
+  if (namespaces[ns_id].types & NS_USER) == 0 { return 0 }
+  if namespaces[ns_id].gid_mapping_count >= MAX_UID_MAPPINGS { return 0 }
+
+  var idx: u32 = namespaces[ns_id].gid_mapping_count
+  namespaces[ns_id].gid_mappings[idx].inside_id = inside_id
+  namespaces[ns_id].gid_mappings[idx].outside_id = outside_id
+  namespaces[ns_id].gid_mappings[idx].count = count
+  namespaces[ns_id].gid_mappings[idx].valid = 1
+  namespaces[ns_id].gid_mapping_count = namespaces[ns_id].gid_mapping_count + 1
+
+  return 1
+}
+
+// Map UID from inside namespace to outside
+export fn namespace_map_uid(ns_id: u32, inside_uid: u32): u32 {
+  if ns_id >= namespace_count { return inside_uid }
+  if (namespaces[ns_id].types & NS_USER) == 0 { return inside_uid }
+
+  var i: u32 = 0
+  while i < namespaces[ns_id].uid_mapping_count {
+    var m: IdMapping = namespaces[ns_id].uid_mappings[i]
+    if m.valid == 1 {
+      if inside_uid >= m.inside_id && inside_uid < m.inside_id + m.count {
+        return m.outside_id + (inside_uid - m.inside_id)
+      }
+    }
+    i = i + 1
   }
-  
+
+  return 65534  // nobody
+}
+
+// Map UID from outside namespace to inside
+export fn namespace_unmap_uid(ns_id: u32, outside_uid: u32): u32 {
+  if ns_id >= namespace_count { return outside_uid }
+  if (namespaces[ns_id].types & NS_USER) == 0 { return outside_uid }
+
+  var i: u32 = 0
+  while i < namespaces[ns_id].uid_mapping_count {
+    var m: IdMapping = namespaces[ns_id].uid_mappings[i]
+    if m.valid == 1 {
+      if outside_uid >= m.outside_id && outside_uid < m.outside_id + m.count {
+        return m.inside_id + (outside_uid - m.outside_id)
+      }
+    }
+    i = i + 1
+  }
+
+  return 65534  // nobody
+}
+
+// Map GID from inside namespace to outside
+export fn namespace_map_gid(ns_id: u32, inside_gid: u32): u32 {
+  if ns_id >= namespace_count { return inside_gid }
+  if (namespaces[ns_id].types & NS_USER) == 0 { return inside_gid }
+
+  var i: u32 = 0
+  while i < namespaces[ns_id].gid_mapping_count {
+    var m: IdMapping = namespaces[ns_id].gid_mappings[i]
+    if m.valid == 1 {
+      if inside_gid >= m.inside_id && inside_gid < m.inside_id + m.count {
+        return m.outside_id + (inside_gid - m.inside_id)
+      }
+    }
+    i = i + 1
+  }
+
+  return 65534  // nogroup
+}
+
+// PID namespace: allocate PID
+export fn namespace_alloc_pid(ns_id: u32): u32 {
+  if ns_id >= namespace_count { return 0 }
+
+  var pid: u32 = namespaces[ns_id].next_pid
+  namespaces[ns_id].next_pid = namespaces[ns_id].next_pid + 1
+
+  // If this is first process, it becomes init (PID 1)
+  if pid == 1 {
+    namespaces[ns_id].init_pid = 1
+  }
+
+  return pid
+}
+
+// PID namespace: translate PID to global
+export fn namespace_pid_to_global(ns_id: u32, ns_pid: u32): u32 {
+  if ns_id >= namespace_count { return ns_pid }
+  return namespaces[ns_id].pid_offset + ns_pid
+}
+
+// PID namespace: translate global PID to namespace local
+export fn namespace_pid_from_global(ns_id: u32, global_pid: u32): u32 {
+  if ns_id >= namespace_count { return global_pid }
+  if global_pid < namespaces[ns_id].pid_offset { return 0 }
   return global_pid - namespaces[ns_id].pid_offset
 }
 
-export fn namespace_unmap_pid(ns_id: u32, ns_pid: u32): u32 {
-  if ns_id >= namespace_count { return ns_pid }
-  
-  // Map namespace PID to global PID
-  return ns_pid + namespaces[ns_id].pid_offset
-}
-
-export fn namespace_set_user_mapping(ns_id: u32, root_uid: u32, root_gid: u32): u32 {
+// Mount namespace: add mount
+export fn namespace_add_mount(ns_id: u32, source: u64, target: u64, fs_type: u64, flags: u32): u32 {
   if ns_id >= namespace_count { return 0 }
-  
-  namespaces[ns_id].root_uid = root_uid
-  namespaces[ns_id].root_gid = root_gid
-  namespaces[ns_id].types = namespaces[ns_id].types | NS_USER
-  
+  if namespaces[ns_id].mount_count >= MAX_MOUNTS_PER_NS { return 0 }
+
+  var idx: u32 = namespaces[ns_id].mount_count
+
+  // Copy source
+  var i: u32 = 0
+  while i < 127 {
+    var ch: u8 = @intToPtr(source + i, u8)
+    namespaces[ns_id].mounts[idx].source[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  namespaces[ns_id].mounts[idx].source[i] = 0
+
+  // Copy target
+  i = 0
+  while i < 127 {
+    var ch: u8 = @intToPtr(target + i, u8)
+    namespaces[ns_id].mounts[idx].target[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  namespaces[ns_id].mounts[idx].target[i] = 0
+
+  // Copy fs_type
+  i = 0
+  while i < 31 {
+    var ch: u8 = @intToPtr(fs_type + i, u8)
+    namespaces[ns_id].mounts[idx].fs_type[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  namespaces[ns_id].mounts[idx].fs_type[i] = 0
+
+  namespaces[ns_id].mounts[idx].flags = flags
+  namespaces[ns_id].mounts[idx].valid = 1
+  namespaces[ns_id].mount_count = namespaces[ns_id].mount_count + 1
+
   return 1
 }
 
-export fn namespace_map_uid(ns_id: u32, uid: u32): u32 {
-  if ns_id >= namespace_count { return uid }
-  
-  if (namespaces[ns_id].types & NS_USER) == 0 {
-    return uid
+// Mount namespace: remove mount
+export fn namespace_remove_mount(ns_id: u32, target: u64): u32 {
+  if ns_id >= namespace_count { return 0 }
+
+  var i: u32 = 0
+  while i < namespaces[ns_id].mount_count {
+    if namespaces[ns_id].mounts[i].valid == 1 {
+      if namespace_strcmp_arr(namespaces[ns_id].mounts[i].target, target) == 1 {
+        namespaces[ns_id].mounts[i].valid = 0
+        return 1
+      }
+    }
+    i = i + 1
   }
-  
-  // Simple mapping: root in namespace maps to configured UID
-  if uid == 0 {
-    return namespaces[ns_id].root_uid
-  }
-  
-  return uid
+
+  return 0
 }
 
+// Network namespace: bring up loopback
+export fn namespace_net_loopback_up(ns_id: u32): u32 {
+  if ns_id >= namespace_count { return 0 }
+  if (namespaces[ns_id].types & NS_NETWORK) == 0 { return 0 }
+
+  namespaces[ns_id].net_ns.loopback_up = 1
+  return 1
+}
+
+// Network namespace: add veth pair
+export fn namespace_net_add_veth(ns_id: u32): u32 {
+  if ns_id >= namespace_count { return 0 }
+  if (namespaces[ns_id].types & NS_NETWORK) == 0 { return 0 }
+
+  var veth_id: u32 = namespaces[ns_id].net_ns.veth_count
+  namespaces[ns_id].net_ns.veth_count = namespaces[ns_id].net_ns.veth_count + 1
+
+  return veth_id
+}
+
+// Time namespace: set boot time offset
+export fn namespace_set_time_offset(ns_id: u32, boottime_sec: i64, boottime_nsec: i64, monotonic_sec: i64, monotonic_nsec: i64): u32 {
+  if ns_id >= namespace_count { return 0 }
+  if (namespaces[ns_id].types & NS_TIME) == 0 { return 0 }
+
+  namespaces[ns_id].time_ns.boottime_sec = boottime_sec
+  namespaces[ns_id].time_ns.boottime_nsec = boottime_nsec
+  namespaces[ns_id].time_ns.monotonic_sec = monotonic_sec
+  namespaces[ns_id].time_ns.monotonic_nsec = monotonic_nsec
+
+  return 1
+}
+
+// Add process to namespace
+export fn namespace_add_process(ns_id: u32, pid: u32): u32 {
+  if ns_id >= namespace_count { return 0 }
+  if namespaces[ns_id].process_count >= MAX_PROCESSES_PER_NS { return 0 }
+
+  namespaces[ns_id].processes[namespaces[ns_id].process_count] = pid
+  namespaces[ns_id].process_count = namespaces[ns_id].process_count + 1
+  namespaces[ns_id].ref_count = namespaces[ns_id].ref_count + 1
+
+  return 1
+}
+
+// Remove process from namespace
+export fn namespace_remove_process(ns_id: u32, pid: u32): u32 {
+  if ns_id >= namespace_count { return 0 }
+
+  var i: u32 = 0
+  while i < namespaces[ns_id].process_count {
+    if namespaces[ns_id].processes[i] == pid {
+      // Shift remaining processes
+      var j: u32 = i
+      while j < namespaces[ns_id].process_count - 1 {
+        namespaces[ns_id].processes[j] = namespaces[ns_id].processes[j + 1]
+        j = j + 1
+      }
+      namespaces[ns_id].process_count = namespaces[ns_id].process_count - 1
+
+      if namespaces[ns_id].ref_count > 0 {
+        namespaces[ns_id].ref_count = namespaces[ns_id].ref_count - 1
+      }
+
+      return 1
+    }
+    i = i + 1
+  }
+
+  return 0
+}
+
+// Destroy namespace (if ref count is 0)
 export fn namespace_destroy(ns_id: u32): u32 {
   if ns_id >= namespace_count { return 0 }
   if ns_id == 0 { return 0 }  // Cannot destroy root namespace
-  
+  if namespaces[ns_id].ref_count > 0 { return 0 }
+
   namespaces[ns_id].active = 0
-  
+  ns_stats.total_destroyed = ns_stats.total_destroyed + 1
+
+  // Update type-specific stats
+  if (namespaces[ns_id].types & NS_PID) != 0 && ns_stats.pid_ns_count > 0 {
+    ns_stats.pid_ns_count = ns_stats.pid_ns_count - 1
+  }
+  if (namespaces[ns_id].types & NS_MOUNT) != 0 && ns_stats.mount_ns_count > 0 {
+    ns_stats.mount_ns_count = ns_stats.mount_ns_count - 1
+  }
+  if (namespaces[ns_id].types & NS_NETWORK) != 0 && ns_stats.net_ns_count > 0 {
+    ns_stats.net_ns_count = ns_stats.net_ns_count - 1
+  }
+  if (namespaces[ns_id].types & NS_UTS) != 0 && ns_stats.uts_ns_count > 0 {
+    ns_stats.uts_ns_count = ns_stats.uts_ns_count - 1
+  }
+  if (namespaces[ns_id].types & NS_IPC) != 0 && ns_stats.ipc_ns_count > 0 {
+    ns_stats.ipc_ns_count = ns_stats.ipc_ns_count - 1
+  }
+  if (namespaces[ns_id].types & NS_USER) != 0 && ns_stats.user_ns_count > 0 {
+    ns_stats.user_ns_count = ns_stats.user_ns_count - 1
+  }
+  if (namespaces[ns_id].types & NS_CGROUP) != 0 && ns_stats.cgroup_ns_count > 0 {
+    ns_stats.cgroup_ns_count = ns_stats.cgroup_ns_count - 1
+  }
+  if (namespaces[ns_id].types & NS_TIME) != 0 && ns_stats.time_ns_count > 0 {
+    ns_stats.time_ns_count = ns_stats.time_ns_count - 1
+  }
+
+  foundation.serial_write_string("[Namespaces] Destroyed namespace ")
+  foundation.serial_write_hex(ns_id)
+  foundation.serial_write_string("\n")
+
   return 1
 }
 
+// Get namespace info
+export fn namespace_get_info(ns_id: u32, types_out: u64, parent_out: u64, proc_count_out: u64): u32 {
+  if ns_id >= namespace_count { return 0 }
+
+  @intToPtr(types_out, u32) = namespaces[ns_id].types
+  @intToPtr(parent_out, u32) = namespaces[ns_id].parent_ns
+  @intToPtr(proc_count_out, u32) = namespaces[ns_id].process_count
+
+  return 1
+}
+
+// Get namespace count
 export fn namespace_get_count(): u32 {
   return namespace_count
+}
+
+// Get namespace stats
+export fn namespace_get_stats(stats_out: u64): u32 {
+  // Copy stats structure
+  @intToPtr(stats_out, u64) = ns_stats.total_created
+  @intToPtr(stats_out + 8, u64) = ns_stats.total_destroyed
+  @intToPtr(stats_out + 16, u32) = ns_stats.pid_ns_count
+  @intToPtr(stats_out + 20, u32) = ns_stats.mount_ns_count
+  @intToPtr(stats_out + 24, u32) = ns_stats.net_ns_count
+  @intToPtr(stats_out + 28, u32) = ns_stats.uts_ns_count
+  @intToPtr(stats_out + 32, u32) = ns_stats.ipc_ns_count
+  @intToPtr(stats_out + 36, u32) = ns_stats.user_ns_count
+  @intToPtr(stats_out + 40, u32) = ns_stats.cgroup_ns_count
+  @intToPtr(stats_out + 44, u32) = ns_stats.time_ns_count
+
+  return 1
+}
+
+// Helper: set string in array
+fn namespace_set_string(dest: [u8; 64], src: u64, max_len: u32) {
+  var i: u32 = 0
+  while i < max_len - 1 {
+    var ch: u8 = @intToPtr(src + i, u8)
+    dest[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  dest[i] = 0
+}
+
+// Helper: copy string array
+fn namespace_copy_string(dest: [u8; 64], src: [u8; 64], max_len: u32) {
+  var i: u32 = 0
+  while i < max_len {
+    dest[i] = src[i]
+    if src[i] == 0 { break }
+    i = i + 1
+  }
+}
+
+// Helper: compare string array to string pointer
+fn namespace_strcmp_arr(arr: [u8; 128], str: u64): u32 {
+  var i: u32 = 0
+  while i < 128 {
+    var c1: u8 = arr[i]
+    var c2: u8 = @intToPtr(str + i, u8)
+    if c1 != c2 { return 0 }
+    if c1 == 0 { return 1 }
+    i = i + 1
+  }
+  return 0
 }

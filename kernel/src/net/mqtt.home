@@ -1,60 +1,1376 @@
-// home-os MQTT Client
-// Message Queue Telemetry Transport
+// home-os MQTT (Message Queuing Telemetry Transport) Client
+// MQTT v3.1.1 and v5.0 compliant IoT messaging protocol
 
 import "../core/foundation.home" as foundation
 import "tcp.home" as tcp
 
+// MQTT Constants
 const MQTT_PORT: u16 = 1883
-const MQTT_VERSION: u8 = 4
+const MQTT_SECURE_PORT: u16 = 8883
+const MQTT_VERSION_3_1_1: u8 = 4
+const MQTT_VERSION_5_0: u8 = 5
+const MQTT_MAX_SUBSCRIPTIONS: u32 = 32
+const MQTT_MAX_PENDING: u32 = 64
+const MQTT_MAX_TOPIC_LEN: u32 = 256
+const MQTT_MAX_PAYLOAD_LEN: u32 = 4096
+const MQTT_BUFFER_SIZE: u32 = 8192
+const MQTT_RETRY_INTERVAL_MS: u64 = 5000
+const MQTT_MAX_RETRIES: u8 = 5
+const MQTT_DEFAULT_KEEPALIVE: u16 = 60
 
+// Packet types
 const MQTT_CONNECT: u8 = 0x10
+const MQTT_CONNACK: u8 = 0x20
 const MQTT_PUBLISH: u8 = 0x30
+const MQTT_PUBACK: u8 = 0x40
+const MQTT_PUBREC: u8 = 0x50
+const MQTT_PUBREL: u8 = 0x62
+const MQTT_PUBCOMP: u8 = 0x70
 const MQTT_SUBSCRIBE: u8 = 0x82
+const MQTT_SUBACK: u8 = 0x90
+const MQTT_UNSUBSCRIBE: u8 = 0xA2
+const MQTT_UNSUBACK: u8 = 0xB0
+const MQTT_PINGREQ: u8 = 0xC0
+const MQTT_PINGRESP: u8 = 0xD0
+const MQTT_DISCONNECT: u8 = 0xE0
+const MQTT_AUTH: u8 = 0xF0
 
-var mqtt_connected: u32 = 0
-var mqtt_client_id: [u8; 32]
+// QoS levels
+const QOS_0: u8 = 0  // At most once
+const QOS_1: u8 = 1  // At least once
+const QOS_2: u8 = 2  // Exactly once
 
-export fn mqtt_init() {
-  mqtt_connected = 0
-  foundation.serial_write_string("[MQTT] Client initialized\n")
+// Connect return codes (v3.1.1)
+const CONNACK_ACCEPTED: u8 = 0
+const CONNACK_UNACCEPTABLE_VERSION: u8 = 1
+const CONNACK_ID_REJECTED: u8 = 2
+const CONNACK_SERVER_UNAVAILABLE: u8 = 3
+const CONNACK_BAD_CREDENTIALS: u8 = 4
+const CONNACK_NOT_AUTHORIZED: u8 = 5
+
+// Reason codes (v5.0)
+const REASON_SUCCESS: u8 = 0x00
+const REASON_NORMAL_DISCONNECT: u8 = 0x00
+const REASON_QOS_0_GRANTED: u8 = 0x00
+const REASON_QOS_1_GRANTED: u8 = 0x01
+const REASON_QOS_2_GRANTED: u8 = 0x02
+const REASON_DISCONNECT_WILL: u8 = 0x04
+const REASON_NO_MATCHING_SUBSCRIBERS: u8 = 0x10
+const REASON_UNSPECIFIED_ERROR: u8 = 0x80
+const REASON_MALFORMED_PACKET: u8 = 0x81
+const REASON_PROTOCOL_ERROR: u8 = 0x82
+const REASON_NOT_AUTHORIZED: u8 = 0x87
+const REASON_SERVER_BUSY: u8 = 0x89
+const REASON_KEEP_ALIVE_TIMEOUT: u8 = 0x8D
+
+// Connection state
+const STATE_DISCONNECTED: u8 = 0
+const STATE_CONNECTING: u8 = 1
+const STATE_CONNECTED: u8 = 2
+const STATE_DISCONNECTING: u8 = 3
+
+// Pending message state
+const PENDING_PUBACK: u8 = 0
+const PENDING_PUBREC: u8 = 1
+const PENDING_PUBCOMP: u8 = 2
+
+// Subscription
+struct MqttSubscription {
+    topic: [u8; 256],
+    topic_len: u16,
+    qos: u8,
+    callback: u64,
+    active: u8
 }
 
+// Pending message
+struct MqttPending {
+    packet_id: u16,
+    topic: [u8; 256],
+    topic_len: u16,
+    payload: [u8; 1024],
+    payload_len: u16,
+    qos: u8,
+    state: u8,
+    retry_count: u8,
+    timestamp: u64,
+    active: u8
+}
+
+// Will message
+struct MqttWill {
+    topic: [u8; 256],
+    topic_len: u16,
+    payload: [u8; 1024],
+    payload_len: u16,
+    qos: u8,
+    retain: u8,
+    active: u8
+}
+
+// Client options
+struct MqttOptions {
+    client_id: [u8; 64],
+    client_id_len: u8,
+    username: [u8; 64],
+    username_len: u8,
+    password: [u8; 64],
+    password_len: u8,
+    will: MqttWill,
+    clean_session: u8,
+    keep_alive: u16,
+    protocol_version: u8
+}
+
+// Statistics
+struct MqttStats {
+    messages_sent: u64,
+    messages_received: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+    reconnections: u32,
+    ping_count: u32
+}
+
+// Global client state
+var mqtt_socket: u32 = 0
+var mqtt_state: u8 = STATE_DISCONNECTED
+var mqtt_options: MqttOptions
+var mqtt_next_packet_id: u16 = 1
+var mqtt_subscriptions: [MqttSubscription; 32]
+var mqtt_subscription_count: u32 = 0
+var mqtt_pending: [MqttPending; 64]
+var mqtt_pending_count: u32 = 0
+var mqtt_last_activity: u64 = 0
+var mqtt_ping_pending: u8 = 0
+var mqtt_rx_buffer: [u8; 8192]
+var mqtt_rx_len: u32 = 0
+var mqtt_tx_buffer: [u8; 8192]
+var mqtt_stats: MqttStats
+var mqtt_initialized: u8 = 0
+var mqtt_on_connect: u64 = 0
+var mqtt_on_disconnect: u64 = 0
+var mqtt_on_message: u64 = 0
+
+// Initialize MQTT client
+export fn mqtt_init(): u32 {
+    if mqtt_initialized == 1 {
+        mqtt_disconnect()
+    }
+
+    mqtt_state = STATE_DISCONNECTED
+    mqtt_next_packet_id = 1
+    mqtt_subscription_count = 0
+    mqtt_pending_count = 0
+    mqtt_last_activity = 0
+    mqtt_ping_pending = 0
+    mqtt_rx_len = 0
+    mqtt_on_connect = 0
+    mqtt_on_disconnect = 0
+    mqtt_on_message = 0
+
+    // Clear subscriptions
+    var i: u32 = 0
+    while i < MQTT_MAX_SUBSCRIPTIONS {
+        mqtt_subscriptions[i].active = 0
+        i = i + 1
+    }
+
+    // Clear pending
+    i = 0
+    while i < MQTT_MAX_PENDING {
+        mqtt_pending[i].active = 0
+        i = i + 1
+    }
+
+    // Clear stats
+    mqtt_stats.messages_sent = 0
+    mqtt_stats.messages_received = 0
+    mqtt_stats.bytes_sent = 0
+    mqtt_stats.bytes_received = 0
+    mqtt_stats.reconnections = 0
+    mqtt_stats.ping_count = 0
+
+    // Default options
+    mqtt_options.client_id_len = 0
+    mqtt_options.username_len = 0
+    mqtt_options.password_len = 0
+    mqtt_options.will.active = 0
+    mqtt_options.clean_session = 1
+    mqtt_options.keep_alive = MQTT_DEFAULT_KEEPALIVE
+    mqtt_options.protocol_version = MQTT_VERSION_3_1_1
+
+    mqtt_initialized = 1
+    foundation.serial_write_string("[MQTT] Client initialized\n")
+    return 1
+}
+
+// Set client options
+export fn mqtt_set_client_id(client_id: u64, len: u8) {
+    var i: u32 = 0
+    while i < len {
+        if i >= 64 { break }
+        mqtt_options.client_id[i] = @intToPtr(client_id + i, u8)
+        i = i + 1
+    }
+    mqtt_options.client_id_len = len
+}
+
+export fn mqtt_set_credentials(username: u64, ulen: u8, password: u64, plen: u8) {
+    var i: u32 = 0
+    while i < ulen {
+        if i >= 64 { break }
+        mqtt_options.username[i] = @intToPtr(username + i, u8)
+        i = i + 1
+    }
+    mqtt_options.username_len = ulen
+
+    i = 0
+    while i < plen {
+        if i >= 64 { break }
+        mqtt_options.password[i] = @intToPtr(password + i, u8)
+        i = i + 1
+    }
+    mqtt_options.password_len = plen
+}
+
+export fn mqtt_set_will(topic: u64, tlen: u16, payload: u64, plen: u16, qos: u8, retain: u8) {
+    var i: u32 = 0
+    while i < tlen {
+        if i >= 256 { break }
+        mqtt_options.will.topic[i] = @intToPtr(topic + i, u8)
+        i = i + 1
+    }
+    mqtt_options.will.topic_len = tlen
+
+    i = 0
+    while i < plen {
+        if i >= 1024 { break }
+        mqtt_options.will.payload[i] = @intToPtr(payload + i, u8)
+        i = i + 1
+    }
+    mqtt_options.will.payload_len = plen
+    mqtt_options.will.qos = qos
+    mqtt_options.will.retain = retain
+    mqtt_options.will.active = 1
+}
+
+export fn mqtt_set_keepalive(keep_alive: u16) {
+    mqtt_options.keep_alive = keep_alive
+}
+
+export fn mqtt_set_clean_session(clean: u8) {
+    mqtt_options.clean_session = clean
+}
+
+export fn mqtt_set_protocol_version(version: u8) {
+    mqtt_options.protocol_version = version
+}
+
+// Connect to broker
 export fn mqtt_connect(broker_ip: u32, port: u16, client_id: u64): u32 {
-  foundation.serial_write_string("[MQTT] Connecting to broker...\n")
-  
-  var i: u32 = 0
-  while i < 32 {
-    mqtt_client_id[i] = @intToPtr(client_id + i, u8)
-    if mqtt_client_id[i] == 0 { break }
-    i = i + 1
-  }
-  
-  mqtt_connected = 1
-  return 0
+    if mqtt_initialized == 0 {
+        if mqtt_init() == 0 {
+            return 0
+        }
+    }
+
+    if mqtt_state != STATE_DISCONNECTED {
+        return 0
+    }
+
+    // Set client ID if provided
+    if client_id != 0 {
+        var i: u32 = 0
+        while i < 64 {
+            var ch: u8 = @intToPtr(client_id + i, u8)
+            mqtt_options.client_id[i] = ch
+            if ch == 0 { break }
+            i = i + 1
+        }
+        mqtt_options.client_id_len = i
+    }
+
+    // Create TCP socket
+    mqtt_socket = tcp.tcp_socket_create()
+    if mqtt_socket == 0xFFFFFFFF {
+        foundation.serial_write_string("[MQTT] Failed to create socket\n")
+        return 0
+    }
+
+    mqtt_state = STATE_CONNECTING
+
+    // Connect to broker
+    if tcp.tcp_socket_connect(mqtt_socket, broker_ip, port) == 0 {
+        foundation.serial_write_string("[MQTT] Failed to connect to broker\n")
+        tcp.tcp_socket_close(mqtt_socket)
+        mqtt_state = STATE_DISCONNECTED
+        return 0
+    }
+
+    // Send CONNECT packet
+    if mqtt_send_connect() == 0 {
+        foundation.serial_write_string("[MQTT] Failed to send CONNECT\n")
+        tcp.tcp_socket_close(mqtt_socket)
+        mqtt_state = STATE_DISCONNECTED
+        return 0
+    }
+
+    mqtt_last_activity = foundation.timer_get_ticks()
+
+    foundation.serial_write_string("[MQTT] Connecting to broker ")
+    foundation.serial_write_hex(broker_ip)
+    foundation.serial_write_string(":")
+    foundation.serial_write_hex(port)
+    foundation.serial_write_string("\n")
+
+    return 1
 }
 
-export fn mqtt_publish(topic: u64, message: u64, length: u32): u32 {
-  if mqtt_connected == 0 { return 1 }
-  
-  foundation.serial_write_string("[MQTT] Publishing to ")
-  foundation.serial_write_string(topic)
-  foundation.serial_write_string("\n")
-  
-  // Send PUBLISH packet (stub)
-  return 0
+// Send CONNECT packet
+fn mqtt_send_connect(): u32 {
+    var offset: u32 = 0
+
+    // Calculate remaining length
+    var remaining_length: u32 = 10  // Variable header for v3.1.1
+
+    // Protocol name
+    if mqtt_options.protocol_version == MQTT_VERSION_5_0 {
+        remaining_length = remaining_length + 1  // Properties length
+    }
+
+    // Client ID
+    remaining_length = remaining_length + 2 + mqtt_options.client_id_len
+
+    // Will
+    if mqtt_options.will.active == 1 {
+        remaining_length = remaining_length + 2 + mqtt_options.will.topic_len
+        remaining_length = remaining_length + 2 + mqtt_options.will.payload_len
+    }
+
+    // Username
+    if mqtt_options.username_len > 0 {
+        remaining_length = remaining_length + 2 + mqtt_options.username_len
+    }
+
+    // Password
+    if mqtt_options.password_len > 0 {
+        remaining_length = remaining_length + 2 + mqtt_options.password_len
+    }
+
+    // Fixed header
+    mqtt_tx_buffer[offset] = MQTT_CONNECT
+    offset = offset + 1
+    offset = offset + mqtt_write_remaining_length(@ptrFromInt(mqtt_tx_buffer) + offset, remaining_length)
+
+    // Protocol name
+    mqtt_tx_buffer[offset] = 0
+    mqtt_tx_buffer[offset + 1] = 4
+    mqtt_tx_buffer[offset + 2] = 'M'
+    mqtt_tx_buffer[offset + 3] = 'Q'
+    mqtt_tx_buffer[offset + 4] = 'T'
+    mqtt_tx_buffer[offset + 5] = 'T'
+    offset = offset + 6
+
+    // Protocol level
+    mqtt_tx_buffer[offset] = mqtt_options.protocol_version
+    offset = offset + 1
+
+    // Connect flags
+    var flags: u8 = 0
+    if mqtt_options.clean_session == 1 { flags = flags | 0x02 }
+    if mqtt_options.will.active == 1 {
+        flags = flags | 0x04
+        flags = flags | ((mqtt_options.will.qos & 0x03) << 3)
+        if mqtt_options.will.retain == 1 { flags = flags | 0x20 }
+    }
+    if mqtt_options.password_len > 0 { flags = flags | 0x40 }
+    if mqtt_options.username_len > 0 { flags = flags | 0x80 }
+    mqtt_tx_buffer[offset] = flags
+    offset = offset + 1
+
+    // Keep alive
+    mqtt_tx_buffer[offset] = (mqtt_options.keep_alive >> 8) & 0xFF
+    mqtt_tx_buffer[offset + 1] = mqtt_options.keep_alive & 0xFF
+    offset = offset + 2
+
+    // v5.0 properties
+    if mqtt_options.protocol_version == MQTT_VERSION_5_0 {
+        mqtt_tx_buffer[offset] = 0  // No properties
+        offset = offset + 1
+    }
+
+    // Client ID
+    mqtt_tx_buffer[offset] = 0
+    mqtt_tx_buffer[offset + 1] = mqtt_options.client_id_len
+    offset = offset + 2
+    var i: u32 = 0
+    while i < mqtt_options.client_id_len {
+        mqtt_tx_buffer[offset + i] = mqtt_options.client_id[i]
+        i = i + 1
+    }
+    offset = offset + mqtt_options.client_id_len
+
+    // Will message
+    if mqtt_options.will.active == 1 {
+        mqtt_tx_buffer[offset] = (mqtt_options.will.topic_len >> 8) & 0xFF
+        mqtt_tx_buffer[offset + 1] = mqtt_options.will.topic_len & 0xFF
+        offset = offset + 2
+        i = 0
+        while i < mqtt_options.will.topic_len {
+            mqtt_tx_buffer[offset + i] = mqtt_options.will.topic[i]
+            i = i + 1
+        }
+        offset = offset + mqtt_options.will.topic_len
+
+        mqtt_tx_buffer[offset] = (mqtt_options.will.payload_len >> 8) & 0xFF
+        mqtt_tx_buffer[offset + 1] = mqtt_options.will.payload_len & 0xFF
+        offset = offset + 2
+        i = 0
+        while i < mqtt_options.will.payload_len {
+            mqtt_tx_buffer[offset + i] = mqtt_options.will.payload[i]
+            i = i + 1
+        }
+        offset = offset + mqtt_options.will.payload_len
+    }
+
+    // Username
+    if mqtt_options.username_len > 0 {
+        mqtt_tx_buffer[offset] = 0
+        mqtt_tx_buffer[offset + 1] = mqtt_options.username_len
+        offset = offset + 2
+        i = 0
+        while i < mqtt_options.username_len {
+            mqtt_tx_buffer[offset + i] = mqtt_options.username[i]
+            i = i + 1
+        }
+        offset = offset + mqtt_options.username_len
+    }
+
+    // Password
+    if mqtt_options.password_len > 0 {
+        mqtt_tx_buffer[offset] = 0
+        mqtt_tx_buffer[offset + 1] = mqtt_options.password_len
+        offset = offset + 2
+        i = 0
+        while i < mqtt_options.password_len {
+            mqtt_tx_buffer[offset + i] = mqtt_options.password[i]
+            i = i + 1
+        }
+        offset = offset + mqtt_options.password_len
+    }
+
+    return mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), offset)
 }
 
-export fn mqtt_subscribe(topic: u64): u32 {
-  if mqtt_connected == 0 { return 1 }
-  
-  foundation.serial_write_string("[MQTT] Subscribing to ")
-  foundation.serial_write_string(topic)
-  foundation.serial_write_string("\n")
-  
-  // Send SUBSCRIBE packet (stub)
-  return 0
-}
-
+// Disconnect from broker
 export fn mqtt_disconnect() {
-  mqtt_connected = 0
+    if mqtt_initialized == 0 || mqtt_state == STATE_DISCONNECTED {
+        return
+    }
+
+    mqtt_state = STATE_DISCONNECTING
+
+    // Send DISCONNECT packet
+    mqtt_tx_buffer[0] = MQTT_DISCONNECT
+    mqtt_tx_buffer[1] = 0
+    mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), 2)
+
+    // Close socket
+    tcp.tcp_socket_close(mqtt_socket)
+
+    // Clear subscriptions
+    var i: u32 = 0
+    while i < MQTT_MAX_SUBSCRIPTIONS {
+        mqtt_subscriptions[i].active = 0
+        i = i + 1
+    }
+    mqtt_subscription_count = 0
+
+    // Clear pending
+    i = 0
+    while i < MQTT_MAX_PENDING {
+        mqtt_pending[i].active = 0
+        i = i + 1
+    }
+    mqtt_pending_count = 0
+
+    mqtt_state = STATE_DISCONNECTED
+    foundation.serial_write_string("[MQTT] Disconnected\n")
+}
+
+// Publish message
+export fn mqtt_publish(topic: u64, message: u64, length: u32): u32 {
+    return mqtt_publish_qos(topic, message, length, QOS_0, 0)
+}
+
+export fn mqtt_publish_qos(topic: u64, message: u64, length: u32, qos: u8, retain: u8): u32 {
+    if mqtt_state != STATE_CONNECTED {
+        return 0
+    }
+
+    var topic_len: u16 = 0
+    var i: u32 = 0
+    while i < 256 {
+        if @intToPtr(topic + i, u8) == 0 { break }
+        topic_len = topic_len + 1
+        i = i + 1
+    }
+
+    var offset: u32 = 0
+
+    // Calculate remaining length
+    var remaining_length: u32 = 2 + topic_len + length
+    if qos > 0 {
+        remaining_length = remaining_length + 2  // Packet ID
+    }
+    if mqtt_options.protocol_version == MQTT_VERSION_5_0 {
+        remaining_length = remaining_length + 1  // Properties
+    }
+
+    // Fixed header
+    var header: u8 = MQTT_PUBLISH
+    if retain == 1 { header = header | 0x01 }
+    header = header | ((qos & 0x03) << 1)
+    mqtt_tx_buffer[offset] = header
+    offset = offset + 1
+    offset = offset + mqtt_write_remaining_length(@ptrFromInt(mqtt_tx_buffer) + offset, remaining_length)
+
+    // Topic
+    mqtt_tx_buffer[offset] = (topic_len >> 8) & 0xFF
+    mqtt_tx_buffer[offset + 1] = topic_len & 0xFF
+    offset = offset + 2
+    i = 0
+    while i < topic_len {
+        mqtt_tx_buffer[offset + i] = @intToPtr(topic + i, u8)
+        i = i + 1
+    }
+    offset = offset + topic_len
+
+    // Packet ID (for QoS > 0)
+    var packet_id: u16 = 0
+    if qos > 0 {
+        packet_id = mqtt_get_packet_id()
+        mqtt_tx_buffer[offset] = (packet_id >> 8) & 0xFF
+        mqtt_tx_buffer[offset + 1] = packet_id & 0xFF
+        offset = offset + 2
+    }
+
+    // v5.0 properties
+    if mqtt_options.protocol_version == MQTT_VERSION_5_0 {
+        mqtt_tx_buffer[offset] = 0
+        offset = offset + 1
+    }
+
+    // Payload
+    if length > MQTT_MAX_PAYLOAD_LEN { length = MQTT_MAX_PAYLOAD_LEN }
+    i = 0
+    while i < length {
+        mqtt_tx_buffer[offset + i] = @intToPtr(message + i, u8)
+        i = i + 1
+    }
+    offset = offset + length
+
+    // Send
+    if mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), offset) == 0 {
+        return 0
+    }
+
+    mqtt_stats.messages_sent = mqtt_stats.messages_sent + 1
+
+    // Add to pending for QoS > 0
+    if qos > 0 {
+        mqtt_add_pending(packet_id, topic, topic_len, message, length, qos)
+    }
+
+    foundation.serial_write_string("[MQTT] Published to ")
+    foundation.serial_write_string(topic)
+    foundation.serial_write_string("\n")
+
+    return 1
+}
+
+// Subscribe to topic
+export fn mqtt_subscribe(topic: u64, qos: u8): u32 {
+    return mqtt_subscribe_callback(topic, qos, 0)
+}
+
+export fn mqtt_subscribe_callback(topic: u64, qos: u8, callback: u64): u32 {
+    if mqtt_state != STATE_CONNECTED {
+        return 0
+    }
+
+    var topic_len: u16 = 0
+    var i: u32 = 0
+    while i < 256 {
+        if @intToPtr(topic + i, u8) == 0 { break }
+        topic_len = topic_len + 1
+        i = i + 1
+    }
+
+    var offset: u32 = 0
+
+    // Calculate remaining length
+    var remaining_length: u32 = 2 + 2 + topic_len + 1  // Packet ID + topic + QoS
+    if mqtt_options.protocol_version == MQTT_VERSION_5_0 {
+        remaining_length = remaining_length + 1  // Properties
+    }
+
+    // Fixed header
+    mqtt_tx_buffer[offset] = MQTT_SUBSCRIBE
+    offset = offset + 1
+    offset = offset + mqtt_write_remaining_length(@ptrFromInt(mqtt_tx_buffer) + offset, remaining_length)
+
+    // Packet ID
+    var packet_id: u16 = mqtt_get_packet_id()
+    mqtt_tx_buffer[offset] = (packet_id >> 8) & 0xFF
+    mqtt_tx_buffer[offset + 1] = packet_id & 0xFF
+    offset = offset + 2
+
+    // v5.0 properties
+    if mqtt_options.protocol_version == MQTT_VERSION_5_0 {
+        mqtt_tx_buffer[offset] = 0
+        offset = offset + 1
+    }
+
+    // Topic filter
+    mqtt_tx_buffer[offset] = (topic_len >> 8) & 0xFF
+    mqtt_tx_buffer[offset + 1] = topic_len & 0xFF
+    offset = offset + 2
+    i = 0
+    while i < topic_len {
+        mqtt_tx_buffer[offset + i] = @intToPtr(topic + i, u8)
+        i = i + 1
+    }
+    offset = offset + topic_len
+
+    // QoS
+    mqtt_tx_buffer[offset] = qos
+    offset = offset + 1
+
+    // Send
+    if mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), offset) == 0 {
+        return 0
+    }
+
+    // Add subscription locally
+    mqtt_add_subscription(topic, topic_len, qos, callback)
+
+    foundation.serial_write_string("[MQTT] Subscribed to ")
+    foundation.serial_write_string(topic)
+    foundation.serial_write_string("\n")
+
+    return 1
+}
+
+// Unsubscribe from topic
+export fn mqtt_unsubscribe(topic: u64): u32 {
+    if mqtt_state != STATE_CONNECTED {
+        return 0
+    }
+
+    var topic_len: u16 = 0
+    var i: u32 = 0
+    while i < 256 {
+        if @intToPtr(topic + i, u8) == 0 { break }
+        topic_len = topic_len + 1
+        i = i + 1
+    }
+
+    var offset: u32 = 0
+
+    // Calculate remaining length
+    var remaining_length: u32 = 2 + 2 + topic_len
+    if mqtt_options.protocol_version == MQTT_VERSION_5_0 {
+        remaining_length = remaining_length + 1
+    }
+
+    // Fixed header
+    mqtt_tx_buffer[offset] = MQTT_UNSUBSCRIBE
+    offset = offset + 1
+    offset = offset + mqtt_write_remaining_length(@ptrFromInt(mqtt_tx_buffer) + offset, remaining_length)
+
+    // Packet ID
+    var packet_id: u16 = mqtt_get_packet_id()
+    mqtt_tx_buffer[offset] = (packet_id >> 8) & 0xFF
+    mqtt_tx_buffer[offset + 1] = packet_id & 0xFF
+    offset = offset + 2
+
+    // v5.0 properties
+    if mqtt_options.protocol_version == MQTT_VERSION_5_0 {
+        mqtt_tx_buffer[offset] = 0
+        offset = offset + 1
+    }
+
+    // Topic filter
+    mqtt_tx_buffer[offset] = (topic_len >> 8) & 0xFF
+    mqtt_tx_buffer[offset + 1] = topic_len & 0xFF
+    offset = offset + 2
+    i = 0
+    while i < topic_len {
+        mqtt_tx_buffer[offset + i] = @intToPtr(topic + i, u8)
+        i = i + 1
+    }
+    offset = offset + topic_len
+
+    // Send
+    if mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), offset) == 0 {
+        return 0
+    }
+
+    // Remove subscription
+    mqtt_remove_subscription(topic, topic_len)
+
+    foundation.serial_write_string("[MQTT] Unsubscribed from ")
+    foundation.serial_write_string(topic)
+    foundation.serial_write_string("\n")
+
+    return 1
+}
+
+// Process incoming data and timeouts
+export fn mqtt_process() {
+    if mqtt_initialized == 0 || mqtt_socket == 0 {
+        return
+    }
+
+    var now: u64 = foundation.timer_get_ticks()
+
+    // Receive data
+    var received: u32 = tcp.tcp_socket_recv(
+        mqtt_socket,
+        @ptrFromInt(mqtt_rx_buffer) + mqtt_rx_len,
+        MQTT_BUFFER_SIZE - mqtt_rx_len
+    )
+
+    if received > 0 {
+        mqtt_rx_len = mqtt_rx_len + received
+        mqtt_stats.bytes_received = mqtt_stats.bytes_received + received
+        mqtt_last_activity = now
+
+        // Process complete packets
+        mqtt_process_received()
+    }
+
+    // Keep-alive handling
+    if mqtt_state == STATE_CONNECTED {
+        var keep_alive_ms: u64 = mqtt_options.keep_alive * 1000
+
+        if now - mqtt_last_activity > keep_alive_ms {
+            if mqtt_ping_pending == 1 {
+                // No PINGRESP, disconnect
+                foundation.serial_write_string("[MQTT] Keep-alive timeout\n")
+                mqtt_handle_disconnect(REASON_KEEP_ALIVE_TIMEOUT)
+            } else {
+                // Send PINGREQ
+                mqtt_send_pingreq()
+            }
+        }
+    }
+
+    // Retry pending messages
+    mqtt_process_pending(now)
+}
+
+// Process received data
+fn mqtt_process_received() {
+    while mqtt_rx_len >= 2 {
+        // Parse fixed header
+        var packet_type: u8 = mqtt_rx_buffer[0] & 0xF0
+        var flags: u8 = mqtt_rx_buffer[0] & 0x0F
+
+        // Parse remaining length
+        var remaining_length: u32 = 0
+        var multiplier: u32 = 1
+        var len_bytes: u32 = 0
+        var i: u32 = 1
+
+        while i < mqtt_rx_len {
+            if i >= 5 { break }
+            remaining_length = remaining_length + ((mqtt_rx_buffer[i] & 0x7F) * multiplier)
+            multiplier = multiplier * 128
+            len_bytes = len_bytes + 1
+
+            if (mqtt_rx_buffer[i] & 0x80) == 0 {
+                break
+            }
+            i = i + 1
+        }
+
+        var total_length: u32 = 1 + len_bytes + remaining_length
+
+        // Check if complete packet
+        if mqtt_rx_len < total_length {
+            return  // Wait for more data
+        }
+
+        // Process packet
+        var payload_start: u32 = 1 + len_bytes
+        mqtt_handle_packet(packet_type, flags, @ptrFromInt(mqtt_rx_buffer) + payload_start, remaining_length)
+
+        // Remove processed data
+        if mqtt_rx_len > total_length {
+            var j: u32 = 0
+            while j < (mqtt_rx_len - total_length) {
+                mqtt_rx_buffer[j] = mqtt_rx_buffer[j + total_length]
+                j = j + 1
+            }
+        }
+        mqtt_rx_len = mqtt_rx_len - total_length
+    }
+}
+
+// Handle received packet
+fn mqtt_handle_packet(packet_type: u8, flags: u8, payload: u64, len: u32) {
+    if packet_type == MQTT_CONNACK {
+        mqtt_handle_connack(payload, len)
+    } else if packet_type == MQTT_PUBLISH {
+        mqtt_handle_publish(flags, payload, len)
+    } else if packet_type == MQTT_PUBACK {
+        mqtt_handle_puback(payload, len)
+    } else if packet_type == MQTT_PUBREC {
+        mqtt_handle_pubrec(payload, len)
+    } else if packet_type == MQTT_PUBREL {
+        mqtt_handle_pubrel(payload, len)
+    } else if packet_type == MQTT_PUBCOMP {
+        mqtt_handle_pubcomp(payload, len)
+    } else if packet_type == MQTT_SUBACK {
+        mqtt_handle_suback(payload, len)
+    } else if packet_type == MQTT_UNSUBACK {
+        mqtt_handle_unsuback(payload, len)
+    } else if packet_type == MQTT_PINGRESP {
+        mqtt_handle_pingresp()
+    }
+}
+
+// Handle CONNACK
+fn mqtt_handle_connack(payload: u64, len: u32) {
+    if len < 2 {
+        return
+    }
+
+    var session_present: u8 = @intToPtr(payload, u8) & 0x01
+    var return_code: u8 = @intToPtr(payload + 1, u8)
+
+    if return_code == CONNACK_ACCEPTED {
+        mqtt_state = STATE_CONNECTED
+        foundation.serial_write_string("[MQTT] Connected (session=")
+        foundation.serial_write_hex(session_present)
+        foundation.serial_write_string(")\n")
+
+        if session_present == 0 {
+            if mqtt_options.clean_session == 0 {
+                // Resubscribe
+                mqtt_resubscribe_all()
+            }
+        }
+
+        if mqtt_on_connect != 0 {
+            // Would call callback
+        }
+    } else {
+        foundation.serial_write_string("[MQTT] Connection rejected: ")
+        foundation.serial_write_hex(return_code)
+        foundation.serial_write_string("\n")
+        mqtt_handle_disconnect(return_code)
+    }
+}
+
+// Handle PUBLISH
+fn mqtt_handle_publish(flags: u8, payload: u64, len: u32) {
+    if len < 2 {
+        return
+    }
+
+    var qos: u8 = (flags >> 1) & 0x03
+    var retain: u8 = flags & 0x01
+    var dup: u8 = (flags >> 3) & 0x01
+
+    var offset: u32 = 0
+
+    // Topic length
+    var topic_len: u16 = (@intToPtr(payload, u8) << 8) | @intToPtr(payload + 1, u8)
+    offset = offset + 2
+
+    if offset + topic_len > len {
+        return
+    }
+
+    // Topic
+    var topic: u64 = payload + offset
+    offset = offset + topic_len
+
+    // Packet ID (QoS > 0)
+    var packet_id: u16 = 0
+    if qos > 0 {
+        if offset + 2 > len { return }
+        packet_id = (@intToPtr(payload + offset, u8) << 8) | @intToPtr(payload + offset + 1, u8)
+        offset = offset + 2
+    }
+
+    // v5.0 properties
+    if mqtt_options.protocol_version == MQTT_VERSION_5_0 {
+        var prop_len: u8 = @intToPtr(payload + offset, u8)
+        offset = offset + 1 + prop_len
+    }
+
+    // Payload
+    var msg_payload: u64 = payload + offset
+    var msg_len: u32 = len - offset
+
+    mqtt_stats.messages_received = mqtt_stats.messages_received + 1
+
+    // Find matching subscription
+    var i: u32 = 0
+    while i < MQTT_MAX_SUBSCRIPTIONS {
+        if mqtt_subscriptions[i].active == 1 {
+            if mqtt_topic_matches(@ptrFromInt(mqtt_subscriptions[i].topic), mqtt_subscriptions[i].topic_len, topic, topic_len) == 1 {
+                if mqtt_subscriptions[i].callback != 0 {
+                    // Would call callback
+                }
+                break
+            }
+        }
+        i = i + 1
+    }
+
+    // Global callback
+    if mqtt_on_message != 0 {
+        // Would call callback
+    }
+
+    // Send acknowledgment
+    if qos == QOS_1 {
+        mqtt_send_puback(packet_id)
+    } else if qos == QOS_2 {
+        mqtt_send_pubrec(packet_id)
+    }
+}
+
+// Handle PUBACK
+fn mqtt_handle_puback(payload: u64, len: u32) {
+    if len < 2 { return }
+    var packet_id: u16 = (@intToPtr(payload, u8) << 8) | @intToPtr(payload + 1, u8)
+    mqtt_remove_pending(packet_id)
+}
+
+// Handle PUBREC
+fn mqtt_handle_pubrec(payload: u64, len: u32) {
+    if len < 2 { return }
+    var packet_id: u16 = (@intToPtr(payload, u8) << 8) | @intToPtr(payload + 1, u8)
+
+    // Update pending state
+    var i: u32 = 0
+    while i < MQTT_MAX_PENDING {
+        if mqtt_pending[i].active == 1 {
+            if mqtt_pending[i].packet_id == packet_id {
+                mqtt_pending[i].state = PENDING_PUBCOMP
+                break
+            }
+        }
+        i = i + 1
+    }
+
+    mqtt_send_pubrel(packet_id)
+}
+
+// Handle PUBREL
+fn mqtt_handle_pubrel(payload: u64, len: u32) {
+    if len < 2 { return }
+    var packet_id: u16 = (@intToPtr(payload, u8) << 8) | @intToPtr(payload + 1, u8)
+    mqtt_send_pubcomp(packet_id)
+}
+
+// Handle PUBCOMP
+fn mqtt_handle_pubcomp(payload: u64, len: u32) {
+    if len < 2 { return }
+    var packet_id: u16 = (@intToPtr(payload, u8) << 8) | @intToPtr(payload + 1, u8)
+    mqtt_remove_pending(packet_id)
+}
+
+// Handle SUBACK
+fn mqtt_handle_suback(payload: u64, len: u32) {
+    if len < 3 { return }
+
+    var packet_id: u16 = (@intToPtr(payload, u8) << 8) | @intToPtr(payload + 1, u8)
+    var offset: u32 = 2
+
+    if mqtt_options.protocol_version == MQTT_VERSION_5_0 {
+        var prop_len: u8 = @intToPtr(payload + offset, u8)
+        offset = offset + 1 + prop_len
+    }
+
+    // Check return codes
+    while offset < len {
+        var return_code: u8 = @intToPtr(payload + offset, u8)
+        if return_code >= 0x80 {
+            foundation.serial_write_string("[MQTT] Subscription failed: 0x")
+            foundation.serial_write_hex(return_code)
+            foundation.serial_write_string("\n")
+        }
+        offset = offset + 1
+    }
+}
+
+// Handle UNSUBACK
+fn mqtt_handle_unsuback(payload: u64, len: u32) {
+    if len < 2 { return }
+    var packet_id: u16 = (@intToPtr(payload, u8) << 8) | @intToPtr(payload + 1, u8)
+    // Unsubscription confirmed
+}
+
+// Handle PINGRESP
+fn mqtt_handle_pingresp() {
+    mqtt_ping_pending = 0
+    mqtt_stats.ping_count = mqtt_stats.ping_count + 1
+}
+
+// Send PINGREQ
+fn mqtt_send_pingreq() {
+    mqtt_tx_buffer[0] = MQTT_PINGREQ
+    mqtt_tx_buffer[1] = 0
+
+    if mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), 2) > 0 {
+        mqtt_ping_pending = 1
+        mqtt_last_activity = foundation.timer_get_ticks()
+    }
+}
+
+// Send PUBACK
+fn mqtt_send_puback(packet_id: u16) {
+    mqtt_tx_buffer[0] = MQTT_PUBACK
+    mqtt_tx_buffer[1] = 2
+    mqtt_tx_buffer[2] = (packet_id >> 8) & 0xFF
+    mqtt_tx_buffer[3] = packet_id & 0xFF
+    mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), 4)
+}
+
+// Send PUBREC
+fn mqtt_send_pubrec(packet_id: u16) {
+    mqtt_tx_buffer[0] = MQTT_PUBREC
+    mqtt_tx_buffer[1] = 2
+    mqtt_tx_buffer[2] = (packet_id >> 8) & 0xFF
+    mqtt_tx_buffer[3] = packet_id & 0xFF
+    mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), 4)
+}
+
+// Send PUBREL
+fn mqtt_send_pubrel(packet_id: u16) {
+    mqtt_tx_buffer[0] = MQTT_PUBREL
+    mqtt_tx_buffer[1] = 2
+    mqtt_tx_buffer[2] = (packet_id >> 8) & 0xFF
+    mqtt_tx_buffer[3] = packet_id & 0xFF
+    mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), 4)
+}
+
+// Send PUBCOMP
+fn mqtt_send_pubcomp(packet_id: u16) {
+    mqtt_tx_buffer[0] = MQTT_PUBCOMP
+    mqtt_tx_buffer[1] = 2
+    mqtt_tx_buffer[2] = (packet_id >> 8) & 0xFF
+    mqtt_tx_buffer[3] = packet_id & 0xFF
+    mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), 4)
+}
+
+// Handle disconnect
+fn mqtt_handle_disconnect(reason: u8) {
+    mqtt_state = STATE_DISCONNECTED
+    tcp.tcp_socket_close(mqtt_socket)
+
+    if mqtt_on_disconnect != 0 {
+        // Would call callback
+    }
+}
+
+// Helper: Send data
+fn mqtt_send_data(data: u64, len: u32): u32 {
+    var sent: u32 = tcp.tcp_socket_send(mqtt_socket, data, len)
+    if sent > 0 {
+        mqtt_stats.bytes_sent = mqtt_stats.bytes_sent + sent
+    }
+    return sent
+}
+
+// Helper: Get next packet ID
+fn mqtt_get_packet_id(): u16 {
+    var id: u16 = mqtt_next_packet_id
+    mqtt_next_packet_id = mqtt_next_packet_id + 1
+    if mqtt_next_packet_id == 0 {
+        mqtt_next_packet_id = 1
+    }
+    return id
+}
+
+// Helper: Write remaining length
+fn mqtt_write_remaining_length(buf: u64, length: u32): u32 {
+    var len: u32 = length
+    var offset: u32 = 0
+
+    while 1 == 1 {
+        var byte: u8 = len & 0x7F
+        len = len >> 7
+
+        if len > 0 {
+            byte = byte | 0x80
+        }
+
+        @intToPtr(buf + offset, u8) = byte
+        offset = offset + 1
+
+        if len == 0 { break }
+    }
+
+    return offset
+}
+
+// Helper: Topic matches (with wildcards)
+fn mqtt_topic_matches(filter: u64, flen: u16, topic: u64, tlen: u16): u32 {
+    var fi: u32 = 0
+    var ti: u32 = 0
+
+    while fi < flen {
+        if ti >= tlen {
+            // Check for trailing #
+            if @intToPtr(filter + fi, u8) == '#' {
+                return 1
+            }
+            return 0
+        }
+
+        var fc: u8 = @intToPtr(filter + fi, u8)
+        var tc: u8 = @intToPtr(topic + ti, u8)
+
+        if fc == '#' {
+            return 1  // Multi-level wildcard
+        }
+
+        if fc == '+' {
+            // Single-level wildcard
+            while ti < tlen {
+                if @intToPtr(topic + ti, u8) == '/' { break }
+                ti = ti + 1
+            }
+            fi = fi + 1
+            continue
+        }
+
+        if fc != tc {
+            return 0
+        }
+
+        fi = fi + 1
+        ti = ti + 1
+    }
+
+    return if ti == tlen { 1 } else { 0 }
+}
+
+// Helper: Add subscription
+fn mqtt_add_subscription(topic: u64, topic_len: u16, qos: u8, callback: u64) {
+    var i: u32 = 0
+    while i < MQTT_MAX_SUBSCRIPTIONS {
+        if mqtt_subscriptions[i].active == 0 {
+            var j: u32 = 0
+            while j < topic_len {
+                mqtt_subscriptions[i].topic[j] = @intToPtr(topic + j, u8)
+                j = j + 1
+            }
+            mqtt_subscriptions[i].topic_len = topic_len
+            mqtt_subscriptions[i].qos = qos
+            mqtt_subscriptions[i].callback = callback
+            mqtt_subscriptions[i].active = 1
+            mqtt_subscription_count = mqtt_subscription_count + 1
+            return
+        }
+        i = i + 1
+    }
+}
+
+// Helper: Remove subscription
+fn mqtt_remove_subscription(topic: u64, topic_len: u16) {
+    var i: u32 = 0
+    while i < MQTT_MAX_SUBSCRIPTIONS {
+        if mqtt_subscriptions[i].active == 1 {
+            if mqtt_subscriptions[i].topic_len == topic_len {
+                var match: u32 = 1
+                var j: u32 = 0
+                while j < topic_len {
+                    if mqtt_subscriptions[i].topic[j] != @intToPtr(topic + j, u8) {
+                        match = 0
+                        break
+                    }
+                    j = j + 1
+                }
+                if match == 1 {
+                    mqtt_subscriptions[i].active = 0
+                    mqtt_subscription_count = mqtt_subscription_count - 1
+                    return
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Helper: Resubscribe all
+fn mqtt_resubscribe_all() {
+    var i: u32 = 0
+    while i < MQTT_MAX_SUBSCRIPTIONS {
+        if mqtt_subscriptions[i].active == 1 {
+            mqtt_subscribe_callback(
+                @ptrFromInt(mqtt_subscriptions[i].topic),
+                mqtt_subscriptions[i].qos,
+                mqtt_subscriptions[i].callback
+            )
+        }
+        i = i + 1
+    }
+}
+
+// Helper: Add pending message
+fn mqtt_add_pending(packet_id: u16, topic: u64, topic_len: u16, payload: u64, payload_len: u32, qos: u8) {
+    var i: u32 = 0
+    while i < MQTT_MAX_PENDING {
+        if mqtt_pending[i].active == 0 {
+            mqtt_pending[i].packet_id = packet_id
+            mqtt_pending[i].topic_len = topic_len
+            mqtt_pending[i].payload_len = payload_len
+            mqtt_pending[i].qos = qos
+            mqtt_pending[i].state = if qos == QOS_1 { PENDING_PUBACK } else { PENDING_PUBREC }
+            mqtt_pending[i].retry_count = 0
+            mqtt_pending[i].timestamp = foundation.timer_get_ticks()
+            mqtt_pending[i].active = 1
+
+            var j: u32 = 0
+            while j < topic_len {
+                mqtt_pending[i].topic[j] = @intToPtr(topic + j, u8)
+                j = j + 1
+            }
+
+            j = 0
+            while j < payload_len {
+                if j >= 1024 { break }
+                mqtt_pending[i].payload[j] = @intToPtr(payload + j, u8)
+                j = j + 1
+            }
+
+            mqtt_pending_count = mqtt_pending_count + 1
+            return
+        }
+        i = i + 1
+    }
+}
+
+// Helper: Remove pending message
+fn mqtt_remove_pending(packet_id: u16) {
+    var i: u32 = 0
+    while i < MQTT_MAX_PENDING {
+        if mqtt_pending[i].active == 1 {
+            if mqtt_pending[i].packet_id == packet_id {
+                mqtt_pending[i].active = 0
+                mqtt_pending_count = mqtt_pending_count - 1
+                return
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Helper: Process pending messages
+fn mqtt_process_pending(now: u64) {
+    var i: u32 = 0
+    while i < MQTT_MAX_PENDING {
+        if mqtt_pending[i].active == 1 {
+            if now - mqtt_pending[i].timestamp > MQTT_RETRY_INTERVAL_MS {
+                if mqtt_pending[i].retry_count >= MQTT_MAX_RETRIES {
+                    // Give up
+                    mqtt_pending[i].active = 0
+                    mqtt_pending_count = mqtt_pending_count - 1
+                } else {
+                    // Retry
+                    mqtt_pending[i].retry_count = mqtt_pending[i].retry_count + 1
+                    mqtt_pending[i].timestamp = now
+
+                    if mqtt_pending[i].state == PENDING_PUBACK || mqtt_pending[i].state == PENDING_PUBREC {
+                        // Republish with DUP
+                        mqtt_republish(@ptrFromInt(mqtt_pending[i]))
+                    } else if mqtt_pending[i].state == PENDING_PUBCOMP {
+                        mqtt_send_pubrel(mqtt_pending[i].packet_id)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Helper: Republish message
+fn mqtt_republish(pending: u64) {
+    var pend: MqttPending = @intToPtr(pending, MqttPending)
+
+    var offset: u32 = 0
+    var remaining_length: u32 = 2 + pend.topic_len + 2 + pend.payload_len
+
+    // Fixed header with DUP
+    var header: u8 = MQTT_PUBLISH | 0x08  // DUP flag
+    header = header | ((pend.qos & 0x03) << 1)
+    mqtt_tx_buffer[offset] = header
+    offset = offset + 1
+    offset = offset + mqtt_write_remaining_length(@ptrFromInt(mqtt_tx_buffer) + offset, remaining_length)
+
+    // Topic
+    mqtt_tx_buffer[offset] = (pend.topic_len >> 8) & 0xFF
+    mqtt_tx_buffer[offset + 1] = pend.topic_len & 0xFF
+    offset = offset + 2
+    var i: u32 = 0
+    while i < pend.topic_len {
+        mqtt_tx_buffer[offset + i] = pend.topic[i]
+        i = i + 1
+    }
+    offset = offset + pend.topic_len
+
+    // Packet ID
+    mqtt_tx_buffer[offset] = (pend.packet_id >> 8) & 0xFF
+    mqtt_tx_buffer[offset + 1] = pend.packet_id & 0xFF
+    offset = offset + 2
+
+    // Payload
+    i = 0
+    while i < pend.payload_len {
+        mqtt_tx_buffer[offset + i] = pend.payload[i]
+        i = i + 1
+    }
+    offset = offset + pend.payload_len
+
+    mqtt_send_data(@ptrFromInt(mqtt_tx_buffer), offset)
+}
+
+// Set callbacks
+export fn mqtt_set_connect_callback(callback: u64) {
+    mqtt_on_connect = callback
+}
+
+export fn mqtt_set_disconnect_callback(callback: u64) {
+    mqtt_on_disconnect = callback
+}
+
+export fn mqtt_set_message_callback(callback: u64) {
+    mqtt_on_message = callback
+}
+
+// Get statistics
+export fn mqtt_get_stats(): u64 {
+    return @ptrFromInt(mqtt_stats)
+}
+
+// Check connection status
+export fn mqtt_is_connected(): u32 {
+    return if mqtt_state == STATE_CONNECTED { 1 } else { 0 }
+}
+
+// Shutdown MQTT
+export fn mqtt_shutdown() {
+    mqtt_disconnect()
+    mqtt_initialized = 0
+    foundation.serial_write_string("[MQTT] Shutdown complete\n")
 }

@@ -1,75 +1,678 @@
-// home-os I2C Driver
-// Inter-Integrated Circuit bus
+// home-os I2C (Inter-Integrated Circuit) Driver
+// Full-featured I2C/SMBus controller with multiple bus support
 
 import "../core/foundation.home" as foundation
 
-const I2C_BASE: u16 = 0x0CF8
+// I2C controller types
+const I2C_CTRL_BCM2835: u8 = 0     // Raspberry Pi
+const I2C_CTRL_INTEL_PCH: u8 = 1   // Intel PCH SMBus
+const I2C_CTRL_DESIGNWARE: u8 = 2  // DesignWare I2C
+const I2C_CTRL_BITBANG: u8 = 3     // Bit-banged GPIO
 
-const I2C_CMD_START: u8 = 0x01
-const I2C_CMD_STOP: u8 = 0x02
-const I2C_CMD_READ: u8 = 0x04
-const I2C_CMD_WRITE: u8 = 0x08
+// I2C speeds
+const I2C_SPEED_STANDARD: u32 = 100000    // 100 kHz
+const I2C_SPEED_FAST: u32 = 400000        // 400 kHz
+const I2C_SPEED_FAST_PLUS: u32 = 1000000  // 1 MHz
+const I2C_SPEED_HIGH: u32 = 3400000       // 3.4 MHz
 
+// I2C address modes
+const I2C_ADDR_7BIT: u8 = 0
+const I2C_ADDR_10BIT: u8 = 1
+
+// I2C transfer flags
+const I2C_FLAG_READ: u8 = 0x01
+const I2C_FLAG_NOSTART: u8 = 0x02
+const I2C_FLAG_NOSTOP: u8 = 0x04
+const I2C_FLAG_10BIT: u8 = 0x08
+
+// SMBus protocol codes
+const SMBUS_QUICK: u8 = 0
+const SMBUS_BYTE: u8 = 1
+const SMBUS_BYTE_DATA: u8 = 2
+const SMBUS_WORD_DATA: u8 = 3
+const SMBUS_BLOCK_DATA: u8 = 4
+const SMBUS_PROC_CALL: u8 = 5
+const SMBUS_BLOCK_PROC_CALL: u8 = 6
+const SMBUS_I2C_BLOCK_DATA: u8 = 7
+
+// BCM2835 BSC (Broadcom Serial Controller) registers
+const BCM_BSC_C: u32 = 0x00      // Control
+const BCM_BSC_S: u32 = 0x04      // Status
+const BCM_BSC_DLEN: u32 = 0x08   // Data Length
+const BCM_BSC_A: u32 = 0x0C      // Slave Address
+const BCM_BSC_FIFO: u32 = 0x10   // Data FIFO
+const BCM_BSC_DIV: u32 = 0x14    // Clock Divider
+const BCM_BSC_DEL: u32 = 0x18    // Data Delay
+const BCM_BSC_CLKT: u32 = 0x1C   // Clock Stretch Timeout
+
+// BCM BSC Control bits
+const BCM_BSC_C_I2CEN: u32 = 0x8000    // I2C Enable
+const BCM_BSC_C_INTR: u32 = 0x0400     // RX Interrupt
+const BCM_BSC_C_INTT: u32 = 0x0200     // TX Interrupt
+const BCM_BSC_C_INTD: u32 = 0x0100     // Done Interrupt
+const BCM_BSC_C_ST: u32 = 0x0080       // Start Transfer
+const BCM_BSC_C_CLEAR: u32 = 0x0030    // Clear FIFO
+const BCM_BSC_C_READ: u32 = 0x0001     // Read Transfer
+
+// BCM BSC Status bits
+const BCM_BSC_S_CLKT: u32 = 0x0200     // Clock Stretch Timeout
+const BCM_BSC_S_ERR: u32 = 0x0100      // ACK Error
+const BCM_BSC_S_RXF: u32 = 0x0080      // RX FIFO Full
+const BCM_BSC_S_TXE: u32 = 0x0040      // TX FIFO Empty
+const BCM_BSC_S_RXD: u32 = 0x0020      // RX FIFO Contains Data
+const BCM_BSC_S_TXD: u32 = 0x0010      // TX FIFO Can Accept Data
+const BCM_BSC_S_RXR: u32 = 0x0008      // RX FIFO Needs Reading
+const BCM_BSC_S_TXW: u32 = 0x0004      // TX FIFO Needs Writing
+const BCM_BSC_S_DONE: u32 = 0x0002     // Transfer Done
+const BCM_BSC_S_TA: u32 = 0x0001       // Transfer Active
+
+// Constants
+const MAX_I2C_CONTROLLERS: u32 = 8
+const MAX_I2C_DEVICES: u32 = 128
+const I2C_FIFO_SIZE: u32 = 16
+const I2C_TIMEOUT_MS: u64 = 1000
+const I2C_CLOCK_STRETCH_MS: u64 = 35
+
+// I2C message
+struct I2cMessage {
+    addr: u16,
+    flags: u8,
+    len: u16,
+    buf: u64
+}
+
+// I2C controller
+struct I2cController {
+    controller_type: u8,
+    base_addr: u64,
+    irq: u8,
+    speed: u32,
+    timeout: u64,
+    clock_stretch_timeout: u64,
+    active: u8
+}
+
+// I2C device
+struct I2cDevice {
+    controller: u8,
+    address: u16,
+    addr_mode: u8,
+    speed: u32,
+    active: u8
+}
+
+// Statistics
+struct I2cStats {
+    transfers: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
+    nacks: u32,
+    timeouts: u32,
+    bus_errors: u32
+}
+
+// Global state
+var i2c_controllers: [I2cController; 8]
+var i2c_controller_count: u32 = 0
+var i2c_devices: [I2cDevice; 128]
+var i2c_device_count: u32 = 0
+var i2c_stats: I2cStats
 var i2c_initialized: u32 = 0
 
-export fn i2c_init() {
-  if i2c_initialized == 1 { return }
-  
-  i2c_initialized = 1
-  foundation.serial_write_string("[I2C] Initialized\n")
+// Initialize I2C subsystem
+export fn i2c_init(): u32 {
+    if i2c_initialized == 1 {
+        return 1
+    }
+
+    // Clear controllers
+    var i: u32 = 0
+    while i < MAX_I2C_CONTROLLERS {
+        i2c_controllers[i].active = 0
+        i = i + 1
+    }
+
+    // Clear devices
+    i = 0
+    while i < MAX_I2C_DEVICES {
+        i2c_devices[i].active = 0
+        i = i + 1
+    }
+
+    // Clear stats
+    i2c_stats.transfers = 0
+    i2c_stats.bytes_sent = 0
+    i2c_stats.bytes_received = 0
+    i2c_stats.nacks = 0
+    i2c_stats.timeouts = 0
+    i2c_stats.bus_errors = 0
+
+    i2c_controller_count = 0
+    i2c_device_count = 0
+
+    i2c_initialized = 1
+    foundation.serial_write_string("[I2C] Subsystem initialized\n")
+    return 1
 }
 
-fn i2c_start() {
-  foundation.outb(I2C_BASE, I2C_CMD_START)
+// Register an I2C controller
+export fn i2c_register_controller(ctrl_type: u8, base_addr: u64, irq: u8): u32 {
+    if i2c_controller_count >= MAX_I2C_CONTROLLERS {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = i2c_controller_count
+    i2c_controllers[idx].controller_type = ctrl_type
+    i2c_controllers[idx].base_addr = base_addr
+    i2c_controllers[idx].irq = irq
+    i2c_controllers[idx].speed = I2C_SPEED_STANDARD
+    i2c_controllers[idx].timeout = I2C_TIMEOUT_MS
+    i2c_controllers[idx].clock_stretch_timeout = I2C_CLOCK_STRETCH_MS
+    i2c_controllers[idx].active = 1
+
+    // Initialize controller hardware
+    if ctrl_type == I2C_CTRL_BCM2835 {
+        i2c_bcm_init(idx)
+    }
+
+    i2c_controller_count = i2c_controller_count + 1
+
+    foundation.serial_write_string("[I2C] Controller ")
+    foundation.serial_write_hex(idx)
+    foundation.serial_write_string(" registered at 0x")
+    foundation.serial_write_hex(base_addr)
+    foundation.serial_write_string("\n")
+
+    return idx
 }
 
-fn i2c_stop() {
-  foundation.outb(I2C_BASE, I2C_CMD_STOP)
+// Register BCM2835 controller
+export fn i2c_register_bcm2835(base_addr: u64, bus_num: u8): u32 {
+    return i2c_register_controller(I2C_CTRL_BCM2835, base_addr, bus_num)
 }
 
-fn i2c_write_byte(data: u8) {
-  foundation.outb(I2C_BASE + 1, data)
-  foundation.outb(I2C_BASE, I2C_CMD_WRITE)
+// Initialize BCM2835 I2C
+fn i2c_bcm_init(idx: u32) {
+    var base: u64 = i2c_controllers[idx].base_addr
+
+    // Clear FIFOs
+    i2c_write_reg32(base + BCM_BSC_C, BCM_BSC_C_CLEAR)
+
+    // Set clock divider for 100kHz (assuming 250MHz core clock)
+    // divider = 250MHz / 100kHz = 2500
+    i2c_write_reg32(base + BCM_BSC_DIV, 2500)
+
+    // Set clock stretch timeout (35ms)
+    i2c_write_reg32(base + BCM_BSC_CLKT, 35000)
+
+    // Enable I2C
+    i2c_write_reg32(base + BCM_BSC_C, BCM_BSC_C_I2CEN)
 }
 
-fn i2c_read_byte(): u8 {
-  foundation.outb(I2C_BASE, I2C_CMD_READ)
-  return foundation.inb(I2C_BASE + 1)
+// Set controller speed
+export fn i2c_set_speed(controller: u32, speed: u32) {
+    if controller >= i2c_controller_count { return }
+
+    i2c_controllers[controller].speed = speed
+
+    if i2c_controllers[controller].controller_type == I2C_CTRL_BCM2835 {
+        var base: u64 = i2c_controllers[controller].base_addr
+        // Calculate divider (assuming 250MHz core clock)
+        var divider: u32 = 250000000 / speed
+        i2c_write_reg32(base + BCM_BSC_DIV, divider)
+    }
 }
 
-export fn i2c_write(device_addr: u8, reg_addr: u8, data: u64, length: u32): u32 {
-  if i2c_initialized == 0 { return 1 }
-  
-  i2c_start()
-  i2c_write_byte(device_addr << 1)
-  i2c_write_byte(reg_addr)
-  
-  var i: u32 = 0
-  while i < length {
-    i2c_write_byte(@intToPtr(data + i, u8))
-    i = i + 1
-  }
-  
-  i2c_stop()
-  return 0
+// Set controller timeout
+export fn i2c_set_timeout(controller: u32, timeout_ms: u64) {
+    if controller >= i2c_controller_count { return }
+    i2c_controllers[controller].timeout = timeout_ms
 }
 
-export fn i2c_read(device_addr: u8, reg_addr: u8, buffer: u64, length: u32): u32 {
-  if i2c_initialized == 0 { return 0 }
-  
-  i2c_start()
-  i2c_write_byte(device_addr << 1)
-  i2c_write_byte(reg_addr)
-  
-  i2c_start()
-  i2c_write_byte((device_addr << 1) | 1)
-  
-  var i: u32 = 0
-  while i < length {
-    @ptrToInt(buffer + i, u8) = i2c_read_byte()
-    i = i + 1
-  }
-  
-  i2c_stop()
-  return length
+// Register a device on the bus
+export fn i2c_register_device(controller: u32, address: u16, addr_mode: u8): u32 {
+    if controller >= i2c_controller_count {
+        return 0xFFFFFFFF
+    }
+
+    // Check for valid address
+    if addr_mode == I2C_ADDR_7BIT {
+        if address > 0x7F { return 0xFFFFFFFF }
+    } else {
+        if address > 0x3FF { return 0xFFFFFFFF }
+    }
+
+    // Find empty slot
+    var i: u32 = 0
+    while i < MAX_I2C_DEVICES {
+        if i2c_devices[i].active == 0 {
+            i2c_devices[i].controller = controller
+            i2c_devices[i].address = address
+            i2c_devices[i].addr_mode = addr_mode
+            i2c_devices[i].speed = i2c_controllers[controller].speed
+            i2c_devices[i].active = 1
+            i2c_device_count = i2c_device_count + 1
+            return i
+        }
+        i = i + 1
+    }
+
+    return 0xFFFFFFFF
+}
+
+// Unregister a device
+export fn i2c_unregister_device(handle: u32) {
+    if handle >= MAX_I2C_DEVICES { return }
+    if i2c_devices[handle].active == 0 { return }
+
+    i2c_devices[handle].active = 0
+    i2c_device_count = i2c_device_count - 1
+}
+
+// Transfer data to/from device
+export fn i2c_transfer(handle: u32, msgs: u64, num_msgs: u32): u32 {
+    if handle >= MAX_I2C_DEVICES { return 0 }
+    if i2c_devices[handle].active == 0 { return 0 }
+
+    var controller: u8 = i2c_devices[handle].controller
+    var result: u32 = 0
+
+    var i: u32 = 0
+    while i < num_msgs {
+        var msg: I2cMessage = @intToPtr(msgs + (i * 16), I2cMessage)
+
+        if i2c_controllers[controller].controller_type == I2C_CTRL_BCM2835 {
+            if (msg.flags & I2C_FLAG_READ) != 0 {
+                result = i2c_bcm_read(controller, i2c_devices[handle].address, msg.buf, msg.len)
+            } else {
+                result = i2c_bcm_write(controller, i2c_devices[handle].address, msg.buf, msg.len)
+            }
+        }
+
+        if result == 0 {
+            return i  // Return number of successful transfers
+        }
+
+        i = i + 1
+    }
+
+    i2c_stats.transfers = i2c_stats.transfers + 1
+    return num_msgs
+}
+
+// BCM2835 read operation
+fn i2c_bcm_read(controller: u8, addr: u16, buf: u64, len: u16): u32 {
+    var base: u64 = i2c_controllers[controller].base_addr
+    var timeout: u64 = i2c_controllers[controller].timeout
+
+    // Clear FIFOs and status
+    i2c_write_reg32(base + BCM_BSC_S, BCM_BSC_S_CLKT | BCM_BSC_S_ERR | BCM_BSC_S_DONE)
+    i2c_write_reg32(base + BCM_BSC_C, BCM_BSC_C_CLEAR)
+
+    // Set slave address
+    i2c_write_reg32(base + BCM_BSC_A, addr)
+
+    // Set data length
+    i2c_write_reg32(base + BCM_BSC_DLEN, len)
+
+    // Start read transfer
+    i2c_write_reg32(base + BCM_BSC_C, BCM_BSC_C_I2CEN | BCM_BSC_C_ST | BCM_BSC_C_READ)
+
+    var start: u64 = foundation.timer_get_ticks()
+    var received: u16 = 0
+
+    while received < len {
+        // Check timeout
+        if foundation.timer_get_ticks() - start > timeout {
+            i2c_stats.timeouts = i2c_stats.timeouts + 1
+            return 0
+        }
+
+        var status: u32 = i2c_read_reg32(base + BCM_BSC_S)
+
+        // Check for errors
+        if (status & BCM_BSC_S_ERR) != 0 {
+            i2c_stats.nacks = i2c_stats.nacks + 1
+            return 0
+        }
+
+        if (status & BCM_BSC_S_CLKT) != 0 {
+            i2c_stats.bus_errors = i2c_stats.bus_errors + 1
+            return 0
+        }
+
+        // Read data from FIFO
+        while ((status & BCM_BSC_S_RXD) != 0) && (received < len) {
+            var byte: u8 = i2c_read_reg32(base + BCM_BSC_FIFO) & 0xFF
+            @ptrToInt(buf + received, u8) = byte
+            received = received + 1
+            status = i2c_read_reg32(base + BCM_BSC_S)
+        }
+
+        // Check if done
+        if (status & BCM_BSC_S_DONE) != 0 {
+            break
+        }
+    }
+
+    // Read any remaining data
+    while (i2c_read_reg32(base + BCM_BSC_S) & BCM_BSC_S_RXD) != 0 {
+        if received >= len { break }
+        var byte: u8 = i2c_read_reg32(base + BCM_BSC_FIFO) & 0xFF
+        @ptrToInt(buf + received, u8) = byte
+        received = received + 1
+    }
+
+    // Clear done flag
+    i2c_write_reg32(base + BCM_BSC_S, BCM_BSC_S_DONE)
+
+    i2c_stats.bytes_received = i2c_stats.bytes_received + received
+    return received
+}
+
+// BCM2835 write operation
+fn i2c_bcm_write(controller: u8, addr: u16, buf: u64, len: u16): u32 {
+    var base: u64 = i2c_controllers[controller].base_addr
+    var timeout: u64 = i2c_controllers[controller].timeout
+
+    // Clear FIFOs and status
+    i2c_write_reg32(base + BCM_BSC_S, BCM_BSC_S_CLKT | BCM_BSC_S_ERR | BCM_BSC_S_DONE)
+    i2c_write_reg32(base + BCM_BSC_C, BCM_BSC_C_CLEAR)
+
+    // Set slave address
+    i2c_write_reg32(base + BCM_BSC_A, addr)
+
+    // Set data length
+    i2c_write_reg32(base + BCM_BSC_DLEN, len)
+
+    // Fill FIFO with initial data
+    var sent: u16 = 0
+    while sent < len {
+        if sent >= I2C_FIFO_SIZE { break }
+        i2c_write_reg32(base + BCM_BSC_FIFO, @intToPtr(buf + sent, u8))
+        sent = sent + 1
+    }
+
+    // Start write transfer
+    i2c_write_reg32(base + BCM_BSC_C, BCM_BSC_C_I2CEN | BCM_BSC_C_ST)
+
+    var start: u64 = foundation.timer_get_ticks()
+
+    while sent < len {
+        // Check timeout
+        if foundation.timer_get_ticks() - start > timeout {
+            i2c_stats.timeouts = i2c_stats.timeouts + 1
+            return 0
+        }
+
+        var status: u32 = i2c_read_reg32(base + BCM_BSC_S)
+
+        // Check for errors
+        if (status & BCM_BSC_S_ERR) != 0 {
+            i2c_stats.nacks = i2c_stats.nacks + 1
+            return 0
+        }
+
+        if (status & BCM_BSC_S_CLKT) != 0 {
+            i2c_stats.bus_errors = i2c_stats.bus_errors + 1
+            return 0
+        }
+
+        // Write data to FIFO
+        while ((status & BCM_BSC_S_TXD) != 0) && (sent < len) {
+            i2c_write_reg32(base + BCM_BSC_FIFO, @intToPtr(buf + sent, u8))
+            sent = sent + 1
+            status = i2c_read_reg32(base + BCM_BSC_S)
+        }
+    }
+
+    // Wait for transfer to complete
+    while 1 == 1 {
+        if foundation.timer_get_ticks() - start > timeout {
+            i2c_stats.timeouts = i2c_stats.timeouts + 1
+            return 0
+        }
+
+        var status: u32 = i2c_read_reg32(base + BCM_BSC_S)
+
+        if (status & BCM_BSC_S_ERR) != 0 {
+            i2c_stats.nacks = i2c_stats.nacks + 1
+            return 0
+        }
+
+        if (status & BCM_BSC_S_DONE) != 0 {
+            break
+        }
+    }
+
+    // Clear done flag
+    i2c_write_reg32(base + BCM_BSC_S, BCM_BSC_S_DONE)
+
+    i2c_stats.bytes_sent = i2c_stats.bytes_sent + sent
+    return sent
+}
+
+// Simple write to device
+export fn i2c_write(handle: u32, reg_addr: u8, data: u64, length: u32): u32 {
+    if handle >= MAX_I2C_DEVICES { return 0 }
+    if i2c_devices[handle].active == 0 { return 0 }
+
+    var controller: u8 = i2c_devices[handle].controller
+    var addr: u16 = i2c_devices[handle].address
+
+    // Prepare buffer with register address + data
+    var buf: [u8; 256]
+    buf[0] = reg_addr
+
+    var i: u32 = 0
+    while i < length {
+        if i >= 255 { break }
+        buf[i + 1] = @intToPtr(data + i, u8)
+        i = i + 1
+    }
+
+    return i2c_bcm_write(controller, addr, @ptrFromInt(buf), length + 1)
+}
+
+// Simple read from device
+export fn i2c_read(handle: u32, reg_addr: u8, buffer: u64, length: u32): u32 {
+    if handle >= MAX_I2C_DEVICES { return 0 }
+    if i2c_devices[handle].active == 0 { return 0 }
+
+    var controller: u8 = i2c_devices[handle].controller
+    var addr: u16 = i2c_devices[handle].address
+
+    // First write register address
+    var reg_buf: [u8; 1]
+    reg_buf[0] = reg_addr
+    if i2c_bcm_write(controller, addr, @ptrFromInt(reg_buf), 1) == 0 {
+        return 0
+    }
+
+    // Then read data
+    return i2c_bcm_read(controller, addr, buffer, length)
+}
+
+// Write single byte
+export fn i2c_write_byte(handle: u32, reg_addr: u8, data: u8): u32 {
+    var byte: [u8; 1]
+    byte[0] = data
+    return i2c_write(handle, reg_addr, @ptrFromInt(byte), 1)
+}
+
+// Read single byte
+export fn i2c_read_byte(handle: u32, reg_addr: u8): u8 {
+    var byte: [u8; 1]
+    if i2c_read(handle, reg_addr, @ptrFromInt(byte), 1) == 0 {
+        return 0
+    }
+    return byte[0]
+}
+
+// Write word (16-bit)
+export fn i2c_write_word(handle: u32, reg_addr: u8, data: u16): u32 {
+    var bytes: [u8; 2]
+    bytes[0] = (data >> 8) & 0xFF
+    bytes[1] = data & 0xFF
+    return i2c_write(handle, reg_addr, @ptrFromInt(bytes), 2)
+}
+
+// Read word (16-bit)
+export fn i2c_read_word(handle: u32, reg_addr: u8): u16 {
+    var bytes: [u8; 2]
+    if i2c_read(handle, reg_addr, @ptrFromInt(bytes), 2) == 0 {
+        return 0
+    }
+    return (bytes[0] << 8) | bytes[1]
+}
+
+// SMBus Quick Command
+export fn i2c_smbus_quick(handle: u32, read: u8): u32 {
+    if handle >= MAX_I2C_DEVICES { return 0 }
+    if i2c_devices[handle].active == 0 { return 0 }
+
+    var controller: u8 = i2c_devices[handle].controller
+    var addr: u16 = i2c_devices[handle].address
+
+    if read != 0 {
+        var dummy: [u8; 1]
+        return i2c_bcm_read(controller, addr, @ptrFromInt(dummy), 0)
+    } else {
+        return i2c_bcm_write(controller, addr, 0, 0)
+    }
+}
+
+// SMBus Block Read
+export fn i2c_smbus_block_read(handle: u32, command: u8, buffer: u64, max_len: u8): u32 {
+    if handle >= MAX_I2C_DEVICES { return 0 }
+    if i2c_devices[handle].active == 0 { return 0 }
+
+    var controller: u8 = i2c_devices[handle].controller
+    var addr: u16 = i2c_devices[handle].address
+
+    // Write command
+    var cmd: [u8; 1]
+    cmd[0] = command
+    if i2c_bcm_write(controller, addr, @ptrFromInt(cmd), 1) == 0 {
+        return 0
+    }
+
+    // Read length + data
+    var temp: [u8; 33]  // 1 byte length + 32 bytes max
+    var read_len: u32 = i2c_bcm_read(controller, addr, @ptrFromInt(temp), max_len + 1)
+    if read_len == 0 {
+        return 0
+    }
+
+    // First byte is the length
+    var data_len: u8 = temp[0]
+    if data_len > max_len { data_len = max_len }
+
+    // Copy data
+    var i: u32 = 0
+    while i < data_len {
+        @ptrToInt(buffer + i, u8) = temp[i + 1]
+        i = i + 1
+    }
+
+    return data_len
+}
+
+// SMBus Block Write
+export fn i2c_smbus_block_write(handle: u32, command: u8, data: u64, length: u8): u32 {
+    if handle >= MAX_I2C_DEVICES { return 0 }
+    if i2c_devices[handle].active == 0 { return 0 }
+    if length > 32 { return 0 }
+
+    var controller: u8 = i2c_devices[handle].controller
+    var addr: u16 = i2c_devices[handle].address
+
+    // Prepare buffer: command + length + data
+    var buf: [u8; 34]
+    buf[0] = command
+    buf[1] = length
+
+    var i: u32 = 0
+    while i < length {
+        buf[i + 2] = @intToPtr(data + i, u8)
+        i = i + 1
+    }
+
+    return i2c_bcm_write(controller, addr, @ptrFromInt(buf), length + 2)
+}
+
+// Scan bus for devices
+export fn i2c_scan(controller: u32, devices: u64, max_devices: u32): u32 {
+    if controller >= i2c_controller_count { return 0 }
+
+    var found: u32 = 0
+    var addr: u16 = 0x08  // Skip reserved addresses 0x00-0x07
+
+    while addr <= 0x77 {  // Skip reserved 0x78-0x7F
+        if found >= max_devices { break }
+
+        // Try quick write
+        var dummy: [u8; 1]
+        dummy[0] = 0
+
+        if i2c_controllers[controller].controller_type == I2C_CTRL_BCM2835 {
+            var result: u32 = i2c_bcm_write(controller, addr, @ptrFromInt(dummy), 1)
+            if result > 0 {
+                @ptrToInt(devices + (found * 2), u16) = addr
+                found = found + 1
+            }
+        }
+
+        addr = addr + 1
+    }
+
+    return found
+}
+
+// Check if device is present
+export fn i2c_probe(controller: u32, address: u16): u32 {
+    if controller >= i2c_controller_count { return 0 }
+
+    var dummy: [u8; 1]
+    dummy[0] = 0
+
+    if i2c_controllers[controller].controller_type == I2C_CTRL_BCM2835 {
+        return if i2c_bcm_write(controller, address, @ptrFromInt(dummy), 1) > 0 { 1 } else { 0 }
+    }
+
+    return 0
+}
+
+// Helper: Read register
+fn i2c_read_reg32(addr: u64): u32 {
+    return @intToPtr(addr, u32)
+}
+
+// Helper: Write register
+fn i2c_write_reg32(addr: u64, value: u32) {
+    @ptrToInt(addr, u32) = value
+}
+
+// Get statistics
+export fn i2c_get_stats(): u64 {
+    return @ptrFromInt(i2c_stats)
+}
+
+// Shutdown I2C
+export fn i2c_shutdown() {
+    if i2c_initialized == 0 { return }
+
+    // Disable all controllers
+    var i: u32 = 0
+    while i < i2c_controller_count {
+        if i2c_controllers[i].controller_type == I2C_CTRL_BCM2835 {
+            var base: u64 = i2c_controllers[i].base_addr
+            i2c_write_reg32(base + BCM_BSC_C, 0)  // Disable I2C
+        }
+        i2c_controllers[i].active = 0
+        i = i + 1
+    }
+
+    i2c_initialized = 0
+    foundation.serial_write_string("[I2C] Shutdown complete\n")
 }
