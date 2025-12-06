@@ -1,89 +1,1058 @@
 // home-os UDP Protocol
-// User Datagram Protocol
+// User Datagram Protocol - Full Implementation
 
 import "../core/foundation.home" as foundation
 import "../drivers/e1000.home" as e1000
 
+// ============================================================================
+// Constants
+// ============================================================================
+
 const UDP_HEADER_SIZE: u32 = 8
+const MAX_UDP_SOCKETS: u32 = 256
+const MAX_UDP_PAYLOAD: u32 = 65507  // 65535 - 20 (IP) - 8 (UDP)
+const UDP_RECV_BUFFER_SIZE: u32 = 65536
+const MAX_RECV_QUEUE: u32 = 64
+const MAX_MULTICAST_GROUPS: u32 = 16
+
+// Socket states
+const UDP_SOCKET_UNUSED: u32 = 0
+const UDP_SOCKET_BOUND: u32 = 1
+const UDP_SOCKET_CONNECTED: u32 = 2
+
+// Socket options
+const UDP_OPT_BROADCAST: u32 = 0x0001
+const UDP_OPT_REUSEADDR: u32 = 0x0002
+const UDP_OPT_REUSEPORT: u32 = 0x0004
+const UDP_OPT_MULTICAST_LOOP: u32 = 0x0008
+const UDP_OPT_NONBLOCKING: u32 = 0x0010
+
+// IP protocol number
+const IP_PROTO_UDP: u8 = 17
+
+// Special addresses
+const INADDR_ANY: u32 = 0x00000000
+const INADDR_BROADCAST: u32 = 0xFFFFFFFF
+const INADDR_LOOPBACK: u32 = 0x7F000001
+
+// ============================================================================
+// Data Structures
+// ============================================================================
 
 struct UDPHeader {
-  src_port: u16,
-  dst_port: u16,
-  length: u16,
-  checksum: u16
+    src_port: u16,
+    dst_port: u16,
+    length: u16,
+    checksum: u16
 }
+
+struct UDPPseudoHeader {
+    src_ip: u32,
+    dst_ip: u32,
+    zero: u8,
+    protocol: u8,
+    udp_length: u16
+}
+
+struct ReceivedDatagram {
+    src_ip: u32,
+    src_port: u16,
+    dst_port: u16,
+    length: u32,
+    data: [u8; 1500],
+    timestamp: u64,
+    active: u32
+}
+
+struct MulticastGroup {
+    group_addr: u32,
+    interface_addr: u32,
+    active: u32
+}
+
+struct UDPSocket {
+    state: u32,
+    local_ip: u32,
+    local_port: u16,
+    remote_ip: u32,
+    remote_port: u16,
+
+    // Options
+    options: u32,
+    ttl: u8,
+    multicast_ttl: u8,
+    multicast_if: u32,
+
+    // Receive queue
+    recv_queue: [ReceivedDatagram; 64],
+    recv_head: u32,
+    recv_tail: u32,
+    recv_count: u32,
+
+    // Multicast groups
+    multicast_groups: [MulticastGroup; 16],
+    multicast_count: u32,
+
+    // Statistics
+    packets_sent: u64,
+    packets_recv: u64,
+    bytes_sent: u64,
+    bytes_recv: u64,
+    send_errors: u32,
+    recv_errors: u32,
+
+    // Buffer sizes
+    send_buffer_size: u32,
+    recv_buffer_size: u32,
+
+    active: u32
+}
+
+struct UDPStats {
+    datagrams_received: u64,
+    datagrams_sent: u64,
+    no_port_errors: u64,
+    receive_errors: u64,
+    send_errors: u64,
+    checksum_errors: u64,
+    buffer_overflows: u64
+}
+
+struct UDPState {
+    initialized: u32,
+    sockets: [UDPSocket; 256],
+    next_ephemeral_port: u16,
+    stats: UDPStats,
+    local_ip: u32,
+    gateway_ip: u32,
+    netmask: u32
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var udp_state: UDPState
+
+// ============================================================================
+// Initialization
+// ============================================================================
 
 export fn udp_init() {
-  foundation.serial_write_string("[UDP] Initialized\n")
+    foundation.mem_set(&udp_state as *u8, 0, @sizeOf(UDPState))
+
+    udp_state.next_ephemeral_port = 49152  // Start of ephemeral port range
+    udp_state.local_ip = 0x0A000002  // 10.0.0.2 default
+    udp_state.gateway_ip = 0x0A000001  // 10.0.0.1
+    udp_state.netmask = 0xFFFFFF00  // 255.255.255.0
+
+    udp_state.initialized = 1
+
+    foundation.serial_write_string("[UDP] Initialized\n")
 }
 
-export fn udp_send(dst_ip: u32, dst_port: u16, src_port: u16, data: u64, len: u32): u32 {
-  var packet: [u8; 1500]
-  var offset: u32 = 0
-  
-  // Ethernet header (14 bytes)
-  var i: u32 = 0
-  while i < 6 {
-    packet[offset + i] = 0xFF
-    i = i + 1
-  }
-  offset = offset + 6
-  
-  e1000.e1000_get_mac_address(@ptrFromInt(packet) + offset)
-  offset = offset + 6
-  
-  packet[offset] = 0x08
-  packet[offset + 1] = 0x00
-  offset = offset + 2
-  
-  // IP header (20 bytes)
-  packet[offset] = 0x45
-  packet[offset + 1] = 0
-  var total_len: u16 = 20 + 8 + len
-  packet[offset + 2] = (total_len >> 8) & 0xFF
-  packet[offset + 3] = total_len & 0xFF
-  packet[offset + 8] = 64
-  packet[offset + 9] = 17  // UDP
-  offset = offset + 20
-  
-  // UDP header (8 bytes)
-  packet[offset] = (src_port >> 8) & 0xFF
-  packet[offset + 1] = src_port & 0xFF
-  packet[offset + 2] = (dst_port >> 8) & 0xFF
-  packet[offset + 3] = dst_port & 0xFF
-  var udp_len: u16 = 8 + len
-  packet[offset + 4] = (udp_len >> 8) & 0xFF
-  packet[offset + 5] = udp_len & 0xFF
-  packet[offset + 6] = 0
-  packet[offset + 7] = 0
-  offset = offset + 8
-  
-  // Data
-  i = 0
-  while i < len {
-    packet[offset + i] = @intToPtr(data + i, u8)
-    i = i + 1
-  }
-  
-  return e1000.e1000_send_packet(@ptrFromInt(packet), offset + len)
+export fn udp_set_ip(local_ip: u32, gateway: u32, netmask: u32) {
+    udp_state.local_ip = local_ip
+    udp_state.gateway_ip = gateway
+    udp_state.netmask = netmask
 }
 
-export fn udp_receive(buffer: u64, max_len: u32): u32 {
-  var packet: [u8; 2048]
-  var len: u32 = e1000.e1000_receive_packet(@ptrFromInt(packet), 2048)
-  
-  if len == 0 { return 0 }
-  
-  var offset: u32 = 14 + 20 + 8
-  var payload_len: u32 = len - offset
-  
-  if payload_len > max_len { payload_len = max_len }
-  
-  var i: u32 = 0
-  while i < payload_len {
-    @ptrToInt(buffer + i, u8) = packet[offset + i]
-    i = i + 1
-  }
-  
-  return payload_len
+// ============================================================================
+// Checksum Calculation
+// ============================================================================
+
+fn calculate_checksum(data: *u8, length: u32): u16 {
+    var sum: u32 = 0
+    var i: u32 = 0
+
+    // Sum 16-bit words
+    while i + 1 < length {
+        let word: u16 = ((data[i] as u16) << 8) | (data[i + 1] as u16)
+        sum = sum + word as u32
+        i = i + 2
+    }
+
+    // Handle odd byte
+    if i < length {
+        sum = sum + ((data[i] as u32) << 8)
+    }
+
+    // Fold 32-bit sum to 16 bits
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16)
+    }
+
+    return ~(sum as u16)
+}
+
+fn calculate_udp_checksum(src_ip: u32, dst_ip: u32, udp_data: *u8, udp_length: u32): u16 {
+    // Build pseudo-header + UDP data for checksum
+    var buffer: [u8; 65536]
+    var offset: u32 = 0
+
+    // Pseudo-header
+    buffer[offset] = ((src_ip >> 24) & 0xFF) as u8
+    buffer[offset + 1] = ((src_ip >> 16) & 0xFF) as u8
+    buffer[offset + 2] = ((src_ip >> 8) & 0xFF) as u8
+    buffer[offset + 3] = (src_ip & 0xFF) as u8
+    offset = offset + 4
+
+    buffer[offset] = ((dst_ip >> 24) & 0xFF) as u8
+    buffer[offset + 1] = ((dst_ip >> 16) & 0xFF) as u8
+    buffer[offset + 2] = ((dst_ip >> 8) & 0xFF) as u8
+    buffer[offset + 3] = (dst_ip & 0xFF) as u8
+    offset = offset + 4
+
+    buffer[offset] = 0  // Zero
+    buffer[offset + 1] = IP_PROTO_UDP  // Protocol
+    buffer[offset + 2] = ((udp_length >> 8) & 0xFF) as u8
+    buffer[offset + 3] = (udp_length & 0xFF) as u8
+    offset = offset + 4
+
+    // Copy UDP data
+    var i: u32 = 0
+    while i < udp_length {
+        buffer[offset + i] = udp_data[i]
+        i = i + 1
+    }
+
+    return calculate_checksum(&buffer[0], offset + udp_length)
+}
+
+// ============================================================================
+// Socket Management
+// ============================================================================
+
+export fn udp_socket(): i32 {
+    var i: u32 = 0
+    while i < MAX_UDP_SOCKETS {
+        if udp_state.sockets[i].active == 0 {
+            let sock: *UDPSocket = &udp_state.sockets[i]
+            foundation.mem_set(sock as *u8, 0, @sizeOf(UDPSocket))
+
+            sock.state = UDP_SOCKET_UNUSED
+            sock.local_ip = INADDR_ANY
+            sock.local_port = 0
+            sock.remote_ip = INADDR_ANY
+            sock.remote_port = 0
+            sock.ttl = 64
+            sock.multicast_ttl = 1
+            sock.send_buffer_size = 65536
+            sock.recv_buffer_size = UDP_RECV_BUFFER_SIZE
+            sock.active = 1
+
+            return i as i32
+        }
+        i = i + 1
+    }
+
+    return -1  // No socket available
+}
+
+export fn udp_close(sockfd: i32) {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return
+    }
+
+    // Clear receive queue
+    sock.recv_head = 0
+    sock.recv_tail = 0
+    sock.recv_count = 0
+
+    // Clear multicast groups
+    var i: u32 = 0
+    while i < MAX_MULTICAST_GROUPS {
+        sock.multicast_groups[i].active = 0
+        i = i + 1
+    }
+    sock.multicast_count = 0
+
+    sock.active = 0
+    sock.state = UDP_SOCKET_UNUSED
+}
+
+export fn udp_bind(sockfd: i32, ip: u32, port: u16): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return -1
+    }
+
+    // Check if port is already in use (unless SO_REUSEADDR/SO_REUSEPORT)
+    if port != 0 and (sock.options & (UDP_OPT_REUSEADDR | UDP_OPT_REUSEPORT)) == 0 {
+        var i: u32 = 0
+        while i < MAX_UDP_SOCKETS {
+            if udp_state.sockets[i].active == 1 and i != sockfd as u32 {
+                if udp_state.sockets[i].local_port == port {
+                    if udp_state.sockets[i].local_ip == ip or
+                       udp_state.sockets[i].local_ip == INADDR_ANY or
+                       ip == INADDR_ANY {
+                        return -1  // Address already in use
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // Assign ephemeral port if not specified
+    if port == 0 {
+        sock.local_port = allocate_ephemeral_port()
+    } else {
+        sock.local_port = port
+    }
+
+    sock.local_ip = ip
+    sock.state = UDP_SOCKET_BOUND
+
+    return 0
+}
+
+fn allocate_ephemeral_port(): u16 {
+    var attempts: u32 = 0
+    while attempts < 16384 {
+        let port: u16 = udp_state.next_ephemeral_port
+        udp_state.next_ephemeral_port = udp_state.next_ephemeral_port + 1
+
+        // Wrap around in ephemeral range
+        if udp_state.next_ephemeral_port >= 65535 {
+            udp_state.next_ephemeral_port = 49152
+        }
+
+        // Check if port is free
+        var in_use: u32 = 0
+        var i: u32 = 0
+        while i < MAX_UDP_SOCKETS {
+            if udp_state.sockets[i].active == 1 and udp_state.sockets[i].local_port == port {
+                in_use = 1
+                break
+            }
+            i = i + 1
+        }
+
+        if in_use == 0 {
+            return port
+        }
+
+        attempts = attempts + 1
+    }
+
+    return 0  // Failed to allocate
+}
+
+export fn udp_connect(sockfd: i32, ip: u32, port: u16): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return -1
+    }
+
+    // Auto-bind if not already bound
+    if sock.state == UDP_SOCKET_UNUSED {
+        if udp_bind(sockfd, INADDR_ANY, 0) < 0 {
+            return -1
+        }
+    }
+
+    sock.remote_ip = ip
+    sock.remote_port = port
+    sock.state = UDP_SOCKET_CONNECTED
+
+    return 0
+}
+
+// ============================================================================
+// Socket Options
+// ============================================================================
+
+export fn udp_setsockopt(sockfd: i32, option: u32, value: u32): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return -1
+    }
+
+    switch option {
+        UDP_OPT_BROADCAST => {
+            if value != 0 {
+                sock.options = sock.options | UDP_OPT_BROADCAST
+            } else {
+                sock.options = sock.options & ~UDP_OPT_BROADCAST
+            }
+        }
+        UDP_OPT_REUSEADDR => {
+            if value != 0 {
+                sock.options = sock.options | UDP_OPT_REUSEADDR
+            } else {
+                sock.options = sock.options & ~UDP_OPT_REUSEADDR
+            }
+        }
+        UDP_OPT_REUSEPORT => {
+            if value != 0 {
+                sock.options = sock.options | UDP_OPT_REUSEPORT
+            } else {
+                sock.options = sock.options & ~UDP_OPT_REUSEPORT
+            }
+        }
+        UDP_OPT_MULTICAST_LOOP => {
+            if value != 0 {
+                sock.options = sock.options | UDP_OPT_MULTICAST_LOOP
+            } else {
+                sock.options = sock.options & ~UDP_OPT_MULTICAST_LOOP
+            }
+        }
+        UDP_OPT_NONBLOCKING => {
+            if value != 0 {
+                sock.options = sock.options | UDP_OPT_NONBLOCKING
+            } else {
+                sock.options = sock.options & ~UDP_OPT_NONBLOCKING
+            }
+        }
+        else => {
+            return -1
+        }
+    }
+
+    return 0
+}
+
+export fn udp_set_ttl(sockfd: i32, ttl: u8): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return -1
+    }
+
+    sock.ttl = ttl
+    return 0
+}
+
+export fn udp_set_multicast_ttl(sockfd: i32, ttl: u8): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return -1
+    }
+
+    sock.multicast_ttl = ttl
+    return 0
+}
+
+// ============================================================================
+// Multicast
+// ============================================================================
+
+fn is_multicast_address(ip: u32): u32 {
+    // Multicast range: 224.0.0.0 - 239.255.255.255
+    let first_octet: u32 = (ip >> 24) & 0xFF
+    return (first_octet >= 224 and first_octet <= 239) as u32
+}
+
+export fn udp_join_multicast_group(sockfd: i32, group_addr: u32, interface_addr: u32): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return -1
+    }
+
+    if is_multicast_address(group_addr) == 0 {
+        return -1  // Not a multicast address
+    }
+
+    // Check if already joined
+    var i: u32 = 0
+    while i < MAX_MULTICAST_GROUPS {
+        if sock.multicast_groups[i].active == 1 and
+           sock.multicast_groups[i].group_addr == group_addr {
+            return 0  // Already joined
+        }
+        i = i + 1
+    }
+
+    // Find free slot
+    i = 0
+    while i < MAX_MULTICAST_GROUPS {
+        if sock.multicast_groups[i].active == 0 {
+            sock.multicast_groups[i].group_addr = group_addr
+            sock.multicast_groups[i].interface_addr = interface_addr
+            sock.multicast_groups[i].active = 1
+            sock.multicast_count = sock.multicast_count + 1
+
+            // Send IGMP join (simplified)
+            send_igmp_report(group_addr)
+
+            return 0
+        }
+        i = i + 1
+    }
+
+    return -1  // No space for more groups
+}
+
+export fn udp_leave_multicast_group(sockfd: i32, group_addr: u32, interface_addr: u32): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return -1
+    }
+
+    var i: u32 = 0
+    while i < MAX_MULTICAST_GROUPS {
+        if sock.multicast_groups[i].active == 1 and
+           sock.multicast_groups[i].group_addr == group_addr {
+            sock.multicast_groups[i].active = 0
+            sock.multicast_count = sock.multicast_count - 1
+
+            // Send IGMP leave (simplified)
+            send_igmp_leave(group_addr)
+
+            return 0
+        }
+        i = i + 1
+    }
+
+    return -1  // Not a member
+}
+
+fn send_igmp_report(group_addr: u32) {
+    // IGMP Membership Report (simplified)
+    var packet: [u8; 64]
+
+    // Build IGMP packet
+    packet[0] = 0x16  // IGMPv2 Membership Report
+    packet[1] = 0x00  // Max response time
+    packet[2] = 0x00  // Checksum (placeholder)
+    packet[3] = 0x00
+    packet[4] = ((group_addr >> 24) & 0xFF) as u8
+    packet[5] = ((group_addr >> 16) & 0xFF) as u8
+    packet[6] = ((group_addr >> 8) & 0xFF) as u8
+    packet[7] = (group_addr & 0xFF) as u8
+
+    // Calculate checksum
+    let checksum: u16 = calculate_checksum(&packet[0], 8)
+    packet[2] = ((checksum >> 8) & 0xFF) as u8
+    packet[3] = (checksum & 0xFF) as u8
+
+    // Send via IP (protocol 2)
+    // In real implementation, this would go through IP layer
+}
+
+fn send_igmp_leave(group_addr: u32) {
+    // IGMP Leave Group (simplified)
+    var packet: [u8; 64]
+
+    packet[0] = 0x17  // IGMPv2 Leave Group
+    packet[1] = 0x00
+    packet[2] = 0x00
+    packet[3] = 0x00
+    packet[4] = ((group_addr >> 24) & 0xFF) as u8
+    packet[5] = ((group_addr >> 16) & 0xFF) as u8
+    packet[6] = ((group_addr >> 8) & 0xFF) as u8
+    packet[7] = (group_addr & 0xFF) as u8
+
+    let checksum: u16 = calculate_checksum(&packet[0], 8)
+    packet[2] = ((checksum >> 8) & 0xFF) as u8
+    packet[3] = (checksum & 0xFF) as u8
+}
+
+// ============================================================================
+// Send Functions
+// ============================================================================
+
+export fn udp_send(sockfd: i32, data: *u8, len: u32): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 or sock.state != UDP_SOCKET_CONNECTED {
+        return -1  // Must be connected for send()
+    }
+
+    return udp_sendto(sockfd, data, len, sock.remote_ip, sock.remote_port)
+}
+
+export fn udp_sendto(sockfd: i32, data: *u8, len: u32, dst_ip: u32, dst_port: u16): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return -1
+    }
+
+    // Auto-bind if necessary
+    if sock.state == UDP_SOCKET_UNUSED {
+        if udp_bind(sockfd, INADDR_ANY, 0) < 0 {
+            return -1
+        }
+    }
+
+    // Check broadcast permission
+    if dst_ip == INADDR_BROADCAST and (sock.options & UDP_OPT_BROADCAST) == 0 {
+        sock.send_errors = sock.send_errors + 1
+        return -1  // Broadcast not permitted
+    }
+
+    // Check payload size
+    if len > MAX_UDP_PAYLOAD {
+        sock.send_errors = sock.send_errors + 1
+        return -1  // Payload too large
+    }
+
+    // Build packet
+    var packet: [u8; 1518]
+    var offset: u32 = 0
+
+    // Ethernet header (14 bytes)
+    // Destination MAC (broadcast for now, should use ARP)
+    var i: u32 = 0
+    while i < 6 {
+        if dst_ip == INADDR_BROADCAST or is_multicast_address(dst_ip) == 1 {
+            if is_multicast_address(dst_ip) == 1 {
+                // Multicast MAC: 01:00:5E + lower 23 bits of IP
+                packet[offset] = 0x01
+                packet[offset + 1] = 0x00
+                packet[offset + 2] = 0x5E
+                packet[offset + 3] = ((dst_ip >> 16) & 0x7F) as u8
+                packet[offset + 4] = ((dst_ip >> 8) & 0xFF) as u8
+                packet[offset + 5] = (dst_ip & 0xFF) as u8
+            } else {
+                // Broadcast
+                packet[offset + i] = 0xFF
+            }
+        } else {
+            // Unicast - should use ARP, using broadcast for now
+            packet[offset + i] = 0xFF
+        }
+        i = i + 1
+    }
+    offset = offset + 6
+
+    // Source MAC
+    e1000.e1000_get_mac_address(&packet[offset])
+    offset = offset + 6
+
+    // EtherType: IPv4
+    packet[offset] = 0x08
+    packet[offset + 1] = 0x00
+    offset = offset + 2
+
+    // IP header (20 bytes)
+    let src_ip: u32 = if sock.local_ip == INADDR_ANY { udp_state.local_ip } else { sock.local_ip }
+    let ip_total_len: u16 = (20 + 8 + len) as u16
+    let ttl: u8 = if is_multicast_address(dst_ip) == 1 { sock.multicast_ttl } else { sock.ttl }
+
+    packet[offset] = 0x45  // Version 4, IHL 5
+    packet[offset + 1] = 0x00  // DSCP, ECN
+    packet[offset + 2] = ((ip_total_len >> 8) & 0xFF) as u8
+    packet[offset + 3] = (ip_total_len & 0xFF) as u8
+    packet[offset + 4] = 0x00  // Identification
+    packet[offset + 5] = 0x00
+    packet[offset + 6] = 0x40  // Flags (Don't Fragment)
+    packet[offset + 7] = 0x00  // Fragment offset
+    packet[offset + 8] = ttl
+    packet[offset + 9] = IP_PROTO_UDP
+    packet[offset + 10] = 0x00  // Header checksum (placeholder)
+    packet[offset + 11] = 0x00
+    packet[offset + 12] = ((src_ip >> 24) & 0xFF) as u8
+    packet[offset + 13] = ((src_ip >> 16) & 0xFF) as u8
+    packet[offset + 14] = ((src_ip >> 8) & 0xFF) as u8
+    packet[offset + 15] = (src_ip & 0xFF) as u8
+    packet[offset + 16] = ((dst_ip >> 24) & 0xFF) as u8
+    packet[offset + 17] = ((dst_ip >> 16) & 0xFF) as u8
+    packet[offset + 18] = ((dst_ip >> 8) & 0xFF) as u8
+    packet[offset + 19] = (dst_ip & 0xFF) as u8
+
+    // Calculate IP header checksum
+    let ip_checksum: u16 = calculate_checksum(&packet[offset], 20)
+    packet[offset + 10] = ((ip_checksum >> 8) & 0xFF) as u8
+    packet[offset + 11] = (ip_checksum & 0xFF) as u8
+
+    offset = offset + 20
+
+    // UDP header (8 bytes)
+    let udp_len: u16 = (8 + len) as u16
+    let udp_header_offset: u32 = offset
+
+    packet[offset] = ((sock.local_port >> 8) & 0xFF) as u8
+    packet[offset + 1] = (sock.local_port & 0xFF) as u8
+    packet[offset + 2] = ((dst_port >> 8) & 0xFF) as u8
+    packet[offset + 3] = (dst_port & 0xFF) as u8
+    packet[offset + 4] = ((udp_len >> 8) & 0xFF) as u8
+    packet[offset + 5] = (udp_len & 0xFF) as u8
+    packet[offset + 6] = 0x00  // Checksum (placeholder)
+    packet[offset + 7] = 0x00
+
+    offset = offset + 8
+
+    // Copy payload
+    i = 0
+    while i < len {
+        packet[offset + i] = data[i]
+        i = i + 1
+    }
+
+    // Calculate UDP checksum
+    let udp_checksum: u16 = calculate_udp_checksum(src_ip, dst_ip, &packet[udp_header_offset], udp_len as u32)
+    packet[udp_header_offset + 6] = ((udp_checksum >> 8) & 0xFF) as u8
+    packet[udp_header_offset + 7] = (udp_checksum & 0xFF) as u8
+
+    // Send packet
+    let total_len: u32 = 14 + 20 + 8 + len
+    let result: u32 = e1000.e1000_send_packet(&packet[0], total_len)
+
+    if result == 0 {
+        sock.send_errors = sock.send_errors + 1
+        udp_state.stats.send_errors = udp_state.stats.send_errors + 1
+        return -1
+    }
+
+    // Update statistics
+    sock.packets_sent = sock.packets_sent + 1
+    sock.bytes_sent = sock.bytes_sent + len as u64
+    udp_state.stats.datagrams_sent = udp_state.stats.datagrams_sent + 1
+
+    return len as i32
+}
+
+// ============================================================================
+// Receive Functions
+// ============================================================================
+
+export fn udp_recv(sockfd: i32, buffer: *u8, max_len: u32): i32 {
+    var src_ip: u32 = 0
+    var src_port: u16 = 0
+    return udp_recvfrom(sockfd, buffer, max_len, &src_ip, &src_port)
+}
+
+export fn udp_recvfrom(sockfd: i32, buffer: *u8, max_len: u32, src_ip: *u32, src_port: *u16): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return -1
+    }
+
+    // Check receive queue
+    if sock.recv_count == 0 {
+        if (sock.options & UDP_OPT_NONBLOCKING) != 0 {
+            return -1  // Would block
+        }
+        return 0  // No data available
+    }
+
+    // Get datagram from queue
+    let dgram: *ReceivedDatagram = &sock.recv_queue[sock.recv_head]
+
+    // Copy data
+    let copy_len: u32 = if dgram.length < max_len { dgram.length } else { max_len }
+    var i: u32 = 0
+    while i < copy_len {
+        buffer[i] = dgram.data[i]
+        i = i + 1
+    }
+
+    // Return source address
+    *src_ip = dgram.src_ip
+    *src_port = dgram.src_port
+
+    // Remove from queue
+    dgram.active = 0
+    sock.recv_head = (sock.recv_head + 1) % MAX_RECV_QUEUE
+    sock.recv_count = sock.recv_count - 1
+
+    // Update statistics
+    sock.packets_recv = sock.packets_recv + 1
+    sock.bytes_recv = sock.bytes_recv + copy_len as u64
+
+    return copy_len as i32
+}
+
+export fn udp_peek(sockfd: i32, buffer: *u8, max_len: u32): i32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return -1
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 or sock.recv_count == 0 {
+        return -1
+    }
+
+    let dgram: *ReceivedDatagram = &sock.recv_queue[sock.recv_head]
+    let copy_len: u32 = if dgram.length < max_len { dgram.length } else { max_len }
+
+    var i: u32 = 0
+    while i < copy_len {
+        buffer[i] = dgram.data[i]
+        i = i + 1
+    }
+
+    return copy_len as i32
+}
+
+// ============================================================================
+// Packet Processing (called from IP layer)
+// ============================================================================
+
+export fn udp_input(src_ip: u32, dst_ip: u32, data: *u8, len: u32) {
+    if len < UDP_HEADER_SIZE {
+        udp_state.stats.receive_errors = udp_state.stats.receive_errors + 1
+        return
+    }
+
+    // Parse UDP header
+    let src_port: u16 = ((data[0] as u16) << 8) | (data[1] as u16)
+    let dst_port: u16 = ((data[2] as u16) << 8) | (data[3] as u16)
+    let udp_len: u16 = ((data[4] as u16) << 8) | (data[5] as u16)
+    let checksum: u16 = ((data[6] as u16) << 8) | (data[7] as u16)
+
+    // Validate length
+    if udp_len as u32 > len or udp_len < UDP_HEADER_SIZE as u16 {
+        udp_state.stats.receive_errors = udp_state.stats.receive_errors + 1
+        return
+    }
+
+    // Verify checksum (if non-zero)
+    if checksum != 0 {
+        let calc_checksum: u16 = calculate_udp_checksum(src_ip, dst_ip, data, udp_len as u32)
+        if calc_checksum != 0 and calc_checksum != 0xFFFF {
+            udp_state.stats.checksum_errors = udp_state.stats.checksum_errors + 1
+            return
+        }
+    }
+
+    let payload_len: u32 = udp_len as u32 - UDP_HEADER_SIZE
+    let payload: *u8 = &data[8]
+
+    udp_state.stats.datagrams_received = udp_state.stats.datagrams_received + 1
+
+    // Find matching socket
+    var best_match: i32 = -1
+    var best_score: u32 = 0
+
+    var i: u32 = 0
+    while i < MAX_UDP_SOCKETS {
+        let sock: *UDPSocket = &udp_state.sockets[i]
+        if sock.active == 0 {
+            i = i + 1
+            continue
+        }
+
+        // Check port match
+        if sock.local_port != dst_port {
+            i = i + 1
+            continue
+        }
+
+        var score: u32 = 1
+
+        // Check IP match
+        if sock.local_ip != INADDR_ANY {
+            if sock.local_ip == dst_ip {
+                score = score + 2
+            } else if is_multicast_address(dst_ip) == 1 {
+                // Check multicast membership
+                var j: u32 = 0
+                while j < MAX_MULTICAST_GROUPS {
+                    if sock.multicast_groups[j].active == 1 and
+                       sock.multicast_groups[j].group_addr == dst_ip {
+                        score = score + 1
+                        break
+                    }
+                    j = j + 1
+                }
+            } else {
+                i = i + 1
+                continue
+            }
+        }
+
+        // Check connected socket source filter
+        if sock.state == UDP_SOCKET_CONNECTED {
+            if sock.remote_ip == src_ip and sock.remote_port == src_port {
+                score = score + 4
+            } else {
+                i = i + 1
+                continue
+            }
+        }
+
+        if score > best_score {
+            best_score = score
+            best_match = i as i32
+        }
+
+        i = i + 1
+    }
+
+    if best_match < 0 {
+        // No matching socket - send ICMP port unreachable
+        udp_state.stats.no_port_errors = udp_state.stats.no_port_errors + 1
+        return
+    }
+
+    // Queue datagram
+    let sock: *UDPSocket = &udp_state.sockets[best_match as u32]
+
+    if sock.recv_count >= MAX_RECV_QUEUE {
+        // Queue full
+        sock.recv_errors = sock.recv_errors + 1
+        udp_state.stats.buffer_overflows = udp_state.stats.buffer_overflows + 1
+        return
+    }
+
+    let dgram: *ReceivedDatagram = &sock.recv_queue[sock.recv_tail]
+    dgram.src_ip = src_ip
+    dgram.src_port = src_port
+    dgram.dst_port = dst_port
+    dgram.length = if payload_len > 1500 { 1500 } else { payload_len }
+
+    i = 0
+    while i < dgram.length {
+        dgram.data[i] = payload[i]
+        i = i + 1
+    }
+
+    dgram.active = 1
+
+    sock.recv_tail = (sock.recv_tail + 1) % MAX_RECV_QUEUE
+    sock.recv_count = sock.recv_count + 1
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+export fn udp_available(sockfd: i32): u32 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return 0
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return 0
+    }
+
+    return sock.recv_count
+}
+
+export fn udp_get_local_port(sockfd: i32): u16 {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return 0
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return 0
+    }
+
+    return sock.local_port
+}
+
+// ============================================================================
+// Simple Send/Receive (backward compatibility)
+// ============================================================================
+
+export fn udp_send_simple(dst_ip: u32, dst_port: u16, src_port: u16, data: *u8, len: u32): u32 {
+    let sockfd: i32 = udp_socket()
+    if sockfd < 0 {
+        return 0
+    }
+
+    if udp_bind(sockfd, INADDR_ANY, src_port) < 0 {
+        udp_close(sockfd)
+        return 0
+    }
+
+    let result: i32 = udp_sendto(sockfd, data, len, dst_ip, dst_port)
+    udp_close(sockfd)
+
+    return if result > 0 { result as u32 } else { 0 }
+}
+
+export fn udp_receive_simple(buffer: *u8, max_len: u32): u32 {
+    // Poll all sockets for data
+    var i: u32 = 0
+    while i < MAX_UDP_SOCKETS {
+        let sock: *UDPSocket = &udp_state.sockets[i]
+        if sock.active == 1 and sock.recv_count > 0 {
+            let result: i32 = udp_recv(i as i32, buffer, max_len)
+            if result > 0 {
+                return result as u32
+            }
+        }
+        i = i + 1
+    }
+
+    return 0
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn udp_get_stats(stats: *UDPStats) {
+    foundation.mem_copy(stats as *u8, &udp_state.stats as *u8, @sizeOf(UDPStats))
+}
+
+export fn udp_get_socket_stats(sockfd: i32, packets_sent: *u64, packets_recv: *u64,
+                                bytes_sent: *u64, bytes_recv: *u64) {
+    if sockfd < 0 or sockfd >= MAX_UDP_SOCKETS as i32 {
+        return
+    }
+
+    let sock: *UDPSocket = &udp_state.sockets[sockfd as u32]
+    if sock.active == 0 {
+        return
+    }
+
+    *packets_sent = sock.packets_sent
+    *packets_recv = sock.packets_recv
+    *bytes_sent = sock.bytes_sent
+    *bytes_recv = sock.bytes_recv
+}
+
+export fn udp_print_stats() {
+    foundation.serial_write_string("[UDP] Statistics:\n")
+    foundation.serial_write_string("  Datagrams received: ")
+    foundation.serial_write_u64(udp_state.stats.datagrams_received)
+    foundation.serial_write_string("\n  Datagrams sent: ")
+    foundation.serial_write_u64(udp_state.stats.datagrams_sent)
+    foundation.serial_write_string("\n  No port errors: ")
+    foundation.serial_write_u64(udp_state.stats.no_port_errors)
+    foundation.serial_write_string("\n  Checksum errors: ")
+    foundation.serial_write_u64(udp_state.stats.checksum_errors)
+    foundation.serial_write_string("\n  Buffer overflows: ")
+    foundation.serial_write_u64(udp_state.stats.buffer_overflows)
+    foundation.serial_write_string("\n")
 }

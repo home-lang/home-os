@@ -1,71 +1,1611 @@
 // home-os GPU Driver
-// Graphics acceleration
+// Full software rasterizer implementation
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
 
+// Display configuration
+const DEFAULT_WIDTH: u32 = 1920
+const DEFAULT_HEIGHT: u32 = 1080
+const DEFAULT_BPP: u32 = 32
+const MAX_TEXTURES: u32 = 256
+const MAX_VERTICES: u32 = 65536
+
+// GPU commands
+const GPU_CMD_NOP: u32 = 0
 const GPU_CMD_CLEAR: u32 = 1
 const GPU_CMD_DRAW_RECT: u32 = 2
 const GPU_CMD_DRAW_TRIANGLE: u32 = 3
 const GPU_CMD_BLIT: u32 = 4
+const GPU_CMD_DRAW_LINE: u32 = 5
+const GPU_CMD_DRAW_CIRCLE: u32 = 6
+const GPU_CMD_DRAW_PIXEL: u32 = 7
+const GPU_CMD_COPY_RECT: u32 = 8
+const GPU_CMD_DRAW_TEXT: u32 = 9
 
-struct GpuCommand {
-  cmd: u32,
-  x: u32,
-  y: u32,
-  width: u32,
-  height: u32,
-  color: u32
+// Blend modes
+const BLEND_NONE: u32 = 0
+const BLEND_ALPHA: u32 = 1
+const BLEND_ADDITIVE: u32 = 2
+const BLEND_MULTIPLY: u32 = 3
+const BLEND_SCREEN: u32 = 4
+
+// Texture formats
+const TEX_FORMAT_RGBA8888: u32 = 0
+const TEX_FORMAT_RGB888: u32 = 1
+const TEX_FORMAT_RGB565: u32 = 2
+const TEX_FORMAT_A8: u32 = 3
+
+// Color components
+struct Color {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8
 }
 
-var gpu_initialized: u32 = 0
-var gpu_memory: u64 = 0
-var gpu_command_buffer: u64 = 0
-
-export fn gpu_init() {
-  if gpu_initialized == 1 { return }
-  
-  gpu_memory = memory.kmalloc(1024 * 1024)  // 1MB VRAM
-  gpu_command_buffer = memory.kmalloc(4096)
-  
-  if gpu_memory == 0 or gpu_command_buffer == 0 {
-    foundation.serial_write_string("[GPU] Failed to allocate memory\n")
-    return
-  }
-  
-  gpu_initialized = 1
-  foundation.serial_write_string("[GPU] Initialized\n")
+// 2D vertex
+struct Vertex2D {
+    x: i32,
+    y: i32,
+    u: f32,          // Texture coordinate
+    v: f32,
+    color: u32
 }
+
+// 3D vertex for software 3D rendering
+struct Vertex3D {
+    x: f32,
+    y: f32,
+    z: f32,
+    w: f32,
+    u: f32,
+    v: f32,
+    nx: f32,         // Normal
+    ny: f32,
+    nz: f32,
+    color: u32
+}
+
+// Triangle for rasterization
+struct Triangle {
+    v0: Vertex3D,
+    v1: Vertex3D,
+    v2: Vertex3D,
+    texture_id: u32
+}
+
+// Texture descriptor
+struct Texture {
+    width: u32,
+    height: u32,
+    format: u32,
+    data: u64,
+    stride: u32,
+    flags: u32,
+    in_use: u32
+}
+
+// Rectangle structure
+struct Rect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32
+}
+
+// Framebuffer descriptor
+struct Framebuffer {
+    width: u32,
+    height: u32,
+    pitch: u32,
+    bpp: u32,
+    data: u64,
+    size: u64
+}
+
+// GPU state
+struct GpuState {
+    initialized: u32,
+    width: u32,
+    height: u32,
+    bpp: u32,
+
+    // Double buffering
+    front_buffer: u64,
+    back_buffer: u64,
+    buffer_size: u64,
+    current_buffer: u32,    // 0 = front, 1 = back
+
+    // Z-buffer for depth testing
+    zbuffer: u64,
+    zbuffer_enabled: u32,
+
+    // Clipping rectangle
+    clip_x: i32,
+    clip_y: i32,
+    clip_width: u32,
+    clip_height: u32,
+    clipping_enabled: u32,
+
+    // Current drawing state
+    blend_mode: u32,
+    current_color: u32,
+    current_texture: u32,
+
+    // Statistics
+    pixels_drawn: u64,
+    triangles_drawn: u64,
+    frames_rendered: u64
+}
+
+// Texture storage
+var textures: [Texture; 256]
+
+// Global GPU state
+var gpu: GpuState
+
+// VGA/VESA framebuffer address (set by bootloader)
+var vga_framebuffer: u64 = 0xFD000000
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn gpu_init(): i32 {
+    return gpu_init_with_mode(DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_BPP)
+}
+
+export fn gpu_init_with_mode(width: u32, height: u32, bpp: u32): i32 {
+    if gpu.initialized == 1 {
+        return 0  // Already initialized
+    }
+
+    gpu.width = width
+    gpu.height = height
+    gpu.bpp = bpp
+
+    // Calculate buffer size
+    let pitch: u32 = width * (bpp / 8)
+    gpu.buffer_size = pitch as u64 * height as u64
+
+    // Allocate double buffers
+    gpu.front_buffer = memory.kmalloc(gpu.buffer_size)
+    gpu.back_buffer = memory.kmalloc(gpu.buffer_size)
+
+    if gpu.front_buffer == 0 or gpu.back_buffer == 0 {
+        foundation.serial_write_string("[GPU] Failed to allocate framebuffers\n")
+        return -1
+    }
+
+    // Allocate Z-buffer (16-bit depth per pixel)
+    let zbuffer_size: u64 = (width as u64) * (height as u64) * 2
+    gpu.zbuffer = memory.kmalloc(zbuffer_size)
+
+    if gpu.zbuffer == 0 {
+        foundation.serial_write_string("[GPU] Failed to allocate Z-buffer\n")
+        return -1
+    }
+
+    // Initialize state
+    gpu.current_buffer = 1  // Draw to back buffer
+    gpu.zbuffer_enabled = 0
+    gpu.blend_mode = BLEND_NONE
+    gpu.current_color = 0xFFFFFFFF
+    gpu.current_texture = 0xFFFFFFFF
+
+    // Set default clipping to full screen
+    gpu.clip_x = 0
+    gpu.clip_y = 0
+    gpu.clip_width = width
+    gpu.clip_height = height
+    gpu.clipping_enabled = 1
+
+    // Initialize texture slots
+    var i: u32 = 0
+    while i < MAX_TEXTURES {
+        textures[i].in_use = 0
+        i = i + 1
+    }
+
+    // Clear both buffers
+    gpu.initialized = 1
+    gpu_clear(0xFF000000)  // Clear to black
+    gpu_present()
+    gpu_clear(0xFF000000)
+
+    foundation.serial_write_string("[GPU] Initialized ")
+    foundation.serial_write_u32(width)
+    foundation.serial_write_string("x")
+    foundation.serial_write_u32(height)
+    foundation.serial_write_string("x")
+    foundation.serial_write_u32(bpp)
+    foundation.serial_write_string("\n")
+
+    return 0
+}
+
+export fn gpu_shutdown() {
+    if gpu.initialized == 0 { return }
+
+    if gpu.front_buffer != 0 {
+        memory.kfree(gpu.front_buffer)
+    }
+    if gpu.back_buffer != 0 {
+        memory.kfree(gpu.back_buffer)
+    }
+    if gpu.zbuffer != 0 {
+        memory.kfree(gpu.zbuffer)
+    }
+
+    // Free textures
+    var i: u32 = 0
+    while i < MAX_TEXTURES {
+        if textures[i].in_use == 1 and textures[i].data != 0 {
+            memory.kfree(textures[i].data)
+        }
+        i = i + 1
+    }
+
+    gpu.initialized = 0
+    foundation.serial_write_string("[GPU] Shutdown\n")
+}
+
+// ============================================================================
+// Color Utilities
+// ============================================================================
+
+fn color_from_rgba(r: u8, g: u8, b: u8, a: u8): u32 {
+    return ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+fn color_to_components(color: u32): Color {
+    var c: Color
+    c.a = ((color >> 24) & 0xFF) as u8
+    c.r = ((color >> 16) & 0xFF) as u8
+    c.g = ((color >> 8) & 0xFF) as u8
+    c.b = (color & 0xFF) as u8
+    return c
+}
+
+fn blend_colors(src: u32, dst: u32, mode: u32): u32 {
+    if mode == BLEND_NONE {
+        return src
+    }
+
+    let s: Color = color_to_components(src)
+    let d: Color = color_to_components(dst)
+    var result: Color
+
+    if mode == BLEND_ALPHA {
+        // Standard alpha blending: out = src * alpha + dst * (1 - alpha)
+        let alpha: u32 = s.a as u32
+        let inv_alpha: u32 = 255 - alpha
+
+        result.r = (((s.r as u32) * alpha + (d.r as u32) * inv_alpha) / 255) as u8
+        result.g = (((s.g as u32) * alpha + (d.g as u32) * inv_alpha) / 255) as u8
+        result.b = (((s.b as u32) * alpha + (d.b as u32) * inv_alpha) / 255) as u8
+        result.a = 255
+    } else if mode == BLEND_ADDITIVE {
+        // Additive: out = src + dst (clamped)
+        let r: u32 = (s.r as u32) + (d.r as u32)
+        let g: u32 = (s.g as u32) + (d.g as u32)
+        let b: u32 = (s.b as u32) + (d.b as u32)
+
+        result.r = if r > 255 { 255 } else { r as u8 }
+        result.g = if g > 255 { 255 } else { g as u8 }
+        result.b = if b > 255 { 255 } else { b as u8 }
+        result.a = 255
+    } else if mode == BLEND_MULTIPLY {
+        // Multiply: out = src * dst / 255
+        result.r = (((s.r as u32) * (d.r as u32)) / 255) as u8
+        result.g = (((s.g as u32) * (d.g as u32)) / 255) as u8
+        result.b = (((s.b as u32) * (d.b as u32)) / 255) as u8
+        result.a = 255
+    } else if mode == BLEND_SCREEN {
+        // Screen: out = 1 - (1 - src) * (1 - dst)
+        result.r = (255 - ((255 - s.r as u32) * (255 - d.r as u32) / 255)) as u8
+        result.g = (255 - ((255 - s.g as u32) * (255 - d.g as u32) / 255)) as u8
+        result.b = (255 - ((255 - s.b as u32) * (255 - d.b as u32) / 255)) as u8
+        result.a = 255
+    } else {
+        return src
+    }
+
+    return color_from_rgba(result.r, result.g, result.b, result.a)
+}
+
+// ============================================================================
+// Clipping
+// ============================================================================
+
+fn clip_point(x: i32, y: i32): bool {
+    if gpu.clipping_enabled == 0 { return true }
+
+    return x >= gpu.clip_x and
+           x < (gpu.clip_x + gpu.clip_width as i32) and
+           y >= gpu.clip_y and
+           y < (gpu.clip_y + gpu.clip_height as i32)
+}
+
+// Cohen-Sutherland line clipping
+const CLIP_INSIDE: u32 = 0
+const CLIP_LEFT: u32 = 1
+const CLIP_RIGHT: u32 = 2
+const CLIP_BOTTOM: u32 = 4
+const CLIP_TOP: u32 = 8
+
+fn compute_outcode(x: i32, y: i32): u32 {
+    var code: u32 = CLIP_INSIDE
+
+    if x < gpu.clip_x {
+        code = code | CLIP_LEFT
+    } else if x >= (gpu.clip_x + gpu.clip_width as i32) {
+        code = code | CLIP_RIGHT
+    }
+
+    if y < gpu.clip_y {
+        code = code | CLIP_TOP
+    } else if y >= (gpu.clip_y + gpu.clip_height as i32) {
+        code = code | CLIP_BOTTOM
+    }
+
+    return code
+}
+
+export fn gpu_set_clip_rect(x: i32, y: i32, width: u32, height: u32) {
+    gpu.clip_x = x
+    gpu.clip_y = y
+    gpu.clip_width = width
+    gpu.clip_height = height
+    gpu.clipping_enabled = 1
+}
+
+export fn gpu_disable_clipping() {
+    gpu.clipping_enabled = 0
+}
+
+export fn gpu_enable_clipping() {
+    gpu.clipping_enabled = 1
+}
+
+// ============================================================================
+// Buffer Management
+// ============================================================================
+
+fn get_draw_buffer(): u64 {
+    if gpu.current_buffer == 0 {
+        return gpu.front_buffer
+    } else {
+        return gpu.back_buffer
+    }
+}
+
+fn get_pixel_offset(x: u32, y: u32): u64 {
+    let bytes_per_pixel: u32 = gpu.bpp / 8
+    return (y as u64) * (gpu.width as u64) * (bytes_per_pixel as u64) +
+           (x as u64) * (bytes_per_pixel as u64)
+}
+
+// ============================================================================
+// Pixel Operations
+// ============================================================================
+
+fn put_pixel_fast(x: u32, y: u32, color: u32) {
+    if x >= gpu.width or y >= gpu.height { return }
+
+    let buffer: u64 = get_draw_buffer()
+    let offset: u64 = get_pixel_offset(x, y)
+
+    let ptr: *volatile u32 = (buffer + offset) as *volatile u32
+    *ptr = color
+
+    gpu.pixels_drawn = gpu.pixels_drawn + 1
+}
+
+fn put_pixel_blended(x: u32, y: u32, color: u32) {
+    if x >= gpu.width or y >= gpu.height { return }
+
+    let buffer: u64 = get_draw_buffer()
+    let offset: u64 = get_pixel_offset(x, y)
+
+    let ptr: *volatile u32 = (buffer + offset) as *volatile u32
+
+    if gpu.blend_mode == BLEND_NONE {
+        *ptr = color
+    } else {
+        let dst: u32 = *ptr
+        *ptr = blend_colors(color, dst, gpu.blend_mode)
+    }
+
+    gpu.pixels_drawn = gpu.pixels_drawn + 1
+}
+
+export fn gpu_draw_pixel(x: i32, y: i32, color: u32) {
+    if gpu.initialized == 0 { return }
+    if not clip_point(x, y) { return }
+
+    put_pixel_blended(x as u32, y as u32, color)
+}
+
+fn get_pixel(x: u32, y: u32): u32 {
+    if x >= gpu.width or y >= gpu.height { return 0 }
+
+    let buffer: u64 = get_draw_buffer()
+    let offset: u64 = get_pixel_offset(x, y)
+
+    let ptr: *volatile u32 = (buffer + offset) as *volatile u32
+    return *ptr
+}
+
+// ============================================================================
+// Z-Buffer Operations
+// ============================================================================
+
+export fn gpu_enable_depth_test() {
+    gpu.zbuffer_enabled = 1
+}
+
+export fn gpu_disable_depth_test() {
+    gpu.zbuffer_enabled = 0
+}
+
+fn clear_zbuffer() {
+    if gpu.zbuffer == 0 { return }
+
+    let size: u64 = (gpu.width as u64) * (gpu.height as u64) * 2
+    memory.memset(gpu.zbuffer as *u8, 0xFF, size)  // Set to max depth
+}
+
+fn depth_test(x: u32, y: u32, z: u16): bool {
+    if gpu.zbuffer_enabled == 0 { return true }
+    if x >= gpu.width or y >= gpu.height { return false }
+
+    let offset: u64 = ((y as u64) * (gpu.width as u64) + (x as u64)) * 2
+    let ptr: *volatile u16 = (gpu.zbuffer + offset) as *volatile u16
+
+    let current_z: u16 = *ptr
+    if z < current_z {
+        *ptr = z
+        return true
+    }
+    return false
+}
+
+// ============================================================================
+// Clear Operations
+// ============================================================================
 
 export fn gpu_clear(color: u32) {
-  if gpu_initialized == 0 { return }
-  
-  var cmd: GpuCommand
-  cmd.cmd = GPU_CMD_CLEAR
-  cmd.color = color
-  
-  // Submit command (stub)
+    if gpu.initialized == 0 { return }
+
+    let buffer: u64 = get_draw_buffer()
+    let pixel_count: u64 = (gpu.width as u64) * (gpu.height as u64)
+
+    // Fill with 32-bit color
+    var ptr: *volatile u32 = buffer as *volatile u32
+    var i: u64 = 0
+    while i < pixel_count {
+        *ptr = color
+        ptr = (ptr as u64 + 4) as *volatile u32
+        i = i + 1
+    }
+
+    // Also clear Z-buffer
+    if gpu.zbuffer_enabled == 1 {
+        clear_zbuffer()
+    }
 }
 
-export fn gpu_draw_rect(x: u32, y: u32, width: u32, height: u32, color: u32) {
-  if gpu_initialized == 0 { return }
-  
-  var cmd: GpuCommand
-  cmd.cmd = GPU_CMD_DRAW_RECT
-  cmd.x = x
-  cmd.y = y
-  cmd.width = width
-  cmd.height = height
-  cmd.color = color
-  
-  // Submit command (stub)
+export fn gpu_clear_rect(x: i32, y: i32, width: u32, height: u32, color: u32) {
+    if gpu.initialized == 0 { return }
+
+    var start_x: i32 = x
+    var start_y: i32 = y
+    var end_x: i32 = x + width as i32
+    var end_y: i32 = y + height as i32
+
+    // Clip to screen bounds
+    if start_x < 0 { start_x = 0 }
+    if start_y < 0 { start_y = 0 }
+    if end_x > gpu.width as i32 { end_x = gpu.width as i32 }
+    if end_y > gpu.height as i32 { end_y = gpu.height as i32 }
+
+    var py: i32 = start_y
+    while py < end_y {
+        var px: i32 = start_x
+        while px < end_x {
+            put_pixel_fast(px as u32, py as u32, color)
+            px = px + 1
+        }
+        py = py + 1
+    }
 }
+
+// ============================================================================
+// Line Drawing - Bresenham's Algorithm
+// ============================================================================
+
+export fn gpu_draw_line(x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+    if gpu.initialized == 0 { return }
+
+    var dx: i32 = x1 - x0
+    var dy: i32 = y1 - y0
+
+    // Get absolute values
+    if dx < 0 { dx = -dx }
+    if dy < 0 { dy = -dy }
+
+    var sx: i32 = if x0 < x1 { 1 } else { -1 }
+    var sy: i32 = if y0 < y1 { 1 } else { -1 }
+
+    var err: i32 = dx - dy
+    var cx: i32 = x0
+    var cy: i32 = y0
+
+    loop {
+        if clip_point(cx, cy) {
+            put_pixel_blended(cx as u32, cy as u32, color)
+        }
+
+        if cx == x1 and cy == y1 { break }
+
+        let e2: i32 = err * 2
+
+        if e2 > -dy {
+            err = err - dy
+            cx = cx + sx
+        }
+
+        if e2 < dx {
+            err = err + dx
+            cy = cy + sy
+        }
+    }
+}
+
+// Anti-aliased line using Wu's algorithm
+export fn gpu_draw_line_aa(x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+    if gpu.initialized == 0 { return }
+
+    var dx: i32 = x1 - x0
+    var dy: i32 = y1 - y0
+
+    let steep: bool = if dy < 0 { -dy > dx or -dy > -dx } else { dy > dx or dy > -dx }
+
+    var ax0: i32 = x0
+    var ay0: i32 = y0
+    var ax1: i32 = x1
+    var ay1: i32 = y1
+
+    if steep {
+        // Swap x and y
+        let tmp: i32 = ax0
+        ax0 = ay0
+        ay0 = tmp
+
+        let tmp2: i32 = ax1
+        ax1 = ay1
+        ay1 = tmp2
+    }
+
+    if ax0 > ax1 {
+        let tmp: i32 = ax0
+        ax0 = ax1
+        ax1 = tmp
+
+        let tmp2: i32 = ay0
+        ay0 = ay1
+        ay1 = tmp2
+    }
+
+    dx = ax1 - ax0
+    dy = ay1 - ay0
+
+    var gradient: f32 = if dx == 0 { 1.0 } else { (dy as f32) / (dx as f32) }
+
+    // First endpoint
+    var xend: f32 = ax0 as f32
+    var yend: f32 = ay0 as f32 + gradient * (xend - ax0 as f32)
+    var xpxl1: i32 = ax0
+    var ypxl1: i32 = yend as i32
+
+    let c: Color = color_to_components(color)
+
+    // Draw main line
+    var intery: f32 = yend + gradient
+    var x: i32 = xpxl1 + 1
+
+    while x < ax1 {
+        let y: i32 = intery as i32
+        let frac: f32 = intery - (y as f32)
+
+        let alpha1: u8 = ((1.0 - frac) * 255.0) as u8
+        let alpha2: u8 = (frac * 255.0) as u8
+
+        if steep {
+            if clip_point(y, x) {
+                put_pixel_blended(y as u32, x as u32, color_from_rgba(c.r, c.g, c.b, alpha1))
+            }
+            if clip_point(y + 1, x) {
+                put_pixel_blended((y + 1) as u32, x as u32, color_from_rgba(c.r, c.g, c.b, alpha2))
+            }
+        } else {
+            if clip_point(x, y) {
+                put_pixel_blended(x as u32, y as u32, color_from_rgba(c.r, c.g, c.b, alpha1))
+            }
+            if clip_point(x, y + 1) {
+                put_pixel_blended(x as u32, (y + 1) as u32, color_from_rgba(c.r, c.g, c.b, alpha2))
+            }
+        }
+
+        intery = intery + gradient
+        x = x + 1
+    }
+}
+
+// ============================================================================
+// Rectangle Drawing
+// ============================================================================
+
+export fn gpu_draw_rect(x: i32, y: i32, width: u32, height: u32, color: u32) {
+    if gpu.initialized == 0 { return }
+    if width == 0 or height == 0 { return }
+
+    // Draw outline only
+    gpu_draw_line(x, y, x + width as i32 - 1, y, color)  // Top
+    gpu_draw_line(x, y + height as i32 - 1, x + width as i32 - 1, y + height as i32 - 1, color)  // Bottom
+    gpu_draw_line(x, y, x, y + height as i32 - 1, color)  // Left
+    gpu_draw_line(x + width as i32 - 1, y, x + width as i32 - 1, y + height as i32 - 1, color)  // Right
+}
+
+export fn gpu_fill_rect(x: i32, y: i32, width: u32, height: u32, color: u32) {
+    if gpu.initialized == 0 { return }
+    if width == 0 or height == 0 { return }
+
+    var start_x: i32 = x
+    var start_y: i32 = y
+    var end_x: i32 = x + width as i32
+    var end_y: i32 = y + height as i32
+
+    // Clip to screen bounds
+    if gpu.clipping_enabled == 1 {
+        if start_x < gpu.clip_x { start_x = gpu.clip_x }
+        if start_y < gpu.clip_y { start_y = gpu.clip_y }
+        if end_x > gpu.clip_x + gpu.clip_width as i32 { end_x = gpu.clip_x + gpu.clip_width as i32 }
+        if end_y > gpu.clip_y + gpu.clip_height as i32 { end_y = gpu.clip_y + gpu.clip_height as i32 }
+    }
+
+    if start_x < 0 { start_x = 0 }
+    if start_y < 0 { start_y = 0 }
+    if end_x > gpu.width as i32 { end_x = gpu.width as i32 }
+    if end_y > gpu.height as i32 { end_y = gpu.height as i32 }
+
+    if start_x >= end_x or start_y >= end_y { return }
+
+    var py: i32 = start_y
+    while py < end_y {
+        var px: i32 = start_x
+        while px < end_x {
+            put_pixel_blended(px as u32, py as u32, color)
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+// Rounded rectangle
+export fn gpu_fill_rounded_rect(x: i32, y: i32, width: u32, height: u32, radius: u32, color: u32) {
+    if gpu.initialized == 0 { return }
+
+    // Clamp radius
+    var r: u32 = radius
+    if r > width / 2 { r = width / 2 }
+    if r > height / 2 { r = height / 2 }
+
+    // Fill main body
+    gpu_fill_rect(x + r as i32, y, width - r * 2, height, color)
+    gpu_fill_rect(x, y + r as i32, width, height - r * 2, color)
+
+    // Fill corners with circles
+    gpu_fill_circle(x + r as i32, y + r as i32, r, color)
+    gpu_fill_circle(x + width as i32 - r as i32 - 1, y + r as i32, r, color)
+    gpu_fill_circle(x + r as i32, y + height as i32 - r as i32 - 1, r, color)
+    gpu_fill_circle(x + width as i32 - r as i32 - 1, y + height as i32 - r as i32 - 1, r, color)
+}
+
+// ============================================================================
+// Circle Drawing - Midpoint Algorithm
+// ============================================================================
+
+export fn gpu_draw_circle(cx: i32, cy: i32, radius: u32, color: u32) {
+    if gpu.initialized == 0 { return }
+    if radius == 0 { return }
+
+    var x: i32 = radius as i32
+    var y: i32 = 0
+    var d: i32 = 1 - (radius as i32)
+
+    while x >= y {
+        // Draw 8 octants
+        if clip_point(cx + x, cy + y) { put_pixel_blended((cx + x) as u32, (cy + y) as u32, color) }
+        if clip_point(cx - x, cy + y) { put_pixel_blended((cx - x) as u32, (cy + y) as u32, color) }
+        if clip_point(cx + x, cy - y) { put_pixel_blended((cx + x) as u32, (cy - y) as u32, color) }
+        if clip_point(cx - x, cy - y) { put_pixel_blended((cx - x) as u32, (cy - y) as u32, color) }
+        if clip_point(cx + y, cy + x) { put_pixel_blended((cx + y) as u32, (cy + x) as u32, color) }
+        if clip_point(cx - y, cy + x) { put_pixel_blended((cx - y) as u32, (cy + x) as u32, color) }
+        if clip_point(cx + y, cy - x) { put_pixel_blended((cx + y) as u32, (cy - x) as u32, color) }
+        if clip_point(cx - y, cy - x) { put_pixel_blended((cx - y) as u32, (cy - x) as u32, color) }
+
+        y = y + 1
+
+        if d <= 0 {
+            d = d + 2 * y + 1
+        } else {
+            x = x - 1
+            d = d + 2 * (y - x) + 1
+        }
+    }
+}
+
+export fn gpu_fill_circle(cx: i32, cy: i32, radius: u32, color: u32) {
+    if gpu.initialized == 0 { return }
+    if radius == 0 { return }
+
+    var x: i32 = radius as i32
+    var y: i32 = 0
+    var d: i32 = 1 - (radius as i32)
+
+    while x >= y {
+        // Draw horizontal lines for each octant pair
+        gpu_draw_line(cx - x, cy + y, cx + x, cy + y, color)
+        gpu_draw_line(cx - x, cy - y, cx + x, cy - y, color)
+        gpu_draw_line(cx - y, cy + x, cx + y, cy + x, color)
+        gpu_draw_line(cx - y, cy - x, cx + y, cy - x, color)
+
+        y = y + 1
+
+        if d <= 0 {
+            d = d + 2 * y + 1
+        } else {
+            x = x - 1
+            d = d + 2 * (y - x) + 1
+        }
+    }
+}
+
+// ============================================================================
+// Triangle Rasterization - Scanline Algorithm
+// ============================================================================
+
+export fn gpu_draw_triangle(x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) {
+    if gpu.initialized == 0 { return }
+
+    gpu_draw_line(x0, y0, x1, y1, color)
+    gpu_draw_line(x1, y1, x2, y2, color)
+    gpu_draw_line(x2, y2, x0, y0, color)
+}
+
+fn fill_flat_bottom_triangle(x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) {
+    let inv_slope1: f32 = ((x1 - x0) as f32) / ((y1 - y0) as f32)
+    let inv_slope2: f32 = ((x2 - x0) as f32) / ((y2 - y0) as f32)
+
+    var curx1: f32 = x0 as f32
+    var curx2: f32 = x0 as f32
+
+    var scanline_y: i32 = y0
+    while scanline_y <= y1 {
+        let start_x: i32 = curx1 as i32
+        let end_x: i32 = curx2 as i32
+
+        if start_x <= end_x {
+            gpu_draw_line(start_x, scanline_y, end_x, scanline_y, color)
+        } else {
+            gpu_draw_line(end_x, scanline_y, start_x, scanline_y, color)
+        }
+
+        curx1 = curx1 + inv_slope1
+        curx2 = curx2 + inv_slope2
+        scanline_y = scanline_y + 1
+    }
+}
+
+fn fill_flat_top_triangle(x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) {
+    let inv_slope1: f32 = ((x2 - x0) as f32) / ((y2 - y0) as f32)
+    let inv_slope2: f32 = ((x2 - x1) as f32) / ((y2 - y1) as f32)
+
+    var curx1: f32 = x2 as f32
+    var curx2: f32 = x2 as f32
+
+    var scanline_y: i32 = y2
+    while scanline_y > y0 {
+        let start_x: i32 = curx1 as i32
+        let end_x: i32 = curx2 as i32
+
+        if start_x <= end_x {
+            gpu_draw_line(start_x, scanline_y, end_x, scanline_y, color)
+        } else {
+            gpu_draw_line(end_x, scanline_y, start_x, scanline_y, color)
+        }
+
+        curx1 = curx1 - inv_slope1
+        curx2 = curx2 - inv_slope2
+        scanline_y = scanline_y - 1
+    }
+}
+
+export fn gpu_fill_triangle(x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) {
+    if gpu.initialized == 0 { return }
+
+    // Sort vertices by y coordinate
+    var vx0: i32 = x0
+    var vy0: i32 = y0
+    var vx1: i32 = x1
+    var vy1: i32 = y1
+    var vx2: i32 = x2
+    var vy2: i32 = y2
+
+    // Sort by y
+    if vy0 > vy1 {
+        var tmp: i32 = vx0
+        vx0 = vx1
+        vx1 = tmp
+        tmp = vy0
+        vy0 = vy1
+        vy1 = tmp
+    }
+    if vy0 > vy2 {
+        var tmp: i32 = vx0
+        vx0 = vx2
+        vx2 = tmp
+        tmp = vy0
+        vy0 = vy2
+        vy2 = tmp
+    }
+    if vy1 > vy2 {
+        var tmp: i32 = vx1
+        vx1 = vx2
+        vx2 = tmp
+        tmp = vy1
+        vy1 = vy2
+        vy2 = tmp
+    }
+
+    if vy1 == vy2 {
+        // Flat bottom triangle
+        fill_flat_bottom_triangle(vx0, vy0, vx1, vy1, vx2, vy2, color)
+    } else if vy0 == vy1 {
+        // Flat top triangle
+        fill_flat_top_triangle(vx0, vy0, vx1, vy1, vx2, vy2, color)
+    } else {
+        // Split into flat-bottom and flat-top
+        let vx3: i32 = (vx0 as f32 + ((vy1 - vy0) as f32 / (vy2 - vy0) as f32) * (vx2 - vx0) as f32) as i32
+        let vy3: i32 = vy1
+
+        fill_flat_bottom_triangle(vx0, vy0, vx1, vy1, vx3, vy3, color)
+        fill_flat_top_triangle(vx1, vy1, vx3, vy3, vx2, vy2, color)
+    }
+
+    gpu.triangles_drawn = gpu.triangles_drawn + 1
+}
+
+// ============================================================================
+// Textured Triangle with Perspective Correction
+// ============================================================================
+
+export fn gpu_fill_triangle_textured(
+    x0: i32, y0: i32, u0: f32, v0: f32,
+    x1: i32, y1: i32, u1: f32, v1: f32,
+    x2: i32, y2: i32, u2: f32, v2: f32,
+    texture_id: u32
+) {
+    if gpu.initialized == 0 { return }
+    if texture_id >= MAX_TEXTURES { return }
+    if textures[texture_id].in_use == 0 { return }
+
+    // Sort vertices by y coordinate
+    var vx0: i32 = x0
+    var vy0: i32 = y0
+    var tu0: f32 = u0
+    var tv0: f32 = v0
+    var vx1: i32 = x1
+    var vy1: i32 = y1
+    var tu1: f32 = u1
+    var tv1: f32 = v1
+    var vx2: i32 = x2
+    var vy2: i32 = y2
+    var tu2: f32 = u2
+    var tv2: f32 = v2
+
+    // Sort by y (bubble sort with UV coords)
+    if vy0 > vy1 {
+        var tmp: i32 = vx0
+        vx0 = vx1
+        vx1 = tmp
+        tmp = vy0
+        vy0 = vy1
+        vy1 = tmp
+        var tmpf: f32 = tu0
+        tu0 = tu1
+        tu1 = tmpf
+        tmpf = tv0
+        tv0 = tv1
+        tv1 = tmpf
+    }
+    if vy0 > vy2 {
+        var tmp: i32 = vx0
+        vx0 = vx2
+        vx2 = tmp
+        tmp = vy0
+        vy0 = vy2
+        vy2 = tmp
+        var tmpf: f32 = tu0
+        tu0 = tu2
+        tu2 = tmpf
+        tmpf = tv0
+        tv0 = tv2
+        tv2 = tmpf
+    }
+    if vy1 > vy2 {
+        var tmp: i32 = vx1
+        vx1 = vx2
+        vx2 = tmp
+        tmp = vy1
+        vy1 = vy2
+        vy2 = tmp
+        var tmpf: f32 = tu1
+        tu1 = tu2
+        tu2 = tmpf
+        tmpf = tv1
+        tv1 = tv2
+        tv2 = tmpf
+    }
+
+    let tex: *Texture = &textures[texture_id]
+    let total_height: i32 = vy2 - vy0
+
+    if total_height == 0 { return }
+
+    var y: i32 = vy0
+    while y <= vy2 {
+        let second_half: bool = y > vy1 or vy1 == vy0
+        let segment_height: i32 = if second_half { vy2 - vy1 } else { vy1 - vy0 }
+
+        if segment_height == 0 {
+            y = y + 1
+            continue
+        }
+
+        let alpha: f32 = (y - vy0) as f32 / total_height as f32
+        let beta: f32 = if second_half {
+            (y - vy1) as f32 / segment_height as f32
+        } else {
+            (y - vy0) as f32 / segment_height as f32
+        }
+
+        // Interpolate x positions
+        var ax: i32 = (vx0 as f32 + (vx2 - vx0) as f32 * alpha) as i32
+        var bx: i32 = if second_half {
+            (vx1 as f32 + (vx2 - vx1) as f32 * beta) as i32
+        } else {
+            (vx0 as f32 + (vx1 - vx0) as f32 * beta) as i32
+        }
+
+        // Interpolate UV coordinates
+        var au: f32 = tu0 + (tu2 - tu0) * alpha
+        var av: f32 = tv0 + (tv2 - tv0) * alpha
+        var bu: f32 = if second_half {
+            tu1 + (tu2 - tu1) * beta
+        } else {
+            tu0 + (tu1 - tu0) * beta
+        }
+        var bv: f32 = if second_half {
+            tv1 + (tv2 - tv1) * beta
+        } else {
+            tv0 + (tv1 - tv0) * beta
+        }
+
+        // Ensure ax <= bx
+        if ax > bx {
+            var tmp: i32 = ax
+            ax = bx
+            bx = tmp
+            var tmpf: f32 = au
+            au = bu
+            bu = tmpf
+            tmpf = av
+            av = bv
+            bv = tmpf
+        }
+
+        // Draw scanline with texture
+        let span_width: i32 = bx - ax
+        if span_width > 0 {
+            var x: i32 = ax
+            while x <= bx {
+                if clip_point(x, y) {
+                    let t: f32 = (x - ax) as f32 / span_width as f32
+                    let u: f32 = au + (bu - au) * t
+                    let v: f32 = av + (bv - av) * t
+
+                    let color: u32 = sample_texture(tex, u, v)
+                    put_pixel_blended(x as u32, y as u32, color)
+                }
+                x = x + 1
+            }
+        }
+
+        y = y + 1
+    }
+
+    gpu.triangles_drawn = gpu.triangles_drawn + 1
+}
+
+// ============================================================================
+// Texture Management
+// ============================================================================
+
+export fn gpu_create_texture(width: u32, height: u32, format: u32): i32 {
+    // Find free slot
+    var slot: i32 = -1
+    var i: u32 = 0
+    while i < MAX_TEXTURES {
+        if textures[i].in_use == 0 {
+            slot = i as i32
+            break
+        }
+        i = i + 1
+    }
+
+    if slot == -1 {
+        return -1  // No free slots
+    }
+
+    // Calculate size based on format
+    var bytes_per_pixel: u32 = 4
+    if format == TEX_FORMAT_RGB888 {
+        bytes_per_pixel = 3
+    } else if format == TEX_FORMAT_RGB565 {
+        bytes_per_pixel = 2
+    } else if format == TEX_FORMAT_A8 {
+        bytes_per_pixel = 1
+    }
+
+    let size: u64 = (width as u64) * (height as u64) * (bytes_per_pixel as u64)
+    let data: u64 = memory.kmalloc(size)
+
+    if data == 0 {
+        return -1
+    }
+
+    textures[slot as u32].width = width
+    textures[slot as u32].height = height
+    textures[slot as u32].format = format
+    textures[slot as u32].data = data
+    textures[slot as u32].stride = width * bytes_per_pixel
+    textures[slot as u32].flags = 0
+    textures[slot as u32].in_use = 1
+
+    return slot
+}
+
+export fn gpu_destroy_texture(texture_id: u32) {
+    if texture_id >= MAX_TEXTURES { return }
+    if textures[texture_id].in_use == 0 { return }
+
+    if textures[texture_id].data != 0 {
+        memory.kfree(textures[texture_id].data)
+    }
+
+    textures[texture_id].in_use = 0
+}
+
+export fn gpu_update_texture(texture_id: u32, data: *u8, size: u64) {
+    if texture_id >= MAX_TEXTURES { return }
+    if textures[texture_id].in_use == 0 { return }
+
+    let tex: *Texture = &textures[texture_id]
+    memory.memcpy(tex.data as *u8, data, size)
+}
+
+fn sample_texture(tex: *Texture, u: f32, v: f32): u32 {
+    // Clamp UV coordinates
+    var cu: f32 = u
+    var cv: f32 = v
+
+    if cu < 0.0 { cu = 0.0 }
+    if cu > 1.0 { cu = 1.0 }
+    if cv < 0.0 { cv = 0.0 }
+    if cv > 1.0 { cv = 1.0 }
+
+    let tx: u32 = (cu * (tex.width - 1) as f32) as u32
+    let ty: u32 = (cv * (tex.height - 1) as f32) as u32
+
+    if tex.format == TEX_FORMAT_RGBA8888 {
+        let offset: u64 = (ty as u64) * (tex.stride as u64) + (tx as u64) * 4
+        let ptr: *volatile u32 = (tex.data + offset) as *volatile u32
+        return *ptr
+    } else if tex.format == TEX_FORMAT_RGB888 {
+        let offset: u64 = (ty as u64) * (tex.stride as u64) + (tx as u64) * 3
+        let ptr: *u8 = (tex.data + offset) as *u8
+        let r: u8 = *ptr
+        let g: u8 = *(ptr as u64 + 1) as *u8
+        let b: u8 = *(ptr as u64 + 2) as *u8
+        return color_from_rgba(r, g, b, 255)
+    } else if tex.format == TEX_FORMAT_RGB565 {
+        let offset: u64 = (ty as u64) * (tex.stride as u64) + (tx as u64) * 2
+        let ptr: *volatile u16 = (tex.data + offset) as *volatile u16
+        let pixel: u16 = *ptr
+        let r: u8 = ((pixel >> 11) & 0x1F) as u8 * 8
+        let g: u8 = ((pixel >> 5) & 0x3F) as u8 * 4
+        let b: u8 = (pixel & 0x1F) as u8 * 8
+        return color_from_rgba(r, g, b, 255)
+    } else if tex.format == TEX_FORMAT_A8 {
+        let offset: u64 = (ty as u64) * (tex.stride as u64) + (tx as u64)
+        let ptr: *u8 = (tex.data + offset) as *u8
+        let a: u8 = *ptr
+        return color_from_rgba(255, 255, 255, a)
+    }
+
+    return 0xFFFF00FF  // Magenta for unsupported format
+}
+
+// Bilinear texture sampling
+fn sample_texture_bilinear(tex: *Texture, u: f32, v: f32): u32 {
+    // Clamp UV coordinates
+    var cu: f32 = u
+    var cv: f32 = v
+
+    if cu < 0.0 { cu = 0.0 }
+    if cu > 1.0 { cu = 1.0 }
+    if cv < 0.0 { cv = 0.0 }
+    if cv > 1.0 { cv = 1.0 }
+
+    let fx: f32 = cu * (tex.width - 1) as f32
+    let fy: f32 = cv * (tex.height - 1) as f32
+
+    let x0: u32 = fx as u32
+    let y0: u32 = fy as u32
+    let x1: u32 = if x0 + 1 < tex.width { x0 + 1 } else { x0 }
+    let y1: u32 = if y0 + 1 < tex.height { y0 + 1 } else { y0 }
+
+    let xfrac: f32 = fx - (x0 as f32)
+    let yfrac: f32 = fy - (y0 as f32)
+
+    // Sample 4 texels
+    let c00: Color = color_to_components(sample_texture_at(tex, x0, y0))
+    let c10: Color = color_to_components(sample_texture_at(tex, x1, y0))
+    let c01: Color = color_to_components(sample_texture_at(tex, x0, y1))
+    let c11: Color = color_to_components(sample_texture_at(tex, x1, y1))
+
+    // Bilinear interpolation
+    let r: u8 = ((c00.r as f32 * (1.0 - xfrac) * (1.0 - yfrac) +
+                  c10.r as f32 * xfrac * (1.0 - yfrac) +
+                  c01.r as f32 * (1.0 - xfrac) * yfrac +
+                  c11.r as f32 * xfrac * yfrac)) as u8
+
+    let g: u8 = ((c00.g as f32 * (1.0 - xfrac) * (1.0 - yfrac) +
+                  c10.g as f32 * xfrac * (1.0 - yfrac) +
+                  c01.g as f32 * (1.0 - xfrac) * yfrac +
+                  c11.g as f32 * xfrac * yfrac)) as u8
+
+    let b: u8 = ((c00.b as f32 * (1.0 - xfrac) * (1.0 - yfrac) +
+                  c10.b as f32 * xfrac * (1.0 - yfrac) +
+                  c01.b as f32 * (1.0 - xfrac) * yfrac +
+                  c11.b as f32 * xfrac * yfrac)) as u8
+
+    let a: u8 = ((c00.a as f32 * (1.0 - xfrac) * (1.0 - yfrac) +
+                  c10.a as f32 * xfrac * (1.0 - yfrac) +
+                  c01.a as f32 * (1.0 - xfrac) * yfrac +
+                  c11.a as f32 * xfrac * yfrac)) as u8
+
+    return color_from_rgba(r, g, b, a)
+}
+
+fn sample_texture_at(tex: *Texture, x: u32, y: u32): u32 {
+    if tex.format == TEX_FORMAT_RGBA8888 {
+        let offset: u64 = (y as u64) * (tex.stride as u64) + (x as u64) * 4
+        let ptr: *volatile u32 = (tex.data + offset) as *volatile u32
+        return *ptr
+    }
+    return 0
+}
+
+// ============================================================================
+// Blit Operations
+// ============================================================================
+
+export fn gpu_blit(src_tex: u32, dst_x: i32, dst_y: i32) {
+    if gpu.initialized == 0 { return }
+    if src_tex >= MAX_TEXTURES { return }
+    if textures[src_tex].in_use == 0 { return }
+
+    let tex: *Texture = &textures[src_tex]
+
+    var y: u32 = 0
+    while y < tex.height {
+        var x: u32 = 0
+        while x < tex.width {
+            let px: i32 = dst_x + x as i32
+            let py: i32 = dst_y + y as i32
+
+            if clip_point(px, py) {
+                let u: f32 = (x as f32) / (tex.width as f32)
+                let v: f32 = (y as f32) / (tex.height as f32)
+                let color: u32 = sample_texture(tex, u, v)
+                put_pixel_blended(px as u32, py as u32, color)
+            }
+
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+export fn gpu_blit_scaled(src_tex: u32, dst_x: i32, dst_y: i32, dst_width: u32, dst_height: u32) {
+    if gpu.initialized == 0 { return }
+    if src_tex >= MAX_TEXTURES { return }
+    if textures[src_tex].in_use == 0 { return }
+
+    let tex: *Texture = &textures[src_tex]
+
+    var y: u32 = 0
+    while y < dst_height {
+        var x: u32 = 0
+        while x < dst_width {
+            let px: i32 = dst_x + x as i32
+            let py: i32 = dst_y + y as i32
+
+            if clip_point(px, py) {
+                let u: f32 = (x as f32) / (dst_width as f32)
+                let v: f32 = (y as f32) / (dst_height as f32)
+                let color: u32 = sample_texture_bilinear(tex, u, v)
+                put_pixel_blended(px as u32, py as u32, color)
+            }
+
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+export fn gpu_copy_rect(src_x: i32, src_y: i32, dst_x: i32, dst_y: i32, width: u32, height: u32) {
+    if gpu.initialized == 0 { return }
+
+    // Handle overlapping regions by copying in correct order
+    let go_down: bool = dst_y > src_y
+    let go_right: bool = dst_x > src_x
+
+    var y: u32 = 0
+    while y < height {
+        let sy: u32 = if go_down { height - 1 - y } else { y }
+
+        var x: u32 = 0
+        while x < width {
+            let sx: u32 = if go_right { width - 1 - x } else { x }
+
+            let src_px: i32 = src_x + sx as i32
+            let src_py: i32 = src_y + sy as i32
+            let dst_px: i32 = dst_x + sx as i32
+            let dst_py: i32 = dst_y + sy as i32
+
+            if src_px >= 0 and src_px < gpu.width as i32 and
+               src_py >= 0 and src_py < gpu.height as i32 and
+               clip_point(dst_px, dst_py) {
+                let color: u32 = get_pixel(src_px as u32, src_py as u32)
+                put_pixel_fast(dst_px as u32, dst_py as u32, color)
+            }
+
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// ============================================================================
+// Buffer Presentation
+// ============================================================================
 
 export fn gpu_present() {
-  if gpu_initialized == 0 { return }
-  // Flip buffers (stub)
+    if gpu.initialized == 0 { return }
+
+    // Copy back buffer to front buffer
+    memory.memcpy(gpu.front_buffer as *u8, gpu.back_buffer as *u8, gpu.buffer_size)
+
+    // Copy to VGA framebuffer if mapped
+    if vga_framebuffer != 0 {
+        memory.memcpy(vga_framebuffer as *u8, gpu.front_buffer as *u8, gpu.buffer_size)
+    }
+
+    gpu.frames_rendered = gpu.frames_rendered + 1
 }
 
-export fn gpu_get_memory_usage(): u32 {
-  return 0  // Stub
+export fn gpu_present_vsync() {
+    if gpu.initialized == 0 { return }
+
+    // Wait for vertical retrace (VGA port 0x3DA)
+    // Bit 3 = vertical retrace in progress
+    loop {
+        let status: u8 = foundation.inb(0x3DA)
+        if (status & 0x08) == 0 { break }
+    }
+    loop {
+        let status: u8 = foundation.inb(0x3DA)
+        if (status & 0x08) != 0 { break }
+    }
+
+    gpu_present()
+}
+
+export fn gpu_set_vga_framebuffer(addr: u64) {
+    vga_framebuffer = addr
+}
+
+// ============================================================================
+// State Management
+// ============================================================================
+
+export fn gpu_set_blend_mode(mode: u32) {
+    gpu.blend_mode = mode
+}
+
+export fn gpu_set_color(color: u32) {
+    gpu.current_color = color
+}
+
+export fn gpu_get_width(): u32 {
+    return gpu.width
+}
+
+export fn gpu_get_height(): u32 {
+    return gpu.height
+}
+
+export fn gpu_get_framebuffer(): u64 {
+    return gpu.front_buffer
+}
+
+export fn gpu_get_backbuffer(): u64 {
+    return gpu.back_buffer
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn gpu_get_pixels_drawn(): u64 {
+    return gpu.pixels_drawn
+}
+
+export fn gpu_get_triangles_drawn(): u64 {
+    return gpu.triangles_drawn
+}
+
+export fn gpu_get_frames_rendered(): u64 {
+    return gpu.frames_rendered
+}
+
+export fn gpu_reset_stats() {
+    gpu.pixels_drawn = 0
+    gpu.triangles_drawn = 0
+}
+
+export fn gpu_get_memory_usage(): u64 {
+    var total: u64 = gpu.buffer_size * 2  // Front + back buffer
+    total = total + (gpu.width as u64) * (gpu.height as u64) * 2  // Z-buffer
+
+    var i: u32 = 0
+    while i < MAX_TEXTURES {
+        if textures[i].in_use == 1 {
+            let bytes_per_pixel: u32 = if textures[i].format == TEX_FORMAT_RGBA8888 { 4 }
+                else if textures[i].format == TEX_FORMAT_RGB888 { 3 }
+                else if textures[i].format == TEX_FORMAT_RGB565 { 2 }
+                else { 1 }
+            total = total + (textures[i].width as u64) * (textures[i].height as u64) * (bytes_per_pixel as u64)
+        }
+        i = i + 1
+    }
+
+    return total
+}
+
+// ============================================================================
+// Gradient and Effect Functions
+// ============================================================================
+
+export fn gpu_fill_gradient_rect(x: i32, y: i32, width: u32, height: u32,
+                                  color1: u32, color2: u32, horizontal: bool) {
+    if gpu.initialized == 0 { return }
+
+    let c1: Color = color_to_components(color1)
+    let c2: Color = color_to_components(color2)
+
+    var py: u32 = 0
+    while py < height {
+        var px: u32 = 0
+        while px < width {
+            let t: f32 = if horizontal {
+                (px as f32) / (width as f32)
+            } else {
+                (py as f32) / (height as f32)
+            }
+
+            let r: u8 = (c1.r as f32 + (c2.r - c1.r) as f32 * t) as u8
+            let g: u8 = (c1.g as f32 + (c2.g - c1.g) as f32 * t) as u8
+            let b: u8 = (c1.b as f32 + (c2.b - c1.b) as f32 * t) as u8
+            let a: u8 = (c1.a as f32 + (c2.a - c1.a) as f32 * t) as u8
+
+            let screen_x: i32 = x + px as i32
+            let screen_y: i32 = y + py as i32
+
+            if clip_point(screen_x, screen_y) {
+                put_pixel_blended(screen_x as u32, screen_y as u32, color_from_rgba(r, g, b, a))
+            }
+
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+// ============================================================================
+// Ellipse Drawing
+// ============================================================================
+
+export fn gpu_draw_ellipse(cx: i32, cy: i32, rx: u32, ry: u32, color: u32) {
+    if gpu.initialized == 0 { return }
+
+    var x: i32 = 0
+    var y: i32 = ry as i32
+
+    let rx2: i64 = (rx as i64) * (rx as i64)
+    let ry2: i64 = (ry as i64) * (ry as i64)
+
+    var px: i64 = 0
+    var py: i64 = 2 * rx2 * (y as i64)
+
+    // Region 1
+    var p: i64 = ry2 - rx2 * (ry as i64) + rx2 / 4
+
+    while px < py {
+        if clip_point(cx + x, cy + y) { put_pixel_blended((cx + x) as u32, (cy + y) as u32, color) }
+        if clip_point(cx - x, cy + y) { put_pixel_blended((cx - x) as u32, (cy + y) as u32, color) }
+        if clip_point(cx + x, cy - y) { put_pixel_blended((cx + x) as u32, (cy - y) as u32, color) }
+        if clip_point(cx - x, cy - y) { put_pixel_blended((cx - x) as u32, (cy - y) as u32, color) }
+
+        x = x + 1
+        px = px + 2 * ry2
+
+        if p < 0 {
+            p = p + ry2 + px
+        } else {
+            y = y - 1
+            py = py - 2 * rx2
+            p = p + ry2 + px - py
+        }
+    }
+
+    // Region 2
+    p = ry2 * ((x as i64) + 1) * ((x as i64) + 1) / 4 + rx2 * ((y as i64) - 1) * ((y as i64) - 1) - rx2 * ry2
+
+    while y >= 0 {
+        if clip_point(cx + x, cy + y) { put_pixel_blended((cx + x) as u32, (cy + y) as u32, color) }
+        if clip_point(cx - x, cy + y) { put_pixel_blended((cx - x) as u32, (cy + y) as u32, color) }
+        if clip_point(cx + x, cy - y) { put_pixel_blended((cx + x) as u32, (cy - y) as u32, color) }
+        if clip_point(cx - x, cy - y) { put_pixel_blended((cx - x) as u32, (cy - y) as u32, color) }
+
+        y = y - 1
+        py = py - 2 * rx2
+
+        if p > 0 {
+            p = p + rx2 - py
+        } else {
+            x = x + 1
+            px = px + 2 * ry2
+            p = p + rx2 - py + px
+        }
+    }
+}
+
+// ============================================================================
+// Polygon Drawing
+// ============================================================================
+
+export fn gpu_draw_polygon(vertices: *Vertex2D, count: u32, color: u32) {
+    if gpu.initialized == 0 { return }
+    if count < 2 { return }
+
+    var i: u32 = 0
+    while i < count {
+        let next: u32 = (i + 1) % count
+        let v1: *Vertex2D = (vertices as u64 + i * 16) as *Vertex2D  // sizeof(Vertex2D) = 16
+        let v2: *Vertex2D = (vertices as u64 + next * 16) as *Vertex2D
+
+        gpu_draw_line(v1.x, v1.y, v2.x, v2.y, color)
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// Arc and Bezier Curves
+// ============================================================================
+
+export fn gpu_draw_arc(cx: i32, cy: i32, radius: u32, start_angle: f32, end_angle: f32, color: u32) {
+    if gpu.initialized == 0 { return }
+
+    let steps: u32 = (radius / 2) + 16
+    let step_angle: f32 = (end_angle - start_angle) / (steps as f32)
+
+    var prev_x: i32 = cx + ((radius as f32) * foundation.cos(start_angle)) as i32
+    var prev_y: i32 = cy + ((radius as f32) * foundation.sin(start_angle)) as i32
+
+    var i: u32 = 1
+    while i <= steps {
+        let angle: f32 = start_angle + (i as f32) * step_angle
+        let curr_x: i32 = cx + ((radius as f32) * foundation.cos(angle)) as i32
+        let curr_y: i32 = cy + ((radius as f32) * foundation.sin(angle)) as i32
+
+        gpu_draw_line(prev_x, prev_y, curr_x, curr_y, color)
+
+        prev_x = curr_x
+        prev_y = curr_y
+        i = i + 1
+    }
+}
+
+export fn gpu_draw_bezier_quadratic(x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) {
+    if gpu.initialized == 0 { return }
+
+    let steps: u32 = 32
+
+    var prev_x: i32 = x0
+    var prev_y: i32 = y0
+
+    var i: u32 = 1
+    while i <= steps {
+        let t: f32 = (i as f32) / (steps as f32)
+        let t2: f32 = t * t
+        let mt: f32 = 1.0 - t
+        let mt2: f32 = mt * mt
+
+        let curr_x: i32 = (mt2 * (x0 as f32) + 2.0 * mt * t * (x1 as f32) + t2 * (x2 as f32)) as i32
+        let curr_y: i32 = (mt2 * (y0 as f32) + 2.0 * mt * t * (y1 as f32) + t2 * (y2 as f32)) as i32
+
+        gpu_draw_line(prev_x, prev_y, curr_x, curr_y, color)
+
+        prev_x = curr_x
+        prev_y = curr_y
+        i = i + 1
+    }
+}
+
+export fn gpu_draw_bezier_cubic(x0: i32, y0: i32, x1: i32, y1: i32,
+                                x2: i32, y2: i32, x3: i32, y3: i32, color: u32) {
+    if gpu.initialized == 0 { return }
+
+    let steps: u32 = 48
+
+    var prev_x: i32 = x0
+    var prev_y: i32 = y0
+
+    var i: u32 = 1
+    while i <= steps {
+        let t: f32 = (i as f32) / (steps as f32)
+        let t2: f32 = t * t
+        let t3: f32 = t2 * t
+        let mt: f32 = 1.0 - t
+        let mt2: f32 = mt * mt
+        let mt3: f32 = mt2 * mt
+
+        let curr_x: i32 = (mt3 * (x0 as f32) + 3.0 * mt2 * t * (x1 as f32) +
+                          3.0 * mt * t2 * (x2 as f32) + t3 * (x3 as f32)) as i32
+        let curr_y: i32 = (mt3 * (y0 as f32) + 3.0 * mt2 * t * (y1 as f32) +
+                          3.0 * mt * t2 * (y2 as f32) + t3 * (y3 as f32)) as i32
+
+        gpu_draw_line(prev_x, prev_y, curr_x, curr_y, color)
+
+        prev_x = curr_x
+        prev_y = curr_y
+        i = i + 1
+    }
 }

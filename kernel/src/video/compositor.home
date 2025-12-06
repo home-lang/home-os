@@ -1,67 +1,1769 @@
 // home-os Display Compositor
-// Window compositing and rendering
+// Window compositing, rendering, and input management
 
 import "../core/foundation.home" as foundation
 import "../drivers/framebuffer.home" as fb
+import "../drivers/gpu.home" as gpu
 
-const MAX_WINDOWS: u32 = 32
+// ============================================================================
+// Constants
+// ============================================================================
+
+const MAX_WINDOWS: u32 = 64
+const MAX_DISPLAYS: u32 = 4
+const MAX_DIRTY_REGIONS: u32 = 128
+const MAX_ANIMATIONS: u32 = 32
+const MAX_LAYERS: u32 = 8
+
+const WINDOW_BORDER_WIDTH: u32 = 2
+const WINDOW_TITLEBAR_HEIGHT: u32 = 24
+const SHADOW_SIZE: u32 = 8
+const SHADOW_OPACITY: u8 = 80
+
+// Window flags
+const WINDOW_FLAG_VISIBLE: u32 = 0x0001
+const WINDOW_FLAG_FOCUSED: u32 = 0x0002
+const WINDOW_FLAG_MAXIMIZED: u32 = 0x0004
+const WINDOW_FLAG_MINIMIZED: u32 = 0x0008
+const WINDOW_FLAG_FULLSCREEN: u32 = 0x0010
+const WINDOW_FLAG_DECORATED: u32 = 0x0020
+const WINDOW_FLAG_RESIZABLE: u32 = 0x0040
+const WINDOW_FLAG_MOVABLE: u32 = 0x0080
+const WINDOW_FLAG_TRANSPARENT: u32 = 0x0100
+const WINDOW_FLAG_ALWAYS_ON_TOP: u32 = 0x0200
+const WINDOW_FLAG_NO_SHADOW: u32 = 0x0400
+const WINDOW_FLAG_POPUP: u32 = 0x0800
+const WINDOW_FLAG_TOOLTIP: u32 = 0x1000
+
+// Animation types
+const ANIM_NONE: u32 = 0
+const ANIM_FADE_IN: u32 = 1
+const ANIM_FADE_OUT: u32 = 2
+const ANIM_SLIDE_IN: u32 = 3
+const ANIM_SLIDE_OUT: u32 = 4
+const ANIM_ZOOM_IN: u32 = 5
+const ANIM_ZOOM_OUT: u32 = 6
+const ANIM_MINIMIZE: u32 = 7
+const ANIM_MAXIMIZE: u32 = 8
+
+// Input event types
+const EVENT_MOUSE_MOVE: u32 = 1
+const EVENT_MOUSE_DOWN: u32 = 2
+const EVENT_MOUSE_UP: u32 = 3
+const EVENT_MOUSE_SCROLL: u32 = 4
+const EVENT_KEY_DOWN: u32 = 5
+const EVENT_KEY_UP: u32 = 6
+const EVENT_WINDOW_FOCUS: u32 = 7
+const EVENT_WINDOW_UNFOCUS: u32 = 8
+const EVENT_WINDOW_CLOSE: u32 = 9
+const EVENT_WINDOW_RESIZE: u32 = 10
+const EVENT_WINDOW_MOVE: u32 = 11
+
+// Hit test regions
+const HIT_NONE: u32 = 0
+const HIT_CLIENT: u32 = 1
+const HIT_TITLEBAR: u32 = 2
+const HIT_CLOSE: u32 = 3
+const HIT_MINIMIZE: u32 = 4
+const HIT_MAXIMIZE: u32 = 5
+const HIT_RESIZE_N: u32 = 6
+const HIT_RESIZE_S: u32 = 7
+const HIT_RESIZE_E: u32 = 8
+const HIT_RESIZE_W: u32 = 9
+const HIT_RESIZE_NE: u32 = 10
+const HIT_RESIZE_NW: u32 = 11
+const HIT_RESIZE_SE: u32 = 12
+const HIT_RESIZE_SW: u32 = 13
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+struct Rect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32
+}
+
+struct Point {
+    x: i32,
+    y: i32
+}
+
+struct Color {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8
+}
 
 struct Window {
-  x: u32,
-  y: u32,
-  width: u32,
-  height: u32,
-  buffer: u64,
-  visible: u32,
-  z_order: u32
+    id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    min_width: u32,
+    min_height: u32,
+    max_width: u32,
+    max_height: u32,
+
+    // Content buffer
+    buffer: *volatile u32,
+    buffer_size: u32,
+    buffer_pitch: u32,
+
+    // Visual properties
+    opacity: u8,
+    z_order: u32,
+    layer: u32,
+    flags: u32,
+
+    // Saved state for restore
+    saved_x: i32,
+    saved_y: i32,
+    saved_width: u32,
+    saved_height: u32,
+
+    // Decoration
+    title: [u8; 128],
+    title_len: u32,
+    border_color: u32,
+    titlebar_color: u32,
+    background_color: u32,
+
+    // Animation state
+    anim_type: u32,
+    anim_progress: f32,
+    anim_duration: f32,
+    anim_start_x: i32,
+    anim_start_y: i32,
+    anim_start_w: u32,
+    anim_start_h: u32,
+    anim_start_opacity: u8,
+
+    // Parent/child relationships
+    parent_id: u32,
+    child_count: u32,
+
+    // Event callbacks
+    event_mask: u32,
+
+    // State
+    active: u32,
+    needs_redraw: u32,
+    last_update_time: u64
 }
 
-var windows: [Window; 32]
-var window_count: u32 = 0
-var vsync_enabled: u32 = 1
+struct DirtyRegion {
+    rect: Rect,
+    window_id: u32,
+    active: u32
+}
+
+struct Display {
+    id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    framebuffer: *volatile u32,
+    backbuffer: *volatile u32,
+    refresh_rate: u32,
+    active: u32,
+    primary: u32
+}
+
+struct InputEvent {
+    event_type: u32,
+    window_id: u32,
+    x: i32,
+    y: i32,
+    button: u32,
+    key_code: u32,
+    modifiers: u32,
+    timestamp: u64
+}
+
+struct CompositorState {
+    initialized: u32,
+
+    // Windows
+    windows: [Window; 64],
+    window_count: u32,
+    next_window_id: u32,
+    focused_window: u32,
+
+    // Z-order (indices into windows array)
+    z_order_list: [u32; 64],
+
+    // Displays
+    displays: [Display; 4],
+    display_count: u32,
+
+    // Dirty regions for partial redraw
+    dirty_regions: [DirtyRegion; 128],
+    dirty_count: u32,
+    full_redraw_needed: u32,
+
+    // Compositor settings
+    vsync_enabled: u32,
+    animations_enabled: u32,
+    shadows_enabled: u32,
+    blur_enabled: u32,
+
+    // Mouse state
+    mouse_x: i32,
+    mouse_y: i32,
+    mouse_buttons: u32,
+    drag_window: u32,
+    drag_mode: u32,
+    drag_start_x: i32,
+    drag_start_y: i32,
+    drag_win_start_x: i32,
+    drag_win_start_y: i32,
+    drag_win_start_w: u32,
+    drag_win_start_h: u32,
+
+    // Desktop
+    desktop_color: u32,
+    wallpaper_buffer: *volatile u32,
+    wallpaper_width: u32,
+    wallpaper_height: u32,
+
+    // Performance stats
+    frame_count: u64,
+    last_fps_time: u64,
+    current_fps: u32,
+    frame_time_us: u32
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var compositor: CompositorState
+var temp_scanline: [u32; 4096]  // Temporary buffer for compositing
+
+// ============================================================================
+// Color Operations
+// ============================================================================
+
+fn color_from_rgba(r: u8, g: u8, b: u8, a: u8): u32 {
+    return ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+fn color_get_r(color: u32): u8 {
+    return ((color >> 16) & 0xFF) as u8
+}
+
+fn color_get_g(color: u32): u8 {
+    return ((color >> 8) & 0xFF) as u8
+}
+
+fn color_get_b(color: u32): u8 {
+    return (color & 0xFF) as u8
+}
+
+fn color_get_a(color: u32): u8 {
+    return ((color >> 24) & 0xFF) as u8
+}
+
+fn color_blend(dst: u32, src: u32, src_alpha: u8): u32 {
+    if src_alpha == 255 {
+        return src | 0xFF000000
+    }
+    if src_alpha == 0 {
+        return dst
+    }
+
+    let alpha: u32 = src_alpha as u32
+    let inv_alpha: u32 = 255 - alpha
+
+    let sr: u32 = (src >> 16) & 0xFF
+    let sg: u32 = (src >> 8) & 0xFF
+    let sb: u32 = src & 0xFF
+
+    let dr: u32 = (dst >> 16) & 0xFF
+    let dg: u32 = (dst >> 8) & 0xFF
+    let db: u32 = dst & 0xFF
+
+    let r: u32 = (sr * alpha + dr * inv_alpha) / 255
+    let g: u32 = (sg * alpha + dg * inv_alpha) / 255
+    let b: u32 = (sb * alpha + db * inv_alpha) / 255
+
+    return 0xFF000000 | (r << 16) | (g << 8) | b
+}
+
+fn color_multiply(color: u32, factor: u8): u32 {
+    let f: u32 = factor as u32
+    let r: u32 = (((color >> 16) & 0xFF) * f) / 255
+    let g: u32 = (((color >> 8) & 0xFF) * f) / 255
+    let b: u32 = ((color & 0xFF) * f) / 255
+    return (color & 0xFF000000) | (r << 16) | (g << 8) | b
+}
+
+// ============================================================================
+// Rect Operations
+// ============================================================================
+
+fn rect_intersect(a: *Rect, b: *Rect, result: *Rect): u32 {
+    let x1: i32 = if a.x > b.x { a.x } else { b.x }
+    let y1: i32 = if a.y > b.y { a.y } else { b.y }
+    let x2: i32 = if (a.x + a.width as i32) < (b.x + b.width as i32) { a.x + a.width as i32 } else { b.x + b.width as i32 }
+    let y2: i32 = if (a.y + a.height as i32) < (b.y + b.height as i32) { a.y + a.height as i32 } else { b.y + b.height as i32 }
+
+    if x1 < x2 and y1 < y2 {
+        result.x = x1
+        result.y = y1
+        result.width = (x2 - x1) as u32
+        result.height = (y2 - y1) as u32
+        return 1
+    }
+    return 0
+}
+
+fn rect_contains_point(r: *Rect, x: i32, y: i32): u32 {
+    return (x >= r.x and x < r.x + r.width as i32 and y >= r.y and y < r.y + r.height as i32) as u32
+}
+
+fn rect_union(a: *Rect, b: *Rect, result: *Rect) {
+    let x1: i32 = if a.x < b.x { a.x } else { b.x }
+    let y1: i32 = if a.y < b.y { a.y } else { b.y }
+    let x2: i32 = if (a.x + a.width as i32) > (b.x + b.width as i32) { a.x + a.width as i32 } else { b.x + b.width as i32 }
+    let y2: i32 = if (a.y + a.height as i32) > (b.y + b.height as i32) { a.y + a.height as i32 } else { b.y + b.height as i32 }
+
+    result.x = x1
+    result.y = y1
+    result.width = (x2 - x1) as u32
+    result.height = (y2 - y1) as u32
+}
+
+// ============================================================================
+// Initialization
+// ============================================================================
 
 export fn compositor_init() {
-  window_count = 0
-  fb.fb_init(0xFD000000, 1024, 768)
-  foundation.serial_write_string("[Compositor] Initialized\n")
+    foundation.mem_set(&compositor as *u8, 0, @sizeOf(CompositorState))
+
+    // Initialize primary display
+    compositor.displays[0].id = 0
+    compositor.displays[0].x = 0
+    compositor.displays[0].y = 0
+    compositor.displays[0].width = 1920
+    compositor.displays[0].height = 1080
+    compositor.displays[0].framebuffer = 0xFD000000 as *volatile u32
+    compositor.displays[0].backbuffer = gpu.gpu_get_backbuffer()
+    compositor.displays[0].refresh_rate = 60
+    compositor.displays[0].active = 1
+    compositor.displays[0].primary = 1
+    compositor.display_count = 1
+
+    // Initialize GPU
+    gpu.gpu_init(0xFD000000, 1920, 1080, 32)
+
+    // Default settings
+    compositor.vsync_enabled = 1
+    compositor.animations_enabled = 1
+    compositor.shadows_enabled = 1
+    compositor.blur_enabled = 0  // Expensive, disabled by default
+
+    compositor.desktop_color = 0xFF2D5A88  // Nice blue desktop
+    compositor.focused_window = 0xFFFFFFFF
+    compositor.drag_window = 0xFFFFFFFF
+    compositor.next_window_id = 1
+
+    compositor.initialized = 1
+
+    foundation.serial_write_string("[Compositor] Initialized with ")
+    foundation.serial_write_u32(compositor.displays[0].width)
+    foundation.serial_write_string("x")
+    foundation.serial_write_u32(compositor.displays[0].height)
+    foundation.serial_write_string(" display\n")
 }
 
-export fn compositor_create_window(x: u32, y: u32, width: u32, height: u32): u32 {
-  if window_count >= MAX_WINDOWS { return 0xFFFFFFFF }
-  
-  windows[window_count].x = x
-  windows[window_count].y = y
-  windows[window_count].width = width
-  windows[window_count].height = height
-  windows[window_count].visible = 1
-  windows[window_count].z_order = window_count
-  
-  var id: u32 = window_count
-  window_count = window_count + 1
-  
-  return id
+export fn compositor_add_display(x: i32, y: i32, width: u32, height: u32, framebuffer: u64): u32 {
+    if compositor.display_count >= MAX_DISPLAYS {
+        return 0xFFFFFFFF
+    }
+
+    let id: u32 = compositor.display_count
+    compositor.displays[id].id = id
+    compositor.displays[id].x = x
+    compositor.displays[id].y = y
+    compositor.displays[id].width = width
+    compositor.displays[id].height = height
+    compositor.displays[id].framebuffer = framebuffer as *volatile u32
+    compositor.displays[id].refresh_rate = 60
+    compositor.displays[id].active = 1
+    compositor.displays[id].primary = 0
+    compositor.display_count = compositor.display_count + 1
+
+    compositor.full_redraw_needed = 1
+    return id
 }
+
+// ============================================================================
+// Window Management
+// ============================================================================
+
+export fn compositor_create_window(x: i32, y: i32, width: u32, height: u32, flags: u32): u32 {
+    // Find free slot
+    var slot: u32 = 0xFFFFFFFF
+    var i: u32 = 0
+    while i < MAX_WINDOWS {
+        if compositor.windows[i].active == 0 {
+            slot = i
+            break
+        }
+        i = i + 1
+    }
+
+    if slot == 0xFFFFFFFF {
+        return 0xFFFFFFFF
+    }
+
+    let win: *Window = &compositor.windows[slot]
+    foundation.mem_set(win as *u8, 0, @sizeOf(Window))
+
+    win.id = compositor.next_window_id
+    compositor.next_window_id = compositor.next_window_id + 1
+
+    win.x = x
+    win.y = y
+    win.width = width
+    win.height = height
+    win.min_width = 100
+    win.min_height = 50
+    win.max_width = 4096
+    win.max_height = 4096
+
+    // Allocate content buffer
+    let buffer_size: u32 = width * height * 4
+    win.buffer = gpu.gpu_allocate_surface(width, height)
+    win.buffer_size = buffer_size
+    win.buffer_pitch = width * 4
+
+    // Clear buffer
+    if win.buffer != null {
+        foundation.mem_set(win.buffer as *u8, 0, buffer_size)
+    }
+
+    win.opacity = 255
+    win.z_order = compositor.window_count
+    win.layer = 0
+    win.flags = flags | WINDOW_FLAG_VISIBLE | WINDOW_FLAG_DECORATED | WINDOW_FLAG_RESIZABLE | WINDOW_FLAG_MOVABLE
+
+    // Default colors
+    win.border_color = 0xFF404040
+    win.titlebar_color = 0xFF303030
+    win.background_color = 0xFFFFFFFF
+
+    win.parent_id = 0xFFFFFFFF
+    win.active = 1
+    win.needs_redraw = 1
+
+    // Add to z-order list
+    compositor.z_order_list[compositor.window_count] = slot
+    compositor.window_count = compositor.window_count + 1
+
+    // Start fade-in animation if enabled
+    if compositor.animations_enabled == 1 {
+        win.anim_type = ANIM_FADE_IN
+        win.anim_progress = 0.0
+        win.anim_duration = 0.2
+        win.anim_start_opacity = 0
+    }
+
+    // Focus new window
+    compositor_focus_window(win.id)
+
+    mark_window_dirty(slot)
+
+    foundation.serial_write_string("[Compositor] Created window ")
+    foundation.serial_write_u32(win.id)
+    foundation.serial_write_string("\n")
+
+    return win.id
+}
+
+export fn compositor_destroy_window(window_id: u32) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return
+    }
+
+    let win: *Window = &compositor.windows[slot]
+
+    // Mark area as dirty before destroying
+    mark_window_dirty(slot)
+
+    // Free buffer
+    if win.buffer != null {
+        gpu.gpu_free_surface(win.buffer)
+    }
+
+    // Remove from z-order list
+    var found: u32 = 0
+    var i: u32 = 0
+    while i < compositor.window_count {
+        if compositor.z_order_list[i] == slot {
+            found = 1
+        }
+        if found == 1 and i < compositor.window_count - 1 {
+            compositor.z_order_list[i] = compositor.z_order_list[i + 1]
+        }
+        i = i + 1
+    }
+    if found == 1 {
+        compositor.window_count = compositor.window_count - 1
+    }
+
+    // Clear window
+    win.active = 0
+
+    // Update focus
+    if compositor.focused_window == window_id {
+        if compositor.window_count > 0 {
+            let top_slot: u32 = compositor.z_order_list[compositor.window_count - 1]
+            compositor.focused_window = compositor.windows[top_slot].id
+        } else {
+            compositor.focused_window = 0xFFFFFFFF
+        }
+    }
+
+    foundation.serial_write_string("[Compositor] Destroyed window ")
+    foundation.serial_write_u32(window_id)
+    foundation.serial_write_string("\n")
+}
+
+fn find_window_slot(window_id: u32): u32 {
+    var i: u32 = 0
+    while i < MAX_WINDOWS {
+        if compositor.windows[i].active == 1 and compositor.windows[i].id == window_id {
+            return i
+        }
+        i = i + 1
+    }
+    return 0xFFFFFFFF
+}
+
+export fn compositor_set_window_title(window_id: u32, title: *u8, len: u32) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return
+    }
+
+    let win: *Window = &compositor.windows[slot]
+    let copy_len: u32 = if len < 127 { len } else { 127 }
+
+    var i: u32 = 0
+    while i < copy_len {
+        win.title[i] = title[i]
+        i = i + 1
+    }
+    win.title[copy_len] = 0
+    win.title_len = copy_len
+
+    win.needs_redraw = 1
+    mark_window_dirty(slot)
+}
+
+export fn compositor_move_window(window_id: u32, x: i32, y: i32) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return
+    }
+
+    let win: *Window = &compositor.windows[slot]
+
+    if (win.flags & WINDOW_FLAG_MOVABLE) == 0 {
+        return
+    }
+
+    // Mark old position dirty
+    mark_window_dirty(slot)
+
+    win.x = x
+    win.y = y
+
+    // Mark new position dirty
+    mark_window_dirty(slot)
+}
+
+export fn compositor_resize_window(window_id: u32, width: u32, height: u32) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return
+    }
+
+    let win: *Window = &compositor.windows[slot]
+
+    if (win.flags & WINDOW_FLAG_RESIZABLE) == 0 {
+        return
+    }
+
+    // Clamp to min/max
+    let new_width: u32 = if width < win.min_width { win.min_width } else { if width > win.max_width { win.max_width } else { width } }
+    let new_height: u32 = if height < win.min_height { win.min_height } else { if height > win.max_height { win.max_height } else { height } }
+
+    if new_width == win.width and new_height == win.height {
+        return
+    }
+
+    // Mark old area dirty
+    mark_window_dirty(slot)
+
+    // Reallocate buffer if needed
+    if new_width != win.width or new_height != win.height {
+        if win.buffer != null {
+            gpu.gpu_free_surface(win.buffer)
+        }
+        win.buffer = gpu.gpu_allocate_surface(new_width, new_height)
+        win.buffer_size = new_width * new_height * 4
+        win.buffer_pitch = new_width * 4
+
+        if win.buffer != null {
+            foundation.mem_set(win.buffer as *u8, 0, win.buffer_size)
+        }
+    }
+
+    win.width = new_width
+    win.height = new_height
+    win.needs_redraw = 1
+
+    mark_window_dirty(slot)
+}
+
+export fn compositor_focus_window(window_id: u32) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return
+    }
+
+    // Unfocus current window
+    if compositor.focused_window != 0xFFFFFFFF {
+        let old_slot: u32 = find_window_slot(compositor.focused_window)
+        if old_slot != 0xFFFFFFFF {
+            compositor.windows[old_slot].flags = compositor.windows[old_slot].flags & ~WINDOW_FLAG_FOCUSED
+            compositor.windows[old_slot].needs_redraw = 1
+            mark_window_dirty(old_slot)
+        }
+    }
+
+    // Focus new window
+    compositor.windows[slot].flags = compositor.windows[slot].flags | WINDOW_FLAG_FOCUSED
+    compositor.windows[slot].needs_redraw = 1
+    compositor.focused_window = window_id
+
+    // Bring to top of z-order (unless always-on-top windows exist above)
+    raise_window_to_top(slot)
+
+    mark_window_dirty(slot)
+}
+
+fn raise_window_to_top(slot: u32) {
+    // Find window in z-order list
+    var pos: u32 = 0xFFFFFFFF
+    var i: u32 = 0
+    while i < compositor.window_count {
+        if compositor.z_order_list[i] == slot {
+            pos = i
+            break
+        }
+        i = i + 1
+    }
+
+    if pos == 0xFFFFFFFF or pos == compositor.window_count - 1 {
+        return
+    }
+
+    // Move to top, below any always-on-top windows
+    var insert_pos: u32 = compositor.window_count - 1
+    i = compositor.window_count - 1
+    while i > pos {
+        let check_slot: u32 = compositor.z_order_list[i]
+        if (compositor.windows[check_slot].flags & WINDOW_FLAG_ALWAYS_ON_TOP) == 0 {
+            insert_pos = i
+            break
+        }
+        i = i - 1
+    }
+
+    // Shift windows down
+    i = pos
+    while i < insert_pos {
+        compositor.z_order_list[i] = compositor.z_order_list[i + 1]
+        i = i + 1
+    }
+    compositor.z_order_list[insert_pos] = slot
+
+    // Update z-order values
+    i = 0
+    while i < compositor.window_count {
+        compositor.windows[compositor.z_order_list[i]].z_order = i
+        i = i + 1
+    }
+}
+
+export fn compositor_maximize_window(window_id: u32) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return
+    }
+
+    let win: *Window = &compositor.windows[slot]
+
+    if (win.flags & WINDOW_FLAG_MAXIMIZED) != 0 {
+        // Restore
+        compositor_restore_window(window_id)
+        return
+    }
+
+    // Save current state
+    win.saved_x = win.x
+    win.saved_y = win.y
+    win.saved_width = win.width
+    win.saved_height = win.height
+
+    // Get display bounds
+    let display: *Display = &compositor.displays[0]  // TODO: Find correct display
+
+    // Maximize to display (with some margin for taskbar)
+    mark_window_dirty(slot)
+    win.x = display.x
+    win.y = display.y
+    compositor_resize_window(window_id, display.width, display.height - 40)
+    win.flags = win.flags | WINDOW_FLAG_MAXIMIZED
+
+    if compositor.animations_enabled == 1 {
+        win.anim_type = ANIM_MAXIMIZE
+        win.anim_progress = 0.0
+        win.anim_duration = 0.15
+        win.anim_start_x = win.saved_x
+        win.anim_start_y = win.saved_y
+        win.anim_start_w = win.saved_width
+        win.anim_start_h = win.saved_height
+    }
+}
+
+export fn compositor_minimize_window(window_id: u32) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return
+    }
+
+    let win: *Window = &compositor.windows[slot]
+
+    if (win.flags & WINDOW_FLAG_MINIMIZED) != 0 {
+        return
+    }
+
+    mark_window_dirty(slot)
+    win.flags = win.flags | WINDOW_FLAG_MINIMIZED
+    win.flags = win.flags & ~WINDOW_FLAG_VISIBLE
+
+    if compositor.animations_enabled == 1 {
+        win.anim_type = ANIM_MINIMIZE
+        win.anim_progress = 0.0
+        win.anim_duration = 0.2
+    }
+
+    // Focus next window
+    if compositor.focused_window == window_id and compositor.window_count > 1 {
+        var i: i32 = compositor.window_count as i32 - 1
+        while i >= 0 {
+            let check_slot: u32 = compositor.z_order_list[i as u32]
+            if check_slot != slot and (compositor.windows[check_slot].flags & WINDOW_FLAG_VISIBLE) != 0 {
+                compositor_focus_window(compositor.windows[check_slot].id)
+                break
+            }
+            i = i - 1
+        }
+    }
+}
+
+export fn compositor_restore_window(window_id: u32) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return
+    }
+
+    let win: *Window = &compositor.windows[slot]
+
+    if (win.flags & WINDOW_FLAG_MINIMIZED) != 0 {
+        win.flags = win.flags & ~WINDOW_FLAG_MINIMIZED
+        win.flags = win.flags | WINDOW_FLAG_VISIBLE
+        compositor_focus_window(window_id)
+    }
+
+    if (win.flags & WINDOW_FLAG_MAXIMIZED) != 0 {
+        mark_window_dirty(slot)
+        win.x = win.saved_x
+        win.y = win.saved_y
+        compositor_resize_window(window_id, win.saved_width, win.saved_height)
+        win.flags = win.flags & ~WINDOW_FLAG_MAXIMIZED
+    }
+
+    mark_window_dirty(slot)
+}
+
+export fn compositor_set_window_opacity(window_id: u32, opacity: u8) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return
+    }
+
+    compositor.windows[slot].opacity = opacity
+    mark_window_dirty(slot)
+}
+
+// ============================================================================
+// Dirty Region Management
+// ============================================================================
+
+fn mark_window_dirty(slot: u32) {
+    let win: *Window = &compositor.windows[slot]
+
+    // Calculate total window bounds including decorations and shadow
+    var rect: Rect
+    rect.x = win.x
+    rect.y = win.y
+    rect.width = win.width
+    rect.height = win.height
+
+    // Add decoration size
+    if (win.flags & WINDOW_FLAG_DECORATED) != 0 {
+        rect.x = rect.x - WINDOW_BORDER_WIDTH as i32
+        rect.y = rect.y - WINDOW_TITLEBAR_HEIGHT as i32 - WINDOW_BORDER_WIDTH as i32
+        rect.width = rect.width + WINDOW_BORDER_WIDTH * 2
+        rect.height = rect.height + WINDOW_TITLEBAR_HEIGHT + WINDOW_BORDER_WIDTH * 2
+    }
+
+    // Add shadow size
+    if compositor.shadows_enabled == 1 and (win.flags & WINDOW_FLAG_NO_SHADOW) == 0 {
+        rect.width = rect.width + SHADOW_SIZE
+        rect.height = rect.height + SHADOW_SIZE
+    }
+
+    add_dirty_region(&rect, slot)
+}
+
+fn add_dirty_region(rect: *Rect, window_id: u32) {
+    // Try to merge with existing regions
+    var i: u32 = 0
+    while i < compositor.dirty_count {
+        if compositor.dirty_regions[i].active == 1 {
+            // Check for significant overlap
+            var intersect: Rect
+            if rect_intersect(&compositor.dirty_regions[i].rect, rect, &intersect) == 1 {
+                // Merge regions
+                rect_union(&compositor.dirty_regions[i].rect, rect, &compositor.dirty_regions[i].rect)
+                return
+            }
+        }
+        i = i + 1
+    }
+
+    // Add new region
+    if compositor.dirty_count < MAX_DIRTY_REGIONS {
+        compositor.dirty_regions[compositor.dirty_count].rect = *rect
+        compositor.dirty_regions[compositor.dirty_count].window_id = window_id
+        compositor.dirty_regions[compositor.dirty_count].active = 1
+        compositor.dirty_count = compositor.dirty_count + 1
+    } else {
+        // Too many regions, force full redraw
+        compositor.full_redraw_needed = 1
+    }
+}
+
+fn clear_dirty_regions() {
+    compositor.dirty_count = 0
+    compositor.full_redraw_needed = 0
+}
+
+export fn compositor_mark_dirty(x: i32, y: i32, width: u32, height: u32) {
+    var rect: Rect
+    rect.x = x
+    rect.y = y
+    rect.width = width
+    rect.height = height
+    add_dirty_region(&rect, 0xFFFFFFFF)
+}
+
+// ============================================================================
+// Window Buffer Access
+// ============================================================================
+
+export fn compositor_get_window_buffer(window_id: u32): *volatile u32 {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return null
+    }
+    return compositor.windows[slot].buffer
+}
+
+export fn compositor_get_window_size(window_id: u32, width: *u32, height: *u32) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        *width = 0
+        *height = 0
+        return
+    }
+    *width = compositor.windows[slot].width
+    *height = compositor.windows[slot].height
+}
+
+export fn compositor_present_window(window_id: u32) {
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return
+    }
+
+    compositor.windows[slot].needs_redraw = 1
+    mark_window_dirty(slot)
+}
+
+// ============================================================================
+// Rendering - Window Decorations
+// ============================================================================
+
+fn draw_window_decoration(win: *Window, target: *volatile u32, target_width: u32, target_height: u32, clip: *Rect) {
+    if (win.flags & WINDOW_FLAG_DECORATED) == 0 {
+        return
+    }
+
+    let is_focused: u32 = (win.flags & WINDOW_FLAG_FOCUSED) != 0
+
+    // Calculate decoration bounds
+    let dec_x: i32 = win.x - WINDOW_BORDER_WIDTH as i32
+    let dec_y: i32 = win.y - WINDOW_TITLEBAR_HEIGHT as i32 - WINDOW_BORDER_WIDTH as i32
+    let dec_w: u32 = win.width + WINDOW_BORDER_WIDTH * 2
+    let dec_h: u32 = win.height + WINDOW_TITLEBAR_HEIGHT + WINDOW_BORDER_WIDTH * 2
+
+    // Colors based on focus state
+    let titlebar_color: u32 = if is_focused == 1 { 0xFF4A90D9 } else { 0xFF606060 }
+    let border_color: u32 = if is_focused == 1 { 0xFF3A70B9 } else { 0xFF505050 }
+
+    // Draw titlebar background
+    var y: i32 = dec_y
+    while y < dec_y + WINDOW_TITLEBAR_HEIGHT as i32 + WINDOW_BORDER_WIDTH as i32 {
+        if y >= clip.y and y < clip.y + clip.height as i32 {
+            var x: i32 = dec_x
+            while x < dec_x + dec_w as i32 {
+                if x >= clip.x and x < clip.x + clip.width as i32 {
+                    if x >= 0 and x < target_width as i32 and y >= 0 and y < target_height as i32 {
+                        target[y as u32 * target_width + x as u32] = titlebar_color
+                    }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+
+    // Draw borders
+    // Left border
+    y = dec_y + WINDOW_TITLEBAR_HEIGHT as i32 + WINDOW_BORDER_WIDTH as i32
+    while y < dec_y + dec_h as i32 {
+        if y >= clip.y and y < clip.y + clip.height as i32 {
+            var x: i32 = dec_x
+            while x < dec_x + WINDOW_BORDER_WIDTH as i32 {
+                if x >= clip.x and x < clip.x + clip.width as i32 {
+                    if x >= 0 and x < target_width as i32 and y >= 0 and y < target_height as i32 {
+                        target[y as u32 * target_width + x as u32] = border_color
+                    }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+
+    // Right border
+    y = dec_y + WINDOW_TITLEBAR_HEIGHT as i32 + WINDOW_BORDER_WIDTH as i32
+    while y < dec_y + dec_h as i32 {
+        if y >= clip.y and y < clip.y + clip.height as i32 {
+            var x: i32 = dec_x + dec_w as i32 - WINDOW_BORDER_WIDTH as i32
+            while x < dec_x + dec_w as i32 {
+                if x >= clip.x and x < clip.x + clip.width as i32 {
+                    if x >= 0 and x < target_width as i32 and y >= 0 and y < target_height as i32 {
+                        target[y as u32 * target_width + x as u32] = border_color
+                    }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+
+    // Bottom border
+    y = dec_y + dec_h as i32 - WINDOW_BORDER_WIDTH as i32
+    while y < dec_y + dec_h as i32 {
+        if y >= clip.y and y < clip.y + clip.height as i32 {
+            var x: i32 = dec_x
+            while x < dec_x + dec_w as i32 {
+                if x >= clip.x and x < clip.x + clip.width as i32 {
+                    if x >= 0 and x < target_width as i32 and y >= 0 and y < target_height as i32 {
+                        target[y as u32 * target_width + x as u32] = border_color
+                    }
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+
+    // Draw window control buttons
+    let button_size: u32 = 16
+    let button_y: i32 = dec_y + 4
+    let button_spacing: u32 = 4
+
+    // Close button (red)
+    let close_x: i32 = dec_x + dec_w as i32 - button_size as i32 - 6
+    draw_control_button(target, target_width, target_height, close_x, button_y, button_size, 0xFFE04040, clip)
+
+    // Maximize button (green)
+    let max_x: i32 = close_x - button_size as i32 - button_spacing as i32
+    draw_control_button(target, target_width, target_height, max_x, button_y, button_size, 0xFF40E040, clip)
+
+    // Minimize button (yellow)
+    let min_x: i32 = max_x - button_size as i32 - button_spacing as i32
+    draw_control_button(target, target_width, target_height, min_x, button_y, button_size, 0xFFE0E040, clip)
+
+    // Draw title text (simple - just placeholder rectangles for now)
+    // Real text rendering would use a font
+    let title_x: i32 = dec_x + 10
+    let title_y: i32 = dec_y + 6
+    var char_x: i32 = title_x
+    var i: u32 = 0
+    while i < win.title_len and i < 30 {
+        // Draw placeholder for each character
+        draw_filled_rect(target, target_width, target_height, char_x, title_y, 6, 12, 0xFFFFFFFF, clip)
+        char_x = char_x + 8
+        i = i + 1
+    }
+}
+
+fn draw_control_button(target: *volatile u32, target_width: u32, target_height: u32, x: i32, y: i32, size: u32, color: u32, clip: *Rect) {
+    var py: i32 = y
+    while py < y + size as i32 {
+        if py >= clip.y and py < clip.y + clip.height as i32 {
+            var px: i32 = x
+            while px < x + size as i32 {
+                if px >= clip.x and px < clip.x + clip.width as i32 {
+                    if px >= 0 and px < target_width as i32 and py >= 0 and py < target_height as i32 {
+                        // Simple circle approximation
+                        let dx: i32 = px - (x + size as i32 / 2)
+                        let dy: i32 = py - (y + size as i32 / 2)
+                        let dist_sq: i32 = dx * dx + dy * dy
+                        let radius: i32 = (size / 2) as i32
+                        if dist_sq <= radius * radius {
+                            target[py as u32 * target_width + px as u32] = color
+                        }
+                    }
+                }
+                px = px + 1
+            }
+        }
+        py = py + 1
+    }
+}
+
+fn draw_filled_rect(target: *volatile u32, target_width: u32, target_height: u32, x: i32, y: i32, w: u32, h: u32, color: u32, clip: *Rect) {
+    var py: i32 = y
+    while py < y + h as i32 {
+        if py >= clip.y and py < clip.y + clip.height as i32 and py >= 0 and py < target_height as i32 {
+            var px: i32 = x
+            while px < x + w as i32 {
+                if px >= clip.x and px < clip.x + clip.width as i32 and px >= 0 and px < target_width as i32 {
+                    target[py as u32 * target_width + px as u32] = color
+                }
+                px = px + 1
+            }
+        }
+        py = py + 1
+    }
+}
+
+// ============================================================================
+// Rendering - Shadow
+// ============================================================================
+
+fn draw_window_shadow(win: *Window, target: *volatile u32, target_width: u32, target_height: u32, clip: *Rect) {
+    if compositor.shadows_enabled == 0 or (win.flags & WINDOW_FLAG_NO_SHADOW) != 0 {
+        return
+    }
+
+    // Calculate window bounds including decoration
+    var win_x: i32 = win.x
+    var win_y: i32 = win.y
+    var win_w: u32 = win.width
+    var win_h: u32 = win.height
+
+    if (win.flags & WINDOW_FLAG_DECORATED) != 0 {
+        win_x = win_x - WINDOW_BORDER_WIDTH as i32
+        win_y = win_y - WINDOW_TITLEBAR_HEIGHT as i32 - WINDOW_BORDER_WIDTH as i32
+        win_w = win_w + WINDOW_BORDER_WIDTH * 2
+        win_h = win_h + WINDOW_TITLEBAR_HEIGHT + WINDOW_BORDER_WIDTH * 2
+    }
+
+    // Shadow offset
+    let shadow_offset: i32 = 4
+    let shadow_x: i32 = win_x + shadow_offset
+    let shadow_y: i32 = win_y + shadow_offset
+
+    // Draw shadow with gradient
+    var i: u32 = 0
+    while i < SHADOW_SIZE {
+        let alpha: u8 = ((SHADOW_SIZE - i) * SHADOW_OPACITY as u32 / SHADOW_SIZE) as u8
+        let shadow_color: u32 = (alpha as u32) << 24
+
+        // Right edge shadow
+        var y: i32 = shadow_y
+        while y < shadow_y + win_h as i32 {
+            if y >= clip.y and y < clip.y + clip.height as i32 and y >= 0 and y < target_height as i32 {
+                let x: i32 = shadow_x + win_w as i32 + i as i32
+                if x >= clip.x and x < clip.x + clip.width as i32 and x >= 0 and x < target_width as i32 {
+                    let idx: u32 = y as u32 * target_width + x as u32
+                    target[idx] = color_blend(target[idx], 0, alpha)
+                }
+            }
+            y = y + 1
+        }
+
+        // Bottom edge shadow
+        let bottom_y: i32 = shadow_y + win_h as i32 + i as i32
+        if bottom_y >= clip.y and bottom_y < clip.y + clip.height as i32 and bottom_y >= 0 and bottom_y < target_height as i32 {
+            var x: i32 = shadow_x
+            while x < shadow_x + win_w as i32 + SHADOW_SIZE as i32 {
+                if x >= clip.x and x < clip.x + clip.width as i32 and x >= 0 and x < target_width as i32 {
+                    let idx: u32 = bottom_y as u32 * target_width + x as u32
+                    target[idx] = color_blend(target[idx], 0, alpha)
+                }
+                x = x + 1
+            }
+        }
+
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// Rendering - Window Content
+// ============================================================================
+
+fn draw_window_content(win: *Window, target: *volatile u32, target_width: u32, target_height: u32, clip: *Rect, opacity: u8) {
+    if win.buffer == null {
+        return
+    }
+
+    // Calculate effective opacity
+    let eff_opacity: u8 = ((win.opacity as u32 * opacity as u32) / 255) as u8
+
+    var dst_y: i32 = win.y
+    var src_y: u32 = 0
+    while src_y < win.height {
+        if dst_y >= clip.y and dst_y < clip.y + clip.height as i32 and dst_y >= 0 and dst_y < target_height as i32 {
+            var dst_x: i32 = win.x
+            var src_x: u32 = 0
+            while src_x < win.width {
+                if dst_x >= clip.x and dst_x < clip.x + clip.width as i32 and dst_x >= 0 and dst_x < target_width as i32 {
+                    let src_pixel: u32 = win.buffer[src_y * win.width + src_x]
+                    let dst_idx: u32 = dst_y as u32 * target_width + dst_x as u32
+
+                    if eff_opacity == 255 and (win.flags & WINDOW_FLAG_TRANSPARENT) == 0 {
+                        target[dst_idx] = src_pixel | 0xFF000000
+                    } else {
+                        let src_alpha: u8 = color_get_a(src_pixel)
+                        let blend_alpha: u8 = ((src_alpha as u32 * eff_opacity as u32) / 255) as u8
+                        target[dst_idx] = color_blend(target[dst_idx], src_pixel, blend_alpha)
+                    }
+                }
+                dst_x = dst_x + 1
+                src_x = src_x + 1
+            }
+        }
+        dst_y = dst_y + 1
+        src_y = src_y + 1
+    }
+}
+
+// ============================================================================
+// Animation
+// ============================================================================
+
+fn update_animations(delta_time: f32) {
+    var i: u32 = 0
+    while i < compositor.window_count {
+        let slot: u32 = compositor.z_order_list[i]
+        let win: *Window = &compositor.windows[slot]
+
+        if win.anim_type != ANIM_NONE {
+            win.anim_progress = win.anim_progress + delta_time / win.anim_duration
+
+            if win.anim_progress >= 1.0 {
+                // Animation complete
+                win.anim_progress = 1.0
+                win.anim_type = ANIM_NONE
+
+                // Handle animation completion
+                if win.anim_type == ANIM_FADE_OUT {
+                    win.flags = win.flags & ~WINDOW_FLAG_VISIBLE
+                }
+            }
+
+            mark_window_dirty(slot)
+        }
+
+        i = i + 1
+    }
+}
+
+fn get_animation_opacity(win: *Window): u8 {
+    if win.anim_type == ANIM_NONE {
+        return win.opacity
+    }
+
+    let t: f32 = win.anim_progress
+
+    switch win.anim_type {
+        ANIM_FADE_IN => {
+            return (t * 255.0) as u8
+        }
+        ANIM_FADE_OUT => {
+            return ((1.0 - t) * 255.0) as u8
+        }
+        ANIM_MINIMIZE => {
+            return ((1.0 - t) * 255.0) as u8
+        }
+        else => {
+            return win.opacity
+        }
+    }
+}
+
+// ============================================================================
+// Compositing
+// ============================================================================
+
+fn composite_region(region: *Rect) {
+    let display: *Display = &compositor.displays[0]  // TODO: Find correct display
+    let target: *volatile u32 = display.backbuffer
+    let target_width: u32 = display.width
+    let target_height: u32 = display.height
+
+    // Clip region to display
+    var clip: Rect
+    clip.x = if region.x < 0 { 0 } else { region.x }
+    clip.y = if region.y < 0 { 0 } else { region.y }
+    let clip_right: i32 = if region.x + region.width as i32 > target_width as i32 { target_width as i32 } else { region.x + region.width as i32 }
+    let clip_bottom: i32 = if region.y + region.height as i32 > target_height as i32 { target_height as i32 } else { region.y + region.height as i32 }
+    clip.width = (clip_right - clip.x) as u32
+    clip.height = (clip_bottom - clip.y) as u32
+
+    if clip.width == 0 or clip.height == 0 {
+        return
+    }
+
+    // Draw desktop background
+    draw_desktop(&clip, target, target_width, target_height)
+
+    // Draw windows in z-order (back to front)
+    var i: u32 = 0
+    while i < compositor.window_count {
+        let slot: u32 = compositor.z_order_list[i]
+        let win: *Window = &compositor.windows[slot]
+
+        if (win.flags & WINDOW_FLAG_VISIBLE) == 0 {
+            i = i + 1
+            continue
+        }
+
+        // Check if window intersects with region
+        var win_rect: Rect
+        win_rect.x = win.x
+        win_rect.y = win.y
+        win_rect.width = win.width
+        win_rect.height = win.height
+
+        // Expand for decoration
+        if (win.flags & WINDOW_FLAG_DECORATED) != 0 {
+            win_rect.x = win_rect.x - WINDOW_BORDER_WIDTH as i32
+            win_rect.y = win_rect.y - WINDOW_TITLEBAR_HEIGHT as i32 - WINDOW_BORDER_WIDTH as i32
+            win_rect.width = win_rect.width + WINDOW_BORDER_WIDTH * 2
+            win_rect.height = win_rect.height + WINDOW_TITLEBAR_HEIGHT + WINDOW_BORDER_WIDTH * 2
+        }
+
+        // Expand for shadow
+        if compositor.shadows_enabled == 1 and (win.flags & WINDOW_FLAG_NO_SHADOW) == 0 {
+            win_rect.width = win_rect.width + SHADOW_SIZE
+            win_rect.height = win_rect.height + SHADOW_SIZE
+        }
+
+        var intersect: Rect
+        if rect_intersect(&win_rect, &clip, &intersect) == 1 {
+            let opacity: u8 = get_animation_opacity(win)
+
+            // Draw shadow first
+            draw_window_shadow(win, target, target_width, target_height, &clip)
+
+            // Draw decoration
+            draw_window_decoration(win, target, target_width, target_height, &clip)
+
+            // Draw content
+            draw_window_content(win, target, target_width, target_height, &clip, opacity)
+        }
+
+        i = i + 1
+    }
+
+    // Draw cursor
+    draw_cursor(target, target_width, target_height, &clip)
+}
+
+fn draw_desktop(clip: *Rect, target: *volatile u32, target_width: u32, target_height: u32) {
+    // Draw wallpaper if set, otherwise solid color
+    if compositor.wallpaper_buffer != null and compositor.wallpaper_width > 0 {
+        // Draw wallpaper
+        var y: i32 = clip.y
+        while y < clip.y + clip.height as i32 {
+            if y >= 0 and y < target_height as i32 {
+                let src_y: u32 = (y as u32 * compositor.wallpaper_height) / target_height
+                var x: i32 = clip.x
+                while x < clip.x + clip.width as i32 {
+                    if x >= 0 and x < target_width as i32 {
+                        let src_x: u32 = (x as u32 * compositor.wallpaper_width) / target_width
+                        let src_idx: u32 = src_y * compositor.wallpaper_width + src_x
+                        target[y as u32 * target_width + x as u32] = compositor.wallpaper_buffer[src_idx]
+                    }
+                    x = x + 1
+                }
+            }
+            y = y + 1
+        }
+    } else {
+        // Solid color desktop with subtle gradient
+        var y: i32 = clip.y
+        while y < clip.y + clip.height as i32 {
+            if y >= 0 and y < target_height as i32 {
+                let gradient: u32 = (y as u32 * 20) / target_height
+                let desktop_r: u32 = ((compositor.desktop_color >> 16) & 0xFF) - gradient
+                let desktop_g: u32 = ((compositor.desktop_color >> 8) & 0xFF) - gradient
+                let desktop_b: u32 = (compositor.desktop_color & 0xFF) - gradient
+                let row_color: u32 = 0xFF000000 | (desktop_r << 16) | (desktop_g << 8) | desktop_b
+
+                var x: i32 = clip.x
+                while x < clip.x + clip.width as i32 {
+                    if x >= 0 and x < target_width as i32 {
+                        target[y as u32 * target_width + x as u32] = row_color
+                    }
+                    x = x + 1
+                }
+            }
+            y = y + 1
+        }
+    }
+}
+
+fn draw_cursor(target: *volatile u32, target_width: u32, target_height: u32, clip: *Rect) {
+    // Simple arrow cursor
+    let cursor_data: [u32; 16] = [
+        0b1000000000000000,
+        0b1100000000000000,
+        0b1110000000000000,
+        0b1111000000000000,
+        0b1111100000000000,
+        0b1111110000000000,
+        0b1111111000000000,
+        0b1111111100000000,
+        0b1111111110000000,
+        0b1111100000000000,
+        0b1101100000000000,
+        0b1000110000000000,
+        0b0000110000000000,
+        0b0000011000000000,
+        0b0000011000000000,
+        0b0000000000000000
+    ]
+
+    var cy: u32 = 0
+    while cy < 16 {
+        let row: u32 = cursor_data[cy]
+        let screen_y: i32 = compositor.mouse_y + cy as i32
+
+        if screen_y >= clip.y and screen_y < clip.y + clip.height as i32 and screen_y >= 0 and screen_y < target_height as i32 {
+            var cx: u32 = 0
+            while cx < 16 {
+                if (row & (0x8000 >> cx)) != 0 {
+                    let screen_x: i32 = compositor.mouse_x + cx as i32
+                    if screen_x >= clip.x and screen_x < clip.x + clip.width as i32 and screen_x >= 0 and screen_x < target_width as i32 {
+                        target[screen_y as u32 * target_width + screen_x as u32] = 0xFFFFFFFF
+                    }
+                }
+                cx = cx + 1
+            }
+        }
+        cy = cy + 1
+    }
+}
+
+// ============================================================================
+// Main Render Loop
+// ============================================================================
 
 export fn compositor_render() {
-  if vsync_enabled == 1 {
-    // Wait for vsync (stub)
-  }
-  
-  // Clear screen
-  fb.fb_clear(0x000000)
-  
-  // Render windows in z-order
-  var i: u32 = 0
-  while i < window_count {
-    if windows[i].visible == 1 {
-      // Blit window (stub)
+    if compositor.initialized == 0 {
+        return
     }
-    i = i + 1
-  }
-  
-  fb.fb_present()
+
+    // Update animations
+    let delta_time: f32 = 1.0 / 60.0  // Assume 60 FPS
+    update_animations(delta_time)
+
+    if compositor.full_redraw_needed == 1 {
+        // Full screen redraw
+        var full_rect: Rect
+        full_rect.x = 0
+        full_rect.y = 0
+        full_rect.width = compositor.displays[0].width
+        full_rect.height = compositor.displays[0].height
+
+        composite_region(&full_rect)
+    } else {
+        // Partial redraw - only dirty regions
+        var i: u32 = 0
+        while i < compositor.dirty_count {
+            if compositor.dirty_regions[i].active == 1 {
+                composite_region(&compositor.dirty_regions[i].rect)
+            }
+            i = i + 1
+        }
+    }
+
+    clear_dirty_regions()
+
+    // VSync and present
+    if compositor.vsync_enabled == 1 {
+        // Wait for vertical blank (actual implementation would use hardware)
+        // For now, this is a placeholder
+    }
+
+    // Copy backbuffer to frontbuffer (present)
+    gpu.gpu_present()
+
+    compositor.frame_count = compositor.frame_count + 1
+}
+
+export fn compositor_force_redraw() {
+    compositor.full_redraw_needed = 1
+}
+
+// ============================================================================
+// Input Handling
+// ============================================================================
+
+export fn compositor_mouse_move(x: i32, y: i32) {
+    let old_x: i32 = compositor.mouse_x
+    let old_y: i32 = compositor.mouse_y
+
+    compositor.mouse_x = x
+    compositor.mouse_y = y
+
+    // Mark cursor area as dirty
+    var cursor_rect: Rect
+    cursor_rect.x = if old_x < x { old_x } else { x }
+    cursor_rect.y = if old_y < y { old_y } else { y }
+    cursor_rect.width = 16 + (if old_x > x { old_x - x } else { x - old_x }) as u32
+    cursor_rect.height = 16 + (if old_y > y { old_y - y } else { y - old_y }) as u32
+    add_dirty_region(&cursor_rect, 0xFFFFFFFF)
+
+    // Handle window dragging
+    if compositor.drag_window != 0xFFFFFFFF {
+        let slot: u32 = find_window_slot(compositor.drag_window)
+        if slot != 0xFFFFFFFF {
+            let win: *Window = &compositor.windows[slot]
+
+            switch compositor.drag_mode {
+                HIT_TITLEBAR => {
+                    // Move window
+                    let new_x: i32 = compositor.drag_win_start_x + (x - compositor.drag_start_x)
+                    let new_y: i32 = compositor.drag_win_start_y + (y - compositor.drag_start_y)
+                    compositor_move_window(compositor.drag_window, new_x, new_y)
+                }
+                HIT_RESIZE_SE => {
+                    // Resize from bottom-right
+                    let new_w: i32 = compositor.drag_win_start_w as i32 + (x - compositor.drag_start_x)
+                    let new_h: i32 = compositor.drag_win_start_h as i32 + (y - compositor.drag_start_y)
+                    if new_w > 0 and new_h > 0 {
+                        compositor_resize_window(compositor.drag_window, new_w as u32, new_h as u32)
+                    }
+                }
+                HIT_RESIZE_E => {
+                    // Resize from right
+                    let new_w: i32 = compositor.drag_win_start_w as i32 + (x - compositor.drag_start_x)
+                    if new_w > 0 {
+                        compositor_resize_window(compositor.drag_window, new_w as u32, win.height)
+                    }
+                }
+                HIT_RESIZE_S => {
+                    // Resize from bottom
+                    let new_h: i32 = compositor.drag_win_start_h as i32 + (y - compositor.drag_start_y)
+                    if new_h > 0 {
+                        compositor_resize_window(compositor.drag_window, win.width, new_h as u32)
+                    }
+                }
+                else => {}
+            }
+        }
+    }
+}
+
+export fn compositor_mouse_button(button: u32, pressed: u32) {
+    if pressed == 1 {
+        compositor.mouse_buttons = compositor.mouse_buttons | (1 << button)
+
+        // Find window under cursor
+        let hit_window: u32 = find_window_at(compositor.mouse_x, compositor.mouse_y)
+        let hit_region: u32 = hit_test(compositor.mouse_x, compositor.mouse_y)
+
+        if hit_window != 0xFFFFFFFF {
+            // Focus window on click
+            if hit_window != compositor.focused_window {
+                compositor_focus_window(hit_window)
+            }
+
+            // Start drag operation
+            switch hit_region {
+                HIT_TITLEBAR, HIT_RESIZE_N, HIT_RESIZE_S, HIT_RESIZE_E, HIT_RESIZE_W,
+                HIT_RESIZE_NE, HIT_RESIZE_NW, HIT_RESIZE_SE, HIT_RESIZE_SW => {
+                    compositor.drag_window = hit_window
+                    compositor.drag_mode = hit_region
+                    compositor.drag_start_x = compositor.mouse_x
+                    compositor.drag_start_y = compositor.mouse_y
+
+                    let slot: u32 = find_window_slot(hit_window)
+                    if slot != 0xFFFFFFFF {
+                        compositor.drag_win_start_x = compositor.windows[slot].x
+                        compositor.drag_win_start_y = compositor.windows[slot].y
+                        compositor.drag_win_start_w = compositor.windows[slot].width
+                        compositor.drag_win_start_h = compositor.windows[slot].height
+                    }
+                }
+                HIT_CLOSE => {
+                    // Send close event (application should handle)
+                    // For now, just destroy window
+                    compositor_destroy_window(hit_window)
+                }
+                HIT_MINIMIZE => {
+                    compositor_minimize_window(hit_window)
+                }
+                HIT_MAXIMIZE => {
+                    compositor_maximize_window(hit_window)
+                }
+                else => {}
+            }
+        }
+    } else {
+        compositor.mouse_buttons = compositor.mouse_buttons & ~(1 << button)
+
+        // End drag operation
+        compositor.drag_window = 0xFFFFFFFF
+        compositor.drag_mode = HIT_NONE
+    }
+}
+
+fn find_window_at(x: i32, y: i32): u32 {
+    // Search from top to bottom of z-order
+    var i: i32 = compositor.window_count as i32 - 1
+    while i >= 0 {
+        let slot: u32 = compositor.z_order_list[i as u32]
+        let win: *Window = &compositor.windows[slot]
+
+        if (win.flags & WINDOW_FLAG_VISIBLE) == 0 {
+            i = i - 1
+            continue
+        }
+
+        // Calculate window bounds including decoration
+        var rect: Rect
+        rect.x = win.x
+        rect.y = win.y
+        rect.width = win.width
+        rect.height = win.height
+
+        if (win.flags & WINDOW_FLAG_DECORATED) != 0 {
+            rect.x = rect.x - WINDOW_BORDER_WIDTH as i32
+            rect.y = rect.y - WINDOW_TITLEBAR_HEIGHT as i32 - WINDOW_BORDER_WIDTH as i32
+            rect.width = rect.width + WINDOW_BORDER_WIDTH * 2
+            rect.height = rect.height + WINDOW_TITLEBAR_HEIGHT + WINDOW_BORDER_WIDTH * 2
+        }
+
+        if rect_contains_point(&rect, x, y) == 1 {
+            return win.id
+        }
+
+        i = i - 1
+    }
+
+    return 0xFFFFFFFF
+}
+
+fn hit_test(x: i32, y: i32): u32 {
+    let window_id: u32 = find_window_at(x, y)
+    if window_id == 0xFFFFFFFF {
+        return HIT_NONE
+    }
+
+    let slot: u32 = find_window_slot(window_id)
+    if slot == 0xFFFFFFFF {
+        return HIT_NONE
+    }
+
+    let win: *Window = &compositor.windows[slot]
+
+    if (win.flags & WINDOW_FLAG_DECORATED) != 0 {
+        let dec_x: i32 = win.x - WINDOW_BORDER_WIDTH as i32
+        let dec_y: i32 = win.y - WINDOW_TITLEBAR_HEIGHT as i32 - WINDOW_BORDER_WIDTH as i32
+        let dec_w: u32 = win.width + WINDOW_BORDER_WIDTH * 2
+
+        // Check titlebar
+        if y >= dec_y and y < dec_y + WINDOW_TITLEBAR_HEIGHT as i32 + WINDOW_BORDER_WIDTH as i32 {
+            // Check control buttons
+            let button_size: u32 = 16
+            let close_x: i32 = dec_x + dec_w as i32 - button_size as i32 - 6
+            let max_x: i32 = close_x - button_size as i32 - 4
+            let min_x: i32 = max_x - button_size as i32 - 4
+            let button_y: i32 = dec_y + 4
+
+            if y >= button_y and y < button_y + button_size as i32 {
+                if x >= close_x and x < close_x + button_size as i32 {
+                    return HIT_CLOSE
+                }
+                if x >= max_x and x < max_x + button_size as i32 {
+                    return HIT_MAXIMIZE
+                }
+                if x >= min_x and x < min_x + button_size as i32 {
+                    return HIT_MINIMIZE
+                }
+            }
+
+            return HIT_TITLEBAR
+        }
+
+        // Check resize borders
+        if (win.flags & WINDOW_FLAG_RESIZABLE) != 0 {
+            let bottom: i32 = win.y + win.height as i32 + WINDOW_BORDER_WIDTH as i32
+            let right: i32 = win.x + win.width as i32 + WINDOW_BORDER_WIDTH as i32
+
+            // Bottom-right corner
+            if x >= right - 8 and y >= bottom - 8 {
+                return HIT_RESIZE_SE
+            }
+            // Right edge
+            if x >= right - WINDOW_BORDER_WIDTH as i32 {
+                return HIT_RESIZE_E
+            }
+            // Bottom edge
+            if y >= bottom - WINDOW_BORDER_WIDTH as i32 {
+                return HIT_RESIZE_S
+            }
+        }
+    }
+
+    return HIT_CLIENT
+}
+
+export fn compositor_key_event(key_code: u32, pressed: u32, modifiers: u32) {
+    // Route to focused window
+    if compositor.focused_window != 0xFFFFFFFF {
+        // Window would receive key event via event system
+        // For now, just handle some compositor shortcuts
+
+        if pressed == 1 {
+            // Alt+F4 to close window
+            if key_code == 62 and (modifiers & 0x04) != 0 {  // F4 + Alt
+                compositor_destroy_window(compositor.focused_window)
+            }
+            // Alt+Tab to cycle windows (simplified)
+            if key_code == 15 and (modifiers & 0x04) != 0 {  // Tab + Alt
+                cycle_window_focus()
+            }
+        }
+    }
+}
+
+fn cycle_window_focus() {
+    if compositor.window_count <= 1 {
+        return
+    }
+
+    // Find current focused window in z-order
+    var current_pos: u32 = 0
+    var i: u32 = 0
+    while i < compositor.window_count {
+        let slot: u32 = compositor.z_order_list[i]
+        if compositor.windows[slot].id == compositor.focused_window {
+            current_pos = i
+            break
+        }
+        i = i + 1
+    }
+
+    // Find next visible window
+    var next_pos: u32 = (current_pos + compositor.window_count - 1) % compositor.window_count
+    while next_pos != current_pos {
+        let slot: u32 = compositor.z_order_list[next_pos]
+        if (compositor.windows[slot].flags & WINDOW_FLAG_VISIBLE) != 0 {
+            compositor_focus_window(compositor.windows[slot].id)
+            return
+        }
+        next_pos = (next_pos + compositor.window_count - 1) % compositor.window_count
+    }
+}
+
+// ============================================================================
+// Desktop Settings
+// ============================================================================
+
+export fn compositor_set_desktop_color(color: u32) {
+    compositor.desktop_color = color
+    compositor.full_redraw_needed = 1
+}
+
+export fn compositor_set_wallpaper(buffer: *volatile u32, width: u32, height: u32) {
+    compositor.wallpaper_buffer = buffer
+    compositor.wallpaper_width = width
+    compositor.wallpaper_height = height
+    compositor.full_redraw_needed = 1
 }
 
 export fn compositor_set_vsync(enabled: u32) {
-  vsync_enabled = enabled
+    compositor.vsync_enabled = enabled
+}
+
+export fn compositor_set_animations(enabled: u32) {
+    compositor.animations_enabled = enabled
+}
+
+export fn compositor_set_shadows(enabled: u32) {
+    compositor.shadows_enabled = enabled
+    compositor.full_redraw_needed = 1
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn compositor_get_fps(): u32 {
+    return compositor.current_fps
+}
+
+export fn compositor_get_window_count(): u32 {
+    return compositor.window_count
+}
+
+export fn compositor_get_frame_count(): u64 {
+    return compositor.frame_count
 }
