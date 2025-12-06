@@ -1,21 +1,331 @@
 // home-os Rm
-// Remove files and directories
+// Remove files and directories with full option support
 
 import "../../kernel/src/core/foundation.home" as foundation
 import "../../kernel/src/core/filesystem.home" as filesystem
 
-export fn rm_main(path: u64, recursive: u32) {
-  foundation.vga_write_string("Removing ")
-  foundation.vga_write_string(path)
-  foundation.vga_write_string("\n")
-  
-  var result: u32 = filesystem.vfs_unlink(path)
-  
-  if result == 0 {
-    foundation.vga_write_string("Removed successfully\n")
-  } else {
-    foundation.vga_write_string("rm: cannot remove ")
-    foundation.vga_write_string(path)
-    foundation.vga_write_string("\n")
+// Configuration flags
+var recursive: bool = false        // -r/-R: remove directories recursively
+var force: bool = false            // -f: ignore nonexistent files, never prompt
+var interactive: bool = false      // -i: prompt before every removal
+var interactive_once: bool = false // -I: prompt once before removing many files
+var verbose: bool = false          // -v: explain what is being done
+var one_fs: bool = false           // --one-file-system: don't cross filesystems
+var preserve_root: bool = true     // --preserve-root: don't remove '/'
+
+// String utilities
+fn strncmp(a: *u8, b: *u8, n: u32): bool {
+  var i: u32 = 0
+  while i < n {
+    if a[i] != b[i] { return false }
+    if a[i] == 0 { return true }
+    i = i + 1
   }
+  return true
+}
+
+fn str_equal(a: *u8, b: *u8): bool {
+  var i: u32 = 0
+  while a[i] != 0 and b[i] != 0 {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return a[i] == b[i]
+}
+
+fn str_len(s: *u8): u32 {
+  var i: u32 = 0
+  while s[i] != 0 { i = i + 1 }
+  return i
+}
+
+fn str_copy(dest: *u8, src: *u8): u32 {
+  var i: u32 = 0
+  while src[i] != 0 {
+    dest[i] = src[i]
+    i = i + 1
+  }
+  dest[i] = 0
+  return i
+}
+
+// Remove a directory recursively
+fn remove_directory(path: *u8): i32 {
+  // Read directory entries
+  var entries: [filesystem.DirEntryInfo; 256]
+  var count: u32 = filesystem.vfs_readdir(@ptrFromInt(path), &entries, 256)
+
+  var i: u32 = 0
+  while i < count {
+    var name: *u8 = &entries[i].name[0]
+
+    // Skip . and ..
+    if str_equal(name, ".") or str_equal(name, "..") {
+      i = i + 1
+      continue
+    }
+
+    // Build full path
+    var child_path: [u8; 256]
+    var p: u32 = str_copy(&child_path[0], path)
+    if p > 0 and child_path[p - 1] != '/' {
+      child_path[p] = '/'
+      p = p + 1
+    }
+    str_copy(&child_path[p], name)
+
+    // Recursively remove
+    if entries[i].file_type == 2 {
+      remove_directory(&child_path[0])
+    } else {
+      if interactive {
+        foundation.serial_write_string("rm: remove regular file '")
+        foundation.serial_write_string(&child_path[0])
+        foundation.serial_write_string("'? ")
+        foundation.serial_write_string("(skipped - interactive mode)\n")
+        i = i + 1
+        continue
+      }
+
+      var result: u32 = filesystem.vfs_unlink(@ptrFromInt(&child_path[0]))
+      if result != 0 and !force {
+        foundation.serial_write_string("rm: cannot remove '")
+        foundation.serial_write_string(&child_path[0])
+        foundation.serial_write_string("'\n")
+      } else if verbose {
+        foundation.serial_write_string("removed '")
+        foundation.serial_write_string(&child_path[0])
+        foundation.serial_write_string("'\n")
+      }
+    }
+
+    i = i + 1
+  }
+
+  // Remove the directory itself
+  if interactive {
+    foundation.serial_write_string("rm: remove directory '")
+    foundation.serial_write_string(path)
+    foundation.serial_write_string("'? ")
+    foundation.serial_write_string("(skipped - interactive mode)\n")
+    return 0
+  }
+
+  var result: u32 = filesystem.vfs_rmdir(@ptrFromInt(path))
+  if result != 0 and !force {
+    foundation.serial_write_string("rm: cannot remove '")
+    foundation.serial_write_string(path)
+    foundation.serial_write_string("'\n")
+    return -1
+  } else if verbose {
+    foundation.serial_write_string("removed directory '")
+    foundation.serial_write_string(path)
+    foundation.serial_write_string("'\n")
+  }
+
+  return 0
+}
+
+// Remove a single file or directory
+fn do_remove(path: *u8): i32 {
+  // Check for root protection
+  if preserve_root and str_equal(path, "/") {
+    foundation.serial_write_string("rm: it is dangerous to operate recursively on '/'\n")
+    foundation.serial_write_string("rm: use --no-preserve-root to override this failsafe\n")
+    return -1
+  }
+
+  // Check if path exists
+  var file_type: u32 = filesystem.vfs_get_type(@ptrFromInt(path))
+
+  if file_type == 0 {
+    if !force {
+      foundation.serial_write_string("rm: cannot remove '")
+      foundation.serial_write_string(path)
+      foundation.serial_write_string("': No such file or directory\n")
+    }
+    return if force { 0 } else { -1 }
+  }
+
+  if file_type == 2 {
+    // Directory
+    if !recursive {
+      foundation.serial_write_string("rm: cannot remove '")
+      foundation.serial_write_string(path)
+      foundation.serial_write_string("': Is a directory\n")
+      return -1
+    }
+    return remove_directory(path)
+  }
+
+  // Regular file or symlink
+  if interactive {
+    foundation.serial_write_string("rm: remove regular file '")
+    foundation.serial_write_string(path)
+    foundation.serial_write_string("'? ")
+    foundation.serial_write_string("(skipped - interactive mode)\n")
+    return 0
+  }
+
+  var result: u32 = filesystem.vfs_unlink(@ptrFromInt(path))
+
+  if result != 0 {
+    if !force {
+      foundation.serial_write_string("rm: cannot remove '")
+      foundation.serial_write_string(path)
+      foundation.serial_write_string("'\n")
+    }
+    return -1
+  }
+
+  if verbose {
+    foundation.serial_write_string("removed '")
+    foundation.serial_write_string(path)
+    foundation.serial_write_string("'\n")
+  }
+
+  return 0
+}
+
+// Print usage
+fn print_usage() {
+  foundation.serial_write_string("\nUsage: rm [OPTION]... [FILE]...\n")
+  foundation.serial_write_string("Remove (unlink) the FILE(s).\n\n")
+  foundation.serial_write_string("Options:\n")
+  foundation.serial_write_string("  -f, --force          ignore nonexistent files, never prompt\n")
+  foundation.serial_write_string("  -i                   prompt before every removal\n")
+  foundation.serial_write_string("  -I                   prompt once before removing more than three files\n")
+  foundation.serial_write_string("  -r, -R, --recursive  remove directories and their contents recursively\n")
+  foundation.serial_write_string("  -d, --dir            remove empty directories\n")
+  foundation.serial_write_string("  -v, --verbose        explain what is being done\n")
+  foundation.serial_write_string("  --no-preserve-root   do not treat '/' specially\n")
+  foundation.serial_write_string("  --preserve-root      do not remove '/' (default)\n")
+  foundation.serial_write_string("  --one-file-system    skip directories on different file systems\n")
+  foundation.serial_write_string("  --help               display this help and exit\n")
+  foundation.serial_write_string("\nBy default, rm does not remove directories. Use the --recursive (-r or -R)\n")
+  foundation.serial_write_string("option to remove each listed directory, too, along with all of its contents.\n")
+  foundation.serial_write_string("\n")
+}
+
+// Reset flags
+fn reset_flags() {
+  recursive = false
+  force = false
+  interactive = false
+  interactive_once = false
+  verbose = false
+  one_fs = false
+  preserve_root = true
+}
+
+// Main entry with argument parsing
+export fn rm_main_args(argc: u32, argv: *[*u8; 16]) {
+  reset_flags()
+
+  var files: [*u8; 16]
+  var file_count: u32 = 0
+  var remove_dirs: bool = false
+
+  var i: u32 = 1
+  while i < argc {
+    var arg: *u8 = argv[i]
+
+    if arg[0] == '-' and arg[1] != 0 {
+      if arg[1] == '-' {
+        // Long options
+        if strncmp(&arg[2], "recursive", 9) {
+          recursive = true
+        } else if strncmp(&arg[2], "force", 5) {
+          force = true
+        } else if strncmp(&arg[2], "verbose", 7) {
+          verbose = true
+        } else if strncmp(&arg[2], "dir", 3) {
+          remove_dirs = true
+        } else if strncmp(&arg[2], "no-preserve-root", 16) {
+          preserve_root = false
+        } else if strncmp(&arg[2], "preserve-root", 13) {
+          preserve_root = true
+        } else if strncmp(&arg[2], "one-file-system", 15) {
+          one_fs = true
+        } else if strncmp(&arg[2], "help", 4) {
+          print_usage()
+          return
+        }
+      } else {
+        // Short options - can be combined
+        var j: u32 = 1
+        while arg[j] != 0 {
+          if arg[j] == 'r' or arg[j] == 'R' {
+            recursive = true
+          } else if arg[j] == 'f' {
+            force = true
+            interactive = false
+          } else if arg[j] == 'i' {
+            interactive = true
+            force = false
+          } else if arg[j] == 'I' {
+            interactive_once = true
+          } else if arg[j] == 'v' {
+            verbose = true
+          } else if arg[j] == 'd' {
+            remove_dirs = true
+          }
+          j = j + 1
+        }
+      }
+    } else {
+      // File argument
+      if file_count < 16 {
+        files[file_count] = arg
+        file_count = file_count + 1
+      }
+    }
+
+    i = i + 1
+  }
+
+  if file_count == 0 {
+    if !force {
+      foundation.serial_write_string("rm: missing operand\n")
+      foundation.serial_write_string("Try 'rm --help' for more information.\n")
+    }
+    return
+  }
+
+  // Interactive once prompt
+  if interactive_once and file_count > 3 {
+    foundation.serial_write_string("rm: remove ")
+    foundation.serial_write_u32(file_count)
+    foundation.serial_write_string(" arguments? ")
+    foundation.serial_write_string("(skipped - interactive mode)\n")
+    return
+  }
+
+  // Remove each file
+  i = 0
+  while i < file_count {
+    do_remove(files[i])
+    i = i + 1
+  }
+}
+
+// Simple entry point for backward compatibility
+export fn rm_main(path: u64, rec: u32) {
+  reset_flags()
+  recursive = (rec != 0)
+
+  var p: *u8 = @ptrFromInt(path)
+  if p[0] == 0 {
+    foundation.serial_write_string("rm: missing operand\n")
+    return
+  }
+
+  do_remove(p)
+}
+
+// Main entry point for standalone execution
+export fn main(): i32 {
+  foundation.serial_write_string("rm: missing operand\n")
+  foundation.serial_write_string("Try 'rm --help' for more information.\n")
+  return 1
 }

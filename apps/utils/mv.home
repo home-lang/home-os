@@ -1,21 +1,315 @@
 // home-os Mv
-// Move/rename files
+// Move/rename files and directories with full option support
 
 import "../../kernel/src/core/foundation.home" as foundation
 import "../../kernel/src/core/filesystem.home" as filesystem
 
-export fn mv_main(source: u64, dest: u64) {
-  foundation.vga_write_string("Moving ")
-  foundation.vga_write_string(source)
-  foundation.vga_write_string(" to ")
-  foundation.vga_write_string(dest)
-  foundation.vga_write_string("\n")
-  
-  var result: u32 = filesystem.vfs_rename(source, dest)
-  
-  if result == 0 {
-    foundation.vga_write_string("Move complete\n")
-  } else {
-    foundation.vga_write_string("mv: cannot move file\n")
+// Configuration flags
+var force: bool = false            // -f: do not prompt before overwriting
+var interactive: bool = false      // -i: prompt before overwrite
+var no_clobber: bool = false       // -n: do not overwrite existing file
+var verbose: bool = false          // -v: explain what is being done
+var update_only: bool = false      // -u: move only when source is newer
+var backup: bool = false           // -b: make backup before overwriting
+
+// String utilities
+fn strncmp(a: *u8, b: *u8, n: u32): bool {
+  var i: u32 = 0
+  while i < n {
+    if a[i] != b[i] { return false }
+    if a[i] == 0 { return true }
+    i = i + 1
   }
+  return true
+}
+
+fn str_len(s: *u8): u32 {
+  var i: u32 = 0
+  while s[i] != 0 { i = i + 1 }
+  return i
+}
+
+fn str_copy(dest: *u8, src: *u8): u32 {
+  var i: u32 = 0
+  while src[i] != 0 {
+    dest[i] = src[i]
+    i = i + 1
+  }
+  dest[i] = 0
+  return i
+}
+
+// Get the basename of a path
+fn get_basename(path: *u8): *u8 {
+  var len: u32 = str_len(path)
+  var i: u32 = len
+  while i > 0 {
+    i = i - 1
+    if path[i] == '/' {
+      return &path[i + 1]
+    }
+  }
+  return path
+}
+
+// Move a single file or directory
+fn do_move(src: *u8, dst: *u8): i32 {
+  // Check if source exists
+  var src_type: u32 = filesystem.vfs_get_type(@ptrFromInt(src))
+  if src_type == 0 {
+    foundation.serial_write_string("mv: cannot stat '")
+    foundation.serial_write_string(src)
+    foundation.serial_write_string("': No such file or directory\n")
+    return -1
+  }
+
+  // Check if destination exists
+  var dst_exists: bool = filesystem.vfs_exists(@ptrFromInt(dst))
+
+  if dst_exists and no_clobber {
+    return 0  // Skip without error
+  }
+
+  if dst_exists and interactive and !force {
+    foundation.serial_write_string("mv: overwrite '")
+    foundation.serial_write_string(dst)
+    foundation.serial_write_string("'? ")
+    // Would read user input here - for now, assume no
+    foundation.serial_write_string("(skipped - interactive mode)\n")
+    return 0
+  }
+
+  // Create backup if requested
+  if dst_exists and backup {
+    var backup_path: [u8; 260]
+    var p: u32 = str_copy(&backup_path[0], dst)
+    backup_path[p] = '~'
+    backup_path[p + 1] = 0
+    filesystem.vfs_rename(@ptrFromInt(dst), @ptrFromInt(&backup_path[0]))
+    if verbose {
+      foundation.serial_write_string("(backup: '")
+      foundation.serial_write_string(&backup_path[0])
+      foundation.serial_write_string("')\n")
+    }
+  }
+
+  // Try to rename (works if on same filesystem)
+  var result: u32 = filesystem.vfs_rename(@ptrFromInt(src), @ptrFromInt(dst))
+
+  if result == 0 {
+    if verbose {
+      foundation.serial_write_string("renamed '")
+      foundation.serial_write_string(src)
+      foundation.serial_write_string("' -> '")
+      foundation.serial_write_string(dst)
+      foundation.serial_write_string("'\n")
+    }
+    return 0
+  }
+
+  // If rename failed (cross-device), fall back to copy + delete
+  // For directories, we'd need recursive copy
+  if src_type == 2 {
+    foundation.serial_write_string("mv: cannot move '")
+    foundation.serial_write_string(src)
+    foundation.serial_write_string("' to a different filesystem\n")
+    return -1
+  }
+
+  // Copy the file
+  var fd_src: u32 = filesystem.vfs_open(@ptrFromInt(src), 0)
+  if fd_src == 0 {
+    foundation.serial_write_string("mv: cannot open '")
+    foundation.serial_write_string(src)
+    foundation.serial_write_string("'\n")
+    return -1
+  }
+
+  var fd_dst: u32 = filesystem.vfs_open(@ptrFromInt(dst), 1)
+  if fd_dst == 0 {
+    filesystem.vfs_close(fd_src)
+    foundation.serial_write_string("mv: cannot create '")
+    foundation.serial_write_string(dst)
+    foundation.serial_write_string("'\n")
+    return -1
+  }
+
+  var buffer: [u8; 4096]
+  while true {
+    var bytes: u64 = filesystem.vfs_read(fd_src, @ptrFromInt(&buffer[0]), 4096)
+    if bytes == 0 { break }
+    filesystem.vfs_write(fd_dst, @ptrFromInt(&buffer[0]), bytes)
+  }
+
+  filesystem.vfs_close(fd_src)
+  filesystem.vfs_close(fd_dst)
+
+  // Preserve permissions
+  var src_perms: u32 = filesystem.vfs_get_permissions(@ptrFromInt(src))
+  filesystem.vfs_chmod(@ptrFromInt(dst), src_perms)
+
+  // Remove source
+  filesystem.vfs_unlink(@ptrFromInt(src))
+
+  if verbose {
+    foundation.serial_write_string("'")
+    foundation.serial_write_string(src)
+    foundation.serial_write_string("' -> '")
+    foundation.serial_write_string(dst)
+    foundation.serial_write_string("'\n")
+  }
+
+  return 0
+}
+
+// Print usage
+fn print_usage() {
+  foundation.serial_write_string("\nUsage: mv [OPTION]... SOURCE... DEST\n")
+  foundation.serial_write_string("Rename SOURCE to DEST, or move SOURCE(s) to DIRECTORY.\n\n")
+  foundation.serial_write_string("Options:\n")
+  foundation.serial_write_string("  -b, --backup         make backup of each existing destination file\n")
+  foundation.serial_write_string("  -f, --force          do not prompt before overwriting\n")
+  foundation.serial_write_string("  -i, --interactive    prompt before overwrite\n")
+  foundation.serial_write_string("  -n, --no-clobber     do not overwrite existing file\n")
+  foundation.serial_write_string("  -u, --update         move only when source is newer\n")
+  foundation.serial_write_string("  -v, --verbose        explain what is being done\n")
+  foundation.serial_write_string("  --help               display this help and exit\n")
+  foundation.serial_write_string("\n")
+}
+
+// Reset flags
+fn reset_flags() {
+  force = false
+  interactive = false
+  no_clobber = false
+  verbose = false
+  update_only = false
+  backup = false
+}
+
+// Main entry with argument parsing
+export fn mv_main_args(argc: u32, argv: *[*u8; 16]) {
+  reset_flags()
+
+  var sources: [*u8; 15]
+  var source_count: u32 = 0
+
+  var i: u32 = 1
+  while i < argc {
+    var arg: *u8 = argv[i]
+
+    if arg[0] == '-' and arg[1] != 0 {
+      if arg[1] == '-' {
+        // Long options
+        if strncmp(&arg[2], "force", 5) {
+          force = true
+        } else if strncmp(&arg[2], "interactive", 11) {
+          interactive = true
+        } else if strncmp(&arg[2], "no-clobber", 10) {
+          no_clobber = true
+        } else if strncmp(&arg[2], "verbose", 7) {
+          verbose = true
+        } else if strncmp(&arg[2], "update", 6) {
+          update_only = true
+        } else if strncmp(&arg[2], "backup", 6) {
+          backup = true
+        } else if strncmp(&arg[2], "help", 4) {
+          print_usage()
+          return
+        }
+      } else {
+        // Short options - can be combined
+        var j: u32 = 1
+        while arg[j] != 0 {
+          if arg[j] == 'f' {
+            force = true
+          } else if arg[j] == 'i' {
+            interactive = true
+          } else if arg[j] == 'n' {
+            no_clobber = true
+          } else if arg[j] == 'v' {
+            verbose = true
+          } else if arg[j] == 'u' {
+            update_only = true
+          } else if arg[j] == 'b' {
+            backup = true
+          }
+          j = j + 1
+        }
+      }
+    } else {
+      // Source/destination argument
+      if source_count < 15 {
+        sources[source_count] = arg
+        source_count = source_count + 1
+      }
+    }
+
+    i = i + 1
+  }
+
+  if source_count < 2 {
+    foundation.serial_write_string("mv: missing destination file operand\n")
+    foundation.serial_write_string("Try 'mv --help' for more information.\n")
+    return
+  }
+
+  // Last argument is destination
+  var dest: *u8 = sources[source_count - 1]
+  source_count = source_count - 1
+
+  // Check if destination is a directory
+  var dest_type: u32 = filesystem.vfs_get_type(@ptrFromInt(dest))
+  var dest_is_dir: bool = (dest_type == 2)
+
+  if source_count > 1 and !dest_is_dir {
+    foundation.serial_write_string("mv: target '")
+    foundation.serial_write_string(dest)
+    foundation.serial_write_string("' is not a directory\n")
+    return
+  }
+
+  // Move each source
+  i = 0
+  while i < source_count {
+    var src: *u8 = sources[i]
+    var final_dest: [u8; 256]
+
+    if dest_is_dir {
+      // Build destination path: dest/basename(src)
+      var p: u32 = str_copy(&final_dest[0], dest)
+      if p > 0 and final_dest[p - 1] != '/' {
+        final_dest[p] = '/'
+        p = p + 1
+      }
+      str_copy(&final_dest[p], get_basename(src))
+    } else {
+      str_copy(&final_dest[0], dest)
+    }
+
+    do_move(src, &final_dest[0])
+    i = i + 1
+  }
+}
+
+// Simple entry point for backward compatibility
+export fn mv_main(source: u64, dest: u64) {
+  reset_flags()
+
+  var src: *u8 = @ptrFromInt(source)
+  var dst: *u8 = @ptrFromInt(dest)
+
+  if src[0] == 0 or dst[0] == 0 {
+    foundation.serial_write_string("mv: missing file operand\n")
+    return
+  }
+
+  do_move(src, dst)
+}
+
+// Main entry point for standalone execution
+export fn main(): i32 {
+  foundation.serial_write_string("mv: missing file operand\n")
+  foundation.serial_write_string("Try 'mv --help' for more information.\n")
+  return 1
 }

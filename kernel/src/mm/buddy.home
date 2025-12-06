@@ -1,0 +1,566 @@
+// home-os Buddy Allocator
+// Efficient power-of-two memory allocation with coalescing
+
+import "../core/foundation.home" as foundation
+
+// Buddy allocator configuration
+const PAGE_SIZE: u64 = 4096
+const PAGE_SHIFT: u32 = 12
+const MAX_ORDER: u32 = 11           // Max block = 2^11 pages = 8MB
+const MIN_ORDER: u32 = 0            // Min block = 2^0 pages = 4KB
+const MAX_ZONES: u32 = 4            // DMA, DMA32, Normal, HighMem
+
+// Block states
+const BLOCK_FREE: u8 = 0
+const BLOCK_SPLIT: u8 = 1
+const BLOCK_ALLOCATED: u8 = 2
+
+// Memory zones
+const ZONE_DMA: u32 = 0             // 0-16MB
+const ZONE_DMA32: u32 = 1           // 16MB-4GB
+const ZONE_NORMAL: u32 = 2          // 4GB+
+const ZONE_HIGHMEM: u32 = 3         // High memory (if any)
+
+// Free list node
+struct FreeBlock {
+  next: *FreeBlock
+  prev: *FreeBlock
+  order: u32
+  zone: u32
+}
+
+// Zone statistics
+struct ZoneStats {
+  total_pages: u64
+  free_pages: u64
+  allocated_pages: u64
+  min_watermark: u64
+  low_watermark: u64
+  high_watermark: u64
+}
+
+// Buddy allocator state
+struct BuddyAllocator {
+  // Free lists for each order (0 to MAX_ORDER)
+  free_lists: [*FreeBlock; 12]
+  // Number of free blocks at each order
+  free_count: [u32; 12]
+  // Zone statistics
+  zones: [ZoneStats; 4]
+  // Total memory managed
+  total_memory: u64
+  // Base physical address
+  base_addr: u64
+  // Number of pages managed
+  num_pages: u64
+  // Page state bitmap (2 bits per page)
+  page_states: *u8
+  // Initialized flag
+  initialized: u32
+}
+
+var allocator: BuddyAllocator
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn buddy_init(base: u64, size: u64): i32 {
+  if allocator.initialized == 1 {
+    foundation.serial_write_string("[BUDDY] Already initialized\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[BUDDY] Initializing buddy allocator\n")
+  foundation.serial_write_string("  Base address: 0x")
+  foundation.serial_write_hex(@truncate(base, u32))
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("  Size: ")
+  foundation.serial_write_u64(size / 1048576)
+  foundation.serial_write_string(" MB\n")
+
+  allocator.base_addr = base
+  allocator.total_memory = size
+  allocator.num_pages = size / PAGE_SIZE
+
+  // Initialize free lists to null
+  var i: u32 = 0
+  while i <= MAX_ORDER {
+    allocator.free_lists[i] = 0
+    allocator.free_count[i] = 0
+    i = i + 1
+  }
+
+  // Initialize zone statistics
+  i = 0
+  while i < MAX_ZONES {
+    allocator.zones[i].total_pages = 0
+    allocator.zones[i].free_pages = 0
+    allocator.zones[i].allocated_pages = 0
+    allocator.zones[i].min_watermark = 0
+    allocator.zones[i].low_watermark = 0
+    allocator.zones[i].high_watermark = 0
+    i = i + 1
+  }
+
+  // Add all pages as free blocks at the highest order possible
+  var addr: u64 = base
+  var remaining: u64 = size
+
+  while remaining >= PAGE_SIZE {
+    // Find largest order that fits
+    var order: u32 = MAX_ORDER
+    while order > 0 {
+      var block_size: u64 = PAGE_SIZE << order
+      if block_size <= remaining {
+        break
+      }
+      order = order - 1
+    }
+
+    var block_size: u64 = PAGE_SIZE << order
+
+    // Add block to free list
+    add_to_free_list(addr, order)
+
+    addr = addr + block_size
+    remaining = remaining - block_size
+  }
+
+  allocator.initialized = 1
+
+  // Print statistics
+  foundation.serial_write_string("[BUDDY] Initialized with:\n")
+  i = 0
+  while i <= MAX_ORDER {
+    if allocator.free_count[i] > 0 {
+      foundation.serial_write_string("  Order ")
+      foundation.serial_write_u32(i)
+      foundation.serial_write_string(": ")
+      foundation.serial_write_u32(allocator.free_count[i])
+      foundation.serial_write_string(" blocks (")
+      foundation.serial_write_u64((PAGE_SIZE << i) / 1024)
+      foundation.serial_write_string(" KB each)\n")
+    }
+    i = i + 1
+  }
+
+  return 0
+}
+
+// ============================================================================
+// Free List Management
+// ============================================================================
+
+fn add_to_free_list(addr: u64, order: u32) {
+  var block: *FreeBlock = @ptrFromInt(addr)
+  block.order = order
+  block.zone = get_zone_for_addr(addr)
+
+  // Add to front of list
+  block.next = allocator.free_lists[order]
+  block.prev = 0
+
+  if allocator.free_lists[order] != 0 {
+    allocator.free_lists[order].prev = block
+  }
+
+  allocator.free_lists[order] = block
+  allocator.free_count[order] = allocator.free_count[order] + 1
+
+  // Update zone stats
+  var num_pages: u64 = 1 << order
+  allocator.zones[block.zone].free_pages =
+    allocator.zones[block.zone].free_pages + num_pages
+}
+
+fn remove_from_free_list(block: *FreeBlock) {
+  var order: u32 = block.order
+
+  if block.prev != 0 {
+    block.prev.next = block.next
+  } else {
+    allocator.free_lists[order] = block.next
+  }
+
+  if block.next != 0 {
+    block.next.prev = block.prev
+  }
+
+  allocator.free_count[order] = allocator.free_count[order] - 1
+
+  // Update zone stats
+  var num_pages: u64 = 1 << order
+  var zone: u32 = block.zone
+  if allocator.zones[zone].free_pages >= num_pages {
+    allocator.zones[zone].free_pages =
+      allocator.zones[zone].free_pages - num_pages
+  }
+}
+
+fn get_zone_for_addr(addr: u64): u32 {
+  if addr < 0x1000000 {        // < 16MB
+    return ZONE_DMA
+  } else if addr < 0x100000000 {  // < 4GB
+    return ZONE_DMA32
+  } else {
+    return ZONE_NORMAL
+  }
+}
+
+// ============================================================================
+// Allocation
+// ============================================================================
+
+// Allocate 2^order pages
+export fn buddy_alloc(order: u32): u64 {
+  if allocator.initialized == 0 {
+    foundation.serial_write_string("[BUDDY] Error: not initialized\n")
+    return 0
+  }
+
+  if order > MAX_ORDER {
+    foundation.serial_write_string("[BUDDY] Error: order too large\n")
+    return 0
+  }
+
+  // Find a free block at this order or higher
+  var current_order: u32 = order
+  while current_order <= MAX_ORDER {
+    if allocator.free_lists[current_order] != 0 {
+      // Found a free block
+      var block: *FreeBlock = allocator.free_lists[current_order]
+      remove_from_free_list(block)
+
+      // Split if necessary
+      while current_order > order {
+        current_order = current_order - 1
+
+        // Split block: add second half to free list
+        var buddy_addr: u64 = @ptrFromInt(block) + (PAGE_SIZE << current_order)
+        add_to_free_list(buddy_addr, current_order)
+      }
+
+      // Update zone stats
+      var zone: u32 = get_zone_for_addr(@ptrFromInt(block))
+      var num_pages: u64 = 1 << order
+      allocator.zones[zone].allocated_pages =
+        allocator.zones[zone].allocated_pages + num_pages
+
+      return @ptrFromInt(block)
+    }
+    current_order = current_order + 1
+  }
+
+  // No free block found
+  foundation.serial_write_string("[BUDDY] Error: out of memory for order ")
+  foundation.serial_write_u32(order)
+  foundation.serial_write_string("\n")
+  return 0
+}
+
+// Allocate a single page
+export fn buddy_alloc_page(): u64 {
+  return buddy_alloc(0)
+}
+
+// Allocate contiguous pages
+export fn buddy_alloc_pages(num_pages: u64): u64 {
+  // Find minimum order that fits
+  var order: u32 = 0
+  var pages: u64 = 1
+  while pages < num_pages and order < MAX_ORDER {
+    order = order + 1
+    pages = pages << 1
+  }
+  return buddy_alloc(order)
+}
+
+// ============================================================================
+// Deallocation
+// ============================================================================
+
+// Free a block of 2^order pages
+export fn buddy_free(addr: u64, order: u32) {
+  if allocator.initialized == 0 {
+    foundation.serial_write_string("[BUDDY] Error: not initialized\n")
+    return
+  }
+
+  if order > MAX_ORDER {
+    foundation.serial_write_string("[BUDDY] Error: order too large\n")
+    return
+  }
+
+  // Validate address
+  if addr < allocator.base_addr or
+     addr >= allocator.base_addr + allocator.total_memory {
+    foundation.serial_write_string("[BUDDY] Error: invalid address\n")
+    return
+  }
+
+  // Try to coalesce with buddy
+  var current_addr: u64 = addr
+  var current_order: u32 = order
+
+  while current_order < MAX_ORDER {
+    // Calculate buddy address
+    var block_size: u64 = PAGE_SIZE << current_order
+    var buddy_addr: u64 = current_addr ^ block_size
+
+    // Check if buddy is free
+    var buddy: *FreeBlock = find_free_block(buddy_addr, current_order)
+
+    if buddy == 0 {
+      // Buddy not free, can't coalesce
+      break
+    }
+
+    // Remove buddy from free list
+    remove_from_free_list(buddy)
+
+    // Coalesce: use lower address
+    if buddy_addr < current_addr {
+      current_addr = buddy_addr
+    }
+
+    current_order = current_order + 1
+  }
+
+  // Update zone stats
+  var zone: u32 = get_zone_for_addr(addr)
+  var num_pages: u64 = 1 << order
+  if allocator.zones[zone].allocated_pages >= num_pages {
+    allocator.zones[zone].allocated_pages =
+      allocator.zones[zone].allocated_pages - num_pages
+  }
+
+  // Add coalesced block to free list
+  add_to_free_list(current_addr, current_order)
+}
+
+// Free a single page
+export fn buddy_free_page(addr: u64) {
+  buddy_free(addr, 0)
+}
+
+// Find a free block at given address and order
+fn find_free_block(addr: u64, order: u32): *FreeBlock {
+  var block: *FreeBlock = allocator.free_lists[order]
+
+  while block != 0 {
+    if @ptrFromInt(block) == addr {
+      return block
+    }
+    block = block.next
+  }
+
+  return 0
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn buddy_get_free_pages(): u64 {
+  var total: u64 = 0
+  var order: u32 = 0
+
+  while order <= MAX_ORDER {
+    total = total + (@as(u64, allocator.free_count[order]) << order)
+    order = order + 1
+  }
+
+  return total
+}
+
+export fn buddy_get_total_memory(): u64 {
+  return allocator.total_memory
+}
+
+export fn buddy_get_free_memory(): u64 {
+  return buddy_get_free_pages() * PAGE_SIZE
+}
+
+export fn buddy_print_stats() {
+  foundation.serial_write_string("\n=== Buddy Allocator Statistics ===\n")
+  foundation.serial_write_string("Total memory: ")
+  foundation.serial_write_u64(allocator.total_memory / 1048576)
+  foundation.serial_write_string(" MB\n")
+  foundation.serial_write_string("Free memory:  ")
+  foundation.serial_write_u64(buddy_get_free_memory() / 1048576)
+  foundation.serial_write_string(" MB\n")
+  foundation.serial_write_string("Free pages:   ")
+  foundation.serial_write_u64(buddy_get_free_pages())
+  foundation.serial_write_string("\n\n")
+
+  foundation.serial_write_string("Free blocks by order:\n")
+  var order: u32 = 0
+  while order <= MAX_ORDER {
+    foundation.serial_write_string("  Order ")
+    foundation.serial_write_u32(order)
+    foundation.serial_write_string(" (")
+    foundation.serial_write_u64((PAGE_SIZE << order) / 1024)
+    foundation.serial_write_string(" KB): ")
+    foundation.serial_write_u32(allocator.free_count[order])
+    foundation.serial_write_string(" blocks\n")
+    order = order + 1
+  }
+
+  foundation.serial_write_string("\nZone statistics:\n")
+  foundation.serial_write_string("  DMA (0-16MB):     ")
+  foundation.serial_write_u64(allocator.zones[ZONE_DMA].free_pages)
+  foundation.serial_write_string(" free, ")
+  foundation.serial_write_u64(allocator.zones[ZONE_DMA].allocated_pages)
+  foundation.serial_write_string(" allocated\n")
+
+  foundation.serial_write_string("  DMA32 (16MB-4GB): ")
+  foundation.serial_write_u64(allocator.zones[ZONE_DMA32].free_pages)
+  foundation.serial_write_string(" free, ")
+  foundation.serial_write_u64(allocator.zones[ZONE_DMA32].allocated_pages)
+  foundation.serial_write_string(" allocated\n")
+
+  foundation.serial_write_string("  Normal (4GB+):    ")
+  foundation.serial_write_u64(allocator.zones[ZONE_NORMAL].free_pages)
+  foundation.serial_write_string(" free, ")
+  foundation.serial_write_u64(allocator.zones[ZONE_NORMAL].allocated_pages)
+  foundation.serial_write_string(" allocated\n")
+
+  foundation.serial_write_string("==================================\n\n")
+}
+
+// ============================================================================
+// Zone-Specific Allocation
+// ============================================================================
+
+// Allocate from specific zone
+export fn buddy_alloc_zone(order: u32, zone: u32): u64 {
+  if zone >= MAX_ZONES {
+    return 0
+  }
+
+  // Find a free block in the specified zone
+  var current_order: u32 = order
+  while current_order <= MAX_ORDER {
+    var block: *FreeBlock = allocator.free_lists[current_order]
+
+    while block != 0 {
+      if block.zone == zone {
+        remove_from_free_list(block)
+
+        // Split if necessary
+        var split_order: u32 = current_order
+        while split_order > order {
+          split_order = split_order - 1
+          var buddy_addr: u64 = @ptrFromInt(block) + (PAGE_SIZE << split_order)
+          add_to_free_list(buddy_addr, split_order)
+        }
+
+        var num_pages: u64 = 1 << order
+        allocator.zones[zone].allocated_pages =
+          allocator.zones[zone].allocated_pages + num_pages
+
+        return @ptrFromInt(block)
+      }
+      block = block.next
+    }
+
+    current_order = current_order + 1
+  }
+
+  return 0
+}
+
+// Allocate DMA-safe memory (below 16MB)
+export fn buddy_alloc_dma(order: u32): u64 {
+  return buddy_alloc_zone(order, ZONE_DMA)
+}
+
+// Allocate DMA32-safe memory (below 4GB)
+export fn buddy_alloc_dma32(order: u32): u64 {
+  var addr: u64 = buddy_alloc_zone(order, ZONE_DMA)
+  if addr != 0 { return addr }
+  return buddy_alloc_zone(order, ZONE_DMA32)
+}
+
+// ============================================================================
+// Watermark Management
+// ============================================================================
+
+export fn buddy_set_watermarks(zone: u32, min: u64, low: u64, high: u64) {
+  if zone >= MAX_ZONES { return }
+
+  allocator.zones[zone].min_watermark = min
+  allocator.zones[zone].low_watermark = low
+  allocator.zones[zone].high_watermark = high
+}
+
+export fn buddy_check_watermarks(zone: u32): u32 {
+  if zone >= MAX_ZONES { return 0 }
+
+  var free: u64 = allocator.zones[zone].free_pages
+
+  if free < allocator.zones[zone].min_watermark {
+    return 3  // Critical
+  } else if free < allocator.zones[zone].low_watermark {
+    return 2  // Low
+  } else if free < allocator.zones[zone].high_watermark {
+    return 1  // Medium
+  }
+  return 0  // OK
+}
+
+// ============================================================================
+// Memory Compaction (defragmentation)
+// ============================================================================
+
+export fn buddy_compact(): u32 {
+  foundation.serial_write_string("[BUDDY] Starting memory compaction...\n")
+
+  var moved: u32 = 0
+
+  // Try to merge adjacent free blocks
+  // This is a simplified version - a real implementation would
+  // also migrate allocated pages
+
+  var order: u32 = 0
+  while order < MAX_ORDER {
+    var block: *FreeBlock = allocator.free_lists[order]
+
+    while block != 0 {
+      var next: *FreeBlock = block.next
+
+      // Calculate buddy
+      var block_size: u64 = PAGE_SIZE << order
+      var buddy_addr: u64 = @ptrFromInt(block) ^ block_size
+
+      // Check if buddy is also free
+      var buddy: *FreeBlock = find_free_block(buddy_addr, order)
+
+      if buddy != 0 {
+        // Remove both blocks
+        remove_from_free_list(block)
+        remove_from_free_list(buddy)
+
+        // Add coalesced block
+        var lower_addr: u64 = if @ptrFromInt(block) < buddy_addr {
+          @ptrFromInt(block)
+        } else {
+          buddy_addr
+        }
+        add_to_free_list(lower_addr, order + 1)
+        moved = moved + 1
+      }
+
+      block = next
+    }
+
+    order = order + 1
+  }
+
+  foundation.serial_write_string("[BUDDY] Compaction complete: ")
+  foundation.serial_write_u32(moved)
+  foundation.serial_write_string(" blocks merged\n")
+
+  return moved
+}

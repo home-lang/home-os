@@ -1,0 +1,608 @@
+// home-os Kernel - Unified Scheduler
+// Integrates CFS, RT scheduling with timer and process management
+
+import "../core/foundation.home" as foundation
+import "../core/process.home" as process
+import "../core/memory.home" as memory
+import "../drivers/timer.home" as timer
+import "../sys/signal.home" as signal
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_CPUS: u32 = 16
+const MAX_PROCESSES: u32 = 256
+const TICK_RATE_HZ: u32 = 100      // 100 Hz = 10ms tick
+const TIME_SLICE_MS: u32 = 10      // Default time slice
+const MIN_GRANULARITY_NS: u64 = 1_000_000  // 1ms minimum
+
+// Scheduling classes
+const SCHED_NORMAL: u32 = 0
+const SCHED_FIFO: u32 = 1
+const SCHED_RR: u32 = 2
+const SCHED_BATCH: u32 = 3
+const SCHED_IDLE: u32 = 5
+const SCHED_DEADLINE: u32 = 6
+
+// Process priorities (nice values mapped to weights)
+// Nice -20 to +19 maps to priority 0-39
+const DEFAULT_PRIO: u32 = 20
+const MAX_RT_PRIO: u32 = 100
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// Run queue entry
+struct RunQueueEntry {
+  pid: u32,
+  vruntime: u64,        // Virtual runtime for CFS
+  priority: u32,        // Static priority
+  sched_class: u32,     // Scheduling class
+  time_slice: u32,      // Remaining time slice (for RR)
+  cpu_affinity: u32,    // CPU affinity mask
+  on_rq: u32            // On run queue?
+}
+
+// Per-CPU run queue
+struct CPURunQueue {
+  current: u32,         // Current running PID
+  nr_running: u32,      // Number of runnable tasks
+  clock: u64,           // CPU clock in nanoseconds
+  min_vruntime: u64,    // Minimum vruntime on this CPU
+  load_weight: u32,     // Total load weight
+  idle_time: u64,       // Time spent idle
+  rq: [RunQueueEntry; 256]
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var cpu_rq: [CPURunQueue; 16]
+var nr_cpus: u32 = 1
+var scheduler_initialized: u32 = 0
+var need_resched: [u32; 16]         // Per-CPU reschedule flags
+var total_forks: u64 = 0
+var context_switches: u64 = 0
+
+// Nice to weight mapping (simplified)
+var nice_to_weight: [u32; 40]
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn scheduler_init() {
+  if scheduler_initialized == 1 { return }
+
+  // Initialize nice to weight table
+  // Nice 0 = weight 1024, each nice level is ~1.25x
+  var i: u32 = 0
+  while i < 40 {
+    var nice: i32 = @intCast(i) - 20
+    if nice < 0 {
+      nice_to_weight[i] = 1024 << @intCast(-nice / 4)
+    } else {
+      nice_to_weight[i] = 1024 >> @intCast(nice / 4)
+    }
+    if nice_to_weight[i] == 0 {
+      nice_to_weight[i] = 1
+    }
+    i = i + 1
+  }
+
+  // Initialize per-CPU run queues
+  i = 0
+  while i < MAX_CPUS {
+    cpu_rq[i].current = 0
+    cpu_rq[i].nr_running = 0
+    cpu_rq[i].clock = 0
+    cpu_rq[i].min_vruntime = 0
+    cpu_rq[i].load_weight = 0
+    cpu_rq[i].idle_time = 0
+    need_resched[i] = 0
+
+    var j: u32 = 0
+    while j < MAX_PROCESSES {
+      cpu_rq[i].rq[j].pid = 0
+      cpu_rq[i].rq[j].on_rq = 0
+      j = j + 1
+    }
+    i = i + 1
+  }
+
+  // Register timer callback
+  timer.timer_register_callback(@ptrFromInt(&scheduler_tick))
+
+  // Initialize signal system
+  signal.signal_init()
+
+  scheduler_initialized = 1
+  foundation.serial_write_string("[Scheduler] Initialized with ")
+  foundation.serial_write_hex(nr_cpus)
+  foundation.serial_write_string(" CPUs\n")
+}
+
+export fn scheduler_set_num_cpus(num: u32) {
+  if num > 0 and num <= MAX_CPUS {
+    nr_cpus = num
+  }
+}
+
+// ============================================================================
+// RUN QUEUE OPERATIONS
+// ============================================================================
+
+fn find_rq_entry(cpu: u32, pid: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_PROCESSES {
+    if cpu_rq[cpu].rq[i].pid == pid {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+fn find_free_rq_slot(cpu: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_PROCESSES {
+    if cpu_rq[cpu].rq[i].pid == 0 {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+export fn scheduler_enqueue(pid: u32, cpu: u32) {
+  if cpu >= nr_cpus { cpu = 0 }
+
+  var slot: u32 = find_rq_entry(cpu, pid)
+  if slot == 0xFFFFFFFF {
+    slot = find_free_rq_slot(cpu)
+  }
+
+  if slot == 0xFFFFFFFF {
+    foundation.serial_write_string("[Scheduler] Run queue full!\n")
+    return
+  }
+
+  // Get process priority from process table
+  var prio: u32 = process.process_get_priority(pid)
+  if prio == 0 { prio = DEFAULT_PRIO }
+
+  cpu_rq[cpu].rq[slot].pid = pid
+  cpu_rq[cpu].rq[slot].priority = prio
+  cpu_rq[cpu].rq[slot].sched_class = SCHED_NORMAL
+  cpu_rq[cpu].rq[slot].time_slice = TIME_SLICE_MS
+  cpu_rq[cpu].rq[slot].cpu_affinity = 0xFFFFFFFF  // All CPUs
+  cpu_rq[cpu].rq[slot].on_rq = 1
+
+  // Set vruntime to min_vruntime to be fair to new tasks
+  cpu_rq[cpu].rq[slot].vruntime = cpu_rq[cpu].min_vruntime
+
+  cpu_rq[cpu].nr_running = cpu_rq[cpu].nr_running + 1
+  cpu_rq[cpu].load_weight = cpu_rq[cpu].load_weight + nice_to_weight[prio]
+}
+
+export fn scheduler_dequeue(pid: u32, cpu: u32) {
+  if cpu >= nr_cpus { cpu = 0 }
+
+  var slot: u32 = find_rq_entry(cpu, pid)
+  if slot == 0xFFFFFFFF { return }
+
+  if cpu_rq[cpu].rq[slot].on_rq == 1 {
+    var prio: u32 = cpu_rq[cpu].rq[slot].priority
+    cpu_rq[cpu].load_weight = cpu_rq[cpu].load_weight - nice_to_weight[prio]
+    cpu_rq[cpu].nr_running = cpu_rq[cpu].nr_running - 1
+  }
+
+  cpu_rq[cpu].rq[slot].on_rq = 0
+  cpu_rq[cpu].rq[slot].pid = 0
+}
+
+// ============================================================================
+// CFS SCHEDULER
+// ============================================================================
+
+// Pick next task using CFS algorithm
+fn pick_next_task_cfs(cpu: u32): u32 {
+  var best_pid: u32 = 0
+  var best_vruntime: u64 = 0xFFFFFFFFFFFFFFFF
+
+  var i: u32 = 0
+  while i < MAX_PROCESSES {
+    if cpu_rq[cpu].rq[i].on_rq == 1 and cpu_rq[cpu].rq[i].pid != 0 {
+      // Check if this process is ready
+      var state: u32 = process.process_get_state(cpu_rq[cpu].rq[i].pid)
+      if state == 1 {  // READY
+        if cpu_rq[cpu].rq[i].vruntime < best_vruntime {
+          best_vruntime = cpu_rq[cpu].rq[i].vruntime
+          best_pid = cpu_rq[cpu].rq[i].pid
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  return best_pid
+}
+
+// Update vruntime after task ran
+fn update_curr_vruntime(cpu: u32, delta_ns: u64) {
+  var slot: u32 = find_rq_entry(cpu, cpu_rq[cpu].current)
+  if slot == 0xFFFFFFFF { return }
+
+  var prio: u32 = cpu_rq[cpu].rq[slot].priority
+  var weight: u32 = nice_to_weight[prio]
+
+  // vruntime increases inversely proportional to weight
+  // Higher priority (lower nice) = lower weight = slower vruntime increase
+  var vruntime_delta: u64 = (delta_ns * 1024) / @as(u64, weight)
+
+  cpu_rq[cpu].rq[slot].vruntime = cpu_rq[cpu].rq[slot].vruntime + vruntime_delta
+
+  // Update minimum vruntime
+  if cpu_rq[cpu].rq[slot].vruntime < cpu_rq[cpu].min_vruntime {
+    cpu_rq[cpu].min_vruntime = cpu_rq[cpu].rq[slot].vruntime
+  }
+}
+
+// ============================================================================
+// TIMER TICK HANDLER
+// ============================================================================
+
+export fn scheduler_tick() {
+  var cpu: u32 = get_current_cpu()
+  if cpu >= nr_cpus { cpu = 0 }
+
+  // Update CPU clock
+  var tick_ns: u64 = 1_000_000_000 / TICK_RATE_HZ
+  cpu_rq[cpu].clock = cpu_rq[cpu].clock + tick_ns
+
+  // Update current task's vruntime
+  if cpu_rq[cpu].current != 0 {
+    update_curr_vruntime(cpu, tick_ns)
+
+    // Decrement time slice for RR tasks
+    var slot: u32 = find_rq_entry(cpu, cpu_rq[cpu].current)
+    if slot != 0xFFFFFFFF {
+      if cpu_rq[cpu].rq[slot].sched_class == SCHED_RR {
+        if cpu_rq[cpu].rq[slot].time_slice > 0 {
+          cpu_rq[cpu].rq[slot].time_slice = cpu_rq[cpu].rq[slot].time_slice - 1
+        }
+        if cpu_rq[cpu].rq[slot].time_slice == 0 {
+          // Time slice expired, need resched
+          cpu_rq[cpu].rq[slot].time_slice = TIME_SLICE_MS
+          need_resched[cpu] = 1
+        }
+      }
+
+      // Check if we should preempt (CFS: if another task has lower vruntime)
+      var next: u32 = pick_next_task_cfs(cpu)
+      if next != 0 and next != cpu_rq[cpu].current {
+        var next_slot: u32 = find_rq_entry(cpu, next)
+        if next_slot != 0xFFFFFFFF {
+          if cpu_rq[cpu].rq[next_slot].vruntime + MIN_GRANULARITY_NS < cpu_rq[cpu].rq[slot].vruntime {
+            need_resched[cpu] = 1
+          }
+        }
+      }
+    }
+  } else {
+    // No current task, track idle time
+    cpu_rq[cpu].idle_time = cpu_rq[cpu].idle_time + tick_ns
+  }
+
+  // Update accounting
+  process.process_tick(cpu_rq[cpu].current)
+}
+
+// ============================================================================
+// SCHEDULE FUNCTION
+// ============================================================================
+
+export fn schedule() {
+  var cpu: u32 = get_current_cpu()
+  if cpu >= nr_cpus { cpu = 0 }
+
+  var prev: u32 = cpu_rq[cpu].current
+  var next: u32 = pick_next_task_cfs(cpu)
+
+  if next == 0 {
+    // No runnable task, run idle
+    cpu_rq[cpu].current = 0
+    return
+  }
+
+  if next == prev {
+    // Same task, no context switch needed
+    need_resched[cpu] = 0
+    return
+  }
+
+  // Perform context switch
+  if prev != 0 {
+    process.process_set_state(prev, 1)  // READY
+  }
+  process.process_set_state(next, 2)  // RUNNING
+  cpu_rq[cpu].current = next
+  need_resched[cpu] = 0
+  context_switches = context_switches + 1
+
+  // Deliver pending signals before returning to userspace
+  signal.signal_deliver(next)
+
+  // Actually switch context
+  process.context_switch(prev, next)
+}
+
+export fn schedule_if_needed() {
+  var cpu: u32 = get_current_cpu()
+  if need_resched[cpu] != 0 {
+    schedule()
+  }
+}
+
+// ============================================================================
+// PROCESS LIFECYCLE INTEGRATION
+// ============================================================================
+
+export fn scheduler_fork(parent_pid: u32, child_pid: u32) {
+  total_forks = total_forks + 1
+
+  // Get parent's CPU
+  var cpu: u32 = 0
+  var i: u32 = 0
+  while i < nr_cpus {
+    var slot: u32 = find_rq_entry(i, parent_pid)
+    if slot != 0xFFFFFFFF {
+      cpu = i
+      break
+    }
+    i = i + 1
+  }
+
+  // Enqueue child on same CPU (for cache locality)
+  scheduler_enqueue(child_pid, cpu)
+
+  // Copy signal handlers
+  signal.signal_fork(parent_pid, child_pid)
+}
+
+export fn scheduler_exec(pid: u32) {
+  // Reset signal handlers on exec
+  signal.signal_exec(pid)
+}
+
+export fn scheduler_exit(pid: u32) {
+  // Clean up signal state
+  signal.signal_exit(pid)
+
+  // Remove from all run queues
+  var cpu: u32 = 0
+  while cpu < nr_cpus {
+    scheduler_dequeue(pid, cpu)
+    cpu = cpu + 1
+  }
+}
+
+export fn scheduler_wake(pid: u32) {
+  // Find which CPU the task is on
+  var cpu: u32 = 0
+  var found: u32 = 0
+
+  while cpu < nr_cpus {
+    var slot: u32 = find_rq_entry(cpu, pid)
+    if slot != 0xFFFFFFFF {
+      found = 1
+      break
+    }
+    cpu = cpu + 1
+  }
+
+  if found == 0 {
+    // Not on any queue, enqueue on least loaded CPU
+    cpu = find_least_loaded_cpu()
+    scheduler_enqueue(pid, cpu)
+  }
+
+  // Set as ready
+  process.process_set_state(pid, 1)  // READY
+
+  // Check if we should preempt current
+  if cpu_rq[cpu].current != 0 {
+    need_resched[cpu] = 1
+  }
+}
+
+export fn scheduler_sleep(pid: u32) {
+  process.process_set_state(pid, 3)  // BLOCKED
+
+  // If this was the current task, schedule another
+  var cpu: u32 = get_current_cpu()
+  if cpu_rq[cpu].current == pid {
+    schedule()
+  }
+}
+
+// ============================================================================
+// LOAD BALANCING
+// ============================================================================
+
+fn find_least_loaded_cpu(): u32 {
+  var best_cpu: u32 = 0
+  var min_load: u32 = cpu_rq[0].nr_running
+
+  var cpu: u32 = 1
+  while cpu < nr_cpus {
+    if cpu_rq[cpu].nr_running < min_load {
+      min_load = cpu_rq[cpu].nr_running
+      best_cpu = cpu
+    }
+    cpu = cpu + 1
+  }
+
+  return best_cpu
+}
+
+fn find_most_loaded_cpu(): u32 {
+  var worst_cpu: u32 = 0
+  var max_load: u32 = cpu_rq[0].nr_running
+
+  var cpu: u32 = 1
+  while cpu < nr_cpus {
+    if cpu_rq[cpu].nr_running > max_load {
+      max_load = cpu_rq[cpu].nr_running
+      worst_cpu = cpu
+    }
+    cpu = cpu + 1
+  }
+
+  return worst_cpu
+}
+
+export fn scheduler_balance() {
+  if nr_cpus <= 1 { return }
+
+  var src_cpu: u32 = find_most_loaded_cpu()
+  var dst_cpu: u32 = find_least_loaded_cpu()
+
+  // Only balance if imbalance is significant
+  if cpu_rq[src_cpu].nr_running <= cpu_rq[dst_cpu].nr_running + 2 {
+    return
+  }
+
+  // Find a task to migrate
+  var i: u32 = 0
+  while i < MAX_PROCESSES {
+    if cpu_rq[src_cpu].rq[i].on_rq == 1 and cpu_rq[src_cpu].rq[i].pid != 0 {
+      // Don't migrate current task
+      if cpu_rq[src_cpu].rq[i].pid == cpu_rq[src_cpu].current {
+        i = i + 1
+        continue
+      }
+
+      // Check affinity
+      if (cpu_rq[src_cpu].rq[i].cpu_affinity & (1 << dst_cpu)) == 0 {
+        i = i + 1
+        continue
+      }
+
+      // Migrate this task
+      var pid: u32 = cpu_rq[src_cpu].rq[i].pid
+      scheduler_dequeue(pid, src_cpu)
+      scheduler_enqueue(pid, dst_cpu)
+
+      foundation.serial_write_string("[Scheduler] Migrated PID ")
+      foundation.serial_write_hex(pid)
+      foundation.serial_write_string(" from CPU ")
+      foundation.serial_write_hex(src_cpu)
+      foundation.serial_write_string(" to CPU ")
+      foundation.serial_write_hex(dst_cpu)
+      foundation.serial_write_string("\n")
+
+      return
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// CPU FUNCTIONS
+// ============================================================================
+
+fn get_current_cpu(): u32 {
+  // Would use APIC ID or similar
+  // For now, return 0
+  return 0
+}
+
+export fn scheduler_get_current_pid(): u32 {
+  var cpu: u32 = get_current_cpu()
+  return cpu_rq[cpu].current
+}
+
+// ============================================================================
+// PRIORITY MANAGEMENT
+// ============================================================================
+
+export fn scheduler_set_priority(pid: u32, prio: u32) {
+  var cpu: u32 = 0
+  while cpu < nr_cpus {
+    var slot: u32 = find_rq_entry(cpu, pid)
+    if slot != 0xFFFFFFFF {
+      var old_prio: u32 = cpu_rq[cpu].rq[slot].priority
+      cpu_rq[cpu].rq[slot].priority = prio
+
+      // Update load weight
+      if cpu_rq[cpu].rq[slot].on_rq == 1 {
+        cpu_rq[cpu].load_weight = cpu_rq[cpu].load_weight - nice_to_weight[old_prio]
+        cpu_rq[cpu].load_weight = cpu_rq[cpu].load_weight + nice_to_weight[prio]
+      }
+
+      return
+    }
+    cpu = cpu + 1
+  }
+}
+
+export fn scheduler_set_affinity(pid: u32, mask: u32) {
+  var cpu: u32 = 0
+  while cpu < nr_cpus {
+    var slot: u32 = find_rq_entry(cpu, pid)
+    if slot != 0xFFFFFFFF {
+      cpu_rq[cpu].rq[slot].cpu_affinity = mask
+
+      // If current CPU not in affinity, migrate
+      if (mask & (1 << cpu)) == 0 {
+        // Find a CPU in the mask
+        var new_cpu: u32 = 0
+        while new_cpu < nr_cpus {
+          if (mask & (1 << new_cpu)) != 0 {
+            scheduler_dequeue(pid, cpu)
+            scheduler_enqueue(pid, new_cpu)
+            return
+          }
+          new_cpu = new_cpu + 1
+        }
+      }
+
+      return
+    }
+    cpu = cpu + 1
+  }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn scheduler_get_stats(switches: *u64, forks: *u64, nr_running: *u32) {
+  switches.* = context_switches
+  forks.* = total_forks
+
+  var total: u32 = 0
+  var cpu: u32 = 0
+  while cpu < nr_cpus {
+    total = total + cpu_rq[cpu].nr_running
+    cpu = cpu + 1
+  }
+  nr_running.* = total
+}
+
+export fn scheduler_get_cpu_stats(cpu: u32, clock: *u64, idle: *u64, load: *u32) {
+  if cpu >= nr_cpus {
+    clock.* = 0
+    idle.* = 0
+    load.* = 0
+    return
+  }
+
+  clock.* = cpu_rq[cpu].clock
+  idle.* = cpu_rq[cpu].idle_time
+  load.* = cpu_rq[cpu].nr_running
+}

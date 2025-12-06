@@ -1,0 +1,622 @@
+// home-os Kernel - VFS mmap Integration
+// Connects memory mapping to filesystem and page fault handling
+
+import "foundation.home" as foundation
+import "memory.home" as memory
+import "filesystem.home" as filesystem
+import "process.home" as process
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_MAPPINGS: u32 = 1024
+const PAGE_SIZE: u64 = 4096
+
+// Protection flags
+export const PROT_NONE: u32 = 0
+export const PROT_READ: u32 = 1
+export const PROT_WRITE: u32 = 2
+export const PROT_EXEC: u32 = 4
+
+// Map flags
+export const MAP_SHARED: u32 = 0x01
+export const MAP_PRIVATE: u32 = 0x02
+export const MAP_FIXED: u32 = 0x10
+export const MAP_ANONYMOUS: u32 = 0x20
+export const MAP_GROWSDOWN: u32 = 0x0100
+export const MAP_LOCKED: u32 = 0x2000
+export const MAP_POPULATE: u32 = 0x8000
+
+// Page fault types
+const FAULT_READ: u32 = 0
+const FAULT_WRITE: u32 = 1
+const FAULT_EXEC: u32 = 2
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// Virtual Memory Area (VMA)
+struct VMA {
+  start: u64,           // Start address
+  end: u64,             // End address
+  prot: u32,            // Protection flags
+  flags: u32,           // Map flags
+  fd: u32,              // File descriptor (for file mappings)
+  offset: u64,          // File offset
+  pid: u32,             // Owner process
+  next: u32             // Next VMA index (for linked list)
+}
+
+// Page cache entry
+struct PageCacheEntry {
+  ino: u32,             // Inode number
+  offset: u64,          // File offset
+  page_addr: u64,       // Physical page address
+  ref_count: u32,       // Reference count
+  dirty: u32            // Dirty flag
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var vma_table: [VMA; 1024]
+var vma_count: u32 = 0
+
+var page_cache: [PageCacheEntry; 512]
+var page_cache_count: u32 = 0
+
+var mmap_initialized: u32 = 0
+
+// Per-process VMA head
+var process_vma_head: [u32; 256]
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn vfs_mmap_init() {
+  if mmap_initialized == 1 { return }
+
+  var i: u32 = 0
+  while i < MAX_MAPPINGS {
+    vma_table[i].start = 0
+    vma_table[i].end = 0
+    vma_table[i].pid = 0
+    i = i + 1
+  }
+
+  i = 0
+  while i < 256 {
+    process_vma_head[i] = 0xFFFFFFFF
+    i = i + 1
+  }
+
+  mmap_initialized = 1
+  foundation.serial_write_string("[mmap] VFS mmap integration initialized\n")
+}
+
+// ============================================================================
+// VMA MANAGEMENT
+// ============================================================================
+
+fn alloc_vma(): u32 {
+  var i: u32 = 0
+  while i < MAX_MAPPINGS {
+    if vma_table[i].start == 0 and vma_table[i].end == 0 {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+fn find_vma(pid: u32, addr: u64): u32 {
+  var idx: u32 = process_vma_head[pid]
+  while idx != 0xFFFFFFFF and idx < MAX_MAPPINGS {
+    if addr >= vma_table[idx].start and addr < vma_table[idx].end {
+      return idx
+    }
+    idx = vma_table[idx].next
+  }
+  return 0xFFFFFFFF
+}
+
+fn find_free_region(pid: u32, length: u64, hint: u64): u64 {
+  // Simple allocation strategy: start at hint or default location
+  var addr: u64 = hint
+  if addr == 0 {
+    addr = 0x7F0000000000  // Default mmap region
+  }
+
+  // Align to page boundary
+  addr = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+
+  // Check for overlaps
+  var attempts: u32 = 0
+  while attempts < 1000 {
+    var overlap: u32 = 0
+    var idx: u32 = process_vma_head[pid]
+
+    while idx != 0xFFFFFFFF and idx < MAX_MAPPINGS {
+      if addr < vma_table[idx].end and (addr + length) > vma_table[idx].start {
+        overlap = 1
+        addr = vma_table[idx].end
+        addr = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+        break
+      }
+      idx = vma_table[idx].next
+    }
+
+    if overlap == 0 {
+      return addr
+    }
+    attempts = attempts + 1
+  }
+
+  return 0  // Failed to find region
+}
+
+// ============================================================================
+// MMAP SYSCALL
+// ============================================================================
+
+export fn do_mmap(pid: u32, addr: u64, length: u64, prot: u32, flags: u32, fd: u32, offset: u64): u64 {
+  if length == 0 {
+    return 0xFFFFFFFFFFFFFFFF  // EINVAL
+  }
+
+  // Align length to page size
+  var aligned_length: u64 = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+
+  // Find or use specified address
+  var map_addr: u64 = addr
+  if (flags & MAP_FIXED) == 0 {
+    map_addr = find_free_region(pid, aligned_length, addr)
+    if map_addr == 0 {
+      return 0xFFFFFFFFFFFFFFFF  // ENOMEM
+    }
+  } else {
+    // Fixed mapping - check for overlaps and unmap existing
+    map_addr = addr & ~(PAGE_SIZE - 1)
+    do_munmap(pid, map_addr, aligned_length)
+  }
+
+  // Allocate VMA
+  var vma_idx: u32 = alloc_vma()
+  if vma_idx == 0xFFFFFFFF {
+    return 0xFFFFFFFFFFFFFFFF  // ENOMEM
+  }
+
+  // Initialize VMA
+  vma_table[vma_idx].start = map_addr
+  vma_table[vma_idx].end = map_addr + aligned_length
+  vma_table[vma_idx].prot = prot
+  vma_table[vma_idx].flags = flags
+  vma_table[vma_idx].fd = fd
+  vma_table[vma_idx].offset = offset
+  vma_table[vma_idx].pid = pid
+
+  // Add to process VMA list
+  vma_table[vma_idx].next = process_vma_head[pid]
+  process_vma_head[pid] = vma_idx
+  vma_count = vma_count + 1
+
+  // For anonymous mappings or MAP_POPULATE, allocate pages now
+  if (flags & MAP_ANONYMOUS) != 0 or (flags & MAP_POPULATE) != 0 {
+    var page_addr: u64 = map_addr
+    while page_addr < map_addr + aligned_length {
+      allocate_page_for_vma(vma_idx, page_addr)
+      page_addr = page_addr + PAGE_SIZE
+    }
+  }
+
+  foundation.serial_write_string("[mmap] Mapped 0x")
+  foundation.serial_write_hex(@truncate(map_addr >> 32, u32))
+  foundation.serial_write_hex(@truncate(map_addr, u32))
+  foundation.serial_write_string(" length=")
+  foundation.serial_write_hex(@truncate(aligned_length, u32))
+  foundation.serial_write_string("\n")
+
+  return map_addr
+}
+
+export fn do_munmap(pid: u32, addr: u64, length: u64): u32 {
+  if length == 0 {
+    return 1  // EINVAL
+  }
+
+  var aligned_start: u64 = addr & ~(PAGE_SIZE - 1)
+  var aligned_end: u64 = (addr + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+
+  // Find and remove VMAs in range
+  var prev_idx: u32 = 0xFFFFFFFF
+  var idx: u32 = process_vma_head[pid]
+
+  while idx != 0xFFFFFFFF and idx < MAX_MAPPINGS {
+    var next: u32 = vma_table[idx].next
+
+    // Check if VMA overlaps with unmap region
+    if vma_table[idx].start < aligned_end and vma_table[idx].end > aligned_start {
+      // Free pages in the unmapped region
+      var page_addr: u64 = vma_table[idx].start
+      if page_addr < aligned_start { page_addr = aligned_start }
+
+      var end_addr: u64 = vma_table[idx].end
+      if end_addr > aligned_end { end_addr = aligned_end }
+
+      while page_addr < end_addr {
+        free_page_for_vma(pid, page_addr)
+        page_addr = page_addr + PAGE_SIZE
+      }
+
+      // Handle partial unmaps by splitting VMA
+      if vma_table[idx].start < aligned_start and vma_table[idx].end > aligned_end {
+        // Unmap in the middle - create new VMA for latter part
+        var new_idx: u32 = alloc_vma()
+        if new_idx != 0xFFFFFFFF {
+          vma_table[new_idx] = vma_table[idx]
+          vma_table[new_idx].start = aligned_end
+          vma_table[new_idx].offset = vma_table[idx].offset + (aligned_end - vma_table[idx].start)
+          vma_table[new_idx].next = next
+          vma_table[idx].end = aligned_start
+          vma_table[idx].next = new_idx
+          vma_count = vma_count + 1
+        }
+      } else if vma_table[idx].start < aligned_start {
+        // Unmap end portion
+        vma_table[idx].end = aligned_start
+      } else if vma_table[idx].end > aligned_end {
+        // Unmap beginning portion
+        vma_table[idx].offset = vma_table[idx].offset + (aligned_end - vma_table[idx].start)
+        vma_table[idx].start = aligned_end
+      } else {
+        // Completely unmapped - remove VMA
+        if prev_idx == 0xFFFFFFFF {
+          process_vma_head[pid] = next
+        } else {
+          vma_table[prev_idx].next = next
+        }
+        vma_table[idx].start = 0
+        vma_table[idx].end = 0
+        vma_table[idx].pid = 0
+        vma_count = vma_count - 1
+
+        idx = next
+        continue
+      }
+    }
+
+    prev_idx = idx
+    idx = next
+  }
+
+  return 0
+}
+
+// ============================================================================
+// PAGE FAULT HANDLING
+// ============================================================================
+
+export fn handle_page_fault(pid: u32, fault_addr: u64, fault_type: u32): u32 {
+  // Find VMA for fault address
+  var vma_idx: u32 = find_vma(pid, fault_addr)
+  if vma_idx == 0xFFFFFFFF {
+    foundation.serial_write_string("[mmap] SIGSEGV: no mapping for address 0x")
+    foundation.serial_write_hex(@truncate(fault_addr, u32))
+    foundation.serial_write_string("\n")
+    return 1  // SIGSEGV - no mapping
+  }
+
+  // Check permissions
+  if fault_type == FAULT_READ and (vma_table[vma_idx].prot & PROT_READ) == 0 {
+    return 1  // Permission denied
+  }
+  if fault_type == FAULT_WRITE and (vma_table[vma_idx].prot & PROT_WRITE) == 0 {
+    return 1  // Permission denied
+  }
+  if fault_type == FAULT_EXEC and (vma_table[vma_idx].prot & PROT_EXEC) == 0 {
+    return 1  // Permission denied
+  }
+
+  // Allocate page and map it
+  var result: u32 = allocate_page_for_vma(vma_idx, fault_addr)
+  if result != 0 {
+    foundation.serial_write_string("[mmap] Failed to allocate page\n")
+    return 1
+  }
+
+  return 0  // Success
+}
+
+fn allocate_page_for_vma(vma_idx: u32, fault_addr: u64): u32 {
+  var page_addr: u64 = fault_addr & ~(PAGE_SIZE - 1)
+
+  if (vma_table[vma_idx].flags & MAP_ANONYMOUS) != 0 {
+    // Anonymous mapping - allocate zeroed page
+    var phys_page: u64 = memory.pmm_alloc_page()
+    if phys_page == 0 {
+      return 1  // Out of memory
+    }
+
+    // Zero the page
+    memory.memset(phys_page, 0, PAGE_SIZE)
+
+    // Map the page
+    var prot: u32 = vma_table[vma_idx].prot
+    memory.vmm_map_page(vma_table[vma_idx].pid, page_addr, phys_page, prot)
+
+    return 0
+
+  } else {
+    // File-backed mapping - load from file
+    var file_offset: u64 = vma_table[vma_idx].offset + (page_addr - vma_table[vma_idx].start)
+
+    // Check page cache first
+    var cache_idx: u32 = find_in_page_cache(vma_table[vma_idx].fd, file_offset)
+    if cache_idx != 0xFFFFFFFF {
+      // Page is in cache
+      page_cache[cache_idx].ref_count = page_cache[cache_idx].ref_count + 1
+
+      var prot: u32 = vma_table[vma_idx].prot
+      memory.vmm_map_page(vma_table[vma_idx].pid, page_addr, page_cache[cache_idx].page_addr, prot)
+      return 0
+    }
+
+    // Allocate page and read from file
+    var phys_page: u64 = memory.pmm_alloc_page()
+    if phys_page == 0 {
+      return 1
+    }
+
+    // Read page from file
+    var bytes_read: u64 = filesystem.vfs_pread(vma_table[vma_idx].fd, phys_page, PAGE_SIZE, file_offset)
+
+    // Zero remainder if short read
+    if bytes_read < PAGE_SIZE {
+      memory.memset(phys_page + bytes_read, 0, PAGE_SIZE - bytes_read)
+    }
+
+    // Add to page cache
+    add_to_page_cache(vma_table[vma_idx].fd, file_offset, phys_page)
+
+    // Map the page
+    var prot: u32 = vma_table[vma_idx].prot
+    memory.vmm_map_page(vma_table[vma_idx].pid, page_addr, phys_page, prot)
+
+    return 0
+  }
+}
+
+fn free_page_for_vma(pid: u32, addr: u64) {
+  var page_addr: u64 = addr & ~(PAGE_SIZE - 1)
+
+  // Get physical page
+  var phys_page: u64 = memory.vmm_get_physical(pid, page_addr)
+  if phys_page == 0 {
+    return
+  }
+
+  // Unmap
+  memory.vmm_unmap_page(pid, page_addr)
+
+  // Check if in page cache
+  var i: u32 = 0
+  while i < page_cache_count {
+    if page_cache[i].page_addr == phys_page {
+      page_cache[i].ref_count = page_cache[i].ref_count - 1
+      if page_cache[i].ref_count == 0 {
+        // Write back if dirty
+        if page_cache[i].dirty != 0 {
+          // Would write back to file here
+        }
+        memory.pmm_free_page(phys_page)
+        // Remove from cache
+        page_cache[i].page_addr = 0
+      }
+      return
+    }
+    i = i + 1
+  }
+
+  // Not in cache, just free
+  memory.pmm_free_page(phys_page)
+}
+
+// ============================================================================
+// PAGE CACHE
+// ============================================================================
+
+fn find_in_page_cache(fd: u32, offset: u64): u32 {
+  // Get inode from fd
+  var ino: u32 = filesystem.vfs_get_inode(fd)
+
+  var i: u32 = 0
+  while i < page_cache_count {
+    if page_cache[i].ino == ino and page_cache[i].offset == offset and page_cache[i].page_addr != 0 {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+fn add_to_page_cache(fd: u32, offset: u64, page_addr: u64) {
+  // Get inode from fd
+  var ino: u32 = filesystem.vfs_get_inode(fd)
+
+  // Find free slot
+  var slot: u32 = 0xFFFFFFFF
+  var i: u32 = 0
+  while i < 512 {
+    if page_cache[i].page_addr == 0 {
+      slot = i
+      break
+    }
+    i = i + 1
+  }
+
+  if slot == 0xFFFFFFFF {
+    // Cache full - evict LRU entry (simplified: evict first unreferenced)
+    i = 0
+    while i < page_cache_count {
+      if page_cache[i].ref_count == 0 {
+        if page_cache[i].dirty != 0 {
+          // Write back
+        }
+        memory.pmm_free_page(page_cache[i].page_addr)
+        slot = i
+        break
+      }
+      i = i + 1
+    }
+  }
+
+  if slot == 0xFFFFFFFF {
+    return  // Cache completely full
+  }
+
+  page_cache[slot].ino = ino
+  page_cache[slot].offset = offset
+  page_cache[slot].page_addr = page_addr
+  page_cache[slot].ref_count = 1
+  page_cache[slot].dirty = 0
+
+  if slot >= page_cache_count {
+    page_cache_count = slot + 1
+  }
+}
+
+// ============================================================================
+// MPROTECT
+// ============================================================================
+
+export fn do_mprotect(pid: u32, addr: u64, length: u64, prot: u32): u32 {
+  var aligned_start: u64 = addr & ~(PAGE_SIZE - 1)
+  var aligned_end: u64 = (addr + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+
+  var idx: u32 = process_vma_head[pid]
+  while idx != 0xFFFFFFFF and idx < MAX_MAPPINGS {
+    if vma_table[idx].start < aligned_end and vma_table[idx].end > aligned_start {
+      // VMA overlaps - update protection
+      vma_table[idx].prot = prot
+
+      // Update page table entries
+      var page_addr: u64 = vma_table[idx].start
+      if page_addr < aligned_start { page_addr = aligned_start }
+
+      var end_addr: u64 = vma_table[idx].end
+      if end_addr > aligned_end { end_addr = aligned_end }
+
+      while page_addr < end_addr {
+        memory.vmm_set_protection(pid, page_addr, prot)
+        page_addr = page_addr + PAGE_SIZE
+      }
+    }
+    idx = vma_table[idx].next
+  }
+
+  return 0
+}
+
+// ============================================================================
+// MSYNC
+// ============================================================================
+
+export fn do_msync(pid: u32, addr: u64, length: u64, flags: u32): u32 {
+  var aligned_start: u64 = addr & ~(PAGE_SIZE - 1)
+  var aligned_end: u64 = (addr + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+
+  // Find VMAs in range and sync dirty pages
+  var idx: u32 = process_vma_head[pid]
+  while idx != 0xFFFFFFFF and idx < MAX_MAPPINGS {
+    if vma_table[idx].start < aligned_end and vma_table[idx].end > aligned_start {
+      if (vma_table[idx].flags & MAP_SHARED) != 0 and (vma_table[idx].flags & MAP_ANONYMOUS) == 0 {
+        // Shared file mapping - sync to file
+        var page_addr: u64 = vma_table[idx].start
+        if page_addr < aligned_start { page_addr = aligned_start }
+
+        var end_addr: u64 = vma_table[idx].end
+        if end_addr > aligned_end { end_addr = aligned_end }
+
+        while page_addr < end_addr {
+          sync_page(vma_table[idx].fd, page_addr - vma_table[idx].start + vma_table[idx].offset, pid, page_addr)
+          page_addr = page_addr + PAGE_SIZE
+        }
+      }
+    }
+    idx = vma_table[idx].next
+  }
+
+  return 0
+}
+
+fn sync_page(fd: u32, file_offset: u64, pid: u32, virt_addr: u64) {
+  var phys_page: u64 = memory.vmm_get_physical(pid, virt_addr)
+  if phys_page == 0 {
+    return
+  }
+
+  // Check if dirty in page cache
+  var ino: u32 = filesystem.vfs_get_inode(fd)
+  var i: u32 = 0
+  while i < page_cache_count {
+    if page_cache[i].ino == ino and page_cache[i].offset == file_offset {
+      if page_cache[i].dirty != 0 {
+        filesystem.vfs_pwrite(fd, phys_page, PAGE_SIZE, file_offset)
+        page_cache[i].dirty = 0
+      }
+      return
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// FORK SUPPORT
+// ============================================================================
+
+export fn vfs_mmap_fork(parent_pid: u32, child_pid: u32) {
+  // Copy VMAs from parent to child with COW
+  var parent_idx: u32 = process_vma_head[parent_pid]
+
+  while parent_idx != 0xFFFFFFFF and parent_idx < MAX_MAPPINGS {
+    var child_idx: u32 = alloc_vma()
+    if child_idx == 0xFFFFFFFF {
+      break
+    }
+
+    // Copy VMA
+    vma_table[child_idx] = vma_table[parent_idx]
+    vma_table[child_idx].pid = child_pid
+
+    // Add to child's VMA list
+    vma_table[child_idx].next = process_vma_head[child_pid]
+    process_vma_head[child_pid] = child_idx
+    vma_count = vma_count + 1
+
+    // Set up COW for private mappings
+    if (vma_table[parent_idx].flags & MAP_PRIVATE) != 0 {
+      var page_addr: u64 = vma_table[parent_idx].start
+      while page_addr < vma_table[parent_idx].end {
+        // Mark pages as read-only in both parent and child
+        memory.vmm_set_cow(parent_pid, page_addr)
+        memory.vmm_set_cow(child_pid, page_addr)
+        page_addr = page_addr + PAGE_SIZE
+      }
+    }
+
+    parent_idx = vma_table[parent_idx].next
+  }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn vfs_mmap_get_stats(mappings: *u32, cached_pages: *u32) {
+  mappings.* = vma_count
+  cached_pages.* = page_cache_count
+}

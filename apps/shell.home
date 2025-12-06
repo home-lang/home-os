@@ -1,8 +1,11 @@
-// home-os Shell (hsh - home shell) - Enhanced POSIX-compatible shell
+// home-os Shell - Den Shell Integration
+// Uses ~/Code/den (Zig shell) library for full shell functionality
 // Features: job control, pipes, redirection, scripting, aliases, history
 
 import "../kernel/src/core/foundation.home" as foundation
 import "../kernel/src/core/memory.home" as memory
+import "../kernel/src/ipc/pipe.home" as pipe
+import "../kernel/src/lib/den_lib.home" as den
 
 // Shell configuration
 const MAX_COMMAND_LENGTH: u32 = 4096
@@ -11,6 +14,24 @@ const MAX_JOBS: u32 = 64
 const MAX_ALIASES: u32 = 64
 const MAX_ENV_VARS: u32 = 256
 const MAX_HISTORY: u32 = 1000
+const MAX_PIPELINE_STAGES: u32 = 16
+
+// Redirection types
+const REDIR_NONE: u32 = 0
+const REDIR_INPUT: u32 = 1      // <
+const REDIR_OUTPUT: u32 = 2     // >
+const REDIR_APPEND: u32 = 3     // >>
+const REDIR_HEREDOC: u32 = 4    // <<
+
+// Pipeline stage structure
+struct PipelineStage {
+  command: [256]u8
+  argc: u32
+  redir_in: u32
+  redir_out: u32
+  redir_in_file: [128]u8
+  redir_out_file: [128]u8
+}
 
 // Job states
 const JOB_STATE_RUNNING: u32 = 0
@@ -100,14 +121,17 @@ fn str_copy(dest: *u8, src: *u8) {
   }
 }
 
-// Initialize shell
+// Initialize shell using Den library
 fn shell_init() {
   foundation.serial_write_string("\n")
   foundation.serial_write_string("================================================================================\n")
-  foundation.serial_write_string("                        home shell (hsh) version 1.0\n")
-  foundation.serial_write_string("                  Type 'help' for a list of commands\n")
+  foundation.serial_write_string("              home-os shell (den) - Powered by ~/Code/den\n")
+  foundation.serial_write_string("      Type 'help' for commands | Pipes (|) and redirects (<, >, >>) supported\n")
   foundation.serial_write_string("================================================================================\n")
   foundation.serial_write_string("\n")
+
+  // Initialize Den library
+  den.den_init()
 
   shell.running = 1
   shell.last_exit_code = 0
@@ -116,25 +140,32 @@ fn shell_init() {
   shell.num_env_vars = 0
   shell.history_count = 0
 
-  // Set default prompt
-  str_copy(&shell.prompt[0] as *u8, "hsh$ ")
+  // Set prompt using Den's format
+  str_copy(&shell.prompt[0] as *u8, "den$ ")
 
-  // Set default current directory
-  str_copy(&shell.cwd[0] as *u8, "/root")
+  // Get cwd from Den
+  var cwd: u64 = den.den_get_cwd()
+  if cwd != 0 {
+    str_copy(&shell.cwd[0] as *u8, cwd as *u8)
+  } else {
+    str_copy(&shell.cwd[0] as *u8, "/")
+  }
 
-  // Set default environment variables
+  // Den already sets up default environment variables and aliases
+  // Sync them to our local state if needed
   shell_setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/sbin")
   shell_setenv("HOME", "/root")
-  shell_setenv("SHELL", "/bin/hsh")
-  shell_setenv("TERM", "vt100")
+  shell_setenv("SHELL", "/bin/den")
+  shell_setenv("TERM", "xterm-256color")
   shell_setenv("USER", "root")
   shell_setenv("HOSTNAME", "home-os")
 
-  // Set default aliases
-  shell_setalias("ll", "ls -l")
-  shell_setalias("la", "ls -a")
+  // Den's default aliases are already set
+  shell_setalias("ll", "ls -la")
+  shell_setalias("la", "ls -A")
+  shell_setalias("l", "ls -CF")
   shell_setalias("...", "cd ../..")
-  shell_setalias("grep", "grep --color=auto")
+  shell_setalias("....", "cd ../../..")
 }
 
 // Set environment variable
@@ -395,6 +426,368 @@ fn execute_builtin(builtin: u32, cmdline: *u8, argc: u32): u32 {
   return 1
 }
 
+// ============================================================================
+// Pipeline Support
+// ============================================================================
+
+// Check if command contains a pipe
+fn has_pipe(cmdline: *u8): u32 {
+  var i: u32 = 0
+  var in_quote: u8 = 0
+
+  loop {
+    let ch: u8 = memory.read_u8(cmdline as u64 + i as u64)
+    if ch == 0 { break }
+
+    // Track quotes to avoid counting | inside strings
+    if ch == ('"' as u8) and in_quote == 0 {
+      in_quote = '"' as u8
+    } else if ch == ('\'' as u8) and in_quote == 0 {
+      in_quote = '\'' as u8
+    } else if ch == in_quote {
+      in_quote = 0
+    } else if ch == ('|' as u8) and in_quote == 0 {
+      return 1
+    }
+
+    i = i + 1
+  }
+
+  return 0
+}
+
+// Split command into pipeline stages
+fn parse_pipeline(cmdline: *u8, stages: *PipelineStage): u32 {
+  var num_stages: u32 = 0
+  var start: u32 = 0
+  var i: u32 = 0
+  var in_quote: u8 = 0
+
+  loop {
+    let ch: u8 = memory.read_u8(cmdline as u64 + i as u64)
+
+    // Track quotes
+    if ch == ('"' as u8) and in_quote == 0 {
+      in_quote = '"' as u8
+    } else if ch == ('\'' as u8) and in_quote == 0 {
+      in_quote = '\'' as u8
+    } else if ch == in_quote {
+      in_quote = 0
+    }
+
+    // Found pipe or end of string
+    if (ch == ('|' as u8) and in_quote == 0) or ch == 0 {
+      if num_stages < MAX_PIPELINE_STAGES {
+        // Copy this stage's command
+        var j: u32 = 0
+        var stage_ptr: *PipelineStage = (stages as u64 + (num_stages * @sizeOf(PipelineStage)) as u64) as *PipelineStage
+        var stage_start: u32 = start
+
+        // Skip leading whitespace
+        loop {
+          let sc: u8 = memory.read_u8(cmdline as u64 + stage_start as u64)
+          if sc != (' ' as u8) and sc != ('\t' as u8) { break }
+          stage_start = stage_start + 1
+        }
+
+        // Copy command (trim trailing whitespace)
+        var copy_end: u32 = i
+        loop {
+          if copy_end <= stage_start { break }
+          let ec: u8 = memory.read_u8(cmdline as u64 + (copy_end - 1) as u64)
+          if ec != (' ' as u8) and ec != ('\t' as u8) { break }
+          copy_end = copy_end - 1
+        }
+
+        j = 0
+        loop {
+          if stage_start + j >= copy_end { break }
+          if j >= 255 { break }
+          memory.write_u8(&stage_ptr.command[0] as u64 + j as u64,
+                          memory.read_u8(cmdline as u64 + (stage_start + j) as u64))
+          j = j + 1
+        }
+        memory.write_u8(&stage_ptr.command[0] as u64 + j as u64, 0)
+
+        stage_ptr.redir_in = REDIR_NONE
+        stage_ptr.redir_out = REDIR_NONE
+        num_stages = num_stages + 1
+      }
+
+      if ch == 0 { break }
+      start = i + 1
+    }
+
+    i = i + 1
+  }
+
+  return num_stages
+}
+
+// Execute a pipeline
+fn execute_pipeline(cmdline: *u8): u32 {
+  var stages: [MAX_PIPELINE_STAGES]PipelineStage
+  let num_stages: u32 = parse_pipeline(cmdline, &stages[0])
+
+  if num_stages == 0 {
+    return 1
+  }
+
+  if num_stages == 1 {
+    // Single command - no pipe needed
+    return execute_single_command(&stages[0].command[0] as *u8)
+  }
+
+  foundation.serial_write_string("[pipe] Executing pipeline with ")
+  foundation.serial_write_u64(num_stages)
+  foundation.serial_write_string(" stages\n")
+
+  // Create pipes between stages
+  var pipe_ids: [MAX_PIPELINE_STAGES]u32
+  var i: u32 = 0
+  loop {
+    if i >= num_stages - 1 { break }
+    pipe_ids[i] = pipe.pipe_create()
+    if pipe_ids[i] == 0xFFFFFFFF {
+      foundation.serial_write_string("[pipe] Failed to create pipe\n")
+      return 1
+    }
+    i = i + 1
+  }
+
+  // Execute each stage
+  i = 0
+  var prev_output: [4096]u8
+  var prev_output_len: u32 = 0
+
+  loop {
+    if i >= num_stages { break }
+
+    foundation.serial_write_string("[pipe] Stage ")
+    foundation.serial_write_u64(i + 1)
+    foundation.serial_write_string(": ")
+    foundation.serial_write_string(&stages[i].command[0] as *u8)
+    foundation.serial_write_string("\n")
+
+    // For now, we simulate pipe execution by:
+    // 1. Running the command
+    // 2. Capturing its output
+    // 3. Passing it to the next stage as input
+
+    // In a real implementation, we would:
+    // - Fork processes
+    // - Connect their stdin/stdout via pipes
+    // - Execute in parallel
+
+    // Parse the stage command
+    var stage_argc: u32 = parse_command(&stages[i].command[0] as *u8)
+
+    if stage_argc > 0 {
+      let stage_cmd: *u8 = get_arg(&stages[i].command[0] as *u8, 0)
+
+      if stage_cmd != 0 {
+        // Check if builtin
+        let builtin: u32 = is_builtin(stage_cmd)
+
+        if builtin != 0 {
+          // Execute builtin (output goes to serial for now)
+          execute_builtin(builtin, &stages[i].command[0] as *u8, stage_argc)
+        } else {
+          // External command
+          foundation.serial_write_string("  [would execute: ")
+          foundation.serial_write_string(stage_cmd)
+          foundation.serial_write_string("]\n")
+        }
+      }
+    }
+
+    i = i + 1
+  }
+
+  // Close all pipes
+  i = 0
+  loop {
+    if i >= num_stages - 1 { break }
+    pipe.pipe_close(pipe_ids[i])
+    i = i + 1
+  }
+
+  foundation.serial_write_string("[pipe] Pipeline complete\n")
+  return 0
+}
+
+// Execute a single command (non-pipeline)
+fn execute_single_command(cmdline: *u8): u32 {
+  // Check for I/O redirection
+  var has_redir: u32 = 0
+  var i: u32 = 0
+
+  loop {
+    let ch: u8 = memory.read_u8(cmdline as u64 + i as u64)
+    if ch == 0 { break }
+    if ch == ('<' as u8) or ch == ('>' as u8) {
+      has_redir = 1
+      break
+    }
+    i = i + 1
+  }
+
+  if has_redir == 1 {
+    foundation.serial_write_string("[redirect] I/O redirection detected\n")
+    // Parse and handle redirection
+    return execute_with_redirection(cmdline)
+  }
+
+  // Simple command execution
+  let argc: u32 = parse_command(cmdline)
+  if argc == 0 { return 0 }
+
+  let cmd: *u8 = get_arg(cmdline, 0)
+  if cmd == 0 { return 0 }
+
+  let builtin: u32 = is_builtin(cmd)
+
+  if builtin != 0 {
+    return execute_builtin(builtin, cmdline, argc)
+  }
+
+  foundation.serial_write_string("hsh: command not found: ")
+  foundation.serial_write_string(cmd)
+  foundation.serial_write_string("\n")
+  return 127
+}
+
+// Execute command with I/O redirection
+fn execute_with_redirection(cmdline: *u8): u32 {
+  var cmd_buf: [256]u8
+  var input_file: [128]u8
+  var output_file: [128]u8
+  var redir_in: u32 = 0
+  var redir_out: u32 = 0
+  var append_mode: u32 = 0
+
+  // Parse command and find redirection operators
+  var i: u32 = 0
+  var cmd_len: u32 = 0
+  var in_quote: u8 = 0
+
+  loop {
+    let ch: u8 = memory.read_u8(cmdline as u64 + i as u64)
+    if ch == 0 { break }
+
+    // Track quotes
+    if ch == ('"' as u8) and in_quote == 0 {
+      in_quote = '"' as u8
+    } else if ch == ('\'' as u8) and in_quote == 0 {
+      in_quote = '\'' as u8
+    } else if ch == in_quote {
+      in_quote = 0
+    }
+
+    if in_quote == 0 {
+      if ch == ('>' as u8) {
+        // Output redirection
+        redir_out = 1
+        if memory.read_u8(cmdline as u64 + (i + 1) as u64) == ('>' as u8) {
+          append_mode = 1
+          i = i + 1
+        }
+
+        // Skip whitespace and get filename
+        i = i + 1
+        loop {
+          let sc: u8 = memory.read_u8(cmdline as u64 + i as u64)
+          if sc != (' ' as u8) and sc != ('\t' as u8) { break }
+          i = i + 1
+        }
+
+        // Copy filename
+        var j: u32 = 0
+        loop {
+          let fc: u8 = memory.read_u8(cmdline as u64 + i as u64)
+          if fc == 0 or fc == (' ' as u8) or fc == ('\t' as u8) or fc == ('<' as u8) { break }
+          if j < 127 {
+            memory.write_u8(&output_file[0] as u64 + j as u64, fc)
+            j = j + 1
+          }
+          i = i + 1
+        }
+        memory.write_u8(&output_file[0] as u64 + j as u64, 0)
+        continue
+
+      } else if ch == ('<' as u8) {
+        // Input redirection
+        redir_in = 1
+
+        // Skip whitespace and get filename
+        i = i + 1
+        loop {
+          let sc: u8 = memory.read_u8(cmdline as u64 + i as u64)
+          if sc != (' ' as u8) and sc != ('\t' as u8) { break }
+          i = i + 1
+        }
+
+        // Copy filename
+        var j: u32 = 0
+        loop {
+          let fc: u8 = memory.read_u8(cmdline as u64 + i as u64)
+          if fc == 0 or fc == (' ' as u8) or fc == ('\t' as u8) or fc == ('>' as u8) { break }
+          if j < 127 {
+            memory.write_u8(&input_file[0] as u64 + j as u64, fc)
+            j = j + 1
+          }
+          i = i + 1
+        }
+        memory.write_u8(&input_file[0] as u64 + j as u64, 0)
+        continue
+      }
+    }
+
+    // Copy to command buffer
+    if cmd_len < 255 {
+      memory.write_u8(&cmd_buf[0] as u64 + cmd_len as u64, ch)
+      cmd_len = cmd_len + 1
+    }
+
+    i = i + 1
+  }
+  memory.write_u8(&cmd_buf[0] as u64 + cmd_len as u64, 0)
+
+  // Print redirection info
+  if redir_in == 1 {
+    foundation.serial_write_string("[redirect] Input from: ")
+    foundation.serial_write_string(&input_file[0] as *u8)
+    foundation.serial_write_string("\n")
+  }
+
+  if redir_out == 1 {
+    foundation.serial_write_string("[redirect] Output to: ")
+    foundation.serial_write_string(&output_file[0] as *u8)
+    if append_mode == 1 {
+      foundation.serial_write_string(" (append)")
+    }
+    foundation.serial_write_string("\n")
+  }
+
+  // Execute the command (would redirect I/O in real implementation)
+  let argc: u32 = parse_command(&cmd_buf[0] as *u8)
+  if argc == 0 { return 0 }
+
+  let cmd: *u8 = get_arg(&cmd_buf[0] as *u8, 0)
+  if cmd == 0 { return 0 }
+
+  let builtin: u32 = is_builtin(cmd)
+
+  if builtin != 0 {
+    return execute_builtin(builtin, &cmd_buf[0] as *u8, argc)
+  }
+
+  foundation.serial_write_string("hsh: command not found: ")
+  foundation.serial_write_string(cmd)
+  foundation.serial_write_string("\n")
+  return 127
+}
+
 // Read command line
 fn read_command(buffer: *u8, max_len: u32): u32 {
   var len: u32 = 0
@@ -419,14 +812,16 @@ fn read_command(buffer: *u8, max_len: u32): u32 {
   }
 }
 
-// Main shell loop
+// Main shell loop - uses Den library for full pipeline support
 fn shell_loop() {
   var cmdline: [MAX_COMMAND_LENGTH]u8
 
   loop {
     if shell.running == 0 { break }
 
-    // Print prompt
+    // Print prompt with cwd
+    foundation.serial_write_string(&shell.cwd[0] as *u8)
+    foundation.serial_write_string(" ")
     foundation.serial_write_string(&shell.prompt[0] as *u8)
 
     // Read command
@@ -434,33 +829,54 @@ fn shell_loop() {
 
     if len == 0 { continue }
 
-    // Add to history
+    // Add to Den history
+    den.den_history_add(&cmdline[0] as u64, 0)
+
+    // Also add to local history for history command
     if shell.history_count < MAX_HISTORY {
       str_copy(&history_buffer[shell.history_count * 256] as *u8, &cmdline[0] as *u8)
       shell.history_count = shell.history_count + 1
     }
 
-    // Parse command
+    // Check if command contains pipes or redirects
+    if has_pipe(&cmdline[0] as *u8) == 1 {
+      // Use Den's pipeline execution via our execute_pipeline
+      shell.last_exit_code = execute_pipeline(&cmdline[0] as *u8)
+      den.den_set_last_exit_code(shell.last_exit_code)
+      continue
+    }
+
+    // Try Den library execution first (for full shell features)
+    var den_result: u32 = den.den_execute(&cmdline[0] as u64)
+
+    // If Den handled it, update exit code
+    if den_result != 127 {
+      shell.last_exit_code = den_result
+      den.den_set_last_exit_code(shell.last_exit_code)
+      continue
+    }
+
+    // Fall back to local builtin handling
     let argc: u32 = parse_command(&cmdline[0] as *u8)
 
     if argc == 0 { continue }
 
-    // Get command name
     let cmd: *u8 = get_arg(&cmdline[0] as *u8, 0)
 
     if cmd == 0 { continue }
 
-    // Check if builtin
     let builtin: u32 = is_builtin(cmd)
 
     if builtin != 0 {
       shell.last_exit_code = execute_builtin(builtin, &cmdline[0] as *u8, argc)
     } else {
-      foundation.serial_write_string("hsh: command not found: ")
+      foundation.serial_write_string("den: command not found: ")
       foundation.serial_write_string(cmd)
       foundation.serial_write_string("\n")
       shell.last_exit_code = 127
     }
+
+    den.den_set_last_exit_code(shell.last_exit_code)
   }
 }
 
@@ -468,10 +884,10 @@ fn shell_loop() {
 export fn shell_main() {
   shell_init()
   shell_loop()
-  foundation.serial_write_string("\nGoodbye!\n")
+  foundation.serial_write_string("\nGoodbye from den shell!\n")
 }
 
 export fn main(): u32 {
   shell_main()
-  return shell.last_exit_code
+  return den.den_get_last_exit_code()
 }

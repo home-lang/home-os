@@ -1,0 +1,738 @@
+// home-os Kernel - Shell to Syscall Integration
+// Connects Den shell library commands to kernel syscalls
+
+import "../core/foundation.home" as foundation
+import "../core/process.home" as process
+import "../core/filesystem.home" as filesystem
+import "../sys/syscall.home" as syscall
+import "../sched/scheduler.home" as scheduler
+import "../net/socket.home" as socket
+import "../net/dns.home" as dns
+import "den_lib.home" as den
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_ARGS: u32 = 16
+const MAX_ARG_LEN: u32 = 256
+const MAX_ENV_VARS: u32 = 64
+const MAX_PATH: u32 = 256
+
+// Shell builtins
+const BUILTIN_CD: u32 = 1
+const BUILTIN_PWD: u32 = 2
+const BUILTIN_EXPORT: u32 = 3
+const BUILTIN_UNSET: u32 = 4
+const BUILTIN_EXIT: u32 = 5
+const BUILTIN_EXEC: u32 = 6
+const BUILTIN_SOURCE: u32 = 7
+const BUILTIN_ALIAS: u32 = 8
+const BUILTIN_JOBS: u32 = 9
+const BUILTIN_FG: u32 = 10
+const BUILTIN_BG: u32 = 11
+const BUILTIN_WAIT: u32 = 12
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// Per-process shell state
+struct ShellState {
+  pid: u32,
+  cwd: [u8; 256],
+  cwd_len: u32,
+  env_names: [[u8; 64]; 64],
+  env_values: [[u8; 256]; 64],
+  env_count: u32,
+  last_exit_code: u32,
+  last_pid: u32,
+  interactive: u32
+}
+
+// Job tracking
+struct Job {
+  job_id: u32,
+  pid: u32,
+  pgid: u32,
+  state: u32,  // 0=none, 1=running, 2=stopped, 3=done
+  command: [u8; 256]
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var shell_states: [ShellState; 256]
+var jobs: [Job; 64]
+var next_job_id: u32 = 1
+var shell_initialized: u32 = 0
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn shell_syscall_init() {
+  if shell_initialized == 1 { return }
+
+  var i: u32 = 0
+  while i < 256 {
+    shell_states[i].pid = 0
+    shell_states[i].cwd[0] = '/'
+    shell_states[i].cwd[1] = 0
+    shell_states[i].cwd_len = 1
+    shell_states[i].env_count = 0
+    shell_states[i].last_exit_code = 0
+    shell_states[i].last_pid = 0
+    shell_states[i].interactive = 0
+    i = i + 1
+  }
+
+  i = 0
+  while i < 64 {
+    jobs[i].job_id = 0
+    jobs[i].pid = 0
+    jobs[i].state = 0
+    i = i + 1
+  }
+
+  // Initialize Den library
+  den.den_init()
+
+  shell_initialized = 1
+  foundation.serial_write_string("[Shell] Shell syscall integration initialized\n")
+}
+
+fn get_shell_state(pid: u32): u32 {
+  if pid >= 256 { return 0xFFFFFFFF }
+
+  if shell_states[pid].pid == 0 {
+    // Initialize shell state for this process
+    shell_states[pid].pid = pid
+    shell_states[pid].cwd[0] = '/'
+    shell_states[pid].cwd[1] = 0
+    shell_states[pid].cwd_len = 1
+    shell_states[pid].env_count = 0
+
+    // Set default environment variables
+    set_env_var(pid, "PATH", "/bin:/usr/bin:/sbin:/usr/sbin")
+    set_env_var(pid, "HOME", "/root")
+    set_env_var(pid, "SHELL", "/bin/hsh")
+    set_env_var(pid, "USER", "root")
+  }
+
+  return pid
+}
+
+// ============================================================================
+// ENVIRONMENT VARIABLES
+// ============================================================================
+
+fn set_env_var(pid: u32, name: []const u8, value: []const u8) {
+  var idx: u32 = get_shell_state(pid)
+  if idx == 0xFFFFFFFF { return }
+
+  // Check if variable exists
+  var i: u32 = 0
+  while i < shell_states[idx].env_count {
+    if str_match(&shell_states[idx].env_names[i], name) {
+      // Update existing
+      copy_str(&shell_states[idx].env_values[i], value, 256)
+      return
+    }
+    i = i + 1
+  }
+
+  // Add new
+  if shell_states[idx].env_count < MAX_ENV_VARS {
+    copy_str(&shell_states[idx].env_names[shell_states[idx].env_count], name, 64)
+    copy_str(&shell_states[idx].env_values[shell_states[idx].env_count], value, 256)
+    shell_states[idx].env_count = shell_states[idx].env_count + 1
+  }
+}
+
+fn get_env_var(pid: u32, name: []const u8, value: *[256]u8): u32 {
+  var idx: u32 = get_shell_state(pid)
+  if idx == 0xFFFFFFFF { return 1 }
+
+  var i: u32 = 0
+  while i < shell_states[idx].env_count {
+    if str_match(&shell_states[idx].env_names[i], name) {
+      copy_str_from(&value[0], &shell_states[idx].env_values[i][0], 256)
+      return 0
+    }
+    i = i + 1
+  }
+
+  return 1  // Not found
+}
+
+fn unset_env_var(pid: u32, name: []const u8) {
+  var idx: u32 = get_shell_state(pid)
+  if idx == 0xFFFFFFFF { return }
+
+  var i: u32 = 0
+  while i < shell_states[idx].env_count {
+    if str_match(&shell_states[idx].env_names[i], name) {
+      // Shift remaining variables down
+      var j: u32 = i
+      while j < shell_states[idx].env_count - 1 {
+        copy_str_from(&shell_states[idx].env_names[j][0], &shell_states[idx].env_names[j + 1][0], 64)
+        copy_str_from(&shell_states[idx].env_values[j][0], &shell_states[idx].env_values[j + 1][0], 256)
+        j = j + 1
+      }
+      shell_states[idx].env_count = shell_states[idx].env_count - 1
+      return
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// BUILTIN COMMANDS
+// ============================================================================
+
+export fn shell_builtin_cd(pid: u32, path: u64): u32 {
+  var idx: u32 = get_shell_state(pid)
+  if idx == 0xFFFFFFFF { return 1 }
+
+  var path_str: *u8 = @ptrFromInt(path)
+
+  // Handle special cases
+  if path_str[0] == 0 or (path_str[0] == '~' and path_str[1] == 0) {
+    // cd to HOME
+    var home: [256]u8
+    if get_env_var(pid, "HOME", &home) == 0 {
+      path_str = &home[0]
+    } else {
+      path_str = @ptrFromInt("/")
+    }
+  } else if path_str[0] == '-' and path_str[1] == 0 {
+    // cd to OLDPWD
+    var oldpwd: [256]u8
+    if get_env_var(pid, "OLDPWD", &oldpwd) != 0 {
+      return 1
+    }
+    path_str = &oldpwd[0]
+  }
+
+  // Resolve path
+  var new_path: [256]u8
+  if path_str[0] != '/' {
+    // Relative path - prepend CWD
+    var i: u32 = 0
+    while i < shell_states[idx].cwd_len and i < 255 {
+      new_path[i] = shell_states[idx].cwd[i]
+      i = i + 1
+    }
+    if i > 0 and new_path[i - 1] != '/' {
+      new_path[i] = '/'
+      i = i + 1
+    }
+    var j: u32 = 0
+    while path_str[j] != 0 and i < 255 {
+      new_path[i] = path_str[j]
+      i = i + 1
+      j = j + 1
+    }
+    new_path[i] = 0
+    path_str = &new_path[0]
+  }
+
+  // Check if directory exists
+  var file_type: u32 = filesystem.vfs_get_type(@ptrFromInt(path_str))
+  if file_type != 2 {  // Not a directory
+    return 1
+  }
+
+  // Update OLDPWD
+  set_env_var(pid, "OLDPWD", &shell_states[idx].cwd)
+
+  // Update CWD
+  var len: u32 = 0
+  while path_str[len] != 0 and len < 255 {
+    shell_states[idx].cwd[len] = path_str[len]
+    len = len + 1
+  }
+  shell_states[idx].cwd[len] = 0
+  shell_states[idx].cwd_len = len
+
+  // Update PWD environment variable
+  set_env_var(pid, "PWD", path_str)
+
+  return 0
+}
+
+export fn shell_builtin_pwd(pid: u32, buffer: u64, size: u32): u32 {
+  var idx: u32 = get_shell_state(pid)
+  if idx == 0xFFFFFFFF { return 1 }
+
+  var buf: *u8 = @ptrFromInt(buffer)
+  var i: u32 = 0
+  while i < shell_states[idx].cwd_len and i < size - 1 {
+    buf[i] = shell_states[idx].cwd[i]
+    i = i + 1
+  }
+  buf[i] = 0
+
+  return 0
+}
+
+export fn shell_builtin_export(pid: u32, name: u64, value: u64): u32 {
+  var idx: u32 = get_shell_state(pid)
+  if idx == 0xFFFFFFFF { return 1 }
+
+  var name_str: *u8 = @ptrFromInt(name)
+  var value_str: *u8 = @ptrFromInt(value)
+
+  set_env_var(pid, name_str, value_str)
+  return 0
+}
+
+export fn shell_builtin_unset(pid: u32, name: u64): u32 {
+  var idx: u32 = get_shell_state(pid)
+  if idx == 0xFFFFFFFF { return 1 }
+
+  var name_str: *u8 = @ptrFromInt(name)
+  unset_env_var(pid, name_str)
+  return 0
+}
+
+export fn shell_builtin_exit(pid: u32, code: u32): u32 {
+  // This triggers process exit
+  process.sys_exit(code)
+  return code
+}
+
+// ============================================================================
+// COMMAND EXECUTION
+// ============================================================================
+
+export fn shell_execute(pid: u32, cmdline: u64): u32 {
+  var idx: u32 = get_shell_state(pid)
+  if idx == 0xFFFFFFFF { return 1 }
+
+  var cmd: *u8 = @ptrFromInt(cmdline)
+  if cmd[0] == 0 { return 0 }
+
+  // Check for builtins first
+  var builtin: u32 = check_builtin(cmd)
+  if builtin != 0 {
+    return execute_builtin(pid, builtin, cmdline)
+  }
+
+  // Parse command and arguments
+  var argv: [*u8; 16]
+  var argc: u32 = 0
+  parse_args(cmdline, &argv, &argc)
+
+  if argc == 0 { return 0 }
+
+  // Look up command in PATH
+  var full_path: [256]u8
+  if resolve_command(pid, argv[0], &full_path) != 0 {
+    foundation.serial_write_string("hsh: command not found: ")
+    foundation.serial_write_string(argv[0])
+    foundation.serial_write_string("\n")
+    return 127
+  }
+
+  // Fork and exec
+  var child_pid: u32 = fork_and_exec(pid, &full_path, &argv, argc)
+  if child_pid == 0 {
+    return 1  // Fork failed
+  }
+
+  // Wait for child
+  var status: u32 = 0
+  process.sys_waitpid(child_pid, &status, 0)
+
+  shell_states[idx].last_exit_code = status
+  shell_states[idx].last_pid = child_pid
+
+  return status
+}
+
+fn check_builtin(cmd: *u8): u32 {
+  if str_match(cmd, "cd") { return BUILTIN_CD }
+  if str_match(cmd, "pwd") { return BUILTIN_PWD }
+  if str_match(cmd, "export") { return BUILTIN_EXPORT }
+  if str_match(cmd, "unset") { return BUILTIN_UNSET }
+  if str_match(cmd, "exit") { return BUILTIN_EXIT }
+  if str_match(cmd, "exec") { return BUILTIN_EXEC }
+  if str_match(cmd, "source") { return BUILTIN_SOURCE }
+  if str_match(cmd, ".") { return BUILTIN_SOURCE }
+  if str_match(cmd, "alias") { return BUILTIN_ALIAS }
+  if str_match(cmd, "jobs") { return BUILTIN_JOBS }
+  if str_match(cmd, "fg") { return BUILTIN_FG }
+  if str_match(cmd, "bg") { return BUILTIN_BG }
+  if str_match(cmd, "wait") { return BUILTIN_WAIT }
+  return 0
+}
+
+fn execute_builtin(pid: u32, builtin: u32, cmdline: u64): u32 {
+  var argv: [*u8; 16]
+  var argc: u32 = 0
+  parse_args(cmdline, &argv, &argc)
+
+  if builtin == BUILTIN_CD {
+    if argc > 1 {
+      return shell_builtin_cd(pid, @ptrFromInt(argv[1]))
+    } else {
+      return shell_builtin_cd(pid, 0)
+    }
+  } else if builtin == BUILTIN_PWD {
+    var buf: [256]u8
+    shell_builtin_pwd(pid, @ptrFromInt(&buf[0]), 256)
+    foundation.serial_write_string(&buf[0])
+    foundation.serial_write_string("\n")
+    return 0
+  } else if builtin == BUILTIN_EXPORT {
+    if argc > 2 {
+      return shell_builtin_export(pid, @ptrFromInt(argv[1]), @ptrFromInt(argv[2]))
+    }
+    return 1
+  } else if builtin == BUILTIN_UNSET {
+    if argc > 1 {
+      return shell_builtin_unset(pid, @ptrFromInt(argv[1]))
+    }
+    return 1
+  } else if builtin == BUILTIN_EXIT {
+    var code: u32 = 0
+    if argc > 1 {
+      code = parse_int(argv[1])
+    }
+    return shell_builtin_exit(pid, code)
+  } else if builtin == BUILTIN_JOBS {
+    return shell_builtin_jobs(pid)
+  }
+
+  return 1
+}
+
+fn resolve_command(pid: u32, cmd: *u8, full_path: *[256]u8): u32 {
+  // Check if cmd is already an absolute path
+  if cmd[0] == '/' {
+    copy_str_from(&full_path[0], cmd, 256)
+    if filesystem.vfs_exists(@ptrFromInt(full_path)) != 0 {
+      return 0
+    }
+    return 1
+  }
+
+  // Search PATH
+  var path_env: [256]u8
+  if get_env_var(pid, "PATH", &path_env) != 0 {
+    return 1
+  }
+
+  var i: u32 = 0
+  var start: u32 = 0
+  while path_env[i] != 0 {
+    if path_env[i] == ':' or path_env[i + 1] == 0 {
+      var end: u32 = i
+      if path_env[i + 1] == 0 { end = i + 1 }
+
+      // Build full path
+      var j: u32 = 0
+      var k: u32 = start
+      while k < end and j < 254 {
+        full_path[j] = path_env[k]
+        j = j + 1
+        k = k + 1
+      }
+      full_path[j] = '/'
+      j = j + 1
+
+      k = 0
+      while cmd[k] != 0 and j < 255 {
+        full_path[j] = cmd[k]
+        j = j + 1
+        k = k + 1
+      }
+      full_path[j] = 0
+
+      // Check if exists
+      if filesystem.vfs_exists(@ptrFromInt(full_path)) != 0 {
+        return 0
+      }
+
+      start = i + 1
+    }
+    i = i + 1
+  }
+
+  return 1  // Not found
+}
+
+fn fork_and_exec(parent_pid: u32, path: *[256]u8, argv: *[*u8; 16], argc: u32): u32 {
+  // Fork
+  var child_pid: u32 = @intCast(syscall.syscall_handler(1, 0, 0, 0, 0))  // SYS_FORK
+  if child_pid == 0 {
+    return 0  // Fork failed
+  }
+
+  // Set up child for exec
+  scheduler.scheduler_fork(parent_pid, child_pid)
+
+  // Exec in child
+  syscall.syscall_set_current_pid(child_pid)
+  syscall.syscall_handler(7, @ptrFromInt(&path[0]), 0, 0, 0)  // SYS_EXEC
+
+  return child_pid
+}
+
+// ============================================================================
+// JOB CONTROL
+// ============================================================================
+
+fn add_job(pid: u32, pgid: u32, cmd: *u8): u32 {
+  var i: u32 = 0
+  while i < 64 {
+    if jobs[i].state == 0 {
+      jobs[i].job_id = next_job_id
+      jobs[i].pid = pid
+      jobs[i].pgid = pgid
+      jobs[i].state = 1  // Running
+      copy_str_from(&jobs[i].command[0], cmd, 256)
+      next_job_id = next_job_id + 1
+      return jobs[i].job_id
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+fn shell_builtin_jobs(pid: u32): u32 {
+  var i: u32 = 0
+  while i < 64 {
+    if jobs[i].state != 0 {
+      foundation.serial_write_string("[")
+      foundation.serial_write_hex(jobs[i].job_id)
+      foundation.serial_write_string("] ")
+      if jobs[i].state == 1 {
+        foundation.serial_write_string("Running    ")
+      } else if jobs[i].state == 2 {
+        foundation.serial_write_string("Stopped    ")
+      } else {
+        foundation.serial_write_string("Done       ")
+      }
+      foundation.serial_write_string(&jobs[i].command[0])
+      foundation.serial_write_string("\n")
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn str_match(a: *u8, b: []const u8): bool {
+  var i: u32 = 0
+  while i < b.len {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return a[i] == 0 or a[i] == ' '
+}
+
+fn copy_str(dest: *[256]u8, src: []const u8, max: u32) {
+  var i: u32 = 0
+  while i < src.len and i < max - 1 {
+    dest[i] = src[i]
+    i = i + 1
+  }
+  dest[i] = 0
+}
+
+fn copy_str_from(dest: *u8, src: *u8, max: u32) {
+  var i: u32 = 0
+  while src[i] != 0 and i < max - 1 {
+    dest[i] = src[i]
+    i = i + 1
+  }
+  dest[i] = 0
+}
+
+fn parse_args(cmdline: u64, argv: *[*u8; 16], argc: *u32) {
+  var cmd: *u8 = @ptrFromInt(cmdline)
+  var count: u32 = 0
+  var i: u32 = 0
+  var in_arg: u32 = 0
+
+  while cmd[i] != 0 and count < MAX_ARGS {
+    if cmd[i] == ' ' or cmd[i] == '\t' {
+      if in_arg != 0 {
+        cmd[i] = 0  // Null-terminate argument
+        in_arg = 0
+      }
+    } else {
+      if in_arg == 0 {
+        argv[count] = &cmd[i]
+        count = count + 1
+        in_arg = 1
+      }
+    }
+    i = i + 1
+  }
+
+  argc.* = count
+}
+
+fn parse_int(s: *u8): u32 {
+  var result: u32 = 0
+  var i: u32 = 0
+  while s[i] >= '0' and s[i] <= '9' {
+    result = result * 10 + @intCast(s[i] - '0')
+    i = i + 1
+  }
+  return result
+}
+
+// ============================================================================
+// PIPELINE EXECUTION
+// ============================================================================
+
+export fn shell_execute_pipeline(pid: u32, cmdline: u64): u32 {
+  // Parse pipeline
+  var commands: [[u8; 256]; 8]
+  var cmd_count: u32 = 0
+
+  var cmd: *u8 = @ptrFromInt(cmdline)
+  var i: u32 = 0
+  var start: u32 = 0
+
+  while cmd[i] != 0 and cmd_count < 8 {
+    if cmd[i] == '|' {
+      // Copy command
+      var j: u32 = 0
+      var k: u32 = start
+      while k < i and j < 255 {
+        commands[cmd_count][j] = cmd[k]
+        j = j + 1
+        k = k + 1
+      }
+      commands[cmd_count][j] = 0
+      cmd_count = cmd_count + 1
+      start = i + 1
+    }
+    i = i + 1
+  }
+
+  // Copy last command
+  if start < i {
+    var j: u32 = 0
+    var k: u32 = start
+    while k <= i and j < 255 {
+      commands[cmd_count][j] = cmd[k]
+      j = j + 1
+      k = k + 1
+    }
+    commands[cmd_count][j] = 0
+    cmd_count = cmd_count + 1
+  }
+
+  if cmd_count == 1 {
+    // Single command, no pipeline
+    return shell_execute(pid, cmdline)
+  }
+
+  // Execute pipeline
+  var prev_read_fd: u32 = 0
+  var child_pids: [u32; 8]
+  var c: u32 = 0
+
+  while c < cmd_count {
+    // Create pipe for all but last command
+    var pipe_fds: [2]u32
+    if c < cmd_count - 1 {
+      syscall.syscall_handler(95, @ptrFromInt(&pipe_fds[0]), 0, 0, 0)  // SYS_PIPE
+    }
+
+    // Fork
+    var child_pid: u32 = @intCast(syscall.syscall_handler(1, 0, 0, 0, 0))
+    if child_pid == 0 {
+      return 1  // Fork failed
+    }
+    child_pids[c] = child_pid
+
+    // Set up redirections in child (would be done by child process)
+    // - If not first command: redirect stdin from prev_read_fd
+    // - If not last command: redirect stdout to pipe_fds[1]
+
+    // Execute command
+    scheduler.scheduler_fork(pid, child_pid)
+    syscall.syscall_set_current_pid(child_pid)
+    shell_execute(child_pid, @ptrFromInt(&commands[c][0]))
+
+    // Close write end of pipe in parent
+    if c < cmd_count - 1 {
+      syscall.syscall_handler(5, pipe_fds[1], 0, 0, 0)  // SYS_CLOSE
+    }
+
+    // Close previous read end
+    if prev_read_fd != 0 {
+      syscall.syscall_handler(5, prev_read_fd, 0, 0, 0)  // SYS_CLOSE
+    }
+
+    prev_read_fd = pipe_fds[0]
+    c = c + 1
+  }
+
+  // Wait for all children
+  var status: u32 = 0
+  c = 0
+  while c < cmd_count {
+    process.sys_waitpid(child_pids[c], &status, 0)
+    c = c + 1
+  }
+
+  return status
+}
+
+// ============================================================================
+// REDIRECTION
+// ============================================================================
+
+export fn shell_execute_with_redirect(pid: u32, cmdline: u64, in_file: u64, out_file: u64, append: u32): u32 {
+  // Fork
+  var child_pid: u32 = @intCast(syscall.syscall_handler(1, 0, 0, 0, 0))
+  if child_pid == 0 {
+    return 1
+  }
+
+  scheduler.scheduler_fork(pid, child_pid)
+  syscall.syscall_set_current_pid(child_pid)
+
+  // Set up redirections
+  if in_file != 0 {
+    var in_fd: u32 = filesystem.vfs_open(in_file, 0)  // O_RDONLY
+    if in_fd != 0 {
+      syscall.syscall_handler(93, in_fd, 0, 0, 0)  // SYS_DUP2 to stdin
+    }
+  }
+
+  if out_file != 0 {
+    var flags: u32 = 1  // O_WRONLY
+    if append != 0 {
+      flags = flags | 0x400  // O_APPEND
+    } else {
+      flags = flags | 0x200  // O_TRUNC
+    }
+    var out_fd: u32 = filesystem.vfs_open(out_file, flags)
+    if out_fd != 0 {
+      syscall.syscall_handler(93, out_fd, 1, 0, 0)  // SYS_DUP2 to stdout
+    }
+  }
+
+  // Execute command
+  var result: u32 = shell_execute(child_pid, cmdline)
+
+  // Wait for child
+  var status: u32 = 0
+  process.sys_waitpid(child_pid, &status, 0)
+
+  return status
+}

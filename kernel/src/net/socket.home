@@ -1,0 +1,777 @@
+// home-os Kernel - Socket Layer
+// Connects syscalls to TCP/UDP/Unix socket implementations
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "tcp.home" as tcp
+import "udp.home" as udp
+import "dns.home" as dns
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// Address families
+export const AF_UNSPEC: u32 = 0
+export const AF_UNIX: u32 = 1
+export const AF_LOCAL: u32 = 1
+export const AF_INET: u32 = 2
+export const AF_INET6: u32 = 10
+
+// Socket types
+export const SOCK_STREAM: u32 = 1
+export const SOCK_DGRAM: u32 = 2
+export const SOCK_RAW: u32 = 3
+export const SOCK_SEQPACKET: u32 = 5
+
+// Socket options levels
+export const SOL_SOCKET: u32 = 1
+export const IPPROTO_IP: u32 = 0
+export const IPPROTO_TCP: u32 = 6
+export const IPPROTO_UDP: u32 = 17
+
+// Socket options (SOL_SOCKET)
+export const SO_DEBUG: u32 = 1
+export const SO_REUSEADDR: u32 = 2
+export const SO_TYPE: u32 = 3
+export const SO_ERROR: u32 = 4
+export const SO_DONTROUTE: u32 = 5
+export const SO_BROADCAST: u32 = 6
+export const SO_SNDBUF: u32 = 7
+export const SO_RCVBUF: u32 = 8
+export const SO_KEEPALIVE: u32 = 9
+export const SO_OOBINLINE: u32 = 10
+export const SO_LINGER: u32 = 13
+export const SO_RCVLOWAT: u32 = 18
+export const SO_SNDLOWAT: u32 = 19
+export const SO_RCVTIMEO: u32 = 20
+export const SO_SNDTIMEO: u32 = 21
+
+// Shutdown modes
+export const SHUT_RD: u32 = 0
+export const SHUT_WR: u32 = 1
+export const SHUT_RDWR: u32 = 2
+
+// Message flags
+export const MSG_OOB: u32 = 1
+export const MSG_PEEK: u32 = 2
+export const MSG_DONTROUTE: u32 = 4
+export const MSG_WAITALL: u32 = 0x100
+export const MSG_DONTWAIT: u32 = 0x40
+export const MSG_NOSIGNAL: u32 = 0x4000
+
+const MAX_SOCKETS: u32 = 256
+const SOCKET_BUFFER_SIZE: u32 = 65536
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// Socket address (IPv4)
+export struct SockAddrIn {
+  sin_family: u16,
+  sin_port: u16,        // Network byte order
+  sin_addr: u32,        // IPv4 address
+  sin_zero: [u8; 8]     // Padding
+}
+
+// Socket address (IPv6)
+export struct SockAddrIn6 {
+  sin6_family: u16,
+  sin6_port: u16,
+  sin6_flowinfo: u32,
+  sin6_addr: [u8; 16],
+  sin6_scope_id: u32
+}
+
+// Socket state
+const SOCK_STATE_CLOSED: u32 = 0
+const SOCK_STATE_UNCONNECTED: u32 = 1
+const SOCK_STATE_LISTENING: u32 = 2
+const SOCK_STATE_CONNECTING: u32 = 3
+const SOCK_STATE_CONNECTED: u32 = 4
+
+// Socket structure
+struct Socket {
+  fd: u32,
+  domain: u32,
+  sock_type: u32,
+  protocol: u32,
+  state: u32,
+
+  // Local address
+  local_addr: u32,
+  local_port: u16,
+
+  // Remote address (for connected sockets)
+  remote_addr: u32,
+  remote_port: u16,
+
+  // TCP/UDP connection handle
+  conn_handle: u32,
+
+  // Options
+  reuseaddr: u32,
+  keepalive: u32,
+  broadcast: u32,
+  nonblocking: u32,
+
+  // Buffers
+  recv_buf: u64,
+  recv_buf_size: u32,
+  recv_buf_len: u32,
+  send_buf: u64,
+  send_buf_size: u32,
+  send_buf_len: u32,
+
+  // Backlog for listening sockets
+  backlog: u32,
+  pending_connections: u32,
+
+  // Error state
+  last_error: u32,
+
+  // Owner process
+  owner_pid: u32
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var sockets: [Socket; 256]
+var socket_count: u32 = 0
+var next_socket_fd: u32 = 100  // Start after normal FDs
+var socket_initialized: u32 = 0
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn socket_init() {
+  if socket_initialized == 1 { return }
+
+  var i: u32 = 0
+  while i < MAX_SOCKETS {
+    sockets[i].fd = 0
+    sockets[i].state = SOCK_STATE_CLOSED
+    i = i + 1
+  }
+
+  socket_initialized = 1
+  foundation.serial_write_string("[Socket] Socket layer initialized\n")
+}
+
+// ============================================================================
+// SOCKET OPERATIONS
+// ============================================================================
+
+export fn socket_create(domain: u32, sock_type: u32, protocol: u32): u32 {
+  if socket_count >= MAX_SOCKETS {
+    return 0  // No free sockets
+  }
+
+  // Validate domain
+  if domain != AF_INET and domain != AF_INET6 and domain != AF_UNIX {
+    return 0
+  }
+
+  // Validate type
+  if sock_type != SOCK_STREAM and sock_type != SOCK_DGRAM and sock_type != SOCK_RAW {
+    return 0
+  }
+
+  // Find free slot
+  var i: u32 = 0
+  while i < MAX_SOCKETS {
+    if sockets[i].state == SOCK_STATE_CLOSED {
+      break
+    }
+    i = i + 1
+  }
+
+  if i >= MAX_SOCKETS {
+    return 0
+  }
+
+  // Initialize socket
+  sockets[i].fd = next_socket_fd
+  sockets[i].domain = domain
+  sockets[i].sock_type = sock_type
+  sockets[i].protocol = protocol
+  sockets[i].state = SOCK_STATE_UNCONNECTED
+  sockets[i].local_addr = 0
+  sockets[i].local_port = 0
+  sockets[i].remote_addr = 0
+  sockets[i].remote_port = 0
+  sockets[i].conn_handle = 0
+  sockets[i].reuseaddr = 0
+  sockets[i].keepalive = 0
+  sockets[i].broadcast = 0
+  sockets[i].nonblocking = 0
+  sockets[i].recv_buf = 0
+  sockets[i].recv_buf_size = SOCKET_BUFFER_SIZE
+  sockets[i].recv_buf_len = 0
+  sockets[i].send_buf = 0
+  sockets[i].send_buf_size = SOCKET_BUFFER_SIZE
+  sockets[i].send_buf_len = 0
+  sockets[i].backlog = 0
+  sockets[i].pending_connections = 0
+  sockets[i].last_error = 0
+  sockets[i].owner_pid = 0
+
+  socket_count = socket_count + 1
+  next_socket_fd = next_socket_fd + 1
+
+  return sockets[i].fd
+}
+
+fn find_socket(fd: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_SOCKETS {
+    if sockets[i].fd == fd and sockets[i].state != SOCK_STATE_CLOSED {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+export fn socket_close(fd: u32): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 1  // Not found
+  }
+
+  // Close underlying connection
+  if sockets[idx].conn_handle != 0 {
+    if sockets[idx].sock_type == SOCK_STREAM {
+      tcp.tcp_close(sockets[idx].conn_handle)
+    }
+  }
+
+  // Free buffers
+  if sockets[idx].recv_buf != 0 {
+    memory.kfree(sockets[idx].recv_buf)
+  }
+  if sockets[idx].send_buf != 0 {
+    memory.kfree(sockets[idx].send_buf)
+  }
+
+  // Mark as closed
+  sockets[idx].state = SOCK_STATE_CLOSED
+  sockets[idx].fd = 0
+  socket_count = socket_count - 1
+
+  return 0
+}
+
+export fn socket_bind(fd: u32, addr: u64, addrlen: u32): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 1
+  }
+
+  if sockets[idx].state != SOCK_STATE_UNCONNECTED {
+    return 1  // Already bound or connected
+  }
+
+  if sockets[idx].domain == AF_INET and addrlen >= 16 {
+    var sockaddr: *SockAddrIn = @ptrFromInt(addr)
+    sockets[idx].local_addr = sockaddr.sin_addr
+    sockets[idx].local_port = ntohs(sockaddr.sin_port)
+
+    foundation.serial_write_string("[Socket] Bound to port ")
+    foundation.serial_write_hex(sockets[idx].local_port)
+    foundation.serial_write_string("\n")
+  }
+
+  return 0
+}
+
+export fn socket_listen(fd: u32, backlog: u32): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 1
+  }
+
+  if sockets[idx].sock_type != SOCK_STREAM {
+    return 1  // Only TCP can listen
+  }
+
+  if sockets[idx].local_port == 0 {
+    return 1  // Must bind first
+  }
+
+  sockets[idx].state = SOCK_STATE_LISTENING
+  sockets[idx].backlog = backlog
+  sockets[idx].pending_connections = 0
+
+  // Tell TCP stack to listen
+  sockets[idx].conn_handle = tcp.tcp_listen(sockets[idx].local_port)
+
+  foundation.serial_write_string("[Socket] Listening on port ")
+  foundation.serial_write_hex(sockets[idx].local_port)
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+export fn socket_accept(fd: u32, addr: u64, addrlen: u64): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 0
+  }
+
+  if sockets[idx].state != SOCK_STATE_LISTENING {
+    return 0
+  }
+
+  // Check for pending connection from TCP stack
+  var conn_info: tcp.TCPConnectionInfo
+  if tcp.tcp_accept(sockets[idx].conn_handle, &conn_info) == 0 {
+    if sockets[idx].nonblocking != 0 {
+      return 0  // Would block
+    }
+    // For blocking socket, would wait here
+    return 0
+  }
+
+  // Create new socket for the connection
+  var new_fd: u32 = socket_create(sockets[idx].domain, SOCK_STREAM, 0)
+  if new_fd == 0 {
+    return 0
+  }
+
+  var new_idx: u32 = find_socket(new_fd)
+  if new_idx == 0xFFFFFFFF {
+    return 0
+  }
+
+  sockets[new_idx].state = SOCK_STATE_CONNECTED
+  sockets[new_idx].local_addr = sockets[idx].local_addr
+  sockets[new_idx].local_port = sockets[idx].local_port
+  sockets[new_idx].remote_addr = conn_info.remote_addr
+  sockets[new_idx].remote_port = conn_info.remote_port
+  sockets[new_idx].conn_handle = conn_info.handle
+
+  // Fill in remote address if requested
+  if addr != 0 and addrlen != 0 {
+    var sockaddr: *SockAddrIn = @ptrFromInt(addr)
+    sockaddr.sin_family = @intCast(AF_INET)
+    sockaddr.sin_port = htons(conn_info.remote_port)
+    sockaddr.sin_addr = conn_info.remote_addr
+
+    var len_ptr: *u32 = @ptrFromInt(addrlen)
+    len_ptr.* = 16
+  }
+
+  return new_fd
+}
+
+export fn socket_connect(fd: u32, addr: u64, addrlen: u32): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 1
+  }
+
+  if sockets[idx].state != SOCK_STATE_UNCONNECTED {
+    return 1  // Already connected
+  }
+
+  if sockets[idx].domain == AF_INET and addrlen >= 16 {
+    var sockaddr: *SockAddrIn = @ptrFromInt(addr)
+    sockets[idx].remote_addr = sockaddr.sin_addr
+    sockets[idx].remote_port = ntohs(sockaddr.sin_port)
+
+    // Allocate local port if not bound
+    if sockets[idx].local_port == 0 {
+      sockets[idx].local_port = allocate_ephemeral_port()
+    }
+
+    sockets[idx].state = SOCK_STATE_CONNECTING
+
+    if sockets[idx].sock_type == SOCK_STREAM {
+      // TCP connect
+      var handle: u32 = tcp.tcp_connect(
+        sockets[idx].local_port,
+        sockets[idx].remote_addr,
+        sockets[idx].remote_port
+      )
+      if handle == 0 {
+        sockets[idx].state = SOCK_STATE_UNCONNECTED
+        return 1
+      }
+      sockets[idx].conn_handle = handle
+    }
+
+    sockets[idx].state = SOCK_STATE_CONNECTED
+
+    foundation.serial_write_string("[Socket] Connected to ")
+    foundation.serial_write_hex(sockets[idx].remote_addr)
+    foundation.serial_write_string(":")
+    foundation.serial_write_hex(sockets[idx].remote_port)
+    foundation.serial_write_string("\n")
+  }
+
+  return 0
+}
+
+export fn socket_send(fd: u32, buf: u64, len: u64, flags: u32): u64 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 0xFFFFFFFFFFFFFFFF
+  }
+
+  if sockets[idx].state != SOCK_STATE_CONNECTED {
+    return 0xFFFFFFFFFFFFFFFF
+  }
+
+  if sockets[idx].sock_type == SOCK_STREAM {
+    return tcp.tcp_send(sockets[idx].conn_handle, buf, len)
+  } else if sockets[idx].sock_type == SOCK_DGRAM {
+    return udp.udp_send(
+      sockets[idx].local_port,
+      sockets[idx].remote_addr,
+      sockets[idx].remote_port,
+      buf,
+      @intCast(len)
+    )
+  }
+
+  return 0
+}
+
+export fn socket_recv(fd: u32, buf: u64, len: u64, flags: u32): u64 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 0xFFFFFFFFFFFFFFFF
+  }
+
+  if sockets[idx].state != SOCK_STATE_CONNECTED {
+    return 0xFFFFFFFFFFFFFFFF
+  }
+
+  var peek: u32 = 0
+  if (flags & MSG_PEEK) != 0 {
+    peek = 1
+  }
+
+  if sockets[idx].sock_type == SOCK_STREAM {
+    return tcp.tcp_recv(sockets[idx].conn_handle, buf, len, peek)
+  } else if sockets[idx].sock_type == SOCK_DGRAM {
+    var remote_addr: u32 = 0
+    var remote_port: u16 = 0
+    return udp.udp_recv(
+      sockets[idx].local_port,
+      buf,
+      @intCast(len),
+      &remote_addr,
+      &remote_port
+    )
+  }
+
+  return 0
+}
+
+export fn socket_sendto(fd: u32, buf: u64, len: u64, flags: u32, dest_addr: u64, addrlen: u32): u64 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 0xFFFFFFFFFFFFFFFF
+  }
+
+  if sockets[idx].sock_type != SOCK_DGRAM {
+    return socket_send(fd, buf, len, flags)  // Fall back to send for TCP
+  }
+
+  var remote_addr: u32 = 0
+  var remote_port: u16 = 0
+
+  if dest_addr != 0 and addrlen >= 16 {
+    var sockaddr: *SockAddrIn = @ptrFromInt(dest_addr)
+    remote_addr = sockaddr.sin_addr
+    remote_port = ntohs(sockaddr.sin_port)
+  } else if sockets[idx].state == SOCK_STATE_CONNECTED {
+    remote_addr = sockets[idx].remote_addr
+    remote_port = sockets[idx].remote_port
+  } else {
+    return 0xFFFFFFFFFFFFFFFF  // No destination
+  }
+
+  // Allocate local port if not bound
+  if sockets[idx].local_port == 0 {
+    sockets[idx].local_port = allocate_ephemeral_port()
+  }
+
+  return udp.udp_send(sockets[idx].local_port, remote_addr, remote_port, buf, @intCast(len))
+}
+
+export fn socket_recvfrom(fd: u32, buf: u64, len: u64, flags: u32, src_addr: u64, addrlen: u64): u64 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 0xFFFFFFFFFFFFFFFF
+  }
+
+  if sockets[idx].sock_type != SOCK_DGRAM {
+    return socket_recv(fd, buf, len, flags)  // Fall back to recv for TCP
+  }
+
+  var remote_addr: u32 = 0
+  var remote_port: u16 = 0
+
+  var received: u64 = udp.udp_recv(
+    sockets[idx].local_port,
+    buf,
+    @intCast(len),
+    &remote_addr,
+    &remote_port
+  )
+
+  // Fill in source address if requested
+  if src_addr != 0 and addrlen != 0 {
+    var sockaddr: *SockAddrIn = @ptrFromInt(src_addr)
+    sockaddr.sin_family = @intCast(AF_INET)
+    sockaddr.sin_port = htons(remote_port)
+    sockaddr.sin_addr = remote_addr
+
+    var len_ptr: *u32 = @ptrFromInt(addrlen)
+    len_ptr.* = 16
+  }
+
+  return received
+}
+
+export fn socket_shutdown(fd: u32, how: u32): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 1
+  }
+
+  if sockets[idx].sock_type == SOCK_STREAM and sockets[idx].conn_handle != 0 {
+    if how == SHUT_RD or how == SHUT_RDWR {
+      tcp.tcp_shutdown_read(sockets[idx].conn_handle)
+    }
+    if how == SHUT_WR or how == SHUT_RDWR {
+      tcp.tcp_shutdown_write(sockets[idx].conn_handle)
+    }
+  }
+
+  return 0
+}
+
+export fn socket_setsockopt(fd: u32, level: u32, optname: u32, optval: u64, optlen: u32): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 1
+  }
+
+  if level == SOL_SOCKET {
+    if optname == SO_REUSEADDR {
+      if optlen >= 4 {
+        var val: *u32 = @ptrFromInt(optval)
+        sockets[idx].reuseaddr = val.*
+      }
+    } else if optname == SO_KEEPALIVE {
+      if optlen >= 4 {
+        var val: *u32 = @ptrFromInt(optval)
+        sockets[idx].keepalive = val.*
+      }
+    } else if optname == SO_BROADCAST {
+      if optlen >= 4 {
+        var val: *u32 = @ptrFromInt(optval)
+        sockets[idx].broadcast = val.*
+      }
+    } else if optname == SO_RCVBUF {
+      if optlen >= 4 {
+        var val: *u32 = @ptrFromInt(optval)
+        sockets[idx].recv_buf_size = val.*
+      }
+    } else if optname == SO_SNDBUF {
+      if optlen >= 4 {
+        var val: *u32 = @ptrFromInt(optval)
+        sockets[idx].send_buf_size = val.*
+      }
+    }
+  }
+
+  return 0
+}
+
+export fn socket_getsockopt(fd: u32, level: u32, optname: u32, optval: u64, optlen: u64): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 1
+  }
+
+  if level == SOL_SOCKET {
+    if optname == SO_TYPE {
+      var val: *u32 = @ptrFromInt(optval)
+      val.* = sockets[idx].sock_type
+      var len: *u32 = @ptrFromInt(optlen)
+      len.* = 4
+    } else if optname == SO_ERROR {
+      var val: *u32 = @ptrFromInt(optval)
+      val.* = sockets[idx].last_error
+      sockets[idx].last_error = 0  // Clear on read
+      var len: *u32 = @ptrFromInt(optlen)
+      len.* = 4
+    } else if optname == SO_REUSEADDR {
+      var val: *u32 = @ptrFromInt(optval)
+      val.* = sockets[idx].reuseaddr
+      var len: *u32 = @ptrFromInt(optlen)
+      len.* = 4
+    }
+  }
+
+  return 0
+}
+
+export fn socket_getpeername(fd: u32, addr: u64, addrlen: u64): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 1
+  }
+
+  if sockets[idx].state != SOCK_STATE_CONNECTED {
+    return 1
+  }
+
+  if addr != 0 and addrlen != 0 {
+    var sockaddr: *SockAddrIn = @ptrFromInt(addr)
+    sockaddr.sin_family = @intCast(AF_INET)
+    sockaddr.sin_port = htons(sockets[idx].remote_port)
+    sockaddr.sin_addr = sockets[idx].remote_addr
+
+    var len_ptr: *u32 = @ptrFromInt(addrlen)
+    len_ptr.* = 16
+  }
+
+  return 0
+}
+
+export fn socket_getsockname(fd: u32, addr: u64, addrlen: u64): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 1
+  }
+
+  if addr != 0 and addrlen != 0 {
+    var sockaddr: *SockAddrIn = @ptrFromInt(addr)
+    sockaddr.sin_family = @intCast(AF_INET)
+    sockaddr.sin_port = htons(sockets[idx].local_port)
+    sockaddr.sin_addr = sockets[idx].local_addr
+
+    var len_ptr: *u32 = @ptrFromInt(addrlen)
+    len_ptr.* = 16
+  }
+
+  return 0
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+var next_ephemeral_port: u16 = 49152
+
+fn allocate_ephemeral_port(): u16 {
+  var port: u16 = next_ephemeral_port
+  next_ephemeral_port = next_ephemeral_port + 1
+  if next_ephemeral_port >= 65535 {
+    next_ephemeral_port = 49152
+  }
+  return port
+}
+
+// Network byte order conversion
+fn htons(val: u16): u16 {
+  return ((val & 0xFF) << 8) | ((val >> 8) & 0xFF)
+}
+
+fn ntohs(val: u16): u16 {
+  return htons(val)  // Same operation
+}
+
+fn htonl(val: u32): u32 {
+  return ((val & 0xFF) << 24) |
+         ((val & 0xFF00) << 8) |
+         ((val & 0xFF0000) >> 8) |
+         ((val >> 24) & 0xFF)
+}
+
+fn ntohl(val: u32): u32 {
+  return htonl(val)  // Same operation
+}
+
+// ============================================================================
+// DNS INTEGRATION
+// ============================================================================
+
+// Resolve hostname to IP address (for getaddrinfo-like functionality)
+export fn socket_resolve_hostname(hostname: u64, addr_out: *u32): u32 {
+  var ip: u32 = dns.dns_resolve(hostname)
+  if ip == 0 {
+    return 1  // Resolution failed
+  }
+  addr_out.* = ip
+  return 0
+}
+
+// ============================================================================
+// POLLING SUPPORT
+// ============================================================================
+
+// Poll events for a socket
+export fn socket_poll(fd: u32, events: u32): u32 {
+  var idx: u32 = find_socket(fd)
+  if idx == 0xFFFFFFFF {
+    return 0
+  }
+
+  var revents: u32 = 0
+
+  // Check for readable
+  if (events & 1) != 0 {  // POLLIN
+    if sockets[idx].state == SOCK_STATE_LISTENING {
+      if sockets[idx].pending_connections > 0 {
+        revents = revents | 1
+      }
+    } else if sockets[idx].state == SOCK_STATE_CONNECTED {
+      if sockets[idx].recv_buf_len > 0 {
+        revents = revents | 1
+      } else if sockets[idx].sock_type == SOCK_STREAM {
+        if tcp.tcp_has_data(sockets[idx].conn_handle) != 0 {
+          revents = revents | 1
+        }
+      }
+    }
+  }
+
+  // Check for writable
+  if (events & 4) != 0 {  // POLLOUT
+    if sockets[idx].state == SOCK_STATE_CONNECTED {
+      revents = revents | 4  // Always writable for now
+    }
+  }
+
+  // Check for errors
+  if sockets[idx].last_error != 0 {
+    revents = revents | 8  // POLLERR
+  }
+
+  // Check for hangup
+  if sockets[idx].state == SOCK_STATE_CLOSED {
+    revents = revents | 16  // POLLHUP
+  }
+
+  return revents
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn socket_get_stats(open_sockets: *u32, total_created: *u32) {
+  open_sockets.* = socket_count
+  total_created.* = next_socket_fd - 100
+}

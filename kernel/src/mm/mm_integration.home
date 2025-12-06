@@ -1,0 +1,520 @@
+// home-os Kernel - Memory Management Integration
+// Connects OOM killer to process, memcg to allocators, swap to VMM
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../core/process.home" as process
+import "../sys/signal.home" as signal
+import "memcg.home" as memcg
+import "swap.home" as swap
+import "slab.home" as slab
+import "buddy.home" as buddy
+import "oom.home" as oom
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const MAX_PROCESSES: u32 = 256
+
+// Memory pressure levels
+export const PRESSURE_NONE: u32 = 0
+export const PRESSURE_LOW: u32 = 1
+export const PRESSURE_MEDIUM: u32 = 2
+export const PRESSURE_CRITICAL: u32 = 3
+
+// OOM priorities
+const OOM_ADJUST_MIN: i32 = -1000
+const OOM_ADJUST_MAX: i32 = 1000
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// Per-process memory info
+struct ProcessMemInfo {
+  rss: u64,              // Resident set size
+  vms: u64,              // Virtual memory size
+  shared: u64,           // Shared memory
+  swap: u64,             // Swap usage
+  oom_score: i32,        // OOM score (-1000 to 1000)
+  oom_score_adj: i32,    // User adjustment
+  memcg_id: u32,         // Memory cgroup ID
+  in_oom: u32            // Currently in OOM handling
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var process_mem: [ProcessMemInfo; 256]
+var mm_initialized: u32 = 0
+var current_pressure: u32 = PRESSURE_NONE
+var oom_in_progress: u32 = 0
+
+// Thresholds (percentage of total memory)
+var low_threshold: u32 = 20   // 20% free = low pressure
+var med_threshold: u32 = 10   // 10% free = medium pressure
+var crit_threshold: u32 = 5   // 5% free = critical
+
+// Statistics
+var oom_kills: u64 = 0
+var reclaim_attempts: u64 = 0
+var pages_reclaimed: u64 = 0
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn mm_integration_init() {
+  if mm_initialized == 1 { return }
+
+  var i: u32 = 0
+  while i < MAX_PROCESSES {
+    process_mem[i].rss = 0
+    process_mem[i].vms = 0
+    process_mem[i].shared = 0
+    process_mem[i].swap = 0
+    process_mem[i].oom_score = 0
+    process_mem[i].oom_score_adj = 0
+    process_mem[i].memcg_id = 0
+    process_mem[i].in_oom = 0
+    i = i + 1
+  }
+
+  mm_initialized = 1
+  foundation.serial_write_string("[MM] Memory integration initialized\n")
+}
+
+// ============================================================================
+// MEMORY PRESSURE DETECTION
+// ============================================================================
+
+export fn check_memory_pressure(): u32 {
+  var total: u64 = memory.get_total_memory()
+  var free: u64 = memory.get_free_memory()
+
+  if total == 0 { return PRESSURE_NONE }
+
+  var free_percent: u32 = @intCast((free * 100) / total)
+
+  if free_percent <= crit_threshold {
+    current_pressure = PRESSURE_CRITICAL
+  } else if free_percent <= med_threshold {
+    current_pressure = PRESSURE_MEDIUM
+  } else if free_percent <= low_threshold {
+    current_pressure = PRESSURE_LOW
+  } else {
+    current_pressure = PRESSURE_NONE
+  }
+
+  return current_pressure
+}
+
+export fn get_memory_pressure(): u32 {
+  return current_pressure
+}
+
+// ============================================================================
+// MEMCG-AWARE ALLOCATION
+// ============================================================================
+
+// Called before any allocation to check memcg limits
+export fn mm_charge(pid: u32, size: u64): u32 {
+  if pid >= MAX_PROCESSES { return 1 }
+
+  var cg_id: u32 = process_mem[pid].memcg_id
+  if cg_id == 0 { return 0 }  // No cgroup, allow
+
+  // Check cgroup limit
+  if memcg.memcg_try_charge(cg_id, size) == 0 {
+    return 0  // Allowed
+  }
+
+  // Over limit - try to reclaim or swap
+  if try_reclaim_memory(pid, size) == 0 {
+    return 0
+  }
+
+  // Still over limit - check if we should OOM
+  if memcg.memcg_should_oom(cg_id) != 0 {
+    oom_kill_memcg(cg_id)
+    return 1
+  }
+
+  return 1  // Allocation denied
+}
+
+// Called after freeing memory
+export fn mm_uncharge(pid: u32, size: u64) {
+  if pid >= MAX_PROCESSES { return }
+
+  var cg_id: u32 = process_mem[pid].memcg_id
+  if cg_id == 0 { return }
+
+  memcg.memcg_uncharge(cg_id, size)
+}
+
+// ============================================================================
+// MEMORY RECLAMATION
+// ============================================================================
+
+fn try_reclaim_memory(pid: u32, needed: u64): u32 {
+  reclaim_attempts = reclaim_attempts + 1
+
+  // Try page cache eviction first
+  var evicted: u64 = evict_page_cache(needed)
+  if evicted >= needed {
+    pages_reclaimed = pages_reclaimed + (evicted / 4096)
+    return 0
+  }
+
+  // Try swapping out anonymous pages
+  if swap.swap_enabled() != 0 {
+    var swapped: u64 = try_swap_pages(pid, needed - evicted)
+    if evicted + swapped >= needed {
+      pages_reclaimed = pages_reclaimed + ((evicted + swapped) / 4096)
+      return 0
+    }
+  }
+
+  // Try slab shrinking
+  var slab_freed: u64 = slab.slab_shrink()
+  if evicted + slab_freed >= needed {
+    pages_reclaimed = pages_reclaimed + ((evicted + slab_freed) / 4096)
+    return 0
+  }
+
+  return 1  // Failed to reclaim enough
+}
+
+fn evict_page_cache(needed: u64): u64 {
+  // Would call into VFS buffer cache to evict clean pages
+  // Simplified: return 0 for now
+  return 0
+}
+
+fn try_swap_pages(pid: u32, needed: u64): u64 {
+  // Find anonymous pages to swap out
+  var swapped: u64 = 0
+  var pages_needed: u32 = @intCast((needed + 4095) / 4096)
+
+  // Would iterate process page tables and swap out LRU pages
+  // Simplified: call swap subsystem
+  swapped = swap.swap_out_pages(pid, pages_needed)
+
+  if swapped > 0 {
+    process_mem[pid].swap = process_mem[pid].swap + swapped
+    process_mem[pid].rss = process_mem[pid].rss - swapped
+  }
+
+  return swapped
+}
+
+// ============================================================================
+// OOM KILLER INTEGRATION
+// ============================================================================
+
+fn calculate_oom_score(pid: u32): i32 {
+  if pid >= MAX_PROCESSES { return 0 }
+  if process.process_exists(pid) == 0 { return OOM_ADJUST_MIN }
+
+  // Base score from memory usage
+  var total_mem: u64 = memory.get_total_memory()
+  if total_mem == 0 { return 0 }
+
+  var mem_usage: u64 = process_mem[pid].rss + process_mem[pid].swap
+  var base_score: i32 = @intCast((mem_usage * 1000) / total_mem)
+
+  // Apply adjustment
+  var score: i32 = base_score + process_mem[pid].oom_score_adj
+
+  // Clamp to valid range
+  if score < OOM_ADJUST_MIN { score = OOM_ADJUST_MIN }
+  if score > OOM_ADJUST_MAX { score = OOM_ADJUST_MAX }
+
+  // PID 1 (init) should never be killed
+  if pid == 1 { score = OOM_ADJUST_MIN }
+
+  // Kernel threads should never be killed
+  if process.process_is_kernel(pid) != 0 { score = OOM_ADJUST_MIN }
+
+  process_mem[pid].oom_score = score
+  return score
+}
+
+export fn oom_kill(): u32 {
+  if oom_in_progress != 0 { return 0 }
+  oom_in_progress = 1
+
+  foundation.serial_write_string("[OOM] Out of memory! Looking for victim...\n")
+
+  var best_victim: u32 = 0
+  var best_score: i32 = OOM_ADJUST_MIN
+
+  // Find process with highest OOM score
+  var pid: u32 = 1
+  while pid < MAX_PROCESSES {
+    if process.process_exists(pid) != 0 {
+      var score: i32 = calculate_oom_score(pid)
+      if score > best_score {
+        best_score = score
+        best_victim = pid
+      }
+    }
+    pid = pid + 1
+  }
+
+  if best_victim == 0 or best_score <= OOM_ADJUST_MIN {
+    foundation.serial_write_string("[OOM] No killable process found!\n")
+    oom_in_progress = 0
+    return 1
+  }
+
+  // Kill the victim
+  foundation.serial_write_string("[OOM] Killing PID ")
+  foundation.serial_write_hex(best_victim)
+  foundation.serial_write_string(" (score=")
+  foundation.serial_write_hex(@intCast(best_score))
+  foundation.serial_write_string(")\n")
+
+  // Send SIGKILL
+  signal.signal_send(best_victim, 9, 0)  // SIGKILL
+
+  // Mark as being OOM killed
+  process_mem[best_victim].in_oom = 1
+
+  oom_kills = oom_kills + 1
+  oom_in_progress = 0
+
+  return 0
+}
+
+fn oom_kill_memcg(cg_id: u32): u32 {
+  foundation.serial_write_string("[OOM] Cgroup OOM for cgroup ")
+  foundation.serial_write_hex(cg_id)
+  foundation.serial_write_string("\n")
+
+  // Find process in this cgroup with highest score
+  var best_victim: u32 = 0
+  var best_score: i32 = OOM_ADJUST_MIN
+
+  var pid: u32 = 1
+  while pid < MAX_PROCESSES {
+    if process.process_exists(pid) != 0 and process_mem[pid].memcg_id == cg_id {
+      var score: i32 = calculate_oom_score(pid)
+      if score > best_score {
+        best_score = score
+        best_victim = pid
+      }
+    }
+    pid = pid + 1
+  }
+
+  if best_victim == 0 {
+    return 1
+  }
+
+  foundation.serial_write_string("[OOM] Killing PID ")
+  foundation.serial_write_hex(best_victim)
+  foundation.serial_write_string(" in cgroup ")
+  foundation.serial_write_hex(cg_id)
+  foundation.serial_write_string("\n")
+
+  signal.signal_send(best_victim, 9, 0)
+  process_mem[best_victim].in_oom = 1
+  oom_kills = oom_kills + 1
+
+  return 0
+}
+
+// ============================================================================
+// PROCESS MEMORY TRACKING
+// ============================================================================
+
+export fn mm_process_fork(parent_pid: u32, child_pid: u32) {
+  if parent_pid >= MAX_PROCESSES or child_pid >= MAX_PROCESSES { return }
+
+  // Inherit parent's memcg
+  process_mem[child_pid].memcg_id = process_mem[parent_pid].memcg_id
+
+  // Inherit OOM score adjustment
+  process_mem[child_pid].oom_score_adj = process_mem[parent_pid].oom_score_adj
+
+  // Start with zero memory (COW means pages are shared initially)
+  process_mem[child_pid].rss = 0
+  process_mem[child_pid].vms = process_mem[parent_pid].vms  // Virtual size is same
+  process_mem[child_pid].shared = process_mem[parent_pid].shared
+  process_mem[child_pid].swap = 0
+  process_mem[child_pid].in_oom = 0
+}
+
+export fn mm_process_exit(pid: u32) {
+  if pid >= MAX_PROCESSES { return }
+
+  // Uncharge all memory
+  var total: u64 = process_mem[pid].rss + process_mem[pid].swap
+  if process_mem[pid].memcg_id != 0 and total > 0 {
+    memcg.memcg_uncharge(process_mem[pid].memcg_id, total)
+  }
+
+  // Free swap pages
+  if process_mem[pid].swap > 0 {
+    swap.swap_free_pages(pid)
+  }
+
+  // Reset
+  process_mem[pid].rss = 0
+  process_mem[pid].vms = 0
+  process_mem[pid].shared = 0
+  process_mem[pid].swap = 0
+  process_mem[pid].memcg_id = 0
+  process_mem[pid].in_oom = 0
+}
+
+export fn mm_add_rss(pid: u32, pages: u32) {
+  if pid >= MAX_PROCESSES { return }
+  process_mem[pid].rss = process_mem[pid].rss + (@as(u64, pages) * 4096)
+}
+
+export fn mm_sub_rss(pid: u32, pages: u32) {
+  if pid >= MAX_PROCESSES { return }
+  var sub: u64 = @as(u64, pages) * 4096
+  if sub > process_mem[pid].rss {
+    process_mem[pid].rss = 0
+  } else {
+    process_mem[pid].rss = process_mem[pid].rss - sub
+  }
+}
+
+// ============================================================================
+// OOM SCORE ADJUSTMENT
+// ============================================================================
+
+export fn mm_set_oom_score_adj(pid: u32, adj: i32): u32 {
+  if pid >= MAX_PROCESSES { return 1 }
+  if adj < OOM_ADJUST_MIN or adj > OOM_ADJUST_MAX { return 1 }
+
+  process_mem[pid].oom_score_adj = adj
+  return 0
+}
+
+export fn mm_get_oom_score(pid: u32): i32 {
+  if pid >= MAX_PROCESSES { return 0 }
+  return calculate_oom_score(pid)
+}
+
+// ============================================================================
+// MEMCG ASSIGNMENT
+// ============================================================================
+
+export fn mm_set_memcg(pid: u32, cg_id: u32): u32 {
+  if pid >= MAX_PROCESSES { return 1 }
+
+  // Uncharge from old cgroup
+  if process_mem[pid].memcg_id != 0 {
+    var total: u64 = process_mem[pid].rss + process_mem[pid].swap
+    memcg.memcg_uncharge(process_mem[pid].memcg_id, total)
+  }
+
+  // Assign to new cgroup
+  process_mem[pid].memcg_id = cg_id
+
+  // Charge to new cgroup
+  if cg_id != 0 {
+    var total: u64 = process_mem[pid].rss + process_mem[pid].swap
+    memcg.memcg_force_charge(cg_id, total)
+  }
+
+  return 0
+}
+
+export fn mm_get_memcg(pid: u32): u32 {
+  if pid >= MAX_PROCESSES { return 0 }
+  return process_mem[pid].memcg_id
+}
+
+// ============================================================================
+// MEMORY INFO QUERIES
+// ============================================================================
+
+export fn mm_get_process_mem(pid: u32, rss: *u64, vms: *u64, shared: *u64, swap: *u64) {
+  if pid >= MAX_PROCESSES {
+    rss.* = 0
+    vms.* = 0
+    shared.* = 0
+    swap.* = 0
+    return
+  }
+
+  rss.* = process_mem[pid].rss
+  vms.* = process_mem[pid].vms
+  shared.* = process_mem[pid].shared
+  swap.* = process_mem[pid].swap
+}
+
+// ============================================================================
+// PAGE FAULT HANDLER INTEGRATION
+// ============================================================================
+
+// Called from page fault handler when allocating a new page
+export fn mm_page_fault_alloc(pid: u32): u32 {
+  // Check memory pressure
+  var pressure: u32 = check_memory_pressure()
+
+  if pressure == PRESSURE_CRITICAL {
+    // Try to reclaim before allowing allocation
+    if try_reclaim_memory(pid, 4096) != 0 {
+      // Trigger OOM
+      oom_kill()
+    }
+  }
+
+  // Check memcg limit
+  if mm_charge(pid, 4096) != 0 {
+    return 1  // Allocation denied
+  }
+
+  // Update RSS
+  mm_add_rss(pid, 1)
+
+  return 0
+}
+
+// ============================================================================
+// SWAP INTEGRATION
+// ============================================================================
+
+// Called when a page is swapped out
+export fn mm_page_swapped_out(pid: u32) {
+  if pid >= MAX_PROCESSES { return }
+  mm_sub_rss(pid, 1)
+  process_mem[pid].swap = process_mem[pid].swap + 4096
+}
+
+// Called when a page is swapped in
+export fn mm_page_swapped_in(pid: u32) {
+  if pid >= MAX_PROCESSES { return }
+  mm_add_rss(pid, 1)
+  if process_mem[pid].swap >= 4096 {
+    process_mem[pid].swap = process_mem[pid].swap - 4096
+  } else {
+    process_mem[pid].swap = 0
+  }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn mm_get_stats(kills: *u64, reclaims: *u64, pages: *u64) {
+  kills.* = oom_kills
+  reclaims.* = reclaim_attempts
+  pages.* = pages_reclaimed
+}
+
+export fn mm_set_thresholds(low: u32, med: u32, crit: u32) {
+  if low > 0 and low <= 100 { low_threshold = low }
+  if med > 0 and med <= 100 { med_threshold = med }
+  if crit > 0 and crit <= 100 { crit_threshold = crit }
+}

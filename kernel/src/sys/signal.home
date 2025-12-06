@@ -1,0 +1,593 @@
+// home-os Kernel - Signal Delivery System
+// Complete signal management and delivery
+
+import "../core/foundation.home" as foundation
+import "../core/process.home" as process
+
+// ============================================================================
+// SIGNAL CONSTANTS
+// ============================================================================
+
+// Standard POSIX signals
+export const SIGHUP: u32 = 1
+export const SIGINT: u32 = 2
+export const SIGQUIT: u32 = 3
+export const SIGILL: u32 = 4
+export const SIGTRAP: u32 = 5
+export const SIGABRT: u32 = 6
+export const SIGBUS: u32 = 7
+export const SIGFPE: u32 = 8
+export const SIGKILL: u32 = 9
+export const SIGUSR1: u32 = 10
+export const SIGSEGV: u32 = 11
+export const SIGUSR2: u32 = 12
+export const SIGPIPE: u32 = 13
+export const SIGALRM: u32 = 14
+export const SIGTERM: u32 = 15
+export const SIGSTKFLT: u32 = 16
+export const SIGCHLD: u32 = 17
+export const SIGCONT: u32 = 18
+export const SIGSTOP: u32 = 19
+export const SIGTSTP: u32 = 20
+export const SIGTTIN: u32 = 21
+export const SIGTTOU: u32 = 22
+export const SIGURG: u32 = 23
+export const SIGXCPU: u32 = 24
+export const SIGXFSZ: u32 = 25
+export const SIGVTALRM: u32 = 26
+export const SIGPROF: u32 = 27
+export const SIGWINCH: u32 = 28
+export const SIGIO: u32 = 29
+export const SIGPWR: u32 = 30
+export const SIGSYS: u32 = 31
+
+const MAX_SIGNALS: u32 = 64
+const MAX_PROCESSES: u32 = 256
+
+// Signal action flags
+export const SA_NOCLDSTOP: u32 = 1
+export const SA_NOCLDWAIT: u32 = 2
+export const SA_SIGINFO: u32 = 4
+export const SA_ONSTACK: u32 = 0x08000000
+export const SA_RESTART: u32 = 0x10000000
+export const SA_NODEFER: u32 = 0x40000000
+export const SA_RESETHAND: u32 = 0x80000000
+
+// Signal handler special values
+export const SIG_DFL: u64 = 0
+export const SIG_IGN: u64 = 1
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// Signal action structure
+struct SigAction {
+  handler: u64,      // Handler function pointer (or SIG_DFL/SIG_IGN)
+  flags: u32,        // SA_* flags
+  restorer: u64,     // Signal trampoline
+  mask: u64          // Signals to block during handler
+}
+
+// Pending signal info
+struct PendingSignal {
+  signum: u32,
+  code: u32,         // SI_* code
+  sender_pid: u32,
+  value: u64         // sigval for real-time signals
+}
+
+// Per-process signal state
+struct ProcessSignalState {
+  pending_mask: u64,           // Bitmask of pending signals
+  blocked_mask: u64,           // Bitmask of blocked signals
+  actions: [SigAction; 64],    // Signal handlers
+  pending_queue: [PendingSignal; 32],  // Queued signals (for real-time)
+  queue_head: u32,
+  queue_tail: u32
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var signal_states: [ProcessSignalState; 256]
+var signal_initialized: u32 = 0
+
+// Default signal actions (0 = terminate, 1 = ignore, 2 = stop, 3 = continue, 4 = coredump)
+var default_actions: [u32; 64]
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn signal_init() {
+  if signal_initialized == 1 { return }
+
+  // Initialize default actions
+  var i: u32 = 0
+  while i < MAX_SIGNALS {
+    default_actions[i] = 0  // Default: terminate
+    i = i + 1
+  }
+
+  // Override specific signals
+  default_actions[SIGCHLD] = 1   // Ignore
+  default_actions[SIGURG] = 1    // Ignore
+  default_actions[SIGWINCH] = 1  // Ignore
+  default_actions[SIGCONT] = 3   // Continue
+  default_actions[SIGSTOP] = 2   // Stop
+  default_actions[SIGTSTP] = 2   // Stop
+  default_actions[SIGTTIN] = 2   // Stop
+  default_actions[SIGTTOU] = 2   // Stop
+  default_actions[SIGQUIT] = 4   // Core dump
+  default_actions[SIGILL] = 4    // Core dump
+  default_actions[SIGTRAP] = 4   // Core dump
+  default_actions[SIGABRT] = 4   // Core dump
+  default_actions[SIGFPE] = 4    // Core dump
+  default_actions[SIGSEGV] = 4   // Core dump
+  default_actions[SIGBUS] = 4    // Core dump
+  default_actions[SIGSYS] = 4    // Core dump
+
+  // Initialize per-process signal states
+  i = 0
+  while i < MAX_PROCESSES {
+    signal_states[i].pending_mask = 0
+    signal_states[i].blocked_mask = 0
+    signal_states[i].queue_head = 0
+    signal_states[i].queue_tail = 0
+
+    var j: u32 = 0
+    while j < MAX_SIGNALS {
+      signal_states[i].actions[j].handler = SIG_DFL
+      signal_states[i].actions[j].flags = 0
+      signal_states[i].actions[j].restorer = 0
+      signal_states[i].actions[j].mask = 0
+      j = j + 1
+    }
+    i = i + 1
+  }
+
+  signal_initialized = 1
+  foundation.serial_write_string("[Signal] Signal system initialized\n")
+}
+
+// ============================================================================
+// SIGNAL ACTIONS
+// ============================================================================
+
+export fn signal_set_handler(pid: u32, signum: u32, handler: u64, flags: u32, mask: u64): u32 {
+  if pid >= MAX_PROCESSES or signum == 0 or signum >= MAX_SIGNALS {
+    return 1  // Invalid
+  }
+
+  // Cannot change SIGKILL or SIGSTOP
+  if signum == SIGKILL or signum == SIGSTOP {
+    return 1
+  }
+
+  signal_states[pid].actions[signum].handler = handler
+  signal_states[pid].actions[signum].flags = flags
+  signal_states[pid].actions[signum].mask = mask
+
+  return 0
+}
+
+export fn signal_get_handler(pid: u32, signum: u32): u64 {
+  if pid >= MAX_PROCESSES or signum == 0 or signum >= MAX_SIGNALS {
+    return SIG_DFL
+  }
+  return signal_states[pid].actions[signum].handler
+}
+
+// ============================================================================
+// SIGNAL MASK OPERATIONS
+// ============================================================================
+
+export fn signal_block(pid: u32, mask: u64): u64 {
+  if pid >= MAX_PROCESSES { return 0 }
+
+  var old_mask: u64 = signal_states[pid].blocked_mask
+
+  // Cannot block SIGKILL or SIGSTOP
+  var safe_mask: u64 = mask & ~((1 << SIGKILL) | (1 << SIGSTOP))
+  signal_states[pid].blocked_mask = signal_states[pid].blocked_mask | safe_mask
+
+  return old_mask
+}
+
+export fn signal_unblock(pid: u32, mask: u64): u64 {
+  if pid >= MAX_PROCESSES { return 0 }
+
+  var old_mask: u64 = signal_states[pid].blocked_mask
+  signal_states[pid].blocked_mask = signal_states[pid].blocked_mask & ~mask
+
+  return old_mask
+}
+
+export fn signal_setmask(pid: u32, mask: u64): u64 {
+  if pid >= MAX_PROCESSES { return 0 }
+
+  var old_mask: u64 = signal_states[pid].blocked_mask
+
+  // Cannot block SIGKILL or SIGSTOP
+  var safe_mask: u64 = mask & ~((1 << SIGKILL) | (1 << SIGSTOP))
+  signal_states[pid].blocked_mask = safe_mask
+
+  return old_mask
+}
+
+export fn signal_pending(pid: u32): u64 {
+  if pid >= MAX_PROCESSES { return 0 }
+  return signal_states[pid].pending_mask & ~signal_states[pid].blocked_mask
+}
+
+// ============================================================================
+// SIGNAL GENERATION
+// ============================================================================
+
+export fn signal_send(target_pid: u32, signum: u32, sender_pid: u32): u32 {
+  if target_pid >= MAX_PROCESSES or signum == 0 or signum >= MAX_SIGNALS {
+    return 1  // Invalid
+  }
+
+  // Check if signal is ignored
+  var handler: u64 = signal_states[target_pid].actions[signum].handler
+  if handler == SIG_IGN and signum != SIGKILL and signum != SIGSTOP {
+    return 0  // Ignored, but no error
+  }
+
+  // Add to pending mask
+  signal_states[target_pid].pending_mask = signal_states[target_pid].pending_mask | (1 << signum)
+
+  // Queue the signal info
+  var tail: u32 = signal_states[target_pid].queue_tail
+  var new_tail: u32 = (tail + 1) % 32
+
+  if new_tail != signal_states[target_pid].queue_head {
+    signal_states[target_pid].pending_queue[tail].signum = signum
+    signal_states[target_pid].pending_queue[tail].code = 0  // SI_USER
+    signal_states[target_pid].pending_queue[tail].sender_pid = sender_pid
+    signal_states[target_pid].pending_queue[tail].value = 0
+    signal_states[target_pid].queue_tail = new_tail
+  }
+
+  // Wake up blocked process if signal is not blocked
+  if (signal_states[target_pid].blocked_mask & (1 << signum)) == 0 {
+    signal_wake_process(target_pid)
+  }
+
+  return 0
+}
+
+export fn signal_send_info(target_pid: u32, signum: u32, code: u32, value: u64): u32 {
+  if target_pid >= MAX_PROCESSES or signum == 0 or signum >= MAX_SIGNALS {
+    return 1
+  }
+
+  signal_states[target_pid].pending_mask = signal_states[target_pid].pending_mask | (1 << signum)
+
+  var tail: u32 = signal_states[target_pid].queue_tail
+  var new_tail: u32 = (tail + 1) % 32
+
+  if new_tail != signal_states[target_pid].queue_head {
+    signal_states[target_pid].pending_queue[tail].signum = signum
+    signal_states[target_pid].pending_queue[tail].code = code
+    signal_states[target_pid].pending_queue[tail].sender_pid = 0
+    signal_states[target_pid].pending_queue[tail].value = value
+    signal_states[target_pid].queue_tail = new_tail
+  }
+
+  return 0
+}
+
+// ============================================================================
+// SIGNAL DELIVERY
+// ============================================================================
+
+// Dequeue a pending signal for a process
+fn dequeue_signal(pid: u32, signum: u32): u32 {
+  if pid >= MAX_PROCESSES { return 0 }
+
+  // Clear from pending mask
+  signal_states[pid].pending_mask = signal_states[pid].pending_mask & ~(1 << signum)
+
+  // Find and remove from queue
+  var head: u32 = signal_states[pid].queue_head
+  var tail: u32 = signal_states[pid].queue_tail
+
+  while head != tail {
+    if signal_states[pid].pending_queue[head].signum == signum {
+      signal_states[pid].queue_head = (head + 1) % 32
+      return 1
+    }
+    head = (head + 1) % 32
+  }
+
+  return 0
+}
+
+// Check and deliver pending signals (called on return to userspace)
+export fn signal_deliver(pid: u32): u32 {
+  if pid >= MAX_PROCESSES { return 0 }
+
+  // Get deliverable signals (pending and not blocked)
+  var deliverable: u64 = signal_states[pid].pending_mask & ~signal_states[pid].blocked_mask
+
+  if deliverable == 0 {
+    return 0  // No signals to deliver
+  }
+
+  // Find lowest numbered signal
+  var signum: u32 = 1
+  while signum < MAX_SIGNALS {
+    if (deliverable & (1 << signum)) != 0 {
+      break
+    }
+    signum = signum + 1
+  }
+
+  if signum >= MAX_SIGNALS {
+    return 0
+  }
+
+  // Get handler
+  var handler: u64 = signal_states[pid].actions[signum].handler
+
+  if handler == SIG_DFL {
+    // Default action
+    return signal_do_default(pid, signum)
+  } else if handler == SIG_IGN {
+    // Ignore
+    dequeue_signal(pid, signum)
+    return 0
+  } else {
+    // User handler - set up signal frame
+    return signal_setup_frame(pid, signum, handler)
+  }
+}
+
+fn signal_do_default(pid: u32, signum: u32): u32 {
+  dequeue_signal(pid, signum)
+
+  var action: u32 = default_actions[signum]
+
+  if action == 0 {
+    // Terminate
+    foundation.serial_write_string("[Signal] Process ")
+    foundation.serial_write_hex(pid)
+    foundation.serial_write_string(" killed by signal ")
+    foundation.serial_write_hex(signum)
+    foundation.serial_write_string("\n")
+    process.process_destroy(pid)
+    return 1  // Process terminated
+
+  } else if action == 1 {
+    // Ignore
+    return 0
+
+  } else if action == 2 {
+    // Stop
+    foundation.serial_write_string("[Signal] Process ")
+    foundation.serial_write_hex(pid)
+    foundation.serial_write_string(" stopped\n")
+    process.process_set_state(pid, 3)  // BLOCKED
+    return 2  // Process stopped
+
+  } else if action == 3 {
+    // Continue
+    foundation.serial_write_string("[Signal] Process ")
+    foundation.serial_write_hex(pid)
+    foundation.serial_write_string(" continued\n")
+    process.process_set_state(pid, 1)  // READY
+    return 0
+
+  } else if action == 4 {
+    // Core dump (terminate + dump)
+    foundation.serial_write_string("[Signal] Process ")
+    foundation.serial_write_hex(pid)
+    foundation.serial_write_string(" dumped core (signal ")
+    foundation.serial_write_hex(signum)
+    foundation.serial_write_string(")\n")
+    // Would write core file here
+    process.process_destroy(pid)
+    return 1
+  }
+
+  return 0
+}
+
+fn signal_setup_frame(pid: u32, signum: u32, handler: u64): u32 {
+  dequeue_signal(pid, signum)
+
+  // Block additional signals during handler (add signal mask)
+  var action_mask: u64 = signal_states[pid].actions[signum].mask
+  var old_blocked: u64 = signal_states[pid].blocked_mask
+
+  // Also block the signal itself unless SA_NODEFER is set
+  if (signal_states[pid].actions[signum].flags & SA_NODEFER) == 0 {
+    signal_states[pid].blocked_mask = signal_states[pid].blocked_mask | (1 << signum)
+  }
+  signal_states[pid].blocked_mask = signal_states[pid].blocked_mask | action_mask
+
+  // Reset handler if SA_RESETHAND is set
+  if (signal_states[pid].actions[signum].flags & SA_RESETHAND) != 0 {
+    signal_states[pid].actions[signum].handler = SIG_DFL
+  }
+
+  foundation.serial_write_string("[Signal] Delivering signal ")
+  foundation.serial_write_hex(signum)
+  foundation.serial_write_string(" to process ")
+  foundation.serial_write_hex(pid)
+  foundation.serial_write_string("\n")
+
+  // Would set up the signal frame on the user stack here:
+  // 1. Save current CPU state
+  // 2. Push signal number and siginfo
+  // 3. Set RIP to handler
+  // 4. Set up return trampoline
+
+  return 0
+}
+
+fn signal_wake_process(pid: u32) {
+  // Wake up process if it's blocked in a system call
+  var state: u32 = process.process_get_state(pid)
+  if state == 3 {  // BLOCKED
+    // Check if blocked in interruptible sleep
+    process.process_set_state(pid, 1)  // READY
+  }
+}
+
+// ============================================================================
+// SIGNAL RETURN
+// ============================================================================
+
+// Called when returning from signal handler
+export fn signal_return(pid: u32) {
+  if pid >= MAX_PROCESSES { return }
+
+  // Would restore CPU state from signal frame
+  // Would restore blocked signal mask
+
+  // Check for more pending signals
+  signal_deliver(pid)
+}
+
+// ============================================================================
+// PROCESS LIFECYCLE INTEGRATION
+// ============================================================================
+
+// Initialize signal state for a new process
+export fn signal_fork(parent_pid: u32, child_pid: u32) {
+  if parent_pid >= MAX_PROCESSES or child_pid >= MAX_PROCESSES { return }
+
+  // Copy signal handlers from parent
+  var i: u32 = 0
+  while i < MAX_SIGNALS {
+    signal_states[child_pid].actions[i] = signal_states[parent_pid].actions[i]
+    i = i + 1
+  }
+
+  // Copy blocked mask
+  signal_states[child_pid].blocked_mask = signal_states[parent_pid].blocked_mask
+
+  // Clear pending signals (child doesn't inherit pending signals)
+  signal_states[child_pid].pending_mask = 0
+  signal_states[child_pid].queue_head = 0
+  signal_states[child_pid].queue_tail = 0
+}
+
+// Reset signal handlers on exec
+export fn signal_exec(pid: u32) {
+  if pid >= MAX_PROCESSES { return }
+
+  var i: u32 = 0
+  while i < MAX_SIGNALS {
+    // Handlers are reset to SIG_DFL on exec
+    // But SIG_IGN signals remain ignored
+    if signal_states[pid].actions[i].handler != SIG_IGN {
+      signal_states[pid].actions[i].handler = SIG_DFL
+    }
+    signal_states[pid].actions[i].flags = 0
+    signal_states[pid].actions[i].mask = 0
+    i = i + 1
+  }
+
+  // Clear pending signals
+  signal_states[pid].pending_mask = 0
+  signal_states[pid].queue_head = 0
+  signal_states[pid].queue_tail = 0
+}
+
+// Clean up signal state when process exits
+export fn signal_exit(pid: u32) {
+  if pid >= MAX_PROCESSES { return }
+
+  // Send SIGCHLD to parent
+  var parent_pid: u32 = process.process_get_parent(pid)
+  if parent_pid != 0 {
+    signal_send(parent_pid, SIGCHLD, pid)
+  }
+
+  // Clear all state
+  signal_states[pid].pending_mask = 0
+  signal_states[pid].blocked_mask = 0
+  signal_states[pid].queue_head = 0
+  signal_states[pid].queue_tail = 0
+}
+
+// ============================================================================
+// SPECIAL SIGNAL OPERATIONS
+// ============================================================================
+
+// Send signal to process group
+export fn signal_send_group(pgid: u32, signum: u32, sender_pid: u32): u32 {
+  var count: u32 = 0
+  var i: u32 = 0
+
+  while i < MAX_PROCESSES {
+    if process.process_get_pgid(i) == pgid {
+      if signal_send(i, signum, sender_pid) == 0 {
+        count = count + 1
+      }
+    }
+    i = i + 1
+  }
+
+  return count
+}
+
+// Send signal to all processes
+export fn signal_send_all(signum: u32, sender_pid: u32): u32 {
+  var count: u32 = 0
+  var i: u32 = 1  // Skip PID 0
+
+  while i < MAX_PROCESSES {
+    if i != sender_pid and process.process_exists(i) {
+      if signal_send(i, signum, sender_pid) == 0 {
+        count = count + 1
+      }
+    }
+    i = i + 1
+  }
+
+  return count
+}
+
+// Wait for signal (used by sigsuspend)
+export fn signal_wait(pid: u32, mask: u64): u32 {
+  if pid >= MAX_PROCESSES { return 0 }
+
+  // Temporarily set signal mask
+  var old_mask: u64 = signal_states[pid].blocked_mask
+  signal_setmask(pid, mask)
+
+  // Check for already pending signals
+  var pending: u64 = signal_pending(pid)
+  if pending != 0 {
+    signal_setmask(pid, old_mask)
+    return signal_deliver(pid)
+  }
+
+  // Block process until signal arrives
+  process.process_set_state(pid, 3)  // BLOCKED
+
+  // When woken up, restore mask and deliver signal
+  signal_setmask(pid, old_mask)
+  return signal_deliver(pid)
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+var signals_sent: u64 = 0
+var signals_delivered: u64 = 0
+var signals_ignored: u64 = 0
+
+export fn signal_get_stats(sent: *u64, delivered: *u64, ignored: *u64) {
+  sent.* = signals_sent
+  delivered.* = signals_delivered
+  ignored.* = signals_ignored
+}

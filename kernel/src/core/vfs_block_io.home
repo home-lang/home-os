@@ -1,0 +1,608 @@
+// home-os Kernel - VFS Block I/O Integration
+// Connects VFS buffer cache to block device drivers and I/O scheduler
+
+import "foundation.home" as foundation
+import "memory.home" as memory
+import "../block/io_scheduler.home" as iosched
+import "../drivers/ata.home" as ata
+import "../drivers/nvme.home" as nvme
+import "../mm/slab.home" as slab
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const BLOCK_SIZE: u32 = 4096
+const MAX_BUFFERS: u32 = 1024
+const MAX_DEVICES: u32 = 16
+
+// Buffer states
+const BUF_CLEAN: u32 = 0
+const BUF_DIRTY: u32 = 1
+const BUF_LOCKED: u32 = 2
+const BUF_UPTODATE: u32 = 4
+const BUF_ASYNC: u32 = 8
+
+// Device types
+const DEV_TYPE_NONE: u32 = 0
+const DEV_TYPE_ATA: u32 = 1
+const DEV_TYPE_NVME: u32 = 2
+const DEV_TYPE_VIRTIO: u32 = 3
+const DEV_TYPE_SD: u32 = 4
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// Buffer head
+struct BufferHead {
+  dev: u32,             // Device number
+  block: u64,           // Block number
+  data: u64,            // Data buffer address
+  state: u32,           // Buffer state flags
+  ref_count: u32,       // Reference count
+  next_hash: u32,       // Hash chain link
+  next_lru: u32,        // LRU chain link
+  prev_lru: u32,
+  callback: u64         // Async I/O completion callback
+}
+
+// Block device
+struct BlockDevice {
+  dev_type: u32,
+  handle: u32,          // Device-specific handle
+  sector_size: u32,
+  total_sectors: u64,
+  read_only: u32,
+  name: [u8; 16]
+}
+
+// I/O request
+struct IORequest {
+  dev: u32,
+  block: u64,
+  count: u32,
+  buffer: u64,
+  is_write: u32,
+  callback: u64,
+  next: u32
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var buffer_cache: [BufferHead; 1024]
+var buffer_count: u32 = 0
+
+var devices: [BlockDevice; 16]
+var device_count: u32 = 0
+
+// Hash table for quick buffer lookup
+const HASH_SIZE: u32 = 256
+var hash_table: [u32; 256]
+
+// LRU list
+var lru_head: u32 = 0xFFFFFFFF
+var lru_tail: u32 = 0xFFFFFFFF
+
+// Pending I/O requests
+var io_queue_head: u32 = 0xFFFFFFFF
+var io_queue_tail: u32 = 0xFFFFFFFF
+var io_requests: [IORequest; 256]
+var io_request_count: u32 = 0
+
+var block_io_initialized: u32 = 0
+
+// Statistics
+var cache_hits: u64 = 0
+var cache_misses: u64 = 0
+var blocks_read: u64 = 0
+var blocks_written: u64 = 0
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn block_io_init() {
+  if block_io_initialized == 1 { return }
+
+  // Initialize hash table
+  var i: u32 = 0
+  while i < HASH_SIZE {
+    hash_table[i] = 0xFFFFFFFF
+    i = i + 1
+  }
+
+  // Initialize buffer cache
+  i = 0
+  while i < MAX_BUFFERS {
+    buffer_cache[i].dev = 0
+    buffer_cache[i].block = 0
+    buffer_cache[i].data = 0
+    buffer_cache[i].state = 0
+    buffer_cache[i].ref_count = 0
+    buffer_cache[i].next_hash = 0xFFFFFFFF
+    buffer_cache[i].next_lru = 0xFFFFFFFF
+    buffer_cache[i].prev_lru = 0xFFFFFFFF
+    i = i + 1
+  }
+
+  // Probe for block devices
+  probe_devices()
+
+  // Initialize I/O scheduler
+  iosched.io_scheduler_init()
+
+  block_io_initialized = 1
+  foundation.serial_write_string("[BlockIO] Buffer cache initialized (")
+  foundation.serial_write_hex(device_count)
+  foundation.serial_write_string(" devices)\n")
+}
+
+fn probe_devices() {
+  // Probe ATA devices
+  var ata_count: u32 = ata.ata_get_device_count()
+  var i: u32 = 0
+  while i < ata_count and device_count < MAX_DEVICES {
+    devices[device_count].dev_type = DEV_TYPE_ATA
+    devices[device_count].handle = i
+    devices[device_count].sector_size = 512
+    devices[device_count].total_sectors = ata.ata_get_size(i)
+    devices[device_count].read_only = 0
+    copy_name(&devices[device_count].name, "ata")
+    devices[device_count].name[3] = '0' + @intCast(i)
+    device_count = device_count + 1
+    i = i + 1
+  }
+
+  // Probe NVMe devices
+  var nvme_count: u32 = nvme.nvme_get_device_count()
+  i = 0
+  while i < nvme_count and device_count < MAX_DEVICES {
+    devices[device_count].dev_type = DEV_TYPE_NVME
+    devices[device_count].handle = i
+    devices[device_count].sector_size = 512
+    devices[device_count].total_sectors = nvme.nvme_get_size(i)
+    devices[device_count].read_only = 0
+    copy_name(&devices[device_count].name, "nvme")
+    devices[device_count].name[4] = '0' + @intCast(i)
+    device_count = device_count + 1
+    i = i + 1
+  }
+}
+
+fn copy_name(dest: *[16]u8, src: []const u8) {
+  var i: u32 = 0
+  while i < src.len and i < 15 {
+    dest[i] = src[i]
+    i = i + 1
+  }
+  dest[i] = 0
+}
+
+// ============================================================================
+// BUFFER CACHE OPERATIONS
+// ============================================================================
+
+fn hash_buffer(dev: u32, block: u64): u32 {
+  return @intCast((dev + @truncate(block, u32)) % HASH_SIZE)
+}
+
+fn find_buffer(dev: u32, block: u64): u32 {
+  var hash: u32 = hash_buffer(dev, block)
+  var idx: u32 = hash_table[hash]
+
+  while idx != 0xFFFFFFFF {
+    if buffer_cache[idx].dev == dev and buffer_cache[idx].block == block {
+      return idx
+    }
+    idx = buffer_cache[idx].next_hash
+  }
+
+  return 0xFFFFFFFF
+}
+
+fn alloc_buffer(): u32 {
+  // First, try to find a free buffer
+  var i: u32 = 0
+  while i < MAX_BUFFERS {
+    if buffer_cache[i].data == 0 {
+      // Allocate data page
+      buffer_cache[i].data = memory.pmm_alloc_page()
+      if buffer_cache[i].data != 0 {
+        buffer_count = buffer_count + 1
+        return i
+      }
+    }
+    i = i + 1
+  }
+
+  // No free buffers - reclaim from LRU
+  var idx: u32 = lru_head
+  while idx != 0xFFFFFFFF {
+    if buffer_cache[idx].ref_count == 0 and (buffer_cache[idx].state & BUF_LOCKED) == 0 {
+      // Write back if dirty
+      if (buffer_cache[idx].state & BUF_DIRTY) != 0 {
+        sync_buffer(idx)
+      }
+
+      // Remove from hash table
+      remove_from_hash(idx)
+
+      // Reset buffer
+      buffer_cache[idx].dev = 0
+      buffer_cache[idx].block = 0
+      buffer_cache[idx].state = 0
+
+      return idx
+    }
+    idx = buffer_cache[idx].next_lru
+  }
+
+  return 0xFFFFFFFF  // Cache is full
+}
+
+fn remove_from_hash(idx: u32) {
+  var hash: u32 = hash_buffer(buffer_cache[idx].dev, buffer_cache[idx].block)
+
+  if hash_table[hash] == idx {
+    hash_table[hash] = buffer_cache[idx].next_hash
+    return
+  }
+
+  var prev: u32 = hash_table[hash]
+  while prev != 0xFFFFFFFF {
+    if buffer_cache[prev].next_hash == idx {
+      buffer_cache[prev].next_hash = buffer_cache[idx].next_hash
+      return
+    }
+    prev = buffer_cache[prev].next_hash
+  }
+}
+
+fn add_to_hash(idx: u32) {
+  var hash: u32 = hash_buffer(buffer_cache[idx].dev, buffer_cache[idx].block)
+  buffer_cache[idx].next_hash = hash_table[hash]
+  hash_table[hash] = idx
+}
+
+fn move_to_lru_tail(idx: u32) {
+  // Remove from current position
+  if buffer_cache[idx].prev_lru != 0xFFFFFFFF {
+    buffer_cache[buffer_cache[idx].prev_lru].next_lru = buffer_cache[idx].next_lru
+  } else {
+    lru_head = buffer_cache[idx].next_lru
+  }
+
+  if buffer_cache[idx].next_lru != 0xFFFFFFFF {
+    buffer_cache[buffer_cache[idx].next_lru].prev_lru = buffer_cache[idx].prev_lru
+  } else {
+    lru_tail = buffer_cache[idx].prev_lru
+  }
+
+  // Add to tail
+  buffer_cache[idx].prev_lru = lru_tail
+  buffer_cache[idx].next_lru = 0xFFFFFFFF
+
+  if lru_tail != 0xFFFFFFFF {
+    buffer_cache[lru_tail].next_lru = idx
+  }
+  lru_tail = idx
+
+  if lru_head == 0xFFFFFFFF {
+    lru_head = idx
+  }
+}
+
+// ============================================================================
+// BLOCK READ/WRITE
+// ============================================================================
+
+export fn bread(dev: u32, block: u64): u64 {
+  // Check cache first
+  var idx: u32 = find_buffer(dev, block)
+  if idx != 0xFFFFFFFF {
+    cache_hits = cache_hits + 1
+    buffer_cache[idx].ref_count = buffer_cache[idx].ref_count + 1
+    move_to_lru_tail(idx)
+    return buffer_cache[idx].data
+  }
+
+  cache_misses = cache_misses + 1
+
+  // Allocate new buffer
+  idx = alloc_buffer()
+  if idx == 0xFFFFFFFF {
+    return 0  // Out of buffers
+  }
+
+  // Set up buffer
+  buffer_cache[idx].dev = dev
+  buffer_cache[idx].block = block
+  buffer_cache[idx].ref_count = 1
+  buffer_cache[idx].state = BUF_LOCKED
+
+  // Add to hash table
+  add_to_hash(idx)
+  move_to_lru_tail(idx)
+
+  // Read from device
+  if read_block(dev, block, buffer_cache[idx].data) == 0 {
+    buffer_cache[idx].state = BUF_UPTODATE
+    blocks_read = blocks_read + 1
+  } else {
+    // Read failed
+    buffer_cache[idx].state = 0
+    return 0
+  }
+
+  return buffer_cache[idx].data
+}
+
+export fn bwrite(dev: u32, block: u64, data: u64): u32 {
+  var idx: u32 = find_buffer(dev, block)
+  if idx == 0xFFFFFFFF {
+    // Allocate new buffer
+    idx = alloc_buffer()
+    if idx == 0xFFFFFFFF {
+      return 1  // Out of buffers
+    }
+
+    buffer_cache[idx].dev = dev
+    buffer_cache[idx].block = block
+    add_to_hash(idx)
+  }
+
+  // Copy data
+  memory.memcpy(buffer_cache[idx].data, data, BLOCK_SIZE)
+  buffer_cache[idx].state = buffer_cache[idx].state | BUF_DIRTY | BUF_UPTODATE
+  move_to_lru_tail(idx)
+
+  return 0
+}
+
+export fn brelse(data: u64) {
+  // Find buffer by data address
+  var i: u32 = 0
+  while i < MAX_BUFFERS {
+    if buffer_cache[i].data == data {
+      if buffer_cache[i].ref_count > 0 {
+        buffer_cache[i].ref_count = buffer_cache[i].ref_count - 1
+      }
+      return
+    }
+    i = i + 1
+  }
+}
+
+fn sync_buffer(idx: u32) {
+  if (buffer_cache[idx].state & BUF_DIRTY) == 0 {
+    return
+  }
+
+  if write_block(buffer_cache[idx].dev, buffer_cache[idx].block, buffer_cache[idx].data) == 0 {
+    buffer_cache[idx].state = buffer_cache[idx].state & ~BUF_DIRTY
+    blocks_written = blocks_written + 1
+  }
+}
+
+// ============================================================================
+// DEVICE I/O
+// ============================================================================
+
+fn read_block(dev: u32, block: u64, buffer: u64): u32 {
+  if dev >= device_count {
+    return 1
+  }
+
+  var sector: u64 = block * (BLOCK_SIZE / devices[dev].sector_size)
+  var count: u32 = BLOCK_SIZE / devices[dev].sector_size
+
+  if devices[dev].dev_type == DEV_TYPE_ATA {
+    return ata.ata_read_sectors(devices[dev].handle, sector, count, buffer)
+  } else if devices[dev].dev_type == DEV_TYPE_NVME {
+    return nvme.nvme_read(devices[dev].handle, sector, count, buffer)
+  }
+
+  return 1  // Unknown device type
+}
+
+fn write_block(dev: u32, block: u64, buffer: u64): u32 {
+  if dev >= device_count {
+    return 1
+  }
+
+  if devices[dev].read_only != 0 {
+    return 1
+  }
+
+  var sector: u64 = block * (BLOCK_SIZE / devices[dev].sector_size)
+  var count: u32 = BLOCK_SIZE / devices[dev].sector_size
+
+  if devices[dev].dev_type == DEV_TYPE_ATA {
+    return ata.ata_write_sectors(devices[dev].handle, sector, count, buffer)
+  } else if devices[dev].dev_type == DEV_TYPE_NVME {
+    return nvme.nvme_write(devices[dev].handle, sector, count, buffer)
+  }
+
+  return 1
+}
+
+// ============================================================================
+// SYNC OPERATIONS
+// ============================================================================
+
+export fn sync_dev(dev: u32) {
+  var i: u32 = 0
+  while i < MAX_BUFFERS {
+    if buffer_cache[i].dev == dev and (buffer_cache[i].state & BUF_DIRTY) != 0 {
+      sync_buffer(i)
+    }
+    i = i + 1
+  }
+}
+
+export fn sync_all() {
+  var i: u32 = 0
+  while i < MAX_BUFFERS {
+    if (buffer_cache[i].state & BUF_DIRTY) != 0 {
+      sync_buffer(i)
+    }
+    i = i + 1
+  }
+
+  foundation.serial_write_string("[BlockIO] Synced all buffers\n")
+}
+
+// ============================================================================
+// READ-AHEAD
+// ============================================================================
+
+export fn bread_ahead(dev: u32, block: u64, count: u32) {
+  var i: u32 = 0
+  while i < count {
+    // Check if already cached
+    if find_buffer(dev, block + i) == 0xFFFFFFFF {
+      // Submit async read
+      submit_async_read(dev, block + i)
+    }
+    i = i + 1
+  }
+}
+
+fn submit_async_read(dev: u32, block: u64) {
+  // Find free request slot
+  var slot: u32 = 0xFFFFFFFF
+  var i: u32 = 0
+  while i < 256 {
+    if io_requests[i].dev == 0 {
+      slot = i
+      break
+    }
+    i = i + 1
+  }
+
+  if slot == 0xFFFFFFFF {
+    return  // Queue full
+  }
+
+  // Allocate buffer
+  var idx: u32 = alloc_buffer()
+  if idx == 0xFFFFFFFF {
+    return
+  }
+
+  buffer_cache[idx].dev = dev
+  buffer_cache[idx].block = block
+  buffer_cache[idx].state = BUF_LOCKED | BUF_ASYNC
+  add_to_hash(idx)
+
+  // Queue request
+  io_requests[slot].dev = dev
+  io_requests[slot].block = block
+  io_requests[slot].count = 1
+  io_requests[slot].buffer = buffer_cache[idx].data
+  io_requests[slot].is_write = 0
+  io_requests[slot].callback = @ptrFromInt(&async_read_complete)
+  io_requests[slot].next = 0xFFFFFFFF
+
+  // Add to queue
+  if io_queue_tail != 0xFFFFFFFF {
+    io_requests[io_queue_tail].next = slot
+  }
+  io_queue_tail = slot
+  if io_queue_head == 0xFFFFFFFF {
+    io_queue_head = slot
+  }
+  io_request_count = io_request_count + 1
+}
+
+fn async_read_complete(dev: u32, block: u64, success: u32) {
+  var idx: u32 = find_buffer(dev, block)
+  if idx != 0xFFFFFFFF {
+    buffer_cache[idx].state = buffer_cache[idx].state & ~(BUF_LOCKED | BUF_ASYNC)
+    if success != 0 {
+      buffer_cache[idx].state = buffer_cache[idx].state | BUF_UPTODATE
+    }
+  }
+}
+
+// ============================================================================
+// PROCESS PENDING I/O
+// ============================================================================
+
+export fn block_io_process() {
+  while io_queue_head != 0xFFFFFFFF {
+    var slot: u32 = io_queue_head
+    io_queue_head = io_requests[slot].next
+    if io_queue_head == 0xFFFFFFFF {
+      io_queue_tail = 0xFFFFFFFF
+    }
+
+    // Execute I/O
+    var result: u32 = 0
+    if io_requests[slot].is_write != 0 {
+      result = write_block(io_requests[slot].dev, io_requests[slot].block, io_requests[slot].buffer)
+    } else {
+      result = read_block(io_requests[slot].dev, io_requests[slot].block, io_requests[slot].buffer)
+    }
+
+    // Call completion callback
+    if io_requests[slot].callback != 0 {
+      var callback: fn(u32, u64, u32) = @ptrFromInt(io_requests[slot].callback)
+      callback(io_requests[slot].dev, io_requests[slot].block, if result == 0 { 1 } else { 0 })
+    }
+
+    // Free request slot
+    io_requests[slot].dev = 0
+    io_request_count = io_request_count - 1
+  }
+}
+
+// ============================================================================
+// DEVICE INTERFACE
+// ============================================================================
+
+export fn get_device_count(): u32 {
+  return device_count
+}
+
+export fn get_device_info(dev: u32, name: *[16]u8, size: *u64) {
+  if dev >= device_count {
+    return
+  }
+
+  var i: u32 = 0
+  while i < 16 {
+    name[i] = devices[dev].name[i]
+    i = i + 1
+  }
+
+  size.* = devices[dev].total_sectors * devices[dev].sector_size
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn block_io_get_stats(hits: *u64, misses: *u64, reads: *u64, writes: *u64) {
+  hits.* = cache_hits
+  misses.* = cache_misses
+  reads.* = blocks_read
+  writes.* = blocks_written
+}
+
+export fn block_io_get_cache_stats(buffers: *u32, dirty: *u32) {
+  buffers.* = buffer_count
+
+  var dirty_count: u32 = 0
+  var i: u32 = 0
+  while i < MAX_BUFFERS {
+    if (buffer_cache[i].state & BUF_DIRTY) != 0 {
+      dirty_count = dirty_count + 1
+    }
+    i = i + 1
+  }
+  dirty.* = dirty_count
+}
