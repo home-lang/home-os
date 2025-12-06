@@ -33,13 +33,38 @@
 - **Home Compiler**: Enhanced with OS development features
 - **Next**: Implement real serial/VGA drivers, complete IDT, add timer support
 
+## How to Use This File
+
+- **Canonical Strategic TODO** (next section) is the **source of truth** for current status and priorities.
+- The long 18-phase roadmap further below is **legacy vision**; use it for ideas and long-term framing, not as an implementation checklist.
+- When adding or updating work, add it under the relevant **Canonical priority** instead of editing legacy checkboxes.
+
 ---
 
-## Canonical Strategic TODO (Merged from TODO-UPDATES.md)
+## Canonical Strategic TODO (Strategic Roadmap)
 
 > **Last Analysis**: November 24, 2025  
 > **Purpose**: This section is the **authoritative, code-informed roadmap** for HomeOS as a minimal, Linux-class OS built entirely in Home and optimized for low-end hardware (Raspberry Pi and similar).  
-> The long 18-phase roadmap further below is now **legacy vision**; its individual checkboxes are historical and may not accurately reflect the current implementation.
+> The long 18-phase roadmap further below is now **legacy vision**; its individual checkboxes are historical and may not accurately reflect the current implementation.  
+> This roadmap merges and supersedes the earlier `TODO-UPDATES.md` strategic document, which can now be archived or deleted.
+
+### Active Focus (Next Up)
+
+- [ ] **Security capabilities** – implement real capability checks and syscall enforcement in `kernel/src/security/caps.home`.
+- [ ] **DNS & networking verification** – complete `kernel/src/net/dns.home` and run end-to-end tests (DHCP + DNS + HTTP/TLS/WebSocket) on Pi and x86-64.
+- [ ] **Pi 3/4/5 boot & perf loop** – benchmark boot time, RAM footprint, and I/O on real hardware; wire results into automated tests.
+- [ ] **Unified build entrypoint** – consolidate current scripts into a single canonical build command for all targets.
+
+### Subsystem Index
+
+- **Memory / MM / perf / power** – see P1, P2.3, P3.2, P8.
+- **Raspberry Pi & ARM64** – see P2 and legacy Phase 12.
+- **Developer experience & tooling** – see P3 and continuous tasks near the end of this file.
+- **Kernel core (process, VFS, syscalls)** – see P4.1 and audit docs in `docs/audits/`.
+- **Security** – see P4.2, P6, and legacy Phase 10.
+- **Networking** – see P1.3, P2.2, P4.3, P7, and legacy Phases 5 & 16.8.
+- **Drivers & hardware** – see P2.1 and legacy Phase 4 & Phase 13.
+- **Userspace & apps** – see P5 and legacy Phases 6, 9, 16.
 
 ### Status Snapshot
 
@@ -276,7 +301,7 @@ Some modules are complete, others still contain explicit stubs. Focus areas:
   - Files: `tests/{unit,system,integration}/`, `tests/run-tests.sh`
   - [ ] Expand coverage for drivers, networking, and apps; add Pi hardware-in-the-loop jobs
 - [ ] **Performance & stability targets (Pi-first)**
-  - Keep and refine the tables from the original `TODO-UPDATES.md` for boot time, RAM usage, uptime, and compatibility; enforce them via automated tests over time.
+  - Keep and refine the performance and compatibility tables in the **Success Metrics** section below (boot time, RAM usage, uptime, compatibility); enforce them via automated tests over time.
 
 ---
 
