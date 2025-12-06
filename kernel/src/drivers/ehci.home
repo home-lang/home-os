@@ -3,58 +3,520 @@
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
+import "pci.home" as pci
 
+// ============================================================================
+// EHCI CONSTANTS
+// ============================================================================
+
+// Capability Registers
+const EHCI_CAPLENGTH: u32 = 0x00
+const EHCI_HCSPARAMS: u32 = 0x04
+const EHCI_HCCPARAMS: u32 = 0x08
+
+// Operational Registers (offset from op_base)
 const EHCI_USBCMD: u32 = 0x00
 const EHCI_USBSTS: u32 = 0x04
+const EHCI_USBINTR: u32 = 0x08
+const EHCI_FRINDEX: u32 = 0x0C
+const EHCI_CTRLDSSEGMENT: u32 = 0x10
 const EHCI_PERIODICLISTBASE: u32 = 0x14
 const EHCI_ASYNCLISTADDR: u32 = 0x18
+const EHCI_CONFIGFLAG: u32 = 0x40
+const EHCI_PORTSC_BASE: u32 = 0x44
 
-var ehci_base: u64 = 0
+// USB Command Register bits
+const EHCI_CMD_RUN: u32 = 0x01
+const EHCI_CMD_HCRESET: u32 = 0x02
+const EHCI_CMD_FLS_1024: u32 = 0x00
+const EHCI_CMD_PSE: u32 = 0x10      // Periodic Schedule Enable
+const EHCI_CMD_ASE: u32 = 0x20      // Async Schedule Enable
+const EHCI_CMD_IAAD: u32 = 0x40     // Interrupt on Async Advance Doorbell
+
+// USB Status Register bits
+const EHCI_STS_INT: u32 = 0x01
+const EHCI_STS_ERRINT: u32 = 0x02
+const EHCI_STS_PCD: u32 = 0x04      // Port Change Detect
+const EHCI_STS_FLR: u32 = 0x08      // Frame List Rollover
+const EHCI_STS_HSE: u32 = 0x10      // Host System Error
+const EHCI_STS_IAA: u32 = 0x20      // Interrupt on Async Advance
+const EHCI_STS_HALT: u32 = 0x1000
+const EHCI_STS_RECL: u32 = 0x2000
+const EHCI_STS_PSS: u32 = 0x4000    // Periodic Schedule Status
+const EHCI_STS_ASS: u32 = 0x8000    // Async Schedule Status
+
+// Port Status bits
+const PORT_CCS: u32 = 0x01          // Current Connect Status
+const PORT_CSC: u32 = 0x02          // Connect Status Change
+const PORT_PE: u32 = 0x04           // Port Enabled
+const PORT_PEC: u32 = 0x08          // Port Enable Change
+const PORT_OC: u32 = 0x10           // Over-current Active
+const PORT_OCC: u32 = 0x20          // Over-current Change
+const PORT_FPR: u32 = 0x40          // Force Port Resume
+const PORT_SUSPEND: u32 = 0x80
+const PORT_RESET: u32 = 0x100
+const PORT_LS_MASK: u32 = 0x0C00
+const PORT_PP: u32 = 0x1000         // Port Power
+const PORT_OWNER: u32 = 0x2000      // Port Owner (1=companion HC)
+
+// Queue Head and Transfer Descriptor types
+const QH_TYPE: u32 = 1
+const ITD_TYPE: u32 = 0
+const SITD_TYPE: u32 = 2
+const FSTN_TYPE: u32 = 3
+
+// PID Tokens
+const PID_OUT: u8 = 0
+const PID_IN: u8 = 1
+const PID_SETUP: u8 = 2
+
+// ============================================================================
+// EHCI STRUCTURES
+// ============================================================================
+
+struct EhciQtd {
+  next: u32,
+  alt_next: u32,
+  token: u32,
+  buffer: [u32; 5]
+}
+
+struct EhciQh {
+  next: u32,
+  characteristics: u32,
+  capabilities: u32,
+  current_qtd: u32,
+  overlay: EhciQtd
+}
+
+struct EhciDevice {
+  address: u8,
+  port: u8,
+  speed: u8,
+  max_packet: u16,
+  qh: u64,
+  qtd_pool: u64,
+  active: u32
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var ehci_mmio_base: u64 = 0
+var ehci_op_base: u64 = 0
 var ehci_periodic_list: u64 = 0
-var ehci_async_list: u64 = 0
+var ehci_async_list_head: u64 = 0
+var ehci_qtd_pool: u64 = 0
+var ehci_num_ports: u32 = 0
+var ehci_devices: [EhciDevice; 128]
+var ehci_next_address: u8 = 1
 var ehci_initialized: u32 = 0
+
+// ============================================================================
+// LOW-LEVEL ACCESS
+// ============================================================================
+
+fn ehci_cap_read32(offset: u32): u32 {
+  return @intToPtr(ehci_mmio_base + offset, u32)
+}
+
+fn ehci_op_read32(offset: u32): u32 {
+  return @intToPtr(ehci_op_base + offset, u32)
+}
+
+fn ehci_op_write32(offset: u32, value: u32) {
+  @ptrToInt(ehci_op_base + offset, u32) = value
+}
+
+fn ehci_port_read32(port: u32): u32 {
+  return ehci_op_read32(EHCI_PORTSC_BASE + port * 4)
+}
+
+fn ehci_port_write32(port: u32, value: u32) {
+  ehci_op_write32(EHCI_PORTSC_BASE + port * 4, value)
+}
+
+// ============================================================================
+// QUEUE HEAD OPERATIONS
+// ============================================================================
+
+fn ehci_alloc_qh(): u64 {
+  var qh: u64 = memory.pmm_alloc_pages(1)
+  if qh == 0 { return 0 }
+  memory.memset(qh, 0, 4096)
+  return qh
+}
+
+fn ehci_init_qh(qh_addr: u64, address: u8, endpoint: u8, max_packet: u16, speed: u8) {
+  var qh: *EhciQh = @ptrFromInt(qh_addr)
+
+  // Horizontal link - point to itself (terminate)
+  qh.next = (qh_addr & 0xFFFFFFFF) as u32 | (QH_TYPE << 1)
+
+  // Endpoint characteristics
+  // Bits: RL(28-31), C(27), max_packet(16-26), H(15), DTC(14), EPS(12-13), EP(8-11), I(7), addr(0-6)
+  var eps: u32 = if speed == 0 { 0 } else if speed == 1 { 1 } else { 2 }  // Full/Low/High
+  qh.characteristics = (address as u32) |
+                       (endpoint as u32 << 8) |
+                       (eps << 12) |
+                       (1 << 14) |  // DTC
+                       (max_packet as u32 << 16)
+
+  // Endpoint capabilities
+  // Bits: mult(30-31), port(23-29), hub_addr(16-22), C-mask(8-15), S-mask(0-7)
+  qh.capabilities = (1 << 30)  // mult=1
+
+  // Current QTD pointer
+  qh.current_qtd = 1  // Terminate
+
+  // Overlay - all terminate
+  qh.overlay.next = 1
+  qh.overlay.alt_next = 1
+  qh.overlay.token = 0
+}
+
+fn ehci_alloc_qtd(): u64 {
+  var qtd: u64 = memory.kmalloc(64)
+  if qtd == 0 { return 0 }
+  memory.memset(qtd, 0, 64)
+  return qtd
+}
+
+fn ehci_init_qtd(qtd_addr: u64, pid: u8, toggle: u8, data: u64, length: u32) {
+  var qtd: *EhciQtd = @ptrFromInt(qtd_addr)
+
+  qtd.next = 1  // Terminate
+  qtd.alt_next = 1  // Terminate
+
+  // Token: Status(7-0), PID(8-9), Cerr(10-11), C_Page(12-14), IOC(15), Total(16-30), Toggle(31)
+  qtd.token = (3 << 10) |                    // Cerr = 3
+              (pid as u32 << 8) |
+              (length << 16) |
+              (toggle as u32 << 31) |
+              0x80                           // Active
+
+  // Buffer pointers
+  qtd.buffer[0] = (data & 0xFFFFFFFF) as u32
+  if length > 4096 {
+    qtd.buffer[1] = ((data + 4096) & 0xFFFFF000) as u32
+  }
+}
+
+// ============================================================================
+// PORT OPERATIONS
+// ============================================================================
+
+fn ehci_reset_port(port: u32): u32 {
+  var portsc: u32 = ehci_port_read32(port)
+
+  // Set reset bit
+  portsc = portsc | PORT_RESET
+  portsc = portsc & ~PORT_PE  // Clear enable
+  ehci_port_write32(port, portsc)
+
+  // Wait at least 50ms (simplified)
+  var delay: u32 = 50000
+  while delay > 0 { delay = delay - 1 }
+
+  // Clear reset bit
+  portsc = ehci_port_read32(port)
+  portsc = portsc & ~PORT_RESET
+  ehci_port_write32(port, portsc)
+
+  // Wait for reset complete
+  var timeout: u32 = 1000
+  while timeout > 0 {
+    portsc = ehci_port_read32(port)
+    if (portsc & PORT_RESET) == 0 { break }
+    timeout = timeout - 1
+  }
+
+  // Check if port enabled (high speed device)
+  portsc = ehci_port_read32(port)
+  if (portsc & PORT_PE) != 0 {
+    return 2  // High speed
+  }
+
+  // Release to companion controller
+  portsc = portsc | PORT_OWNER
+  ehci_port_write32(port, portsc)
+  return 0  // Not high speed
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
 
 export fn ehci_init() {
   if ehci_initialized == 1 { return }
-  
-  ehci_base = 0xF0001000  // Stub: would read from PCI
-  
-  // Allocate lists
-  ehci_periodic_list = memory.kmalloc(4096)
-  ehci_async_list = memory.kmalloc(4096)
-  
-  if ehci_periodic_list == 0 or ehci_async_list == 0 {
-    foundation.serial_write_string("[EHCI] Failed to allocate lists\n")
+
+  foundation.serial_write_string("[EHCI] Scanning for controllers...\n")
+
+  // Find EHCI controller via PCI (class 0Ch, subclass 03h, prog-if 20h)
+  var i: u32 = 0
+  var found: u32 = 0
+  while i < pci.pci_get_device_count() {
+    var dev: u64 = pci.pci_get_device(i)
+    if dev != 0 {
+      var class_code: u8 = pci.pci_read_config8(dev, 0x0B)
+      var subclass: u8 = pci.pci_read_config8(dev, 0x0A)
+      var prog_if: u8 = pci.pci_read_config8(dev, 0x09)
+
+      if class_code == 0x0C and subclass == 0x03 and prog_if == 0x20 {
+        ehci_mmio_base = pci.pci_read_bar(dev, 0) & ~0xF
+
+        // Enable bus mastering and memory space
+        var cmd: u16 = pci.pci_read_config16(dev, 0x04)
+        pci.pci_write_config16(dev, 0x04, cmd | 0x06)
+
+        found = 1
+        foundation.serial_write_string("[EHCI] Found controller at: 0x")
+        foundation.serial_write_hex(@truncate(ehci_mmio_base, u32))
+        foundation.serial_write_string("\n")
+        break
+      }
+    }
+    i = i + 1
+  }
+
+  if found == 0 {
+    foundation.serial_write_string("[EHCI] No controller found\n")
     return
   }
-  
-  // Reset controller
-  @ptrToInt(ehci_base + EHCI_USBCMD, u32) = 0x00080000
-  
+
+  // Read capability registers
+  var caplength: u8 = ehci_cap_read32(EHCI_CAPLENGTH) & 0xFF
+  var hcsparams: u32 = ehci_cap_read32(EHCI_HCSPARAMS)
+
+  ehci_op_base = ehci_mmio_base + caplength as u64
+  ehci_num_ports = hcsparams & 0xF
+
+  foundation.serial_write_string("[EHCI] Ports: ")
+  foundation.serial_write_u32(ehci_num_ports)
+  foundation.serial_write_string("\n")
+
+  // Halt controller
+  var usbcmd: u32 = ehci_op_read32(EHCI_USBCMD)
+  ehci_op_write32(EHCI_USBCMD, usbcmd & ~EHCI_CMD_RUN)
+
+  // Wait for halt
   var timeout: u32 = 1000
   while timeout > 0 {
-    if (@intToPtr(ehci_base + EHCI_USBCMD, u32) & 0x00080000) == 0 {
+    var usbsts: u32 = ehci_op_read32(EHCI_USBSTS)
+    if (usbsts & EHCI_STS_HALT) != 0 { break }
+    timeout = timeout - 1
+  }
+
+  // Reset controller
+  ehci_op_write32(EHCI_USBCMD, EHCI_CMD_HCRESET)
+
+  timeout = 1000
+  while timeout > 0 {
+    usbcmd = ehci_op_read32(EHCI_USBCMD)
+    if (usbcmd & EHCI_CMD_HCRESET) == 0 { break }
+    timeout = timeout - 1
+  }
+
+  // Allocate periodic frame list (4KB, 1024 entries)
+  ehci_periodic_list = memory.pmm_alloc_pages(1)
+  if ehci_periodic_list == 0 {
+    foundation.serial_write_string("[EHCI] Failed to allocate periodic list\n")
+    return
+  }
+
+  // Initialize periodic list with terminate bits
+  i = 0
+  while i < 1024 {
+    @ptrToInt(ehci_periodic_list + i * 4, u32) = 1  // Terminate
+    i = i + 1
+  }
+
+  // Allocate async list head (queue head for control/bulk)
+  ehci_async_list_head = ehci_alloc_qh()
+  if ehci_async_list_head == 0 {
+    foundation.serial_write_string("[EHCI] Failed to allocate async list head\n")
+    return
+  }
+
+  // Initialize async list head as reclamation head
+  var async_qh: *EhciQh = @ptrFromInt(ehci_async_list_head)
+  async_qh.next = (ehci_async_list_head & 0xFFFFFFFF) as u32 | (QH_TYPE << 1)
+  async_qh.characteristics = (1 << 15)  // H bit (head of reclamation list)
+  async_qh.capabilities = 0
+  async_qh.current_qtd = 1
+  async_qh.overlay.next = 1
+  async_qh.overlay.alt_next = 1
+
+  // Set segment selector (for 64-bit)
+  ehci_op_write32(EHCI_CTRLDSSEGMENT, 0)
+
+  // Set periodic frame list base
+  ehci_op_write32(EHCI_PERIODICLISTBASE, (ehci_periodic_list & 0xFFFFFFFF) as u32)
+
+  // Set async list address
+  ehci_op_write32(EHCI_ASYNCLISTADDR, (ehci_async_list_head & 0xFFFFFFFF) as u32)
+
+  // Set config flag (take over from companion controllers)
+  ehci_op_write32(EHCI_CONFIGFLAG, 1)
+
+  // Start controller with async schedule enabled
+  ehci_op_write32(EHCI_USBCMD, EHCI_CMD_RUN | EHCI_CMD_ASE | EHCI_CMD_FLS_1024)
+
+  // Wait for running
+  timeout = 1000
+  while timeout > 0 {
+    var usbsts: u32 = ehci_op_read32(EHCI_USBSTS)
+    if (usbsts & EHCI_STS_HALT) == 0 { break }
+    timeout = timeout - 1
+  }
+
+  foundation.serial_write_string("[EHCI] Controller started\n")
+
+  // Probe ports
+  i = 0
+  while i < ehci_num_ports {
+    var portsc: u32 = ehci_port_read32(i)
+    if (portsc & PORT_CCS) != 0 {
+      foundation.serial_write_string("[EHCI] Port ")
+      foundation.serial_write_u32(i)
+      foundation.serial_write_string(": Device connected\n")
+
+      var speed: u32 = ehci_reset_port(i)
+      if speed == 2 {
+        // High speed device - enumerate
+        foundation.serial_write_string("[EHCI] High-speed device on port ")
+        foundation.serial_write_u32(i)
+        foundation.serial_write_string("\n")
+      }
+    }
+    i = i + 1
+  }
+
+  ehci_initialized = 1
+  foundation.serial_write_string("[EHCI] Initialization complete\n")
+}
+
+// ============================================================================
+// USB TRANSFERS
+// ============================================================================
+
+export fn ehci_control_transfer(address: u8, request_type: u8, request: u8, value: u16, index: u16, data: u64, length: u16): u32 {
+  if ehci_initialized == 0 { return 1 }
+
+  // Allocate QH for this transfer
+  var qh: u64 = ehci_alloc_qh()
+  if qh == 0 { return 1 }
+
+  ehci_init_qh(qh, address, 0, 64, 2)  // EP0, max 64, high speed
+
+  // Allocate setup QTD
+  var setup_qtd: u64 = ehci_alloc_qtd()
+  if setup_qtd == 0 { return 1 }
+
+  // Build setup packet
+  var setup_data: u64 = memory.kmalloc(8)
+  @ptrToInt(setup_data, u8) = request_type
+  @ptrToInt(setup_data + 1, u8) = request
+  @ptrToInt(setup_data + 2, u16) = value
+  @ptrToInt(setup_data + 4, u16) = index
+  @ptrToInt(setup_data + 6, u16) = length
+
+  ehci_init_qtd(setup_qtd, PID_SETUP, 0, setup_data, 8)
+
+  // Allocate data QTD if needed
+  var data_qtd: u64 = 0
+  if length > 0 {
+    data_qtd = ehci_alloc_qtd()
+    if data_qtd == 0 { return 1 }
+
+    var pid: u8 = if (request_type & 0x80) != 0 { PID_IN } else { PID_OUT }
+    ehci_init_qtd(data_qtd, pid, 1, data, length as u32)
+
+    // Link setup -> data
+    var setup: *EhciQtd = @ptrFromInt(setup_qtd)
+    setup.next = (data_qtd & 0xFFFFFFFF) as u32
+  }
+
+  // Allocate status QTD
+  var status_qtd: u64 = ehci_alloc_qtd()
+  if status_qtd == 0 { return 1 }
+
+  var status_pid: u8 = if length == 0 or (request_type & 0x80) == 0 { PID_IN } else { PID_OUT }
+  ehci_init_qtd(status_qtd, status_pid, 1, 0, 0)
+
+  // Link chain
+  if data_qtd != 0 {
+    var data_td: *EhciQtd = @ptrFromInt(data_qtd)
+    data_td.next = (status_qtd & 0xFFFFFFFF) as u32
+  } else {
+    var setup: *EhciQtd = @ptrFromInt(setup_qtd)
+    setup.next = (status_qtd & 0xFFFFFFFF) as u32
+  }
+
+  // Link QTD chain to QH
+  var qh_ptr: *EhciQh = @ptrFromInt(qh)
+  qh_ptr.overlay.next = (setup_qtd & 0xFFFFFFFF) as u32
+
+  // Insert QH into async list
+  var head: *EhciQh = @ptrFromInt(ehci_async_list_head)
+  qh_ptr.next = head.next
+  head.next = (qh & 0xFFFFFFFF) as u32 | (QH_TYPE << 1)
+
+  // Wait for completion
+  var timeout: u32 = 100000
+  while timeout > 0 {
+    var status: *EhciQtd = @ptrFromInt(status_qtd)
+    if (status.token & 0x80) == 0 {  // Not active
       break
     }
     timeout = timeout - 1
   }
-  
-  // Set periodic list
-  @ptrToInt(ehci_base + EHCI_PERIODICLISTBASE, u32) = ehci_periodic_list & 0xFFFFFFFF
-  
-  // Set async list
-  @ptrToInt(ehci_base + EHCI_ASYNCLISTADDR, u32) = ehci_async_list & 0xFFFFFFFF
-  
-  // Start controller
-  @ptrToInt(ehci_base + EHCI_USBCMD, u32) = 0x00010001
-  
-  ehci_initialized = 1
-  foundation.serial_write_string("[EHCI] Initialized\n")
+
+  // Remove QH from list
+  head.next = qh_ptr.next
+
+  if timeout == 0 {
+    return 1  // Timeout
+  }
+
+  return 0
 }
 
-export fn ehci_control_transfer(device: u8, request: u8, value: u16, index: u16, data: u64, length: u16): u32 {
+export fn ehci_bulk_transfer(address: u8, endpoint: u8, data: u64, length: u32, direction: u8): u32 {
   if ehci_initialized == 0 { return 1 }
-  
-  // Stub: would perform control transfer
-  return 0
+
+  var qh: u64 = ehci_alloc_qh()
+  if qh == 0 { return 1 }
+
+  ehci_init_qh(qh, address, endpoint, 512, 2)
+
+  var qtd: u64 = ehci_alloc_qtd()
+  if qtd == 0 { return 1 }
+
+  var pid: u8 = if direction != 0 { PID_IN } else { PID_OUT }
+  ehci_init_qtd(qtd, pid, 0, data, length)
+
+  var qh_ptr: *EhciQh = @ptrFromInt(qh)
+  qh_ptr.overlay.next = (qtd & 0xFFFFFFFF) as u32
+
+  // Insert and wait
+  var head: *EhciQh = @ptrFromInt(ehci_async_list_head)
+  qh_ptr.next = head.next
+  head.next = (qh & 0xFFFFFFFF) as u32 | (QH_TYPE << 1)
+
+  var timeout: u32 = 100000
+  while timeout > 0 {
+    var td: *EhciQtd = @ptrFromInt(qtd)
+    if (td.token & 0x80) == 0 { break }
+    timeout = timeout - 1
+  }
+
+  head.next = qh_ptr.next
+
+  return if timeout == 0 { 1 } else { 0 }
+}
+
+export fn ehci_is_initialized(): u32 {
+  return ehci_initialized
 }

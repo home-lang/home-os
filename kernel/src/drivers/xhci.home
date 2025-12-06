@@ -3,57 +3,650 @@
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
+import "pci.home" as pci
 
+// ============================================================================
+// XHCI CONSTANTS
+// ============================================================================
+
+// Capability Registers (offset from MMIO base)
+const XHCI_CAPLENGTH: u32 = 0x00
+const XHCI_HCSPARAMS1: u32 = 0x04
+const XHCI_HCSPARAMS2: u32 = 0x08
+const XHCI_HCSPARAMS3: u32 = 0x0C
+const XHCI_HCCPARAMS1: u32 = 0x10
+const XHCI_DBOFF: u32 = 0x14
+const XHCI_RTSOFF: u32 = 0x18
+
+// Operational Registers (offset from op_base)
 const XHCI_USBCMD: u32 = 0x00
 const XHCI_USBSTS: u32 = 0x04
+const XHCI_PAGESIZE: u32 = 0x08
+const XHCI_DNCTRL: u32 = 0x14
+const XHCI_CRCR: u32 = 0x18
 const XHCI_DCBAAP: u32 = 0x30
 const XHCI_CONFIG: u32 = 0x38
 
-var xhci_base: u64 = 0
-var xhci_dcbaa: u64 = 0
-var xhci_command_ring: u64 = 0
-var xhci_event_ring: u64 = 0
+// USB Command Register bits
+const XHCI_CMD_RUN: u32 = 0x01
+const XHCI_CMD_HCRST: u32 = 0x02
+const XHCI_CMD_INTE: u32 = 0x04
+const XHCI_CMD_HSEE: u32 = 0x08
+
+// USB Status Register bits
+const XHCI_STS_HCH: u32 = 0x01
+const XHCI_STS_HSE: u32 = 0x04
+const XHCI_STS_EINT: u32 = 0x08
+const XHCI_STS_PCD: u32 = 0x10
+const XHCI_STS_CNR: u32 = 0x800
+
+// TRB Types
+const TRB_TYPE_NORMAL: u32 = 1
+const TRB_TYPE_SETUP: u32 = 2
+const TRB_TYPE_DATA: u32 = 3
+const TRB_TYPE_STATUS: u32 = 4
+const TRB_TYPE_LINK: u32 = 6
+const TRB_TYPE_NO_OP: u32 = 8
+const TRB_TYPE_ENABLE_SLOT: u32 = 9
+const TRB_TYPE_DISABLE_SLOT: u32 = 10
+const TRB_TYPE_ADDRESS_DEVICE: u32 = 11
+const TRB_TYPE_CONFIG_EP: u32 = 12
+const TRB_TYPE_TRANSFER: u32 = 32
+const TRB_TYPE_CMD_COMPLETE: u32 = 33
+const TRB_TYPE_PORT_CHANGE: u32 = 34
+
+// Port Status bits
+const PORT_CCS: u32 = 0x01      // Current Connect Status
+const PORT_PED: u32 = 0x02      // Port Enabled
+const PORT_PR: u32 = 0x10       // Port Reset
+const PORT_PLS_MASK: u32 = 0x1E0
+const PORT_PP: u32 = 0x200      // Port Power
+const PORT_SPEED_MASK: u32 = 0x3C00
+const PORT_CSC: u32 = 0x20000   // Connect Status Change
+
+// ============================================================================
+// XHCI STRUCTURES
+// ============================================================================
+
+struct XhciTrb {
+  param: u64,
+  status: u32,
+  control: u32
+}
+
+struct XhciSlotContext {
+  route_speed: u32,
+  latency_slots: u32,
+  tt_info: u32,
+  state_addr: u32,
+  reserved: [u32; 4]
+}
+
+struct XhciEpContext {
+  ep_state: u32,
+  interval_esit: u32,
+  avg_trb: u32,
+  deq: u64,
+  tx_info: u32,
+  reserved: [u32; 3]
+}
+
+struct XhciDeviceContext {
+  slot: XhciSlotContext,
+  ep: [XhciEpContext; 31]
+}
+
+struct XhciInputContext {
+  drop_flags: u32,
+  add_flags: u32,
+  reserved: [u32; 6],
+  slot: XhciSlotContext,
+  ep: [XhciEpContext; 31]
+}
+
+struct XhciDevice {
+  slot_id: u8,
+  port: u8,
+  speed: u8,
+  configured: u8,
+  address: u8,
+  input_context: u64,
+  device_context: u64,
+  transfer_ring: [u64; 31],  // One per endpoint
+  enqueue_ptr: [u32; 31],
+  cycle_bit: [u8; 31]
+}
+
+struct XhciController {
+  mmio_base: u64,
+  op_base: u64,
+  runtime_base: u64,
+  doorbell_base: u64,
+  dcbaa: u64,
+  command_ring: u64,
+  event_ring: u64,
+  erst: u64,
+  cmd_enqueue: u32,
+  cmd_cycle: u8,
+  event_dequeue: u32,
+  event_cycle: u8,
+  max_slots: u8,
+  max_ports: u8,
+  context_size: u32,
+  devices: [XhciDevice; 256]
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var xhci: XhciController
 var xhci_initialized: u32 = 0
+
+// ============================================================================
+// LOW-LEVEL ACCESS
+// ============================================================================
+
+fn xhci_cap_read32(offset: u32): u32 {
+  return @intToPtr(xhci.mmio_base + offset, u32)
+}
+
+fn xhci_op_read32(offset: u32): u32 {
+  return @intToPtr(xhci.op_base + offset, u32)
+}
+
+fn xhci_op_write32(offset: u32, value: u32) {
+  @ptrToInt(xhci.op_base + offset, u32) = value
+}
+
+fn xhci_op_read64(offset: u32): u64 {
+  return @intToPtr(xhci.op_base + offset, u64)
+}
+
+fn xhci_op_write64(offset: u32, value: u64) {
+  @ptrToInt(xhci.op_base + offset, u64) = value
+}
+
+fn xhci_runtime_write32(offset: u32, value: u32) {
+  @ptrToInt(xhci.runtime_base + offset, u32) = value
+}
+
+fn xhci_runtime_read32(offset: u32): u32 {
+  return @intToPtr(xhci.runtime_base + offset, u32)
+}
+
+fn xhci_runtime_write64(offset: u32, value: u64) {
+  @ptrToInt(xhci.runtime_base + offset, u64) = value
+}
+
+fn xhci_doorbell_write(slot: u32, value: u32) {
+  @ptrToInt(xhci.doorbell_base + slot * 4, u32) = value
+}
+
+fn xhci_port_read32(port: u32): u32 {
+  return @intToPtr(xhci.op_base + 0x400 + port * 0x10, u32)
+}
+
+fn xhci_port_write32(port: u32, value: u32) {
+  @ptrToInt(xhci.op_base + 0x400 + port * 0x10, u32) = value
+}
+
+// ============================================================================
+// RING OPERATIONS
+// ============================================================================
+
+fn xhci_enqueue_command(trb: *XhciTrb) {
+  var ptr: u64 = xhci.command_ring + xhci.cmd_enqueue as u64 * 16
+
+  // Copy TRB and set cycle bit
+  var dest: *XhciTrb = @ptrFromInt(ptr)
+  dest.param = trb.param
+  dest.status = trb.status
+  dest.control = (trb.control & ~1) | (xhci.cmd_cycle as u32)
+
+  // Advance enqueue pointer
+  xhci.cmd_enqueue = xhci.cmd_enqueue + 1
+  if xhci.cmd_enqueue >= 64 {
+    // Link TRB at end of ring
+    var link: *XhciTrb = @ptrFromInt(xhci.command_ring + 64 * 16)
+    link.param = xhci.command_ring
+    link.status = 0
+    link.control = (TRB_TYPE_LINK << 10) | xhci.cmd_cycle as u32 | (1 << 5)  // Toggle cycle
+
+    xhci.cmd_enqueue = 0
+    xhci.cmd_cycle = xhci.cmd_cycle ^ 1
+  }
+}
+
+fn xhci_ring_doorbell(slot: u32, endpoint: u32) {
+  xhci_doorbell_write(slot, endpoint)
+}
+
+fn xhci_wait_completion(): u32 {
+  var timeout: u32 = 100000
+
+  while timeout > 0 {
+    var ptr: u64 = xhci.event_ring + xhci.event_dequeue as u64 * 16
+    var trb: *XhciTrb = @ptrFromInt(ptr)
+
+    var cycle: u8 = (trb.control & 1) as u8
+    if cycle == xhci.event_cycle {
+      var trb_type: u32 = (trb.control >> 10) & 0x3F
+
+      if trb_type == TRB_TYPE_CMD_COMPLETE {
+        var completion_code: u32 = (trb.status >> 24) & 0xFF
+
+        // Advance dequeue pointer
+        xhci.event_dequeue = xhci.event_dequeue + 1
+        if xhci.event_dequeue >= 64 {
+          xhci.event_dequeue = 0
+          xhci.event_cycle = xhci.event_cycle ^ 1
+        }
+
+        // Update ERDP
+        xhci_runtime_write64(0x38, xhci.event_ring + xhci.event_dequeue as u64 * 16 | (1 << 3))
+
+        return completion_code
+      }
+    }
+
+    timeout = timeout - 1
+  }
+
+  return 0xFF  // Timeout
+}
+
+// ============================================================================
+// DEVICE MANAGEMENT
+// ============================================================================
+
+fn xhci_enable_slot(): u8 {
+  var trb: XhciTrb
+  trb.param = 0
+  trb.status = 0
+  trb.control = TRB_TYPE_ENABLE_SLOT << 10
+
+  xhci_enqueue_command(&trb)
+  xhci_ring_doorbell(0, 0)
+
+  var result: u32 = xhci_wait_completion()
+  if result != 1 {  // Success code is 1
+    return 0
+  }
+
+  // Get slot ID from event TRB
+  var ptr: u64 = xhci.event_ring + ((xhci.event_dequeue + 63) % 64) as u64 * 16
+  var event: *XhciTrb = @ptrFromInt(ptr)
+  return ((event.control >> 24) & 0xFF) as u8
+}
+
+fn xhci_address_device(slot_id: u8, port: u8, speed: u8): u32 {
+  // Allocate input context
+  var input_ctx: u64 = memory.pmm_alloc_pages(1)
+  if input_ctx == 0 { return 1 }
+  memory.memset(input_ctx, 0, 4096)
+
+  // Allocate device context
+  var device_ctx: u64 = memory.pmm_alloc_pages(1)
+  if device_ctx == 0 { return 1 }
+  memory.memset(device_ctx, 0, 4096)
+
+  // Allocate transfer ring for EP0
+  var transfer_ring: u64 = memory.pmm_alloc_pages(1)
+  if transfer_ring == 0 { return 1 }
+  memory.memset(transfer_ring, 0, 4096)
+
+  // Store in device structure
+  xhci.devices[slot_id].slot_id = slot_id
+  xhci.devices[slot_id].port = port
+  xhci.devices[slot_id].speed = speed
+  xhci.devices[slot_id].input_context = input_ctx
+  xhci.devices[slot_id].device_context = device_ctx
+  xhci.devices[slot_id].transfer_ring[0] = transfer_ring
+  xhci.devices[slot_id].enqueue_ptr[0] = 0
+  xhci.devices[slot_id].cycle_bit[0] = 1
+
+  // Set device context in DCBAA
+  @ptrToInt(xhci.dcbaa + slot_id as u64 * 8, u64) = device_ctx
+
+  // Setup input context
+  var input: *XhciInputContext = @ptrFromInt(input_ctx)
+  input.add_flags = 3  // Add slot and EP0
+
+  // Setup slot context
+  var slot_ctx: u64 = input_ctx + xhci.context_size
+  var slot: *XhciSlotContext = @ptrFromInt(slot_ctx)
+  slot.route_speed = (speed as u32 << 20) | 1  // Route string = 0, entries = 1
+  slot.latency_slots = (port as u32) << 16  // Root hub port
+
+  // Setup EP0 context
+  var ep0_ctx: u64 = slot_ctx + xhci.context_size
+  var ep0: *XhciEpContext = @ptrFromInt(ep0_ctx)
+
+  var max_packet: u32 = 8
+  if speed == 3 { max_packet = 64 }      // High speed
+  else if speed == 4 { max_packet = 512 } // Super speed
+
+  ep0.ep_state = (4 << 1) | (3 << 3)  // EP type = Control, CErr = 3
+  ep0.avg_trb = max_packet << 16
+  ep0.deq = transfer_ring | 1  // DCS = 1
+
+  // Send Address Device command
+  var trb: XhciTrb
+  trb.param = input_ctx
+  trb.status = 0
+  trb.control = (TRB_TYPE_ADDRESS_DEVICE << 10) | (slot_id as u32 << 24)
+
+  xhci_enqueue_command(&trb)
+  xhci_ring_doorbell(0, 0)
+
+  var result: u32 = xhci_wait_completion()
+  if result != 1 {
+    foundation.serial_write_string("[XHCI] Address device failed\n")
+    return 1
+  }
+
+  xhci.devices[slot_id].configured = 1
+  return 0
+}
+
+fn xhci_reset_port(port: u8) {
+  var portsc: u32 = xhci_port_read32(port as u32)
+
+  // Preserve RW1CS bits and set PR (Port Reset)
+  portsc = (portsc & ~0x7E02E0) | PORT_PR
+  xhci_port_write32(port as u32, portsc)
+
+  // Wait for reset to complete
+  var timeout: u32 = 100
+  while timeout > 0 {
+    portsc = xhci_port_read32(port as u32)
+    if (portsc & PORT_PR) == 0 { break }
+    timeout = timeout - 1
+  }
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
 
 export fn xhci_init() {
   if xhci_initialized == 1 { return }
-  
-  xhci_base = 0xF0002000  // Stub: would read from PCI
-  
-  // Allocate structures
-  xhci_dcbaa = memory.kmalloc(2048)
-  xhci_command_ring = memory.kmalloc(4096)
-  xhci_event_ring = memory.kmalloc(4096)
-  
-  if xhci_dcbaa == 0 or xhci_command_ring == 0 or xhci_event_ring == 0 {
-    foundation.serial_write_string("[XHCI] Failed to allocate structures\n")
+
+  foundation.serial_write_string("[XHCI] Scanning for controllers...\n")
+
+  // Find XHCI controller via PCI (class 0Ch, subclass 03h, prog-if 30h)
+  var i: u32 = 0
+  var found: u32 = 0
+  while i < pci.pci_get_device_count() {
+    var dev: u64 = pci.pci_get_device(i)
+    if dev != 0 {
+      var class_code: u8 = pci.pci_read_config8(dev, 0x0B)
+      var subclass: u8 = pci.pci_read_config8(dev, 0x0A)
+      var prog_if: u8 = pci.pci_read_config8(dev, 0x09)
+
+      if class_code == 0x0C and subclass == 0x03 and prog_if == 0x30 {
+        xhci.mmio_base = pci.pci_read_bar(dev, 0) & ~0xF
+
+        // Enable bus mastering and memory space
+        var cmd: u16 = pci.pci_read_config16(dev, 0x04)
+        pci.pci_write_config16(dev, 0x04, cmd | 0x06)
+
+        found = 1
+        foundation.serial_write_string("[XHCI] Found controller at: 0x")
+        foundation.serial_write_hex(@truncate(xhci.mmio_base, u32))
+        foundation.serial_write_string("\n")
+        break
+      }
+    }
+    i = i + 1
+  }
+
+  if found == 0 {
+    foundation.serial_write_string("[XHCI] No controller found\n")
     return
   }
-  
-  // Reset controller
-  @ptrToInt(xhci_base + XHCI_USBCMD, u32) = 0x00000002
-  
+
+  // Read capability registers
+  var caplength: u8 = xhci_cap_read32(XHCI_CAPLENGTH) & 0xFF
+  var hcsparams1: u32 = xhci_cap_read32(XHCI_HCSPARAMS1)
+  var hccparams1: u32 = xhci_cap_read32(XHCI_HCCPARAMS1)
+  var dboff: u32 = xhci_cap_read32(XHCI_DBOFF)
+  var rtsoff: u32 = xhci_cap_read32(XHCI_RTSOFF)
+
+  xhci.max_slots = (hcsparams1 & 0xFF) as u8
+  xhci.max_ports = ((hcsparams1 >> 24) & 0xFF) as u8
+  xhci.context_size = if (hccparams1 & 4) != 0 { 64 } else { 32 }
+
+  xhci.op_base = xhci.mmio_base + caplength as u64
+  xhci.doorbell_base = xhci.mmio_base + dboff as u64
+  xhci.runtime_base = xhci.mmio_base + rtsoff as u64
+
+  foundation.serial_write_string("[XHCI] Max slots: ")
+  foundation.serial_write_u32(xhci.max_slots as u32)
+  foundation.serial_write_string(", Max ports: ")
+  foundation.serial_write_u32(xhci.max_ports as u32)
+  foundation.serial_write_string("\n")
+
+  // Halt controller
+  var usbcmd: u32 = xhci_op_read32(XHCI_USBCMD)
+  xhci_op_write32(XHCI_USBCMD, usbcmd & ~XHCI_CMD_RUN)
+
+  // Wait for halt
   var timeout: u32 = 1000
   while timeout > 0 {
-    if (@intToPtr(xhci_base + XHCI_USBSTS, u32) & 0x00000800) == 0 {
-      break
-    }
+    var usbsts: u32 = xhci_op_read32(XHCI_USBSTS)
+    if (usbsts & XHCI_STS_HCH) != 0 { break }
     timeout = timeout - 1
   }
-  
+
+  // Reset controller
+  xhci_op_write32(XHCI_USBCMD, XHCI_CMD_HCRST)
+
+  timeout = 1000
+  while timeout > 0 {
+    var usbcmd: u32 = xhci_op_read32(XHCI_USBCMD)
+    if (usbcmd & XHCI_CMD_HCRST) == 0 { break }
+    timeout = timeout - 1
+  }
+
+  // Wait for CNR to clear
+  timeout = 1000
+  while timeout > 0 {
+    var usbsts: u32 = xhci_op_read32(XHCI_USBSTS)
+    if (usbsts & XHCI_STS_CNR) == 0 { break }
+    timeout = timeout - 1
+  }
+
+  // Allocate DCBAA (64-byte aligned)
+  xhci.dcbaa = memory.pmm_alloc_pages(1)
+  if xhci.dcbaa == 0 {
+    foundation.serial_write_string("[XHCI] Failed to allocate DCBAA\n")
+    return
+  }
+  memory.memset(xhci.dcbaa, 0, 4096)
+
+  // Allocate command ring (64-byte aligned, 64 TRBs + link)
+  xhci.command_ring = memory.pmm_alloc_pages(1)
+  if xhci.command_ring == 0 {
+    foundation.serial_write_string("[XHCI] Failed to allocate command ring\n")
+    return
+  }
+  memory.memset(xhci.command_ring, 0, 4096)
+
+  // Allocate event ring (64 TRBs)
+  xhci.event_ring = memory.pmm_alloc_pages(1)
+  if xhci.event_ring == 0 {
+    foundation.serial_write_string("[XHCI] Failed to allocate event ring\n")
+    return
+  }
+  memory.memset(xhci.event_ring, 0, 4096)
+
+  // Allocate ERST (Event Ring Segment Table)
+  xhci.erst = memory.pmm_alloc_pages(1)
+  if xhci.erst == 0 {
+    foundation.serial_write_string("[XHCI] Failed to allocate ERST\n")
+    return
+  }
+
+  // Setup ERST entry
+  @ptrToInt(xhci.erst, u64) = xhci.event_ring
+  @ptrToInt(xhci.erst + 8, u32) = 64  // Ring size
+  @ptrToInt(xhci.erst + 12, u32) = 0  // Reserved
+
+  // Initialize ring pointers
+  xhci.cmd_enqueue = 0
+  xhci.cmd_cycle = 1
+  xhci.event_dequeue = 0
+  xhci.event_cycle = 1
+
+  // Configure MAX_SLOTS_EN
+  xhci_op_write32(XHCI_CONFIG, xhci.max_slots as u32)
+
   // Set DCBAAP
-  @ptrToInt(xhci_base + XHCI_DCBAAP, u64) = xhci_dcbaa
-  
+  xhci_op_write64(XHCI_DCBAAP, xhci.dcbaa)
+
+  // Set Command Ring Control Register
+  xhci_op_write64(XHCI_CRCR, xhci.command_ring | 1)  // RCS = 1
+
+  // Setup interrupter 0
+  xhci_runtime_write32(0x28, 64)  // ERSTSZ
+  xhci_runtime_write64(0x30, xhci.erst)  // ERSTBA
+  xhci_runtime_write64(0x38, xhci.event_ring | (1 << 3))  // ERDP
+
+  // Enable interrupts
+  xhci_runtime_write32(0x20, xhci_runtime_read32(0x20) | 2)  // IMAN.IE
+
   // Start controller
-  @ptrToInt(xhci_base + XHCI_USBCMD, u32) = 0x00000001
-  
+  xhci_op_write32(XHCI_USBCMD, XHCI_CMD_RUN | XHCI_CMD_INTE)
+
+  // Wait for running
+  timeout = 1000
+  while timeout > 0 {
+    var usbsts: u32 = xhci_op_read32(XHCI_USBSTS)
+    if (usbsts & XHCI_STS_HCH) == 0 { break }
+    timeout = timeout - 1
+  }
+
+  foundation.serial_write_string("[XHCI] Controller started\n")
+
+  // Probe ports
+  i = 0
+  while i < xhci.max_ports as u32 {
+    var portsc: u32 = xhci_port_read32(i)
+    if (portsc & PORT_CCS) != 0 {
+      var speed: u32 = (portsc & PORT_SPEED_MASK) >> 10
+
+      foundation.serial_write_string("[XHCI] Port ")
+      foundation.serial_write_u32(i)
+      foundation.serial_write_string(": Device connected (speed=")
+      foundation.serial_write_u32(speed)
+      foundation.serial_write_string(")\n")
+
+      // Reset port and enumerate device
+      xhci_reset_port(i as u8)
+
+      var slot_id: u8 = xhci_enable_slot()
+      if slot_id != 0 {
+        xhci_address_device(slot_id, i as u8 + 1, speed as u8)
+      }
+    }
+    i = i + 1
+  }
+
   xhci_initialized = 1
-  foundation.serial_write_string("[XHCI] Initialized\n")
+  foundation.serial_write_string("[XHCI] Initialization complete\n")
 }
 
-export fn xhci_control_transfer(device: u8, request: u8, value: u16, index: u16, data: u64, length: u16): u32 {
+// ============================================================================
+// USB TRANSFERS
+// ============================================================================
+
+export fn xhci_control_transfer(slot_id: u8, request_type: u8, request: u8, value: u16, index: u16, data: u64, length: u16): u32 {
   if xhci_initialized == 0 { return 1 }
-  
-  // Stub: would perform control transfer
-  return 0
+  if slot_id == 0 or slot_id > xhci.max_slots { return 1 }
+  if xhci.devices[slot_id].configured == 0 { return 1 }
+
+  var ring: u64 = xhci.devices[slot_id].transfer_ring[0]
+  var enq: u32 = xhci.devices[slot_id].enqueue_ptr[0]
+  var cycle: u8 = xhci.devices[slot_id].cycle_bit[0]
+
+  // Setup TRB
+  var setup: *XhciTrb = @ptrFromInt(ring + enq as u64 * 16)
+  setup.param = (request_type as u64) | (request as u64 << 8) | (value as u64 << 16) | (index as u64 << 32) | (length as u64 << 48)
+  setup.status = 8  // TRB transfer length
+  setup.control = (TRB_TYPE_SETUP << 10) | (cycle as u32) | (1 << 6)  // IDT=1
+
+  if length > 0 {
+    setup.control = setup.control | (if (request_type & 0x80) != 0 { 3 << 16 } else { 2 << 16 })  // TRT
+  }
+
+  enq = enq + 1
+
+  // Data TRB (if needed)
+  if length > 0 {
+    var data_trb: *XhciTrb = @ptrFromInt(ring + enq as u64 * 16)
+    data_trb.param = data
+    data_trb.status = length as u32
+    data_trb.control = (TRB_TYPE_DATA << 10) | (cycle as u32)
+
+    if (request_type & 0x80) != 0 {
+      data_trb.control = data_trb.control | (1 << 16)  // DIR=1 (IN)
+    }
+
+    enq = enq + 1
+  }
+
+  // Status TRB
+  var status: *XhciTrb = @ptrFromInt(ring + enq as u64 * 16)
+  status.param = 0
+  status.status = 0
+  status.control = (TRB_TYPE_STATUS << 10) | (cycle as u32) | (1 << 5)  // IOC=1
+
+  if length == 0 or (request_type & 0x80) == 0 {
+    status.control = status.control | (1 << 16)  // DIR=1 (IN)
+  }
+
+  enq = enq + 1
+
+  // Update enqueue pointer
+  xhci.devices[slot_id].enqueue_ptr[0] = enq
+
+  // Ring doorbell for EP0
+  xhci_ring_doorbell(slot_id as u32, 1)
+
+  // Wait for completion
+  var result: u32 = xhci_wait_completion()
+  return if result == 1 { 0 } else { result }
+}
+
+export fn xhci_bulk_transfer(slot_id: u8, endpoint: u8, data: u64, length: u32, direction: u8): u32 {
+  if xhci_initialized == 0 { return 1 }
+  if slot_id == 0 or slot_id > xhci.max_slots { return 1 }
+
+  var ep_idx: u32 = endpoint as u32
+  var ring: u64 = xhci.devices[slot_id].transfer_ring[ep_idx]
+  if ring == 0 { return 1 }
+
+  var enq: u32 = xhci.devices[slot_id].enqueue_ptr[ep_idx]
+  var cycle: u8 = xhci.devices[slot_id].cycle_bit[ep_idx]
+
+  // Normal TRB
+  var trb: *XhciTrb = @ptrFromInt(ring + enq as u64 * 16)
+  trb.param = data
+  trb.status = length
+  trb.control = (TRB_TYPE_NORMAL << 10) | (cycle as u32) | (1 << 5)  // IOC=1
+
+  enq = enq + 1
+  xhci.devices[slot_id].enqueue_ptr[ep_idx] = enq
+
+  // Ring doorbell
+  var db_target: u32 = (endpoint as u32 * 2) + direction as u32
+  xhci_ring_doorbell(slot_id as u32, db_target)
+
+  return xhci_wait_completion()
+}
+
+export fn xhci_is_initialized(): u32 {
+  return xhci_initialized
 }

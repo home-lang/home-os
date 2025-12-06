@@ -1,62 +1,377 @@
 // home-os OOM Killer
-// Out-of-memory handler
+// Out-of-memory handler with Linux-compatible scoring algorithm
 
 import "../core/foundation.home" as foundation
 import "../core/process.home" as process
 import "../core/memory.home" as memory
 
+// OOM killer configuration
 var oom_enabled: u32 = 1
+var oom_panic_on_oom: u32 = 0
+var oom_kill_allocating_task: u32 = 0
 
-fn oom_score_process(pid: u32): u32 {
-  // Calculate OOM score based on memory usage (stub)
-  return 50
+// OOM score adjustment range (-1000 to 1000)
+const OOM_SCORE_ADJ_MIN: i32 = -1000
+const OOM_SCORE_ADJ_MAX: i32 = 1000
+const OOM_SCORE_NEVER_KILL: i32 = -1000
+
+// OOM thresholds
+const OOM_THRESHOLD_LOW: u64 = 4 * 1024 * 1024     // 4MB - start monitoring
+const OOM_THRESHOLD_CRITICAL: u64 = 1024 * 1024   // 1MB - kill process
+const OOM_THRESHOLD_PANIC: u64 = 256 * 1024       // 256KB - panic
+
+// Per-process OOM configuration (stored in process structure)
+struct OomProcessInfo {
+    oom_score_adj: i32,       // User-adjustable score (-1000 to 1000)
+    oom_score: u32,           // Computed OOM score (0-1000)
+    oom_killed: u32,          // Set when process is being killed
+    oom_protected: u32        // Temporarily protected from OOM
 }
 
-export fn oom_init() {
-  oom_enabled = 1
-  foundation.serial_write_string("[OOM] Killer initialized\n")
-}
+// Global OOM process info table
+var oom_info: [256]OomProcessInfo = undefined
 
-export fn oom_check() {
-  if oom_enabled == 0 { return }
-  
-  var free_mem: u64 = memory.get_free_memory()
-  var threshold: u64 = 1024 * 1024  // 1MB
-  
-  if free_mem < threshold {
-    foundation.serial_write_string("[OOM] Low memory detected!\n")
-    oom_kill_process()
-  }
-}
+// Calculate badness score for a process
+// Higher score = more likely to be killed
+// Based on Linux kernel's oom_badness() algorithm
+fn calculate_badness(pid: u32): u32 {
+    // Get process memory information
+    var rss: u64 = process.process_get_rss(pid)              // Resident set size
+    var swap: u64 = process.process_get_swap_usage(pid)      // Swap usage
+    var pgtables: u64 = process.process_get_pgtable_size(pid) // Page table size
 
-fn oom_kill_process() {
-  foundation.serial_write_string("[OOM] Selecting victim...\n")
-  
-  var victim_pid: u32 = 0
-  var highest_score: u32 = 0
-  
-  var count: u32 = process.process_get_count()
-  var i: u32 = 0
-  while i < count {
-    var score: u32 = oom_score_process(i)
-    if score > highest_score {
-      highest_score = score
-      victim_pid = i
+    // Total points based on memory usage
+    var points: u64 = rss + swap + pgtables
+
+    // Convert to score relative to total memory
+    var total_mem: u64 = memory.get_total_memory()
+    if total_mem == 0 {
+        return 0
     }
-    i = i + 1
-  }
-  
-  if victim_pid != 0 {
-    foundation.serial_write_string("[OOM] Killing process ")
-    foundation.serial_write_string("\n")
-    process.process_kill(victim_pid, 9)
-  }
+
+    // Scale to 0-1000 range
+    var score: u64 = (points * 1000) / total_mem
+
+    // Apply oom_score_adj
+    var adj: i32 = oom_info[pid].oom_score_adj
+
+    // OOM_SCORE_ADJ_MIN (-1000) means never kill
+    if adj == OOM_SCORE_ADJ_MIN {
+        return 0
+    }
+
+    // Apply adjustment
+    if adj > 0 {
+        // Increase score proportionally
+        score = score + ((1000 - score) * @intCast(adj, u64)) / 1000
+    } else if adj < 0 {
+        // Decrease score proportionally
+        var neg_adj: u64 = @intCast(-adj, u64)
+        score = (score * (1000 - neg_adj)) / 1000
+    }
+
+    // Clamp to valid range
+    if score > 1000 {
+        score = 1000
+    }
+
+    return @truncate(score, u32)
 }
 
+// Full OOM score calculation
+fn oom_score_process(pid: u32): u32 {
+    // Skip kernel threads (pid 0 and 1)
+    if pid == 0 {
+        return 0
+    }
+
+    // Skip init process unless explicitly allowed
+    if pid == 1 {
+        return 0
+    }
+
+    // Skip already dying processes
+    var state: u32 = process.process_get_state(pid)
+    if state == process.PROCESS_STATE_ZOMBIE or state == process.PROCESS_STATE_DEAD {
+        return 0
+    }
+
+    // Skip protected processes
+    if oom_info[pid].oom_protected != 0 {
+        return 0
+    }
+
+    // Skip processes being killed
+    if oom_info[pid].oom_killed != 0 {
+        return 0
+    }
+
+    // Calculate and cache the score
+    var score: u32 = calculate_badness(pid)
+    oom_info[pid].oom_score = score
+
+    return score
+}
+
+// Select the best victim process to kill
+fn select_victim(): u32 {
+    var victim_pid: u32 = 0
+    var highest_score: u32 = 0
+
+    var count: u32 = process.process_get_count()
+    var i: u32 = 1  // Skip pid 0 (idle/swapper)
+
+    while i < count {
+        var score: u32 = oom_score_process(i)
+
+        // Check if this process has higher score
+        if score > highest_score {
+            // Verify process is killable
+            var can_kill: u32 = process.process_can_signal(i, 9)
+            if can_kill != 0 {
+                highest_score = score
+                victim_pid = i
+            }
+        }
+        i = i + 1
+    }
+
+    return victim_pid
+}
+
+// Kill a process with OOM notification
+fn oom_kill_victim(pid: u32) {
+    // Mark as being killed
+    oom_info[pid].oom_killed = 1
+
+    // Log victim information
+    foundation.serial_write_string("[OOM] Killing pid ")
+    foundation.serial_write_dec(pid)
+    foundation.serial_write_string(" (")
+
+    var name_ptr: u64 = process.process_get_name(pid)
+    if name_ptr != 0 {
+        foundation.serial_write_string(@intToPtr(name_ptr, [*]u8))
+    }
+
+    foundation.serial_write_string(") score=")
+    foundation.serial_write_dec(oom_info[pid].oom_score)
+    foundation.serial_write_string(" rss=")
+    var rss: u64 = process.process_get_rss(pid) / 1024
+    foundation.serial_write_dec(@truncate(rss, u32))
+    foundation.serial_write_string("KB\n")
+
+    // Send SIGKILL
+    process.process_kill(pid, 9)
+
+    // Also kill all threads of this process
+    process.process_kill_threads(pid)
+}
+
+// Main OOM handler - called when memory is exhausted
+fn oom_kill_process() {
+    foundation.serial_write_string("[OOM] Selecting victim...\n")
+
+    // Try to free cached memory first
+    var freed: u64 = memory.shrink_caches()
+    if freed > OOM_THRESHOLD_CRITICAL {
+        foundation.serial_write_string("[OOM] Freed ")
+        foundation.serial_write_dec(@truncate(freed / 1024, u32))
+        foundation.serial_write_string("KB from caches\n")
+        return
+    }
+
+    // Select victim
+    var victim_pid: u32 = select_victim()
+
+    if victim_pid == 0 {
+        // No suitable victim found
+        foundation.serial_write_string("[OOM] No suitable victim found!\n")
+
+        if oom_panic_on_oom != 0 {
+            foundation.panic("Out of memory - no killable processes")
+        }
+        return
+    }
+
+    // Kill the victim
+    oom_kill_victim(victim_pid)
+
+    // Wait briefly for memory to be freed
+    var i: u32 = 0
+    while i < 100 {
+        var free_mem: u64 = memory.get_free_memory()
+        if free_mem > OOM_THRESHOLD_LOW {
+            foundation.serial_write_string("[OOM] Memory recovered\n")
+            return
+        }
+        foundation.hlt()
+        i = i + 1
+    }
+
+    // If still low, may need to kill more
+    var free_after: u64 = memory.get_free_memory()
+    if free_after < OOM_THRESHOLD_CRITICAL {
+        foundation.serial_write_string("[OOM] Still critical, may need more victims\n")
+    }
+}
+
+// Check memory pressure and trigger OOM if needed
+export fn oom_check() {
+    if oom_enabled == 0 {
+        return
+    }
+
+    var free_mem: u64 = memory.get_free_memory()
+
+    // Panic threshold - system is unrecoverable
+    if free_mem < OOM_THRESHOLD_PANIC {
+        if oom_panic_on_oom != 0 {
+            foundation.panic("Out of memory - below panic threshold")
+        }
+
+        // Emergency: kill multiple processes
+        foundation.serial_write_string("[OOM] EMERGENCY: Memory critically low!\n")
+
+        var killed: u32 = 0
+        while killed < 3 {
+            oom_kill_process()
+            killed = killed + 1
+
+            free_mem = memory.get_free_memory()
+            if free_mem > OOM_THRESHOLD_LOW {
+                break
+            }
+        }
+        return
+    }
+
+    // Critical threshold - kill a process
+    if free_mem < OOM_THRESHOLD_CRITICAL {
+        foundation.serial_write_string("[OOM] Low memory detected: ")
+        foundation.serial_write_dec(@truncate(free_mem / 1024, u32))
+        foundation.serial_write_string("KB free\n")
+        oom_kill_process()
+        return
+    }
+
+    // Low threshold - just warn
+    if free_mem < OOM_THRESHOLD_LOW {
+        foundation.serial_write_string("[OOM] Warning: memory getting low\n")
+    }
+}
+
+// Initialize OOM killer
+export fn oom_init() {
+    // Clear all OOM info
+    var i: u32 = 0
+    while i < 256 {
+        oom_info[i].oom_score_adj = 0
+        oom_info[i].oom_score = 0
+        oom_info[i].oom_killed = 0
+        oom_info[i].oom_protected = 0
+        i = i + 1
+    }
+
+    oom_enabled = 1
+    oom_panic_on_oom = 0
+    oom_kill_allocating_task = 0
+
+    foundation.serial_write_string("[OOM] Killer initialized\n")
+}
+
+// Disable OOM killer (dangerous!)
 export fn oom_disable() {
-  oom_enabled = 0
+    oom_enabled = 0
+    foundation.serial_write_string("[OOM] WARNING: OOM killer disabled\n")
 }
 
+// Enable OOM killer
 export fn oom_enable() {
-  oom_enabled = 1
+    oom_enabled = 1
+}
+
+// Set OOM score adjustment for a process
+export fn oom_set_score_adj(pid: u32, adj: i32): i32 {
+    if pid >= 256 {
+        return -1
+    }
+
+    // Clamp to valid range
+    var clamped: i32 = adj
+    if clamped < OOM_SCORE_ADJ_MIN {
+        clamped = OOM_SCORE_ADJ_MIN
+    }
+    if clamped > OOM_SCORE_ADJ_MAX {
+        clamped = OOM_SCORE_ADJ_MAX
+    }
+
+    oom_info[pid].oom_score_adj = clamped
+    return 0
+}
+
+// Get OOM score adjustment for a process
+export fn oom_get_score_adj(pid: u32): i32 {
+    if pid >= 256 {
+        return 0
+    }
+    return oom_info[pid].oom_score_adj
+}
+
+// Get computed OOM score for a process
+export fn oom_get_score(pid: u32): u32 {
+    if pid >= 256 {
+        return 0
+    }
+
+    // Recalculate fresh score
+    return oom_score_process(pid)
+}
+
+// Temporarily protect a process from OOM
+export fn oom_protect(pid: u32) {
+    if pid < 256 {
+        oom_info[pid].oom_protected = 1
+    }
+}
+
+// Remove OOM protection
+export fn oom_unprotect(pid: u32) {
+    if pid < 256 {
+        oom_info[pid].oom_protected = 0
+    }
+}
+
+// Set panic-on-oom behavior
+export fn oom_set_panic(enable: u32) {
+    oom_panic_on_oom = enable
+}
+
+// Called by memory allocator when allocation fails
+export fn oom_allocation_failed(size: u64, gfp_flags: u32) {
+    foundation.serial_write_string("[OOM] Allocation failed: size=")
+    foundation.serial_write_dec(@truncate(size, u32))
+    foundation.serial_write_string(" flags=")
+    foundation.serial_write_hex(gfp_flags)
+    foundation.serial_write_string("\n")
+
+    // Trigger OOM check
+    oom_check()
+}
+
+// Notify OOM killer that a process exited (cleanup)
+export fn oom_process_exit(pid: u32) {
+    if pid < 256 {
+        oom_info[pid].oom_score_adj = 0
+        oom_info[pid].oom_score = 0
+        oom_info[pid].oom_killed = 0
+        oom_info[pid].oom_protected = 0
+    }
+}
+
+// Get OOM statistics
+export fn oom_get_stats(total_killed: *u32, last_kill_time: *u64) {
+    // These would be tracked globally
+    @ptrToInt(total_killed, u32) = 0  // Stub
+    @ptrToInt(last_kill_time, u64) = 0  // Stub
 }

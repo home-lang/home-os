@@ -3,52 +3,436 @@
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
+import "pci.home" as pci
 
-const UHCI_USBCMD: u16 = 0x00
-const UHCI_USBSTS: u16 = 0x02
-const UHCI_FRNUM: u16 = 0x06
-const UHCI_FRBASEADD: u16 = 0x08
+// ============================================================================
+// UHCI CONSTANTS
+// ============================================================================
 
-var uhci_base: u16 = 0
+// I/O Port Registers
+const UHCI_USBCMD: u16 = 0x00      // USB Command
+const UHCI_USBSTS: u16 = 0x02      // USB Status
+const UHCI_USBINTR: u16 = 0x04     // USB Interrupt Enable
+const UHCI_FRNUM: u16 = 0x06       // Frame Number
+const UHCI_FRBASEADD: u16 = 0x08   // Frame List Base Address
+const UHCI_SOFMOD: u16 = 0x0C      // Start of Frame Modify
+const UHCI_PORTSC1: u16 = 0x10     // Port 1 Status/Control
+const UHCI_PORTSC2: u16 = 0x12     // Port 2 Status/Control
+
+// USB Command bits
+const UHCI_CMD_RUN: u16 = 0x0001
+const UHCI_CMD_HCRESET: u16 = 0x0002
+const UHCI_CMD_GRESET: u16 = 0x0004
+const UHCI_CMD_EGSM: u16 = 0x0008
+const UHCI_CMD_FGR: u16 = 0x0010
+const UHCI_CMD_SWDBG: u16 = 0x0020
+const UHCI_CMD_CF: u16 = 0x0040
+const UHCI_CMD_MAXP: u16 = 0x0080
+
+// USB Status bits
+const UHCI_STS_USBINT: u16 = 0x0001
+const UHCI_STS_ERROR: u16 = 0x0002
+const UHCI_STS_RD: u16 = 0x0004
+const UHCI_STS_HSE: u16 = 0x0008
+const UHCI_STS_HCPE: u16 = 0x0010
+const UHCI_STS_HCH: u16 = 0x0020
+
+// Port Status bits
+const UHCI_PORT_CCS: u16 = 0x0001   // Current Connect Status
+const UHCI_PORT_CSC: u16 = 0x0002   // Connect Status Change
+const UHCI_PORT_PE: u16 = 0x0004    // Port Enabled
+const UHCI_PORT_PEC: u16 = 0x0008   // Port Enable Change
+const UHCI_PORT_LS: u16 = 0x0030    // Line Status
+const UHCI_PORT_RD: u16 = 0x0040    // Resume Detect
+const UHCI_PORT_LSDA: u16 = 0x0100  // Low Speed Device Attached
+const UHCI_PORT_RESET: u16 = 0x0200 // Port Reset
+const UHCI_PORT_SUSPEND: u16 = 0x1000
+
+// Transfer Descriptor flags
+const TD_PTR_TERMINATE: u32 = 0x00000001
+const TD_PTR_QH: u32 = 0x00000002
+const TD_PTR_DEPTH: u32 = 0x00000004
+
+// TD Status bits
+const TD_STS_ACTIVE: u32 = 0x00800000
+const TD_STS_STALLED: u32 = 0x00400000
+const TD_STS_DBERR: u32 = 0x00200000
+const TD_STS_BABBLE: u32 = 0x00100000
+const TD_STS_NAK: u32 = 0x00080000
+const TD_STS_CRCTMO: u32 = 0x00040000
+const TD_STS_BITSTUFF: u32 = 0x00020000
+
+// PID tokens
+const PID_SETUP: u8 = 0x2D
+const PID_IN: u8 = 0x69
+const PID_OUT: u8 = 0xE1
+
+// ============================================================================
+// UHCI STRUCTURES
+// ============================================================================
+
+struct UhciTd {
+  link: u32,
+  status: u32,
+  token: u32,
+  buffer: u32
+}
+
+struct UhciQh {
+  head: u32,
+  element: u32
+}
+
+struct UhciDevice {
+  address: u8,
+  port: u8,
+  speed: u8,
+  max_packet: u8,
+  active: u32
+}
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+var uhci_io_base: u16 = 0
 var uhci_frame_list: u64 = 0
+var uhci_qh_pool: u64 = 0
+var uhci_td_pool: u64 = 0
+var uhci_devices: [UhciDevice; 128]
+var uhci_next_address: u8 = 1
 var uhci_initialized: u32 = 0
+
+// ============================================================================
+// LOW-LEVEL ACCESS
+// ============================================================================
+
+fn uhci_read16(offset: u16): u16 {
+  return foundation.inw(uhci_io_base + offset)
+}
+
+fn uhci_write16(offset: u16, value: u16) {
+  foundation.outw(uhci_io_base + offset, value)
+}
+
+fn uhci_read32(offset: u16): u32 {
+  return foundation.inl(uhci_io_base + offset)
+}
+
+fn uhci_write32(offset: u16, value: u32) {
+  foundation.outl(uhci_io_base + offset, value)
+}
+
+// ============================================================================
+// TRANSFER DESCRIPTOR OPERATIONS
+// ============================================================================
+
+fn uhci_alloc_td(): u64 {
+  var td: u64 = memory.kmalloc(32)
+  if td == 0 { return 0 }
+  memory.memset(td, 0, 32)
+  return td
+}
+
+fn uhci_init_td(td_addr: u64, pid: u8, address: u8, endpoint: u8, toggle: u8, data: u64, length: u32, lowspeed: u8) {
+  var td: *UhciTd = @ptrFromInt(td_addr)
+
+  td.link = TD_PTR_TERMINATE
+
+  // Status: Active, IOC if last, Errors=3, Low speed if needed
+  var status: u32 = TD_STS_ACTIVE | (3 << 27)  // Active, Err count=3
+  if lowspeed != 0 {
+    status = status | (1 << 26)  // Low speed
+  }
+  td.status = status
+
+  // Token: MaxLen, Toggle, Endpoint, Address, PID
+  var maxlen: u32 = if length == 0 { 0x7FF } else { length - 1 }
+  td.token = (maxlen << 21) |
+             (toggle as u32 << 19) |
+             (endpoint as u32 << 15) |
+             (address as u32 << 8) |
+             (pid as u32)
+
+  td.buffer = (data & 0xFFFFFFFF) as u32
+}
+
+fn uhci_alloc_qh(): u64 {
+  var qh: u64 = memory.kmalloc(16)
+  if qh == 0 { return 0 }
+  memory.memset(qh, 0, 16)
+
+  var q: *UhciQh = @ptrFromInt(qh)
+  q.head = TD_PTR_TERMINATE
+  q.element = TD_PTR_TERMINATE
+
+  return qh
+}
+
+// ============================================================================
+// PORT OPERATIONS
+// ============================================================================
+
+fn uhci_reset_port(port: u32): u32 {
+  var portsc: u16 = if port == 0 { UHCI_PORTSC1 } else { UHCI_PORTSC2 }
+
+  // Set reset bit
+  uhci_write16(portsc, UHCI_PORT_RESET)
+
+  // Wait 50ms (simplified delay)
+  var delay: u32 = 50000
+  while delay > 0 { delay = delay - 1 }
+
+  // Clear reset bit
+  uhci_write16(portsc, 0)
+
+  // Wait for reset complete
+  delay = 10000
+  while delay > 0 { delay = delay - 1 }
+
+  // Enable port
+  var status: u16 = uhci_read16(portsc)
+  uhci_write16(portsc, status | UHCI_PORT_PE)
+
+  // Check if low speed
+  status = uhci_read16(portsc)
+  if (status & UHCI_PORT_LSDA) != 0 {
+    return 1  // Low speed
+  }
+  return 0  // Full speed
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
 
 export fn uhci_init() {
   if uhci_initialized == 1 { return }
-  
-  uhci_base = 0xC020  // Stub: would read from PCI
-  
-  // Allocate frame list
-  uhci_frame_list = memory.kmalloc(4096)
+
+  foundation.serial_write_string("[UHCI] Scanning for controllers...\n")
+
+  // Find UHCI controller via PCI (class 0Ch, subclass 03h, prog-if 00h)
+  var i: u32 = 0
+  var found: u32 = 0
+  while i < pci.pci_get_device_count() {
+    var dev: u64 = pci.pci_get_device(i)
+    if dev != 0 {
+      var class_code: u8 = pci.pci_read_config8(dev, 0x0B)
+      var subclass: u8 = pci.pci_read_config8(dev, 0x0A)
+      var prog_if: u8 = pci.pci_read_config8(dev, 0x09)
+
+      if class_code == 0x0C and subclass == 0x03 and prog_if == 0x00 {
+        // UHCI uses I/O space (BAR4)
+        uhci_io_base = (pci.pci_read_bar(dev, 4) & ~0x3) as u16
+
+        // Enable bus mastering and I/O space
+        var cmd: u16 = pci.pci_read_config16(dev, 0x04)
+        pci.pci_write_config16(dev, 0x04, cmd | 0x05)
+
+        found = 1
+        foundation.serial_write_string("[UHCI] Found controller at I/O: 0x")
+        foundation.serial_write_hex(uhci_io_base as u32)
+        foundation.serial_write_string("\n")
+        break
+      }
+    }
+    i = i + 1
+  }
+
+  if found == 0 {
+    foundation.serial_write_string("[UHCI] No controller found\n")
+    return
+  }
+
+  // Global reset
+  uhci_write16(UHCI_USBCMD, UHCI_CMD_GRESET)
+  var delay: u32 = 50000
+  while delay > 0 { delay = delay - 1 }
+  uhci_write16(UHCI_USBCMD, 0)
+
+  // Host controller reset
+  uhci_write16(UHCI_USBCMD, UHCI_CMD_HCRESET)
+
+  var timeout: u32 = 1000
+  while timeout > 0 {
+    if (uhci_read16(UHCI_USBCMD) & UHCI_CMD_HCRESET) == 0 { break }
+    timeout = timeout - 1
+  }
+
+  // Allocate frame list (4KB, 1024 entries)
+  uhci_frame_list = memory.pmm_alloc_pages(1)
   if uhci_frame_list == 0 {
     foundation.serial_write_string("[UHCI] Failed to allocate frame list\n")
     return
   }
-  
-  // Reset controller
-  foundation.outb(uhci_base + UHCI_USBCMD, 0x0004)
-  
-  var timeout: u32 = 1000
-  while timeout > 0 {
-    if (foundation.inb(uhci_base + UHCI_USBCMD) & 0x0004) == 0 {
-      break
-    }
-    timeout = timeout - 1
+
+  // Initialize frame list with terminate bits
+  i = 0
+  while i < 1024 {
+    @ptrToInt(uhci_frame_list + i * 4, u32) = TD_PTR_TERMINATE
+    i = i + 1
   }
-  
-  // Set frame list base
-  foundation.outb(uhci_base + UHCI_FRBASEADD, uhci_frame_list & 0xFFFFFFFF)
-  
+
+  // Set frame list base address
+  uhci_write32(UHCI_FRBASEADD, (uhci_frame_list & 0xFFFFFFFF) as u32)
+
+  // Set frame number to 0
+  uhci_write16(UHCI_FRNUM, 0)
+
+  // Enable interrupts
+  uhci_write16(UHCI_USBINTR, 0x000F)
+
   // Start controller
-  foundation.outb(uhci_base + UHCI_USBCMD, 0x0001)
-  
+  uhci_write16(UHCI_USBCMD, UHCI_CMD_RUN | UHCI_CMD_CF | UHCI_CMD_MAXP)
+
+  foundation.serial_write_string("[UHCI] Controller started\n")
+
+  // Probe ports
+  i = 0
+  while i < 2 {
+    var portsc: u16 = if i == 0 { UHCI_PORTSC1 } else { UHCI_PORTSC2 }
+    var status: u16 = uhci_read16(portsc)
+
+    if (status & UHCI_PORT_CCS) != 0 {
+      foundation.serial_write_string("[UHCI] Port ")
+      foundation.serial_write_u32(i)
+      foundation.serial_write_string(": Device connected\n")
+
+      var speed: u32 = uhci_reset_port(i)
+      if speed == 1 {
+        foundation.serial_write_string("[UHCI] Low-speed device\n")
+      } else {
+        foundation.serial_write_string("[UHCI] Full-speed device\n")
+      }
+    }
+    i = i + 1
+  }
+
   uhci_initialized = 1
-  foundation.serial_write_string("[UHCI] Initialized\n")
+  foundation.serial_write_string("[UHCI] Initialization complete\n")
 }
 
-export fn uhci_control_transfer(device: u8, request: u8, value: u16, index: u16, data: u64, length: u16): u32 {
+// ============================================================================
+// USB TRANSFERS
+// ============================================================================
+
+export fn uhci_control_transfer(address: u8, request_type: u8, request: u8, value: u16, index: u16, data: u64, length: u16): u32 {
   if uhci_initialized == 0 { return 1 }
-  
-  // Stub: would perform control transfer
+
+  // Allocate QH
+  var qh: u64 = uhci_alloc_qh()
+  if qh == 0 { return 1 }
+
+  // Allocate setup TD
+  var setup_td: u64 = uhci_alloc_td()
+  if setup_td == 0 { return 1 }
+
+  // Build setup packet
+  var setup_data: u64 = memory.kmalloc(8)
+  @ptrToInt(setup_data, u8) = request_type
+  @ptrToInt(setup_data + 1, u8) = request
+  @ptrToInt(setup_data + 2, u16) = value
+  @ptrToInt(setup_data + 4, u16) = index
+  @ptrToInt(setup_data + 6, u16) = length
+
+  uhci_init_td(setup_td, PID_SETUP, address, 0, 0, setup_data, 8, 0)
+
+  // Allocate data TD if needed
+  var data_td: u64 = 0
+  if length > 0 {
+    data_td = uhci_alloc_td()
+    if data_td == 0 { return 1 }
+
+    var pid: u8 = if (request_type & 0x80) != 0 { PID_IN } else { PID_OUT }
+    uhci_init_td(data_td, pid, address, 0, 1, data, length as u32, 0)
+
+    // Link setup -> data
+    var setup: *UhciTd = @ptrFromInt(setup_td)
+    setup.link = (data_td & 0xFFFFFFFF) as u32 | TD_PTR_DEPTH
+  }
+
+  // Allocate status TD
+  var status_td: u64 = uhci_alloc_td()
+  if status_td == 0 { return 1 }
+
+  var status_pid: u8 = if length == 0 or (request_type & 0x80) == 0 { PID_IN } else { PID_OUT }
+  uhci_init_td(status_td, status_pid, address, 0, 1, 0, 0, 0)
+
+  // Set IOC on status TD
+  var status: *UhciTd = @ptrFromInt(status_td)
+  status.status = status.status | (1 << 24)  // IOC
+
+  // Link chain
+  if data_td != 0 {
+    var data: *UhciTd = @ptrFromInt(data_td)
+    data.link = (status_td & 0xFFFFFFFF) as u32 | TD_PTR_DEPTH
+  } else {
+    var setup: *UhciTd = @ptrFromInt(setup_td)
+    setup.link = (status_td & 0xFFFFFFFF) as u32 | TD_PTR_DEPTH
+  }
+
+  // Link QH to TD chain
+  var q: *UhciQh = @ptrFromInt(qh)
+  q.element = (setup_td & 0xFFFFFFFF) as u32
+
+  // Insert QH into frame list (frame 0)
+  var old_frame: u32 = @intToPtr(uhci_frame_list, u32)
+  q.head = old_frame
+  @ptrToInt(uhci_frame_list, u32) = (qh & 0xFFFFFFFF) as u32 | TD_PTR_QH
+
+  // Wait for completion
+  var timeout: u32 = 100000
+  while timeout > 0 {
+    var s: *UhciTd = @ptrFromInt(status_td)
+    if (s.status & TD_STS_ACTIVE) == 0 { break }
+    timeout = timeout - 1
+  }
+
+  // Remove QH from frame list
+  @ptrToInt(uhci_frame_list, u32) = old_frame
+
+  if timeout == 0 {
+    return 1
+  }
+
   return 0
+}
+
+export fn uhci_bulk_transfer(address: u8, endpoint: u8, data: u64, length: u32, direction: u8): u32 {
+  if uhci_initialized == 0 { return 1 }
+
+  var qh: u64 = uhci_alloc_qh()
+  if qh == 0 { return 1 }
+
+  var td: u64 = uhci_alloc_td()
+  if td == 0 { return 1 }
+
+  var pid: u8 = if direction != 0 { PID_IN } else { PID_OUT }
+  uhci_init_td(td, pid, address, endpoint, 0, data, length, 0)
+
+  // Set IOC
+  var t: *UhciTd = @ptrFromInt(td)
+  t.status = t.status | (1 << 24)
+
+  var q: *UhciQh = @ptrFromInt(qh)
+  q.element = (td & 0xFFFFFFFF) as u32
+
+  // Insert and wait
+  var old_frame: u32 = @intToPtr(uhci_frame_list, u32)
+  q.head = old_frame
+  @ptrToInt(uhci_frame_list, u32) = (qh & 0xFFFFFFFF) as u32 | TD_PTR_QH
+
+  var timeout: u32 = 100000
+  while timeout > 0 {
+    if (t.status & TD_STS_ACTIVE) == 0 { break }
+    timeout = timeout - 1
+  }
+
+  @ptrToInt(uhci_frame_list, u32) = old_frame
+
+  return if timeout == 0 { 1 } else { 0 }
+}
+
+export fn uhci_is_initialized(): u32 {
+  return uhci_initialized
 }

@@ -1,43 +1,873 @@
 // home-os Semaphore
-// Counting semaphore
+// Counting semaphore with wait queue support
 
 import "../core/foundation.home" as foundation
+import "../core/process.home" as process
+import "../core/scheduler.home" as scheduler
+import "spinlock.home" as spinlock
 
+// Semaphore wait entry
+struct SemWaitEntry {
+    pid: u32,              // Waiting process
+    next: *SemWaitEntry,   // Next in queue
+    prev: *SemWaitEntry,   // Previous in queue
+    woken: u32,            // Set when acquired
+    requested: u32         // Number of permits requested
+}
+
+// Semaphore wait queue
+struct SemWaitQueue {
+    head: *SemWaitEntry,
+    tail: *SemWaitEntry,
+    count: u32,
+    lock: spinlock.Spinlock
+}
+
+// Counting semaphore
 export struct Semaphore {
-  count: u32,
-  wait_queue: u64
+    count: i32,              // Available permits (can go negative)
+    max_count: u32,          // Maximum permits (0 = unlimited)
+    waiters: SemWaitQueue,   // Waiting processes
+    name: [32]u8             // Debug name
 }
 
-export fn semaphore_init(sem: u64, initial: u32) {
-  @ptrToInt(sem, u32) = initial
-  @ptrToInt(sem + 4, u64) = 0
+// Binary semaphore (mutex-like, but no ownership)
+export struct BinarySemaphore {
+    locked: u32,
+    waiters: SemWaitQueue
 }
 
-export fn semaphore_wait(sem: u64) {
-  while true {
-    var count: u32 = @intToPtr(sem, u32)
-    if count > 0 {
-      @ptrToInt(sem, u32) = count - 1
-      break
+// Read-write semaphore
+export struct RWSemaphore {
+    count: i32,              // >0 = readers, <0 = writer waiting, 0 = free or -1 = writer active
+    active_readers: u32,
+    writer_pid: u32,
+    reader_queue: SemWaitQueue,
+    writer_queue: SemWaitQueue
+}
+
+// Wait entry pool
+const MAX_SEM_WAITERS: u32 = 128
+var sem_wait_entries: [MAX_SEM_WAITERS]SemWaitEntry = undefined
+var sem_wait_used: [MAX_SEM_WAITERS]u32 = undefined
+
+// Allocate wait entry
+fn alloc_sem_entry(): *SemWaitEntry {
+    var i: u32 = 0
+    while i < MAX_SEM_WAITERS {
+        if sem_wait_used[i] == 0 {
+            sem_wait_used[i] = 1
+            var entry: *SemWaitEntry = &sem_wait_entries[i]
+            entry.pid = 0
+            entry.next = null
+            entry.prev = null
+            entry.woken = 0
+            entry.requested = 1
+            return entry
+        }
+        i = i + 1
     }
-    foundation.hlt()
-  }
+    return null
 }
 
-export fn semaphore_post(sem: u64) {
-  var count: u32 = @intToPtr(sem, u32)
-  @ptrToInt(sem, u32) = count + 1
+// Free wait entry
+fn free_sem_entry(entry: *SemWaitEntry) {
+    var i: u32 = 0
+    while i < MAX_SEM_WAITERS {
+        if &sem_wait_entries[i] == entry {
+            sem_wait_used[i] = 0
+            return
+        }
+        i = i + 1
+    }
 }
 
-export fn semaphore_try_wait(sem: u64): u32 {
-  var count: u32 = @intToPtr(sem, u32)
-  if count > 0 {
-    @ptrToInt(sem, u32) = count - 1
+// Initialize wait queue
+fn semqueue_init(wq: *SemWaitQueue) {
+    wq.head = null
+    wq.tail = null
+    wq.count = 0
+    spinlock.spinlock_init(&wq.lock)
+}
+
+// Add to wait queue
+fn semqueue_add(wq: *SemWaitQueue, entry: *SemWaitEntry) {
+    spinlock.spinlock_acquire(&wq.lock)
+
+    entry.next = null
+    entry.prev = wq.tail
+
+    if wq.tail != null {
+        wq.tail.next = entry
+    } else {
+        wq.head = entry
+    }
+    wq.tail = entry
+    wq.count = wq.count + 1
+
+    spinlock.spinlock_release(&wq.lock)
+}
+
+// Remove from wait queue
+fn semqueue_remove(wq: *SemWaitQueue, entry: *SemWaitEntry) {
+    spinlock.spinlock_acquire(&wq.lock)
+
+    if entry.prev != null {
+        entry.prev.next = entry.next
+    } else {
+        wq.head = entry.next
+    }
+
+    if entry.next != null {
+        entry.next.prev = entry.prev
+    } else {
+        wq.tail = entry.prev
+    }
+
+    wq.count = wq.count - 1
+
+    spinlock.spinlock_release(&wq.lock)
+}
+
+// Wake waiters that can be satisfied
+fn semqueue_wake_eligible(wq: *SemWaitQueue, sem: *Semaphore): u32 {
+    spinlock.spinlock_acquire(&wq.lock)
+
+    var woken: u32 = 0
+    var entry: *SemWaitEntry = wq.head
+
+    while entry != null {
+        // Check if this waiter can be satisfied
+        if sem.count >= @intCast(entry.requested, i32) {
+            // Remove from queue
+            if entry.prev != null {
+                entry.prev.next = entry.next
+            } else {
+                wq.head = entry.next
+            }
+
+            if entry.next != null {
+                entry.next.prev = entry.prev
+            } else {
+                wq.tail = entry.prev
+            }
+            wq.count = wq.count - 1
+
+            // Consume permits
+            sem.count = sem.count - @intCast(entry.requested, i32)
+
+            // Wake the process
+            entry.woken = 1
+            scheduler.wake_process(entry.pid)
+
+            var next: *SemWaitEntry = entry.next
+            free_sem_entry(entry)
+            entry = next
+            woken = woken + 1
+        } else {
+            entry = entry.next
+        }
+    }
+
+    spinlock.spinlock_release(&wq.lock)
+    return woken
+}
+
+// Get current PID
+fn get_current_pid(): u32 {
+    return process.current_pid()
+}
+
+// ============= Counting Semaphore =============
+
+// Initialize semaphore
+export fn semaphore_init(sem: *Semaphore, initial: u32) {
+    sem.count = @intCast(initial, i32)
+    sem.max_count = 0  // Unlimited
+    semqueue_init(&sem.waiters)
+
+    var i: u32 = 0
+    while i < 32 {
+        sem.name[i] = 0
+        i = i + 1
+    }
+}
+
+// Initialize with max count
+export fn semaphore_init_bounded(sem: *Semaphore, initial: u32, max: u32) {
+    sem.count = @intCast(initial, i32)
+    sem.max_count = max
+    semqueue_init(&sem.waiters)
+
+    var i: u32 = 0
+    while i < 32 {
+        sem.name[i] = 0
+        i = i + 1
+    }
+}
+
+// Initialize with name
+export fn semaphore_init_named(sem: *Semaphore, initial: u32, name: [*]u8) {
+    semaphore_init(sem, initial)
+
+    var i: u32 = 0
+    while i < 31 {
+        if name[i] == 0 {
+            break
+        }
+        sem.name[i] = name[i]
+        i = i + 1
+    }
+    sem.name[i] = 0
+}
+
+// Wait (P operation / down / acquire)
+export fn semaphore_wait(sem: *Semaphore) {
+    // Fast path - try to decrement atomically
+    while true {
+        var current: i32 = sem.count
+        if current > 0 {
+            var new_val: i32 = current - 1
+            var old: i32 = @atomicCmpXchg(&sem.count, current, new_val)
+            if old == current {
+                return  // Acquired
+            }
+            continue  // Retry
+        }
+
+        // Need to wait
+        var entry: *SemWaitEntry = alloc_sem_entry()
+        if entry == null {
+            foundation.hlt()
+            continue
+        }
+
+        entry.pid = get_current_pid()
+        entry.requested = 1
+        entry.woken = 0
+
+        semqueue_add(&sem.waiters, entry)
+
+        // Double-check count after adding to queue
+        if sem.count > 0 {
+            semqueue_remove(&sem.waiters, entry)
+            free_sem_entry(entry)
+            continue
+        }
+
+        // Block until woken
+        while entry.woken == 0 {
+            scheduler.block_current()
+        }
+
+        return
+    }
+}
+
+// Wait for multiple permits
+export fn semaphore_wait_n(sem: *Semaphore, n: u32) {
+    var requested: i32 = @intCast(n, i32)
+
+    while true {
+        var current: i32 = sem.count
+        if current >= requested {
+            var new_val: i32 = current - requested
+            var old: i32 = @atomicCmpXchg(&sem.count, current, new_val)
+            if old == current {
+                return
+            }
+            continue
+        }
+
+        var entry: *SemWaitEntry = alloc_sem_entry()
+        if entry == null {
+            foundation.hlt()
+            continue
+        }
+
+        entry.pid = get_current_pid()
+        entry.requested = n
+        entry.woken = 0
+
+        semqueue_add(&sem.waiters, entry)
+
+        while entry.woken == 0 {
+            scheduler.block_current()
+        }
+
+        return
+    }
+}
+
+// Post (V operation / up / release)
+export fn semaphore_post(sem: *Semaphore) {
+    // Check max count
+    if sem.max_count > 0 {
+        var current: i32 = sem.count
+        if @intCast(current, u32) >= sem.max_count {
+            return  // At max
+        }
+    }
+
+    // Increment count
+    @atomicFetchAdd(&sem.count, 1)
+
+    // Wake eligible waiters
+    if sem.waiters.count > 0 {
+        semqueue_wake_eligible(&sem.waiters, sem)
+    }
+}
+
+// Post multiple permits
+export fn semaphore_post_n(sem: *Semaphore, n: u32) {
+    // Check max count
+    if sem.max_count > 0 {
+        var current: i32 = sem.count
+        var new_count: u32 = @intCast(current, u32) + n
+        if new_count > sem.max_count {
+            n = sem.max_count - @intCast(current, u32)
+        }
+    }
+
+    // Increment count
+    @atomicFetchAdd(&sem.count, @intCast(n, i32))
+
+    // Wake eligible waiters
+    if sem.waiters.count > 0 {
+        semqueue_wake_eligible(&sem.waiters, sem)
+    }
+}
+
+// Try wait (non-blocking)
+export fn semaphore_try_wait(sem: *Semaphore): u32 {
+    var current: i32 = sem.count
+    if current <= 0 {
+        return 0
+    }
+
+    var new_val: i32 = current - 1
+    var old: i32 = @atomicCmpXchg(&sem.count, current, new_val)
+    if old == current {
+        return 1
+    }
+    return 0
+}
+
+// Try wait for multiple
+export fn semaphore_try_wait_n(sem: *Semaphore, n: u32): u32 {
+    var requested: i32 = @intCast(n, i32)
+    var current: i32 = sem.count
+
+    if current < requested {
+        return 0
+    }
+
+    var new_val: i32 = current - requested
+    var old: i32 = @atomicCmpXchg(&sem.count, current, new_val)
+    if old == current {
+        return 1
+    }
+    return 0
+}
+
+// Wait with timeout
+export fn semaphore_wait_timeout(sem: *Semaphore, timeout_ms: u32): u32 {
+    // Fast path
+    if semaphore_try_wait(sem) != 0 {
+        return 1
+    }
+
+    var entry: *SemWaitEntry = alloc_sem_entry()
+    if entry == null {
+        return 0
+    }
+
+    entry.pid = get_current_pid()
+    entry.requested = 1
+    entry.woken = 0
+
+    semqueue_add(&sem.waiters, entry)
+
+    var deadline: u64 = foundation.get_ticks() + @intCast(timeout_ms, u64) * 1000
+
+    while entry.woken == 0 {
+        if foundation.get_ticks() >= deadline {
+            semqueue_remove(&sem.waiters, entry)
+            free_sem_entry(entry)
+            return 0
+        }
+        scheduler.block_current_timeout(1)
+    }
+
     return 1
-  }
-  return 0
 }
 
-export fn semaphore_get_value(sem: u64): u32 {
-  return @intToPtr(sem, u32)
+// Get current count
+export fn semaphore_get_value(sem: *Semaphore): i32 {
+    return sem.count
+}
+
+// Get number of waiters
+export fn semaphore_get_waiters(sem: *Semaphore): u32 {
+    return sem.waiters.count
+}
+
+// ============= Binary Semaphore =============
+
+// Initialize binary semaphore
+export fn binary_semaphore_init(sem: *BinarySemaphore, initial: u32) {
+    if initial != 0 {
+        sem.locked = 0  // Available
+    } else {
+        sem.locked = 1  // Taken
+    }
+    semqueue_init(&sem.waiters)
+}
+
+// Wait on binary semaphore
+export fn binary_semaphore_wait(sem: *BinarySemaphore) {
+    while true {
+        var old: u32 = @atomicCmpXchg(&sem.locked, 0, 1)
+        if old == 0 {
+            return  // Acquired
+        }
+
+        var entry: *SemWaitEntry = alloc_sem_entry()
+        if entry == null {
+            foundation.hlt()
+            continue
+        }
+
+        entry.pid = get_current_pid()
+        entry.woken = 0
+
+        semqueue_add(&sem.waiters, entry)
+
+        while entry.woken == 0 and sem.locked != 0 {
+            scheduler.block_current()
+        }
+    }
+}
+
+// Post binary semaphore
+export fn binary_semaphore_post(sem: *BinarySemaphore) {
+    @atomicStore(&sem.locked, 0)
+
+    // Wake one waiter
+    if sem.waiters.count > 0 {
+        spinlock.spinlock_acquire(&sem.waiters.lock)
+
+        if sem.waiters.head != null {
+            var entry: *SemWaitEntry = sem.waiters.head
+            sem.waiters.head = entry.next
+            if sem.waiters.head != null {
+                sem.waiters.head.prev = null
+            } else {
+                sem.waiters.tail = null
+            }
+            sem.waiters.count = sem.waiters.count - 1
+
+            entry.woken = 1
+            scheduler.wake_process(entry.pid)
+            free_sem_entry(entry)
+        }
+
+        spinlock.spinlock_release(&sem.waiters.lock)
+    }
+}
+
+// Try wait binary
+export fn binary_semaphore_try_wait(sem: *BinarySemaphore): u32 {
+    var old: u32 = @atomicCmpXchg(&sem.locked, 0, 1)
+    if old == 0 {
+        return 1
+    }
+    return 0
+}
+
+// ============= Read-Write Semaphore =============
+
+// Initialize RW semaphore
+export fn rwsemaphore_init(sem: *RWSemaphore) {
+    sem.count = 0
+    sem.active_readers = 0
+    sem.writer_pid = 0
+    semqueue_init(&sem.reader_queue)
+    semqueue_init(&sem.writer_queue)
+}
+
+// Acquire read (down_read)
+export fn rwsemaphore_read_lock(sem: *RWSemaphore) {
+    while true {
+        var current: i32 = sem.count
+
+        // If writer active or writers waiting with readers active, wait
+        if current < 0 or (sem.writer_queue.count > 0 and sem.active_readers > 0) {
+            var entry: *SemWaitEntry = alloc_sem_entry()
+            if entry == null {
+                foundation.hlt()
+                continue
+            }
+
+            entry.pid = get_current_pid()
+            entry.woken = 0
+
+            semqueue_add(&sem.reader_queue, entry)
+
+            while entry.woken == 0 and sem.count < 0 {
+                scheduler.block_current()
+            }
+
+            continue
+        }
+
+        // Try to increment reader count
+        var new_count: i32 = current + 1
+        var old: i32 = @atomicCmpXchg(&sem.count, current, new_count)
+        if old == current {
+            @atomicFetchAdd(&sem.active_readers, 1)
+            return
+        }
+    }
+}
+
+// Release read (up_read)
+export fn rwsemaphore_read_unlock(sem: *RWSemaphore) {
+    @atomicFetchSub(&sem.active_readers, 1)
+    var old_count: i32 = @atomicFetchSub(&sem.count, 1)
+
+    // If we were last reader and writers waiting
+    if old_count == 1 and sem.writer_queue.count > 0 {
+        spinlock.spinlock_acquire(&sem.writer_queue.lock)
+
+        if sem.writer_queue.head != null {
+            var entry: *SemWaitEntry = sem.writer_queue.head
+            sem.writer_queue.head = entry.next
+            if sem.writer_queue.head != null {
+                sem.writer_queue.head.prev = null
+            } else {
+                sem.writer_queue.tail = null
+            }
+            sem.writer_queue.count = sem.writer_queue.count - 1
+
+            entry.woken = 1
+            scheduler.wake_process(entry.pid)
+            free_sem_entry(entry)
+        }
+
+        spinlock.spinlock_release(&sem.writer_queue.lock)
+    }
+}
+
+// Try read lock
+export fn rwsemaphore_try_read_lock(sem: *RWSemaphore): u32 {
+    var current: i32 = sem.count
+
+    if current < 0 {
+        return 0
+    }
+
+    var new_count: i32 = current + 1
+    var old: i32 = @atomicCmpXchg(&sem.count, current, new_count)
+    if old == current {
+        @atomicFetchAdd(&sem.active_readers, 1)
+        return 1
+    }
+    return 0
+}
+
+// Acquire write (down_write)
+export fn rwsemaphore_write_lock(sem: *RWSemaphore) {
+    var current_pid: u32 = get_current_pid()
+
+    while true {
+        // Try to acquire when free
+        var old: i32 = @atomicCmpXchg(&sem.count, 0, -1)
+        if old == 0 {
+            sem.writer_pid = current_pid
+            return
+        }
+
+        var entry: *SemWaitEntry = alloc_sem_entry()
+        if entry == null {
+            foundation.hlt()
+            continue
+        }
+
+        entry.pid = current_pid
+        entry.woken = 0
+
+        semqueue_add(&sem.writer_queue, entry)
+
+        while entry.woken == 0 and sem.count != 0 {
+            scheduler.block_current()
+        }
+    }
+}
+
+// Release write (up_write)
+export fn rwsemaphore_write_unlock(sem: *RWSemaphore) {
+    sem.writer_pid = 0
+    @atomicStore(&sem.count, 0)
+
+    // Wake waiting readers first, then writers
+    if sem.reader_queue.count > 0 {
+        spinlock.spinlock_acquire(&sem.reader_queue.lock)
+
+        while sem.reader_queue.head != null {
+            var entry: *SemWaitEntry = sem.reader_queue.head
+            sem.reader_queue.head = entry.next
+            if sem.reader_queue.head != null {
+                sem.reader_queue.head.prev = null
+            } else {
+                sem.reader_queue.tail = null
+            }
+            sem.reader_queue.count = sem.reader_queue.count - 1
+
+            entry.woken = 1
+            scheduler.wake_process(entry.pid)
+            free_sem_entry(entry)
+        }
+
+        spinlock.spinlock_release(&sem.reader_queue.lock)
+    } else if sem.writer_queue.count > 0 {
+        spinlock.spinlock_acquire(&sem.writer_queue.lock)
+
+        if sem.writer_queue.head != null {
+            var entry: *SemWaitEntry = sem.writer_queue.head
+            sem.writer_queue.head = entry.next
+            if sem.writer_queue.head != null {
+                sem.writer_queue.head.prev = null
+            } else {
+                sem.writer_queue.tail = null
+            }
+            sem.writer_queue.count = sem.writer_queue.count - 1
+
+            entry.woken = 1
+            scheduler.wake_process(entry.pid)
+            free_sem_entry(entry)
+        }
+
+        spinlock.spinlock_release(&sem.writer_queue.lock)
+    }
+}
+
+// Try write lock
+export fn rwsemaphore_try_write_lock(sem: *RWSemaphore): u32 {
+    var old: i32 = @atomicCmpXchg(&sem.count, 0, -1)
+    if old == 0 {
+        sem.writer_pid = get_current_pid()
+        return 1
+    }
+    return 0
+}
+
+// Downgrade write to read
+export fn rwsemaphore_downgrade(sem: *RWSemaphore) {
+    sem.writer_pid = 0
+    @atomicStore(&sem.count, 1)
+    @atomicFetchAdd(&sem.active_readers, 1)
+
+    // Wake waiting readers
+    if sem.reader_queue.count > 0 {
+        spinlock.spinlock_acquire(&sem.reader_queue.lock)
+
+        while sem.reader_queue.head != null {
+            var entry: *SemWaitEntry = sem.reader_queue.head
+            sem.reader_queue.head = entry.next
+            if sem.reader_queue.head != null {
+                sem.reader_queue.head.prev = null
+            } else {
+                sem.reader_queue.tail = null
+            }
+            sem.reader_queue.count = sem.reader_queue.count - 1
+
+            entry.woken = 1
+            scheduler.wake_process(entry.pid)
+            free_sem_entry(entry)
+        }
+
+        spinlock.spinlock_release(&sem.reader_queue.lock)
+    }
+}
+
+// ============= Barrier =============
+
+export struct Barrier {
+    count: u32,              // Number of threads to wait for
+    waiting: u32,            // Currently waiting
+    generation: u32,         // Barrier generation (for reuse)
+    waiters: SemWaitQueue,
+    lock: spinlock.Spinlock
+}
+
+// Initialize barrier
+export fn barrier_init(barrier: *Barrier, count: u32) {
+    barrier.count = count
+    barrier.waiting = 0
+    barrier.generation = 0
+    semqueue_init(&barrier.waiters)
+    spinlock.spinlock_init(&barrier.lock)
+}
+
+// Wait at barrier
+export fn barrier_wait(barrier: *Barrier): u32 {
+    spinlock.spinlock_acquire(&barrier.lock)
+
+    var gen: u32 = barrier.generation
+    barrier.waiting = barrier.waiting + 1
+
+    if barrier.waiting >= barrier.count {
+        // Last thread - release all
+        barrier.waiting = 0
+        barrier.generation = barrier.generation + 1
+
+        // Wake all waiters
+        while barrier.waiters.head != null {
+            var entry: *SemWaitEntry = barrier.waiters.head
+            barrier.waiters.head = entry.next
+            barrier.waiters.count = barrier.waiters.count - 1
+
+            entry.woken = 1
+            scheduler.wake_process(entry.pid)
+            free_sem_entry(entry)
+        }
+        barrier.waiters.tail = null
+
+        spinlock.spinlock_release(&barrier.lock)
+        return 1  // This thread is the "serial" thread
+    }
+
+    // Not last - wait
+    var entry: *SemWaitEntry = alloc_sem_entry()
+    if entry != null {
+        entry.pid = get_current_pid()
+        entry.woken = 0
+
+        // Add to waiters
+        entry.next = null
+        entry.prev = barrier.waiters.tail
+        if barrier.waiters.tail != null {
+            barrier.waiters.tail.next = entry
+        } else {
+            barrier.waiters.head = entry
+        }
+        barrier.waiters.tail = entry
+        barrier.waiters.count = barrier.waiters.count + 1
+
+        spinlock.spinlock_release(&barrier.lock)
+
+        // Wait until generation changes
+        while entry.woken == 0 and barrier.generation == gen {
+            scheduler.block_current()
+        }
+    } else {
+        spinlock.spinlock_release(&barrier.lock)
+    }
+
+    return 0
+}
+
+// Reset barrier
+export fn barrier_reset(barrier: *Barrier) {
+    spinlock.spinlock_acquire(&barrier.lock)
+    barrier.waiting = 0
+    barrier.generation = barrier.generation + 1
+    spinlock.spinlock_release(&barrier.lock)
+}
+
+// ============= Latch (One-shot barrier) =============
+
+export struct Latch {
+    count: i32,              // Countdown
+    waiters: SemWaitQueue,
+    lock: spinlock.Spinlock
+}
+
+// Initialize latch
+export fn latch_init(latch: *Latch, count: u32) {
+    latch.count = @intCast(count, i32)
+    semqueue_init(&latch.waiters)
+    spinlock.spinlock_init(&latch.lock)
+}
+
+// Count down
+export fn latch_count_down(latch: *Latch) {
+    var old: i32 = @atomicFetchSub(&latch.count, 1)
+
+    if old == 1 {
+        // We reached zero - wake all
+        spinlock.spinlock_acquire(&latch.lock)
+
+        while latch.waiters.head != null {
+            var entry: *SemWaitEntry = latch.waiters.head
+            latch.waiters.head = entry.next
+            latch.waiters.count = latch.waiters.count - 1
+
+            entry.woken = 1
+            scheduler.wake_process(entry.pid)
+            free_sem_entry(entry)
+        }
+        latch.waiters.tail = null
+
+        spinlock.spinlock_release(&latch.lock)
+    }
+}
+
+// Wait for latch
+export fn latch_wait(latch: *Latch) {
+    if latch.count <= 0 {
+        return  // Already released
+    }
+
+    var entry: *SemWaitEntry = alloc_sem_entry()
+    if entry == null {
+        // Busy wait fallback
+        while latch.count > 0 {
+            foundation.hlt()
+        }
+        return
+    }
+
+    entry.pid = get_current_pid()
+    entry.woken = 0
+
+    spinlock.spinlock_acquire(&latch.lock)
+
+    // Double check
+    if latch.count <= 0 {
+        spinlock.spinlock_release(&latch.lock)
+        free_sem_entry(entry)
+        return
+    }
+
+    // Add to waiters
+    entry.next = null
+    entry.prev = latch.waiters.tail
+    if latch.waiters.tail != null {
+        latch.waiters.tail.next = entry
+    } else {
+        latch.waiters.head = entry
+    }
+    latch.waiters.tail = entry
+    latch.waiters.count = latch.waiters.count + 1
+
+    spinlock.spinlock_release(&latch.lock)
+
+    while entry.woken == 0 and latch.count > 0 {
+        scheduler.block_current()
+    }
+}
+
+// Try wait (non-blocking check)
+export fn latch_try_wait(latch: *Latch): u32 {
+    if latch.count <= 0 {
+        return 1
+    }
+    return 0
+}
+
+// Get current count
+export fn latch_get_count(latch: *Latch): i32 {
+    return latch.count
 }

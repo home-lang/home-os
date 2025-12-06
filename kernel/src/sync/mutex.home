@@ -1,45 +1,715 @@
 // home-os Mutex
-// Sleeping lock
+// Sleeping lock with wait queue, priority inheritance, and deadlock detection
 
 import "../core/foundation.home" as foundation
+import "../core/process.home" as process
+import "../core/scheduler.home" as scheduler
 import "spinlock.home" as spinlock
 
+// Mutex states
+const MUTEX_UNLOCKED: u32 = 0
+const MUTEX_LOCKED: u32 = 1
+const MUTEX_CONTENDED: u32 = 2  // Locked with waiters
+
+// Wait queue entry
+struct WaitQueueEntry {
+    pid: u32,                    // Waiting process ID
+    priority: u32,               // Original priority (for inheritance)
+    next: *WaitQueueEntry,       // Next in queue
+    prev: *WaitQueueEntry,       // Previous in queue
+    woken: u32                   // Set when woken up
+}
+
+// Wait queue head
+struct WaitQueue {
+    head: *WaitQueueEntry,
+    tail: *WaitQueueEntry,
+    count: u32,
+    lock: spinlock.Spinlock
+}
+
+// Mutex structure
 export struct Mutex {
-  locked: u32,
-  owner: u32,
-  wait_queue: u64
+    state: u32,                  // Lock state
+    owner: u32,                  // Owner PID (0 = none)
+    owner_cpu: u32,              // Owner CPU
+    waiters: WaitQueue,          // Wait queue
+    recursion_count: u32,        // For recursive mutexes
+    flags: u32,                  // Configuration flags
+    original_priority: u32,      // Owner's original priority (for inheritance)
+    acquired_at: u64,            // Timestamp when acquired
+    name: [32]u8                 // Debug name
 }
 
-export fn mutex_init(mutex: u64) {
-  @ptrToInt(mutex, u32) = 0
-  @ptrToInt(mutex + 4, u32) = 0
-  @ptrToInt(mutex + 8, u64) = 0
+// Mutex flags
+const MUTEX_FLAG_RECURSIVE: u32 = 0x01
+const MUTEX_FLAG_PI: u32 = 0x02          // Priority inheritance
+const MUTEX_FLAG_ROBUST: u32 = 0x04      // Handle owner death
+const MUTEX_FLAG_ERRORCHECK: u32 = 0x08  // Check for errors
+
+// Read-write mutex (rwlock)
+export struct RWMutex {
+    state: i32,                  // >0 = reader count, -1 = writer, 0 = free
+    writer_pid: u32,             // Writer PID
+    writer_queue: WaitQueue,     // Writers waiting
+    reader_queue: WaitQueue,     // Readers waiting
+    flags: u32
 }
 
-export fn mutex_lock(mutex: u64) {
-  while true {
-    var current: u32 = @intToPtr(mutex, u32)
-    if current == 0 {
-      @ptrToInt(mutex, u32) = 1
-      @ptrToInt(mutex + 4, u32) = 1  // Current PID stub
-      break
+// Wait queue max for static allocation
+const MAX_WAITERS: u32 = 64
+var wait_entries: [MAX_WAITERS]WaitQueueEntry = undefined
+var wait_entry_used: [MAX_WAITERS]u32 = undefined
+
+// Allocate wait entry
+fn alloc_wait_entry(): *WaitQueueEntry {
+    var i: u32 = 0
+    while i < MAX_WAITERS {
+        if wait_entry_used[i] == 0 {
+            wait_entry_used[i] = 1
+            var entry: *WaitQueueEntry = &wait_entries[i]
+            entry.pid = 0
+            entry.priority = 0
+            entry.next = null
+            entry.prev = null
+            entry.woken = 0
+            return entry
+        }
+        i = i + 1
     }
-    
-    foundation.hlt()  // Sleep
-  }
+    return null
 }
 
-export fn mutex_unlock(mutex: u64) {
-  @ptrToInt(mutex, u32) = 0
-  @ptrToInt(mutex + 4, u32) = 0
+// Free wait entry
+fn free_wait_entry(entry: *WaitQueueEntry) {
+    var i: u32 = 0
+    while i < MAX_WAITERS {
+        if &wait_entries[i] == entry {
+            wait_entry_used[i] = 0
+            return
+        }
+        i = i + 1
+    }
 }
 
-export fn mutex_try_lock(mutex: u64): u32 {
-  var current: u32 = @intToPtr(mutex, u32)
-  if current == 0 {
-    @ptrToInt(mutex, u32) = 1
-    @ptrToInt(mutex + 4, u32) = 1
+// Initialize wait queue
+fn waitqueue_init(wq: *WaitQueue) {
+    wq.head = null
+    wq.tail = null
+    wq.count = 0
+    spinlock.spinlock_init(&wq.lock)
+}
+
+// Add to wait queue (tail - FIFO)
+fn waitqueue_add(wq: *WaitQueue, entry: *WaitQueueEntry) {
+    spinlock.spinlock_acquire(&wq.lock)
+
+    entry.next = null
+    entry.prev = wq.tail
+
+    if wq.tail != null {
+        wq.tail.next = entry
+    } else {
+        wq.head = entry
+    }
+    wq.tail = entry
+    wq.count = wq.count + 1
+
+    spinlock.spinlock_release(&wq.lock)
+}
+
+// Remove from wait queue
+fn waitqueue_remove(wq: *WaitQueue, entry: *WaitQueueEntry) {
+    spinlock.spinlock_acquire(&wq.lock)
+
+    if entry.prev != null {
+        entry.prev.next = entry.next
+    } else {
+        wq.head = entry.next
+    }
+
+    if entry.next != null {
+        entry.next.prev = entry.prev
+    } else {
+        wq.tail = entry.prev
+    }
+
+    wq.count = wq.count - 1
+
+    spinlock.spinlock_release(&wq.lock)
+}
+
+// Wake one waiter
+fn waitqueue_wake_one(wq: *WaitQueue): u32 {
+    spinlock.spinlock_acquire(&wq.lock)
+
+    if wq.head == null {
+        spinlock.spinlock_release(&wq.lock)
+        return 0
+    }
+
+    var entry: *WaitQueueEntry = wq.head
+
+    // Remove from queue
+    wq.head = entry.next
+    if wq.head != null {
+        wq.head.prev = null
+    } else {
+        wq.tail = null
+    }
+    wq.count = wq.count - 1
+
+    // Mark as woken and wake process
+    entry.woken = 1
+    var pid: u32 = entry.pid
+
+    spinlock.spinlock_release(&wq.lock)
+
+    // Wake the process
+    scheduler.wake_process(pid)
+
+    // Free the entry
+    free_wait_entry(entry)
+
     return 1
-  }
-  return 0
+}
+
+// Wake all waiters
+fn waitqueue_wake_all(wq: *WaitQueue): u32 {
+    var count: u32 = 0
+    while waitqueue_wake_one(wq) != 0 {
+        count = count + 1
+    }
+    return count
+}
+
+// Get highest priority waiter (for PI)
+fn waitqueue_highest_priority(wq: *WaitQueue): u32 {
+    spinlock.spinlock_acquire(&wq.lock)
+
+    var highest: u32 = 0
+    var entry: *WaitQueueEntry = wq.head
+
+    while entry != null {
+        if entry.priority > highest {
+            highest = entry.priority
+        }
+        entry = entry.next
+    }
+
+    spinlock.spinlock_release(&wq.lock)
+    return highest
+}
+
+// Initialize mutex
+export fn mutex_init(mutex: *Mutex) {
+    mutex.state = MUTEX_UNLOCKED
+    mutex.owner = 0
+    mutex.owner_cpu = 0xFFFFFFFF
+    mutex.recursion_count = 0
+    mutex.flags = 0
+    mutex.original_priority = 0
+    mutex.acquired_at = 0
+    waitqueue_init(&mutex.waiters)
+
+    var i: u32 = 0
+    while i < 32 {
+        mutex.name[i] = 0
+        i = i + 1
+    }
+}
+
+// Initialize with flags
+export fn mutex_init_flags(mutex: *Mutex, flags: u32) {
+    mutex_init(mutex)
+    mutex.flags = flags
+}
+
+// Initialize with name (for debugging)
+export fn mutex_init_named(mutex: *Mutex, name: [*]u8) {
+    mutex_init(mutex)
+
+    var i: u32 = 0
+    while i < 31 {
+        if name[i] == 0 {
+            break
+        }
+        mutex.name[i] = name[i]
+        i = i + 1
+    }
+    mutex.name[i] = 0
+}
+
+// Get current process ID
+fn get_current_pid(): u32 {
+    return process.current_pid()
+}
+
+// Lock mutex (blocking)
+export fn mutex_lock(mutex: *Mutex) {
+    var current_pid: u32 = get_current_pid()
+
+    // Fast path - try to acquire unlocked mutex
+    if mutex.state == MUTEX_UNLOCKED {
+        // Use atomic CAS
+        var old: u32 = @atomicCmpXchg(&mutex.state, MUTEX_UNLOCKED, MUTEX_LOCKED)
+        if old == MUTEX_UNLOCKED {
+            mutex.owner = current_pid
+            mutex.acquired_at = foundation.get_ticks()
+            return
+        }
+    }
+
+    // Check for recursive lock
+    if (mutex.flags & MUTEX_FLAG_RECURSIVE) != 0 {
+        if mutex.owner == current_pid {
+            mutex.recursion_count = mutex.recursion_count + 1
+            return
+        }
+    }
+
+    // Check for deadlock (error checking)
+    if (mutex.flags & MUTEX_FLAG_ERRORCHECK) != 0 {
+        if mutex.owner == current_pid {
+            foundation.serial_write_string("[MUTEX] Deadlock detected on ")
+            foundation.serial_write_string(&mutex.name[0])
+            foundation.serial_write_string("\n")
+            foundation.panic("Mutex deadlock")
+            return
+        }
+    }
+
+    // Slow path - need to wait
+    mutex.state = MUTEX_CONTENDED
+
+    // Add ourselves to wait queue
+    var entry: *WaitQueueEntry = alloc_wait_entry()
+    if entry == null {
+        foundation.serial_write_string("[MUTEX] Out of wait entries\n")
+        return
+    }
+
+    entry.pid = current_pid
+    entry.priority = process.process_get_priority(current_pid)
+    entry.woken = 0
+
+    waitqueue_add(&mutex.waiters, entry)
+
+    // Priority inheritance
+    if (mutex.flags & MUTEX_FLAG_PI) != 0 {
+        var waiter_prio: u32 = waitqueue_highest_priority(&mutex.waiters)
+        var owner_prio: u32 = process.process_get_priority(mutex.owner)
+
+        if waiter_prio > owner_prio {
+            // Boost owner's priority
+            mutex.original_priority = owner_prio
+            process.process_set_priority(mutex.owner, waiter_prio)
+        }
+    }
+
+    // Block until woken
+    while entry.woken == 0 {
+        scheduler.block_current()
+    }
+
+    // We now own the mutex
+    mutex.owner = current_pid
+    mutex.acquired_at = foundation.get_ticks()
+}
+
+// Unlock mutex
+export fn mutex_unlock(mutex: *Mutex) {
+    var current_pid: u32 = get_current_pid()
+
+    // Verify ownership
+    if mutex.owner != current_pid {
+        if (mutex.flags & MUTEX_FLAG_ERRORCHECK) != 0 {
+            foundation.serial_write_string("[MUTEX] Unlock by non-owner\n")
+        }
+        return
+    }
+
+    // Handle recursive mutex
+    if (mutex.flags & MUTEX_FLAG_RECURSIVE) != 0 {
+        if mutex.recursion_count > 0 {
+            mutex.recursion_count = mutex.recursion_count - 1
+            return
+        }
+    }
+
+    // Restore priority if PI was used
+    if (mutex.flags & MUTEX_FLAG_PI) != 0 {
+        if mutex.original_priority != 0 {
+            process.process_set_priority(current_pid, mutex.original_priority)
+            mutex.original_priority = 0
+        }
+    }
+
+    // Clear owner
+    mutex.owner = 0
+
+    // Check for waiters
+    if mutex.state == MUTEX_CONTENDED {
+        // Wake one waiter
+        if waitqueue_wake_one(&mutex.waiters) == 0 {
+            // No more waiters
+            mutex.state = MUTEX_UNLOCKED
+        }
+        // State stays CONTENDED until new owner sets it
+    } else {
+        mutex.state = MUTEX_UNLOCKED
+    }
+}
+
+// Try to lock mutex (non-blocking)
+export fn mutex_try_lock(mutex: *Mutex): u32 {
+    var current_pid: u32 = get_current_pid()
+
+    // Try atomic acquire
+    var old: u32 = @atomicCmpXchg(&mutex.state, MUTEX_UNLOCKED, MUTEX_LOCKED)
+    if old == MUTEX_UNLOCKED {
+        mutex.owner = current_pid
+        mutex.acquired_at = foundation.get_ticks()
+        return 1
+    }
+
+    // Check for recursive
+    if (mutex.flags & MUTEX_FLAG_RECURSIVE) != 0 {
+        if mutex.owner == current_pid {
+            mutex.recursion_count = mutex.recursion_count + 1
+            return 1
+        }
+    }
+
+    return 0
+}
+
+// Lock with timeout (returns 1 on success, 0 on timeout)
+export fn mutex_lock_timeout(mutex: *Mutex, timeout_ms: u32): u32 {
+    var current_pid: u32 = get_current_pid()
+
+    // Fast path
+    if mutex_try_lock(mutex) != 0 {
+        return 1
+    }
+
+    // Add to wait queue
+    var entry: *WaitQueueEntry = alloc_wait_entry()
+    if entry == null {
+        return 0
+    }
+
+    entry.pid = current_pid
+    entry.priority = process.process_get_priority(current_pid)
+    entry.woken = 0
+
+    waitqueue_add(&mutex.waiters, entry)
+    mutex.state = MUTEX_CONTENDED
+
+    // Wait with timeout
+    var deadline: u64 = foundation.get_ticks() + @intCast(timeout_ms, u64) * 1000
+
+    while entry.woken == 0 {
+        if foundation.get_ticks() >= deadline {
+            // Timeout - remove from queue
+            waitqueue_remove(&mutex.waiters, entry)
+            free_wait_entry(entry)
+            return 0
+        }
+        scheduler.block_current_timeout(1)  // 1ms sleep
+    }
+
+    mutex.owner = current_pid
+    mutex.acquired_at = foundation.get_ticks()
+    return 1
+}
+
+// Check if mutex is locked
+export fn mutex_is_locked(mutex: *Mutex): u32 {
+    if mutex.state != MUTEX_UNLOCKED {
+        return 1
+    }
+    return 0
+}
+
+// Check if current process owns mutex
+export fn mutex_is_owned(mutex: *Mutex): u32 {
+    if mutex.owner == get_current_pid() {
+        return 1
+    }
+    return 0
+}
+
+// Get owner PID
+export fn mutex_get_owner(mutex: *Mutex): u32 {
+    return mutex.owner
+}
+
+// Get waiter count
+export fn mutex_get_waiter_count(mutex: *Mutex): u32 {
+    return mutex.waiters.count
+}
+
+// ============= Read-Write Mutex =============
+
+// Initialize RW mutex
+export fn rwmutex_init(rw: *RWMutex) {
+    rw.state = 0
+    rw.writer_pid = 0
+    rw.flags = 0
+    waitqueue_init(&rw.writer_queue)
+    waitqueue_init(&rw.reader_queue)
+}
+
+// Acquire read lock (shared)
+export fn rwmutex_read_lock(rw: *RWMutex) {
+    while true {
+        var state: i32 = rw.state
+
+        // If writer is holding or waiting writers, wait
+        if state < 0 or rw.writer_queue.count > 0 {
+            var entry: *WaitQueueEntry = alloc_wait_entry()
+            if entry == null {
+                foundation.hlt()
+                continue
+            }
+
+            entry.pid = get_current_pid()
+            entry.woken = 0
+
+            waitqueue_add(&rw.reader_queue, entry)
+
+            while entry.woken == 0 and rw.state < 0 {
+                scheduler.block_current()
+            }
+
+            continue
+        }
+
+        // Try to increment reader count
+        var new_state: i32 = state + 1
+        var old: i32 = @atomicCmpXchg(&rw.state, state, new_state)
+        if old == state {
+            return
+        }
+    }
+}
+
+// Release read lock
+export fn rwmutex_read_unlock(rw: *RWMutex) {
+    var old: i32 = @atomicFetchSub(&rw.state, 1)
+
+    // If we were last reader and writers waiting, wake one
+    if old == 1 and rw.writer_queue.count > 0 {
+        waitqueue_wake_one(&rw.writer_queue)
+    }
+}
+
+// Try read lock
+export fn rwmutex_try_read_lock(rw: *RWMutex): u32 {
+    var state: i32 = rw.state
+
+    if state < 0 {
+        return 0
+    }
+
+    var new_state: i32 = state + 1
+    var old: i32 = @atomicCmpXchg(&rw.state, state, new_state)
+    if old == state {
+        return 1
+    }
+    return 0
+}
+
+// Acquire write lock (exclusive)
+export fn rwmutex_write_lock(rw: *RWMutex) {
+    var current_pid: u32 = get_current_pid()
+
+    while true {
+        // Try to acquire when free
+        var old: i32 = @atomicCmpXchg(&rw.state, 0, -1)
+        if old == 0 {
+            rw.writer_pid = current_pid
+            return
+        }
+
+        // Add to writer queue
+        var entry: *WaitQueueEntry = alloc_wait_entry()
+        if entry == null {
+            foundation.hlt()
+            continue
+        }
+
+        entry.pid = current_pid
+        entry.woken = 0
+
+        waitqueue_add(&rw.writer_queue, entry)
+
+        while entry.woken == 0 and rw.state != 0 {
+            scheduler.block_current()
+        }
+    }
+}
+
+// Release write lock
+export fn rwmutex_write_unlock(rw: *RWMutex) {
+    rw.writer_pid = 0
+
+    // Set to unlocked
+    @atomicStore(&rw.state, 0)
+
+    // Wake all waiting readers, or one writer
+    if rw.reader_queue.count > 0 {
+        waitqueue_wake_all(&rw.reader_queue)
+    } else if rw.writer_queue.count > 0 {
+        waitqueue_wake_one(&rw.writer_queue)
+    }
+}
+
+// Try write lock
+export fn rwmutex_try_write_lock(rw: *RWMutex): u32 {
+    var old: i32 = @atomicCmpXchg(&rw.state, 0, -1)
+    if old == 0 {
+        rw.writer_pid = get_current_pid()
+        return 1
+    }
+    return 0
+}
+
+// Upgrade read to write lock
+export fn rwmutex_upgrade(rw: *RWMutex) {
+    rwmutex_read_unlock(rw)
+    rwmutex_write_lock(rw)
+}
+
+// Downgrade write to read lock
+export fn rwmutex_downgrade(rw: *RWMutex) {
+    rw.writer_pid = 0
+    @atomicStore(&rw.state, 1)  // Single reader
+
+    // Wake waiting readers
+    waitqueue_wake_all(&rw.reader_queue)
+}
+
+// ============= Condition Variable =============
+
+export struct CondVar {
+    waiters: WaitQueue,
+    signal_count: u32
+}
+
+// Initialize condition variable
+export fn condvar_init(cv: *CondVar) {
+    waitqueue_init(&cv.waiters)
+    cv.signal_count = 0
+}
+
+// Wait on condition (must hold mutex)
+export fn condvar_wait(cv: *CondVar, mutex: *Mutex) {
+    var current_pid: u32 = get_current_pid()
+
+    // Add to wait queue
+    var entry: *WaitQueueEntry = alloc_wait_entry()
+    if entry == null {
+        return
+    }
+
+    entry.pid = current_pid
+    entry.woken = 0
+    var current_signal: u32 = cv.signal_count
+
+    waitqueue_add(&cv.waiters, entry)
+
+    // Release mutex before sleeping
+    mutex_unlock(mutex)
+
+    // Wait for signal
+    while entry.woken == 0 and cv.signal_count == current_signal {
+        scheduler.block_current()
+    }
+
+    // Reacquire mutex
+    mutex_lock(mutex)
+}
+
+// Wait with timeout
+export fn condvar_wait_timeout(cv: *CondVar, mutex: *Mutex, timeout_ms: u32): u32 {
+    var current_pid: u32 = get_current_pid()
+
+    var entry: *WaitQueueEntry = alloc_wait_entry()
+    if entry == null {
+        return 0
+    }
+
+    entry.pid = current_pid
+    entry.woken = 0
+    var current_signal: u32 = cv.signal_count
+
+    waitqueue_add(&cv.waiters, entry)
+    mutex_unlock(mutex)
+
+    var deadline: u64 = foundation.get_ticks() + @intCast(timeout_ms, u64) * 1000
+
+    while entry.woken == 0 and cv.signal_count == current_signal {
+        if foundation.get_ticks() >= deadline {
+            waitqueue_remove(&cv.waiters, entry)
+            free_wait_entry(entry)
+            mutex_lock(mutex)
+            return 0
+        }
+        scheduler.block_current_timeout(1)
+    }
+
+    mutex_lock(mutex)
+    return 1
+}
+
+// Signal one waiter
+export fn condvar_signal(cv: *CondVar) {
+    cv.signal_count = cv.signal_count + 1
+    waitqueue_wake_one(&cv.waiters)
+}
+
+// Signal all waiters
+export fn condvar_broadcast(cv: *CondVar) {
+    cv.signal_count = cv.signal_count + 1
+    waitqueue_wake_all(&cv.waiters)
+}
+
+// ============= Once =============
+
+export struct Once {
+    done: u32,
+    lock: spinlock.Spinlock
+}
+
+// Initialize once
+export fn once_init(once: *Once) {
+    once.done = 0
+    spinlock.spinlock_init(&once.lock)
+}
+
+// Execute function once
+export fn once_call(once: *Once, func: fn()) {
+    // Fast check
+    if once.done != 0 {
+        return
+    }
+
+    spinlock.spinlock_acquire(&once.lock)
+
+    // Double check
+    if once.done == 0 {
+        func()
+        once.done = 1
+    }
+
+    spinlock.spinlock_release(&once.lock)
+}
+
+// Reset once (for reuse)
+export fn once_reset(once: *Once) {
+    spinlock.spinlock_acquire(&once.lock)
+    once.done = 0
+    spinlock.spinlock_release(&once.lock)
 }

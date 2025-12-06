@@ -1,41 +1,515 @@
 // home-os Spinlock
-// Basic synchronization primitive
+// Low-level synchronization primitive with atomic operations and memory barriers
 
 import "../core/foundation.home" as foundation
 
+// Spinlock structure
 export struct Spinlock {
-  locked: u32
+    locked: u32,              // Lock state (0 = unlocked, 1 = locked)
+    owner_cpu: u32,           // CPU that holds the lock
+    irq_flags: u64,           // Saved interrupt flags
+    lock_count: u32,          // Recursion count (for recursive locks)
+    contention_count: u64     // Statistics: number of contentions
 }
 
-export fn spinlock_init(lock: u64) {
-  @ptrToInt(lock, u32) = 0
+// Spinlock with debugging info
+export struct SpinlockDebug {
+    lock: Spinlock,
+    name: [32]u8,             // Lock name for debugging
+    file: [64]u8,             // File where lock was created
+    line: u32,                // Line number
+    last_owner: u32,          // Last CPU that held the lock
+    acquire_time: u64         // Timestamp when acquired
 }
 
-export fn spinlock_acquire(lock: u64) {
-  while true {
-    var expected: u32 = 0
-    var desired: u32 = 1
-    
-    // Atomic compare-exchange stub
-    var current: u32 = @intToPtr(lock, u32)
-    if current == expected {
-      @ptrToInt(lock, u32) = desired
-      break
+// Ticket spinlock for fairness
+export struct TicketSpinlock {
+    next_ticket: u32,         // Next ticket to be given
+    now_serving: u32,         // Current ticket being served
+    owner_cpu: u32,
+    irq_flags: u64
+}
+
+// Read-write spinlock
+export struct RWSpinlock {
+    lock: u32,                // Bit 31 = write lock, bits 0-30 = reader count
+    writer_cpu: u32,
+    irq_flags: u64
+}
+
+const SPINLOCK_UNLOCKED: u32 = 0
+const SPINLOCK_LOCKED: u32 = 1
+const RWLOCK_WRITER_BIT: u32 = 0x80000000
+const RWLOCK_READER_MASK: u32 = 0x7FFFFFFF
+
+// Atomic compare-and-swap
+fn atomic_cmpxchg(ptr: *volatile u32, expected: u32, desired: u32): u32 {
+    // Use x86 LOCK CMPXCHG instruction
+    var result: u32 = undefined
+    asm volatile (
+        "lock cmpxchgl %2, %1"
+        : "=a" (result), "+m" (@ptrToInt(ptr, u32))
+        : "r" (desired), "0" (expected)
+        : "memory"
+    )
+    return result
+}
+
+// Atomic exchange
+fn atomic_xchg(ptr: *volatile u32, value: u32): u32 {
+    var result: u32 = undefined
+    asm volatile (
+        "xchgl %0, %1"
+        : "=r" (result), "+m" (@ptrToInt(ptr, u32))
+        : "0" (value)
+        : "memory"
+    )
+    return result
+}
+
+// Atomic load
+fn atomic_load(ptr: *volatile u32): u32 {
+    var result: u32 = undefined
+    asm volatile (
+        "movl %1, %0"
+        : "=r" (result)
+        : "m" (@ptrToInt(ptr, u32))
+        : "memory"
+    )
+    return result
+}
+
+// Atomic store
+fn atomic_store(ptr: *volatile u32, value: u32) {
+    asm volatile (
+        "movl %1, %0"
+        : "=m" (@ptrToInt(ptr, u32))
+        : "r" (value)
+        : "memory"
+    )
+}
+
+// Atomic add and return old value
+fn atomic_fetch_add(ptr: *volatile u32, value: u32): u32 {
+    var result: u32 = undefined
+    asm volatile (
+        "lock xaddl %0, %1"
+        : "=r" (result), "+m" (@ptrToInt(ptr, u32))
+        : "0" (value)
+        : "memory"
+    )
+    return result
+}
+
+// Atomic subtract and return old value
+fn atomic_fetch_sub(ptr: *volatile u32, value: u32): u32 {
+    return atomic_fetch_add(ptr, @bitCast(-@intCast(value, i32), u32))
+}
+
+// Memory barrier - full fence
+fn memory_barrier() {
+    asm volatile ("mfence" ::: "memory")
+}
+
+// Compiler barrier
+fn compiler_barrier() {
+    asm volatile ("" ::: "memory")
+}
+
+// CPU pause hint for spin loops
+fn cpu_pause() {
+    asm volatile ("pause")
+}
+
+// Disable interrupts and return previous flags
+fn irq_save(): u64 {
+    var flags: u64 = undefined
+    asm volatile (
+        "pushfq\n"
+        "popq %0\n"
+        "cli"
+        : "=r" (flags)
+        :
+        : "memory"
+    )
+    return flags
+}
+
+// Restore interrupt flags
+fn irq_restore(flags: u64) {
+    asm volatile (
+        "pushq %0\n"
+        "popfq"
+        :
+        : "r" (flags)
+        : "memory", "cc"
+    )
+}
+
+// Get current CPU ID
+fn get_cpu_id(): u32 {
+    // Read from APIC ID or similar
+    return 0  // Simplified for single CPU
+}
+
+// Initialize a spinlock
+export fn spinlock_init(lock: *Spinlock) {
+    lock.locked = SPINLOCK_UNLOCKED
+    lock.owner_cpu = 0xFFFFFFFF
+    lock.irq_flags = 0
+    lock.lock_count = 0
+    lock.contention_count = 0
+}
+
+// Acquire spinlock (spinning)
+export fn spinlock_acquire(lock: *Spinlock) {
+    var iterations: u32 = 0
+
+    while true {
+        // Try to acquire
+        var old: u32 = atomic_cmpxchg(&lock.locked, SPINLOCK_UNLOCKED, SPINLOCK_LOCKED)
+        if old == SPINLOCK_UNLOCKED {
+            // Acquired successfully
+            memory_barrier()
+            lock.owner_cpu = get_cpu_id()
+            return
+        }
+
+        // Count contention
+        if iterations == 0 {
+            lock.contention_count = lock.contention_count + 1
+        }
+
+        // Spin with backoff
+        iterations = iterations + 1
+
+        // Use pause instruction to reduce power and improve performance
+        var i: u32 = 0
+        while i < iterations {
+            cpu_pause()
+            i = i + 1
+        }
+
+        // Cap backoff
+        if iterations > 1000 {
+            iterations = 1000
+        }
     }
-    
-    foundation.hlt()  // Yield CPU
-  }
 }
 
-export fn spinlock_release(lock: u64) {
-  @ptrToInt(lock, u32) = 0
+// Release spinlock
+export fn spinlock_release(lock: *Spinlock) {
+    lock.owner_cpu = 0xFFFFFFFF
+    memory_barrier()
+    atomic_store(&lock.locked, SPINLOCK_UNLOCKED)
 }
 
-export fn spinlock_try_acquire(lock: u64): u32 {
-  var current: u32 = @intToPtr(lock, u32)
-  if current == 0 {
-    @ptrToInt(lock, u32) = 1
-    return 1
-  }
-  return 0
+// Try to acquire spinlock (non-blocking)
+export fn spinlock_try_acquire(lock: *Spinlock): u32 {
+    var old: u32 = atomic_cmpxchg(&lock.locked, SPINLOCK_UNLOCKED, SPINLOCK_LOCKED)
+    if old == SPINLOCK_UNLOCKED {
+        memory_barrier()
+        lock.owner_cpu = get_cpu_id()
+        return 1
+    }
+    return 0
+}
+
+// Check if spinlock is held
+export fn spinlock_is_locked(lock: *Spinlock): u32 {
+    return atomic_load(&lock.locked)
+}
+
+// Acquire spinlock with IRQ disabled
+export fn spinlock_acquire_irq(lock: *Spinlock) {
+    var flags: u64 = irq_save()
+    spinlock_acquire(lock)
+    lock.irq_flags = flags
+}
+
+// Release spinlock and restore IRQ
+export fn spinlock_release_irq(lock: *Spinlock) {
+    var flags: u64 = lock.irq_flags
+    spinlock_release(lock)
+    irq_restore(flags)
+}
+
+// Try acquire with IRQ
+export fn spinlock_try_acquire_irq(lock: *Spinlock): u32 {
+    var flags: u64 = irq_save()
+    if spinlock_try_acquire(lock) != 0 {
+        lock.irq_flags = flags
+        return 1
+    }
+    irq_restore(flags)
+    return 0
+}
+
+// ============= Ticket Spinlock (Fair) =============
+
+// Initialize ticket spinlock
+export fn ticket_spinlock_init(lock: *TicketSpinlock) {
+    lock.next_ticket = 0
+    lock.now_serving = 0
+    lock.owner_cpu = 0xFFFFFFFF
+    lock.irq_flags = 0
+}
+
+// Acquire ticket spinlock
+export fn ticket_spinlock_acquire(lock: *TicketSpinlock) {
+    // Get our ticket
+    var ticket: u32 = atomic_fetch_add(&lock.next_ticket, 1)
+
+    // Wait for our turn
+    while atomic_load(&lock.now_serving) != ticket {
+        cpu_pause()
+    }
+
+    memory_barrier()
+    lock.owner_cpu = get_cpu_id()
+}
+
+// Release ticket spinlock
+export fn ticket_spinlock_release(lock: *TicketSpinlock) {
+    lock.owner_cpu = 0xFFFFFFFF
+    memory_barrier()
+    atomic_fetch_add(&lock.now_serving, 1)
+}
+
+// Try acquire ticket spinlock
+export fn ticket_spinlock_try_acquire(lock: *TicketSpinlock): u32 {
+    var ticket: u32 = atomic_load(&lock.next_ticket)
+    var serving: u32 = atomic_load(&lock.now_serving)
+
+    if ticket == serving {
+        // Try to get ticket atomically
+        var old: u32 = atomic_cmpxchg(&lock.next_ticket, ticket, ticket + 1)
+        if old == ticket {
+            memory_barrier()
+            lock.owner_cpu = get_cpu_id()
+            return 1
+        }
+    }
+    return 0
+}
+
+// Acquire with IRQ disabled
+export fn ticket_spinlock_acquire_irq(lock: *TicketSpinlock) {
+    var flags: u64 = irq_save()
+    ticket_spinlock_acquire(lock)
+    lock.irq_flags = flags
+}
+
+// Release with IRQ restore
+export fn ticket_spinlock_release_irq(lock: *TicketSpinlock) {
+    var flags: u64 = lock.irq_flags
+    ticket_spinlock_release(lock)
+    irq_restore(flags)
+}
+
+// ============= Read-Write Spinlock =============
+
+// Initialize RW spinlock
+export fn rwspinlock_init(lock: *RWSpinlock) {
+    lock.lock = 0
+    lock.writer_cpu = 0xFFFFFFFF
+    lock.irq_flags = 0
+}
+
+// Acquire read lock (shared)
+export fn rwspinlock_read_acquire(lock: *RWSpinlock) {
+    while true {
+        var old: u32 = atomic_load(&lock.lock)
+
+        // If writer is holding, wait
+        if (old & RWLOCK_WRITER_BIT) != 0 {
+            cpu_pause()
+            continue
+        }
+
+        // Try to increment reader count
+        var new_val: u32 = old + 1
+        var result: u32 = atomic_cmpxchg(&lock.lock, old, new_val)
+        if result == old {
+            memory_barrier()
+            return
+        }
+        cpu_pause()
+    }
+}
+
+// Release read lock
+export fn rwspinlock_read_release(lock: *RWSpinlock) {
+    memory_barrier()
+    atomic_fetch_sub(&lock.lock, 1)
+}
+
+// Try acquire read lock
+export fn rwspinlock_read_try_acquire(lock: *RWSpinlock): u32 {
+    var old: u32 = atomic_load(&lock.lock)
+
+    // If writer is holding, fail
+    if (old & RWLOCK_WRITER_BIT) != 0 {
+        return 0
+    }
+
+    // Try to increment reader count
+    var new_val: u32 = old + 1
+    var result: u32 = atomic_cmpxchg(&lock.lock, old, new_val)
+    if result == old {
+        memory_barrier()
+        return 1
+    }
+    return 0
+}
+
+// Acquire write lock (exclusive)
+export fn rwspinlock_write_acquire(lock: *RWSpinlock) {
+    while true {
+        // Try to set writer bit when no readers or writers
+        var old: u32 = atomic_cmpxchg(&lock.lock, 0, RWLOCK_WRITER_BIT)
+        if old == 0 {
+            memory_barrier()
+            lock.writer_cpu = get_cpu_id()
+            return
+        }
+        cpu_pause()
+    }
+}
+
+// Release write lock
+export fn rwspinlock_write_release(lock: *RWSpinlock) {
+    lock.writer_cpu = 0xFFFFFFFF
+    memory_barrier()
+    atomic_store(&lock.lock, 0)
+}
+
+// Try acquire write lock
+export fn rwspinlock_write_try_acquire(lock: *RWSpinlock): u32 {
+    var old: u32 = atomic_cmpxchg(&lock.lock, 0, RWLOCK_WRITER_BIT)
+    if old == 0 {
+        memory_barrier()
+        lock.writer_cpu = get_cpu_id()
+        return 1
+    }
+    return 0
+}
+
+// Acquire read with IRQ
+export fn rwspinlock_read_acquire_irq(lock: *RWSpinlock) {
+    var flags: u64 = irq_save()
+    rwspinlock_read_acquire(lock)
+    lock.irq_flags = flags
+}
+
+// Release read with IRQ
+export fn rwspinlock_read_release_irq(lock: *RWSpinlock) {
+    var flags: u64 = lock.irq_flags
+    rwspinlock_read_release(lock)
+    irq_restore(flags)
+}
+
+// Acquire write with IRQ
+export fn rwspinlock_write_acquire_irq(lock: *RWSpinlock) {
+    var flags: u64 = irq_save()
+    rwspinlock_write_acquire(lock)
+    lock.irq_flags = flags
+}
+
+// Release write with IRQ
+export fn rwspinlock_write_release_irq(lock: *RWSpinlock) {
+    var flags: u64 = lock.irq_flags
+    rwspinlock_write_release(lock)
+    irq_restore(flags)
+}
+
+// Upgrade read to write lock (releases read, acquires write)
+export fn rwspinlock_upgrade(lock: *RWSpinlock) {
+    rwspinlock_read_release(lock)
+    rwspinlock_write_acquire(lock)
+}
+
+// Downgrade write to read lock
+export fn rwspinlock_downgrade(lock: *RWSpinlock) {
+    // Atomically convert write to single reader
+    lock.writer_cpu = 0xFFFFFFFF
+    memory_barrier()
+    atomic_store(&lock.lock, 1)  // Set reader count to 1
+}
+
+// Get reader count
+export fn rwspinlock_reader_count(lock: *RWSpinlock): u32 {
+    var val: u32 = atomic_load(&lock.lock)
+    return val & RWLOCK_READER_MASK
+}
+
+// Check if write locked
+export fn rwspinlock_is_write_locked(lock: *RWSpinlock): u32 {
+    var val: u32 = atomic_load(&lock.lock)
+    if (val & RWLOCK_WRITER_BIT) != 0 {
+        return 1
+    }
+    return 0
+}
+
+// ============= Debug Functions =============
+
+// Initialize debug spinlock
+export fn spinlock_debug_init(lock: *SpinlockDebug, name: [*]u8) {
+    spinlock_init(&lock.lock)
+
+    // Copy name
+    var i: u32 = 0
+    while i < 31 {
+        if name[i] == 0 {
+            break
+        }
+        lock.name[i] = name[i]
+        i = i + 1
+    }
+    lock.name[i] = 0
+    lock.line = 0
+    lock.last_owner = 0xFFFFFFFF
+    lock.acquire_time = 0
+}
+
+// Acquire with debugging
+export fn spinlock_debug_acquire(lock: *SpinlockDebug, file: [*]u8, line: u32) {
+    var start_time: u64 = foundation.get_ticks()
+
+    spinlock_acquire(&lock.lock)
+
+    lock.acquire_time = foundation.get_ticks()
+    lock.last_owner = get_cpu_id()
+
+    // Warn if lock took too long
+    var elapsed: u64 = lock.acquire_time - start_time
+    if elapsed > 1000000 {
+        foundation.serial_write_string("[SPINLOCK] Warning: ")
+        foundation.serial_write_string(&lock.name[0])
+        foundation.serial_write_string(" took ")
+        foundation.serial_write_dec(@truncate(elapsed, u32))
+        foundation.serial_write_string(" ticks to acquire\n")
+    }
+}
+
+// Release with debugging
+export fn spinlock_debug_release(lock: *SpinlockDebug) {
+    var held_time: u64 = foundation.get_ticks() - lock.acquire_time
+
+    // Warn if lock held too long
+    if held_time > 10000000 {
+        foundation.serial_write_string("[SPINLOCK] Warning: ")
+        foundation.serial_write_string(&lock.name[0])
+        foundation.serial_write_string(" held for ")
+        foundation.serial_write_dec(@truncate(held_time, u32))
+        foundation.serial_write_string(" ticks\n")
+    }
+
+    spinlock_release(&lock.lock)
+}
+
+// Get spinlock statistics
+export fn spinlock_get_stats(lock: *Spinlock, contention: *u64) {
+    @ptrToInt(contention, u64) = lock.contention_count
 }
