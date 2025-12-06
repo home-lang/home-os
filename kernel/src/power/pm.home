@@ -1,8 +1,12 @@
 // home-os Power Management
-// Power states and management
+// Power states, peripheral power management, and device suspend/resume
 
 import "../core/foundation.home" as foundation
 import "../drivers/acpi.home" as acpi
+
+// ============================================================================
+// System Power States
+// ============================================================================
 
 const PM_STATE_RUNNING: u32 = 0
 const PM_STATE_SUSPEND: u32 = 1
@@ -10,29 +14,725 @@ const PM_STATE_HIBERNATE: u32 = 2
 const PM_STATE_SHUTDOWN: u32 = 3
 
 var pm_state: u32 = PM_STATE_RUNNING
+var pm_initialized: u32 = 0
+
+// ============================================================================
+// Device Power States (D-states like ACPI)
+// ============================================================================
+
+const DEV_POWER_D0: u32 = 0    // Fully on
+const DEV_POWER_D1: u32 = 1    // Light sleep
+const DEV_POWER_D2: u32 = 2    // Deep sleep
+const DEV_POWER_D3: u32 = 3    // Off
+
+// Device types for power management
+const DEV_TYPE_USB: u32 = 0
+const DEV_TYPE_DISPLAY: u32 = 1
+const DEV_TYPE_AUDIO: u32 = 2
+const DEV_TYPE_NETWORK: u32 = 3
+const DEV_TYPE_STORAGE: u32 = 4
+const DEV_TYPE_GPIO: u32 = 5
+const DEV_TYPE_OTHER: u32 = 6
+
+const MAX_PM_DEVICES: u32 = 64
+
+struct PMDevice {
+  active: u32,
+  dev_type: u32,
+  power_state: u32,
+  name: [32]u8,
+  idle_timeout_ms: u32,
+  last_activity_ms: u64,
+  suspend_count: u32,
+  resume_count: u32,
+  can_suspend: u32,
+  can_clock_gate: u32
+}
+
+var pm_devices: [PMDevice; 64]
+var pm_device_count: u32 = 0
+
+// ============================================================================
+// Clock Gating
+// ============================================================================
+
+const MAX_CLOCKS: u32 = 32
+
+struct ClockDomain {
+  active: u32,
+  id: u32,
+  name: [32]u8,
+  enabled: u32,
+  ref_count: u32,
+  gate_register: u64,
+  gate_bit: u32
+}
+
+var clocks: [ClockDomain; 32]
+var clock_count: u32 = 0
+
+// ============================================================================
+// Display Blanking
+// ============================================================================
+
+const DISPLAY_STATE_ON: u32 = 0
+const DISPLAY_STATE_DIMMED: u32 = 1
+const DISPLAY_STATE_BLANKED: u32 = 2
+const DISPLAY_STATE_OFF: u32 = 3
+
+var display_state: u32 = DISPLAY_STATE_ON
+var display_timeout_ms: u32 = 300000  // 5 minutes default
+var display_last_activity: u64 = 0
+var display_brightness: u32 = 100
+
+// ============================================================================
+// USB Selective Suspend
+// ============================================================================
+
+const USB_SUSPEND_DISABLED: u32 = 0
+const USB_SUSPEND_ENABLED: u32 = 1
+
+var usb_autosuspend: u32 = USB_SUSPEND_ENABLED
+var usb_suspend_delay_ms: u32 = 3000  // 3 seconds idle before suspend
+var usb_devices_suspended: u32 = 0
+var usb_devices_active: u32 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
 
 export fn pm_init() {
   pm_state = PM_STATE_RUNNING
+
+  // Initialize device tracking
+  var i: u32 = 0
+  while i < MAX_PM_DEVICES {
+    pm_devices[i].active = 0
+    i = i + 1
+  }
+
+  i = 0
+  while i < MAX_CLOCKS {
+    clocks[i].active = 0
+    i = i + 1
+  }
+
+  pm_device_count = 0
+  clock_count = 0
+  pm_initialized = 1
+
   foundation.serial_write_string("[PM] Power management initialized\n")
+  foundation.serial_write_string("[PM] USB autosuspend: enabled (")
+  foundation.serial_write_u64(usb_suspend_delay_ms)
+  foundation.serial_write_string(" ms delay)\n")
+  foundation.serial_write_string("[PM] Display timeout: ")
+  foundation.serial_write_u64(display_timeout_ms / 1000)
+  foundation.serial_write_string(" seconds\n")
 }
+
+// ============================================================================
+// System Power Control
+// ============================================================================
 
 export fn pm_shutdown() {
   foundation.serial_write_string("[PM] Shutting down...\n")
+
+  // Suspend all devices first
+  pm_suspend_all_devices()
+
   pm_state = PM_STATE_SHUTDOWN
   acpi.acpi_shutdown()
 }
 
 export fn pm_reboot() {
   foundation.serial_write_string("[PM] Rebooting...\n")
+  pm_suspend_all_devices()
   acpi.acpi_reboot()
 }
 
 export fn pm_suspend() {
   foundation.serial_write_string("[PM] Suspending...\n")
+
+  // Suspend all peripherals
+  pm_suspend_all_devices()
+
+  // Gate all non-essential clocks
+  pm_gate_idle_clocks()
+
   pm_state = PM_STATE_SUSPEND
   foundation.hlt()
 }
 
+export fn pm_resume() {
+  foundation.serial_write_string("[PM] Resuming...\n")
+
+  pm_state = PM_STATE_RUNNING
+
+  // Ungate clocks
+  pm_ungate_all_clocks()
+
+  // Resume devices
+  pm_resume_all_devices()
+}
+
 export fn pm_get_state(): u32 {
   return pm_state
+}
+
+// ============================================================================
+// Device Registration
+// ============================================================================
+
+export fn pm_register_device(name: u64, dev_type: u32, can_suspend: u32): u32 {
+  if pm_device_count >= MAX_PM_DEVICES { return 0xFFFFFFFF }
+
+  var idx: u32 = pm_device_count
+  var dev: *PMDevice = &pm_devices[idx]
+
+  dev.active = 1
+  dev.dev_type = dev_type
+  dev.power_state = DEV_POWER_D0
+  dev.idle_timeout_ms = 5000  // 5 second default
+  dev.last_activity_ms = 0
+  dev.suspend_count = 0
+  dev.resume_count = 0
+  dev.can_suspend = can_suspend
+  dev.can_clock_gate = 1
+
+  // Copy name
+  var i: u32 = 0
+  while i < 31 {
+    var c: u8 = @ptrLoad(name + i, u8)
+    dev.name[i] = c
+    if c == 0 { break }
+    i = i + 1
+  }
+  dev.name[31] = 0
+
+  pm_device_count = pm_device_count + 1
+
+  foundation.serial_write_string("[PM] Registered device: ")
+  foundation.serial_write_string(&dev.name[0])
+  foundation.serial_write_string("\n")
+
+  return idx
+}
+
+// ============================================================================
+// Device Power Management
+// ============================================================================
+
+export fn pm_device_activity(dev_id: u32, timestamp_ms: u64) {
+  if dev_id >= pm_device_count { return }
+
+  var dev: *PMDevice = &pm_devices[dev_id]
+  dev.last_activity_ms = timestamp_ms
+
+  // Resume if suspended
+  if dev.power_state != DEV_POWER_D0 {
+    pm_device_resume(dev_id)
+  }
+}
+
+export fn pm_device_suspend(dev_id: u32): u32 {
+  if dev_id >= pm_device_count { return 1 }
+
+  var dev: *PMDevice = &pm_devices[dev_id]
+
+  if dev.can_suspend == 0 { return 1 }
+  if dev.power_state != DEV_POWER_D0 { return 0 }  // Already suspended
+
+  foundation.serial_write_string("[PM] Suspending device: ")
+  foundation.serial_write_string(&dev.name[0])
+  foundation.serial_write_string("\n")
+
+  dev.power_state = DEV_POWER_D3
+  dev.suspend_count = dev.suspend_count + 1
+
+  return 0
+}
+
+export fn pm_device_resume(dev_id: u32): u32 {
+  if dev_id >= pm_device_count { return 1 }
+
+  var dev: *PMDevice = &pm_devices[dev_id]
+
+  if dev.power_state == DEV_POWER_D0 { return 0 }  // Already active
+
+  foundation.serial_write_string("[PM] Resuming device: ")
+  foundation.serial_write_string(&dev.name[0])
+  foundation.serial_write_string("\n")
+
+  dev.power_state = DEV_POWER_D0
+  dev.resume_count = dev.resume_count + 1
+
+  return 0
+}
+
+fn pm_suspend_all_devices() {
+  foundation.serial_write_string("[PM] Suspending all devices...\n")
+
+  var i: u32 = 0
+  while i < pm_device_count {
+    if pm_devices[i].active == 1 and pm_devices[i].can_suspend == 1 {
+      pm_device_suspend(i)
+    }
+    i = i + 1
+  }
+}
+
+fn pm_resume_all_devices() {
+  foundation.serial_write_string("[PM] Resuming all devices...\n")
+
+  var i: u32 = 0
+  while i < pm_device_count {
+    if pm_devices[i].active == 1 {
+      pm_device_resume(i)
+    }
+    i = i + 1
+  }
+}
+
+// Check and suspend idle devices
+export fn pm_check_idle_devices(current_time_ms: u64) {
+  var i: u32 = 0
+  while i < pm_device_count {
+    var dev: *PMDevice = &pm_devices[i]
+
+    if dev.active == 1 and dev.can_suspend == 1 and dev.power_state == DEV_POWER_D0 {
+      var idle_time: u64 = current_time_ms - dev.last_activity_ms
+
+      if idle_time > dev.idle_timeout_ms {
+        pm_device_suspend(i)
+      }
+    }
+
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// USB Selective Suspend
+// ============================================================================
+
+export fn pm_usb_enable_autosuspend(enable: u32) {
+  usb_autosuspend = if enable != 0 { USB_SUSPEND_ENABLED } else { USB_SUSPEND_DISABLED }
+
+  foundation.serial_write_string("[PM] USB autosuspend: ")
+  if usb_autosuspend == USB_SUSPEND_ENABLED {
+    foundation.serial_write_string("enabled\n")
+  } else {
+    foundation.serial_write_string("disabled\n")
+  }
+}
+
+export fn pm_usb_set_suspend_delay(delay_ms: u32) {
+  usb_suspend_delay_ms = delay_ms
+
+  foundation.serial_write_string("[PM] USB suspend delay: ")
+  foundation.serial_write_u64(delay_ms)
+  foundation.serial_write_string(" ms\n")
+}
+
+export fn pm_usb_suspend_device(port: u32): u32 {
+  if usb_autosuspend == USB_SUSPEND_DISABLED { return 1 }
+
+  foundation.serial_write_string("[PM] USB port ")
+  foundation.serial_write_u64(port)
+  foundation.serial_write_string(" suspended\n")
+
+  usb_devices_suspended = usb_devices_suspended + 1
+  if usb_devices_active > 0 {
+    usb_devices_active = usb_devices_active - 1
+  }
+
+  return 0
+}
+
+export fn pm_usb_resume_device(port: u32): u32 {
+  foundation.serial_write_string("[PM] USB port ")
+  foundation.serial_write_u64(port)
+  foundation.serial_write_string(" resumed\n")
+
+  if usb_devices_suspended > 0 {
+    usb_devices_suspended = usb_devices_suspended - 1
+  }
+  usb_devices_active = usb_devices_active + 1
+
+  return 0
+}
+
+export fn pm_usb_get_suspend_count(): u32 {
+  return usb_devices_suspended
+}
+
+// ============================================================================
+// Display Blanking
+// ============================================================================
+
+export fn pm_display_set_timeout(timeout_ms: u32) {
+  display_timeout_ms = timeout_ms
+
+  foundation.serial_write_string("[PM] Display timeout: ")
+  foundation.serial_write_u64(timeout_ms / 1000)
+  foundation.serial_write_string(" seconds\n")
+}
+
+export fn pm_display_activity(timestamp_ms: u64) {
+  display_last_activity = timestamp_ms
+
+  // Turn on display if blanked
+  if display_state != DISPLAY_STATE_ON {
+    pm_display_on()
+  }
+}
+
+export fn pm_display_check_timeout(current_time_ms: u64) {
+  if display_state == DISPLAY_STATE_OFF { return }
+
+  var idle_time: u64 = current_time_ms - display_last_activity
+
+  if idle_time > display_timeout_ms {
+    pm_display_blank()
+  } else if idle_time > (display_timeout_ms * 3 / 4) {
+    pm_display_dim()
+  }
+}
+
+export fn pm_display_on() {
+  if display_state == DISPLAY_STATE_ON { return }
+
+  foundation.serial_write_string("[PM] Display: ON\n")
+  display_state = DISPLAY_STATE_ON
+  display_brightness = 100
+}
+
+export fn pm_display_dim() {
+  if display_state == DISPLAY_STATE_DIMMED { return }
+
+  foundation.serial_write_string("[PM] Display: DIMMED\n")
+  display_state = DISPLAY_STATE_DIMMED
+  display_brightness = 50
+}
+
+export fn pm_display_blank() {
+  if display_state == DISPLAY_STATE_BLANKED { return }
+
+  foundation.serial_write_string("[PM] Display: BLANKED\n")
+  display_state = DISPLAY_STATE_BLANKED
+  display_brightness = 0
+}
+
+export fn pm_display_off() {
+  if display_state == DISPLAY_STATE_OFF { return }
+
+  foundation.serial_write_string("[PM] Display: OFF\n")
+  display_state = DISPLAY_STATE_OFF
+  display_brightness = 0
+}
+
+export fn pm_display_get_state(): u32 {
+  return display_state
+}
+
+export fn pm_display_set_brightness(brightness: u32) {
+  display_brightness = if brightness > 100 { 100 } else { brightness }
+
+  if display_brightness == 0 {
+    display_state = DISPLAY_STATE_BLANKED
+  } else if display_brightness < 50 {
+    display_state = DISPLAY_STATE_DIMMED
+  } else {
+    display_state = DISPLAY_STATE_ON
+  }
+}
+
+// ============================================================================
+// Clock Gating
+// ============================================================================
+
+export fn pm_register_clock(name: u64, gate_reg: u64, gate_bit: u32): u32 {
+  if clock_count >= MAX_CLOCKS { return 0xFFFFFFFF }
+
+  var idx: u32 = clock_count
+  var clk: *ClockDomain = &clocks[idx]
+
+  clk.active = 1
+  clk.id = idx
+  clk.enabled = 1
+  clk.ref_count = 0
+  clk.gate_register = gate_reg
+  clk.gate_bit = gate_bit
+
+  // Copy name
+  var i: u32 = 0
+  while i < 31 {
+    var c: u8 = @ptrLoad(name + i, u8)
+    clk.name[i] = c
+    if c == 0 { break }
+    i = i + 1
+  }
+  clk.name[31] = 0
+
+  clock_count = clock_count + 1
+
+  return idx
+}
+
+export fn pm_clock_enable(clock_id: u32): u32 {
+  if clock_id >= clock_count { return 1 }
+
+  var clk: *ClockDomain = &clocks[clock_id]
+
+  clk.ref_count = clk.ref_count + 1
+
+  if clk.enabled == 0 {
+    foundation.serial_write_string("[PM] Clock enabled: ")
+    foundation.serial_write_string(&clk.name[0])
+    foundation.serial_write_string("\n")
+
+    clk.enabled = 1
+
+    // Write to gate register to enable clock
+    if clk.gate_register != 0 {
+      var val: u32 = @ptrLoad(clk.gate_register, u32)
+      val = val | (1 << clk.gate_bit)
+      @ptrStore(clk.gate_register, u32, val)
+    }
+  }
+
+  return 0
+}
+
+export fn pm_clock_disable(clock_id: u32): u32 {
+  if clock_id >= clock_count { return 1 }
+
+  var clk: *ClockDomain = &clocks[clock_id]
+
+  if clk.ref_count > 0 {
+    clk.ref_count = clk.ref_count - 1
+  }
+
+  // Only disable if no references
+  if clk.ref_count == 0 and clk.enabled == 1 {
+    foundation.serial_write_string("[PM] Clock disabled: ")
+    foundation.serial_write_string(&clk.name[0])
+    foundation.serial_write_string("\n")
+
+    clk.enabled = 0
+
+    // Write to gate register to disable clock
+    if clk.gate_register != 0 {
+      var val: u32 = @ptrLoad(clk.gate_register, u32)
+      val = val & ~(1 << clk.gate_bit)
+      @ptrStore(clk.gate_register, u32, val)
+    }
+  }
+
+  return 0
+}
+
+fn pm_gate_idle_clocks() {
+  foundation.serial_write_string("[PM] Gating idle clocks...\n")
+
+  var i: u32 = 0
+  while i < clock_count {
+    if clocks[i].active == 1 and clocks[i].ref_count == 0 {
+      pm_clock_disable(i)
+    }
+    i = i + 1
+  }
+}
+
+fn pm_ungate_all_clocks() {
+  foundation.serial_write_string("[PM] Ungating all clocks...\n")
+
+  var i: u32 = 0
+  while i < clock_count {
+    if clocks[i].active == 1 {
+      pm_clock_enable(i)
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// Status and Reporting
+// ============================================================================
+
+export fn pm_print_status() {
+  foundation.serial_write_string("\n========== POWER MANAGEMENT STATUS ==========\n\n")
+
+  foundation.serial_write_string("System state: ")
+  if pm_state == PM_STATE_RUNNING {
+    foundation.serial_write_string("RUNNING\n")
+  } else if pm_state == PM_STATE_SUSPEND {
+    foundation.serial_write_string("SUSPENDED\n")
+  } else if pm_state == PM_STATE_HIBERNATE {
+    foundation.serial_write_string("HIBERNATED\n")
+  } else {
+    foundation.serial_write_string("SHUTDOWN\n")
+  }
+
+  foundation.serial_write_string("\nDisplay:\n")
+  foundation.serial_write_string("  State: ")
+  if display_state == DISPLAY_STATE_ON {
+    foundation.serial_write_string("ON\n")
+  } else if display_state == DISPLAY_STATE_DIMMED {
+    foundation.serial_write_string("DIMMED\n")
+  } else if display_state == DISPLAY_STATE_BLANKED {
+    foundation.serial_write_string("BLANKED\n")
+  } else {
+    foundation.serial_write_string("OFF\n")
+  }
+  foundation.serial_write_string("  Brightness: ")
+  foundation.serial_write_u64(display_brightness)
+  foundation.serial_write_string("%\n")
+  foundation.serial_write_string("  Timeout: ")
+  foundation.serial_write_u64(display_timeout_ms / 1000)
+  foundation.serial_write_string(" sec\n")
+
+  foundation.serial_write_string("\nUSB:\n")
+  foundation.serial_write_string("  Autosuspend: ")
+  if usb_autosuspend == USB_SUSPEND_ENABLED {
+    foundation.serial_write_string("enabled\n")
+  } else {
+    foundation.serial_write_string("disabled\n")
+  }
+  foundation.serial_write_string("  Suspend delay: ")
+  foundation.serial_write_u64(usb_suspend_delay_ms)
+  foundation.serial_write_string(" ms\n")
+  foundation.serial_write_string("  Active devices: ")
+  foundation.serial_write_u64(usb_devices_active)
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("  Suspended devices: ")
+  foundation.serial_write_u64(usb_devices_suspended)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\nRegistered devices: ")
+  foundation.serial_write_u64(pm_device_count)
+  foundation.serial_write_string("\n")
+
+  var suspended: u32 = 0
+  var i: u32 = 0
+  while i < pm_device_count {
+    if pm_devices[i].power_state != DEV_POWER_D0 {
+      suspended = suspended + 1
+    }
+    i = i + 1
+  }
+
+  foundation.serial_write_string("  Active: ")
+  foundation.serial_write_u64(pm_device_count - suspended)
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("  Suspended: ")
+  foundation.serial_write_u64(suspended)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\nClocks:\n")
+  foundation.serial_write_string("  Registered: ")
+  foundation.serial_write_u64(clock_count)
+  foundation.serial_write_string("\n")
+
+  var enabled_clocks: u32 = 0
+  i = 0
+  while i < clock_count {
+    if clocks[i].enabled == 1 {
+      enabled_clocks = enabled_clocks + 1
+    }
+    i = i + 1
+  }
+
+  foundation.serial_write_string("  Enabled: ")
+  foundation.serial_write_u64(enabled_clocks)
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("  Gated: ")
+  foundation.serial_write_u64(clock_count - enabled_clocks)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n============================================\n\n")
+}
+
+// ============================================================================
+// Proc Interface
+// ============================================================================
+
+export fn pm_proc_read(buffer: u64, max_len: u32): u32 {
+  var pos: u32 = 0
+
+  // System state
+  pos = pos + pm_proc_line("state: ", buffer + pos)
+  if pm_state == PM_STATE_RUNNING {
+    pos = pos + pm_proc_line("running\n", buffer + pos)
+  } else {
+    pos = pos + pm_proc_line("suspended\n", buffer + pos)
+  }
+
+  // Display
+  pos = pos + pm_proc_line("display_state: ", buffer + pos)
+  pos = pos + pm_proc_u32(display_state, buffer + pos)
+  pos = pos + pm_proc_line("\n", buffer + pos)
+
+  pos = pos + pm_proc_line("display_brightness: ", buffer + pos)
+  pos = pos + pm_proc_u32(display_brightness, buffer + pos)
+  pos = pos + pm_proc_line("\n", buffer + pos)
+
+  // USB
+  pos = pos + pm_proc_line("usb_autosuspend: ", buffer + pos)
+  pos = pos + pm_proc_u32(usb_autosuspend, buffer + pos)
+  pos = pos + pm_proc_line("\n", buffer + pos)
+
+  pos = pos + pm_proc_line("usb_suspended: ", buffer + pos)
+  pos = pos + pm_proc_u32(usb_devices_suspended, buffer + pos)
+  pos = pos + pm_proc_line("\n", buffer + pos)
+
+  // Device counts
+  pos = pos + pm_proc_line("devices_total: ", buffer + pos)
+  pos = pos + pm_proc_u32(pm_device_count, buffer + pos)
+  pos = pos + pm_proc_line("\n", buffer + pos)
+
+  // Clocks
+  pos = pos + pm_proc_line("clocks_total: ", buffer + pos)
+  pos = pos + pm_proc_u32(clock_count, buffer + pos)
+  pos = pos + pm_proc_line("\n", buffer + pos)
+
+  @ptrStore(buffer + pos, u8, 0)
+  return pos
+}
+
+fn pm_proc_line(str: u64, buffer: u64): u32 {
+  var i: u32 = 0
+  while 1 == 1 {
+    var c: u8 = @ptrLoad(str + i, u8)
+    if c == 0 { break }
+    @ptrStore(buffer + i, u8, c)
+    i = i + 1
+  }
+  return i
+}
+
+fn pm_proc_u32(val: u32, buffer: u64): u32 {
+  var temp: [16]u8
+  var i: u32 = 15
+  var v: u32 = val
+
+  if v == 0 {
+    @ptrStore(buffer, u8, '0')
+    return 1
+  }
+
+  while v > 0 and i > 0 {
+    temp[i] = '0' + @truncate(v % 10, u8)
+    v = v / 10
+    i = i - 1
+  }
+
+  var len: u32 = 0
+  while i < 16 {
+    @ptrStore(buffer + len, u8, temp[i])
+    len = len + 1
+    i = i + 1
+  }
+
+  return len
 }

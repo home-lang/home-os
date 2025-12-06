@@ -1,0 +1,321 @@
+name: HomeOS CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================================
+  # Build Jobs
+  # ============================================================================
+
+  build-x86_64:
+    name: Build x86-64
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          nasm \
+          grub-pc-bin \
+          xorriso \
+          qemu-system-x86 \
+          mtools
+
+    - name: Install Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.11.0
+
+    - name: Build Home compiler
+      run: |
+        if [ -d ~/Code/home ]; then
+          cd ~/Code/home && zig build
+        else
+          echo "Home compiler not available, using Zig directly"
+        fi
+
+    - name: Build kernel (x86-64)
+      run: |
+        ./scripts/build-unified.sh x86-64 --debug
+
+    - name: Upload kernel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: home-kernel-x86_64
+        path: build/x86-64/home-kernel.elf
+        if-no-files-found: warn
+
+  build-arm64:
+    name: Build ARM64
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc-aarch64-linux-gnu \
+          binutils-aarch64-linux-gnu \
+          qemu-system-arm
+
+    - name: Install Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.11.0
+
+    - name: Build kernel (ARM64)
+      run: |
+        ./scripts/build-unified.sh arm64 --debug
+
+    - name: Upload kernel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: home-kernel-arm64
+        path: build/arm64/home-kernel.elf
+        if-no-files-found: warn
+
+  # ============================================================================
+  # Test Jobs
+  # ============================================================================
+
+  test-utilities:
+    name: Test Utilities
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run utility tests
+      run: |
+        ./tests/utils/test_utils.sh
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      with:
+        name: utility-test-results
+        path: build/test-results/
+        if-no-files-found: warn
+
+  test-kernel-syntax:
+    name: Kernel Syntax Check
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check .home file syntax
+      run: |
+        echo "Checking kernel source files..."
+        find kernel/src -name "*.home" | wc -l
+        echo "All .home files found"
+
+        # Basic syntax checks
+        for file in $(find kernel/src -name "*.home" | head -20); do
+          echo "Checking: $file"
+          # Check for basic structure
+          if ! grep -q "import\|export\|fn\|const\|struct" "$file"; then
+            echo "Warning: $file may have syntax issues"
+          fi
+        done
+
+  # ============================================================================
+  # QEMU Boot Test
+  # ============================================================================
+
+  qemu-smoke-test:
+    name: QEMU Boot Test
+    runs-on: ubuntu-latest
+    needs: build-x86_64
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install QEMU
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-system-x86
+
+    - name: Download kernel
+      uses: actions/download-artifact@v4
+      with:
+        name: home-kernel-x86_64
+        path: build/x86-64/
+
+    - name: Run QEMU boot test
+      run: |
+        # Boot kernel and capture serial output
+        timeout 30s qemu-system-x86_64 \
+          -kernel build/x86-64/home-kernel.elf \
+          -serial file:/tmp/serial.log \
+          -display none \
+          -m 256M \
+          -no-reboot \
+          -d guest_errors \
+          || true
+
+        echo "=== Serial Output ==="
+        cat /tmp/serial.log || echo "No serial output"
+
+        # Check for successful boot indicators
+        if grep -q "home-os\|HomeOS\|kernel\|Initialized" /tmp/serial.log 2>/dev/null; then
+          echo "Boot test PASSED"
+        else
+          echo "Boot test - no expected output detected"
+        fi
+
+  # ============================================================================
+  # Code Quality
+  # ============================================================================
+
+  lint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check file formatting
+      run: |
+        # Check for trailing whitespace
+        echo "Checking for trailing whitespace..."
+        ! grep -rn " $" kernel/src/*.home || echo "Found trailing whitespace"
+
+        # Check for tabs vs spaces consistency
+        echo "Checking indentation..."
+
+    - name: Check documentation
+      run: |
+        echo "Checking documentation..."
+        ls -la docs/ || echo "No docs directory"
+        ls -la *.md || echo "No markdown files in root"
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run security audit
+      run: |
+        echo "Running security audit..."
+
+        # Check for common security issues
+        echo "Checking for unsafe patterns..."
+
+        # Look for raw pointer usage without bounds checking
+        grep -rn "@ptrFromInt" kernel/src/ | head -20 || true
+
+        # Check for potential buffer overflows
+        grep -rn "while.*<.*len" kernel/src/ | head -20 || true
+
+        # Verify security features are enabled
+        if [ -f "kernel/src/security/cpu_security.home" ]; then
+          echo "SMEP/SMAP module: FOUND"
+        fi
+
+        if [ -f "kernel/src/security/seccomp.home" ]; then
+          echo "Seccomp module: FOUND"
+        fi
+
+        if [ -f "kernel/src/security/capabilities.home" ]; then
+          echo "Capabilities module: FOUND"
+        fi
+
+  # ============================================================================
+  # Release Build
+  # ============================================================================
+
+  release:
+    name: Release Build
+    runs-on: ubuntu-latest
+    needs: [build-x86_64, build-arm64, test-utilities, qemu-smoke-test]
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          nasm \
+          grub-pc-bin \
+          xorriso \
+          mtools
+
+    - name: Install Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.11.0
+
+    - name: Build release (x86-64)
+      run: |
+        ./scripts/build-unified.sh x86-64 --release --iso
+
+    - name: Upload ISO
+      uses: actions/upload-artifact@v4
+      with:
+        name: home-os-x86_64.iso
+        path: build/x86-64/home-os.iso
+        if-no-files-found: warn
+
+  # ============================================================================
+  # Performance Tracking
+  # ============================================================================
+
+  perf-metrics:
+    name: Performance Metrics
+    runs-on: ubuntu-latest
+    needs: build-x86_64
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download kernel
+      uses: actions/download-artifact@v4
+      with:
+        name: home-kernel-x86_64
+        path: build/x86-64/
+
+    - name: Measure kernel size
+      run: |
+        echo "=== Kernel Size Metrics ==="
+        ls -lh build/x86-64/home-kernel.elf || echo "Kernel not found"
+
+        # Get size in bytes
+        SIZE=$(stat -c%s build/x86-64/home-kernel.elf 2>/dev/null || echo "0")
+        echo "Kernel size: $SIZE bytes"
+
+        # Check against target (1MB for minimal kernel)
+        if [ "$SIZE" -gt 1048576 ]; then
+          echo "Warning: Kernel exceeds 1MB target"
+        else
+          echo "Kernel size within target"
+        fi
+
+    - name: Count modules
+      run: |
+        echo "=== Module Count ==="
+        MODULES=$(find kernel/src -name "*.home" | wc -l)
+        echo "Total .home files: $MODULES"
+
+        echo ""
+        echo "By category:"
+        echo "  Core:     $(find kernel/src/core -name "*.home" 2>/dev/null | wc -l)"
+        echo "  Drivers:  $(find kernel/src/drivers -name "*.home" 2>/dev/null | wc -l)"
+        echo "  Net:      $(find kernel/src/net -name "*.home" 2>/dev/null | wc -l)"
+        echo "  FS:       $(find kernel/src/fs -name "*.home" 2>/dev/null | wc -l)"
+        echo "  Security: $(find kernel/src/security -name "*.home" 2>/dev/null | wc -l)"

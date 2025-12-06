@@ -1,0 +1,664 @@
+// home-os Kernel - Container-like Sandbox
+// Lightweight process isolation with namespaces and resource limits
+// Inspired by Linux namespaces and cgroups but simplified for HomeOS
+
+import "../core/foundation.home" as foundation
+import "../core/process.home" as process
+import "../core/memory.home" as memory
+import "seccomp.home" as seccomp
+import "capabilities.home" as capabilities
+
+// ============================================================================
+// Namespace Types
+// ============================================================================
+
+const NS_PID: u32 = 1 << 0      // Process ID namespace
+const NS_NET: u32 = 1 << 1      // Network namespace
+const NS_MNT: u32 = 1 << 2      // Mount namespace
+const NS_USER: u32 = 1 << 3     // User namespace
+const NS_UTS: u32 = 1 << 4      // Hostname namespace
+const NS_IPC: u32 = 1 << 5      // IPC namespace
+
+const NS_ALL: u32 = NS_PID | NS_NET | NS_MNT | NS_USER | NS_UTS | NS_IPC
+
+// ============================================================================
+// Resource Limits (cgroup-like)
+// ============================================================================
+
+struct ResourceLimits {
+  // Memory limits
+  memory_limit_bytes: u64,
+  memory_soft_limit_bytes: u64,
+  swap_limit_bytes: u64,
+
+  // CPU limits
+  cpu_shares: u32,           // Relative CPU weight (default 1024)
+  cpu_quota_us: u32,         // CPU quota in microseconds per period
+  cpu_period_us: u32,        // CPU period in microseconds (default 100000)
+
+  // I/O limits
+  io_read_bps: u64,          // Read bytes per second limit
+  io_write_bps: u64,         // Write bytes per second limit
+  io_read_iops: u32,         // Read IOPS limit
+  io_write_iops: u32,        // Write IOPS limit
+
+  // Process limits
+  max_pids: u32,             // Maximum number of processes
+  max_files: u32,            // Maximum open files
+  max_threads: u32           // Maximum threads
+}
+
+// ============================================================================
+// Namespace State
+// ============================================================================
+
+struct PidNamespace {
+  id: u32,
+  parent_ns: u32,
+  pid_offset: u32,          // PID translation offset
+  next_pid: u32,
+  max_pids: u32
+}
+
+struct NetNamespace {
+  id: u32,
+  parent_ns: u32,
+  has_loopback: u32,
+  veth_count: u32
+}
+
+struct MntNamespace {
+  id: u32,
+  parent_ns: u32,
+  root_mount: u64,
+  mount_count: u32
+}
+
+struct UserNamespace {
+  id: u32,
+  parent_ns: u32,
+  uid_offset: u32,
+  gid_offset: u32
+}
+
+struct UtsNamespace {
+  id: u32,
+  hostname: [64]u8,
+  domainname: [64]u8
+}
+
+// ============================================================================
+// Sandbox Container
+// ============================================================================
+
+const MAX_SANDBOXES: u32 = 64
+
+struct Sandbox {
+  id: u32,
+  active: u32,
+  owner_pid: u32,
+
+  // Namespace flags
+  ns_flags: u32,
+
+  // Namespace instances
+  pid_ns: PidNamespace,
+  net_ns: NetNamespace,
+  mnt_ns: MntNamespace,
+  user_ns: UserNamespace,
+  uts_ns: UtsNamespace,
+
+  // Resource limits
+  limits: ResourceLimits,
+
+  // Current usage
+  memory_usage: u64,
+  cpu_usage_us: u64,
+  io_read_bytes: u64,
+  io_write_bytes: u64,
+  process_count: u32,
+
+  // Security
+  seccomp_profile: u32,
+  capability_mask: u64,
+
+  // Root filesystem (for mount namespace)
+  rootfs_path: [256]u8
+}
+
+var sandboxes: [Sandbox; 64]
+var sandbox_count: u32 = 0
+var next_sandbox_id: u32 = 1
+var sandbox_initialized: u32 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn sandbox_init() {
+  if sandbox_initialized == 1 { return }
+
+  var i: u32 = 0
+  while i < MAX_SANDBOXES {
+    sandboxes[i].active = 0
+    sandboxes[i].id = 0
+    i = i + 1
+  }
+
+  sandbox_count = 0
+  next_sandbox_id = 1
+  sandbox_initialized = 1
+
+  foundation.serial_write_string("[Sandbox] Container sandbox system initialized\n")
+}
+
+// ============================================================================
+// Sandbox Creation
+// ============================================================================
+
+// Create a new sandbox with specified namespaces
+export fn sandbox_create(ns_flags: u32): u32 {
+  if sandbox_count >= MAX_SANDBOXES {
+    foundation.serial_write_string("[Sandbox] Maximum sandbox limit reached\n")
+    return 0
+  }
+
+  // Find free slot
+  var slot: u32 = 0
+  while slot < MAX_SANDBOXES {
+    if sandboxes[slot].active == 0 {
+      break
+    }
+    slot = slot + 1
+  }
+
+  if slot >= MAX_SANDBOXES {
+    return 0
+  }
+
+  var sb: *Sandbox = &sandboxes[slot]
+
+  // Initialize sandbox
+  sb.id = next_sandbox_id
+  next_sandbox_id = next_sandbox_id + 1
+  sb.active = 1
+  sb.owner_pid = 0  // Will be set when process enters
+  sb.ns_flags = ns_flags
+
+  // Initialize namespaces
+  if (ns_flags & NS_PID) != 0 {
+    sb.pid_ns.id = sb.id
+    sb.pid_ns.parent_ns = 0
+    sb.pid_ns.pid_offset = sb.id * 1000  // Simple PID offset
+    sb.pid_ns.next_pid = 1
+    sb.pid_ns.max_pids = 1000
+  }
+
+  if (ns_flags & NS_NET) != 0 {
+    sb.net_ns.id = sb.id
+    sb.net_ns.parent_ns = 0
+    sb.net_ns.has_loopback = 1
+    sb.net_ns.veth_count = 0
+  }
+
+  if (ns_flags & NS_MNT) != 0 {
+    sb.mnt_ns.id = sb.id
+    sb.mnt_ns.parent_ns = 0
+    sb.mnt_ns.root_mount = 0
+    sb.mnt_ns.mount_count = 0
+  }
+
+  if (ns_flags & NS_USER) != 0 {
+    sb.user_ns.id = sb.id
+    sb.user_ns.parent_ns = 0
+    sb.user_ns.uid_offset = sb.id * 100000
+    sb.user_ns.gid_offset = sb.id * 100000
+  }
+
+  if (ns_flags & NS_UTS) != 0 {
+    sb.uts_ns.id = sb.id
+    // Set default hostname
+    sb.uts_ns.hostname[0] = 's'
+    sb.uts_ns.hostname[1] = 'a'
+    sb.uts_ns.hostname[2] = 'n'
+    sb.uts_ns.hostname[3] = 'd'
+    sb.uts_ns.hostname[4] = 'b'
+    sb.uts_ns.hostname[5] = 'o'
+    sb.uts_ns.hostname[6] = 'x'
+    sb.uts_ns.hostname[7] = 0
+  }
+
+  // Set default resource limits
+  sb.limits.memory_limit_bytes = 256 * 1024 * 1024  // 256MB
+  sb.limits.memory_soft_limit_bytes = 128 * 1024 * 1024
+  sb.limits.swap_limit_bytes = 0
+  sb.limits.cpu_shares = 1024
+  sb.limits.cpu_quota_us = 100000  // 100% of one CPU
+  sb.limits.cpu_period_us = 100000
+  sb.limits.io_read_bps = 0       // No limit
+  sb.limits.io_write_bps = 0
+  sb.limits.io_read_iops = 0
+  sb.limits.io_write_iops = 0
+  sb.limits.max_pids = 100
+  sb.limits.max_files = 1024
+  sb.limits.max_threads = 256
+
+  // Initialize usage counters
+  sb.memory_usage = 0
+  sb.cpu_usage_us = 0
+  sb.io_read_bytes = 0
+  sb.io_write_bytes = 0
+  sb.process_count = 0
+
+  // Default security: apply standard seccomp profile
+  sb.seccomp_profile = 3  // Standard profile
+  sb.capability_mask = 0  // No special capabilities
+
+  sandbox_count = sandbox_count + 1
+
+  foundation.serial_write_string("[Sandbox] Created sandbox ")
+  foundation.serial_write_hex(sb.id)
+  foundation.serial_write_string(" with ns_flags=0x")
+  foundation.serial_write_hex(ns_flags)
+  foundation.serial_write_string("\n")
+
+  return sb.id
+}
+
+// ============================================================================
+// Sandbox Entry
+// ============================================================================
+
+// Enter a sandbox (called from fork/clone)
+export fn sandbox_enter(sandbox_id: u32, pid: u32): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 0 }
+
+  // Check process limit
+  if sb.process_count >= sb.limits.max_pids {
+    foundation.serial_write_string("[Sandbox] Process limit reached for sandbox ")
+    foundation.serial_write_hex(sandbox_id)
+    foundation.serial_write_string("\n")
+    return 0
+  }
+
+  // Apply seccomp profile
+  if sb.seccomp_profile == 1 {
+    seccomp.seccomp_apply_minimal_profile(pid)
+  } else if sb.seccomp_profile == 2 {
+    seccomp.seccomp_apply_compute_profile(pid)
+  } else if sb.seccomp_profile == 3 {
+    seccomp.seccomp_apply_standard_profile(pid)
+  } else if sb.seccomp_profile == 4 {
+    seccomp.seccomp_apply_filesystem_profile(pid)
+  }
+
+  // Set capability mask
+  if sb.capability_mask != 0xFFFFFFFFFFFFFFFF {
+    // Drop capabilities not in mask
+    capabilities.cap_set_effective(pid, sb.capability_mask)
+  }
+
+  sb.process_count = sb.process_count + 1
+
+  if sb.owner_pid == 0 {
+    sb.owner_pid = pid
+  }
+
+  foundation.serial_write_string("[Sandbox] PID ")
+  foundation.serial_write_hex(pid)
+  foundation.serial_write_string(" entered sandbox ")
+  foundation.serial_write_hex(sandbox_id)
+  foundation.serial_write_string("\n")
+
+  return 1
+}
+
+// Exit a sandbox (called on process exit)
+export fn sandbox_exit(sandbox_id: u32, pid: u32) {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return }
+
+  if sb.process_count > 0 {
+    sb.process_count = sb.process_count - 1
+  }
+
+  // If last process, clean up sandbox
+  if sb.process_count == 0 {
+    sandbox_destroy(sandbox_id)
+  }
+}
+
+// ============================================================================
+// Resource Limit Enforcement
+// ============================================================================
+
+// Check and enforce memory limit
+export fn sandbox_check_memory(sandbox_id: u32, requested_bytes: u64): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 1 }  // No sandbox, allow
+
+  var new_usage: u64 = sb.memory_usage + requested_bytes
+
+  if new_usage > sb.limits.memory_limit_bytes {
+    foundation.serial_write_string("[Sandbox] Memory limit exceeded for sandbox ")
+    foundation.serial_write_hex(sandbox_id)
+    foundation.serial_write_string("\n")
+    return 0  // Deny
+  }
+
+  // Soft limit warning
+  if new_usage > sb.limits.memory_soft_limit_bytes {
+    foundation.serial_write_string("[Sandbox] Memory soft limit warning for sandbox ")
+    foundation.serial_write_hex(sandbox_id)
+    foundation.serial_write_string("\n")
+  }
+
+  return 1  // Allow
+}
+
+// Update memory usage
+export fn sandbox_update_memory(sandbox_id: u32, delta: i64) {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return }
+
+  if delta > 0 {
+    sb.memory_usage = sb.memory_usage + @bitCast(delta, u64)
+  } else if delta < 0 {
+    var neg: u64 = @bitCast(-delta, u64)
+    if sb.memory_usage >= neg {
+      sb.memory_usage = sb.memory_usage - neg
+    } else {
+      sb.memory_usage = 0
+    }
+  }
+}
+
+// Check CPU quota
+export fn sandbox_check_cpu(sandbox_id: u32, used_us: u64): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 1 }
+
+  if sb.limits.cpu_quota_us == 0 { return 1 }  // No limit
+
+  var new_usage: u64 = sb.cpu_usage_us + used_us
+
+  // Simple per-period quota check
+  if (new_usage % sb.limits.cpu_period_us) > sb.limits.cpu_quota_us {
+    return 0  // Throttle
+  }
+
+  sb.cpu_usage_us = new_usage
+  return 1
+}
+
+// Check I/O limits
+export fn sandbox_check_io_read(sandbox_id: u32, bytes: u64): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 1 }
+
+  if sb.limits.io_read_bps == 0 { return 1 }
+
+  // Simple rate limiting (would need timer integration for proper BPS)
+  sb.io_read_bytes = sb.io_read_bytes + bytes
+  return 1
+}
+
+export fn sandbox_check_io_write(sandbox_id: u32, bytes: u64): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 1 }
+
+  if sb.limits.io_write_bps == 0 { return 1 }
+
+  sb.io_write_bytes = sb.io_write_bytes + bytes
+  return 1
+}
+
+// ============================================================================
+// Namespace Operations
+// ============================================================================
+
+// Translate PID from sandbox namespace to host namespace
+export fn sandbox_translate_pid_to_host(sandbox_id: u32, sandbox_pid: u32): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return sandbox_pid }
+
+  if (sb.ns_flags & NS_PID) == 0 { return sandbox_pid }
+
+  return sandbox_pid + sb.pid_ns.pid_offset
+}
+
+// Translate PID from host namespace to sandbox namespace
+export fn sandbox_translate_pid_from_host(sandbox_id: u32, host_pid: u32): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return host_pid }
+
+  if (sb.ns_flags & NS_PID) == 0 { return host_pid }
+
+  if host_pid < sb.pid_ns.pid_offset { return 0 }
+
+  return host_pid - sb.pid_ns.pid_offset
+}
+
+// Set hostname for UTS namespace
+export fn sandbox_set_hostname(sandbox_id: u32, hostname: u64): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 0 }
+
+  if (sb.ns_flags & NS_UTS) == 0 { return 0 }
+
+  var i: u32 = 0
+  while i < 63 {
+    var c: u8 = @ptrLoad(hostname + i, u8)
+    sb.uts_ns.hostname[i] = c
+    if c == 0 { break }
+    i = i + 1
+  }
+  sb.uts_ns.hostname[63] = 0
+
+  return 1
+}
+
+// Get hostname for UTS namespace
+export fn sandbox_get_hostname(sandbox_id: u32, buffer: u64, max_len: u32): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 0 }
+
+  if (sb.ns_flags & NS_UTS) == 0 { return 0 }
+
+  var i: u32 = 0
+  while i < max_len - 1 and i < 63 {
+    var c: u8 = sb.uts_ns.hostname[i]
+    @ptrStore(buffer + i, u8, c)
+    if c == 0 { break }
+    i = i + 1
+  }
+  @ptrStore(buffer + i, u8, 0)
+
+  return i
+}
+
+// ============================================================================
+// Limit Configuration
+// ============================================================================
+
+export fn sandbox_set_memory_limit(sandbox_id: u32, limit_bytes: u64): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 0 }
+
+  sb.limits.memory_limit_bytes = limit_bytes
+  return 1
+}
+
+export fn sandbox_set_cpu_quota(sandbox_id: u32, quota_us: u32, period_us: u32): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 0 }
+
+  sb.limits.cpu_quota_us = quota_us
+  sb.limits.cpu_period_us = period_us
+  return 1
+}
+
+export fn sandbox_set_max_pids(sandbox_id: u32, max_pids: u32): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 0 }
+
+  sb.limits.max_pids = max_pids
+  return 1
+}
+
+export fn sandbox_set_seccomp_profile(sandbox_id: u32, profile: u32): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 0 }
+
+  sb.seccomp_profile = profile
+  return 1
+}
+
+// ============================================================================
+// Sandbox Lifecycle
+// ============================================================================
+
+export fn sandbox_destroy(sandbox_id: u32): u32 {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 { return 0 }
+
+  sb.active = 0
+  sb.id = 0
+
+  if sandbox_count > 0 {
+    sandbox_count = sandbox_count - 1
+  }
+
+  foundation.serial_write_string("[Sandbox] Destroyed sandbox ")
+  foundation.serial_write_hex(sandbox_id)
+  foundation.serial_write_string("\n")
+
+  return 1
+}
+
+fn sandbox_find(sandbox_id: u32): *Sandbox {
+  var i: u32 = 0
+  while i < MAX_SANDBOXES {
+    if sandboxes[i].active == 1 and sandboxes[i].id == sandbox_id {
+      return &sandboxes[i]
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// ============================================================================
+// Status and Debugging
+// ============================================================================
+
+export fn sandbox_print_status(sandbox_id: u32) {
+  var sb: *Sandbox = sandbox_find(sandbox_id)
+  if sb == 0 {
+    foundation.serial_write_string("[Sandbox] Sandbox not found\n")
+    return
+  }
+
+  foundation.serial_write_string("\n[Sandbox] Status for sandbox ")
+  foundation.serial_write_hex(sandbox_id)
+  foundation.serial_write_string(":\n")
+
+  foundation.serial_write_string("  Namespaces: 0x")
+  foundation.serial_write_hex(sb.ns_flags)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Processes:  ")
+  foundation.serial_write_hex(sb.process_count)
+  foundation.serial_write_string(" / ")
+  foundation.serial_write_hex(sb.limits.max_pids)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Memory:     ")
+  foundation.serial_write_hex(@truncate(sb.memory_usage / 1024, u32))
+  foundation.serial_write_string(" KB / ")
+  foundation.serial_write_hex(@truncate(sb.limits.memory_limit_bytes / 1024, u32))
+  foundation.serial_write_string(" KB\n")
+
+  foundation.serial_write_string("  CPU usage:  ")
+  foundation.serial_write_hex(@truncate(sb.cpu_usage_us / 1000, u32))
+  foundation.serial_write_string(" ms\n")
+
+  foundation.serial_write_string("  Seccomp:    profile ")
+  foundation.serial_write_hex(sb.seccomp_profile)
+  foundation.serial_write_string("\n\n")
+}
+
+export fn sandbox_list() {
+  foundation.serial_write_string("\n[Sandbox] Active sandboxes:\n")
+
+  var count: u32 = 0
+  var i: u32 = 0
+  while i < MAX_SANDBOXES {
+    if sandboxes[i].active == 1 {
+      foundation.serial_write_string("  ID=")
+      foundation.serial_write_hex(sandboxes[i].id)
+      foundation.serial_write_string(" procs=")
+      foundation.serial_write_hex(sandboxes[i].process_count)
+      foundation.serial_write_string(" mem=")
+      foundation.serial_write_hex(@truncate(sandboxes[i].memory_usage / 1024, u32))
+      foundation.serial_write_string("KB\n")
+      count = count + 1
+    }
+    i = i + 1
+  }
+
+  foundation.serial_write_string("Total: ")
+  foundation.serial_write_hex(count)
+  foundation.serial_write_string(" sandboxes\n\n")
+}
+
+// ============================================================================
+// High-Level API
+// ============================================================================
+
+// Create a minimal sandbox (like a Docker container)
+export fn sandbox_create_container(rootfs: u64): u32 {
+  var id: u32 = sandbox_create(NS_ALL)
+  if id == 0 { return 0 }
+
+  var sb: *Sandbox = sandbox_find(id)
+  if sb == 0 { return 0 }
+
+  // Copy rootfs path
+  var i: u32 = 0
+  while i < 255 {
+    var c: u8 = @ptrLoad(rootfs + i, u8)
+    sb.rootfs_path[i] = c
+    if c == 0 { break }
+    i = i + 1
+  }
+  sb.rootfs_path[255] = 0
+
+  // Set restrictive defaults
+  sb.limits.memory_limit_bytes = 512 * 1024 * 1024  // 512MB
+  sb.limits.max_pids = 50
+  sb.seccomp_profile = 3  // Standard profile
+
+  foundation.serial_write_string("[Sandbox] Created container ")
+  foundation.serial_write_hex(id)
+  foundation.serial_write_string("\n")
+
+  return id
+}
+
+// Create a lightweight sandbox (less isolation)
+export fn sandbox_create_light(): u32 {
+  // Only PID and resource limits, shared network and mounts
+  var id: u32 = sandbox_create(NS_PID)
+  if id == 0 { return 0 }
+
+  var sb: *Sandbox = sandbox_find(id)
+  if sb == 0 { return 0 }
+
+  // More permissive limits
+  sb.limits.memory_limit_bytes = 1024 * 1024 * 1024  // 1GB
+  sb.limits.max_pids = 200
+  sb.seccomp_profile = 0  // No seccomp filtering
+
+  return id
+}

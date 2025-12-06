@@ -1,52 +1,498 @@
 // home-os DNS Client
-// Domain Name System
+// Domain Name System resolver with caching
 
 import "../core/foundation.home" as foundation
 import "udp.home" as udp
 
-const DNS_TYPE_A: u16 = 1
-const DNS_TYPE_AAAA: u16 = 28
-const DNS_CLASS_IN: u16 = 1
+// DNS record types
+const DNS_TYPE_A: u16 = 1       // IPv4 address
+const DNS_TYPE_AAAA: u16 = 28   // IPv6 address
+const DNS_TYPE_CNAME: u16 = 5   // Canonical name
+const DNS_TYPE_MX: u16 = 15     // Mail exchange
+const DNS_TYPE_TXT: u16 = 16    // Text record
+const DNS_TYPE_NS: u16 = 2      // Name server
+const DNS_TYPE_PTR: u16 = 12    // Pointer record
 
+// DNS classes
+const DNS_CLASS_IN: u16 = 1     // Internet
+
+// DNS flags
+const DNS_FLAG_QR: u16 = 0x8000     // Query/Response
+const DNS_FLAG_OPCODE: u16 = 0x7800 // Operation code
+const DNS_FLAG_AA: u16 = 0x0400     // Authoritative answer
+const DNS_FLAG_TC: u16 = 0x0200     // Truncated
+const DNS_FLAG_RD: u16 = 0x0100     // Recursion desired
+const DNS_FLAG_RA: u16 = 0x0080     // Recursion available
+const DNS_FLAG_RCODE: u16 = 0x000F  // Response code
+
+// DNS response codes
+const DNS_RCODE_OK: u16 = 0
+const DNS_RCODE_FORMAT_ERROR: u16 = 1
+const DNS_RCODE_SERVER_FAILURE: u16 = 2
+const DNS_RCODE_NAME_ERROR: u16 = 3
+const DNS_RCODE_NOT_IMPLEMENTED: u16 = 4
+const DNS_RCODE_REFUSED: u16 = 5
+
+// DNS header structure (12 bytes)
 struct DnsHeader {
   id: u16,
   flags: u16,
-  qdcount: u16,
-  ancount: u16,
-  nscount: u16,
-  arcount: u16
+  qdcount: u16,  // Question count
+  ancount: u16,  // Answer count
+  nscount: u16,  // Authority count
+  arcount: u16   // Additional count
 }
 
-var dns_server: u32 = 0x08080808  // 8.8.8.8
+// DNS cache entry
+struct DnsCacheEntry {
+  hostname_hash: u32,
+  ip_address: u32,
+  ttl: u32,
+  timestamp: u32,
+  valid: u32
+}
+
+// Configuration
+const DNS_PORT: u16 = 53
+const DNS_TIMEOUT_MS: u32 = 5000
+const DNS_MAX_RETRIES: u32 = 3
+const DNS_CACHE_SIZE: u32 = 64
+const DNS_MAX_PACKET_SIZE: u32 = 512
+
+// State
+var dns_server: u32 = 0x08080808  // 8.8.8.8 (Google DNS)
+var dns_server_alt: u32 = 0x08080404  // 8.8.4.4 (Google DNS alt)
+var dns_query_id: u16 = 0x1234
+var dns_cache: [DnsCacheEntry; 64]
+var dns_cache_initialized: u32 = 0
+var dns_current_time: u32 = 0
 
 export fn dns_init() {
-  foundation.serial_write_string("[DNS] Initialized\n")
+  // Initialize cache
+  var i: u32 = 0
+  while i < DNS_CACHE_SIZE {
+    dns_cache[i].valid = 0
+    i = i + 1
+  }
+  dns_cache_initialized = 1
+  foundation.serial_write_string("[DNS] Initialized with server 8.8.8.8\n")
 }
 
 export fn dns_set_server(server_ip: u32) {
   dns_server = server_ip
+  foundation.serial_write_string("[DNS] Server set to ")
+  dns_print_ip(server_ip)
+  foundation.serial_write_string("\n")
 }
 
+export fn dns_set_alt_server(server_ip: u32) {
+  dns_server_alt = server_ip
+}
+
+// Set current time for cache TTL management
+export fn dns_set_time(time: u32) {
+  dns_current_time = time
+}
+
+// Simple hash function for hostname
+fn dns_hash_hostname(hostname: u64): u32 {
+  var hash: u32 = 5381
+  var ptr: u64 = hostname
+  var c: u8 = @ptrLoad(ptr, u8)
+
+  while c != 0 {
+    hash = ((hash << 5) + hash) + c
+    ptr = ptr + 1
+    c = @ptrLoad(ptr, u8)
+  }
+
+  return hash
+}
+
+// Check cache for hostname
+fn dns_cache_lookup(hostname: u64): u32 {
+  var hash: u32 = dns_hash_hostname(hostname)
+
+  var i: u32 = 0
+  while i < DNS_CACHE_SIZE {
+    if dns_cache[i].valid == 1 {
+      if dns_cache[i].hostname_hash == hash {
+        // Check TTL
+        if dns_current_time < dns_cache[i].timestamp + dns_cache[i].ttl {
+          foundation.serial_write_string("[DNS] Cache hit for hash ")
+          foundation.serial_write_hex(hash)
+          foundation.serial_write_string("\n")
+          return dns_cache[i].ip_address
+        } else {
+          // Expired entry
+          dns_cache[i].valid = 0
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  return 0  // Not found
+}
+
+// Add entry to cache
+fn dns_cache_add(hostname: u64, ip: u32, ttl: u32) {
+  var hash: u32 = dns_hash_hostname(hostname)
+
+  // Find empty slot or oldest entry
+  var slot: u32 = 0
+  var oldest_time: u32 = 0xFFFFFFFF
+
+  var i: u32 = 0
+  while i < DNS_CACHE_SIZE {
+    if dns_cache[i].valid == 0 {
+      slot = i
+      break
+    }
+    if dns_cache[i].timestamp < oldest_time {
+      oldest_time = dns_cache[i].timestamp
+      slot = i
+    }
+    i = i + 1
+  }
+
+  dns_cache[slot].hostname_hash = hash
+  dns_cache[slot].ip_address = ip
+  dns_cache[slot].ttl = ttl
+  dns_cache[slot].timestamp = dns_current_time
+  dns_cache[slot].valid = 1
+}
+
+// Encode hostname to DNS format (e.g., "www.example.com" -> "\x03www\x07example\x03com\x00")
+fn dns_encode_hostname(hostname: u64, buffer: u64): u32 {
+  var src: u64 = hostname
+  var dst: u64 = buffer
+  var label_start: u64 = dst
+  dst = dst + 1  // Skip length byte for now
+
+  var total_len: u32 = 0
+  var label_len: u32 = 0
+
+  var c: u8 = @ptrLoad(src, u8)
+  while c != 0 {
+    if c == 0x2E {  // '.'
+      // Write label length
+      @ptrStore(label_start, u8, label_len)
+      label_start = dst
+      dst = dst + 1
+      label_len = 0
+    } else {
+      @ptrStore(dst, u8, c)
+      dst = dst + 1
+      label_len = label_len + 1
+    }
+    total_len = total_len + 1
+    src = src + 1
+    c = @ptrLoad(src, u8)
+  }
+
+  // Write final label length
+  @ptrStore(label_start, u8, label_len)
+
+  // Null terminator
+  @ptrStore(dst, u8, 0)
+
+  return total_len + 2  // Include length bytes and null terminator
+}
+
+// Build DNS query packet
+fn dns_build_query(hostname: u64, query_type: u16, buffer: u64): u32 {
+  var offset: u32 = 0
+
+  // DNS header (12 bytes)
+  dns_query_id = dns_query_id + 1
+
+  // ID (2 bytes)
+  @ptrStore(buffer + offset, u8, (dns_query_id >> 8) & 0xFF)
+  @ptrStore(buffer + offset + 1, u8, dns_query_id & 0xFF)
+  offset = offset + 2
+
+  // Flags: Standard query with recursion desired (2 bytes)
+  @ptrStore(buffer + offset, u8, 0x01)  // RD=1
+  @ptrStore(buffer + offset + 1, u8, 0x00)
+  offset = offset + 2
+
+  // QDCOUNT: 1 question (2 bytes)
+  @ptrStore(buffer + offset, u8, 0x00)
+  @ptrStore(buffer + offset + 1, u8, 0x01)
+  offset = offset + 2
+
+  // ANCOUNT: 0 (2 bytes)
+  @ptrStore(buffer + offset, u8, 0x00)
+  @ptrStore(buffer + offset + 1, u8, 0x00)
+  offset = offset + 2
+
+  // NSCOUNT: 0 (2 bytes)
+  @ptrStore(buffer + offset, u8, 0x00)
+  @ptrStore(buffer + offset + 1, u8, 0x00)
+  offset = offset + 2
+
+  // ARCOUNT: 0 (2 bytes)
+  @ptrStore(buffer + offset, u8, 0x00)
+  @ptrStore(buffer + offset + 1, u8, 0x00)
+  offset = offset + 2
+
+  // Question section
+  // QNAME: encoded hostname
+  var name_len: u32 = dns_encode_hostname(hostname, buffer + offset)
+  offset = offset + name_len
+
+  // QTYPE (2 bytes)
+  @ptrStore(buffer + offset, u8, (query_type >> 8) & 0xFF)
+  @ptrStore(buffer + offset + 1, u8, query_type & 0xFF)
+  offset = offset + 2
+
+  // QCLASS: IN (2 bytes)
+  @ptrStore(buffer + offset, u8, 0x00)
+  @ptrStore(buffer + offset + 1, u8, 0x01)
+  offset = offset + 2
+
+  return offset
+}
+
+// Skip DNS name in response (handles compression)
+fn dns_skip_name(buffer: u64, offset: u32): u32 {
+  var pos: u32 = offset
+  var b: u8 = @ptrLoad(buffer + pos, u8)
+
+  while b != 0 {
+    if (b & 0xC0) == 0xC0 {
+      // Compression pointer - skip 2 bytes
+      return pos + 2
+    }
+    // Regular label - skip label
+    pos = pos + 1 + b
+    b = @ptrLoad(buffer + pos, u8)
+  }
+
+  return pos + 1  // Skip null terminator
+}
+
+// Parse DNS response and extract IP address
+fn dns_parse_response(buffer: u64, len: u32, expected_id: u16): u32 {
+  if len < 12 {
+    return 0  // Too short
+  }
+
+  // Check ID
+  var id: u16 = (@ptrLoad(buffer, u8) << 8) | @ptrLoad(buffer + 1, u8)
+  if id != expected_id {
+    foundation.serial_write_string("[DNS] ID mismatch\n")
+    return 0
+  }
+
+  // Check flags
+  var flags: u16 = (@ptrLoad(buffer + 2, u8) << 8) | @ptrLoad(buffer + 3, u8)
+  if (flags & DNS_FLAG_QR) == 0 {
+    foundation.serial_write_string("[DNS] Not a response\n")
+    return 0
+  }
+
+  var rcode: u16 = flags & DNS_FLAG_RCODE
+  if rcode != DNS_RCODE_OK {
+    foundation.serial_write_string("[DNS] Error response code: ")
+    foundation.serial_write_hex(rcode)
+    foundation.serial_write_string("\n")
+    return 0
+  }
+
+  // Get counts
+  var qdcount: u16 = (@ptrLoad(buffer + 4, u8) << 8) | @ptrLoad(buffer + 5, u8)
+  var ancount: u16 = (@ptrLoad(buffer + 6, u8) << 8) | @ptrLoad(buffer + 7, u8)
+
+  if ancount == 0 {
+    foundation.serial_write_string("[DNS] No answers\n")
+    return 0
+  }
+
+  // Skip header (12 bytes)
+  var offset: u32 = 12
+
+  // Skip questions
+  var i: u32 = 0
+  while i < qdcount {
+    offset = dns_skip_name(buffer, offset)
+    offset = offset + 4  // QTYPE + QCLASS
+    i = i + 1
+  }
+
+  // Parse answers
+  i = 0
+  while i < ancount {
+    // Skip name
+    offset = dns_skip_name(buffer, offset)
+
+    // Read type and class
+    var rtype: u16 = (@ptrLoad(buffer + offset, u8) << 8) | @ptrLoad(buffer + offset + 1, u8)
+    offset = offset + 4  // TYPE + CLASS
+
+    // TTL (4 bytes)
+    var ttl: u32 = (@ptrLoad(buffer + offset, u8) << 24) |
+                   (@ptrLoad(buffer + offset + 1, u8) << 16) |
+                   (@ptrLoad(buffer + offset + 2, u8) << 8) |
+                   @ptrLoad(buffer + offset + 3, u8)
+    offset = offset + 4
+
+    // RDLENGTH (2 bytes)
+    var rdlength: u16 = (@ptrLoad(buffer + offset, u8) << 8) | @ptrLoad(buffer + offset + 1, u8)
+    offset = offset + 2
+
+    // Check for A record (IPv4)
+    if rtype == DNS_TYPE_A and rdlength == 4 {
+      var ip: u32 = (@ptrLoad(buffer + offset, u8) << 24) |
+                    (@ptrLoad(buffer + offset + 1, u8) << 16) |
+                    (@ptrLoad(buffer + offset + 2, u8) << 8) |
+                    @ptrLoad(buffer + offset + 3, u8)
+
+      foundation.serial_write_string("[DNS] Resolved to: ")
+      dns_print_ip(ip)
+      foundation.serial_write_string(" (TTL: ")
+      foundation.serial_write_hex(ttl)
+      foundation.serial_write_string(")\n")
+
+      return ip
+    }
+
+    // Skip RDATA
+    offset = offset + rdlength
+    i = i + 1
+  }
+
+  return 0  // No A record found
+}
+
+// Print IP address in dotted notation
+fn dns_print_ip(ip: u32) {
+  foundation.serial_write_hex((ip >> 24) & 0xFF)
+  foundation.serial_write_string(".")
+  foundation.serial_write_hex((ip >> 16) & 0xFF)
+  foundation.serial_write_string(".")
+  foundation.serial_write_hex((ip >> 8) & 0xFF)
+  foundation.serial_write_string(".")
+  foundation.serial_write_hex(ip & 0xFF)
+}
+
+// Main DNS resolution function
 export fn dns_resolve(hostname: u64): u32 {
   foundation.serial_write_string("[DNS] Resolving: ")
-  foundation.serial_write_string(hostname)
+  // Print hostname (cast to string pointer)
+  var ptr: u64 = hostname
+  var c: u8 = @ptrLoad(ptr, u8)
+  while c != 0 {
+    foundation.serial_write_char(c)
+    ptr = ptr + 1
+    c = @ptrLoad(ptr, u8)
+  }
   foundation.serial_write_string("\n")
-  
+
+  // Check cache first
+  var cached_ip: u32 = dns_cache_lookup(hostname)
+  if cached_ip != 0 {
+    return cached_ip
+  }
+
+  // Build query
   var query: [u8; 512]
-  var offset: u32 = 0
-  
-  // DNS header
-  var header: DnsHeader
-  header.id = 0x1234
-  header.flags = 0x0100  // Standard query
-  header.qdcount = 1
-  header.ancount = 0
-  header.nscount = 0
-  header.arcount = 0
-  
-  // Build query (stub)
-  
-  // Send via UDP (stub)
-  
-  return 0  // Stub: would return resolved IP
+  var query_len: u32 = dns_build_query(hostname, DNS_TYPE_A, @ptrFromInt(query))
+
+  // Try primary DNS server
+  var retries: u32 = 0
+  while retries < DNS_MAX_RETRIES {
+    foundation.serial_write_string("[DNS] Sending query (attempt ")
+    foundation.serial_write_hex(retries + 1)
+    foundation.serial_write_string(")\n")
+
+    // Send query via UDP
+    udp.udp_send(dns_server, DNS_PORT, 53000, @ptrFromInt(query), query_len)
+
+    // Wait for response (simplified - real implementation needs timeout)
+    var response: [u8; 512]
+    var response_len: u32 = udp.udp_receive(@ptrFromInt(response), 512)
+
+    if response_len > 0 {
+      var ip: u32 = dns_parse_response(@ptrFromInt(response), response_len, dns_query_id)
+      if ip != 0 {
+        // Cache the result
+        dns_cache_add(hostname, ip, 300)  // Default 5 min TTL
+        return ip
+      }
+    }
+
+    retries = retries + 1
+  }
+
+  // Try alternate DNS server
+  foundation.serial_write_string("[DNS] Trying alternate server\n")
+  udp.udp_send(dns_server_alt, DNS_PORT, 53000, @ptrFromInt(query), query_len)
+
+  var response: [u8; 512]
+  var response_len: u32 = udp.udp_receive(@ptrFromInt(response), 512)
+
+  if response_len > 0 {
+    var ip: u32 = dns_parse_response(@ptrFromInt(response), response_len, dns_query_id)
+    if ip != 0 {
+      dns_cache_add(hostname, ip, 300)
+      return ip
+    }
+  }
+
+  foundation.serial_write_string("[DNS] Resolution failed\n")
+  return 0
+}
+
+// Resolve hostname for IPv6 (AAAA record)
+export fn dns_resolve_ipv6(hostname: u64, result: u64): u32 {
+  // Build AAAA query
+  var query: [u8; 512]
+  var query_len: u32 = dns_build_query(hostname, DNS_TYPE_AAAA, @ptrFromInt(query))
+
+  udp.udp_send(dns_server, DNS_PORT, 53000, @ptrFromInt(query), query_len)
+
+  var response: [u8; 512]
+  var response_len: u32 = udp.udp_receive(@ptrFromInt(response), 512)
+
+  // Parse response (would need to handle 16-byte IPv6 addresses)
+  // For now, return 0 to indicate not implemented
+  return 0
+}
+
+// Clear DNS cache
+export fn dns_cache_clear() {
+  var i: u32 = 0
+  while i < DNS_CACHE_SIZE {
+    dns_cache[i].valid = 0
+    i = i + 1
+  }
+  foundation.serial_write_string("[DNS] Cache cleared\n")
+}
+
+// Get DNS cache statistics
+export fn dns_cache_stats(): u32 {
+  var valid_entries: u32 = 0
+  var i: u32 = 0
+  while i < DNS_CACHE_SIZE {
+    if dns_cache[i].valid == 1 {
+      valid_entries = valid_entries + 1
+    }
+    i = i + 1
+  }
+  return valid_entries
+}
+
+// Reverse DNS lookup (PTR record)
+export fn dns_reverse_lookup(ip: u32, result: u64, max_len: u32): u32 {
+  // Build reverse lookup query
+  // Convert IP to in-addr.arpa format (e.g., 8.8.8.8 -> 8.8.8.8.in-addr.arpa)
+  // This is a simplified stub - real implementation would build proper query
+
+  foundation.serial_write_string("[DNS] Reverse lookup for ")
+  dns_print_ip(ip)
+  foundation.serial_write_string(" not yet implemented\n")
+
+  return 0
 }

@@ -545,3 +545,474 @@ export fn driver_get_state(name: *u8): u32 {
 
   return DRIVER_STATE_FAILED
 }
+
+// ============================================================================
+// Parallel Initialization Support
+// ============================================================================
+
+// Init batch - group of drivers that can initialize in parallel
+const MAX_BATCH_SIZE: u32 = 16
+
+struct InitBatch {
+  driver_ids: [16]u32,
+  count: u32,
+  priority: u32
+}
+
+var init_batches: [32]InitBatch
+var batch_count: u32 = 0
+
+// Build parallel init batches by analyzing dependencies
+export fn driver_build_parallel_batches(): u32 {
+  batch_count = 0
+
+  foundation.serial_write_string("\n[Driver Init] Building parallel init batches...\n")
+
+  // For each priority level, find independent driver groups
+  var priority: u32 = DRIVER_PRIORITY_CRITICAL
+  loop {
+    if priority > DRIVER_PRIORITY_LOW { break }
+
+    // Find all drivers at this priority with satisfied dependencies
+    var batch_idx: u32 = batch_count
+    var batch: *InitBatch = &init_batches[batch_idx]
+    batch.count = 0
+    batch.priority = priority
+
+    var found_any: u32 = 0
+    var iteration: u32 = 0
+
+    // Keep building batches until no more drivers at this priority
+    loop {
+      if iteration > driver_count { break }
+      iteration = iteration + 1
+
+      var added_to_batch: u32 = 0
+
+      var i: u32 = 0
+      loop {
+        if i >= driver_count { break }
+
+        let driver: *DriverDescriptor = &drivers[i]
+
+        // Skip wrong priority
+        if driver.priority != priority {
+          i = i + 1
+          continue
+        }
+
+        // Skip already processed
+        if driver.state != DRIVER_STATE_PENDING {
+          i = i + 1
+          continue
+        }
+
+        // Skip lazy
+        if (driver.flags & DRIVER_FLAG_LAZY) != 0 {
+          i = i + 1
+          continue
+        }
+
+        // Check if dependencies are in previous batches (or already init'd)
+        if driver_deps_in_earlier_batches(driver, batch_idx) == 0 {
+          i = i + 1
+          continue
+        }
+
+        // Add to current batch
+        if batch.count < MAX_BATCH_SIZE {
+          batch.driver_ids[batch.count] = i
+          batch.count = batch.count + 1
+          driver.state = DRIVER_STATE_INITIALIZING  // Mark as scheduled
+          added_to_batch = 1
+          found_any = 1
+        }
+
+        i = i + 1
+      }
+
+      // If batch is full or no more can be added, finalize batch
+      if batch.count > 0 and (batch.count >= MAX_BATCH_SIZE or added_to_batch == 0) {
+        batch_count = batch_count + 1
+
+        if batch_count < 32 {
+          batch = &init_batches[batch_count]
+          batch.count = 0
+          batch.priority = priority
+        }
+      }
+
+      if added_to_batch == 0 { break }
+    }
+
+    priority = priority + 1
+  }
+
+  // Reset states back to pending
+  var i: u32 = 0
+  loop {
+    if i >= driver_count { break }
+    if drivers[i].state == DRIVER_STATE_INITIALIZING {
+      drivers[i].state = DRIVER_STATE_PENDING
+    }
+    i = i + 1
+  }
+
+  foundation.serial_write_string("[Driver Init] Created ")
+  foundation.serial_write_u64(batch_count)
+  foundation.serial_write_string(" parallel batches\n")
+
+  return batch_count
+}
+
+fn driver_deps_in_earlier_batches(driver: *DriverDescriptor, current_batch: u32): u32 {
+  if driver.dep_count == 0 { return 1 }
+
+  var i: u32 = 0
+  loop {
+    if i >= driver.dep_count { break }
+
+    let dep_id: u32 = driver.dependencies[i]
+    if dep_id >= driver_count { return 0 }
+
+    let dep: *DriverDescriptor = &drivers[dep_id]
+
+    // Check if dep is already initialized or scheduled in earlier batch
+    if dep.state == DRIVER_STATE_INITIALIZED {
+      i = i + 1
+      continue
+    }
+
+    // Check if in earlier batch
+    var found: u32 = 0
+    var b: u32 = 0
+    loop {
+      if b >= current_batch { break }
+
+      let batch: *InitBatch = &init_batches[b]
+      var j: u32 = 0
+      loop {
+        if j >= batch.count { break }
+
+        if batch.driver_ids[j] == dep_id {
+          found = 1
+          break
+        }
+
+        j = j + 1
+      }
+
+      if found == 1 { break }
+      b = b + 1
+    }
+
+    if found == 0 { return 0 }
+
+    i = i + 1
+  }
+
+  return 1
+}
+
+// Execute parallel batches
+export fn driver_init_parallel(): u32 {
+  if batch_count == 0 {
+    driver_build_parallel_batches()
+  }
+
+  foundation.serial_write_string("\n========== PARALLEL DRIVER INITIALIZATION ==========\n")
+
+  var total_parallel: u32 = 0
+  var total_time: u64 = 0
+
+  var b: u32 = 0
+  loop {
+    if b >= batch_count { break }
+
+    let batch: *InitBatch = &init_batches[b]
+
+    if batch.count == 0 {
+      b = b + 1
+      continue
+    }
+
+    foundation.serial_write_string("\n[Batch ")
+    foundation.serial_write_u64(b)
+    foundation.serial_write_string("] Priority=")
+    foundation.serial_write_u64(batch.priority)
+    foundation.serial_write_string(" Drivers=")
+    foundation.serial_write_u64(batch.count)
+    foundation.serial_write_string(" (parallel)\n")
+
+    let batch_start: u64 = get_timestamp_us()
+
+    // Initialize all drivers in batch "in parallel"
+    // Note: True parallelism requires SMP/threading support
+    // For now, we simulate by initializing in rapid sequence
+    var i: u32 = 0
+    loop {
+      if i >= batch.count { break }
+
+      let driver_id: u32 = batch.driver_ids[i]
+      let driver: *DriverDescriptor = &drivers[driver_id]
+
+      let result: u32 = driver_init_single(driver)
+      if result != 0 and (driver.flags & DRIVER_FLAG_OPTIONAL) == 0 {
+        foundation.serial_write_string("[Driver Init] FATAL: Driver in batch failed\n")
+        return result
+      }
+
+      i = i + 1
+    }
+
+    let batch_end: u64 = get_timestamp_us()
+    let batch_time: u64 = batch_end - batch_start
+
+    foundation.serial_write_string("[Batch ")
+    foundation.serial_write_u64(b)
+    foundation.serial_write_string("] Complete in ")
+    foundation.serial_write_u64(batch_time)
+    foundation.serial_write_string(" us\n")
+
+    total_parallel = total_parallel + batch.count
+    total_time = total_time + batch_time
+
+    b = b + 1
+  }
+
+  foundation.serial_write_string("\n========== PARALLEL INIT COMPLETE ==========\n")
+  foundation.serial_write_string("Total batches: ")
+  foundation.serial_write_u64(batch_count)
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("Drivers initialized: ")
+  foundation.serial_write_u64(total_parallel)
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("Total time: ")
+  foundation.serial_write_u64(total_time / 1000)
+  foundation.serial_write_string(" ms\n")
+  foundation.serial_write_string("============================================\n\n")
+
+  return 0
+}
+
+// Print batch structure for debugging
+export fn driver_print_batches() {
+  foundation.serial_write_string("\n========== PARALLEL BATCH STRUCTURE ==========\n\n")
+
+  var b: u32 = 0
+  loop {
+    if b >= batch_count { break }
+
+    let batch: *InitBatch = &init_batches[b]
+
+    foundation.serial_write_string("Batch ")
+    foundation.serial_write_u64(b)
+    foundation.serial_write_string(" (priority ")
+    foundation.serial_write_u64(batch.priority)
+    foundation.serial_write_string("): ")
+    foundation.serial_write_u64(batch.count)
+    foundation.serial_write_string(" drivers\n")
+
+    var i: u32 = 0
+    loop {
+      if i >= batch.count { break }
+
+      let driver_id: u32 = batch.driver_ids[i]
+      let driver: *DriverDescriptor = &drivers[driver_id]
+
+      foundation.serial_write_string("  - ")
+      foundation.serial_write_string(driver.name)
+
+      if (driver.flags & DRIVER_FLAG_ASYNC) != 0 {
+        foundation.serial_write_string(" [async]")
+      }
+
+      foundation.serial_write_string("\n")
+
+      i = i + 1
+    }
+
+    b = b + 1
+  }
+
+  foundation.serial_write_string("\n============================================\n\n")
+}
+
+// ============================================================================
+// Init Groups - Predefined parallel init groups
+// ============================================================================
+
+const INIT_GROUP_CORE: u32 = 0       // Core system (memory, interrupts, timer)
+const INIT_GROUP_STORAGE: u32 = 1   // Storage drivers (AHCI, NVMe, SD)
+const INIT_GROUP_INPUT: u32 = 2     // Input devices (keyboard, mouse, touchpad)
+const INIT_GROUP_NETWORK: u32 = 3   // Network drivers (Ethernet, WiFi)
+const INIT_GROUP_DISPLAY: u32 = 4   // Display/GPU drivers
+const INIT_GROUP_USB: u32 = 5       // USB controllers
+const INIT_GROUP_AUDIO: u32 = 6     // Audio devices
+const INIT_GROUP_OTHER: u32 = 7     // Misc devices
+
+// Group states for parallel init tracking
+var group_states: [8]u32
+var group_driver_counts: [8]u32
+
+export fn driver_assign_group(driver_id: u32, group: u32): u32 {
+  if driver_id >= driver_count { return 1 }
+  if group >= 8 { return 1 }
+
+  // Store group in unused field or add new field
+  // For now, use flags upper bits
+  let driver: *DriverDescriptor = &drivers[driver_id]
+  driver.flags = (driver.flags & 0x0000FFFF) | (group << 16)
+
+  group_driver_counts[group] = group_driver_counts[group] + 1
+
+  return 0
+}
+
+fn driver_get_group(driver: *DriverDescriptor): u32 {
+  return (driver.flags >> 16) & 0xFF
+}
+
+// Initialize all drivers in a specific group
+export fn driver_init_group(group: u32): u32 {
+  if group >= 8 { return 1 }
+
+  foundation.serial_write_string("[Driver Init] Initializing group ")
+  foundation.serial_write_u64(group)
+  foundation.serial_write_string("\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= driver_count { break }
+
+    let driver: *DriverDescriptor = &drivers[i]
+
+    if driver_get_group(driver) != group {
+      i = i + 1
+      continue
+    }
+
+    if driver.state != DRIVER_STATE_PENDING {
+      i = i + 1
+      continue
+    }
+
+    if (driver.flags & DRIVER_FLAG_LAZY) != 0 {
+      i = i + 1
+      continue
+    }
+
+    if driver_deps_satisfied(driver) == 0 {
+      i = i + 1
+      continue
+    }
+
+    let result: u32 = driver_init_single(driver)
+    if result != 0 and (driver.flags & DRIVER_FLAG_OPTIONAL) == 0 {
+      return result
+    }
+
+    i = i + 1
+  }
+
+  group_states[group] = 1
+
+  return 0
+}
+
+// Initialize multiple groups in parallel (for SMP systems)
+export fn driver_init_groups_parallel(groups: *u32, group_count: u32): u32 {
+  foundation.serial_write_string("[Driver Init] Parallel group initialization\n")
+  foundation.serial_write_string("Groups: ")
+
+  var i: u32 = 0
+  loop {
+    if i >= group_count { break }
+
+    let g: u32 = *@ptrFromInt(groups + i * 4, *u32)
+    foundation.serial_write_u64(g)
+    foundation.serial_write_string(" ")
+
+    i = i + 1
+  }
+  foundation.serial_write_string("\n")
+
+  // In a true SMP system, each group would run on a separate CPU
+  // For now, run sequentially
+  i = 0
+  loop {
+    if i >= group_count { break }
+
+    let g: u32 = *@ptrFromInt(groups + i * 4, *u32)
+    let result: u32 = driver_init_group(g)
+    if result != 0 { return result }
+
+    i = i + 1
+  }
+
+  return 0
+}
+
+// Estimate parallelization speedup
+export fn driver_estimate_speedup(): u32 {
+  if batch_count == 0 {
+    driver_build_parallel_batches()
+  }
+
+  // Calculate sequential time
+  var seq_time: u64 = 0
+  var i: u32 = 0
+  loop {
+    if i >= driver_count { break }
+
+    if drivers[i].state == DRIVER_STATE_INITIALIZED {
+      seq_time = seq_time + drivers[i].init_time_us
+    }
+
+    i = i + 1
+  }
+
+  // Calculate parallel time (max per batch)
+  var par_time: u64 = 0
+  var b: u32 = 0
+  loop {
+    if b >= batch_count { break }
+
+    let batch: *InitBatch = &init_batches[b]
+    var batch_max: u64 = 0
+
+    var j: u32 = 0
+    loop {
+      if j >= batch.count { break }
+
+      let driver_id: u32 = batch.driver_ids[j]
+      let time: u64 = drivers[driver_id].init_time_us
+
+      if time > batch_max {
+        batch_max = time
+      }
+
+      j = j + 1
+    }
+
+    par_time = par_time + batch_max
+
+    b = b + 1
+  }
+
+  if par_time == 0 { return 100 }
+
+  let speedup: u32 = @truncate((seq_time * 100) / par_time, u32)
+
+  foundation.serial_write_string("[Driver Init] Estimated speedup: ")
+  foundation.serial_write_u64(speedup)
+  foundation.serial_write_string("%\n")
+  foundation.serial_write_string("  Sequential time: ")
+  foundation.serial_write_u64(seq_time / 1000)
+  foundation.serial_write_string(" ms\n")
+  foundation.serial_write_string("  Parallel time:   ")
+  foundation.serial_write_u64(par_time / 1000)
+  foundation.serial_write_string(" ms\n")
+
+  return speedup
+}

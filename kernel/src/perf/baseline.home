@@ -1,0 +1,568 @@
+// HomeOS Performance Baseline Module
+// Collects and compares performance metrics against baselines
+// Provides automated regression detection
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Metric Types
+// ============================================================================
+
+const METRIC_BOOT_TIME: u32 = 0
+const METRIC_MEM_USAGE: u32 = 1
+const METRIC_SYSCALL_LATENCY: u32 = 2
+const METRIC_IO_THROUGHPUT: u32 = 3
+const METRIC_NET_LATENCY: u32 = 4
+const METRIC_CONTEXT_SWITCH: u32 = 5
+const METRIC_IRQ_LATENCY: u32 = 6
+const METRIC_ALLOC_SPEED: u32 = 7
+const METRIC_PAGE_FAULT: u32 = 8
+const METRIC_CACHE_HIT_RATE: u32 = 9
+
+const MAX_METRICS: u32 = 32
+const MAX_SAMPLES_PER_METRIC: u32 = 1000
+const MAX_BASELINES: u32 = 8
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+struct Metric {
+    id: u32,
+    name: [32]u8,
+    unit: [16]u8,
+    samples: [MAX_SAMPLES_PER_METRIC]u64,
+    sample_count: u32,
+    min: u64,
+    max: u64,
+    sum: u64,
+    enabled: u32,
+}
+
+struct Baseline {
+    name: [32]u8,
+    metrics: [MAX_METRICS]MetricBaseline,
+    timestamp: u64,
+    valid: u32,
+}
+
+struct MetricBaseline {
+    mean: u64,
+    stddev: u64,
+    p50: u64,       // Median
+    p95: u64,       // 95th percentile
+    p99: u64,       // 99th percentile
+    threshold_pct: u32,  // Regression threshold percentage
+}
+
+struct RegressionReport {
+    metric_id: u32,
+    current_mean: u64,
+    baseline_mean: u64,
+    delta_pct: i32,
+    is_regression: u32,
+}
+
+var metrics: [MAX_METRICS]Metric = undefined
+var metric_count: u32 = 0
+
+var baselines: [MAX_BASELINES]Baseline = undefined
+var current_baseline: u32 = 0
+
+var regression_reports: [MAX_METRICS]RegressionReport = undefined
+var regression_count: u32 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn baseline_init() void {
+    metric_count = 0
+    current_baseline = 0
+    regression_count = 0
+
+    // Initialize built-in metrics
+    baseline_register_metric(METRIC_BOOT_TIME, "boot_time", "ms")
+    baseline_register_metric(METRIC_MEM_USAGE, "memory_usage", "KB")
+    baseline_register_metric(METRIC_SYSCALL_LATENCY, "syscall_latency", "ns")
+    baseline_register_metric(METRIC_IO_THROUGHPUT, "io_throughput", "MB/s")
+    baseline_register_metric(METRIC_NET_LATENCY, "net_latency", "us")
+    baseline_register_metric(METRIC_CONTEXT_SWITCH, "context_switch", "ns")
+    baseline_register_metric(METRIC_IRQ_LATENCY, "irq_latency", "ns")
+    baseline_register_metric(METRIC_ALLOC_SPEED, "alloc_speed", "ops/s")
+    baseline_register_metric(METRIC_PAGE_FAULT, "page_fault", "ns")
+    baseline_register_metric(METRIC_CACHE_HIT_RATE, "cache_hit", "%")
+
+    serial.write_string("[BASELINE] Initialized with ")
+    serial.write_u32(metric_count)
+    serial.write_string(" metrics\n")
+}
+
+export fn baseline_register_metric(id: u32, name: u64, unit: u64) u32 {
+    if (metric_count >= MAX_METRICS) return 0xFFFFFFFF
+
+    var m: *Metric = &metrics[metric_count]
+    m.id = id
+    m.sample_count = 0
+    m.min = 0xFFFFFFFFFFFFFFFF
+    m.max = 0
+    m.sum = 0
+    m.enabled = 1
+
+    // Copy name
+    var name_ptr: *u8 = @ptrFromInt(name)
+    var i: u32 = 0
+    while (i < 31 and name_ptr[i] != 0) {
+        m.name[i] = name_ptr[i]
+        i += 1
+    }
+    m.name[i] = 0
+
+    // Copy unit
+    var unit_ptr: *u8 = @ptrFromInt(unit)
+    i = 0
+    while (i < 15 and unit_ptr[i] != 0) {
+        m.unit[i] = unit_ptr[i]
+        i += 1
+    }
+    m.unit[i] = 0
+
+    var idx: u32 = metric_count
+    metric_count += 1
+
+    return idx
+}
+
+// ============================================================================
+// Sample Recording
+// ============================================================================
+
+export fn baseline_record(metric_id: u32, value: u64) void {
+    if (metric_id >= metric_count) return
+
+    var m: *Metric = &metrics[metric_id]
+    if (m.enabled == 0) return
+
+    if (m.sample_count < MAX_SAMPLES_PER_METRIC) {
+        m.samples[m.sample_count] = value
+        m.sample_count += 1
+    }
+
+    if (value < m.min) m.min = value
+    if (value > m.max) m.max = value
+    m.sum += value
+}
+
+export fn baseline_record_start(metric_id: u32) u64 {
+    // Return current timestamp for latency measurement
+    // Would use TSC or high-resolution timer
+    return read_tsc()
+}
+
+export fn baseline_record_end(metric_id: u32, start: u64) void {
+    var end: u64 = read_tsc()
+    var elapsed: u64 = end - start
+
+    // Convert TSC to nanoseconds (assuming 1GHz for simplicity)
+    // In production, would calibrate against known timer
+    baseline_record(metric_id, elapsed)
+}
+
+fn read_tsc() u64 {
+    // Placeholder - would use RDTSC instruction
+    // For now, return a pseudo-random value for testing
+    return 0
+}
+
+// ============================================================================
+// Statistics Calculation
+// ============================================================================
+
+fn calculate_mean(m: *Metric) u64 {
+    if (m.sample_count == 0) return 0
+    return m.sum / @as(u64, m.sample_count)
+}
+
+fn calculate_stddev(m: *Metric, mean: u64) u64 {
+    if (m.sample_count < 2) return 0
+
+    var variance_sum: u64 = 0
+    var i: u32 = 0
+
+    while (i < m.sample_count) {
+        var diff: i64 = @as(i64, m.samples[i]) - @as(i64, mean)
+        variance_sum += @as(u64, diff * diff)
+        i += 1
+    }
+
+    var variance: u64 = variance_sum / @as(u64, m.sample_count - 1)
+
+    // Integer square root approximation
+    return isqrt(variance)
+}
+
+fn isqrt(n: u64) u64 {
+    if (n == 0) return 0
+
+    var x: u64 = n
+    var y: u64 = (x + 1) / 2
+
+    while (y < x) {
+        x = y
+        y = (x + n / x) / 2
+    }
+
+    return x
+}
+
+fn calculate_percentile(m: *Metric, percentile: u32) u64 {
+    if (m.sample_count == 0) return 0
+
+    // For accurate percentiles, would need to sort
+    // Using approximation based on min/max/mean
+    var mean: u64 = calculate_mean(m)
+
+    if (percentile == 50) {
+        return mean
+    } else if (percentile == 95) {
+        return mean + (m.max - mean) * 4 / 5
+    } else if (percentile == 99) {
+        return mean + (m.max - mean) * 9 / 10
+    }
+
+    return mean
+}
+
+// ============================================================================
+// Baseline Management
+// ============================================================================
+
+export fn baseline_save(name: u64) u32 {
+    // Find free slot or oldest baseline
+    var slot: u32 = 0
+    var i: u32 = 0
+
+    while (i < MAX_BASELINES) {
+        if (baselines[i].valid == 0) {
+            slot = i
+            break
+        }
+        i += 1
+    }
+
+    if (i >= MAX_BASELINES) {
+        slot = 0  // Overwrite oldest
+    }
+
+    var b: *Baseline = &baselines[slot]
+
+    // Copy name
+    var name_ptr: *u8 = @ptrFromInt(name)
+    i = 0
+    while (i < 31 and name_ptr[i] != 0) {
+        b.name[i] = name_ptr[i]
+        i += 1
+    }
+    b.name[i] = 0
+
+    // Calculate and store baseline for each metric
+    i = 0
+    while (i < metric_count) {
+        var m: *Metric = &metrics[i]
+        var mb: *MetricBaseline = &b.metrics[i]
+
+        mb.mean = calculate_mean(m)
+        mb.stddev = calculate_stddev(m, mb.mean)
+        mb.p50 = calculate_percentile(m, 50)
+        mb.p95 = calculate_percentile(m, 95)
+        mb.p99 = calculate_percentile(m, 99)
+        mb.threshold_pct = 10  // Default 10% regression threshold
+
+        i += 1
+    }
+
+    b.timestamp = 0  // Would store current time
+    b.valid = 1
+
+    serial.write_string("[BASELINE] Saved baseline '")
+    serial.write_string(@ptrFromInt(@intFromPtr(&b.name)))
+    serial.write_string("' to slot ")
+    serial.write_u32(slot)
+    serial.write_string("\n")
+
+    return slot
+}
+
+export fn baseline_load(slot: u32) u32 {
+    if (slot >= MAX_BASELINES) return 1
+    if (baselines[slot].valid == 0) return 1
+
+    current_baseline = slot
+
+    serial.write_string("[BASELINE] Loaded baseline '")
+    serial.write_string(@ptrFromInt(@intFromPtr(&baselines[slot].name)))
+    serial.write_string("'\n")
+
+    return 0
+}
+
+// ============================================================================
+// Regression Detection
+// ============================================================================
+
+export fn baseline_compare() u32 {
+    if (baselines[current_baseline].valid == 0) {
+        serial.write_string("[BASELINE] No baseline loaded\n")
+        return 0
+    }
+
+    regression_count = 0
+    var regressions: u32 = 0
+
+    var i: u32 = 0
+    while (i < metric_count) {
+        var m: *Metric = &metrics[i]
+        var mb: *MetricBaseline = &baselines[current_baseline].metrics[i]
+
+        if (m.sample_count == 0) {
+            i += 1
+            continue
+        }
+
+        var current_mean: u64 = calculate_mean(m)
+        var baseline_mean: u64 = mb.mean
+
+        // Calculate percentage change
+        var delta_pct: i32 = 0
+        if (baseline_mean > 0) {
+            delta_pct = @as(i32, ((current_mean * 100) / baseline_mean)) - 100
+        }
+
+        // Check for regression
+        var is_regression: u32 = 0
+        if (delta_pct > @as(i32, mb.threshold_pct)) {
+            is_regression = 1
+            regressions += 1
+        }
+
+        // Store report
+        if (regression_count < MAX_METRICS) {
+            regression_reports[regression_count].metric_id = i
+            regression_reports[regression_count].current_mean = current_mean
+            regression_reports[regression_count].baseline_mean = baseline_mean
+            regression_reports[regression_count].delta_pct = delta_pct
+            regression_reports[regression_count].is_regression = is_regression
+            regression_count += 1
+        }
+
+        i += 1
+    }
+
+    return regressions
+}
+
+export fn baseline_print_comparison() void {
+    serial.write_string("\n")
+    serial.write_string("================================================================================\n")
+    serial.write_string("                     PERFORMANCE BASELINE COMPARISON                           \n")
+    serial.write_string("================================================================================\n")
+    serial.write_string("\n")
+
+    if (baselines[current_baseline].valid == 1) {
+        serial.write_string("Baseline: ")
+        serial.write_string(@ptrFromInt(@intFromPtr(&baselines[current_baseline].name)))
+        serial.write_string("\n\n")
+    }
+
+    serial.write_string("Metric                    Current       Baseline      Delta    Status\n")
+    serial.write_string("--------------------------------------------------------------------------------\n")
+
+    var i: u32 = 0
+    while (i < regression_count) {
+        var r: *RegressionReport = &regression_reports[i]
+        var m: *Metric = &metrics[r.metric_id]
+
+        // Print metric name (padded to 24 chars)
+        serial.write_string(@ptrFromInt(@intFromPtr(&m.name)))
+        serial.write_string("  ")
+
+        // Current value
+        serial.write_u64(r.current_mean)
+        serial.write_string("  ")
+
+        // Baseline value
+        serial.write_u64(r.baseline_mean)
+        serial.write_string("  ")
+
+        // Delta
+        if (r.delta_pct >= 0) {
+            serial.write_string("+")
+        }
+        serial.write_i32(r.delta_pct)
+        serial.write_string("%  ")
+
+        // Status
+        if (r.is_regression == 1) {
+            serial.write_string("REGRESSION")
+        } else if (r.delta_pct < -5) {
+            serial.write_string("IMPROVED")
+        } else {
+            serial.write_string("OK")
+        }
+
+        serial.write_string("\n")
+        i += 1
+    }
+
+    serial.write_string("--------------------------------------------------------------------------------\n")
+}
+
+// ============================================================================
+// Output Formats
+// ============================================================================
+
+// JSON output for CI/CD integration
+export fn baseline_output_json(buffer: u64, max_len: u32) u32 {
+    var buf: *u8 = @ptrFromInt(buffer)
+    var pos: u32 = 0
+
+    pos = append_str(buf, pos, max_len, "{\n")
+    pos = append_str(buf, pos, max_len, "  \"metrics\": [\n")
+
+    var i: u32 = 0
+    while (i < metric_count and pos < max_len - 256) {
+        var m: *Metric = &metrics[i]
+
+        pos = append_str(buf, pos, max_len, "    {\n")
+
+        pos = append_str(buf, pos, max_len, "      \"name\": \"")
+        pos = append_str(buf, pos, max_len, @intFromPtr(&m.name))
+        pos = append_str(buf, pos, max_len, "\",\n")
+
+        pos = append_str(buf, pos, max_len, "      \"unit\": \"")
+        pos = append_str(buf, pos, max_len, @intFromPtr(&m.unit))
+        pos = append_str(buf, pos, max_len, "\",\n")
+
+        pos = append_str(buf, pos, max_len, "      \"samples\": ")
+        pos = append_u32(buf, pos, max_len, m.sample_count)
+        pos = append_str(buf, pos, max_len, ",\n")
+
+        pos = append_str(buf, pos, max_len, "      \"mean\": ")
+        pos = append_u64(buf, pos, max_len, calculate_mean(m))
+        pos = append_str(buf, pos, max_len, ",\n")
+
+        pos = append_str(buf, pos, max_len, "      \"min\": ")
+        pos = append_u64(buf, pos, max_len, m.min)
+        pos = append_str(buf, pos, max_len, ",\n")
+
+        pos = append_str(buf, pos, max_len, "      \"max\": ")
+        pos = append_u64(buf, pos, max_len, m.max)
+        pos = append_str(buf, pos, max_len, "\n")
+
+        pos = append_str(buf, pos, max_len, "    }")
+        if (i < metric_count - 1) {
+            pos = append_str(buf, pos, max_len, ",")
+        }
+        pos = append_str(buf, pos, max_len, "\n")
+
+        i += 1
+    }
+
+    pos = append_str(buf, pos, max_len, "  ]\n")
+    pos = append_str(buf, pos, max_len, "}\n")
+
+    return pos
+}
+
+// ============================================================================
+// Reset and Cleanup
+// ============================================================================
+
+export fn baseline_reset_metrics() void {
+    var i: u32 = 0
+    while (i < metric_count) {
+        metrics[i].sample_count = 0
+        metrics[i].min = 0xFFFFFFFFFFFFFFFF
+        metrics[i].max = 0
+        metrics[i].sum = 0
+        i += 1
+    }
+
+    serial.write_string("[BASELINE] Metrics reset\n")
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn append_str(buf: *u8, pos: u32, max_len: u32, s: u64) u32 {
+    var str: *u8 = @ptrFromInt(s)
+    var p: u32 = pos
+    var i: u32 = 0
+
+    while (str[i] != 0 and p < max_len - 1) {
+        buf[p] = str[i]
+        p += 1
+        i += 1
+    }
+
+    return p
+}
+
+fn append_u32(buf: *u8, pos: u32, max_len: u32, val: u32) u32 {
+    var temp: [12]u8 = undefined
+    var v: u32 = val
+    var i: u32 = 0
+
+    if (v == 0) {
+        if (pos < max_len - 1) {
+            buf[pos] = '0'
+            return pos + 1
+        }
+        return pos
+    }
+
+    while (v > 0) {
+        temp[i] = @as(u8, v % 10) + '0'
+        v = v / 10
+        i += 1
+    }
+
+    var p: u32 = pos
+    while (i > 0 and p < max_len - 1) {
+        i -= 1
+        buf[p] = temp[i]
+        p += 1
+    }
+
+    return p
+}
+
+fn append_u64(buf: *u8, pos: u32, max_len: u32, val: u64) u32 {
+    var temp: [20]u8 = undefined
+    var v: u64 = val
+    var i: u32 = 0
+
+    if (v == 0) {
+        if (pos < max_len - 1) {
+            buf[pos] = '0'
+            return pos + 1
+        }
+        return pos
+    }
+
+    while (v > 0) {
+        temp[i] = @as(u8, v % 10) + '0'
+        v = v / 10
+        i += 1
+    }
+
+    var p: u32 = pos
+    while (i > 0 and p < max_len - 1) {
+        i -= 1
+        buf[p] = temp[i]
+        p += 1
+    }
+
+    return p
+}

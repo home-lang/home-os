@@ -1,0 +1,606 @@
+// Memory Footprint Analysis Module for HomeOS
+// Provides comprehensive memory usage tracking and analysis
+// Part of the kernel memory footprint audit for build profile optimization
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Memory Budget Constants by Profile
+// ============================================================================
+
+// Minimal headless profile - target: 32MB kernel footprint
+const BUDGET_MINIMAL_HEADLESS: u32 = 32 * 1024 * 1024
+
+// Server profile - target: 48MB kernel footprint
+const BUDGET_SERVER: u32 = 48 * 1024 * 1024
+
+// Desktop profile - target: 64MB kernel footprint
+const BUDGET_DESKTOP: u32 = 64 * 1024 * 1024
+
+// ============================================================================
+// Memory Category Tracking
+// ============================================================================
+
+const MemoryCategory = struct {
+    name: [32]u8,
+    static_bytes: u64,      // Compile-time allocations
+    heap_bytes: u64,        // Runtime allocations
+    pool_bytes: u64,        // Pool/slab allocations
+    max_instances: u32,     // Max concurrent instances
+    current_instances: u32,
+    enabled: u32,           // Feature flag status
+}
+
+const MAX_CATEGORIES: u32 = 64
+
+var categories: [MAX_CATEGORIES]MemoryCategory = undefined
+var category_count: u32 = 0
+var total_static_bytes: u64 = 0
+var total_heap_bytes: u64 = 0
+var current_profile: u32 = 2  // 0=minimal, 1=server, 2=desktop
+
+// ============================================================================
+// Static Allocation Registry
+// ============================================================================
+
+// Pre-computed static allocation sizes from kernel modules
+// These are documented during the audit and used for budget verification
+
+const StaticAllocation = struct {
+    module: [48]u8,
+    description: [64]u8,
+    size_bytes: u64,
+    category: u32,          // 0=core, 1=driver, 2=net, 3=fs, 4=security, 5=debug, 6=gui
+    profile_min: u32,       // Minimum profile that includes this (0=all)
+}
+
+// Core kernel static allocations
+const STATIC_CORE: u64 =
+    // PMM bitmap: MAX_PAGES/8 = 131072 bytes (128KB)
+    131072 +
+    // Process table: 256 entries * 512 bytes = 128KB
+    131072 +
+    // Scheduler: 4 run queues * 64 entries * 8 bytes = 2KB
+    2048 +
+    // Timer: 128 timers * 32 bytes = 4KB
+    4096
+
+// Memory management static allocations
+const STATIC_MM: u64 =
+    // ZRAM: depends on config, base 64KB
+    65536 +
+    // Slab caches: 16 slabs * 32 entries * 64 bytes = 32KB
+    32768 +
+    // Page tables: variable, base 16KB
+    16384
+
+// Network stack static allocations
+const STATIC_NET: u64 =
+    // TCP connections: 256 * 256 bytes = 64KB
+    65536 +
+    // UDP sockets: 64 * 128 bytes = 8KB
+    8192 +
+    // HTTP connections: 64 * 512 bytes = 32KB
+    32768 +
+    // WebSocket connections: 32 * 512 bytes = 16KB
+    16384 +
+    // DNS cache: 64 * 256 bytes = 16KB
+    16384 +
+    // Socket buffers: 64KB per-connection * 64 = 4MB (peak)
+    4194304
+
+// Driver static allocations
+const STATIC_DRIVERS: u64 =
+    // USB: 8 devices * 1KB = 8KB
+    8192 +
+    // Storage: 16 devices * 4KB = 64KB
+    65536 +
+    // Network: 4 interfaces * 16KB = 64KB
+    65536 +
+    // VirtIO: 8 devices * 4KB = 32KB
+    32768 +
+    // GPIO/I2C/SPI: 4KB combined
+    4096
+
+// Filesystem static allocations
+const STATIC_FS: u64 =
+    // VFS inode cache: 256 * 256 bytes = 64KB
+    65536 +
+    // Dentry cache: 256 * 128 bytes = 32KB
+    32768 +
+    // File table: 256 * 64 bytes = 16KB
+    16384 +
+    // Buffer cache: 256 pages * 4KB = 1MB
+    1048576 +
+    // Mount table: 16 * 256 bytes = 4KB
+    4096
+
+// Security static allocations
+const STATIC_SECURITY: u64 =
+    // Capability sets: 256 processes * 64 bytes = 16KB
+    16384 +
+    // Seccomp filters: 256 * 256 bytes = 64KB
+    65536 +
+    // Audit buffer: 10000 * 256 bytes = 2.5MB
+    2560000 +
+    // ACL cache: 1000 * 64 bytes = 64KB
+    65536 +
+    // Firewall rules: 1000 * 128 bytes = 128KB
+    131072
+
+// Debug static allocations (optional)
+const STATIC_DEBUG: u64 =
+    // Memleak tracker: 10000 * 64 bytes = 640KB
+    655360 +
+    // Profiler: 10000 * 32 bytes = 320KB
+    327680 +
+    // GDB stub: 32KB
+    32768 +
+    // KDB: 16KB
+    16384
+
+// GUI static allocations (optional)
+const STATIC_GUI: u64 =
+    // Framebuffer: 1920*1080*4 = 8MB (typical)
+    8294400 +
+    // Compositor windows: 32 * 4KB = 128KB
+    131072 +
+    // Font cache: 256KB
+    262144 +
+    // Render buffers: 2MB
+    2097152
+
+// ============================================================================
+// Profile Configurations
+// ============================================================================
+
+const ProfileConfig = struct {
+    name: [32]u8,
+    budget_bytes: u64,
+    include_networking: u32,
+    include_gui: u32,
+    include_debug: u32,
+    include_containers: u32,
+    include_advanced_fs: u32,
+    max_processes: u32,
+    max_files: u32,
+    max_sockets: u32,
+    buffer_cache_mb: u32,
+}
+
+var profiles: [4]ProfileConfig = undefined
+
+export fn mem_footprint_init() void {
+    // Initialize profile configurations
+
+    // Profile 0: Minimal Headless
+    inline for (0..32) |i| {
+        profiles[0].name[i] = 0
+    }
+    profiles[0].name[0] = 'm'
+    profiles[0].name[1] = 'i'
+    profiles[0].name[2] = 'n'
+    profiles[0].name[3] = 'i'
+    profiles[0].name[4] = 'm'
+    profiles[0].name[5] = 'a'
+    profiles[0].name[6] = 'l'
+    profiles[0].budget_bytes = BUDGET_MINIMAL_HEADLESS
+    profiles[0].include_networking = 1
+    profiles[0].include_gui = 0
+    profiles[0].include_debug = 0
+    profiles[0].include_containers = 0
+    profiles[0].include_advanced_fs = 0
+    profiles[0].max_processes = 64
+    profiles[0].max_files = 128
+    profiles[0].max_sockets = 32
+    profiles[0].buffer_cache_mb = 4
+
+    // Profile 1: Server
+    inline for (0..32) |i| {
+        profiles[1].name[i] = 0
+    }
+    profiles[1].name[0] = 's'
+    profiles[1].name[1] = 'e'
+    profiles[1].name[2] = 'r'
+    profiles[1].name[3] = 'v'
+    profiles[1].name[4] = 'e'
+    profiles[1].name[5] = 'r'
+    profiles[1].budget_bytes = BUDGET_SERVER
+    profiles[1].include_networking = 1
+    profiles[1].include_gui = 0
+    profiles[1].include_debug = 1
+    profiles[1].include_containers = 1
+    profiles[1].include_advanced_fs = 1
+    profiles[1].max_processes = 256
+    profiles[1].max_files = 512
+    profiles[1].max_sockets = 256
+    profiles[1].buffer_cache_mb = 16
+
+    // Profile 2: Desktop
+    inline for (0..32) |i| {
+        profiles[2].name[i] = 0
+    }
+    profiles[2].name[0] = 'd'
+    profiles[2].name[1] = 'e'
+    profiles[2].name[2] = 's'
+    profiles[2].name[3] = 'k'
+    profiles[2].name[4] = 't'
+    profiles[2].name[5] = 'o'
+    profiles[2].name[6] = 'p'
+    profiles[2].budget_bytes = BUDGET_DESKTOP
+    profiles[2].include_networking = 1
+    profiles[2].include_gui = 1
+    profiles[2].include_debug = 1
+    profiles[2].include_containers = 1
+    profiles[2].include_advanced_fs = 1
+    profiles[2].max_processes = 512
+    profiles[2].max_files = 1024
+    profiles[2].max_sockets = 256
+    profiles[2].buffer_cache_mb = 32
+
+    // Profile 3: Pi Optimized (new for Raspberry Pi)
+    inline for (0..32) |i| {
+        profiles[3].name[i] = 0
+    }
+    profiles[3].name[0] = 'p'
+    profiles[3].name[1] = 'i'
+    profiles[3].budget_bytes = 24 * 1024 * 1024  // 24MB target for Pi
+    profiles[3].include_networking = 1
+    profiles[3].include_gui = 1
+    profiles[3].include_debug = 0
+    profiles[3].include_containers = 0
+    profiles[3].include_advanced_fs = 0
+    profiles[3].max_processes = 128
+    profiles[3].max_files = 256
+    profiles[3].max_sockets = 64
+    profiles[3].buffer_cache_mb = 8
+
+    serial.write_string("[MEM_FOOTPRINT] Initialized with profile configurations\n")
+}
+
+export fn mem_footprint_set_profile(profile_id: u32) void {
+    if (profile_id < 4) {
+        current_profile = profile_id
+        serial.write_string("[MEM_FOOTPRINT] Profile set: ")
+        serial.write_u32(profile_id)
+        serial.write_string("\n")
+    }
+}
+
+export fn mem_footprint_register_category(name: u64, static_size: u64, heap_size: u64, max_inst: u32, cat_type: u32) u32 {
+    if (category_count >= MAX_CATEGORIES) {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = category_count
+    category_count += 1
+
+    // Copy name
+    var name_ptr: *u8 = @ptrFromInt(name)
+    inline for (0..32) |i| {
+        if (name_ptr[i] == 0) {
+            categories[idx].name[i] = 0
+            break
+        }
+        categories[idx].name[i] = name_ptr[i]
+    }
+
+    categories[idx].static_bytes = static_size
+    categories[idx].heap_bytes = heap_size
+    categories[idx].pool_bytes = 0
+    categories[idx].max_instances = max_inst
+    categories[idx].current_instances = 0
+    categories[idx].enabled = 1
+
+    total_static_bytes += static_size
+    total_heap_bytes += heap_size
+
+    return idx
+}
+
+export fn mem_footprint_update_heap(category_id: u32, heap_bytes: u64) void {
+    if (category_id < category_count) {
+        var old: u64 = categories[category_id].heap_bytes
+        categories[category_id].heap_bytes = heap_bytes
+        total_heap_bytes = total_heap_bytes - old + heap_bytes
+    }
+}
+
+export fn mem_footprint_calculate_total() u64 {
+    var total: u64 = STATIC_CORE + STATIC_MM + STATIC_FS
+
+    var config: *ProfileConfig = &profiles[current_profile]
+
+    if (config.include_networking == 1) {
+        total += STATIC_NET
+    }
+
+    total += STATIC_DRIVERS
+
+    if (config.include_debug == 1) {
+        total += STATIC_DEBUG
+    }
+
+    if (config.include_gui == 1) {
+        total += STATIC_GUI
+    }
+
+    // Add security (always included but scaled)
+    if (config.include_containers == 1) {
+        total += STATIC_SECURITY
+    } else {
+        total += STATIC_SECURITY / 4  // Minimal security for non-container profiles
+    }
+
+    return total
+}
+
+export fn mem_footprint_check_budget() u32 {
+    var total: u64 = mem_footprint_calculate_total()
+    var budget: u64 = profiles[current_profile].budget_bytes
+
+    if (total <= budget) {
+        return 1  // Within budget
+    } else {
+        return 0  // Over budget
+    }
+}
+
+export fn mem_footprint_get_margin() i64 {
+    var total: u64 = mem_footprint_calculate_total()
+    var budget: u64 = profiles[current_profile].budget_bytes
+
+    return @as(i64, budget) - @as(i64, total)
+}
+
+export fn mem_footprint_print_report() void {
+    serial.write_string("\n")
+    serial.write_string("================================================================================\n")
+    serial.write_string("                     KERNEL MEMORY FOOTPRINT AUDIT REPORT                      \n")
+    serial.write_string("================================================================================\n")
+    serial.write_string("\n")
+
+    // Profile info
+    serial.write_string("Current Profile: ")
+    serial.write_string(@ptrFromInt(@intFromPtr(&profiles[current_profile].name)))
+    serial.write_string("\n")
+    serial.write_string("Budget: ")
+    serial.write_u64(profiles[current_profile].budget_bytes / 1024 / 1024)
+    serial.write_string(" MB\n\n")
+
+    // Static allocations by category
+    serial.write_string("STATIC ALLOCATIONS:\n")
+    serial.write_string("--------------------------------------------------------------------------------\n")
+
+    serial.write_string("  Core Kernel:        ")
+    mem_footprint_print_size(STATIC_CORE)
+    serial.write_string("\n")
+
+    serial.write_string("  Memory Management:  ")
+    mem_footprint_print_size(STATIC_MM)
+    serial.write_string("\n")
+
+    serial.write_string("  Filesystem/VFS:     ")
+    mem_footprint_print_size(STATIC_FS)
+    serial.write_string("\n")
+
+    serial.write_string("  Drivers:            ")
+    mem_footprint_print_size(STATIC_DRIVERS)
+    serial.write_string("\n")
+
+    if (profiles[current_profile].include_networking == 1) {
+        serial.write_string("  Networking:         ")
+        mem_footprint_print_size(STATIC_NET)
+        serial.write_string("\n")
+    }
+
+    if (profiles[current_profile].include_debug == 1) {
+        serial.write_string("  Debug:              ")
+        mem_footprint_print_size(STATIC_DEBUG)
+        serial.write_string("\n")
+    }
+
+    if (profiles[current_profile].include_gui == 1) {
+        serial.write_string("  GUI/Compositor:     ")
+        mem_footprint_print_size(STATIC_GUI)
+        serial.write_string("\n")
+    }
+
+    serial.write_string("  Security:           ")
+    if (profiles[current_profile].include_containers == 1) {
+        mem_footprint_print_size(STATIC_SECURITY)
+    } else {
+        mem_footprint_print_size(STATIC_SECURITY / 4)
+    }
+    serial.write_string("\n")
+
+    serial.write_string("--------------------------------------------------------------------------------\n")
+
+    var total: u64 = mem_footprint_calculate_total()
+    serial.write_string("  TOTAL:              ")
+    mem_footprint_print_size(total)
+    serial.write_string("\n\n")
+
+    // Budget check
+    var budget: u64 = profiles[current_profile].budget_bytes
+    var margin: i64 = mem_footprint_get_margin()
+
+    if (margin >= 0) {
+        serial.write_string("STATUS: WITHIN BUDGET (")
+        mem_footprint_print_size(@as(u64, margin))
+        serial.write_string(" margin)\n")
+    } else {
+        serial.write_string("STATUS: OVER BUDGET by ")
+        mem_footprint_print_size(@as(u64, -margin))
+        serial.write_string("\n")
+    }
+
+    serial.write_string("\n")
+
+    // Recommendations
+    serial.write_string("OPTIMIZATION RECOMMENDATIONS:\n")
+    serial.write_string("--------------------------------------------------------------------------------\n")
+
+    if (profiles[current_profile].include_debug == 1 and margin < 0) {
+        serial.write_string("  - Disable debug features (saves ~1MB)\n")
+    }
+
+    if (profiles[current_profile].include_containers == 1 and margin < 0) {
+        serial.write_string("  - Reduce audit buffer size (saves ~2.5MB)\n")
+    }
+
+    if (profiles[current_profile].include_gui == 1 and margin < 0) {
+        serial.write_string("  - Use lower framebuffer resolution (saves ~4MB at 1280x720)\n")
+    }
+
+    if (STATIC_NET > 4 * 1024 * 1024) {
+        serial.write_string("  - Reduce socket buffer sizes for Pi\n")
+    }
+
+    serial.write_string("\n")
+    serial.write_string("================================================================================\n")
+}
+
+fn mem_footprint_print_size(bytes: u64) void {
+    if (bytes >= 1024 * 1024) {
+        serial.write_u64(bytes / 1024 / 1024)
+        serial.write_string(".")
+        serial.write_u64((bytes / 1024 % 1024) * 10 / 1024)
+        serial.write_string(" MB")
+    } else if (bytes >= 1024) {
+        serial.write_u64(bytes / 1024)
+        serial.write_string(" KB")
+    } else {
+        serial.write_u64(bytes)
+        serial.write_string(" B")
+    }
+}
+
+// ============================================================================
+// Profile-specific size limit enforcement
+// ============================================================================
+
+export fn mem_footprint_get_max_processes() u32 {
+    return profiles[current_profile].max_processes
+}
+
+export fn mem_footprint_get_max_files() u32 {
+    return profiles[current_profile].max_files
+}
+
+export fn mem_footprint_get_max_sockets() u32 {
+    return profiles[current_profile].max_sockets
+}
+
+export fn mem_footprint_get_buffer_cache_mb() u32 {
+    return profiles[current_profile].buffer_cache_mb
+}
+
+export fn mem_footprint_feature_enabled(feature: u32) u32 {
+    // feature: 0=networking, 1=gui, 2=debug, 3=containers, 4=advanced_fs
+    var config: *ProfileConfig = &profiles[current_profile]
+
+    if (feature == 0) return config.include_networking
+    if (feature == 1) return config.include_gui
+    if (feature == 2) return config.include_debug
+    if (feature == 3) return config.include_containers
+    if (feature == 4) return config.include_advanced_fs
+
+    return 0
+}
+
+// ============================================================================
+// /proc/meminfo-style output for userspace
+// ============================================================================
+
+export fn mem_footprint_proc_read(buffer: u64, max_len: u32) u32 {
+    var buf: *u8 = @ptrFromInt(buffer)
+    var pos: u32 = 0
+
+    // Profile name
+    pos = mem_footprint_append(buf, pos, max_len, "Profile: ")
+    pos = mem_footprint_append(buf, pos, max_len, @ptrFromInt(@intFromPtr(&profiles[current_profile].name)))
+    pos = mem_footprint_append(buf, pos, max_len, "\n")
+
+    // Total
+    pos = mem_footprint_append(buf, pos, max_len, "KernelTotal: ")
+    pos = mem_footprint_append_u64(buf, pos, max_len, mem_footprint_calculate_total() / 1024)
+    pos = mem_footprint_append(buf, pos, max_len, " kB\n")
+
+    // Budget
+    pos = mem_footprint_append(buf, pos, max_len, "Budget: ")
+    pos = mem_footprint_append_u64(buf, pos, max_len, profiles[current_profile].budget_bytes / 1024)
+    pos = mem_footprint_append(buf, pos, max_len, " kB\n")
+
+    // Individual sections
+    pos = mem_footprint_append(buf, pos, max_len, "StaticCore: ")
+    pos = mem_footprint_append_u64(buf, pos, max_len, STATIC_CORE / 1024)
+    pos = mem_footprint_append(buf, pos, max_len, " kB\n")
+
+    pos = mem_footprint_append(buf, pos, max_len, "StaticMM: ")
+    pos = mem_footprint_append_u64(buf, pos, max_len, STATIC_MM / 1024)
+    pos = mem_footprint_append(buf, pos, max_len, " kB\n")
+
+    pos = mem_footprint_append(buf, pos, max_len, "StaticFS: ")
+    pos = mem_footprint_append_u64(buf, pos, max_len, STATIC_FS / 1024)
+    pos = mem_footprint_append(buf, pos, max_len, " kB\n")
+
+    pos = mem_footprint_append(buf, pos, max_len, "StaticNet: ")
+    pos = mem_footprint_append_u64(buf, pos, max_len, STATIC_NET / 1024)
+    pos = mem_footprint_append(buf, pos, max_len, " kB\n")
+
+    pos = mem_footprint_append(buf, pos, max_len, "StaticDrivers: ")
+    pos = mem_footprint_append_u64(buf, pos, max_len, STATIC_DRIVERS / 1024)
+    pos = mem_footprint_append(buf, pos, max_len, " kB\n")
+
+    if (profiles[current_profile].include_gui == 1) {
+        pos = mem_footprint_append(buf, pos, max_len, "StaticGUI: ")
+        pos = mem_footprint_append_u64(buf, pos, max_len, STATIC_GUI / 1024)
+        pos = mem_footprint_append(buf, pos, max_len, " kB\n")
+    }
+
+    return pos
+}
+
+fn mem_footprint_append(buf: *u8, pos: u32, max_len: u32, str: u64) u32 {
+    var s: *u8 = @ptrFromInt(str)
+    var p: u32 = pos
+    var i: u32 = 0
+
+    while (s[i] != 0 and p < max_len - 1) {
+        buf[p] = s[i]
+        p += 1
+        i += 1
+    }
+
+    return p
+}
+
+fn mem_footprint_append_u64(buf: *u8, pos: u32, max_len: u32, val: u64) u32 {
+    var temp: [20]u8 = undefined
+    var v: u64 = val
+    var i: u32 = 0
+
+    if (v == 0) {
+        if (pos < max_len - 1) {
+            buf[pos] = '0'
+            return pos + 1
+        }
+        return pos
+    }
+
+    while (v > 0) {
+        temp[i] = @as(u8, v % 10) + '0'
+        v = v / 10
+        i += 1
+    }
+
+    var p: u32 = pos
+    while (i > 0 and p < max_len - 1) {
+        i -= 1
+        buf[p] = temp[i]
+        p += 1
+    }
+
+    return p
+}

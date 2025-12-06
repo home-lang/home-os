@@ -1,0 +1,456 @@
+// HomeOS Flamegraph Support Module
+// Collects stack samples for flamegraph visualization
+// Outputs data compatible with Brendan Gregg's flamegraph.pl
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Sample Collection
+// ============================================================================
+
+const MAX_SAMPLES: u32 = 100000
+const MAX_STACK_DEPTH: u32 = 64
+const SAMPLE_INTERVAL_MS: u32 = 1  // 1ms sampling
+
+// Stack sample entry
+struct StackSample {
+    stack: [MAX_STACK_DEPTH]u64,   // Return addresses
+    depth: u32,                     // Actual stack depth
+    count: u32,                     // How many times this stack was seen
+    cpu: u32,                       // CPU that recorded this sample
+    pid: u32,                       // Process ID
+    tid: u32,                       // Thread ID
+}
+
+// Aggregated stack for output
+struct AggregatedStack {
+    hash: u64,                      // Hash of the stack
+    sample: StackSample,
+    total_count: u32,
+}
+
+var samples: [MAX_SAMPLES]StackSample = undefined
+var sample_count: u32 = 0
+var sampling_enabled: u32 = 0
+var sample_interval: u32 = SAMPLE_INTERVAL_MS
+
+// Aggregation buffer
+const MAX_UNIQUE_STACKS: u32 = 10000
+var aggregated: [MAX_UNIQUE_STACKS]AggregatedStack = undefined
+var aggregated_count: u32 = 0
+
+// Statistics
+var total_samples: u64 = 0
+var dropped_samples: u64 = 0
+var collection_start_time: u64 = 0
+var collection_end_time: u64 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn flamegraph_init() void {
+    sample_count = 0
+    aggregated_count = 0
+    sampling_enabled = 0
+    total_samples = 0
+    dropped_samples = 0
+
+    serial.write_string("[FLAMEGRAPH] Initialized\n")
+}
+
+// ============================================================================
+// Sampling Control
+// ============================================================================
+
+export fn flamegraph_start(interval_ms: u32) void {
+    sample_count = 0
+    aggregated_count = 0
+    sample_interval = if (interval_ms > 0) interval_ms else SAMPLE_INTERVAL_MS
+    sampling_enabled = 1
+    collection_start_time = get_timestamp()
+
+    serial.write_string("[FLAMEGRAPH] Sampling started (interval: ")
+    serial.write_u32(sample_interval)
+    serial.write_string("ms)\n")
+}
+
+export fn flamegraph_stop() void {
+    sampling_enabled = 0
+    collection_end_time = get_timestamp()
+
+    serial.write_string("[FLAMEGRAPH] Sampling stopped\n")
+    serial.write_string("  Total samples: ")
+    serial.write_u64(total_samples)
+    serial.write_string("\n")
+    serial.write_string("  Unique stacks: ")
+    serial.write_u32(sample_count)
+    serial.write_string("\n")
+    serial.write_string("  Dropped: ")
+    serial.write_u64(dropped_samples)
+    serial.write_string("\n")
+}
+
+export fn flamegraph_is_enabled() u32 {
+    return sampling_enabled
+}
+
+// ============================================================================
+// Sample Recording (called from timer interrupt)
+// ============================================================================
+
+export fn flamegraph_record_sample(rip: u64, rbp: u64, cpu: u32, pid: u32, tid: u32) void {
+    if (sampling_enabled == 0) return
+
+    total_samples += 1
+
+    if (sample_count >= MAX_SAMPLES) {
+        dropped_samples += 1
+        return
+    }
+
+    var sample: *StackSample = &samples[sample_count]
+    sample.cpu = cpu
+    sample.pid = pid
+    sample.tid = tid
+    sample.count = 1
+    sample.depth = 0
+
+    // Record current instruction pointer
+    sample.stack[0] = rip
+    sample.depth = 1
+
+    // Walk the stack using frame pointers
+    var frame_ptr: u64 = rbp
+    var depth: u32 = 1
+
+    while (depth < MAX_STACK_DEPTH and frame_ptr != 0) {
+        // Validate frame pointer is in valid range
+        if (frame_ptr < 0x1000 or frame_ptr > 0xFFFFFFFFFFFF0000) {
+            break
+        }
+
+        // Read return address (frame_ptr + 8 on x86-64)
+        var ret_addr_ptr: *u64 = @ptrFromInt(frame_ptr + 8)
+        var ret_addr: u64 = ret_addr_ptr.*
+
+        if (ret_addr == 0) break
+
+        sample.stack[depth] = ret_addr
+        depth += 1
+
+        // Read previous frame pointer
+        var prev_frame_ptr: *u64 = @ptrFromInt(frame_ptr)
+        frame_ptr = prev_frame_ptr.*
+    }
+
+    sample.depth = depth
+    sample_count += 1
+}
+
+// ============================================================================
+// Stack Hashing and Aggregation
+// ============================================================================
+
+fn hash_stack(sample: *StackSample) u64 {
+    var hash: u64 = 0x9E3779B97F4A7C15  // Golden ratio constant
+    var i: u32 = 0
+
+    while (i < sample.depth) {
+        hash = hash ^ sample.stack[i]
+        hash = hash * 0x9E3779B97F4A7C15
+        i += 1
+    }
+
+    // Include pid in hash
+    hash = hash ^ (@as(u64, sample.pid) << 32)
+
+    return hash
+}
+
+fn find_or_add_aggregated(sample: *StackSample) *AggregatedStack {
+    var hash: u64 = hash_stack(sample)
+
+    // Search for existing entry
+    var i: u32 = 0
+    while (i < aggregated_count) {
+        if (aggregated[i].hash == hash) {
+            // Verify it's actually the same stack
+            if (stacks_equal(&aggregated[i].sample, sample) == 1) {
+                return &aggregated[i]
+            }
+        }
+        i += 1
+    }
+
+    // Add new entry
+    if (aggregated_count >= MAX_UNIQUE_STACKS) {
+        return null
+    }
+
+    var entry: *AggregatedStack = &aggregated[aggregated_count]
+    entry.hash = hash
+    entry.total_count = 0
+
+    // Copy sample
+    entry.sample.depth = sample.depth
+    entry.sample.pid = sample.pid
+    entry.sample.tid = sample.tid
+    entry.sample.cpu = sample.cpu
+
+    i = 0
+    while (i < sample.depth) {
+        entry.sample.stack[i] = sample.stack[i]
+        i += 1
+    }
+
+    aggregated_count += 1
+    return entry
+}
+
+fn stacks_equal(a: *StackSample, b: *StackSample) u32 {
+    if (a.depth != b.depth) return 0
+    if (a.pid != b.pid) return 0
+
+    var i: u32 = 0
+    while (i < a.depth) {
+        if (a.stack[i] != b.stack[i]) return 0
+        i += 1
+    }
+
+    return 1
+}
+
+export fn flamegraph_aggregate() void {
+    serial.write_string("[FLAMEGRAPH] Aggregating samples...\n")
+
+    aggregated_count = 0
+
+    var i: u32 = 0
+    while (i < sample_count) {
+        var entry: *AggregatedStack = find_or_add_aggregated(&samples[i])
+        if (entry != null) {
+            entry.total_count += samples[i].count
+        }
+        i += 1
+    }
+
+    serial.write_string("  Aggregated to ")
+    serial.write_u32(aggregated_count)
+    serial.write_string(" unique stacks\n")
+}
+
+// ============================================================================
+// Output Generation
+// ============================================================================
+
+// Output in folded stack format for flamegraph.pl
+// Format: stack_frame1;stack_frame2;stack_frame3 count
+export fn flamegraph_output_folded(buffer: u64, max_len: u32) u32 {
+    if (aggregated_count == 0) {
+        flamegraph_aggregate()
+    }
+
+    var buf: *u8 = @ptrFromInt(buffer)
+    var pos: u32 = 0
+
+    var i: u32 = 0
+    while (i < aggregated_count and pos < max_len - 256) {
+        var entry: *AggregatedStack = &aggregated[i]
+
+        // Output stack frames (bottom to top for flamegraph)
+        var j: i32 = @as(i32, entry.sample.depth) - 1
+        while (j >= 0 and pos < max_len - 64) {
+            // Output hex address (would be symbol name in production)
+            pos = append_hex(buf, pos, max_len, entry.sample.stack[@as(u32, j)])
+
+            if (j > 0) {
+                buf[pos] = ';'
+                pos += 1
+            }
+
+            j -= 1
+        }
+
+        // Output count
+        buf[pos] = ' '
+        pos += 1
+        pos = append_u32(buf, pos, max_len, entry.total_count)
+        buf[pos] = '\n'
+        pos += 1
+
+        i += 1
+    }
+
+    return pos
+}
+
+// Output for perf script format
+export fn flamegraph_output_perf(buffer: u64, max_len: u32) u32 {
+    if (aggregated_count == 0) {
+        flamegraph_aggregate()
+    }
+
+    var buf: *u8 = @ptrFromInt(buffer)
+    var pos: u32 = 0
+
+    var i: u32 = 0
+    while (i < aggregated_count and pos < max_len - 512) {
+        var entry: *AggregatedStack = &aggregated[i]
+
+        // Header: comm pid/tid timestamp:
+        pos = append_str(buf, pos, max_len, "home-os ")
+        pos = append_u32(buf, pos, max_len, entry.sample.pid)
+        buf[pos] = '/'
+        pos += 1
+        pos = append_u32(buf, pos, max_len, entry.sample.tid)
+        pos = append_str(buf, pos, max_len, " [")
+        pos = append_u32(buf, pos, max_len, entry.sample.cpu)
+        pos = append_str(buf, pos, max_len, "] ")
+        pos = append_u32(buf, pos, max_len, entry.total_count)
+        pos = append_str(buf, pos, max_len, ".000000: cycles:\n")
+
+        // Stack trace
+        var j: u32 = 0
+        while (j < entry.sample.depth and pos < max_len - 64) {
+            pos = append_str(buf, pos, max_len, "\t")
+            pos = append_hex(buf, pos, max_len, entry.sample.stack[j])
+            pos = append_str(buf, pos, max_len, " [unknown]\n")
+            j += 1
+        }
+
+        buf[pos] = '\n'
+        pos += 1
+
+        i += 1
+    }
+
+    return pos
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn get_timestamp() u64 {
+    // Would read TSC or system timer
+    // Placeholder implementation
+    return 0
+}
+
+fn append_str(buf: *u8, pos: u32, max_len: u32, s: u64) u32 {
+    var str: *u8 = @ptrFromInt(s)
+    var p: u32 = pos
+    var i: u32 = 0
+
+    while (str[i] != 0 and p < max_len - 1) {
+        buf[p] = str[i]
+        p += 1
+        i += 1
+    }
+
+    return p
+}
+
+fn append_u32(buf: *u8, pos: u32, max_len: u32, val: u32) u32 {
+    var temp: [12]u8 = undefined
+    var v: u32 = val
+    var i: u32 = 0
+
+    if (v == 0) {
+        if (pos < max_len - 1) {
+            buf[pos] = '0'
+            return pos + 1
+        }
+        return pos
+    }
+
+    while (v > 0) {
+        temp[i] = @as(u8, v % 10) + '0'
+        v = v / 10
+        i += 1
+    }
+
+    var p: u32 = pos
+    while (i > 0 and p < max_len - 1) {
+        i -= 1
+        buf[p] = temp[i]
+        p += 1
+    }
+
+    return p
+}
+
+fn append_hex(buf: *u8, pos: u32, max_len: u32, val: u64) u32 {
+    var hex_chars: [16]u8 = "0123456789abcdef".*
+    var p: u32 = pos
+
+    if (p < max_len - 2) {
+        buf[p] = '0'
+        buf[p + 1] = 'x'
+        p += 2
+    }
+
+    // Output 16 hex digits
+    var shift: i32 = 60
+    var started: u32 = 0
+
+    while (shift >= 0 and p < max_len - 1) {
+        var digit: u8 = @as(u8, @truncate((val >> @as(u6, @intCast(shift))) & 0xF))
+
+        if (digit != 0 or started == 1 or shift == 0) {
+            buf[p] = hex_chars[digit]
+            p += 1
+            started = 1
+        }
+
+        shift -= 4
+    }
+
+    return p
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn flamegraph_print_stats() void {
+    serial.write_string("\n[FLAMEGRAPH] Statistics:\n")
+
+    serial.write_string("  Status: ")
+    if (sampling_enabled == 1) {
+        serial.write_string("ACTIVE\n")
+    } else {
+        serial.write_string("STOPPED\n")
+    }
+
+    serial.write_string("  Sample interval: ")
+    serial.write_u32(sample_interval)
+    serial.write_string("ms\n")
+
+    serial.write_string("  Total samples: ")
+    serial.write_u64(total_samples)
+    serial.write_string("\n")
+
+    serial.write_string("  Stored samples: ")
+    serial.write_u32(sample_count)
+    serial.write_string("\n")
+
+    serial.write_string("  Unique stacks: ")
+    serial.write_u32(aggregated_count)
+    serial.write_string("\n")
+
+    serial.write_string("  Dropped samples: ")
+    serial.write_u64(dropped_samples)
+    serial.write_string("\n")
+}
+
+export fn flamegraph_reset() void {
+    sample_count = 0
+    aggregated_count = 0
+    total_samples = 0
+    dropped_samples = 0
+    sampling_enabled = 0
+
+    serial.write_string("[FLAMEGRAPH] Reset\n")
+}

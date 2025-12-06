@@ -1,0 +1,740 @@
+// HomeOS I/O Scheduler
+// Optimized for flash storage (SD cards, NVMe) without external dependencies
+// Provides deadline-like scheduling with flash-aware optimizations
+
+const serial = @import("../drivers/serial.home")
+const request_merge = @import("request_merge.home")
+
+// ============================================================================
+// Scheduler Types
+// ============================================================================
+
+// Scheduler algorithms
+const SCHED_NOOP: u32 = 0       // No-op: FIFO, best for fast NVMe
+const SCHED_DEADLINE: u32 = 1   // Deadline: balanced, good for SD cards
+const SCHED_BFQ: u32 = 2        // Budget Fair Queuing: for mixed workloads
+
+// I/O priorities
+const IO_PRIO_RT: u32 = 0       // Real-time (audio, video)
+const IO_PRIO_BE: u32 = 1       // Best-effort (normal)
+const IO_PRIO_IDLE: u32 = 2     // Idle (background, low priority)
+
+// Flash optimization flags
+const FLASH_OPT_AVOID_RANDOM: u32 = 1 << 0    // Avoid random writes
+const FLASH_OPT_BATCH_WRITES: u32 = 1 << 1    // Batch small writes
+const FLASH_OPT_WEAR_LEVEL: u32 = 1 << 2      // Consider wear leveling
+const FLASH_OPT_TRIM_SUPPORT: u32 = 1 << 3    // Use TRIM/DISCARD
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// I/O request with scheduling metadata
+struct ScheduledRequest {
+    base: request_merge.BlockRequest,   // Base request
+    deadline_jiffies: u64,               // Deadline timestamp
+    submit_jiffies: u64,                 // Submit timestamp
+    priority: u32,                        // I/O priority
+    batch_id: u32,                        // For write batching
+    next_prio: *ScheduledRequest,        // Next in priority queue
+    next_fifo: *ScheduledRequest,        // Next in FIFO queue
+}
+
+// Priority queue (separate for reads and writes)
+struct PriorityQueue {
+    head: *ScheduledRequest,
+    tail: *ScheduledRequest,
+    count: u32,
+}
+
+// Scheduler context per device
+struct SchedulerContext {
+    device_id: u32,
+    algorithm: u32,
+    flash_opts: u32,
+
+    // Separate queues for reads/writes (deadline-style)
+    read_queue: PriorityQueue,
+    write_queue: PriorityQueue,
+
+    // FIFO fallback queues for deadline enforcement
+    read_fifo: PriorityQueue,
+    write_fifo: PriorityQueue,
+
+    // Deadline settings (in jiffies)
+    read_deadline: u64,          // Default 500ms for reads
+    write_deadline: u64,         // Default 5000ms for writes
+
+    // Write batching
+    batch_size: u32,
+    current_batch_id: u32,
+    pending_batch_blocks: u32,
+    batch_timeout_jiffies: u64,
+    last_batch_time: u64,
+
+    // Dispatch tracking
+    dispatched_reads: u32,
+    dispatched_writes: u32,
+    starved_reads: u32,          // Reads waiting too long
+    starved_writes: u32,         // Writes waiting too long
+
+    // Statistics
+    total_requests: u64,
+    merged_requests: u64,
+    deadline_misses: u64,
+    batched_writes: u64,
+    random_write_avoids: u64,
+
+    active: u32,
+}
+
+const MAX_SCHEDULERS: u32 = 8
+const JIFFIES_PER_MS: u64 = 1    // Simplified: 1 jiffy = 1 ms
+
+var schedulers: [MAX_SCHEDULERS]SchedulerContext = undefined
+var scheduler_count: u32 = 0
+var current_jiffies: u64 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn io_scheduler_init() void {
+    scheduler_count = 0
+    current_jiffies = 0
+
+    serial.write_string("[IO Scheduler] Subsystem initialized\n")
+}
+
+export fn io_scheduler_create(device_id: u32, algorithm: u32, is_flash: u32) u32 {
+    if (scheduler_count >= MAX_SCHEDULERS) {
+        serial.write_string("[IO Scheduler] Maximum schedulers reached\n")
+        return 0xFFFFFFFF
+    }
+
+    var ctx: *SchedulerContext = &schedulers[scheduler_count]
+    ctx.device_id = device_id
+    ctx.algorithm = algorithm
+
+    // Initialize queues
+    ctx.read_queue.head = null
+    ctx.read_queue.tail = null
+    ctx.read_queue.count = 0
+
+    ctx.write_queue.head = null
+    ctx.write_queue.tail = null
+    ctx.write_queue.count = 0
+
+    ctx.read_fifo.head = null
+    ctx.read_fifo.tail = null
+    ctx.read_fifo.count = 0
+
+    ctx.write_fifo.head = null
+    ctx.write_fifo.tail = null
+    ctx.write_fifo.count = 0
+
+    // Default deadlines
+    ctx.read_deadline = 500 * JIFFIES_PER_MS     // 500ms for reads
+    ctx.write_deadline = 5000 * JIFFIES_PER_MS   // 5s for writes
+
+    // Flash optimizations
+    if (is_flash == 1) {
+        ctx.flash_opts = FLASH_OPT_AVOID_RANDOM | FLASH_OPT_BATCH_WRITES | FLASH_OPT_WEAR_LEVEL
+        ctx.batch_size = 64                       // 32KB batches (64 * 512 bytes)
+        ctx.batch_timeout_jiffies = 100 * JIFFIES_PER_MS  // 100ms timeout
+    } else {
+        ctx.flash_opts = 0
+        ctx.batch_size = 0
+        ctx.batch_timeout_jiffies = 0
+    }
+
+    ctx.current_batch_id = 0
+    ctx.pending_batch_blocks = 0
+    ctx.last_batch_time = 0
+
+    ctx.dispatched_reads = 0
+    ctx.dispatched_writes = 0
+    ctx.starved_reads = 0
+    ctx.starved_writes = 0
+
+    ctx.total_requests = 0
+    ctx.merged_requests = 0
+    ctx.deadline_misses = 0
+    ctx.batched_writes = 0
+    ctx.random_write_avoids = 0
+
+    ctx.active = 1
+
+    var id: u32 = scheduler_count
+    scheduler_count += 1
+
+    serial.write_string("[IO Scheduler] Created scheduler ")
+    serial.write_u32(id)
+    serial.write_string(" for device ")
+    serial.write_u32(device_id)
+    serial.write_string(" (algorithm: ")
+    if (algorithm == SCHED_NOOP) {
+        serial.write_string("noop")
+    } else if (algorithm == SCHED_DEADLINE) {
+        serial.write_string("deadline")
+    } else {
+        serial.write_string("bfq")
+    }
+    if (is_flash == 1) {
+        serial.write_string(", flash-optimized")
+    }
+    serial.write_string(")\n")
+
+    return id
+}
+
+// ============================================================================
+// Request Sorting and Insertion
+// ============================================================================
+
+// Insert request sorted by sector (for elevator algorithm)
+fn insert_sorted(queue: *PriorityQueue, req: *ScheduledRequest) void {
+    if (queue.head == null) {
+        queue.head = req
+        queue.tail = req
+        req.next_prio = null
+        queue.count = 1
+        return
+    }
+
+    // Insert sorted by block_start for elevator ordering
+    var current: *ScheduledRequest = queue.head
+    var prev: *ScheduledRequest = null
+
+    while (current != null) {
+        if (req.base.block_start < current.base.block_start) {
+            break
+        }
+        prev = current
+        current = current.next_prio
+    }
+
+    if (prev == null) {
+        // Insert at head
+        req.next_prio = queue.head
+        queue.head = req
+    } else {
+        req.next_prio = prev.next_prio
+        prev.next_prio = req
+
+        if (prev == queue.tail) {
+            queue.tail = req
+        }
+    }
+
+    queue.count += 1
+}
+
+// Insert request at FIFO tail
+fn insert_fifo(queue: *PriorityQueue, req: *ScheduledRequest) void {
+    req.next_fifo = null
+
+    if (queue.tail == null) {
+        queue.head = req
+        queue.tail = req
+    } else {
+        queue.tail.next_fifo = req
+        queue.tail = req
+    }
+
+    queue.count += 1
+}
+
+// ============================================================================
+// Request Submission
+// ============================================================================
+
+export fn io_scheduler_submit(
+    sched_id: u32,
+    req_type: u32,
+    block_start: u64,
+    block_count: u32,
+    buffer: u64,
+    priority: u32
+) u32 {
+    if (sched_id >= scheduler_count) {
+        return 1
+    }
+
+    var ctx: *SchedulerContext = &schedulers[sched_id]
+
+    // For NOOP scheduler, just pass through to request merge layer
+    if (ctx.algorithm == SCHED_NOOP) {
+        // TODO: Direct dispatch to block layer
+        ctx.total_requests += 1
+        return 0
+    }
+
+    // Allocate scheduled request
+    // In real implementation, would use slab allocator
+    var req: *ScheduledRequest = @ptrFromInt(0)  // Placeholder for allocation
+
+    // Check flash optimizations for writes
+    if (req_type == request_merge.REQ_TYPE_WRITE and (ctx.flash_opts & FLASH_OPT_BATCH_WRITES) != 0) {
+        // Add to current batch
+        ctx.pending_batch_blocks += block_count
+        ctx.batched_writes += 1
+
+        // Check if batch should be flushed
+        if (ctx.pending_batch_blocks >= ctx.batch_size or
+            (current_jiffies - ctx.last_batch_time) >= ctx.batch_timeout_jiffies) {
+            io_scheduler_flush_batch(sched_id)
+        }
+    }
+
+    // Random write avoidance for flash
+    if (req_type == request_merge.REQ_TYPE_WRITE and (ctx.flash_opts & FLASH_OPT_AVOID_RANDOM) != 0) {
+        // Check if this is a random write (not adjacent to existing queued writes)
+        if (is_random_write(ctx, block_start)) {
+            // Defer or reorder this write
+            ctx.random_write_avoids += 1
+        }
+    }
+
+    ctx.total_requests += 1
+    return 0
+}
+
+fn is_random_write(ctx: *SchedulerContext, block_start: u64) u32 {
+    // Check if block_start is within 64KB of any queued write
+    var current: *ScheduledRequest = ctx.write_queue.head
+
+    while (current != null) {
+        var diff: i64 = @as(i64, block_start) - @as(i64, current.base.block_start)
+        if (diff < 0) diff = -diff
+
+        if (diff < 128) {  // Within 64KB (128 blocks)
+            return 0  // Sequential or nearby
+        }
+
+        current = current.next_prio
+    }
+
+    return 1  // Random write
+}
+
+// ============================================================================
+// Batch Management
+// ============================================================================
+
+export fn io_scheduler_flush_batch(sched_id: u32) void {
+    if (sched_id >= scheduler_count) return
+
+    var ctx: *SchedulerContext = &schedulers[sched_id]
+
+    if (ctx.pending_batch_blocks == 0) return
+
+    serial.write_string("[IO Scheduler] Flushing batch: ")
+    serial.write_u32(ctx.pending_batch_blocks)
+    serial.write_string(" blocks\n")
+
+    // Increment batch ID
+    ctx.current_batch_id += 1
+    ctx.pending_batch_blocks = 0
+    ctx.last_batch_time = current_jiffies
+}
+
+// ============================================================================
+// Request Dispatch
+// ============================================================================
+
+export fn io_scheduler_dispatch(sched_id: u32) *ScheduledRequest {
+    if (sched_id >= scheduler_count) return null
+
+    var ctx: *SchedulerContext = &schedulers[sched_id]
+
+    if (ctx.algorithm == SCHED_NOOP) {
+        // NOOP: return next request from FIFO
+        return dispatch_fifo(ctx)
+    } else if (ctx.algorithm == SCHED_DEADLINE) {
+        return dispatch_deadline(ctx)
+    } else {
+        return dispatch_bfq(ctx)
+    }
+}
+
+fn dispatch_fifo(ctx: *SchedulerContext) *ScheduledRequest {
+    // Simple FIFO dispatch
+    if (ctx.read_fifo.count > 0) {
+        return dequeue_fifo(&ctx.read_fifo)
+    }
+
+    if (ctx.write_fifo.count > 0) {
+        return dequeue_fifo(&ctx.write_fifo)
+    }
+
+    return null
+}
+
+fn dispatch_deadline(ctx: *SchedulerContext) *ScheduledRequest {
+    // Deadline algorithm:
+    // 1. Check for expired deadlines (reads first)
+    // 2. Otherwise, use elevator algorithm
+
+    // Check read deadline expiry
+    var read_req: *ScheduledRequest = ctx.read_fifo.head
+    if (read_req != null) {
+        if (current_jiffies >= read_req.deadline_jiffies) {
+            ctx.starved_reads += 1
+            ctx.deadline_misses += 1
+            return dequeue_fifo(&ctx.read_fifo)
+        }
+    }
+
+    // Check write deadline expiry
+    var write_req: *ScheduledRequest = ctx.write_fifo.head
+    if (write_req != null) {
+        if (current_jiffies >= write_req.deadline_jiffies) {
+            ctx.starved_writes += 1
+            ctx.deadline_misses += 1
+            return dequeue_fifo(&ctx.write_fifo)
+        }
+    }
+
+    // No expired deadlines, use elevator algorithm
+    // Favor reads over writes (2:1 ratio typical)
+    if (ctx.dispatched_reads < 2 and ctx.read_queue.count > 0) {
+        ctx.dispatched_reads += 1
+        ctx.dispatched_writes = 0
+        return dequeue_sorted(&ctx.read_queue)
+    }
+
+    if (ctx.write_queue.count > 0) {
+        ctx.dispatched_writes += 1
+        ctx.dispatched_reads = 0
+        return dequeue_sorted(&ctx.write_queue)
+    }
+
+    // Fallback to any available read
+    if (ctx.read_queue.count > 0) {
+        ctx.dispatched_reads += 1
+        return dequeue_sorted(&ctx.read_queue)
+    }
+
+    return null
+}
+
+fn dispatch_bfq(ctx: *SchedulerContext) *ScheduledRequest {
+    // Budget Fair Queuing: simplified version
+    // Similar to deadline but with per-process budgets
+    // For now, use deadline as fallback
+    return dispatch_deadline(ctx)
+}
+
+fn dequeue_sorted(queue: *PriorityQueue) *ScheduledRequest {
+    if (queue.head == null) return null
+
+    var req: *ScheduledRequest = queue.head
+    queue.head = req.next_prio
+
+    if (queue.head == null) {
+        queue.tail = null
+    }
+
+    queue.count -= 1
+    req.next_prio = null
+
+    return req
+}
+
+fn dequeue_fifo(queue: *PriorityQueue) *ScheduledRequest {
+    if (queue.head == null) return null
+
+    var req: *ScheduledRequest = queue.head
+    queue.head = req.next_fifo
+
+    if (queue.head == null) {
+        queue.tail = null
+    }
+
+    queue.count -= 1
+    req.next_fifo = null
+
+    return req
+}
+
+// ============================================================================
+// Timer Tick
+// ============================================================================
+
+export fn io_scheduler_tick() void {
+    current_jiffies += 1
+
+    // Check batch timeouts
+    var i: u32 = 0
+    while (i < scheduler_count) {
+        var ctx: *SchedulerContext = &schedulers[i]
+
+        if (ctx.pending_batch_blocks > 0 and
+            (current_jiffies - ctx.last_batch_time) >= ctx.batch_timeout_jiffies) {
+            io_scheduler_flush_batch(i)
+        }
+
+        i += 1
+    }
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+export fn io_scheduler_set_algorithm(sched_id: u32, algorithm: u32) void {
+    if (sched_id >= scheduler_count) return
+
+    schedulers[sched_id].algorithm = algorithm
+
+    serial.write_string("[IO Scheduler] Scheduler ")
+    serial.write_u32(sched_id)
+    serial.write_string(" algorithm changed to ")
+    if (algorithm == SCHED_NOOP) {
+        serial.write_string("noop\n")
+    } else if (algorithm == SCHED_DEADLINE) {
+        serial.write_string("deadline\n")
+    } else {
+        serial.write_string("bfq\n")
+    }
+}
+
+export fn io_scheduler_set_deadlines(sched_id: u32, read_ms: u32, write_ms: u32) void {
+    if (sched_id >= scheduler_count) return
+
+    schedulers[sched_id].read_deadline = read_ms * JIFFIES_PER_MS
+    schedulers[sched_id].write_deadline = write_ms * JIFFIES_PER_MS
+}
+
+export fn io_scheduler_set_flash_opts(sched_id: u32, opts: u32) void {
+    if (sched_id >= scheduler_count) return
+
+    schedulers[sched_id].flash_opts = opts
+}
+
+// ============================================================================
+// /sys/block/XXX/queue/scheduler interface
+// ============================================================================
+
+export fn io_scheduler_sysfs_read(sched_id: u32, buffer: u64, max_len: u32) u32 {
+    if (sched_id >= scheduler_count) return 0
+
+    var ctx: *SchedulerContext = &schedulers[sched_id]
+    var buf: *u8 = @ptrFromInt(buffer)
+    var pos: u32 = 0
+
+    // Show available schedulers, bracket current one
+    var algs: [3][12]u8 = undefined
+    algs[0] = "noop"
+    algs[1] = "deadline"
+    algs[2] = "bfq"
+
+    var i: u32 = 0
+    while (i < 3 and pos < max_len - 16) {
+        if (i == ctx.algorithm) {
+            buf[pos] = '['
+            pos += 1
+        }
+
+        // Copy algorithm name
+        var j: u32 = 0
+        while (j < 12 and algs[i][j] != 0 and pos < max_len - 2) {
+            buf[pos] = algs[i][j]
+            pos += 1
+            j += 1
+        }
+
+        if (i == ctx.algorithm) {
+            buf[pos] = ']'
+            pos += 1
+        }
+
+        buf[pos] = ' '
+        pos += 1
+
+        i += 1
+    }
+
+    buf[pos] = '\n'
+    pos += 1
+
+    return pos
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn io_scheduler_print_stats(sched_id: u32) void {
+    if (sched_id >= scheduler_count) return
+
+    var ctx: *SchedulerContext = &schedulers[sched_id]
+
+    serial.write_string("\n[IO Scheduler] Statistics for device ")
+    serial.write_u32(ctx.device_id)
+    serial.write_string(":\n")
+
+    serial.write_string("  Algorithm: ")
+    if (ctx.algorithm == SCHED_NOOP) {
+        serial.write_string("noop\n")
+    } else if (ctx.algorithm == SCHED_DEADLINE) {
+        serial.write_string("deadline\n")
+    } else {
+        serial.write_string("bfq\n")
+    }
+
+    serial.write_string("  Total requests: ")
+    serial.write_u64(ctx.total_requests)
+    serial.write_string("\n")
+
+    serial.write_string("  Merged requests: ")
+    serial.write_u64(ctx.merged_requests)
+    serial.write_string("\n")
+
+    if (ctx.total_requests > 0) {
+        var merge_rate: u64 = (ctx.merged_requests * 100) / ctx.total_requests
+        serial.write_string("  Merge rate: ")
+        serial.write_u64(merge_rate)
+        serial.write_string("%\n")
+    }
+
+    serial.write_string("  Deadline misses: ")
+    serial.write_u64(ctx.deadline_misses)
+    serial.write_string("\n")
+
+    serial.write_string("  Read queue depth: ")
+    serial.write_u32(ctx.read_queue.count)
+    serial.write_string("\n")
+
+    serial.write_string("  Write queue depth: ")
+    serial.write_u32(ctx.write_queue.count)
+    serial.write_string("\n")
+
+    if ((ctx.flash_opts & FLASH_OPT_BATCH_WRITES) != 0) {
+        serial.write_string("  Batched writes: ")
+        serial.write_u64(ctx.batched_writes)
+        serial.write_string("\n")
+    }
+
+    if ((ctx.flash_opts & FLASH_OPT_AVOID_RANDOM) != 0) {
+        serial.write_string("  Random write avoidances: ")
+        serial.write_u64(ctx.random_write_avoids)
+        serial.write_string("\n")
+    }
+}
+
+// ============================================================================
+// /proc/diskstats interface
+// ============================================================================
+
+export fn io_scheduler_proc_read(buffer: u64, max_len: u32) u32 {
+    var buf: *u8 = @ptrFromInt(buffer)
+    var pos: u32 = 0
+
+    var i: u32 = 0
+    while (i < scheduler_count and pos < max_len - 100) {
+        var ctx: *SchedulerContext = &schedulers[i]
+
+        // Format: device algorithm requests merged misses read_q write_q
+        pos = append_str(buf, pos, max_len, "sched")
+        pos = append_u32(buf, pos, max_len, i)
+        pos = append_str(buf, pos, max_len, " ")
+
+        if (ctx.algorithm == SCHED_NOOP) {
+            pos = append_str(buf, pos, max_len, "noop")
+        } else if (ctx.algorithm == SCHED_DEADLINE) {
+            pos = append_str(buf, pos, max_len, "deadline")
+        } else {
+            pos = append_str(buf, pos, max_len, "bfq")
+        }
+
+        pos = append_str(buf, pos, max_len, " ")
+        pos = append_u64(buf, pos, max_len, ctx.total_requests)
+        pos = append_str(buf, pos, max_len, " ")
+        pos = append_u64(buf, pos, max_len, ctx.merged_requests)
+        pos = append_str(buf, pos, max_len, " ")
+        pos = append_u64(buf, pos, max_len, ctx.deadline_misses)
+        pos = append_str(buf, pos, max_len, " ")
+        pos = append_u32(buf, pos, max_len, ctx.read_queue.count)
+        pos = append_str(buf, pos, max_len, " ")
+        pos = append_u32(buf, pos, max_len, ctx.write_queue.count)
+        pos = append_str(buf, pos, max_len, "\n")
+
+        i += 1
+    }
+
+    return pos
+}
+
+fn append_str(buf: *u8, pos: u32, max_len: u32, s: u64) u32 {
+    var str: *u8 = @ptrFromInt(s)
+    var p: u32 = pos
+    var i: u32 = 0
+
+    while (str[i] != 0 and p < max_len - 1) {
+        buf[p] = str[i]
+        p += 1
+        i += 1
+    }
+
+    return p
+}
+
+fn append_u32(buf: *u8, pos: u32, max_len: u32, val: u32) u32 {
+    var temp: [12]u8 = undefined
+    var v: u32 = val
+    var i: u32 = 0
+
+    if (v == 0) {
+        if (pos < max_len - 1) {
+            buf[pos] = '0'
+            return pos + 1
+        }
+        return pos
+    }
+
+    while (v > 0) {
+        temp[i] = @as(u8, v % 10) + '0'
+        v = v / 10
+        i += 1
+    }
+
+    var p: u32 = pos
+    while (i > 0 and p < max_len - 1) {
+        i -= 1
+        buf[p] = temp[i]
+        p += 1
+    }
+
+    return p
+}
+
+fn append_u64(buf: *u8, pos: u32, max_len: u32, val: u64) u32 {
+    var temp: [20]u8 = undefined
+    var v: u64 = val
+    var i: u32 = 0
+
+    if (v == 0) {
+        if (pos < max_len - 1) {
+            buf[pos] = '0'
+            return pos + 1
+        }
+        return pos
+    }
+
+    while (v > 0) {
+        temp[i] = @as(u8, v % 10) + '0'
+        v = v / 10
+        i += 1
+    }
+
+    var p: u32 = pos
+    while (i > 0 and p < max_len - 1) {
+        i -= 1
+        buf[p] = temp[i]
+        p += 1
+    }
+
+    return p
+}

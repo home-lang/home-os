@@ -1,10 +1,41 @@
 // home-os Kernel - System Call Interface
-// Real implementation
+// Real implementation with capability enforcement
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
 import "../core/process.home" as process
 import "../core/filesystem.home" as filesystem
+import "../security/capabilities.home" as capabilities
+import "../security/seccomp.home" as seccomp
+import "../security/audit.home" as audit
+import "../perf/async_io.home" as async_io
+
+// Seccomp return values for reference
+const SECCOMP_RET_ALLOW: u32 = 0x7FFF0000
+const SECCOMP_RET_ERRNO: u32 = 0x00050000
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x80000000
+
+// Capability bits (match capabilities.home)
+const CAP_KILL: u64 = 1 << 5
+const CAP_SETGID: u64 = 1 << 6
+const CAP_SETUID: u64 = 1 << 7
+const CAP_NET_BIND_SERVICE: u64 = 1 << 10
+const CAP_NET_ADMIN: u64 = 1 << 12
+const CAP_NET_RAW: u64 = 1 << 13
+const CAP_SYS_MODULE: u64 = 1 << 16
+const CAP_SYS_RAWIO: u64 = 1 << 17
+const CAP_SYS_CHROOT: u64 = 1 << 18
+const CAP_SYS_PTRACE: u64 = 1 << 19
+const CAP_SYS_ADMIN: u64 = 1 << 21
+const CAP_SYS_BOOT: u64 = 1 << 22
+const CAP_SYS_RESOURCE: u64 = 1 << 24
+const CAP_SYS_TIME: u64 = 1 << 25
+const CAP_MKNOD: u64 = 1 << 27
+
+// Error codes
+const EPERM: u64 = 0xFFFFFFFFFFFFFFFF  // Operation not permitted
+const EINVAL: u64 = 0xFFFFFFFFFFFFFFFE // Invalid argument
+const ENOSYS: u64 = 0xFFFFFFFFFFFFFFFD // Function not implemented
 
 // System call numbers
 const SYS_EXIT: u32 = 0
@@ -23,13 +54,93 @@ const SYS_BRK: u32 = 12
 const SYS_LSEEK: u32 = 13
 const SYS_MKDIR: u32 = 14
 const SYS_RMDIR: u32 = 15
+const SYS_SETUID: u32 = 16
+const SYS_SETGID: u32 = 17
+const SYS_CHROOT: u32 = 18
+const SYS_PTRACE: u32 = 19
+const SYS_REBOOT: u32 = 20
+const SYS_MKNOD: u32 = 21
+const SYS_SOCKET: u32 = 22
+const SYS_BIND: u32 = 23
+const SYS_IOCTL: u32 = 24
+const SYS_CAPGET: u32 = 25
+const SYS_CAPSET: u32 = 26
+const SYS_SETTIMEOFDAY: u32 = 27
+const SYS_SETRLIMIT: u32 = 28
+
+// Async I/O syscalls (io_uring-like interface)
+const SYS_IO_URING_SETUP: u32 = 425
+const SYS_IO_URING_ENTER: u32 = 426
+const SYS_IO_URING_REGISTER: u32 = 427
+
+// Get current process ID for capability checking
+var current_pid: u32 = 0
+
+export fn syscall_set_current_pid(pid: u32) {
+  current_pid = pid
+}
+
+// Check if current process has required capability
+fn require_capability(cap: u64): u32 {
+  if capabilities.cap_has_capability(current_pid, cap) == 0 {
+    foundation.serial_write_string("[Syscall] Permission denied: missing capability 0x")
+    foundation.serial_write_hex(@truncate(cap, u32))
+    foundation.serial_write_string(" for PID ")
+    foundation.serial_write_hex(current_pid)
+    foundation.serial_write_string("\n")
+
+    // Log capability denial to audit system
+    audit.audit_log_capability(current_pid, 0, cap, -1)
+
+    return 0
+  }
+  return 1
+}
+
+// Log syscall execution to audit (for sensitive syscalls)
+fn audit_syscall(syscall_num: u32, result: i32) {
+  audit.audit_log_syscall(current_pid, 0, syscall_num, result)
+}
 
 export fn syscall_handler(syscall_num: u32, arg1: u64, arg2: u64, arg3: u64, arg4: u64): u64 {
+  // ========================================================================
+  // Step 1: Seccomp filtering (before any syscall processing)
+  // ========================================================================
+  var seccomp_result: u32 = seccomp.seccomp_filter_syscall(current_pid, syscall_num)
+
+  if seccomp_result == SECCOMP_RET_KILL_PROCESS {
+    foundation.serial_write_string("[Syscall] Seccomp killed process ")
+    foundation.serial_write_hex(current_pid)
+    foundation.serial_write_string(" for syscall ")
+    foundation.serial_write_hex(syscall_num)
+    foundation.serial_write_string("\n")
+    process.sys_exit(139)  // SIGSEGV
+    return EPERM
+  }
+
+  if seccomp_result != SECCOMP_RET_ALLOW {
+    // Syscall blocked by seccomp filter
+    return EPERM
+  }
+
+  // ========================================================================
+  // Step 2: Syscall dispatch with capability enforcement
+  // ========================================================================
+
+  // Unprivileged syscalls - no capability check needed
   if syscall_num == SYS_EXIT {
     process.sys_exit(arg1)
     return 0
   } else if syscall_num == SYS_FORK {
-    return process.sys_fork()
+    // Fork inherits capabilities and seccomp settings
+    var result: u64 = process.sys_fork()
+    if result > 0 {
+      // Parent: set up child capabilities and seccomp
+      var child_pid: u32 = @truncate(result, u32)
+      capabilities.cap_fork(current_pid, child_pid)
+      seccomp.seccomp_inherit(current_pid, child_pid)
+    }
+    return result
   } else if syscall_num == SYS_READ {
     return filesystem.vfs_read(arg1, arg2, arg3)
   } else if syscall_num == SYS_WRITE {
@@ -41,6 +152,8 @@ export fn syscall_handler(syscall_num: u32, arg1: u64, arg2: u64, arg3: u64, arg
   } else if syscall_num == SYS_WAIT {
     return process.sys_wait(arg1)
   } else if syscall_num == SYS_EXEC {
+    // Exec recalculates capabilities
+    capabilities.cap_exec(current_pid)
     return process.sys_exec(arg1)
   } else if syscall_num == SYS_GETPID {
     return process.sys_getpid()
@@ -58,10 +171,394 @@ export fn syscall_handler(syscall_num: u32, arg1: u64, arg2: u64, arg3: u64, arg
   } else if syscall_num == SYS_BRK {
     return memory.kmalloc(arg1)
   }
-  
-  return 0xFFFFFFFFFFFFFFFF  // Error
+
+  // Privileged syscalls - require specific capabilities
+
+  // SYS_KILL requires CAP_KILL to signal other processes
+  if syscall_num == SYS_KILL {
+    var target_pid: u32 = @truncate(arg1, u32)
+    // Can always signal own process
+    if target_pid != current_pid {
+      if require_capability(CAP_KILL) == 0 {
+        return EPERM
+      }
+    }
+    return process.sys_kill(target_pid, arg2)
+  }
+
+  // SYS_SETUID requires CAP_SETUID
+  if syscall_num == SYS_SETUID {
+    if require_capability(CAP_SETUID) == 0 {
+      return EPERM
+    }
+    return process.sys_setuid(@truncate(arg1, u32))
+  }
+
+  // SYS_SETGID requires CAP_SETGID
+  if syscall_num == SYS_SETGID {
+    if require_capability(CAP_SETGID) == 0 {
+      return EPERM
+    }
+    return process.sys_setgid(@truncate(arg1, u32))
+  }
+
+  // SYS_CHROOT requires CAP_SYS_CHROOT
+  if syscall_num == SYS_CHROOT {
+    if require_capability(CAP_SYS_CHROOT) == 0 {
+      return EPERM
+    }
+    return filesystem.vfs_chroot(arg1)
+  }
+
+  // SYS_PTRACE requires CAP_SYS_PTRACE
+  if syscall_num == SYS_PTRACE {
+    if require_capability(CAP_SYS_PTRACE) == 0 {
+      return EPERM
+    }
+    return process.sys_ptrace(arg1, arg2, arg3)
+  }
+
+  // SYS_REBOOT requires CAP_SYS_BOOT
+  if syscall_num == SYS_REBOOT {
+    if require_capability(CAP_SYS_BOOT) == 0 {
+      return EPERM
+    }
+    return sys_reboot(@truncate(arg1, u32))
+  }
+
+  // SYS_MKNOD requires CAP_MKNOD for device nodes
+  if syscall_num == SYS_MKNOD {
+    if require_capability(CAP_MKNOD) == 0 {
+      return EPERM
+    }
+    return filesystem.vfs_mknod(arg1, arg2, arg3)
+  }
+
+  // SYS_BIND with port < 1024 requires CAP_NET_BIND_SERVICE
+  if syscall_num == SYS_BIND {
+    var port: u32 = @truncate(arg2, u32)
+    if port < 1024 {
+      if require_capability(CAP_NET_BIND_SERVICE) == 0 {
+        return EPERM
+      }
+    }
+    return sys_bind(arg1, arg2, arg3)
+  }
+
+  // SYS_SOCKET with raw type requires CAP_NET_RAW
+  if syscall_num == SYS_SOCKET {
+    var sock_type: u32 = @truncate(arg2, u32)
+    if sock_type == 3 {  // SOCK_RAW
+      if require_capability(CAP_NET_RAW) == 0 {
+        return EPERM
+      }
+    }
+    return sys_socket(@truncate(arg1, u32), sock_type, @truncate(arg3, u32))
+  }
+
+  // SYS_IOCTL on certain devices requires CAP_SYS_RAWIO
+  if syscall_num == SYS_IOCTL {
+    // For now, just check if it's a privileged ioctl
+    var cmd: u32 = @truncate(arg2, u32)
+    if (cmd & 0x80000000) != 0 {  // Privileged ioctl bit
+      if require_capability(CAP_SYS_RAWIO) == 0 {
+        return EPERM
+      }
+    }
+    return sys_ioctl(arg1, cmd, arg3)
+  }
+
+  // SYS_CAPGET - get capabilities (unprivileged for own process)
+  if syscall_num == SYS_CAPGET {
+    var target_pid: u32 = @truncate(arg1, u32)
+    if target_pid == 0 {
+      target_pid = current_pid
+    }
+    return capabilities.cap_get_effective(target_pid)
+  }
+
+  // SYS_CAPSET - set capabilities requires CAP_SETPCAP
+  if syscall_num == SYS_CAPSET {
+    // Can only modify own capabilities, and can only drop them
+    var target_pid: u32 = @truncate(arg1, u32)
+    if target_pid != current_pid {
+      return EPERM
+    }
+    // Can only drop capabilities, not add new ones
+    var current_caps: u64 = capabilities.cap_get_effective(current_pid)
+    var new_caps: u64 = arg2
+    if (new_caps & ~current_caps) != 0 {
+      return EPERM  // Trying to add capabilities we don't have
+    }
+    capabilities.cap_remove_capability(current_pid, current_caps & ~new_caps)
+    return 0
+  }
+
+  // SYS_SETTIMEOFDAY requires CAP_SYS_TIME
+  if syscall_num == SYS_SETTIMEOFDAY {
+    if require_capability(CAP_SYS_TIME) == 0 {
+      return EPERM
+    }
+    return sys_settimeofday(arg1, arg2)
+  }
+
+  // SYS_SETRLIMIT requires CAP_SYS_RESOURCE
+  if syscall_num == SYS_SETRLIMIT {
+    if require_capability(CAP_SYS_RESOURCE) == 0 {
+      return EPERM
+    }
+    return sys_setrlimit(@truncate(arg1, u32), arg2)
+  }
+
+  // ========================================================================
+  // Async I/O syscalls (io_uring-like interface)
+  // ========================================================================
+
+  // SYS_IO_URING_SETUP - create a new io_uring instance
+  // arg1: entries (queue size)
+  // arg2: pointer to io_uring_params struct
+  // Returns: ring fd on success, negative errno on failure
+  if syscall_num == SYS_IO_URING_SETUP {
+    var entries: u32 = @truncate(arg1, u32)
+    return sys_io_uring_setup(entries, arg2)
+  }
+
+  // SYS_IO_URING_ENTER - submit I/O requests and/or wait for completions
+  // arg1: ring fd
+  // arg2: to_submit (number of SQEs to submit)
+  // arg3: min_complete (wait until this many CQEs)
+  // arg4: flags
+  // Returns: number of CQEs completed
+  if syscall_num == SYS_IO_URING_ENTER {
+    var ring_id: u32 = @truncate(arg1, u32)
+    var to_submit: u32 = @truncate(arg2, u32)
+    var min_complete: u32 = @truncate(arg3, u32)
+    var flags: u32 = @truncate(arg4, u32)
+    return sys_io_uring_enter(ring_id, to_submit, min_complete, flags)
+  }
+
+  // SYS_IO_URING_REGISTER - register resources for async I/O
+  // arg1: ring fd
+  // arg2: opcode (what to register)
+  // arg3: arg (pointer to data)
+  // arg4: nr_args (number of items)
+  // Returns: 0 on success, negative errno on failure
+  if syscall_num == SYS_IO_URING_REGISTER {
+    var ring_id: u32 = @truncate(arg1, u32)
+    var opcode: u32 = @truncate(arg2, u32)
+    return sys_io_uring_register(ring_id, opcode, arg3, @truncate(arg4, u32))
+  }
+
+  return ENOSYS  // Function not implemented
+}
+
+// Stub syscall implementations for new syscalls
+fn sys_reboot(cmd: u32): u64 {
+  foundation.serial_write_string("[Syscall] Reboot requested with cmd: ")
+  foundation.serial_write_hex(cmd)
+  foundation.serial_write_string("\n")
+  // In real implementation, would trigger system reboot
+  return 0
+}
+
+fn sys_bind(sockfd: u64, port: u64, addr: u64): u64 {
+  // Placeholder for socket bind
+  return 0
+}
+
+fn sys_socket(domain: u32, sock_type: u32, protocol: u32): u64 {
+  // Placeholder for socket creation
+  return 0
+}
+
+fn sys_ioctl(fd: u64, cmd: u32, arg: u64): u64 {
+  // Placeholder for ioctl
+  return 0
+}
+
+fn sys_settimeofday(tv: u64, tz: u64): u64 {
+  // Placeholder for setting time
+  return 0
+}
+
+fn sys_setrlimit(resource: u32, rlim: u64): u64 {
+  // Placeholder for setting resource limits
+  return 0
 }
 
 export fn syscall_init() {
   foundation.serial_write_string("[Syscall] Initialized\n")
+
+  // Initialize async I/O subsystem
+  async_io.async_io_init()
+}
+
+// ============================================================================
+// Async I/O (io_uring-like) syscall implementations
+// ============================================================================
+
+// io_uring_params flags
+const IORING_SETUP_SQPOLL: u32 = 1 << 1       // Use polling thread
+const IORING_SETUP_SQ_AFF: u32 = 1 << 2       // SQ poll thread affinity
+const IORING_SETUP_CQSIZE: u32 = 1 << 3       // Custom CQ size
+const IORING_SETUP_CLAMP: u32 = 1 << 4        // Clamp queue sizes
+
+// io_uring_enter flags
+const IORING_ENTER_GETEVENTS: u32 = 1 << 0    // Wait for events
+const IORING_ENTER_SQ_WAKEUP: u32 = 1 << 1    // Wake SQ poll thread
+const IORING_ENTER_SQ_WAIT: u32 = 1 << 2      // Wait for SQ space
+
+// io_uring_register opcodes
+const IORING_REGISTER_BUFFERS: u32 = 0
+const IORING_REGISTER_FILES: u32 = 2
+const IORING_REGISTER_EVENTFD: u32 = 4
+
+fn sys_io_uring_setup(entries: u32, params: u64): u64 {
+  // Validate entries (must be power of 2, minimum 1, maximum 32768)
+  if entries == 0 or entries > 32768 {
+    return EINVAL
+  }
+
+  // Check if entries is power of 2
+  if (entries & (entries - 1)) != 0 {
+    // Round up to next power of 2
+    var n: u32 = entries
+    n = n - 1
+    n = n | (n >> 1)
+    n = n | (n >> 2)
+    n = n | (n >> 4)
+    n = n | (n >> 8)
+    n = n | (n >> 16)
+    // entries = n + 1  // Would be rounded value
+  }
+
+  // Create the io_uring instance
+  var ring_id: u32 = async_io.async_io_create_ring()
+
+  if ring_id == 0xFFFFFFFF {
+    return EINVAL  // Failed to create ring
+  }
+
+  foundation.serial_write_string("[Syscall] io_uring_setup: created ring ")
+  foundation.serial_write_hex(ring_id)
+  foundation.serial_write_string(" with ")
+  foundation.serial_write_hex(entries)
+  foundation.serial_write_string(" entries\n")
+
+  // If params pointer is valid, fill in ring info
+  if params != 0 {
+    // Would populate io_uring_params struct with SQ/CQ offsets
+    // For now, just store the ring ID in the first field
+    var params_ptr: *u32 = @ptrFromInt(params)
+    params_ptr.* = ring_id
+  }
+
+  return @as(u64, ring_id)
+}
+
+fn sys_io_uring_enter(ring_id: u32, to_submit: u32, min_complete: u32, flags: u32): u64 {
+  // Validate ring ID
+  if ring_id >= 64 {
+    return EINVAL
+  }
+
+  var submitted: u32 = 0
+  var completed: u32 = 0
+
+  // Process pending submissions
+  if to_submit > 0 {
+    submitted = async_io.async_io_process(ring_id)
+  }
+
+  // Wait for completions if requested
+  if (flags & IORING_ENTER_GETEVENTS) != 0 and min_complete > 0 {
+    // Poll for completions
+    var wait_count: u32 = 0
+    while wait_count < 1000 {  // Max 1000 iterations to prevent infinite loop
+      completed = async_io.async_io_get_completions(ring_id)
+      if completed >= min_complete {
+        break
+      }
+
+      // Process more requests if any pending
+      async_io.async_io_process(ring_id)
+      wait_count = wait_count + 1
+    }
+  } else {
+    completed = async_io.async_io_get_completions(ring_id)
+  }
+
+  // Return number of completions available
+  return @as(u64, completed)
+}
+
+fn sys_io_uring_register(ring_id: u32, opcode: u32, arg: u64, nr_args: u32): u64 {
+  // Validate ring ID
+  if ring_id >= 64 {
+    return EINVAL
+  }
+
+  if opcode == IORING_REGISTER_BUFFERS {
+    // Register fixed buffers for zero-copy I/O
+    foundation.serial_write_string("[Syscall] io_uring_register: buffers (")
+    foundation.serial_write_hex(nr_args)
+    foundation.serial_write_string(" entries)\n")
+    // Would register buffer addresses for direct I/O
+    return 0
+  }
+
+  if opcode == IORING_REGISTER_FILES {
+    // Register fixed file descriptors
+    foundation.serial_write_string("[Syscall] io_uring_register: files (")
+    foundation.serial_write_hex(nr_args)
+    foundation.serial_write_string(" entries)\n")
+    // Would register file descriptors for faster access
+    return 0
+  }
+
+  if opcode == IORING_REGISTER_EVENTFD {
+    // Register eventfd for completion notification
+    foundation.serial_write_string("[Syscall] io_uring_register: eventfd\n")
+    return 0
+  }
+
+  return EINVAL  // Unknown opcode
+}
+
+// ============================================================================
+// Userspace async I/O helpers
+// ============================================================================
+
+// Submit a read request to an io_uring
+export fn io_uring_prep_read(ring_id: u32, fd: u32, buffer: u64, size: u32, offset: u64, user_data: u64): u32 {
+  return async_io.async_io_submit(ring_id, 0, fd, buffer, size, offset, user_data)
+}
+
+// Submit a write request to an io_uring
+export fn io_uring_prep_write(ring_id: u32, fd: u32, buffer: u64, size: u32, offset: u64, user_data: u64): u32 {
+  return async_io.async_io_submit(ring_id, 1, fd, buffer, size, offset, user_data)
+}
+
+// Submit a fsync request to an io_uring
+export fn io_uring_prep_fsync(ring_id: u32, fd: u32, user_data: u64): u32 {
+  return async_io.async_io_submit(ring_id, 2, fd, 0, 0, 0, user_data)
+}
+
+// Wait for and reap a completion
+export fn io_uring_wait_cqe(ring_id: u32, user_data_out: u64, result_out: u64): u32 {
+  // Poll until completion available
+  var attempts: u32 = 0
+  while attempts < 10000 {
+    // Process pending requests
+    async_io.async_io_process(ring_id)
+
+    // Check for completions
+    if async_io.async_io_reap(ring_id, user_data_out, result_out) == 1 {
+      return 1  // Got a completion
+    }
+
+    attempts = attempts + 1
+  }
+
+  return 0  // Timeout
 }

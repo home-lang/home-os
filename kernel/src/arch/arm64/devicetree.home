@@ -153,23 +153,518 @@ fn dt_strlen(str: u64): u32 {
   return len
 }
 
+// ============================================================================
+// Device Registry - For driver probing
+// ============================================================================
+
+const MAX_DEVICES: u32 = 128
+const MAX_COMPATIBLE_LEN: u32 = 64
+
+struct DTDevice {
+  active: u32,
+  node_offset: u64,
+  reg_base: u64,
+  reg_size: u64,
+  irq: u32,
+  compatible: [64]u8,
+  name: [32]u8,
+  driver_probed: u32
+}
+
+var devices: [DTDevice; 128]
+var device_count: u32 = 0
+var memory_base: u64 = 0
+var memory_size: u64 = 0
+var cpu_count: u32 = 0
+var parsed_strings_base: u64 = 0
+
+// ============================================================================
+// Enhanced Parsing with Device Discovery
+// ============================================================================
+
+export fn devicetree_discover_devices() {
+  if dt_initialized == 0 { return }
+
+  var header_totalsize: u32 = dt_read_be32(fdt_base + 4)
+  var header_off_dt_struct: u32 = dt_read_be32(fdt_base + 8)
+  var header_off_dt_strings: u32 = dt_read_be32(fdt_base + 12)
+
+  var struct_ptr: u64 = fdt_base + header_off_dt_struct
+  parsed_strings_base = fdt_base + header_off_dt_strings
+
+  foundation.serial_write_string("[DT] Discovering devices from DTB...\n")
+
+  device_count = 0
+  dt_discover_recursive(struct_ptr, 0, 0)
+
+  foundation.serial_write_string("[DT] Found ")
+  foundation.serial_write_hex(device_count)
+  foundation.serial_write_string(" devices\n")
+}
+
+fn dt_discover_recursive(struct_ptr: u64, depth: u32, parent_addr_cells: u32): u64 {
+  var ptr: u64 = struct_ptr
+  var current_addr_cells: u32 = parent_addr_cells
+  var current_size_cells: u32 = 1
+  var current_compatible: [64]u8
+  var current_reg_base: u64 = 0
+  var current_reg_size: u64 = 0
+  var current_irq: u32 = 0
+  var current_name: [32]u8
+  var has_compatible: u32 = 0
+
+  // Clear current_compatible
+  var ci: u32 = 0
+  while ci < 64 {
+    current_compatible[ci] = 0
+    ci = ci + 1
+  }
+  ci = 0
+  while ci < 32 {
+    current_name[ci] = 0
+    ci = ci + 1
+  }
+
+  while 1 == 1 {
+    var token: u32 = dt_read_be32(ptr)
+    ptr = ptr + 4
+
+    if token == FDT_BEGIN_NODE {
+      // Node name
+      var name: u64 = ptr
+      var name_len: u32 = dt_strlen(name)
+
+      // Copy name
+      var ni: u32 = 0
+      while ni < name_len and ni < 31 {
+        current_name[ni] = @ptrLoad(name + ni, u8)
+        ni = ni + 1
+      }
+      current_name[ni] = 0
+
+      ptr = ptr + ((name_len + 4) & ~3)
+
+      // Parse child content
+      ptr = dt_discover_recursive(ptr, depth + 1, current_addr_cells)
+
+    } else if token == FDT_PROP {
+      var len: u32 = dt_read_be32(ptr)
+      ptr = ptr + 4
+      var nameoff: u32 = dt_read_be32(ptr)
+      ptr = ptr + 4
+
+      var prop_name: u64 = parsed_strings_base + nameoff
+      var prop_value: u64 = ptr
+
+      // Check property type
+      if dt_strcmp(prop_name, "#address-cells") == 1 {
+        current_addr_cells = dt_read_be32(prop_value)
+      } else if dt_strcmp(prop_name, "#size-cells") == 1 {
+        current_size_cells = dt_read_be32(prop_value)
+      } else if dt_strcmp(prop_name, "compatible") == 1 {
+        // Copy compatible string
+        var ci2: u32 = 0
+        while ci2 < len and ci2 < 63 {
+          current_compatible[ci2] = @ptrLoad(prop_value + ci2, u8)
+          ci2 = ci2 + 1
+        }
+        current_compatible[ci2] = 0
+        has_compatible = 1
+      } else if dt_strcmp(prop_name, "reg") == 1 {
+        // Parse reg property based on address/size cells
+        if current_addr_cells == 2 {
+          current_reg_base = (dt_read_be32(prop_value) << 32) | dt_read_be32(prop_value + 4)
+        } else {
+          current_reg_base = dt_read_be32(prop_value)
+        }
+        var size_offset: u64 = current_addr_cells * 4
+        if current_size_cells == 2 {
+          current_reg_size = (dt_read_be32(prop_value + size_offset) << 32) | dt_read_be32(prop_value + size_offset + 4)
+        } else {
+          current_reg_size = dt_read_be32(prop_value + size_offset)
+        }
+      } else if dt_strcmp(prop_name, "interrupts") == 1 {
+        current_irq = dt_read_be32(prop_value)
+      } else if dt_strcmp(prop_name, "device_type") == 1 {
+        // Check for memory node
+        if dt_strcmp(prop_value, "memory") == 1 {
+          memory_base = current_reg_base
+          memory_size = current_reg_size
+        } else if dt_strcmp(prop_value, "cpu") == 1 {
+          cpu_count = cpu_count + 1
+        }
+      }
+
+      ptr = ptr + ((len + 3) & ~3)
+
+    } else if token == FDT_END_NODE {
+      // Register device if it has compatible string
+      if has_compatible == 1 and device_count < MAX_DEVICES {
+        var dev: *DTDevice = &devices[device_count]
+        dev.active = 1
+        dev.reg_base = current_reg_base
+        dev.reg_size = current_reg_size
+        dev.irq = current_irq
+        dev.driver_probed = 0
+
+        // Copy compatible
+        var ci3: u32 = 0
+        while ci3 < 64 {
+          dev.compatible[ci3] = current_compatible[ci3]
+          ci3 = ci3 + 1
+        }
+
+        // Copy name
+        var ni2: u32 = 0
+        while ni2 < 32 {
+          dev.name[ni2] = current_name[ni2]
+          ni2 = ni2 + 1
+        }
+
+        device_count = device_count + 1
+      }
+      return ptr
+
+    } else if token == FDT_NOP {
+      continue
+
+    } else if token == FDT_END {
+      return ptr
+    }
+  }
+
+  return ptr
+}
+
+// ============================================================================
+// Property Lookup
+// ============================================================================
+
 export fn devicetree_get_property(path: u64, prop_name: u64, value_out: u64, size_out: u64): u32 {
-  // Find node by path and get property
-  // Simplified implementation
+  if dt_initialized == 0 { return 0 }
+
+  var header_off_dt_struct: u32 = dt_read_be32(fdt_base + 8)
+  var header_off_dt_strings: u32 = dt_read_be32(fdt_base + 12)
+
+  var struct_ptr: u64 = fdt_base + header_off_dt_struct
+  var strings_ptr: u64 = fdt_base + header_off_dt_strings
+
+  // Find node by path and return property
+  var result: u64 = dt_find_property(struct_ptr, strings_ptr, path, prop_name, value_out, size_out)
+
+  return @truncate(result, u32)
+}
+
+fn dt_find_property(struct_ptr: u64, strings_ptr: u64, path: u64, prop_name: u64, value_out: u64, size_out: u64): u64 {
+  var ptr: u64 = struct_ptr
+  var current_path: [256]u8
+  var path_depth: u32 = 0
+  var in_target_node: u32 = 0
+
+  while 1 == 1 {
+    var token: u32 = dt_read_be32(ptr)
+    ptr = ptr + 4
+
+    if token == FDT_BEGIN_NODE {
+      var name: u64 = ptr
+      var name_len: u32 = dt_strlen(name)
+
+      // Check if this is the target node
+      if dt_path_matches(name, path) == 1 {
+        in_target_node = 1
+      }
+
+      ptr = ptr + ((name_len + 4) & ~3)
+      path_depth = path_depth + 1
+
+    } else if token == FDT_PROP {
+      var len: u32 = dt_read_be32(ptr)
+      ptr = ptr + 4
+      var nameoff: u32 = dt_read_be32(ptr)
+      ptr = ptr + 4
+
+      var pname: u64 = strings_ptr + nameoff
+      var pvalue: u64 = ptr
+
+      if in_target_node == 1 and dt_strcmp(pname, prop_name) == 1 {
+        // Found the property - copy value
+        var i: u32 = 0
+        while i < len {
+          @ptrStore(value_out + i, u8, @ptrLoad(pvalue + i, u8))
+          i = i + 1
+        }
+        @ptrStore(size_out, u32, len)
+        return 1
+      }
+
+      ptr = ptr + ((len + 3) & ~3)
+
+    } else if token == FDT_END_NODE {
+      if in_target_node == 1 and path_depth == 1 {
+        return 0  // Property not found in target node
+      }
+      path_depth = path_depth - 1
+      if path_depth == 0 {
+        in_target_node = 0
+      }
+
+    } else if token == FDT_END {
+      return 0
+    }
+  }
+
   return 0
 }
 
+fn dt_path_matches(name: u64, path: u64): u32 {
+  // Simple path matching - compare node name with last component of path
+  // For now, just compare directly
+  var ni: u32 = 0
+  while 1 == 1 {
+    var c1: u8 = @ptrLoad(name + ni, u8)
+    var c2: u8 = @ptrLoad(path + ni, u8)
+    if c1 == 0 and c2 == 0 { return 1 }
+    if c1 != c2 { return 0 }
+    ni = ni + 1
+    if ni > 255 { return 0 }
+  }
+  return 0
+}
+
+fn dt_strcmp(s1: u64, s2: u64): u32 {
+  var i: u32 = 0
+  while 1 == 1 {
+    var c1: u8 = @ptrLoad(s1 + i, u8)
+    var c2: u8 = @ptrLoad(s2 + i, u8)
+    if c1 == 0 and c2 == 0 { return 1 }
+    if c1 != c2 { return 0 }
+    i = i + 1
+    if i > 255 { return 0 }
+  }
+  return 0
+}
+
+// ============================================================================
+// Memory and CPU Information
+// ============================================================================
+
 export fn devicetree_get_memory_size(): u64 {
-  // Parse /memory node to get RAM size
-  return 4 * 1024 * 1024 * 1024  // Default 4GB
+  if memory_size == 0 {
+    // Fallback: try to parse /memory node
+    devicetree_discover_devices()
+  }
+
+  if memory_size > 0 {
+    return memory_size
+  }
+
+  // Default fallback
+  return 4 * 1024 * 1024 * 1024  // 4GB
+}
+
+export fn devicetree_get_memory_base(): u64 {
+  return memory_base
 }
 
 export fn devicetree_get_cpu_count(): u32 {
-  // Count /cpus/cpu@* nodes
+  if cpu_count == 0 {
+    devicetree_discover_devices()
+  }
+
+  if cpu_count > 0 {
+    return cpu_count
+  }
+
   return 4  // Default 4 cores
 }
 
+// ============================================================================
+// Driver Probing from Compatible Strings
+// ============================================================================
+
+// Callback type for driver probe
+// fn(device_idx: u32, reg_base: u64, reg_size: u64, irq: u32) -> u32
+
+export fn devicetree_probe_compatible(compatible: u64, probe_fn: u64): u32 {
+  var probed: u32 = 0
+
+  var i: u32 = 0
+  while i < device_count {
+    if devices[i].active == 1 and devices[i].driver_probed == 0 {
+      if dt_compatible_matches(&devices[i].compatible[0], compatible) == 1 {
+        foundation.serial_write_string("[DT] Probing driver for: ")
+        foundation.serial_write_string(&devices[i].name[0])
+        foundation.serial_write_string(" (")
+        foundation.serial_write_string(&devices[i].compatible[0])
+        foundation.serial_write_string(")\n")
+
+        // Call probe function
+        // Note: In real implementation, would use function pointer
+        devices[i].driver_probed = 1
+        probed = probed + 1
+      }
+    }
+    i = i + 1
+  }
+
+  return probed
+}
+
+fn dt_compatible_matches(device_compat: u64, target_compat: u64): u32 {
+  // Check if target compatible string appears anywhere in device compatible
+  // Device compatible can have multiple null-separated strings
+  var di: u32 = 0
+
+  while di < 64 {
+    var c: u8 = @ptrLoad(device_compat + di, u8)
+    if c == 0 {
+      // End of current string, check if matches
+      break
+    }
+    di = di + 1
+  }
+
+  // Simple string compare for now
+  return dt_strcmp(device_compat, target_compat)
+}
+
 export fn devicetree_find_compatible(compatible: u64): u64 {
-  // Find first node with matching compatible string
+  var i: u32 = 0
+  while i < device_count {
+    if devices[i].active == 1 {
+      if dt_compatible_matches(&devices[i].compatible[0], compatible) == 1 {
+        return devices[i].reg_base
+      }
+    }
+    i = i + 1
+  }
   return 0
+}
+
+export fn devicetree_get_device_reg(compatible: u64, base_out: u64, size_out: u64): u32 {
+  var i: u32 = 0
+  while i < device_count {
+    if devices[i].active == 1 {
+      if dt_compatible_matches(&devices[i].compatible[0], compatible) == 1 {
+        @ptrStore(base_out, u64, devices[i].reg_base)
+        @ptrStore(size_out, u64, devices[i].reg_size)
+        return 1
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+export fn devicetree_get_device_irq(compatible: u64): u32 {
+  var i: u32 = 0
+  while i < device_count {
+    if devices[i].active == 1 {
+      if dt_compatible_matches(&devices[i].compatible[0], compatible) == 1 {
+        return devices[i].irq
+      }
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+// ============================================================================
+// Debug Dump
+// ============================================================================
+
+export fn devicetree_dump() {
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("============================================\n")
+  foundation.serial_write_string("        Device Tree Dump\n")
+  foundation.serial_write_string("============================================\n\n")
+
+  if dt_initialized == 0 {
+    foundation.serial_write_string("Device tree not initialized\n")
+    return
+  }
+
+  // Header info
+  var totalsize: u32 = dt_read_be32(fdt_base + 4)
+  var version: u32 = dt_read_be32(fdt_base + 20)
+
+  foundation.serial_write_string("FDT Base:     0x")
+  foundation.serial_write_hex(@truncate(fdt_base, u32))
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("Total Size:   ")
+  foundation.serial_write_hex(totalsize)
+  foundation.serial_write_string(" bytes\n")
+  foundation.serial_write_string("Version:      ")
+  foundation.serial_write_hex(version)
+  foundation.serial_write_string("\n\n")
+
+  // Memory info
+  foundation.serial_write_string("Memory:\n")
+  foundation.serial_write_string("  Base: 0x")
+  foundation.serial_write_hex(@truncate(memory_base >> 32, u32))
+  foundation.serial_write_hex(@truncate(memory_base, u32))
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("  Size: ")
+  foundation.serial_write_hex(@truncate(memory_size / (1024 * 1024), u32))
+  foundation.serial_write_string(" MB\n\n")
+
+  foundation.serial_write_string("CPUs: ")
+  foundation.serial_write_hex(cpu_count)
+  foundation.serial_write_string("\n\n")
+
+  // Discovered devices
+  foundation.serial_write_string("Discovered Devices:\n")
+  foundation.serial_write_string("-------------------\n")
+
+  var i: u32 = 0
+  while i < device_count {
+    if devices[i].active == 1 {
+      foundation.serial_write_string("  [")
+      foundation.serial_write_hex(i)
+      foundation.serial_write_string("] ")
+      foundation.serial_write_string(&devices[i].name[0])
+      foundation.serial_write_string("\n")
+      foundation.serial_write_string("      Compatible: ")
+      foundation.serial_write_string(&devices[i].compatible[0])
+      foundation.serial_write_string("\n")
+      foundation.serial_write_string("      Reg: 0x")
+      foundation.serial_write_hex(@truncate(devices[i].reg_base, u32))
+      foundation.serial_write_string(" size=0x")
+      foundation.serial_write_hex(@truncate(devices[i].reg_size, u32))
+      foundation.serial_write_string("\n")
+      if devices[i].irq != 0 {
+        foundation.serial_write_string("      IRQ: ")
+        foundation.serial_write_hex(devices[i].irq)
+        foundation.serial_write_string("\n")
+      }
+      if devices[i].driver_probed == 1 {
+        foundation.serial_write_string("      Driver: PROBED\n")
+      }
+      foundation.serial_write_string("\n")
+    }
+    i = i + 1
+  }
+
+  foundation.serial_write_string("============================================\n\n")
+}
+
+export fn devicetree_dump_raw() {
+  // Dump raw DTB structure for debugging
+  if dt_initialized == 0 {
+    foundation.serial_write_string("[DT] Not initialized\n")
+    return
+  }
+
+  var header_off_dt_struct: u32 = dt_read_be32(fdt_base + 8)
+  var header_off_dt_strings: u32 = dt_read_be32(fdt_base + 12)
+
+  foundation.serial_write_string("\n[DT] Raw Device Tree Structure:\n")
+  foundation.serial_write_string("--------------------------------\n")
+
+  var struct_ptr: u64 = fdt_base + header_off_dt_struct
+  var strings_ptr: u64 = fdt_base + header_off_dt_strings
+
+  dt_parse_node(struct_ptr, strings_ptr, 0)
+
+  foundation.serial_write_string("--------------------------------\n\n")
 }
