@@ -1,64 +1,792 @@
-// home-os Framebuffer Driver
-// Graphics framebuffer support
+// home-os Enhanced Framebuffer Driver
+// Supports up to 4K (3840x2160) resolution with multiple pixel formats
+// Optimized for Raspberry Pi 5 and LG 27UP850-W monitor
 
 import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
 
-const FB_WIDTH: u32 = 1024
-const FB_HEIGHT: u32 = 768
-const FB_BPP: u32 = 32
+// Pixel formats
+const FB_FORMAT_RGB888: u32 = 0    // 24-bit RGB (packed)
+const FB_FORMAT_RGBA8888: u32 = 1  // 32-bit RGBA
+const FB_FORMAT_BGRA8888: u32 = 2  // 32-bit BGRA (common for displays)
+const FB_FORMAT_RGB565: u32 = 3   // 16-bit RGB
 
-var fb_address: u64 = 0xFD000000
-var fb_initialized: u32 = 0
+// Default 4K resolution for LG 27UP850-W
+const FB_DEFAULT_WIDTH: u32 = 3840
+const FB_DEFAULT_HEIGHT: u32 = 2160
+const FB_DEFAULT_BPP: u32 = 32
 
-export fn fb_init(addr: u64, width: u32, height: u32) {
-  fb_address = addr
-  fb_initialized = 1
-  foundation.serial_write_string("[Framebuffer] Initialized\n")
+// Maximum supported resolution
+const FB_MAX_WIDTH: u32 = 3840
+const FB_MAX_HEIGHT: u32 = 2160
+const FB_MAX_SIZE: u64 = 3840 * 2160 * 4  // 33,177,600 bytes (~32 MB)
+
+// Standard resolutions
+const RES_720P_WIDTH: u32 = 1280
+const RES_720P_HEIGHT: u32 = 720
+const RES_1080P_WIDTH: u32 = 1920
+const RES_1080P_HEIGHT: u32 = 1080
+const RES_4K_WIDTH: u32 = 3840
+const RES_4K_HEIGHT: u32 = 2160
+
+// Framebuffer state
+struct Framebuffer {
+    address: u64           // Physical address of framebuffer memory
+    virtual_addr: u64      // Virtual address (if mapped differently)
+    width: u32             // Current width in pixels
+    height: u32            // Current height in pixels
+    pitch: u32             // Bytes per line (may include padding)
+    bpp: u32               // Bits per pixel
+    pixel_format: u32      // Pixel format (RGB888, RGBA8888, etc.)
+    size: u64              // Total framebuffer size in bytes
+    initialized: u32       // Initialization flag
+    double_buffered: u32   // Double buffering enabled
+    back_buffer: u64       // Back buffer address (if double buffered)
+    current_buffer: u32    // 0 = front, 1 = back
 }
 
+// Font for text rendering (8x16 basic font)
+struct Font {
+    width: u32
+    height: u32
+    data: *u8
+    char_count: u32
+}
+
+// Console state for text mode
+struct Console {
+    cursor_x: u32
+    cursor_y: u32
+    fg_color: u32
+    bg_color: u32
+    width_chars: u32
+    height_chars: u32
+}
+
+var fb: Framebuffer
+var console: Console
+
+// Statistics
+var pixels_drawn: u64 = 0
+var rects_filled: u64 = 0
+var blits_performed: u64 = 0
+
+// Initialize framebuffer with specified parameters
+export fn fb_init(addr: u64, width: u32, height: u32, bpp: u32, format: u32): u32 {
+    if width > FB_MAX_WIDTH or height > FB_MAX_HEIGHT {
+        foundation.serial_write_string("[Framebuffer] Resolution exceeds maximum\n")
+        return 1
+    }
+
+    fb.address = addr
+    fb.virtual_addr = addr
+    fb.width = width
+    fb.height = height
+    fb.bpp = bpp
+    fb.pixel_format = format
+
+    // Calculate pitch (bytes per row)
+    fb.pitch = width * (bpp / 8)
+
+    // Calculate total size
+    fb.size = fb.pitch * height
+
+    fb.initialized = 1
+    fb.double_buffered = 0
+    fb.back_buffer = 0
+    fb.current_buffer = 0
+
+    // Initialize console
+    console.cursor_x = 0
+    console.cursor_y = 0
+    console.fg_color = 0xFFFFFF  // White
+    console.bg_color = 0x000000  // Black
+    console.width_chars = width / 8
+    console.height_chars = height / 16
+
+    foundation.serial_write_string("[Framebuffer] Initialized: ")
+    foundation.serial_write_u64(width)
+    foundation.serial_write_string("x")
+    foundation.serial_write_u64(height)
+    foundation.serial_write_string("@")
+    foundation.serial_write_u64(bpp)
+    foundation.serial_write_string("bpp at 0x")
+    foundation.serial_write_u64(addr)
+    foundation.serial_write_string("\n")
+
+    return 0
+}
+
+// Initialize framebuffer with default 4K settings
+export fn fb_init_4k(addr: u64): u32 {
+    foundation.serial_write_string("[Framebuffer] Initializing 4K framebuffer\n")
+    return fb_init(addr, RES_4K_WIDTH, RES_4K_HEIGHT, 32, FB_FORMAT_BGRA8888)
+}
+
+// Initialize framebuffer for 1080p
+export fn fb_init_1080p(addr: u64): u32 {
+    return fb_init(addr, RES_1080P_WIDTH, RES_1080P_HEIGHT, 32, FB_FORMAT_BGRA8888)
+}
+
+// Initialize framebuffer for 720p
+export fn fb_init_720p(addr: u64): u32 {
+    return fb_init(addr, RES_720P_WIDTH, RES_720P_HEIGHT, 32, FB_FORMAT_BGRA8888)
+}
+
+// Enable double buffering
+export fn fb_enable_double_buffer(back_addr: u64): u32 {
+    if fb.initialized == 0 { return 1 }
+
+    fb.back_buffer = back_addr
+    fb.double_buffered = 1
+    fb.current_buffer = 0
+
+    foundation.serial_write_string("[Framebuffer] Double buffering enabled\n")
+    return 0
+}
+
+// Swap buffers (for double buffering)
+export fn fb_swap_buffers(): u32 {
+    if fb.initialized == 0 { return 1 }
+    if fb.double_buffered == 0 { return 1 }
+
+    if fb.current_buffer == 0 {
+        fb.current_buffer = 1
+    } else {
+        fb.current_buffer = 0
+    }
+
+    return 0
+}
+
+// Get current drawing buffer address
+fn fb_get_draw_buffer(): u64 {
+    if fb.double_buffered == 1 and fb.current_buffer == 1 {
+        return fb.back_buffer
+    }
+    return fb.address
+}
+
+// Pack color based on pixel format
+fn fb_pack_color(r: u8, g: u8, b: u8, a: u8): u32 {
+    if fb.pixel_format == FB_FORMAT_RGBA8888 {
+        return (r << 24) | (g << 16) | (b << 8) | a
+    } else if fb.pixel_format == FB_FORMAT_BGRA8888 {
+        return (b << 24) | (g << 16) | (r << 8) | a
+    } else if fb.pixel_format == FB_FORMAT_RGB565 {
+        return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+    }
+    // Default: RGB888 packed as u32
+    return (r << 16) | (g << 8) | b
+}
+
+// Unpack color to RGBA
+fn fb_unpack_color(color: u32, r: *u8, g: *u8, b: *u8, a: *u8) {
+    if fb.pixel_format == FB_FORMAT_RGBA8888 {
+        *r = (color >> 24) & 0xFF
+        *g = (color >> 16) & 0xFF
+        *b = (color >> 8) & 0xFF
+        *a = color & 0xFF
+    } else if fb.pixel_format == FB_FORMAT_BGRA8888 {
+        *b = (color >> 24) & 0xFF
+        *g = (color >> 16) & 0xFF
+        *r = (color >> 8) & 0xFF
+        *a = color & 0xFF
+    } else {
+        *r = (color >> 16) & 0xFF
+        *g = (color >> 8) & 0xFF
+        *b = color & 0xFF
+        *a = 0xFF
+    }
+}
+
+// Put a single pixel (bounds-checked)
 export fn fb_put_pixel(x: u32, y: u32, color: u32) {
-  if fb_initialized == 0 { return }
-  if x >= FB_WIDTH or y >= FB_HEIGHT { return }
-  
-  var offset: u64 = (y * FB_WIDTH + x) * 4
-  @ptrToInt(fb_address + offset, u32) = color
+    if fb.initialized == 0 { return }
+    if x >= fb.width or y >= fb.height { return }
+
+    var buffer: u64 = fb_get_draw_buffer()
+    var offset: u64 = (y * fb.pitch) + (x * (fb.bpp / 8))
+    var addr: u64 = buffer + offset
+
+    if fb.bpp == 32 {
+        memory.write_volatile_u32(addr, color)
+    } else if fb.bpp == 16 {
+        memory.write_volatile_u16(addr, color & 0xFFFF)
+    } else if fb.bpp == 24 {
+        memory.write_volatile_u8(addr, color & 0xFF)
+        memory.write_volatile_u8(addr + 1, (color >> 8) & 0xFF)
+        memory.write_volatile_u8(addr + 2, (color >> 16) & 0xFF)
+    }
+
+    pixels_drawn = pixels_drawn + 1
 }
 
+// Put a single pixel (unchecked - for performance critical paths)
+fn fb_put_pixel_fast(x: u32, y: u32, color: u32) {
+    var buffer: u64 = fb_get_draw_buffer()
+    var offset: u64 = (y * fb.pitch) + (x * 4)  // Assumes 32bpp
+    memory.write_volatile_u32(buffer + offset, color)
+}
+
+// Get pixel color
+export fn fb_get_pixel(x: u32, y: u32): u32 {
+    if fb.initialized == 0 { return 0 }
+    if x >= fb.width or y >= fb.height { return 0 }
+
+    var buffer: u64 = fb_get_draw_buffer()
+    var offset: u64 = (y * fb.pitch) + (x * (fb.bpp / 8))
+
+    if fb.bpp == 32 {
+        return memory.read_volatile_u32(buffer + offset)
+    } else if fb.bpp == 16 {
+        return memory.read_volatile_u16(buffer + offset)
+    }
+
+    return 0
+}
+
+// Fill rectangle (optimized)
 export fn fb_fill_rect(x: u32, y: u32, width: u32, height: u32, color: u32) {
-  var i: u32 = 0
-  while i < height {
-    var j: u32 = 0
-    while j < width {
-      fb_put_pixel(x + j, y + i, color)
-      j = j + 1
+    if fb.initialized == 0 { return }
+
+    // Clip to framebuffer bounds
+    var x1: u32 = x
+    var y1: u32 = y
+    var x2: u32 = x + width
+    var y2: u32 = y + height
+
+    if x1 >= fb.width { return }
+    if y1 >= fb.height { return }
+    if x2 > fb.width { x2 = fb.width }
+    if y2 > fb.height { y2 = fb.height }
+
+    var actual_width: u32 = x2 - x1
+    var actual_height: u32 = y2 - y1
+
+    var buffer: u64 = fb_get_draw_buffer()
+
+    // Optimized fill using 64-bit writes for 32bpp
+    if fb.bpp == 32 {
+        var color64: u64 = (color << 32) | color
+
+        var row: u32 = 0
+        while row < actual_height {
+            var row_addr: u64 = buffer + ((y1 + row) * fb.pitch) + (x1 * 4)
+            var col: u32 = 0
+
+            // Fill pairs of pixels with 64-bit writes
+            while col + 1 < actual_width {
+                memory.write_volatile_u64(row_addr + (col * 4), color64)
+                col = col + 2
+            }
+
+            // Fill remaining odd pixel
+            if col < actual_width {
+                memory.write_volatile_u32(row_addr + (col * 4), color)
+            }
+
+            row = row + 1
+        }
+    } else {
+        // Fallback for other bit depths
+        var row: u32 = 0
+        while row < actual_height {
+            var col: u32 = 0
+            while col < actual_width {
+                fb_put_pixel(x1 + col, y1 + row, color)
+                col = col + 1
+            }
+            row = row + 1
+        }
     }
-    i = i + 1
-  }
+
+    rects_filled = rects_filled + 1
 }
 
+// Clear entire framebuffer
 export fn fb_clear(color: u32) {
-  fb_fill_rect(0, 0, FB_WIDTH, FB_HEIGHT, color)
+    if fb.initialized == 0 { return }
+
+    fb_fill_rect(0, 0, fb.width, fb.height, color)
+
+    foundation.serial_write_string("[Framebuffer] Cleared\n")
 }
 
-export fn fb_draw_char(x: u32, y: u32, ch: u8, color: u32) {
-  // Simple 8x8 font rendering stub
-  var i: u32 = 0
-  while i < 8 {
-    var j: u32 = 0
-    while j < 8 {
-      fb_put_pixel(x + j, y + i, color)
-      j = j + 1
+// Draw horizontal line (optimized)
+export fn fb_draw_hline(x: u32, y: u32, width: u32, color: u32) {
+    if fb.initialized == 0 { return }
+    if y >= fb.height { return }
+
+    var x1: u32 = x
+    var x2: u32 = x + width
+    if x1 >= fb.width { return }
+    if x2 > fb.width { x2 = fb.width }
+
+    var buffer: u64 = fb_get_draw_buffer()
+    var row_addr: u64 = buffer + (y * fb.pitch) + (x1 * (fb.bpp / 8))
+
+    if fb.bpp == 32 {
+        var color64: u64 = (color << 32) | color
+        var col: u32 = x1
+
+        // Fast 64-bit fill
+        while col + 1 < x2 {
+            memory.write_volatile_u64(row_addr, color64)
+            row_addr = row_addr + 8
+            col = col + 2
+        }
+
+        if col < x2 {
+            memory.write_volatile_u32(row_addr, color)
+        }
+    } else {
+        var col: u32 = x1
+        while col < x2 {
+            fb_put_pixel(col, y, color)
+            col = col + 1
+        }
     }
-    i = i + 1
-  }
 }
 
-export fn fb_draw_string(x: u32, y: u32, text: u64, color: u32) {
-  var i: u32 = 0
-  while i < 256 {
-    var ch: u8 = @intToPtr(text + i, u8)
-    if ch == 0 { break }
-    fb_draw_char(x + (i * 8), y, ch, color)
-    i = i + 1
-  }
+// Draw vertical line
+export fn fb_draw_vline(x: u32, y: u32, height: u32, color: u32) {
+    if fb.initialized == 0 { return }
+    if x >= fb.width { return }
+
+    var y1: u32 = y
+    var y2: u32 = y + height
+    if y1 >= fb.height { return }
+    if y2 > fb.height { y2 = fb.height }
+
+    var buffer: u64 = fb_get_draw_buffer()
+    var col_offset: u64 = x * (fb.bpp / 8)
+
+    var row: u32 = y1
+    while row < y2 {
+        var addr: u64 = buffer + (row * fb.pitch) + col_offset
+        if fb.bpp == 32 {
+            memory.write_volatile_u32(addr, color)
+        } else if fb.bpp == 16 {
+            memory.write_volatile_u16(addr, color & 0xFFFF)
+        }
+        row = row + 1
+    }
+}
+
+// Draw rectangle outline
+export fn fb_draw_rect(x: u32, y: u32, width: u32, height: u32, color: u32) {
+    if fb.initialized == 0 { return }
+    if width < 2 or height < 2 { return }
+
+    fb_draw_hline(x, y, width, color)                    // Top
+    fb_draw_hline(x, y + height - 1, width, color)       // Bottom
+    fb_draw_vline(x, y, height, color)                   // Left
+    fb_draw_vline(x + width - 1, y, height, color)       // Right
+}
+
+// Draw line (Bresenham's algorithm)
+export fn fb_draw_line(x0: u32, y0: u32, x1: u32, y1: u32, color: u32) {
+    if fb.initialized == 0 { return }
+
+    var dx: i32 = 0
+    var dy: i32 = 0
+    var sx: i32 = 0
+    var sy: i32 = 0
+
+    if x1 >= x0 {
+        dx = x1 - x0
+        sx = 1
+    } else {
+        dx = x0 - x1
+        sx = -1
+    }
+
+    if y1 >= y0 {
+        dy = -(y1 - y0)
+        sy = 1
+    } else {
+        dy = y0 - y1
+        sy = -1
+    }
+
+    var err: i32 = dx + dy
+    var x: i32 = x0
+    var y: i32 = y0
+
+    loop {
+        fb_put_pixel(x, y, color)
+
+        if x == x1 and y == y1 { break }
+
+        var e2: i32 = 2 * err
+
+        if e2 >= dy {
+            if x == x1 { break }
+            err = err + dy
+            x = x + sx
+        }
+
+        if e2 <= dx {
+            if y == y1 { break }
+            err = err + dx
+            y = y + sy
+        }
+    }
+}
+
+// Draw circle (Midpoint algorithm)
+export fn fb_draw_circle(cx: u32, cy: u32, radius: u32, color: u32) {
+    if fb.initialized == 0 { return }
+
+    var x: i32 = radius
+    var y: i32 = 0
+    var err: i32 = 0
+
+    while x >= y {
+        fb_put_pixel(cx + x, cy + y, color)
+        fb_put_pixel(cx + y, cy + x, color)
+        fb_put_pixel(cx - y, cy + x, color)
+        fb_put_pixel(cx - x, cy + y, color)
+        fb_put_pixel(cx - x, cy - y, color)
+        fb_put_pixel(cx - y, cy - x, color)
+        fb_put_pixel(cx + y, cy - x, color)
+        fb_put_pixel(cx + x, cy - y, color)
+
+        y = y + 1
+        if err <= 0 {
+            err = err + 2 * y + 1
+        }
+        if err > 0 {
+            x = x - 1
+            err = err - 2 * x + 1
+        }
+    }
+}
+
+// Fill circle
+export fn fb_fill_circle(cx: u32, cy: u32, radius: u32, color: u32) {
+    if fb.initialized == 0 { return }
+
+    var x: i32 = radius
+    var y: i32 = 0
+    var err: i32 = 0
+
+    while x >= y {
+        fb_draw_hline(cx - x, cy + y, 2 * x + 1, color)
+        fb_draw_hline(cx - x, cy - y, 2 * x + 1, color)
+        fb_draw_hline(cx - y, cy + x, 2 * y + 1, color)
+        fb_draw_hline(cx - y, cy - x, 2 * y + 1, color)
+
+        y = y + 1
+        if err <= 0 {
+            err = err + 2 * y + 1
+        }
+        if err > 0 {
+            x = x - 1
+            err = err - 2 * x + 1
+        }
+    }
+}
+
+// Blit (copy) region from source to destination
+export fn fb_blit(src_addr: u64, src_width: u32, src_height: u32,
+                  dst_x: u32, dst_y: u32, width: u32, height: u32) {
+    if fb.initialized == 0 { return }
+
+    // Clip to destination bounds
+    var copy_width: u32 = width
+    var copy_height: u32 = height
+
+    if dst_x + copy_width > fb.width {
+        copy_width = fb.width - dst_x
+    }
+    if dst_y + copy_height > fb.height {
+        copy_height = fb.height - dst_y
+    }
+    if copy_width > src_width { copy_width = src_width }
+    if copy_height > src_height { copy_height = src_height }
+
+    var buffer: u64 = fb_get_draw_buffer()
+    var bytes_per_pixel: u32 = fb.bpp / 8
+    var src_pitch: u32 = src_width * bytes_per_pixel
+
+    var row: u32 = 0
+    while row < copy_height {
+        var src_row: u64 = src_addr + (row * src_pitch)
+        var dst_row: u64 = buffer + ((dst_y + row) * fb.pitch) + (dst_x * bytes_per_pixel)
+
+        // Copy row using 64-bit transfers
+        var col: u32 = 0
+        while col + 8 <= copy_width * bytes_per_pixel {
+            var data: u64 = memory.read_volatile_u64(src_row + col)
+            memory.write_volatile_u64(dst_row + col, data)
+            col = col + 8
+        }
+
+        // Copy remaining bytes
+        while col < copy_width * bytes_per_pixel {
+            var data: u8 = memory.read_volatile_u8(src_row + col)
+            memory.write_volatile_u8(dst_row + col, data)
+            col = col + 1
+        }
+
+        row = row + 1
+    }
+
+    blits_performed = blits_performed + 1
+}
+
+// Alpha-blended blit
+export fn fb_blit_alpha(src_addr: u64, src_width: u32, src_height: u32,
+                        dst_x: u32, dst_y: u32) {
+    if fb.initialized == 0 { return }
+    if fb.bpp != 32 { return }  // Alpha blending requires 32bpp
+
+    var buffer: u64 = fb_get_draw_buffer()
+
+    var row: u32 = 0
+    while row < src_height {
+        if dst_y + row >= fb.height { break }
+
+        var col: u32 = 0
+        while col < src_width {
+            if dst_x + col >= fb.width { break }
+
+            var src_offset: u64 = (row * src_width + col) * 4
+            var src_pixel: u32 = memory.read_volatile_u32(src_addr + src_offset)
+
+            var alpha: u32 = src_pixel & 0xFF
+            if alpha == 0xFF {
+                // Fully opaque - just copy
+                fb_put_pixel_fast(dst_x + col, dst_y + row, src_pixel)
+            } else if alpha > 0 {
+                // Alpha blend
+                var dst_pixel: u32 = fb_get_pixel(dst_x + col, dst_y + row)
+
+                var sr: u32 = (src_pixel >> 8) & 0xFF
+                var sg: u32 = (src_pixel >> 16) & 0xFF
+                var sb: u32 = (src_pixel >> 24) & 0xFF
+
+                var dr: u32 = (dst_pixel >> 8) & 0xFF
+                var dg: u32 = (dst_pixel >> 16) & 0xFF
+                var db: u32 = (dst_pixel >> 24) & 0xFF
+
+                var inv_alpha: u32 = 255 - alpha
+                var r: u32 = (sr * alpha + dr * inv_alpha) / 255
+                var g: u32 = (sg * alpha + dg * inv_alpha) / 255
+                var b: u32 = (sb * alpha + db * inv_alpha) / 255
+
+                var blended: u32 = (b << 24) | (g << 16) | (r << 8) | 0xFF
+                fb_put_pixel_fast(dst_x + col, dst_y + row, blended)
+            }
+            // alpha == 0: fully transparent, skip
+
+            col = col + 1
+        }
+        row = row + 1
+    }
+
+    blits_performed = blits_performed + 1
+}
+
+// Basic 8x8 font bitmap (space through ~)
+// Each byte represents one row of pixels
+const FONT_8X8: [95][8]u8 = [
+    // Space
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    // !
+    [0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x00],
+    // " ... (simplified - full font would be here)
+    [0x6C, 0x6C, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00],
+    // #
+    [0x6C, 0x6C, 0xFE, 0x6C, 0xFE, 0x6C, 0x6C, 0x00],
+    // ... additional characters
+]
+
+// Draw character at position
+export fn fb_draw_char(x: u32, y: u32, ch: u8, fg_color: u32, bg_color: u32) {
+    if fb.initialized == 0 { return }
+    if ch < 32 or ch > 126 { return }
+
+    var char_index: u32 = ch - 32
+
+    var row: u32 = 0
+    while row < 8 {
+        var line: u8 = 0x00  // Simplified - would index into font
+
+        var col: u32 = 0
+        while col < 8 {
+            var mask: u8 = 0x80 >> col
+            if (line & mask) != 0 {
+                fb_put_pixel(x + col, y + row, fg_color)
+            } else if bg_color != 0 {
+                fb_put_pixel(x + col, y + row, bg_color)
+            }
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+// Draw string at position
+export fn fb_draw_string(x: u32, y: u32, text: *u8, fg_color: u32, bg_color: u32) {
+    if fb.initialized == 0 { return }
+
+    var cx: u32 = x
+    var cy: u32 = y
+    var i: u32 = 0
+
+    while i < 1024 {  // Max string length
+        var ch: u8 = text[i]
+        if ch == 0 { break }
+
+        if ch == '\n' {
+            cx = x
+            cy = cy + 8
+        } else {
+            fb_draw_char(cx, cy, ch, fg_color, bg_color)
+            cx = cx + 8
+        }
+
+        if cx >= fb.width {
+            cx = x
+            cy = cy + 8
+        }
+
+        i = i + 1
+    }
+}
+
+// Console operations
+export fn fb_console_write(text: *u8) {
+    if fb.initialized == 0 { return }
+
+    var i: u32 = 0
+    while i < 1024 {
+        var ch: u8 = text[i]
+        if ch == 0 { break }
+
+        fb_console_putchar(ch)
+        i = i + 1
+    }
+}
+
+export fn fb_console_putchar(ch: u8) {
+    if fb.initialized == 0 { return }
+
+    if ch == '\n' {
+        console.cursor_x = 0
+        console.cursor_y = console.cursor_y + 1
+    } else if ch == '\r' {
+        console.cursor_x = 0
+    } else if ch == '\t' {
+        console.cursor_x = (console.cursor_x + 4) & ~3
+    } else if ch >= 32 {
+        fb_draw_char(console.cursor_x * 8, console.cursor_y * 8,
+                     ch, console.fg_color, console.bg_color)
+        console.cursor_x = console.cursor_x + 1
+    }
+
+    // Line wrap
+    if console.cursor_x >= console.width_chars {
+        console.cursor_x = 0
+        console.cursor_y = console.cursor_y + 1
+    }
+
+    // Scroll if needed
+    if console.cursor_y >= console.height_chars {
+        fb_console_scroll()
+        console.cursor_y = console.height_chars - 1
+    }
+}
+
+// Scroll console up by one line
+fn fb_console_scroll() {
+    if fb.initialized == 0 { return }
+
+    var buffer: u64 = fb_get_draw_buffer()
+    var line_size: u64 = fb.pitch * 8  // 8 pixels per character line
+
+    // Copy lines up
+    var dst: u64 = buffer
+    var src: u64 = buffer + line_size
+    var copy_size: u64 = fb.pitch * (fb.height - 8)
+
+    memory.memcpy(dst, src, copy_size)
+
+    // Clear bottom line
+    fb_fill_rect(0, fb.height - 8, fb.width, 8, console.bg_color)
+}
+
+// Set console colors
+export fn fb_console_set_colors(fg: u32, bg: u32) {
+    console.fg_color = fg
+    console.bg_color = bg
+}
+
+// Get framebuffer info
+export fn fb_get_width(): u32 {
+    return fb.width
+}
+
+export fn fb_get_height(): u32 {
+    return fb.height
+}
+
+export fn fb_get_bpp(): u32 {
+    return fb.bpp
+}
+
+export fn fb_get_pitch(): u32 {
+    return fb.pitch
+}
+
+export fn fb_get_address(): u64 {
+    return fb.address
+}
+
+export fn fb_get_size(): u64 {
+    return fb.size
+}
+
+export fn fb_is_initialized(): u32 {
+    return fb.initialized
+}
+
+// Print statistics
+export fn fb_print_stats() {
+    foundation.serial_write_string("\n[Framebuffer] Statistics:\n")
+
+    foundation.serial_write_string("  Resolution: ")
+    foundation.serial_write_u64(fb.width)
+    foundation.serial_write_string("x")
+    foundation.serial_write_u64(fb.height)
+    foundation.serial_write_string("@")
+    foundation.serial_write_u64(fb.bpp)
+    foundation.serial_write_string("bpp\n")
+
+    foundation.serial_write_string("  Address: 0x")
+    foundation.serial_write_u64(fb.address)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Size: ")
+    foundation.serial_write_u64(fb.size / 1024)
+    foundation.serial_write_string(" KB\n")
+
+    foundation.serial_write_string("  Pixels drawn: ")
+    foundation.serial_write_u64(pixels_drawn)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Rects filled: ")
+    foundation.serial_write_u64(rects_filled)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Blits: ")
+    foundation.serial_write_u64(blits_performed)
+    foundation.serial_write_string("\n")
+
+    if fb.double_buffered == 1 {
+        foundation.serial_write_string("  Double buffering: enabled\n")
+    }
 }

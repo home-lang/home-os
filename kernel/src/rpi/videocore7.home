@@ -1,0 +1,646 @@
+// home-os VideoCore VII GPU Driver
+// Raspberry Pi 5 BCM2712 Graphics Processor
+// Supports Vulkan 1.3, OpenGL ES 3.1, 2x 4K@60Hz HDMI
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "./mailbox_vc7.home" as mailbox
+import "./rp1_hdmi.home" as hdmi
+import "../drivers/framebuffer.home" as framebuffer
+
+// VideoCore VII base addresses
+const VC7_BASE: u64 = 0x1000800000
+const VC7_HVS_BASE: u64 = VC7_BASE + 0x00200000   // Hardware Video Scaler
+const VC7_V3D_BASE: u64 = VC7_BASE + 0x00400000   // 3D engine
+const VC7_VEC_BASE: u64 = VC7_BASE + 0x00600000   // Video encoder
+const VC7_HDMI_BASE: u64 = VC7_BASE + 0x00800000  // HDMI encoder
+const VC7_PIXELVALVE0: u64 = VC7_BASE + 0x00206000
+const VC7_PIXELVALVE1: u64 = VC7_BASE + 0x00207000
+const VC7_PIXELVALVE2: u64 = VC7_BASE + 0x0020A000
+
+// V3D (3D Engine) registers
+const V3D_IDENT0: u64 = 0x000
+const V3D_IDENT1: u64 = 0x004
+const V3D_IDENT2: u64 = 0x008
+const V3D_SCRATCH: u64 = 0x010
+const V3D_L2CACTL: u64 = 0x020
+const V3D_SLCACTL: u64 = 0x024
+const V3D_INTCTL: u64 = 0x030
+const V3D_INTENA: u64 = 0x034
+const V3D_INTDIS: u64 = 0x038
+const V3D_CT0CS: u64 = 0x100  // Control list executor 0 control
+const V3D_CT0EA: u64 = 0x104  // Control list executor 0 end address
+const V3D_CT0CA: u64 = 0x108  // Control list executor 0 current address
+const V3D_CT1CS: u64 = 0x110  // Control list executor 1 control
+const V3D_CT1EA: u64 = 0x114
+const V3D_CT1CA: u64 = 0x118
+const V3D_BFC: u64 = 0x134    // Binning flush count
+const V3D_RFC: u64 = 0x138    // Rendering flush count
+const V3D_BPCA: u64 = 0x300   // Current address of binning pool
+const V3D_BPCS: u64 = 0x304   // Size of binning pool
+const V3D_BPOA: u64 = 0x308   // Address of overspill binning pool
+const V3D_BPOS: u64 = 0x30C   // Size of overspill binning pool
+
+// HVS (Hardware Video Scaler) registers
+const HVS_DISPCTRL: u64 = 0x000
+const HVS_DISPSTAT: u64 = 0x004
+const HVS_DISPID: u64 = 0x008
+const HVS_DISPECTRL: u64 = 0x00C
+const HVS_DISPPROF: u64 = 0x010
+const HVS_DISPDITHER: u64 = 0x014
+const HVS_DISPEOLN: u64 = 0x018
+const HVS_DISPLIST0: u64 = 0x020
+const HVS_DISPLIST1: u64 = 0x024
+const HVS_DISPLIST2: u64 = 0x028
+const HVS_DISPLSTAT: u64 = 0x02C
+const HVS_DISPLACT: u64 = 0x030
+const HVS_DISPCTRL0: u64 = 0x040
+const HVS_DISPBKGND0: u64 = 0x044
+const HVS_DISPSTAT0: u64 = 0x048
+const HVS_DISPCTRL1: u64 = 0x050
+const HVS_DISPBKGND1: u64 = 0x054
+const HVS_DISPSTAT1: u64 = 0x058
+const HVS_DISPCTRL2: u64 = 0x060
+const HVS_DISPBKGND2: u64 = 0x064
+const HVS_DISPSTAT2: u64 = 0x068
+
+// PixelValve registers
+const PV_CONTROL: u64 = 0x000
+const PV_V_CONTROL: u64 = 0x004
+const PV_VSYNCD_EVEN: u64 = 0x008
+const PV_HORZA: u64 = 0x00C
+const PV_HORZB: u64 = 0x010
+const PV_VERTA: u64 = 0x014
+const PV_VERTB: u64 = 0x018
+const PV_VERTA_EVEN: u64 = 0x01C
+const PV_VERTB_EVEN: u64 = 0x020
+const PV_INTEN: u64 = 0x024
+const PV_INTSTAT: u64 = 0x028
+const PV_STAT: u64 = 0x02C
+const PV_HACT_ACT: u64 = 0x030
+
+// Display list entry types
+const DLIST_CTRL_END: u32 = 0x80000000
+const DLIST_CTRL_VALID: u32 = 0x40000000
+const DLIST_CTRL_WORDS_MASK: u32 = 0x3F000000
+const DLIST_CTRL_UNITY: u32 = 0x00008000
+const DLIST_CTRL_ALPHA_MASK: u32 = 0x0000F800
+
+// Pixel formats for display
+const PIXEL_FORMAT_RGB565: u32 = 0
+const PIXEL_FORMAT_RGB888: u32 = 1
+const PIXEL_FORMAT_XRGB8888: u32 = 2
+const PIXEL_FORMAT_ARGB8888: u32 = 3
+const PIXEL_FORMAT_RGBA8888: u32 = 4
+
+// GPU memory allocation
+struct GpuMemBlock {
+    handle: u32
+    bus_address: u64
+    virt_address: u64
+    size: u64
+    flags: u32
+}
+
+// Display configuration
+struct DisplayConfig {
+    width: u32
+    height: u32
+    refresh: u32
+    format: u32
+    hvs_channel: u32
+    pixelvalve_id: u32
+    hdmi_port: u32
+}
+
+// V3D state
+struct V3dState {
+    initialized: u32
+    ident0: u32
+    ident1: u32
+    ident2: u32
+    num_slices: u32
+    num_qpus: u32
+    vpm_size: u32
+    binning_pool: GpuMemBlock
+    render_pool: GpuMemBlock
+}
+
+// VideoCore VII controller state
+struct VC7Controller {
+    initialized: u32
+    v3d: V3dState
+    displays: [3]DisplayConfig     // Up to 3 display outputs
+    active_displays: u32
+    framebuffer_addr: u64
+    framebuffer_size: u64
+    primary_width: u32
+    primary_height: u32
+    primary_bpp: u32
+}
+
+var vc7: VC7Controller
+
+// Statistics
+var frames_rendered: u64 = 0
+var v3d_jobs: u64 = 0
+var display_updates: u64 = 0
+
+// Read V3D register
+fn v3d_read(offset: u64): u32 {
+    return memory.read_volatile_u32(VC7_V3D_BASE + offset)
+}
+
+// Write V3D register
+fn v3d_write(offset: u64, value: u32) {
+    memory.write_volatile_u32(VC7_V3D_BASE + offset, value)
+}
+
+// Read HVS register
+fn hvs_read(offset: u64): u32 {
+    return memory.read_volatile_u32(VC7_HVS_BASE + offset)
+}
+
+// Write HVS register
+fn hvs_write(offset: u64, value: u32) {
+    memory.write_volatile_u32(VC7_HVS_BASE + offset, value)
+}
+
+// Read PixelValve register
+fn pv_read(pv_id: u32, offset: u64): u32 {
+    var base: u64 = VC7_PIXELVALVE0
+    if pv_id == 1 { base = VC7_PIXELVALVE1 }
+    if pv_id == 2 { base = VC7_PIXELVALVE2 }
+    return memory.read_volatile_u32(base + offset)
+}
+
+// Write PixelValve register
+fn pv_write(pv_id: u32, offset: u64, value: u32) {
+    var base: u64 = VC7_PIXELVALVE0
+    if pv_id == 1 { base = VC7_PIXELVALVE1 }
+    if pv_id == 2 { base = VC7_PIXELVALVE2 }
+    memory.write_volatile_u32(base + offset, value)
+}
+
+// Initialize VideoCore VII
+export fn vc7_init(): u32 {
+    if vc7.initialized == 1 {
+        foundation.serial_write_string("[VC7] Already initialized\n")
+        return 0
+    }
+
+    foundation.serial_write_string("[VC7] Initializing VideoCore VII GPU\n")
+
+    // Initialize V3D (3D engine)
+    var result: u32 = vc7_v3d_init()
+    if result != 0 {
+        foundation.serial_write_string("[VC7] V3D initialization failed\n")
+        return 1
+    }
+
+    // Initialize HVS (display scaler)
+    result = vc7_hvs_init()
+    if result != 0 {
+        foundation.serial_write_string("[VC7] HVS initialization failed\n")
+        return 1
+    }
+
+    vc7.initialized = 1
+    vc7.active_displays = 0
+
+    foundation.serial_write_string("[VC7] VideoCore VII initialized successfully\n")
+    return 0
+}
+
+// Initialize V3D (3D engine)
+fn vc7_v3d_init(): u32 {
+    foundation.serial_write_string("[VC7] Initializing V3D 3D engine\n")
+
+    // Read identity registers
+    vc7.v3d.ident0 = v3d_read(V3D_IDENT0)
+    vc7.v3d.ident1 = v3d_read(V3D_IDENT1)
+    vc7.v3d.ident2 = v3d_read(V3D_IDENT2)
+
+    // Parse capabilities from ident registers
+    // IDENT1: bits 0-3 = VPM size, bits 4-7 = HDR support, bits 8-11 = NSEM
+    vc7.v3d.vpm_size = (vc7.v3d.ident1 & 0xF) * 4  // VPM size in KB
+
+    // IDENT2: bits 0-3 = slice count - 1
+    vc7.v3d.num_slices = (vc7.v3d.ident2 & 0xF) + 1
+
+    // Each slice has 4 QPUs in VC7
+    vc7.v3d.num_qpus = vc7.v3d.num_slices * 4
+
+    foundation.serial_write_string("[VC7] V3D: ")
+    foundation.serial_write_u64(vc7.v3d.num_slices)
+    foundation.serial_write_string(" slices, ")
+    foundation.serial_write_u64(vc7.v3d.num_qpus)
+    foundation.serial_write_string(" QPUs, ")
+    foundation.serial_write_u64(vc7.v3d.vpm_size)
+    foundation.serial_write_string("KB VPM\n")
+
+    // Disable interrupts initially
+    v3d_write(V3D_INTDIS, 0xFFFFFFFF)
+
+    // Clear L2 cache
+    v3d_write(V3D_L2CACTL, 0x04)  // Clear entire L2 cache
+
+    // Clear SLC cache
+    v3d_write(V3D_SLCACTL, 0x0F0F0F0F)  // Clear all SLC partitions
+
+    vc7.v3d.initialized = 1
+
+    return 0
+}
+
+// Initialize HVS (Hardware Video Scaler)
+fn vc7_hvs_init(): u32 {
+    foundation.serial_write_string("[VC7] Initializing HVS display scaler\n")
+
+    // Read HVS ID
+    var hvs_id: u32 = hvs_read(HVS_DISPID)
+    foundation.serial_write_string("[VC7] HVS ID: 0x")
+    foundation.serial_write_u64(hvs_id)
+    foundation.serial_write_string("\n")
+
+    // Reset display control
+    hvs_write(HVS_DISPCTRL, 0x00000000)
+    foundation.delay_us(100)
+
+    // Enable HVS
+    hvs_write(HVS_DISPCTRL, 0x80000000)
+
+    // Initialize display list memory
+    // HVS has 4096 words of display list memory
+
+    return 0
+}
+
+// Configure display for 4K@60Hz (for LG 27UP850-W)
+export fn vc7_setup_4k_display(hdmi_port: u32): u32 {
+    if vc7.initialized == 0 { return 1 }
+    if hdmi_port >= 2 { return 1 }
+
+    foundation.serial_write_string("[VC7] Setting up 4K@60Hz display on HDMI")
+    foundation.serial_write_u64(hdmi_port)
+    foundation.serial_write_string("\n")
+
+    // Allocate framebuffer via mailbox
+    var fb_addr: u64 = mailbox.mailbox_allocate_framebuffer(3840, 2160, 32)
+    if fb_addr == 0 {
+        foundation.serial_write_string("[VC7] Failed to allocate 4K framebuffer\n")
+        return 1
+    }
+
+    foundation.serial_write_string("[VC7] Framebuffer allocated at 0x")
+    foundation.serial_write_u64(fb_addr)
+    foundation.serial_write_string("\n")
+
+    // Store framebuffer info
+    vc7.framebuffer_addr = fb_addr
+    vc7.framebuffer_size = 3840 * 2160 * 4  // 32bpp
+    vc7.primary_width = 3840
+    vc7.primary_height = 2160
+    vc7.primary_bpp = 32
+
+    // Initialize framebuffer driver
+    framebuffer.fb_init_4k(fb_addr)
+
+    // Configure display pipeline
+    vc7.displays[hdmi_port].width = 3840
+    vc7.displays[hdmi_port].height = 2160
+    vc7.displays[hdmi_port].refresh = 60
+    vc7.displays[hdmi_port].format = PIXEL_FORMAT_XRGB8888
+    vc7.displays[hdmi_port].hvs_channel = hdmi_port
+    vc7.displays[hdmi_port].pixelvalve_id = hdmi_port
+    vc7.displays[hdmi_port].hdmi_port = hdmi_port
+
+    // Setup HVS display list for this channel
+    vc7_hvs_setup_display_list(hdmi_port, fb_addr, 3840, 2160)
+
+    // Configure PixelValve
+    vc7_pv_configure(hdmi_port, 3840, 2160, 60)
+
+    // Initialize HDMI
+    hdmi.hdmi_init()
+    hdmi.hdmi_set_mode(hdmi_port, 5)  // HDMI_MODE_4K60
+    hdmi.hdmi_set_framebuffer(hdmi_port, fb_addr, vc7.framebuffer_size)
+
+    vc7.active_displays = vc7.active_displays | (1 << hdmi_port)
+
+    foundation.serial_write_string("[VC7] 4K display configured successfully\n")
+    return 0
+}
+
+// Setup HVS display list for a channel
+fn vc7_hvs_setup_display_list(channel: u32, fb_addr: u64, width: u32, height: u32) {
+    if channel >= 3 { return }
+
+    // Display list base address for this channel
+    var dlist_offset: u64 = channel * 1024 * 4  // 1024 words per channel
+
+    // Write display list entries
+    var entry_addr: u64 = VC7_HVS_BASE + 0x2000 + dlist_offset  // Display list RAM
+    var entry_offset: u32 = 0
+
+    // Entry 0: Control word
+    // Format: XRGB8888 (format 3), unity scaling, full alpha
+    var ctrl: u32 = DLIST_CTRL_VALID | DLIST_CTRL_UNITY
+    ctrl = ctrl | (3 << 0)  // Format: XRGB8888
+    ctrl = ctrl | (0x1F << 11)  // Full alpha
+    memory.write_volatile_u32(entry_addr + entry_offset, ctrl)
+    entry_offset = entry_offset + 4
+
+    // Entry 1: Position (x=0, y=0)
+    memory.write_volatile_u32(entry_addr + entry_offset, 0)
+    entry_offset = entry_offset + 4
+
+    // Entry 2: Source address
+    memory.write_volatile_u32(entry_addr + entry_offset, fb_addr & 0xFFFFFFFF)
+    entry_offset = entry_offset + 4
+
+    // Entry 3: Source pitch
+    var pitch: u32 = width * 4
+    memory.write_volatile_u32(entry_addr + entry_offset, pitch)
+    entry_offset = entry_offset + 4
+
+    // Entry 4: Width/Height
+    var size: u32 = (width << 16) | height
+    memory.write_volatile_u32(entry_addr + entry_offset, size)
+    entry_offset = entry_offset + 4
+
+    // Entry 5: End marker
+    memory.write_volatile_u32(entry_addr + entry_offset, DLIST_CTRL_END)
+
+    // Set display list pointer for this channel
+    if channel == 0 {
+        hvs_write(HVS_DISPLIST0, dlist_offset / 4)
+    } else if channel == 1 {
+        hvs_write(HVS_DISPLIST1, dlist_offset / 4)
+    } else {
+        hvs_write(HVS_DISPLIST2, dlist_offset / 4)
+    }
+
+    // Set background color to black
+    if channel == 0 {
+        hvs_write(HVS_DISPBKGND0, 0x00000000)
+        hvs_write(HVS_DISPCTRL0, 0x80000000)  // Enable channel
+    } else if channel == 1 {
+        hvs_write(HVS_DISPBKGND1, 0x00000000)
+        hvs_write(HVS_DISPCTRL1, 0x80000000)
+    } else {
+        hvs_write(HVS_DISPBKGND2, 0x00000000)
+        hvs_write(HVS_DISPCTRL2, 0x80000000)
+    }
+}
+
+// Configure PixelValve for display timing
+fn vc7_pv_configure(pv_id: u32, width: u32, height: u32, refresh: u32) {
+    if pv_id >= 3 { return }
+
+    // Standard 4K@60Hz timing
+    var h_active: u32 = width
+    var h_fp: u32 = 176
+    var h_sync: u32 = 88
+    var h_bp: u32 = 296
+    var h_total: u32 = h_active + h_fp + h_sync + h_bp
+
+    var v_active: u32 = height
+    var v_fp: u32 = 8
+    var v_sync: u32 = 10
+    var v_bp: u32 = 72
+    var v_total: u32 = v_active + v_fp + v_sync + v_bp
+
+    // Disable PixelValve first
+    pv_write(pv_id, PV_CONTROL, 0)
+    foundation.delay_us(100)
+
+    // Horizontal timing
+    // HORZA: HBP | HSYNC
+    pv_write(pv_id, PV_HORZA, (h_bp << 16) | h_sync)
+    // HORZB: HACTIVE | HFP
+    pv_write(pv_id, PV_HORZB, (h_active << 16) | h_fp)
+
+    // Vertical timing
+    // VERTA: VBP | VSYNC
+    pv_write(pv_id, PV_VERTA, (v_bp << 16) | v_sync)
+    // VERTB: VACTIVE | VFP
+    pv_write(pv_id, PV_VERTB, (v_active << 16) | v_fp)
+
+    // For interlaced (not used for 4K progressive)
+    pv_write(pv_id, PV_VERTA_EVEN, 0)
+    pv_write(pv_id, PV_VERTB_EVEN, 0)
+
+    // Vertical control
+    // Bit 0: continuous mode
+    // Bit 1: wait for vstart
+    pv_write(pv_id, PV_V_CONTROL, 0x01)
+
+    // Enable PixelValve
+    // Bit 0: Enable
+    // Bit 2: FIFO clear
+    // Bit 12-15: Format (for HDMI)
+    var control: u32 = 0x00001005  // Enable + FIFO clear + 24bpp
+    pv_write(pv_id, PV_CONTROL, control)
+
+    foundation.serial_write_string("[VC7] PixelValve ")
+    foundation.serial_write_u64(pv_id)
+    foundation.serial_write_string(" configured for ")
+    foundation.serial_write_u64(width)
+    foundation.serial_write_string("x")
+    foundation.serial_write_u64(height)
+    foundation.serial_write_string("@")
+    foundation.serial_write_u64(refresh)
+    foundation.serial_write_string("Hz\n")
+}
+
+// Submit V3D render job (simplified)
+export fn vc7_submit_render(bin_cl: u64, bin_size: u32, render_cl: u64, render_size: u32): u32 {
+    if vc7.initialized == 0 { return 1 }
+    if vc7.v3d.initialized == 0 { return 1 }
+
+    // Wait for any previous job to complete
+    var timeout: u32 = 100000
+    while timeout > 0 {
+        var cs: u32 = v3d_read(V3D_CT0CS)
+        if (cs & 0x20) == 0 {  // Not running
+            break
+        }
+        timeout = timeout - 1
+    }
+
+    if timeout == 0 {
+        foundation.serial_write_string("[VC7] Render timeout waiting for previous job\n")
+        return 1
+    }
+
+    // Submit binning job first (if provided)
+    if bin_cl != 0 and bin_size > 0 {
+        v3d_write(V3D_CT0CA, bin_cl & 0xFFFFFFFF)
+        v3d_write(V3D_CT0EA, (bin_cl + bin_size) & 0xFFFFFFFF)
+        v3d_write(V3D_CT0CS, 0x20)  // Start binning
+
+        // Wait for binning to complete
+        timeout = 100000
+        while timeout > 0 {
+            var cs: u32 = v3d_read(V3D_CT0CS)
+            if (cs & 0x20) == 0 {
+                break
+            }
+            timeout = timeout - 1
+        }
+    }
+
+    // Submit rendering job
+    if render_cl != 0 and render_size > 0 {
+        v3d_write(V3D_CT1CA, render_cl & 0xFFFFFFFF)
+        v3d_write(V3D_CT1EA, (render_cl + render_size) & 0xFFFFFFFF)
+        v3d_write(V3D_CT1CS, 0x20)  // Start rendering
+    }
+
+    v3d_jobs = v3d_jobs + 1
+
+    return 0
+}
+
+// Wait for V3D to complete rendering
+export fn vc7_wait_render(): u32 {
+    if vc7.initialized == 0 { return 1 }
+
+    var timeout: u32 = 1000000
+    while timeout > 0 {
+        var cs: u32 = v3d_read(V3D_CT1CS)
+        if (cs & 0x20) == 0 {  // Not running
+            return 0
+        }
+        timeout = timeout - 1
+    }
+
+    foundation.serial_write_string("[VC7] Render wait timeout\n")
+    return 1
+}
+
+// Present frame (swap display)
+export fn vc7_present(): u32 {
+    if vc7.initialized == 0 { return 1 }
+
+    // Trigger HVS display list reload
+    var ctrl: u32 = hvs_read(HVS_DISPCTRL)
+    hvs_write(HVS_DISPCTRL, ctrl | 0x40000000)  // Request update
+
+    frames_rendered = frames_rendered + 1
+    display_updates = display_updates + 1
+
+    return 0
+}
+
+// Clear framebuffer to color
+export fn vc7_clear(color: u32) {
+    if vc7.initialized == 0 { return }
+
+    framebuffer.fb_clear(color)
+}
+
+// Get framebuffer address
+export fn vc7_get_framebuffer(): u64 {
+    return vc7.framebuffer_addr
+}
+
+// Get display dimensions
+export fn vc7_get_width(): u32 {
+    return vc7.primary_width
+}
+
+export fn vc7_get_height(): u32 {
+    return vc7.primary_height
+}
+
+// Print statistics
+export fn vc7_print_stats() {
+    foundation.serial_write_string("\n[VC7] VideoCore VII Statistics:\n")
+
+    foundation.serial_write_string("  V3D Slices: ")
+    foundation.serial_write_u64(vc7.v3d.num_slices)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  V3D QPUs: ")
+    foundation.serial_write_u64(vc7.v3d.num_qpus)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  VPM Size: ")
+    foundation.serial_write_u64(vc7.v3d.vpm_size)
+    foundation.serial_write_string(" KB\n")
+
+    foundation.serial_write_string("  Framebuffer: 0x")
+    foundation.serial_write_u64(vc7.framebuffer_addr)
+    foundation.serial_write_string(" (")
+    foundation.serial_write_u64(vc7.framebuffer_size / 1024 / 1024)
+    foundation.serial_write_string(" MB)\n")
+
+    foundation.serial_write_string("  Resolution: ")
+    foundation.serial_write_u64(vc7.primary_width)
+    foundation.serial_write_string("x")
+    foundation.serial_write_u64(vc7.primary_height)
+    foundation.serial_write_string("@")
+    foundation.serial_write_u64(vc7.primary_bpp)
+    foundation.serial_write_string("bpp\n")
+
+    foundation.serial_write_string("  Frames rendered: ")
+    foundation.serial_write_u64(frames_rendered)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  V3D jobs: ")
+    foundation.serial_write_u64(v3d_jobs)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Display updates: ")
+    foundation.serial_write_u64(display_updates)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Active displays: ")
+    if (vc7.active_displays & 1) != 0 {
+        foundation.serial_write_string("HDMI0 ")
+    }
+    if (vc7.active_displays & 2) != 0 {
+        foundation.serial_write_string("HDMI1 ")
+    }
+    foundation.serial_write_string("\n")
+}
+
+// Initialize for LG 27UP850-W monitor specifically
+export fn vc7_init_lg_monitor(): u32 {
+    foundation.serial_write_string("[VC7] Initializing for LG 27UP850-W monitor\n")
+
+    // Initialize VideoCore VII
+    var result: u32 = vc7_init()
+    if result != 0 {
+        return 1
+    }
+
+    // Setup 4K display on HDMI0 (primary port)
+    result = vc7_setup_4k_display(0)
+    if result != 0 {
+        return 1
+    }
+
+    // Initialize for LG monitor via HDMI driver
+    hdmi.hdmi_init_lg_27up850w(0)
+
+    // Clear screen to dark blue (HomeOS boot color)
+    vc7_clear(0x001830)
+
+    // Draw test pattern
+    framebuffer.fb_fill_rect(100, 100, 200, 200, 0xFFFFFF)  // White box
+    framebuffer.fb_fill_rect(400, 100, 200, 200, 0xFF0000)  // Red box
+    framebuffer.fb_fill_rect(700, 100, 200, 200, 0x00FF00)  // Green box
+    framebuffer.fb_fill_rect(1000, 100, 200, 200, 0x0000FF) // Blue box
+
+    // Draw text
+    framebuffer.fb_draw_string(100, 400, "HomeOS on Raspberry Pi 5", 0xFFFFFF, 0)
+    framebuffer.fb_draw_string(100, 420, "LG 27UP850-W - 3840x2160@60Hz", 0xFFFFFF, 0)
+
+    vc7_present()
+
+    foundation.serial_write_string("[VC7] LG 27UP850-W initialization complete\n")
+    return 0
+}
