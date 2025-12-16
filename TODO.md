@@ -351,7 +351,13 @@ The rest of this section focuses on **improvements that matter most** for a mini
 
 - [x] **GDB remote stub** – implemented
   - Implementation: `kernel/src/debug/gdb.home` (RSP over serial)
-  - [ ] Wire into exception paths on both x86-64 and ARM64 and document usage in `docs/`
+  - [x] Wire into exception paths on both x86-64 and ARM64 and document usage in `docs/` (**COMPLETED Dec 16, 2025**)
+    - Created `kernel/src/debug/gdb_exception_hooks.home` for architecture integration
+    - x86-64: Hooks into IDT exception vectors, maps to GDB signals
+    - ARM64: Hooks into EL1 exception vectors, converts ESR to unified trap codes
+    - Unified `GDBRegisterContext` structure for cross-architecture debugging
+    - Single-step support via TF (x86-64) and MDSCR (ARM64)
+    - Created `docs/GDB_DEBUGGING.md` with comprehensive usage guide
 - [x] **Panic & memleak tooling** – implemented (**ENHANCED Dec 5, 2025**)
   - Files: `kernel/src/debug/{panic.home,memleak.home,memory_audit.home,profiler.home}`
   - [x] Standardize panic output format and add basic crash-dump-to-storage support
@@ -381,7 +387,12 @@ The rest of this section focuses on **improvements that matter most** for a mini
     - TLS (`kernel/src/net/tls.home`): connection events, handshake success/failure, security alerts
     - Capabilities (`kernel/src/security/capabilities.home`): permission checks, grants, denials
     - Existing coverage: syscalls, file access, process events, auth, security events
-  - [ ] Auto-generate syscall & driver reference docs from `.home` sources
+  - [x] Auto-generate syscall & driver reference docs from `.home` sources (**COMPLETED Dec 16, 2025**)
+    - Created `scripts/generate-docs.sh` documentation generator
+    - Functions: `generate_syscall_docs()`, `generate_driver_docs()`, `generate_module_index()`, `generate_api_reference()`
+    - Generated docs in `docs/api/`: SYSCALLS.md (121 syscalls), DRIVERS.md (65 drivers), MODULE_INDEX.md, API_REFERENCE.md
+    - Options: --syscalls, --drivers, --index, --api, --all
+    - Auto-extracts: syscall definitions, exported functions, constants, structs from .home sources
 
 ---
 

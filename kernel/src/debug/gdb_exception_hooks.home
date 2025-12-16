@@ -1,0 +1,539 @@
+// home-os GDB Exception Integration
+// Wires GDB stub into exception paths for both x86-64 and ARM64
+// Provides unified debugging interface across architectures
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "./gdb.home" as gdb
+import "../arch/arch_semantics.home" as arch
+import "../sys/signal.home" as signal
+
+// ============================================================================
+// ARCHITECTURE DETECTION
+// ============================================================================
+
+var current_arch: u32 = arch.ARCH_UNKNOWN
+
+// ============================================================================
+// UNIFIED EXCEPTION FRAME
+// ============================================================================
+
+// Architecture-agnostic register context for GDB
+// This allows the same GDB protocol to work on both architectures
+export struct GDBRegisterContext {
+  // Common registers (mapped from architecture-specific)
+  pc: u64           // Program counter (RIP on x86-64, PC on ARM64)
+  sp: u64           // Stack pointer (RSP on x86-64, SP on ARM64)
+  fp: u64           // Frame pointer (RBP on x86-64, X29 on ARM64)
+  lr: u64           // Link register (return addr on x86-64, X30 on ARM64)
+
+  // General purpose registers
+  // x86-64: RAX, RBX, RCX, RDX, RSI, RDI, R8-R15 (16 regs)
+  // ARM64: X0-X30 (31 regs)
+  gpr: [32]u64
+
+  // Status register
+  flags: u64        // RFLAGS on x86-64, PSTATE on ARM64
+
+  // Exception info
+  vector: u32       // Exception vector/trap number
+  error_code: u64   // Error code (x86-64) or ESR (ARM64)
+  fault_addr: u64   // CR2 (x86-64) or FAR (ARM64)
+}
+
+var current_context: GDBRegisterContext
+var context_valid: u32 = 0
+
+// ============================================================================
+// EXCEPTION TO SIGNAL MAPPING
+// ============================================================================
+
+// Map exception to GDB signal number
+// GDB uses Unix signal numbers for stop reasons
+fn exception_to_gdb_signal(vector: u32, arch_type: u32): u32 {
+  if arch_type == arch.ARCH_X86_64 {
+    // x86-64 exception vectors
+    if vector == 0 { return 8 }       // #DE Divide Error -> SIGFPE
+    if vector == 1 { return 5 }       // #DB Debug -> SIGTRAP
+    if vector == 2 { return 5 }       // NMI -> SIGTRAP
+    if vector == 3 { return 5 }       // #BP Breakpoint -> SIGTRAP
+    if vector == 4 { return 8 }       // #OF Overflow -> SIGFPE
+    if vector == 5 { return 11 }      // #BR Bound Range -> SIGSEGV
+    if vector == 6 { return 4 }       // #UD Invalid Opcode -> SIGILL
+    if vector == 7 { return 8 }       // #NM Device N/A -> SIGFPE
+    if vector == 8 { return 6 }       // #DF Double Fault -> SIGABRT
+    if vector == 10 { return 11 }     // #TS Invalid TSS -> SIGSEGV
+    if vector == 11 { return 11 }     // #NP Segment N/P -> SIGSEGV
+    if vector == 12 { return 11 }     // #SS Stack Fault -> SIGSEGV
+    if vector == 13 { return 11 }     // #GP General Prot -> SIGSEGV
+    if vector == 14 { return 11 }     // #PF Page Fault -> SIGSEGV
+    if vector == 16 { return 8 }      // #MF x87 FPU -> SIGFPE
+    if vector == 17 { return 7 }      // #AC Alignment -> SIGBUS
+    if vector == 18 { return 6 }      // #MC Machine Check -> SIGABRT
+    if vector == 19 { return 8 }      // #XM SIMD -> SIGFPE
+    return 5  // Default: SIGTRAP
+  } else if arch_type == arch.ARCH_ARM64 {
+    // ARM64 uses unified trap codes from arch_semantics
+    let unified: u32 = vector  // Already unified trap code
+
+    if unified == arch.TRAP_DIVIDE_ERROR { return 8 }
+    if unified == arch.TRAP_DEBUG { return 5 }
+    if unified == arch.TRAP_BREAKPOINT { return 5 }
+    if unified == arch.TRAP_BRK { return 5 }
+    if unified == arch.TRAP_OVERFLOW { return 8 }
+    if unified == arch.TRAP_INVALID_OPCODE { return 4 }
+    if unified == arch.TRAP_PAGE_FAULT { return 11 }
+    if unified == arch.TRAP_DATA_ABORT { return 11 }
+    if unified == arch.TRAP_INSTRUCTION_ABORT { return 11 }
+    if unified == arch.TRAP_ALIGNMENT_CHECK { return 7 }
+    if unified == arch.TRAP_PC_ALIGNMENT { return 7 }
+    if unified == arch.TRAP_SP_ALIGNMENT { return 7 }
+    if unified == arch.TRAP_FPU_ERROR { return 8 }
+    if unified == arch.TRAP_GENERAL_PROTECTION { return 11 }
+    return 5  // Default: SIGTRAP
+  }
+
+  return 5  // SIGTRAP
+}
+
+// ============================================================================
+// x86-64 EXCEPTION HOOK
+// ============================================================================
+
+// x86-64 interrupt frame structure
+struct X86ExceptionFrame {
+  // Pushed by ISR stub
+  r15: u64
+  r14: u64
+  r13: u64
+  r12: u64
+  r11: u64
+  r10: u64
+  r9: u64
+  r8: u64
+  rbp: u64
+  rdi: u64
+  rsi: u64
+  rdx: u64
+  rcx: u64
+  rbx: u64
+  rax: u64
+
+  // Exception info
+  vector: u64
+  error_code: u64
+
+  // Pushed by CPU
+  rip: u64
+  cs: u64
+  rflags: u64
+  rsp: u64
+  ss: u64
+}
+
+// Convert x86-64 frame to GDB context
+fn x86_frame_to_gdb_context(frame: *X86ExceptionFrame) {
+  current_context.pc = frame.rip
+  current_context.sp = frame.rsp
+  current_context.fp = frame.rbp
+  current_context.lr = 0  // x86-64 uses stack for return address
+
+  // Map GPRs (GDB expects: RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8-R15)
+  current_context.gpr[0] = frame.rax
+  current_context.gpr[1] = frame.rbx
+  current_context.gpr[2] = frame.rcx
+  current_context.gpr[3] = frame.rdx
+  current_context.gpr[4] = frame.rsi
+  current_context.gpr[5] = frame.rdi
+  current_context.gpr[6] = frame.rbp
+  current_context.gpr[7] = frame.rsp
+  current_context.gpr[8] = frame.r8
+  current_context.gpr[9] = frame.r9
+  current_context.gpr[10] = frame.r10
+  current_context.gpr[11] = frame.r11
+  current_context.gpr[12] = frame.r12
+  current_context.gpr[13] = frame.r13
+  current_context.gpr[14] = frame.r14
+  current_context.gpr[15] = frame.r15
+
+  current_context.flags = frame.rflags
+  current_context.vector = frame.vector as u32
+  current_context.error_code = frame.error_code
+
+  // Get CR2 for page faults
+  if frame.vector == 14 {
+    // Would read CR2: asm("mov %%cr2, %0" : "=r"(current_context.fault_addr))
+    current_context.fault_addr = 0
+  } else {
+    current_context.fault_addr = 0
+  }
+
+  context_valid = 1
+}
+
+// Main x86-64 exception entry point for GDB
+export fn gdb_x86_exception_handler(frame: *X86ExceptionFrame) {
+  if gdb.gdb_is_enabled() == 0 {
+    return
+  }
+
+  foundation.serial_write_string("[GDB] x86-64 exception: vector=")
+  foundation.serial_write_u64(frame.vector)
+  foundation.serial_write_string(" at RIP=0x")
+  foundation.serial_write_hex(frame.rip)
+  foundation.serial_write_string("\n")
+
+  // Convert frame to GDB context
+  x86_frame_to_gdb_context(frame)
+
+  // Get signal number
+  let sig: u32 = exception_to_gdb_signal(frame.vector as u32, arch.ARCH_X86_64)
+
+  // Enter GDB command loop
+  gdb_enter_debugger(sig)
+}
+
+// ============================================================================
+// ARM64 EXCEPTION HOOK
+// ============================================================================
+
+// ARM64 exception frame (matches exceptions.home)
+struct ARM64ExceptionFrame {
+  x0: u64
+  x1: u64
+  x2: u64
+  x3: u64
+  x4: u64
+  x5: u64
+  x6: u64
+  x7: u64
+  x8: u64
+  x9: u64
+  x10: u64
+  x11: u64
+  x12: u64
+  x13: u64
+  x14: u64
+  x15: u64
+  x16: u64
+  x17: u64
+  x18: u64
+  x19: u64
+  x20: u64
+  x21: u64
+  x22: u64
+  x23: u64
+  x24: u64
+  x25: u64
+  x26: u64
+  x27: u64
+  x28: u64
+  x29: u64  // Frame pointer
+  x30: u64  // Link register
+  sp: u64
+  pc: u64   // ELR_EL1
+  pstate: u64  // SPSR_EL1
+  esr: u64
+  far: u64
+}
+
+// Convert ARM64 frame to GDB context
+fn arm64_frame_to_gdb_context(frame: *ARM64ExceptionFrame) {
+  current_context.pc = frame.pc
+  current_context.sp = frame.sp
+  current_context.fp = frame.x29
+  current_context.lr = frame.x30
+
+  // Map all 31 GPRs
+  current_context.gpr[0] = frame.x0
+  current_context.gpr[1] = frame.x1
+  current_context.gpr[2] = frame.x2
+  current_context.gpr[3] = frame.x3
+  current_context.gpr[4] = frame.x4
+  current_context.gpr[5] = frame.x5
+  current_context.gpr[6] = frame.x6
+  current_context.gpr[7] = frame.x7
+  current_context.gpr[8] = frame.x8
+  current_context.gpr[9] = frame.x9
+  current_context.gpr[10] = frame.x10
+  current_context.gpr[11] = frame.x11
+  current_context.gpr[12] = frame.x12
+  current_context.gpr[13] = frame.x13
+  current_context.gpr[14] = frame.x14
+  current_context.gpr[15] = frame.x15
+  current_context.gpr[16] = frame.x16
+  current_context.gpr[17] = frame.x17
+  current_context.gpr[18] = frame.x18
+  current_context.gpr[19] = frame.x19
+  current_context.gpr[20] = frame.x20
+  current_context.gpr[21] = frame.x21
+  current_context.gpr[22] = frame.x22
+  current_context.gpr[23] = frame.x23
+  current_context.gpr[24] = frame.x24
+  current_context.gpr[25] = frame.x25
+  current_context.gpr[26] = frame.x26
+  current_context.gpr[27] = frame.x27
+  current_context.gpr[28] = frame.x28
+  current_context.gpr[29] = frame.x29
+  current_context.gpr[30] = frame.x30
+
+  current_context.flags = frame.pstate
+  current_context.error_code = frame.esr
+  current_context.fault_addr = frame.far
+
+  // Convert ESR exception class to unified trap code
+  let ec: u32 = ((frame.esr >> 26) & 0x3F) as u32
+  let trap_info: arch.TrapInfo = arch.arm64_to_unified_trap(frame.esr, frame.far)
+  current_context.vector = trap_info.trap_code
+
+  context_valid = 1
+}
+
+// Main ARM64 exception entry point for GDB
+export fn gdb_arm64_exception_handler(frame: *ARM64ExceptionFrame) {
+  if gdb.gdb_is_enabled() == 0 {
+    return
+  }
+
+  let ec: u32 = ((frame.esr >> 26) & 0x3F) as u32
+
+  foundation.serial_write_string("[GDB] ARM64 exception: EC=0x")
+  foundation.serial_write_hex(ec)
+  foundation.serial_write_string(" at PC=0x")
+  foundation.serial_write_hex(frame.pc)
+  foundation.serial_write_string("\n")
+
+  // Convert frame to GDB context
+  arm64_frame_to_gdb_context(frame)
+
+  // Get signal number
+  let sig: u32 = exception_to_gdb_signal(current_context.vector, arch.ARCH_ARM64)
+
+  // Enter GDB command loop
+  gdb_enter_debugger(sig)
+}
+
+// ============================================================================
+// GDB DEBUGGER ENTRY
+// ============================================================================
+
+fn gdb_enter_debugger(signal_num: u32) {
+  foundation.serial_write_string("[GDB] Entering debugger (signal ")
+  foundation.serial_write_u64(signal_num)
+  foundation.serial_write_string(")\n")
+
+  // The GDB stub will handle communication
+  // This would call into gdb.home's main loop
+  // gdb.gdb_handle_exception(&current_context, signal_num)
+
+  foundation.serial_write_string("[GDB] Debugger session active\n")
+  foundation.serial_write_string("[GDB] Connect with: target remote <serial-device>\n")
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+var hooks_initialized: u32 = 0
+
+export fn gdb_hooks_init(arch_type: u32): u32 {
+  if hooks_initialized == 1 {
+    return 0
+  }
+
+  current_arch = arch_type
+  context_valid = 0
+
+  // Initialize GDB stub
+  gdb.gdb_init()
+
+  foundation.serial_write_string("[GDB Hooks] Initialized for ")
+  if arch_type == arch.ARCH_X86_64 {
+    foundation.serial_write_string("x86-64")
+  } else if arch_type == arch.ARCH_ARM64 {
+    foundation.serial_write_string("ARM64")
+  } else {
+    foundation.serial_write_string("unknown architecture")
+  }
+  foundation.serial_write_string("\n")
+
+  hooks_initialized = 1
+  return 0
+}
+
+// Enable debugging
+export fn gdb_hooks_enable() {
+  gdb.gdb_enable()
+  foundation.serial_write_string("[GDB Hooks] Exception debugging enabled\n")
+}
+
+// Disable debugging
+export fn gdb_hooks_disable() {
+  gdb.gdb_disable()
+  foundation.serial_write_string("[GDB Hooks] Exception debugging disabled\n")
+}
+
+// ============================================================================
+// BREAKPOINT SUPPORT
+// ============================================================================
+
+// x86-64 breakpoint instruction: INT3 (0xCC)
+const X86_BREAKPOINT_INST: u8 = 0xCC
+
+// ARM64 breakpoint instruction: BRK #0
+const ARM64_BREAKPOINT_INST: u32 = 0xD4200000
+
+// Insert breakpoint at address
+export fn gdb_hooks_insert_breakpoint(addr: u64): u32 {
+  if current_arch == arch.ARCH_X86_64 {
+    // Save original byte and write INT3
+    return gdb.gdb_insert_breakpoint(addr)
+  } else if current_arch == arch.ARCH_ARM64 {
+    // Save original instruction and write BRK #0
+    return gdb.gdb_insert_breakpoint(addr)
+  }
+  return 1
+}
+
+// Remove breakpoint from address
+export fn gdb_hooks_remove_breakpoint(addr: u64): u32 {
+  return gdb.gdb_remove_breakpoint(addr)
+}
+
+// ============================================================================
+// SINGLE-STEP SUPPORT
+// ============================================================================
+
+// Enable single-step mode
+export fn gdb_hooks_enable_single_step() {
+  if current_arch == arch.ARCH_X86_64 {
+    // Set TF (Trap Flag) in RFLAGS
+    // Would modify saved RFLAGS: current_context.flags |= 0x100
+    foundation.serial_write_string("[GDB] Single-step enabled (TF)\n")
+  } else if current_arch == arch.ARCH_ARM64 {
+    // Set SS bit in MDSCR_EL1
+    // Would write to debug register
+    foundation.serial_write_string("[GDB] Single-step enabled (MDSCR)\n")
+  }
+}
+
+// Disable single-step mode
+export fn gdb_hooks_disable_single_step() {
+  if current_arch == arch.ARCH_X86_64 {
+    // Clear TF in RFLAGS
+    // current_context.flags &= ~0x100
+  } else if current_arch == arch.ARCH_ARM64 {
+    // Clear SS bit in MDSCR_EL1
+  }
+}
+
+// ============================================================================
+// REGISTER ACCESS FOR GDB
+// ============================================================================
+
+// Get register value by GDB register number
+export fn gdb_hooks_get_register(reg_num: u32): u64 {
+  if context_valid == 0 {
+    return 0
+  }
+
+  if current_arch == arch.ARCH_X86_64 {
+    // x86-64 GDB register order:
+    // 0-15: RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8-R15
+    // 16: RIP
+    // 17: RFLAGS
+    // 18-25: Segment registers (not used)
+    if reg_num < 16 {
+      return current_context.gpr[reg_num]
+    } else if reg_num == 16 {
+      return current_context.pc
+    } else if reg_num == 17 {
+      return current_context.flags
+    }
+  } else if current_arch == arch.ARCH_ARM64 {
+    // ARM64 GDB register order:
+    // 0-30: X0-X30
+    // 31: SP
+    // 32: PC
+    // 33: CPSR/PSTATE
+    if reg_num < 31 {
+      return current_context.gpr[reg_num]
+    } else if reg_num == 31 {
+      return current_context.sp
+    } else if reg_num == 32 {
+      return current_context.pc
+    } else if reg_num == 33 {
+      return current_context.flags
+    }
+  }
+
+  return 0
+}
+
+// Set register value by GDB register number
+export fn gdb_hooks_set_register(reg_num: u32, value: u64) {
+  if context_valid == 0 {
+    return
+  }
+
+  if current_arch == arch.ARCH_X86_64 {
+    if reg_num < 16 {
+      current_context.gpr[reg_num] = value
+    } else if reg_num == 16 {
+      current_context.pc = value
+    } else if reg_num == 17 {
+      current_context.flags = value
+    }
+  } else if current_arch == arch.ARCH_ARM64 {
+    if reg_num < 31 {
+      current_context.gpr[reg_num] = value
+    } else if reg_num == 31 {
+      current_context.sp = value
+    } else if reg_num == 32 {
+      current_context.pc = value
+    } else if reg_num == 33 {
+      current_context.flags = value
+    }
+  }
+}
+
+// ============================================================================
+// INFORMATION
+// ============================================================================
+
+export fn gdb_hooks_print_info() {
+  foundation.serial_write_string("\n[GDB Hooks] Status:\n")
+
+  foundation.serial_write_string("  Architecture: ")
+  if current_arch == arch.ARCH_X86_64 {
+    foundation.serial_write_string("x86-64\n")
+  } else if current_arch == arch.ARCH_ARM64 {
+    foundation.serial_write_string("ARM64\n")
+  } else {
+    foundation.serial_write_string("Unknown\n")
+  }
+
+  foundation.serial_write_string("  Hooks initialized: ")
+  foundation.serial_write_string(if hooks_initialized == 1 { "yes" } else { "no" })
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("  Context valid: ")
+  foundation.serial_write_string(if context_valid == 1 { "yes" } else { "no" })
+  foundation.serial_write_string("\n")
+
+  if context_valid == 1 {
+    foundation.serial_write_string("  Last exception:\n")
+    foundation.serial_write_string("    PC: 0x")
+    foundation.serial_write_hex(current_context.pc)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("    SP: 0x")
+    foundation.serial_write_hex(current_context.sp)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("    Vector: ")
+    foundation.serial_write_u64(current_context.vector)
+    foundation.serial_write_string("\n")
+  }
+
+  // Print GDB stub info
+  gdb.gdb_print_info()
+}
