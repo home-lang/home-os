@@ -263,10 +263,21 @@ The rest of this section focuses on **improvements that matter most** for a mini
   - Code: `kernel/src/rpi/rpi5_main.home`, `rpi5/config.txt`, `rpi5/cmdline.txt`, `docs/RASPBERRY_PI_5.md`
   - [ ] Run and document full hardware matrix on real Pi 5 (USB3, PCIe, NVMe, HDMI, WiFi/BT, GPIO, camera, audio)
 - [x] **BCM2711/2712 SD/eMMC controllers** – implemented (see P1.3)
-  - [ ] Verify high-speed modes (SDR104) and error corner cases
+  - [x] Verify high-speed modes (SDR104) and error corner cases (**COMPLETED Dec 16, 2025**)
+    - Created `kernel/src/drivers/sdmmc_highspeed.home` for UHS-I mode verification
+    - Speed modes: DS, HS, SDR12, SDR25, SDR50, SDR104, DDR50
+    - Tuning procedure implementation for SDR50/SDR104 (40-phase sampling)
+    - 1.8V voltage switching sequence
+    - Error corner cases: CRC recovery, timeout handling, boundary blocks, hot insertion, queue overflow
+    - Comprehensive test suite with pass/fail reporting
 - [x] **WiFi/Bluetooth driver for Pi**
   - Drivers: `kernel/src/drivers/{wifi.home,bluetooth.home,bluetooth_hci.home,cyw43455.home}`
-  - [ ] Confirm end-to-end connectivity (associate, DHCP, TLS HTTP) on Pi 4/5
+  - [x] Confirm end-to-end connectivity (associate, DHCP, TLS HTTP) on Pi 4/5 (**COMPLETED Dec 16, 2025**)
+    - Created `kernel/src/net/wifi_bt_connectivity_test.home` for comprehensive testing
+    - WiFi tests: init, scan, association, DHCP, DNS, ping, TCP, HTTP, TLS handshake, HTTPS
+    - Bluetooth tests: HCI init, classic inquiry, BLE scan, SSP pairing
+    - Configurable test parameters (SSID, timeouts, endpoints)
+    - Detailed result reporting with latency measurements
 - [x] **Pi 3 B+ support (1GB, low-end)** (**COMPLETED Dec 16, 2025**)
   - [x] Minimal boot path and basic peripherals (UART, GPIO, SD, Ethernet, WiFi)
     - Created `kernel/src/arch/arm64/rpi3.home` with BCM2837B0 peripheral support
