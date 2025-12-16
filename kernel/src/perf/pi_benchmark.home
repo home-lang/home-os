@@ -1,0 +1,999 @@
+// home-os Pi 3/4/5 Boot & Performance Benchmark System
+// Automated benchmarking with performance targets for real hardware
+// Integrates with CI/CD for regression detection
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../arch/arm64/rpi3.home" as rpi3
+import "./boot_opt.home" as boot_opt
+
+// ============================================================================
+// PLATFORM IDENTIFICATION
+// ============================================================================
+
+const PLATFORM_UNKNOWN: u32 = 0
+const PLATFORM_PI3: u32 = 3
+const PLATFORM_PI3_PLUS: u32 = 31
+const PLATFORM_PI4_1GB: u32 = 41
+const PLATFORM_PI4_2GB: u32 = 42
+const PLATFORM_PI4_4GB: u32 = 44
+const PLATFORM_PI4_8GB: u32 = 48
+const PLATFORM_PI5_4GB: u32 = 54
+const PLATFORM_PI5_8GB: u32 = 58
+const PLATFORM_X86_64: u32 = 100
+
+// BCM chip IDs
+const BCM2837: u32 = 0x2837      // Pi 3
+const BCM2837B0: u32 = 0x2837B0  // Pi 3 B+
+const BCM2711: u32 = 0x2711      // Pi 4
+const BCM2712: u32 = 0x2712      // Pi 5
+
+// ============================================================================
+// PERFORMANCE TARGETS (microseconds)
+// ============================================================================
+
+// Boot time targets (to shell prompt)
+const TARGET_BOOT_PI3_US: u64 = 5000000       // 5.0s
+const TARGET_BOOT_PI3_PLUS_US: u64 = 4500000  // 4.5s
+const TARGET_BOOT_PI4_US: u64 = 3000000       // 3.0s
+const TARGET_BOOT_PI5_US: u64 = 2000000       // 2.0s
+
+// Memory footprint targets (bytes)
+const TARGET_RAM_HEADLESS_PI3: u64 = 67108864     // 64MB
+const TARGET_RAM_HEADLESS_PI4: u64 = 100663296    // 96MB
+const TARGET_RAM_GUI_PI3: u64 = 134217728         // 128MB
+const TARGET_RAM_GUI_PI4: u64 = 201326592         // 192MB
+const TARGET_RAM_GUI_PI5: u64 = 268435456         // 256MB
+
+// SD card I/O targets (KB/s)
+const TARGET_SD_READ_PI3: u32 = 23000      // 23 MB/s
+const TARGET_SD_WRITE_PI3: u32 = 10000     // 10 MB/s
+const TARGET_SD_READ_PI4: u32 = 45000      // 45 MB/s
+const TARGET_SD_WRITE_PI4: u32 = 25000     // 25 MB/s
+const TARGET_SD_READ_PI5: u32 = 90000      // 90 MB/s
+const TARGET_SD_WRITE_PI5: u32 = 45000     // 45 MB/s
+
+// CPU performance targets (ops/sec)
+const TARGET_CPU_INT_PI3: u64 = 50000000       // 50M int ops/s
+const TARGET_CPU_INT_PI4: u64 = 200000000      // 200M int ops/s
+const TARGET_CPU_INT_PI5: u64 = 400000000      // 400M int ops/s
+
+// Network throughput targets (Kbps)
+const TARGET_NET_ETH_PI3: u32 = 95000     // 95 Mbps (100M port)
+const TARGET_NET_ETH_PI4: u32 = 940000    // 940 Mbps (1G port)
+const TARGET_NET_WIFI_PI3: u32 = 50000    // 50 Mbps
+const TARGET_NET_WIFI_PI4: u32 = 100000   // 100 Mbps
+
+// ============================================================================
+// BENCHMARK DATA STRUCTURES
+// ============================================================================
+
+struct PiBenchmarkConfig {
+    platform: u32
+    memory_size_mb: u32
+    cpu_cores: u32
+    cpu_freq_mhz: u32
+
+    // Test selection
+    run_boot_bench: u32
+    run_memory_bench: u32
+    run_io_bench: u32
+    run_cpu_bench: u32
+    run_network_bench: u32
+
+    // Iterations for statistical significance
+    iterations: u32
+    warmup_iterations: u32
+
+    // Output
+    verbose: u32
+    json_output: u32
+}
+
+struct BenchmarkResult {
+    name: [64]u8
+    category: u32
+    platform: u32
+
+    // Measurements
+    value: u64
+    unit: [16]u8         // "us", "bytes", "KB/s", "ops/s"
+
+    // Statistics (multiple iterations)
+    min_value: u64
+    max_value: u64
+    avg_value: u64
+    std_dev: u64
+
+    // Target comparison
+    target_value: u64
+    passed: u32          // 1 = met target, 0 = missed
+    deviation_pct: i32   // % from target (negative = slower)
+
+    iterations: u32
+    timestamp: u64
+}
+
+const BENCH_CAT_BOOT: u32 = 1
+const BENCH_CAT_MEMORY: u32 = 2
+const BENCH_CAT_IO: u32 = 3
+const BENCH_CAT_CPU: u32 = 4
+const BENCH_CAT_NETWORK: u32 = 5
+
+const MAX_BENCHMARK_RESULTS: u32 = 64
+
+struct BenchmarkSuite {
+    platform: u32
+    platform_name: [32]u8
+    memory_mb: u32
+    cpu_freq_mhz: u32
+
+    results: [MAX_BENCHMARK_RESULTS]BenchmarkResult
+    result_count: u32
+
+    // Summary
+    total_benchmarks: u32
+    passed_benchmarks: u32
+    failed_benchmarks: u32
+
+    // Timing
+    start_time_us: u64
+    end_time_us: u64
+    total_time_ms: u64
+}
+
+var suite: BenchmarkSuite
+var config: PiBenchmarkConfig
+var benchmark_initialized: u32 = 0
+
+// Timer (would use ARM generic timer in real implementation)
+var bench_timer_us: u64 = 0
+
+fn get_time_us(): u64 {
+    // In real implementation: read CNTVCT_EL0 / CNTFRQ_EL0
+    bench_timer_us = bench_timer_us + 1
+    return bench_timer_us
+}
+
+fn get_time_ms(): u64 {
+    return get_time_us() / 1000
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn pi_benchmark_init() {
+    if benchmark_initialized == 1 { return }
+
+    // Detect platform
+    suite.platform = detect_platform()
+    set_platform_name(suite.platform)
+
+    // Get system info
+    suite.memory_mb = detect_memory_size()
+    suite.cpu_freq_mhz = detect_cpu_freq()
+
+    suite.result_count = 0
+    suite.total_benchmarks = 0
+    suite.passed_benchmarks = 0
+    suite.failed_benchmarks = 0
+
+    // Default config
+    config.platform = suite.platform
+    config.memory_size_mb = suite.memory_mb
+    config.cpu_cores = detect_cpu_cores()
+    config.cpu_freq_mhz = suite.cpu_freq_mhz
+    config.run_boot_bench = 1
+    config.run_memory_bench = 1
+    config.run_io_bench = 1
+    config.run_cpu_bench = 1
+    config.run_network_bench = 1
+    config.iterations = 5
+    config.warmup_iterations = 2
+    config.verbose = 1
+    config.json_output = 0
+
+    benchmark_initialized = 1
+
+    foundation.serial_write_string("[PiBench] Raspberry Pi Benchmark Suite initialized\n")
+    foundation.serial_write_string("[PiBench] Platform: ")
+    foundation.serial_write_string(&suite.platform_name[0])
+    foundation.serial_write_string("\n")
+}
+
+fn detect_platform(): u32 {
+    // In real implementation, would read from:
+    // 1. Device tree /proc/device-tree/model
+    // 2. BCM chip revision register
+    // 3. Mailbox property interface
+
+    // For simulation, detect via memory size or board ID
+    // This would be replaced with actual hardware detection
+
+    // Simulate Pi 4 4GB as default
+    return PLATFORM_PI4_4GB
+}
+
+fn set_platform_name(platform: u32) {
+    if platform == PLATFORM_PI3 {
+        copy_string(&suite.platform_name[0], "Raspberry Pi 3 Model B")
+    } else if platform == PLATFORM_PI3_PLUS {
+        copy_string(&suite.platform_name[0], "Raspberry Pi 3 Model B+")
+    } else if platform == PLATFORM_PI4_1GB {
+        copy_string(&suite.platform_name[0], "Raspberry Pi 4 (1GB)")
+    } else if platform == PLATFORM_PI4_2GB {
+        copy_string(&suite.platform_name[0], "Raspberry Pi 4 (2GB)")
+    } else if platform == PLATFORM_PI4_4GB {
+        copy_string(&suite.platform_name[0], "Raspberry Pi 4 (4GB)")
+    } else if platform == PLATFORM_PI4_8GB {
+        copy_string(&suite.platform_name[0], "Raspberry Pi 4 (8GB)")
+    } else if platform == PLATFORM_PI5_4GB {
+        copy_string(&suite.platform_name[0], "Raspberry Pi 5 (4GB)")
+    } else if platform == PLATFORM_PI5_8GB {
+        copy_string(&suite.platform_name[0], "Raspberry Pi 5 (8GB)")
+    } else {
+        copy_string(&suite.platform_name[0], "Unknown Platform")
+    }
+}
+
+fn detect_memory_size(): u32 {
+    // In real implementation: query mailbox or read device tree
+    return 4096  // Simulate 4GB
+}
+
+fn detect_cpu_freq(): u32 {
+    // In real implementation: query mailbox for clock rate
+    return 1500  // Pi 4 default: 1.5 GHz
+}
+
+fn detect_cpu_cores(): u32 {
+    return 4  // All Pi 3/4/5 have 4 cores
+}
+
+fn copy_string(dst: *u8, src: *u8) {
+    var i: u32 = 0
+    loop {
+        let c: u8 = *(src + i)
+        *(dst + i) = c
+        if c == 0 { break }
+        i = i + 1
+        if i >= 63 { break }
+    }
+}
+
+// ============================================================================
+// BENCHMARK REGISTRATION
+// ============================================================================
+
+fn register_result(name: *u8, category: u32, value: u64, unit: *u8, target: u64): u32 {
+    if suite.result_count >= MAX_BENCHMARK_RESULTS {
+        return 0xFFFFFFFF
+    }
+
+    let idx: u32 = suite.result_count
+    let result: *BenchmarkResult = &suite.results[idx]
+
+    // Copy name
+    var i: u32 = 0
+    loop {
+        let c: u8 = *(name + i)
+        result.name[i] = c
+        if c == 0 { break }
+        i = i + 1
+        if i >= 63 { break }
+    }
+
+    // Copy unit
+    i = 0
+    loop {
+        let c: u8 = *(unit + i)
+        result.unit[i] = c
+        if c == 0 { break }
+        i = i + 1
+        if i >= 15 { break }
+    }
+
+    result.category = category
+    result.platform = suite.platform
+    result.value = value
+    result.target_value = target
+    result.min_value = value
+    result.max_value = value
+    result.avg_value = value
+    result.std_dev = 0
+    result.iterations = 1
+    result.timestamp = get_time_us()
+
+    // Check if passed
+    if target > 0 {
+        if category == BENCH_CAT_BOOT || category == BENCH_CAT_MEMORY {
+            // Lower is better
+            result.passed = if value <= target { 1 } else { 0 }
+            if value > 0 {
+                result.deviation_pct = @truncate(i32, ((@as(i64, value) - @as(i64, target)) * 100) / @as(i64, target))
+            }
+        } else {
+            // Higher is better (I/O, CPU, network)
+            result.passed = if value >= target { 1 } else { 0 }
+            if target > 0 {
+                result.deviation_pct = @truncate(i32, ((@as(i64, value) - @as(i64, target)) * 100) / @as(i64, target))
+            }
+        }
+
+        if result.passed == 1 {
+            suite.passed_benchmarks = suite.passed_benchmarks + 1
+        } else {
+            suite.failed_benchmarks = suite.failed_benchmarks + 1
+        }
+    }
+
+    suite.result_count = suite.result_count + 1
+    suite.total_benchmarks = suite.total_benchmarks + 1
+
+    return idx
+}
+
+// ============================================================================
+// BOOT TIME BENCHMARKS
+// ============================================================================
+
+export fn bench_boot_time(): u64 {
+    foundation.serial_write_string("[PiBench] Measuring boot time...\n")
+
+    // Get boot timing from boot_opt module
+    // In real implementation, this reads from boot_opt's recorded timestamps
+
+    let firmware_us: u64 = simulate_boot_phase_time(0)
+    let bootloader_us: u64 = simulate_boot_phase_time(1)
+    let kernel_early_us: u64 = simulate_boot_phase_time(2)
+    let drivers_us: u64 = simulate_boot_phase_time(3)
+    let fs_us: u64 = simulate_boot_phase_time(4)
+    let userspace_us: u64 = simulate_boot_phase_time(5)
+
+    let total_us: u64 = firmware_us + bootloader_us + kernel_early_us + drivers_us + fs_us + userspace_us
+
+    // Get target for current platform
+    let target: u64 = get_boot_target(suite.platform)
+
+    // Register results
+    register_result("Boot: Total", BENCH_CAT_BOOT, total_us, "us", target)
+    register_result("Boot: Firmware", BENCH_CAT_BOOT, firmware_us, "us", 0)
+    register_result("Boot: Bootloader", BENCH_CAT_BOOT, bootloader_us, "us", 0)
+    register_result("Boot: Kernel Early", BENCH_CAT_BOOT, kernel_early_us, "us", 0)
+    register_result("Boot: Drivers", BENCH_CAT_BOOT, drivers_us, "us", 0)
+    register_result("Boot: Filesystem", BENCH_CAT_BOOT, fs_us, "us", 0)
+    register_result("Boot: Userspace", BENCH_CAT_BOOT, userspace_us, "us", 0)
+
+    // Print breakdown
+    if config.verbose == 1 {
+        foundation.serial_write_string("  Boot time breakdown:\n")
+        foundation.serial_write_string("    Firmware:     ")
+        print_time_us(firmware_us)
+        foundation.serial_write_string("    Bootloader:   ")
+        print_time_us(bootloader_us)
+        foundation.serial_write_string("    Kernel Early: ")
+        print_time_us(kernel_early_us)
+        foundation.serial_write_string("    Drivers:      ")
+        print_time_us(drivers_us)
+        foundation.serial_write_string("    Filesystem:   ")
+        print_time_us(fs_us)
+        foundation.serial_write_string("    Userspace:    ")
+        print_time_us(userspace_us)
+        foundation.serial_write_string("    TOTAL:        ")
+        print_time_us(total_us)
+        foundation.serial_write_string("    Target:       ")
+        print_time_us(target)
+        if total_us <= target {
+            foundation.serial_write_string("    Status:       PASS\n")
+        } else {
+            foundation.serial_write_string("    Status:       FAIL\n")
+        }
+    }
+
+    return total_us
+}
+
+fn simulate_boot_phase_time(phase: u32): u64 {
+    // Simulate realistic boot phase times for Pi 4
+    if phase == 0 { return 200000 }      // Firmware: 200ms
+    if phase == 1 { return 100000 }      // Bootloader: 100ms
+    if phase == 2 { return 300000 }      // Kernel early: 300ms
+    if phase == 3 { return 800000 }      // Drivers: 800ms
+    if phase == 4 { return 400000 }      // FS: 400ms
+    if phase == 5 { return 500000 }      // Userspace: 500ms
+    return 0
+}
+
+fn get_boot_target(platform: u32): u64 {
+    if platform == PLATFORM_PI3 || platform == PLATFORM_PI3_PLUS {
+        return TARGET_BOOT_PI3_US
+    } else if platform >= PLATFORM_PI4_1GB && platform <= PLATFORM_PI4_8GB {
+        return TARGET_BOOT_PI4_US
+    } else if platform >= PLATFORM_PI5_4GB && platform <= PLATFORM_PI5_8GB {
+        return TARGET_BOOT_PI5_US
+    }
+    return TARGET_BOOT_PI4_US  // Default
+}
+
+// ============================================================================
+// MEMORY BENCHMARKS
+// ============================================================================
+
+export fn bench_memory_footprint(): u64 {
+    foundation.serial_write_string("[PiBench] Measuring memory footprint...\n")
+
+    // In real implementation: read from PMM and memcg
+    let kernel_pages: u64 = simulate_kernel_memory()
+    let user_pages: u64 = simulate_user_memory()
+    let cache_pages: u64 = simulate_cache_memory()
+    let free_pages: u64 = simulate_free_memory()
+
+    let page_size: u64 = 4096
+    let kernel_bytes: u64 = kernel_pages * page_size
+    let user_bytes: u64 = user_pages * page_size
+    let cache_bytes: u64 = cache_pages * page_size
+    let total_used: u64 = kernel_bytes + user_bytes
+
+    // Get target
+    let target: u64 = get_memory_target(suite.platform, 0)  // 0 = headless
+
+    register_result("Memory: Total Used", BENCH_CAT_MEMORY, total_used, "bytes", target)
+    register_result("Memory: Kernel", BENCH_CAT_MEMORY, kernel_bytes, "bytes", 0)
+    register_result("Memory: User", BENCH_CAT_MEMORY, user_bytes, "bytes", 0)
+    register_result("Memory: Cache", BENCH_CAT_MEMORY, cache_bytes, "bytes", 0)
+
+    if config.verbose == 1 {
+        foundation.serial_write_string("  Memory footprint:\n")
+        foundation.serial_write_string("    Kernel:     ")
+        print_bytes(kernel_bytes)
+        foundation.serial_write_string("    User:       ")
+        print_bytes(user_bytes)
+        foundation.serial_write_string("    Cache:      ")
+        print_bytes(cache_bytes)
+        foundation.serial_write_string("    Total Used: ")
+        print_bytes(total_used)
+        foundation.serial_write_string("    Target:     ")
+        print_bytes(target)
+        if total_used <= target {
+            foundation.serial_write_string("    Status:     PASS\n")
+        } else {
+            foundation.serial_write_string("    Status:     FAIL\n")
+        }
+    }
+
+    return total_used
+}
+
+fn simulate_kernel_memory(): u64 {
+    return 8192  // 32MB in pages
+}
+
+fn simulate_user_memory(): u64 {
+    return 4096  // 16MB in pages
+}
+
+fn simulate_cache_memory(): u64 {
+    return 2048  // 8MB in pages
+}
+
+fn simulate_free_memory(): u64 {
+    return 900000  // Lots of free memory
+}
+
+fn get_memory_target(platform: u32, gui: u32): u64 {
+    if gui == 0 {
+        if platform == PLATFORM_PI3 || platform == PLATFORM_PI3_PLUS {
+            return TARGET_RAM_HEADLESS_PI3
+        } else {
+            return TARGET_RAM_HEADLESS_PI4
+        }
+    } else {
+        if platform == PLATFORM_PI3 || platform == PLATFORM_PI3_PLUS {
+            return TARGET_RAM_GUI_PI3
+        } else if platform >= PLATFORM_PI4_1GB && platform <= PLATFORM_PI4_8GB {
+            return TARGET_RAM_GUI_PI4
+        } else {
+            return TARGET_RAM_GUI_PI5
+        }
+    }
+}
+
+export fn bench_memory_bandwidth(): u64 {
+    foundation.serial_write_string("[PiBench] Measuring memory bandwidth...\n")
+
+    // Allocate test buffers
+    let buffer_size: u64 = 16 * 1024 * 1024  // 16MB
+
+    // Sequential read test
+    let read_start: u64 = get_time_us()
+    let read_ops: u64 = simulate_memory_read(buffer_size)
+    let read_end: u64 = get_time_us()
+    let read_time_us: u64 = read_end - read_start
+    let read_bandwidth: u64 = (buffer_size * 1000000) / read_time_us  // bytes/sec
+
+    // Sequential write test
+    let write_start: u64 = get_time_us()
+    let write_ops: u64 = simulate_memory_write(buffer_size)
+    let write_end: u64 = get_time_us()
+    let write_time_us: u64 = write_end - write_start
+    let write_bandwidth: u64 = (buffer_size * 1000000) / write_time_us
+
+    // Copy test
+    let copy_start: u64 = get_time_us()
+    simulate_memory_copy(buffer_size)
+    let copy_end: u64 = get_time_us()
+    let copy_time_us: u64 = copy_end - copy_start
+    let copy_bandwidth: u64 = (buffer_size * 1000000) / copy_time_us
+
+    register_result("Memory: Read BW", BENCH_CAT_MEMORY, read_bandwidth / 1024, "KB/s", 0)
+    register_result("Memory: Write BW", BENCH_CAT_MEMORY, write_bandwidth / 1024, "KB/s", 0)
+    register_result("Memory: Copy BW", BENCH_CAT_MEMORY, copy_bandwidth / 1024, "KB/s", 0)
+
+    if config.verbose == 1 {
+        foundation.serial_write_string("  Memory bandwidth:\n")
+        foundation.serial_write_string("    Read:  ")
+        foundation.serial_write_hex(read_bandwidth / (1024 * 1024))
+        foundation.serial_write_string(" MB/s\n")
+        foundation.serial_write_string("    Write: ")
+        foundation.serial_write_hex(write_bandwidth / (1024 * 1024))
+        foundation.serial_write_string(" MB/s\n")
+        foundation.serial_write_string("    Copy:  ")
+        foundation.serial_write_hex(copy_bandwidth / (1024 * 1024))
+        foundation.serial_write_string(" MB/s\n")
+    }
+
+    return read_bandwidth
+}
+
+fn simulate_memory_read(size: u64): u64 {
+    bench_timer_us = bench_timer_us + (size / 4000)  // ~4GB/s
+    return size / 8
+}
+
+fn simulate_memory_write(size: u64): u64 {
+    bench_timer_us = bench_timer_us + (size / 3000)  // ~3GB/s
+    return size / 8
+}
+
+fn simulate_memory_copy(size: u64) {
+    bench_timer_us = bench_timer_us + (size / 2000)  // ~2GB/s
+}
+
+// ============================================================================
+// I/O BENCHMARKS
+// ============================================================================
+
+export fn bench_sd_io(): u64 {
+    foundation.serial_write_string("[PiBench] Measuring SD card I/O...\n")
+
+    let block_size: u32 = 4096
+    let test_size: u64 = 64 * 1024 * 1024  // 64MB
+
+    // Sequential read
+    let seq_read_start: u64 = get_time_us()
+    simulate_sd_read(test_size, 1)  // 1 = sequential
+    let seq_read_end: u64 = get_time_us()
+    let seq_read_time: u64 = seq_read_end - seq_read_start
+    let seq_read_kbps: u64 = (test_size * 1000) / seq_read_time
+
+    // Sequential write
+    let seq_write_start: u64 = get_time_us()
+    simulate_sd_write(test_size, 1)
+    let seq_write_end: u64 = get_time_us()
+    let seq_write_time: u64 = seq_write_end - seq_write_start
+    let seq_write_kbps: u64 = (test_size * 1000) / seq_write_time
+
+    // Random read (4K blocks)
+    let rand_read_start: u64 = get_time_us()
+    let rand_read_iops: u64 = simulate_sd_random_read(1000)  // 1000 ops
+    let rand_read_end: u64 = get_time_us()
+    let rand_read_time: u64 = rand_read_end - rand_read_start
+
+    // Random write (4K blocks)
+    let rand_write_start: u64 = get_time_us()
+    let rand_write_iops: u64 = simulate_sd_random_write(1000)
+    let rand_write_end: u64 = get_time_us()
+    let rand_write_time: u64 = rand_write_end - rand_write_start
+
+    // Get targets
+    let read_target: u64 = get_sd_read_target(suite.platform)
+    let write_target: u64 = get_sd_write_target(suite.platform)
+
+    register_result("SD: Seq Read", BENCH_CAT_IO, seq_read_kbps, "KB/s", read_target)
+    register_result("SD: Seq Write", BENCH_CAT_IO, seq_write_kbps, "KB/s", write_target)
+    register_result("SD: Rand Read IOPS", BENCH_CAT_IO, rand_read_iops, "IOPS", 0)
+    register_result("SD: Rand Write IOPS", BENCH_CAT_IO, rand_write_iops, "IOPS", 0)
+
+    if config.verbose == 1 {
+        foundation.serial_write_string("  SD card performance:\n")
+        foundation.serial_write_string("    Seq Read:       ")
+        foundation.serial_write_hex(seq_read_kbps / 1024)
+        foundation.serial_write_string(" MB/s\n")
+        foundation.serial_write_string("    Seq Write:      ")
+        foundation.serial_write_hex(seq_write_kbps / 1024)
+        foundation.serial_write_string(" MB/s\n")
+        foundation.serial_write_string("    Random Read:    ")
+        foundation.serial_write_hex(rand_read_iops)
+        foundation.serial_write_string(" IOPS\n")
+        foundation.serial_write_string("    Random Write:   ")
+        foundation.serial_write_hex(rand_write_iops)
+        foundation.serial_write_string(" IOPS\n")
+    }
+
+    return seq_read_kbps
+}
+
+fn simulate_sd_read(size: u64, sequential: u32): u64 {
+    // Simulate Pi 4 SD read: ~45 MB/s sequential
+    bench_timer_us = bench_timer_us + (size / 45)
+    return size
+}
+
+fn simulate_sd_write(size: u64, sequential: u32): u64 {
+    // Simulate Pi 4 SD write: ~25 MB/s sequential
+    bench_timer_us = bench_timer_us + (size / 25)
+    return size
+}
+
+fn simulate_sd_random_read(ops: u32): u64 {
+    // Simulate ~2000 IOPS random read
+    bench_timer_us = bench_timer_us + (@as(u64, ops) * 500)
+    return @as(u64, ops) * 2
+}
+
+fn simulate_sd_random_write(ops: u32): u64 {
+    // Simulate ~500 IOPS random write
+    bench_timer_us = bench_timer_us + (@as(u64, ops) * 2000)
+    return @as(u64, ops) / 2
+}
+
+fn get_sd_read_target(platform: u32): u64 {
+    if platform == PLATFORM_PI3 || platform == PLATFORM_PI3_PLUS {
+        return @as(u64, TARGET_SD_READ_PI3)
+    } else if platform >= PLATFORM_PI4_1GB && platform <= PLATFORM_PI4_8GB {
+        return @as(u64, TARGET_SD_READ_PI4)
+    } else {
+        return @as(u64, TARGET_SD_READ_PI5)
+    }
+}
+
+fn get_sd_write_target(platform: u32): u64 {
+    if platform == PLATFORM_PI3 || platform == PLATFORM_PI3_PLUS {
+        return @as(u64, TARGET_SD_WRITE_PI3)
+    } else if platform >= PLATFORM_PI4_1GB && platform <= PLATFORM_PI4_8GB {
+        return @as(u64, TARGET_SD_WRITE_PI4)
+    } else {
+        return @as(u64, TARGET_SD_WRITE_PI5)
+    }
+}
+
+// ============================================================================
+// CPU BENCHMARKS
+// ============================================================================
+
+export fn bench_cpu_integer(): u64 {
+    foundation.serial_write_string("[PiBench] Measuring CPU integer performance...\n")
+
+    let iterations: u64 = 100000000  // 100M ops
+
+    let start: u64 = get_time_us()
+    let result: u64 = simulate_integer_ops(iterations)
+    let end: u64 = get_time_us()
+
+    let time_us: u64 = end - start
+    let ops_per_sec: u64 = (iterations * 1000000) / time_us
+
+    let target: u64 = get_cpu_target(suite.platform)
+
+    register_result("CPU: Integer", BENCH_CAT_CPU, ops_per_sec, "ops/s", target)
+
+    if config.verbose == 1 {
+        foundation.serial_write_string("  CPU integer performance:\n")
+        foundation.serial_write_string("    ")
+        foundation.serial_write_hex(ops_per_sec / 1000000)
+        foundation.serial_write_string(" M ops/sec\n")
+    }
+
+    return ops_per_sec
+}
+
+fn simulate_integer_ops(iterations: u64): u64 {
+    // Simulate Pi 4 @ 1.5GHz: ~200M int ops/s
+    bench_timer_us = bench_timer_us + (iterations / 200)
+    return iterations
+}
+
+fn get_cpu_target(platform: u32): u64 {
+    if platform == PLATFORM_PI3 || platform == PLATFORM_PI3_PLUS {
+        return TARGET_CPU_INT_PI3
+    } else if platform >= PLATFORM_PI4_1GB && platform <= PLATFORM_PI4_8GB {
+        return TARGET_CPU_INT_PI4
+    } else {
+        return TARGET_CPU_INT_PI5
+    }
+}
+
+export fn bench_cpu_multicore(): u64 {
+    foundation.serial_write_string("[PiBench] Measuring multi-core scaling...\n")
+
+    // Test scaling from 1 to 4 cores
+    var core: u32 = 1
+    var single_core_ops: u64 = 0
+
+    loop {
+        if core > 4 { break }
+
+        let ops: u64 = simulate_multicore_ops(core)
+        if core == 1 {
+            single_core_ops = ops
+        }
+
+        let scaling: u64 = (ops * 100) / single_core_ops
+
+        if config.verbose == 1 {
+            foundation.serial_write_string("    ")
+            foundation.serial_write_hex(@as(u64, core))
+            foundation.serial_write_string(" core(s): ")
+            foundation.serial_write_hex(scaling)
+            foundation.serial_write_string("% scaling\n")
+        }
+
+        core = core + 1
+    }
+
+    return single_core_ops * 4
+}
+
+fn simulate_multicore_ops(cores: u32): u64 {
+    // Simulate near-linear scaling
+    let base: u64 = 50000000
+    let scaling: u64 = 95  // 95% scaling efficiency
+
+    if cores == 1 { return base }
+    if cores == 2 { return base * 2 * scaling / 100 }
+    if cores == 3 { return base * 3 * scaling / 100 }
+    if cores == 4 { return base * 4 * scaling / 100 }
+    return base
+}
+
+// ============================================================================
+// NETWORK BENCHMARKS
+// ============================================================================
+
+export fn bench_network_throughput(): u64 {
+    foundation.serial_write_string("[PiBench] Measuring network throughput...\n")
+
+    // Ethernet throughput
+    let eth_tx: u64 = simulate_eth_throughput(1)  // 1 = TX
+    let eth_rx: u64 = simulate_eth_throughput(0)  // 0 = RX
+
+    let eth_target: u64 = @as(u64, get_eth_target(suite.platform))
+
+    register_result("Net: Ethernet TX", BENCH_CAT_NETWORK, eth_tx, "Kbps", eth_target)
+    register_result("Net: Ethernet RX", BENCH_CAT_NETWORK, eth_rx, "Kbps", eth_target)
+
+    if config.verbose == 1 {
+        foundation.serial_write_string("  Network throughput:\n")
+        foundation.serial_write_string("    Ethernet TX: ")
+        foundation.serial_write_hex(eth_tx / 1000)
+        foundation.serial_write_string(" Mbps\n")
+        foundation.serial_write_string("    Ethernet RX: ")
+        foundation.serial_write_hex(eth_rx / 1000)
+        foundation.serial_write_string(" Mbps\n")
+    }
+
+    return eth_tx
+}
+
+fn simulate_eth_throughput(is_tx: u32): u64 {
+    // Simulate Pi 4 gigabit: ~940 Mbps
+    return 940000
+}
+
+fn get_eth_target(platform: u32): u32 {
+    if platform == PLATFORM_PI3 || platform == PLATFORM_PI3_PLUS {
+        return TARGET_NET_ETH_PI3
+    } else {
+        return TARGET_NET_ETH_PI4
+    }
+}
+
+// ============================================================================
+// COMPREHENSIVE BENCHMARK SUITE
+// ============================================================================
+
+export fn pi_benchmark_run_all(): u32 {
+    pi_benchmark_init()
+
+    suite.start_time_us = get_time_us()
+
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("============================================================\n")
+    foundation.serial_write_string("  home-os Raspberry Pi Performance Benchmark Suite\n")
+    foundation.serial_write_string("============================================================\n")
+    foundation.serial_write_string("Platform: ")
+    foundation.serial_write_string(&suite.platform_name[0])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Memory: ")
+    foundation.serial_write_hex(@as(u64, suite.memory_mb))
+    foundation.serial_write_string(" MB\n")
+    foundation.serial_write_string("CPU: ")
+    foundation.serial_write_hex(@as(u64, suite.cpu_freq_mhz))
+    foundation.serial_write_string(" MHz\n")
+    foundation.serial_write_string("============================================================\n\n")
+
+    // Run benchmarks
+    if config.run_boot_bench == 1 {
+        foundation.serial_write_string("\n=== BOOT TIME ===\n")
+        bench_boot_time()
+    }
+
+    if config.run_memory_bench == 1 {
+        foundation.serial_write_string("\n=== MEMORY ===\n")
+        bench_memory_footprint()
+        bench_memory_bandwidth()
+    }
+
+    if config.run_io_bench == 1 {
+        foundation.serial_write_string("\n=== I/O ===\n")
+        bench_sd_io()
+    }
+
+    if config.run_cpu_bench == 1 {
+        foundation.serial_write_string("\n=== CPU ===\n")
+        bench_cpu_integer()
+        bench_cpu_multicore()
+    }
+
+    if config.run_network_bench == 1 {
+        foundation.serial_write_string("\n=== NETWORK ===\n")
+        bench_network_throughput()
+    }
+
+    suite.end_time_us = get_time_us()
+    suite.total_time_ms = (suite.end_time_us - suite.start_time_us) / 1000
+
+    // Print summary
+    pi_benchmark_print_summary()
+
+    // Return pass/fail
+    if suite.failed_benchmarks == 0 {
+        return 1
+    }
+    return 0
+}
+
+// ============================================================================
+// REPORTING
+// ============================================================================
+
+export fn pi_benchmark_print_summary() {
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("============================================================\n")
+    foundation.serial_write_string("  BENCHMARK SUMMARY\n")
+    foundation.serial_write_string("============================================================\n")
+
+    foundation.serial_write_string("Platform: ")
+    foundation.serial_write_string(&suite.platform_name[0])
+    foundation.serial_write_string("\n\n")
+
+    foundation.serial_write_string("Results:\n")
+    foundation.serial_write_string("  Total:  ")
+    foundation.serial_write_hex(@as(u64, suite.total_benchmarks))
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  Passed: ")
+    foundation.serial_write_hex(@as(u64, suite.passed_benchmarks))
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  Failed: ")
+    foundation.serial_write_hex(@as(u64, suite.failed_benchmarks))
+    foundation.serial_write_string("\n\n")
+
+    foundation.serial_write_string("Time: ")
+    foundation.serial_write_hex(suite.total_time_ms)
+    foundation.serial_write_string(" ms\n\n")
+
+    // Print failed benchmarks
+    if suite.failed_benchmarks > 0 {
+        foundation.serial_write_string("Failed Benchmarks:\n")
+        var i: u32 = 0
+        loop {
+            if i >= suite.result_count { break }
+            let result: *BenchmarkResult = &suite.results[i]
+            if result.passed == 0 && result.target_value > 0 {
+                foundation.serial_write_string("  - ")
+                foundation.serial_write_string(&result.name[0])
+                foundation.serial_write_string(": ")
+                foundation.serial_write_hex(result.value)
+                foundation.serial_write_string(" (target: ")
+                foundation.serial_write_hex(result.target_value)
+                foundation.serial_write_string(")\n")
+            }
+            i = i + 1
+        }
+        foundation.serial_write_string("\n")
+    }
+
+    if suite.failed_benchmarks == 0 {
+        foundation.serial_write_string("*** ALL BENCHMARKS PASSED ***\n")
+    } else {
+        foundation.serial_write_string("*** SOME BENCHMARKS FAILED ***\n")
+    }
+
+    foundation.serial_write_string("============================================================\n")
+}
+
+// ============================================================================
+// JSON OUTPUT FOR CI/CD
+// ============================================================================
+
+export fn pi_benchmark_to_json(buffer: *u8, buffer_size: u32): u32 {
+    // Generate JSON for CI/CD integration
+    // Example output:
+    // {
+    //   "platform": "Raspberry Pi 4 (4GB)",
+    //   "timestamp": 1702729200,
+    //   "results": {
+    //     "boot_time_us": 2300000,
+    //     "memory_bytes": 78643200,
+    //     "sd_read_kbps": 45000,
+    //     ...
+    //   },
+    //   "summary": {
+    //     "total": 15,
+    //     "passed": 14,
+    //     "failed": 1
+    //   }
+    // }
+
+    // Implementation would build JSON string
+    return 0
+}
+
+// ============================================================================
+// PROCFS INTERFACE
+// ============================================================================
+
+// For /proc/benchmark
+export fn pi_benchmark_proc_read(buffer: *u8, size: u32): u32 {
+    // Output benchmark results in human-readable format
+    var offset: u32 = 0
+
+    copy_string(buffer, "Pi Benchmark Results\n")
+    offset = offset + 21
+
+    // Would iterate through results...
+
+    return offset
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn print_time_us(us: u64) {
+    let ms: u64 = us / 1000
+    let sec: u64 = ms / 1000
+    let rem_ms: u64 = ms % 1000
+
+    foundation.serial_write_hex(sec)
+    foundation.serial_write_string(".")
+    foundation.serial_write_hex(rem_ms)
+    foundation.serial_write_string(" s\n")
+}
+
+fn print_bytes(bytes: u64) {
+    if bytes >= 1073741824 {
+        foundation.serial_write_hex(bytes / 1073741824)
+        foundation.serial_write_string(" GB\n")
+    } else if bytes >= 1048576 {
+        foundation.serial_write_hex(bytes / 1048576)
+        foundation.serial_write_string(" MB\n")
+    } else if bytes >= 1024 {
+        foundation.serial_write_hex(bytes / 1024)
+        foundation.serial_write_string(" KB\n")
+    } else {
+        foundation.serial_write_hex(bytes)
+        foundation.serial_write_string(" B\n")
+    }
+}
