@@ -1,0 +1,885 @@
+// home-os ZRAM Tuning & Stress Testing
+// Platform-specific ZRAM tuning for Pi 3/4/5 with stress test support
+// Validates compression, page-in latency, and power efficiency
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "./zram.home" as zram
+import "./swap.home" as swap
+import "../power/cpufreq.home" as cpufreq
+import "../power/thermal.home" as thermal
+
+// ============================================================================
+// PLATFORM-SPECIFIC TUNING PROFILES
+// ============================================================================
+
+// Platform IDs
+const PLATFORM_PI3: u32 = 3
+const PLATFORM_PI4: u32 = 4
+const PLATFORM_PI5: u32 = 5
+const PLATFORM_X86: u32 = 0
+
+// ZRAM tuning profile
+struct ZramTuningProfile {
+    platform: u32
+    zram_size_mb: u32           // ZRAM device size in MB
+    compression_algo: u8        // Compression algorithm
+    swap_priority: i32          // Swap priority (higher = preferred)
+    page_cluster: u32           // Pages to read/write at once
+    swappiness: u32             // Kernel swappiness (0-100)
+    writeback_threshold_pct: u32 // Writeback threshold percentage
+    max_pool_pct: u32           // Max ZRAM pool as % of RAM
+}
+
+// Pre-defined tuning profiles
+const PROFILE_PI3: ZramTuningProfile = ZramTuningProfile {
+    platform: PLATFORM_PI3,
+    zram_size_mb: 256,          // 256MB ZRAM for 1GB device
+    compression_algo: 1,        // LZ4 (fast, low CPU)
+    swap_priority: 100,         // Highest priority
+    page_cluster: 3,            // 8 pages (2^3)
+    swappiness: 60,             // Moderate swappiness
+    writeback_threshold_pct: 75,
+    max_pool_pct: 25            // Max 25% of RAM
+}
+
+const PROFILE_PI4: ZramTuningProfile = ZramTuningProfile {
+    platform: PLATFORM_PI4,
+    zram_size_mb: 512,          // 512MB ZRAM for 2-8GB device
+    compression_algo: 1,        // LZ4
+    swap_priority: 100,
+    page_cluster: 3,
+    swappiness: 50,             // Slightly lower - more RAM available
+    writeback_threshold_pct: 80,
+    max_pool_pct: 25
+}
+
+const PROFILE_PI5: ZramTuningProfile = ZramTuningProfile {
+    platform: PLATFORM_PI5,
+    zram_size_mb: 1024,         // 1GB ZRAM for 4-8GB device
+    compression_algo: 2,        // ZSTD (better ratio, CPU can handle it)
+    swap_priority: 100,
+    page_cluster: 4,            // 16 pages (faster CPU)
+    swappiness: 40,             // Lower - plenty of RAM
+    writeback_threshold_pct: 85,
+    max_pool_pct: 25
+}
+
+const PROFILE_X86: ZramTuningProfile = ZramTuningProfile {
+    platform: PLATFORM_X86,
+    zram_size_mb: 2048,         // 2GB ZRAM
+    compression_algo: 2,        // ZSTD
+    swap_priority: 100,
+    page_cluster: 4,
+    swappiness: 30,
+    writeback_threshold_pct: 90,
+    max_pool_pct: 25
+}
+
+// Current active profile
+var active_profile: ZramTuningProfile
+var profile_initialized: u32 = 0
+
+// ============================================================================
+// STRESS TEST CONFIGURATION
+// ============================================================================
+
+// Stress test types
+const STRESS_SWAP_THRASH: u32 = 1       // Heavy swap in/out
+const STRESS_RANDOM_ACCESS: u32 = 2     // Random page access patterns
+const STRESS_SEQUENTIAL: u32 = 3        // Sequential access
+const STRESS_MIXED_WORKLOAD: u32 = 4    // Realistic mixed workload
+const STRESS_COMPRESSION_RATIO: u32 = 5 // Test compression efficiency
+const STRESS_LATENCY: u32 = 6           // Page-in latency measurement
+
+// Stress test configuration
+struct StressTestConfig {
+    test_type: u32
+    duration_sec: u32           // Test duration in seconds
+    working_set_mb: u32         // Working set size in MB
+    access_pattern: u32         // 0=random, 1=sequential, 2=stride
+    report_interval_sec: u32    // How often to report progress
+}
+
+// Stress test results
+struct StressTestResult {
+    test_type: u32
+    duration_ms: u64
+    pages_written: u64
+    pages_read: u64
+    page_faults: u64
+    avg_page_in_latency_us: u64
+    max_page_in_latency_us: u64
+    min_page_in_latency_us: u64
+    compression_ratio_pct: u32
+    memory_pressure_events: u32
+    thermal_throttle_events: u32
+    passed: u32
+}
+
+// Latency targets (microseconds)
+const TARGET_AVG_LATENCY_PI3_US: u64 = 500      // 500us average
+const TARGET_AVG_LATENCY_PI4_US: u64 = 200      // 200us average
+const TARGET_AVG_LATENCY_PI5_US: u64 = 100      // 100us average
+const TARGET_AVG_LATENCY_X86_US: u64 = 50       // 50us average
+
+const TARGET_MAX_LATENCY_PI3_US: u64 = 5000     // 5ms max
+const TARGET_MAX_LATENCY_PI4_US: u64 = 2000     // 2ms max
+const TARGET_MAX_LATENCY_PI5_US: u64 = 1000     // 1ms max
+const TARGET_MAX_LATENCY_X86_US: u64 = 500      // 500us max
+
+// Compression ratio targets (percentage - higher is better)
+const TARGET_COMPRESSION_MIN: u32 = 150         // At least 1.5:1
+
+// Statistics tracking
+var stress_stats: StressTestResult
+var stress_running: u32 = 0
+
+// Latency histogram buckets (microseconds)
+const LATENCY_BUCKETS: u32 = 10
+var latency_histogram: [LATENCY_BUCKETS]u64  // <10us, <50us, <100us, <200us, <500us, <1ms, <2ms, <5ms, <10ms, >10ms
+var latency_samples: u64 = 0
+
+// ============================================================================
+// INITIALIZATION & PROFILE MANAGEMENT
+// ============================================================================
+
+// Detect platform and return appropriate profile
+fn detect_platform(): u32 {
+    // Check for Pi model via device tree or board detection
+    // Simplified: would read from DTB or mailbox
+
+    // For now, check available memory as a heuristic
+    let total_ram: u64 = memory.get_total_memory()
+
+    if total_ram <= 1024 * 1024 * 1024 {
+        return PLATFORM_PI3  // 1GB = Pi 3
+    } else if total_ram <= 4 * 1024 * 1024 * 1024 {
+        return PLATFORM_PI4  // 2-4GB = Pi 4
+    } else if total_ram <= 8 * 1024 * 1024 * 1024 {
+        // Could be Pi 4 8GB or Pi 5
+        // Check for RP1 chip presence for Pi 5
+        return PLATFORM_PI5
+    } else {
+        return PLATFORM_X86
+    }
+}
+
+// Get profile for platform
+fn get_profile_for_platform(platform: u32): ZramTuningProfile {
+    if platform == PLATFORM_PI3 {
+        return PROFILE_PI3
+    } else if platform == PLATFORM_PI4 {
+        return PROFILE_PI4
+    } else if platform == PLATFORM_PI5 {
+        return PROFILE_PI5
+    } else {
+        return PROFILE_X86
+    }
+}
+
+// Initialize ZRAM with platform-specific tuning
+export fn zram_tuning_init(): u32 {
+    if profile_initialized == 1 {
+        foundation.serial_write_string("[ZRAM-TUNE] Already initialized\n")
+        return 0
+    }
+
+    let platform: u32 = detect_platform()
+    active_profile = get_profile_for_platform(platform)
+
+    foundation.serial_write_string("[ZRAM-TUNE] Detected platform: ")
+    if platform == PLATFORM_PI3 {
+        foundation.serial_write_string("Raspberry Pi 3")
+    } else if platform == PLATFORM_PI4 {
+        foundation.serial_write_string("Raspberry Pi 4")
+    } else if platform == PLATFORM_PI5 {
+        foundation.serial_write_string("Raspberry Pi 5")
+    } else {
+        foundation.serial_write_string("x86-64")
+    }
+    foundation.serial_write_string("\n")
+
+    // Initialize ZRAM with profile settings
+    let zram_size: u64 = active_profile.zram_size_mb * 1024 * 1024
+    zram.zram_init(zram_size, active_profile.compression_algo)
+
+    // Configure swap settings
+    swap.swap_set_swappiness(active_profile.swappiness)
+    swap.swap_set_page_cluster(active_profile.page_cluster)
+
+    // Reset statistics
+    reset_latency_histogram()
+
+    profile_initialized = 1
+
+    foundation.serial_write_string("[ZRAM-TUNE] Configured: ")
+    foundation.serial_write_u64(active_profile.zram_size_mb)
+    foundation.serial_write_string("MB, swappiness=")
+    foundation.serial_write_u64(active_profile.swappiness)
+    foundation.serial_write_string(", algo=")
+    if active_profile.compression_algo == 1 {
+        foundation.serial_write_string("LZ4")
+    } else if active_profile.compression_algo == 2 {
+        foundation.serial_write_string("ZSTD")
+    } else {
+        foundation.serial_write_string("NONE")
+    }
+    foundation.serial_write_string("\n")
+
+    return 0
+}
+
+// Apply a custom profile
+export fn zram_tuning_apply_profile(profile: *ZramTuningProfile): u32 {
+    if profile == 0 { return 1 }
+
+    // Shutdown existing ZRAM
+    zram.zram_shutdown()
+
+    // Apply new profile
+    active_profile = *profile
+
+    let zram_size: u64 = active_profile.zram_size_mb * 1024 * 1024
+    zram.zram_init(zram_size, active_profile.compression_algo)
+
+    swap.swap_set_swappiness(active_profile.swappiness)
+    swap.swap_set_page_cluster(active_profile.page_cluster)
+
+    foundation.serial_write_string("[ZRAM-TUNE] Applied custom profile\n")
+
+    return 0
+}
+
+// ============================================================================
+// LATENCY TRACKING
+// ============================================================================
+
+fn reset_latency_histogram() {
+    var i: u32 = 0
+    loop {
+        if i >= LATENCY_BUCKETS { break }
+        latency_histogram[i] = 0
+        i = i + 1
+    }
+    latency_samples = 0
+}
+
+fn record_latency(latency_us: u64) {
+    latency_samples = latency_samples + 1
+
+    // Update histogram
+    if latency_us < 10 {
+        latency_histogram[0] = latency_histogram[0] + 1
+    } else if latency_us < 50 {
+        latency_histogram[1] = latency_histogram[1] + 1
+    } else if latency_us < 100 {
+        latency_histogram[2] = latency_histogram[2] + 1
+    } else if latency_us < 200 {
+        latency_histogram[3] = latency_histogram[3] + 1
+    } else if latency_us < 500 {
+        latency_histogram[4] = latency_histogram[4] + 1
+    } else if latency_us < 1000 {
+        latency_histogram[5] = latency_histogram[5] + 1
+    } else if latency_us < 2000 {
+        latency_histogram[6] = latency_histogram[6] + 1
+    } else if latency_us < 5000 {
+        latency_histogram[7] = latency_histogram[7] + 1
+    } else if latency_us < 10000 {
+        latency_histogram[8] = latency_histogram[8] + 1
+    } else {
+        latency_histogram[9] = latency_histogram[9] + 1
+    }
+
+    // Update min/max/avg in results
+    if stress_stats.min_page_in_latency_us == 0 || latency_us < stress_stats.min_page_in_latency_us {
+        stress_stats.min_page_in_latency_us = latency_us
+    }
+    if latency_us > stress_stats.max_page_in_latency_us {
+        stress_stats.max_page_in_latency_us = latency_us
+    }
+}
+
+// ============================================================================
+// STRESS TESTS
+// ============================================================================
+
+// Generate test data with specific compressibility
+fn generate_test_page(buffer: *u8, compressibility: u32) {
+    let page_size: u32 = 4096
+
+    if compressibility == 0 {
+        // Incompressible: random data
+        var i: u32 = 0
+        var seed: u32 = 12345
+        loop {
+            if i >= page_size { break }
+            seed = seed * 1103515245 + 12345
+            let ptr: *u8 = buffer + i
+            *ptr = (seed >> 16) & 0xFF
+            i = i + 1
+        }
+    } else if compressibility == 100 {
+        // Highly compressible: all zeros
+        memory.memset(buffer, 0, page_size)
+    } else {
+        // Mixed: some zeros, some random
+        let zero_bytes: u32 = (page_size * compressibility) / 100
+        memory.memset(buffer, 0, zero_bytes)
+
+        var i: u32 = zero_bytes
+        var seed: u32 = 54321
+        loop {
+            if i >= page_size { break }
+            seed = seed * 1103515245 + 12345
+            let ptr: *u8 = buffer + i
+            *ptr = (seed >> 16) & 0xFF
+            i = i + 1
+        }
+    }
+}
+
+// Get current timestamp in microseconds (simplified)
+fn get_timestamp_us(): u64 {
+    // Would use actual timer in real implementation
+    return foundation.timer_get_ticks() / 1000
+}
+
+// Run swap thrash stress test
+fn stress_swap_thrash(config: *StressTestConfig): u32 {
+    foundation.serial_write_string("[STRESS] Starting swap thrash test\n")
+
+    let pages_needed: u32 = (config.working_set_mb * 1024 * 1024) / 4096
+    let test_buffer: *u8 = memory.kmalloc(4096)  // Single page buffer
+
+    if test_buffer == 0 {
+        foundation.serial_write_string("[STRESS] Failed to allocate test buffer\n")
+        return 1
+    }
+
+    let start_time: u64 = get_timestamp_us()
+    let end_time: u64 = start_time + (config.duration_sec * 1000000)
+    var current_time: u64 = start_time
+    var last_report: u64 = start_time
+
+    var page_index: u32 = 0
+    var seed: u32 = 98765
+
+    loop {
+        current_time = get_timestamp_us()
+        if current_time >= end_time { break }
+
+        // Generate test data (50% compressible)
+        generate_test_page(test_buffer, 50)
+
+        // Write to ZRAM
+        let write_start: u64 = get_timestamp_us()
+        let write_result: u32 = zram.zram_write_page(page_index, test_buffer)
+        let write_end: u64 = get_timestamp_us()
+
+        if write_result == 0 {
+            stress_stats.pages_written = stress_stats.pages_written + 1
+        }
+
+        // Read back from ZRAM
+        let read_start: u64 = get_timestamp_us()
+        let read_result: u32 = zram.zram_read_page(page_index, test_buffer)
+        let read_end: u64 = get_timestamp_us()
+
+        if read_result == 0 {
+            stress_stats.pages_read = stress_stats.pages_read + 1
+            record_latency(read_end - read_start)
+        }
+
+        // Random page index
+        seed = seed * 1103515245 + 12345
+        page_index = seed % pages_needed
+
+        // Check for thermal throttling
+        if thermal.thermal_is_throttled(0) == 1 {
+            stress_stats.thermal_throttle_events = stress_stats.thermal_throttle_events + 1
+        }
+
+        // Progress report
+        if current_time - last_report >= config.report_interval_sec * 1000000 {
+            foundation.serial_write_string("[STRESS] Progress: ")
+            foundation.serial_write_u64(stress_stats.pages_written)
+            foundation.serial_write_string(" writes, ")
+            foundation.serial_write_u64(stress_stats.pages_read)
+            foundation.serial_write_string(" reads\n")
+            last_report = current_time
+        }
+    }
+
+    stress_stats.duration_ms = (current_time - start_time) / 1000
+
+    memory.kfree(test_buffer)
+
+    return 0
+}
+
+// Run compression ratio test
+fn stress_compression_ratio(config: *StressTestConfig): u32 {
+    foundation.serial_write_string("[STRESS] Starting compression ratio test\n")
+
+    let test_buffer: *u8 = memory.kmalloc(4096)
+    if test_buffer == 0 { return 1 }
+
+    // Test different compressibility levels
+    let levels: [5]u32 = [0, 25, 50, 75, 100]
+    var total_ratio: u32 = 0
+    var tests: u32 = 0
+
+    var level_idx: u32 = 0
+    loop {
+        if level_idx >= 5 { break }
+
+        let compressibility: u32 = levels[level_idx]
+
+        // Reset ZRAM stats
+        zram.zram_reset()
+
+        // Write 100 pages at this compressibility
+        var page: u32 = 0
+        loop {
+            if page >= 100 { break }
+
+            generate_test_page(test_buffer, compressibility)
+            zram.zram_write_page(page, test_buffer)
+            stress_stats.pages_written = stress_stats.pages_written + 1
+
+            page = page + 1
+        }
+
+        // Get compression ratio
+        let ratio: u32 = zram.zram_get_compression_ratio()
+        total_ratio = total_ratio + ratio
+        tests = tests + 1
+
+        foundation.serial_write_string("  Compressibility ")
+        foundation.serial_write_u64(compressibility)
+        foundation.serial_write_string("%: ratio ")
+        foundation.serial_write_u64(ratio)
+        foundation.serial_write_string("%\n")
+
+        level_idx = level_idx + 1
+    }
+
+    stress_stats.compression_ratio_pct = total_ratio / tests
+
+    memory.kfree(test_buffer)
+
+    return 0
+}
+
+// Run page-in latency test
+fn stress_latency(config: *StressTestConfig): u32 {
+    foundation.serial_write_string("[STRESS] Starting page-in latency test\n")
+
+    let pages_needed: u32 = (config.working_set_mb * 1024 * 1024) / 4096
+    let test_buffer: *u8 = memory.kmalloc(4096)
+
+    if test_buffer == 0 { return 1 }
+
+    // First, populate ZRAM with data
+    foundation.serial_write_string("[STRESS] Populating ZRAM...\n")
+
+    var page: u32 = 0
+    loop {
+        if page >= pages_needed { break }
+
+        generate_test_page(test_buffer, 50)
+        zram.zram_write_page(page, test_buffer)
+
+        page = page + 1
+    }
+
+    // Now measure read latencies
+    foundation.serial_write_string("[STRESS] Measuring read latencies...\n")
+
+    let iterations: u32 = 10000
+    var i: u32 = 0
+    var seed: u32 = 11111
+    var total_latency: u64 = 0
+
+    loop {
+        if i >= iterations { break }
+
+        // Random page
+        seed = seed * 1103515245 + 12345
+        page = seed % pages_needed
+
+        let start: u64 = get_timestamp_us()
+        zram.zram_read_page(page, test_buffer)
+        let end: u64 = get_timestamp_us()
+
+        let latency: u64 = end - start
+        record_latency(latency)
+        total_latency = total_latency + latency
+
+        stress_stats.pages_read = stress_stats.pages_read + 1
+
+        i = i + 1
+    }
+
+    stress_stats.avg_page_in_latency_us = total_latency / iterations
+
+    memory.kfree(test_buffer)
+
+    return 0
+}
+
+// Main stress test entry point
+export fn zram_stress_test(config: *StressTestConfig): *StressTestResult {
+    if stress_running == 1 {
+        foundation.serial_write_string("[STRESS] Test already running\n")
+        return 0
+    }
+
+    if profile_initialized == 0 {
+        zram_tuning_init()
+    }
+
+    stress_running = 1
+
+    // Initialize results
+    stress_stats.test_type = config.test_type
+    stress_stats.duration_ms = 0
+    stress_stats.pages_written = 0
+    stress_stats.pages_read = 0
+    stress_stats.page_faults = 0
+    stress_stats.avg_page_in_latency_us = 0
+    stress_stats.max_page_in_latency_us = 0
+    stress_stats.min_page_in_latency_us = 0
+    stress_stats.compression_ratio_pct = 0
+    stress_stats.memory_pressure_events = 0
+    stress_stats.thermal_throttle_events = 0
+    stress_stats.passed = 0
+
+    reset_latency_histogram()
+
+    foundation.serial_write_string("\n[STRESS] ========================================\n")
+    foundation.serial_write_string("[STRESS] ZRAM Stress Test Starting\n")
+    foundation.serial_write_string("[STRESS] Test type: ")
+    foundation.serial_write_u64(config.test_type)
+    foundation.serial_write_string(", Duration: ")
+    foundation.serial_write_u64(config.duration_sec)
+    foundation.serial_write_string("s, Working set: ")
+    foundation.serial_write_u64(config.working_set_mb)
+    foundation.serial_write_string("MB\n")
+    foundation.serial_write_string("[STRESS] ========================================\n\n")
+
+    // Run appropriate test
+    var result: u32 = 0
+
+    if config.test_type == STRESS_SWAP_THRASH {
+        result = stress_swap_thrash(config)
+    } else if config.test_type == STRESS_COMPRESSION_RATIO {
+        result = stress_compression_ratio(config)
+    } else if config.test_type == STRESS_LATENCY {
+        result = stress_latency(config)
+    } else {
+        foundation.serial_write_string("[STRESS] Unknown test type\n")
+        result = 1
+    }
+
+    // Get final compression ratio
+    stress_stats.compression_ratio_pct = zram.zram_get_compression_ratio()
+
+    // Determine pass/fail
+    stress_stats.passed = evaluate_results()
+
+    stress_running = 0
+
+    return &stress_stats
+}
+
+// Evaluate results against targets
+fn evaluate_results(): u32 {
+    let platform: u32 = active_profile.platform
+    var target_avg_latency: u64 = TARGET_AVG_LATENCY_X86_US
+    var target_max_latency: u64 = TARGET_MAX_LATENCY_X86_US
+
+    if platform == PLATFORM_PI3 {
+        target_avg_latency = TARGET_AVG_LATENCY_PI3_US
+        target_max_latency = TARGET_MAX_LATENCY_PI3_US
+    } else if platform == PLATFORM_PI4 {
+        target_avg_latency = TARGET_AVG_LATENCY_PI4_US
+        target_max_latency = TARGET_MAX_LATENCY_PI4_US
+    } else if platform == PLATFORM_PI5 {
+        target_avg_latency = TARGET_AVG_LATENCY_PI5_US
+        target_max_latency = TARGET_MAX_LATENCY_PI5_US
+    }
+
+    var passed: u32 = 1
+
+    // Check latency targets
+    if stress_stats.avg_page_in_latency_us > target_avg_latency {
+        foundation.serial_write_string("[STRESS] FAIL: Average latency ")
+        foundation.serial_write_u64(stress_stats.avg_page_in_latency_us)
+        foundation.serial_write_string("us > target ")
+        foundation.serial_write_u64(target_avg_latency)
+        foundation.serial_write_string("us\n")
+        passed = 0
+    }
+
+    if stress_stats.max_page_in_latency_us > target_max_latency {
+        foundation.serial_write_string("[STRESS] FAIL: Max latency ")
+        foundation.serial_write_u64(stress_stats.max_page_in_latency_us)
+        foundation.serial_write_string("us > target ")
+        foundation.serial_write_u64(target_max_latency)
+        foundation.serial_write_string("us\n")
+        passed = 0
+    }
+
+    // Check compression ratio
+    if stress_stats.compression_ratio_pct < TARGET_COMPRESSION_MIN {
+        foundation.serial_write_string("[STRESS] FAIL: Compression ratio ")
+        foundation.serial_write_u64(stress_stats.compression_ratio_pct)
+        foundation.serial_write_string("% < target ")
+        foundation.serial_write_u64(TARGET_COMPRESSION_MIN)
+        foundation.serial_write_string("%\n")
+        passed = 0
+    }
+
+    return passed
+}
+
+// Print detailed test report
+export fn zram_stress_print_report() {
+    foundation.serial_write_string("\n[STRESS] ========================================\n")
+    foundation.serial_write_string("[STRESS] ZRAM Stress Test Report\n")
+    foundation.serial_write_string("[STRESS] ========================================\n\n")
+
+    foundation.serial_write_string("Platform: ")
+    if active_profile.platform == PLATFORM_PI3 {
+        foundation.serial_write_string("Raspberry Pi 3\n")
+    } else if active_profile.platform == PLATFORM_PI4 {
+        foundation.serial_write_string("Raspberry Pi 4\n")
+    } else if active_profile.platform == PLATFORM_PI5 {
+        foundation.serial_write_string("Raspberry Pi 5\n")
+    } else {
+        foundation.serial_write_string("x86-64\n")
+    }
+
+    foundation.serial_write_string("\nTest Duration: ")
+    foundation.serial_write_u64(stress_stats.duration_ms)
+    foundation.serial_write_string(" ms\n")
+
+    foundation.serial_write_string("\nI/O Statistics:\n")
+    foundation.serial_write_string("  Pages Written: ")
+    foundation.serial_write_u64(stress_stats.pages_written)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  Pages Read: ")
+    foundation.serial_write_u64(stress_stats.pages_read)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\nLatency Statistics:\n")
+    foundation.serial_write_string("  Average: ")
+    foundation.serial_write_u64(stress_stats.avg_page_in_latency_us)
+    foundation.serial_write_string(" us\n")
+    foundation.serial_write_string("  Minimum: ")
+    foundation.serial_write_u64(stress_stats.min_page_in_latency_us)
+    foundation.serial_write_string(" us\n")
+    foundation.serial_write_string("  Maximum: ")
+    foundation.serial_write_u64(stress_stats.max_page_in_latency_us)
+    foundation.serial_write_string(" us\n")
+
+    foundation.serial_write_string("\nLatency Histogram:\n")
+    foundation.serial_write_string("  <10us:   ")
+    foundation.serial_write_u64(latency_histogram[0])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <50us:   ")
+    foundation.serial_write_u64(latency_histogram[1])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <100us:  ")
+    foundation.serial_write_u64(latency_histogram[2])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <200us:  ")
+    foundation.serial_write_u64(latency_histogram[3])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <500us:  ")
+    foundation.serial_write_u64(latency_histogram[4])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <1ms:    ")
+    foundation.serial_write_u64(latency_histogram[5])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <2ms:    ")
+    foundation.serial_write_u64(latency_histogram[6])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <5ms:    ")
+    foundation.serial_write_u64(latency_histogram[7])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <10ms:   ")
+    foundation.serial_write_u64(latency_histogram[8])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  >10ms:   ")
+    foundation.serial_write_u64(latency_histogram[9])
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\nCompression:\n")
+    foundation.serial_write_string("  Ratio: ")
+    foundation.serial_write_u64(stress_stats.compression_ratio_pct)
+    foundation.serial_write_string("%\n")
+
+    foundation.serial_write_string("\nThermal Events:\n")
+    foundation.serial_write_string("  Throttle events: ")
+    foundation.serial_write_u64(stress_stats.thermal_throttle_events)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\n========================================\n")
+    if stress_stats.passed == 1 {
+        foundation.serial_write_string("RESULT: PASSED\n")
+    } else {
+        foundation.serial_write_string("RESULT: FAILED\n")
+    }
+    foundation.serial_write_string("========================================\n\n")
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS
+// ============================================================================
+
+// Run 24-hour stress test (for CI/CD with shorter duration option)
+export fn zram_run_full_stress_test(duration_hours: u32): u32 {
+    var config: StressTestConfig
+    config.test_type = STRESS_SWAP_THRASH
+    config.duration_sec = duration_hours * 3600
+    config.working_set_mb = 128
+    config.access_pattern = 0  // Random
+    config.report_interval_sec = 300  // Every 5 minutes
+
+    let result: *StressTestResult = zram_stress_test(&config)
+    zram_stress_print_report()
+
+    return if result != 0 && result.passed == 1 { 0 } else { 1 }
+}
+
+// Quick validation test (5 minutes)
+export fn zram_run_quick_test(): u32 {
+    foundation.serial_write_string("[ZRAM-TUNE] Running quick validation test (5 min)...\n")
+
+    var config: StressTestConfig
+    config.test_type = STRESS_LATENCY
+    config.duration_sec = 300
+    config.working_set_mb = 64
+    config.access_pattern = 0
+    config.report_interval_sec = 60
+
+    let result: *StressTestResult = zram_stress_test(&config)
+    zram_stress_print_report()
+
+    return if result != 0 && result.passed == 1 { 0 } else { 1 }
+}
+
+// Get current profile
+export fn zram_tuning_get_profile(): *ZramTuningProfile {
+    return &active_profile
+}
+
+// ============================================================================
+// PROC INTERFACE
+// ============================================================================
+
+export fn zram_tuning_proc_read(buffer: u64, max_len: u32): u32 {
+    var pos: u32 = 0
+
+    // Platform
+    pos = pos + proc_write_str("platform: ", buffer + pos)
+    if active_profile.platform == PLATFORM_PI3 {
+        pos = pos + proc_write_str("pi3\n", buffer + pos)
+    } else if active_profile.platform == PLATFORM_PI4 {
+        pos = pos + proc_write_str("pi4\n", buffer + pos)
+    } else if active_profile.platform == PLATFORM_PI5 {
+        pos = pos + proc_write_str("pi5\n", buffer + pos)
+    } else {
+        pos = pos + proc_write_str("x86\n", buffer + pos)
+    }
+
+    // Configuration
+    pos = pos + proc_write_str("zram_size_mb: ", buffer + pos)
+    pos = pos + proc_write_u32(active_profile.zram_size_mb, buffer + pos)
+    pos = pos + proc_write_str("\n", buffer + pos)
+
+    pos = pos + proc_write_str("compression: ", buffer + pos)
+    if active_profile.compression_algo == 1 {
+        pos = pos + proc_write_str("lz4\n", buffer + pos)
+    } else if active_profile.compression_algo == 2 {
+        pos = pos + proc_write_str("zstd\n", buffer + pos)
+    } else {
+        pos = pos + proc_write_str("none\n", buffer + pos)
+    }
+
+    pos = pos + proc_write_str("swappiness: ", buffer + pos)
+    pos = pos + proc_write_u32(active_profile.swappiness, buffer + pos)
+    pos = pos + proc_write_str("\n", buffer + pos)
+
+    pos = pos + proc_write_str("page_cluster: ", buffer + pos)
+    pos = pos + proc_write_u32(active_profile.page_cluster, buffer + pos)
+    pos = pos + proc_write_str("\n", buffer + pos)
+
+    // Last test results
+    if stress_stats.duration_ms > 0 {
+        pos = pos + proc_write_str("\nlast_test:\n", buffer + pos)
+        pos = pos + proc_write_str("  duration_ms: ", buffer + pos)
+        pos = pos + proc_write_u64(stress_stats.duration_ms, buffer + pos)
+        pos = pos + proc_write_str("\n", buffer + pos)
+        pos = pos + proc_write_str("  avg_latency_us: ", buffer + pos)
+        pos = pos + proc_write_u64(stress_stats.avg_page_in_latency_us, buffer + pos)
+        pos = pos + proc_write_str("\n", buffer + pos)
+        pos = pos + proc_write_str("  compression_ratio: ", buffer + pos)
+        pos = pos + proc_write_u32(stress_stats.compression_ratio_pct, buffer + pos)
+        pos = pos + proc_write_str("\n", buffer + pos)
+        pos = pos + proc_write_str("  passed: ", buffer + pos)
+        pos = pos + proc_write_u32(stress_stats.passed, buffer + pos)
+        pos = pos + proc_write_str("\n", buffer + pos)
+    }
+
+    @ptrStore(buffer + pos, u8, 0)
+    return pos
+}
+
+fn proc_write_str(str: u64, buffer: u64): u32 {
+    var i: u32 = 0
+    loop {
+        let c: u8 = @ptrLoad(str + i, u8)
+        if c == 0 { break }
+        @ptrStore(buffer + i, u8, c)
+        i = i + 1
+    }
+    return i
+}
+
+fn proc_write_u32(val: u32, buffer: u64): u32 {
+    var temp: [16]u8
+    var i: u32 = 15
+    var v: u32 = val
+
+    if v == 0 {
+        @ptrStore(buffer, u8, '0')
+        return 1
+    }
+
+    loop {
+        if v == 0 { break }
+        if i == 0 { break }
+        temp[i] = '0' + @truncate(v % 10, u8)
+        v = v / 10
+        i = i - 1
+    }
+
+    var len: u32 = 0
+    i = i + 1
+    loop {
+        if i > 15 { break }
+        @ptrStore(buffer + len, u8, temp[i])
+        len = len + 1
+        i = i + 1
+    }
+
+    return len
+}
+
+fn proc_write_u64(val: u64, buffer: u64): u32 {
+    return proc_write_u32(@truncate(val, u32), buffer)
+}

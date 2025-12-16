@@ -1,0 +1,1016 @@
+// home-os Memory Fragmentation & Cache Benchmark
+// Measures memory allocator efficiency under real workloads
+// Tracks: fragmentation, slab/pool cache hits, allocation latency
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "./slab.home" as slab
+import "./pool.home" as pool
+
+// ============================================================================
+// BENCHMARK CONFIGURATION
+// ============================================================================
+
+// Benchmark types
+const BENCH_FRAGMENTATION: u32 = 1       // Memory fragmentation measurement
+const BENCH_CACHE_HIT: u32 = 2           // Slab/pool cache hit rate
+const BENCH_ALLOC_LATENCY: u32 = 3       // Allocation latency
+const BENCH_MIXED_WORKLOAD: u32 = 4      // Realistic mixed workload
+const BENCH_STRESS_ALLOC: u32 = 5        // High-frequency allocation stress
+
+// Workload types for mixed benchmark
+const WORKLOAD_WEB_SERVER: u32 = 1       // Many small allocs (buffers, headers)
+const WORKLOAD_DATABASE: u32 = 2         // Mixed sizes, long-lived
+const WORKLOAD_COMPILER: u32 = 3         // Many temporary allocs, trees
+const WORKLOAD_KERNEL_TYPICAL: u32 = 4   // Typical kernel workload mix
+
+// Size classes for allocation patterns
+const SIZE_TINY: u32 = 16
+const SIZE_SMALL: u32 = 64
+const SIZE_MEDIUM: u32 = 256
+const SIZE_LARGE: u32 = 1024
+const SIZE_HUGE: u32 = 4096
+
+// Maximum tracked allocations
+const MAX_TRACKED_ALLOCS: u32 = 4096
+
+// Latency histogram buckets (nanoseconds)
+const LATENCY_BUCKET_COUNT: u32 = 12
+
+// ============================================================================
+// BENCHMARK STRUCTURES
+// ============================================================================
+
+// Single allocation record
+struct AllocRecord {
+    address: u64
+    size: u32
+    timestamp: u64
+    freed: u32
+}
+
+// Fragmentation statistics
+struct FragmentationStats {
+    total_allocated: u64        // Total bytes allocated
+    total_requested: u64        // Total bytes requested
+    external_fragmentation: u32 // External fragmentation percentage (0-100)
+    internal_fragmentation: u32 // Internal fragmentation percentage (0-100)
+    largest_free_block: u64     // Largest contiguous free block
+    free_block_count: u32       // Number of free blocks
+    allocation_count: u32       // Active allocations
+}
+
+// Cache performance statistics
+struct CacheStats {
+    slab_allocs: u64
+    slab_hits: u64
+    slab_misses: u64
+    slab_hit_rate: u32          // Percentage (0-100)
+    pool_allocs: u64
+    pool_hits: u64
+    pool_misses: u64
+    pool_hit_rate: u32          // Percentage (0-100)
+    combined_hit_rate: u32      // Overall hit rate
+}
+
+// Latency statistics
+struct LatencyStats {
+    samples: u64
+    total_ns: u64
+    min_ns: u64
+    max_ns: u64
+    avg_ns: u64
+    p50_ns: u64                 // 50th percentile
+    p90_ns: u64                 // 90th percentile
+    p99_ns: u64                 // 99th percentile
+    histogram: [LATENCY_BUCKET_COUNT]u64  // <100ns, <500ns, <1us, <5us, <10us, <50us, <100us, <500us, <1ms, <5ms, <10ms, >10ms
+}
+
+// Complete benchmark results
+struct BenchmarkResults {
+    benchmark_type: u32
+    workload_type: u32
+    duration_ms: u64
+    iterations: u64
+    fragmentation: FragmentationStats
+    cache: CacheStats
+    latency: LatencyStats
+    passed: u32
+}
+
+// ============================================================================
+// BENCHMARK STATE
+// ============================================================================
+
+var tracked_allocs: [MAX_TRACKED_ALLOCS]AllocRecord
+var tracked_count: u32 = 0
+var benchmark_running: u32 = 0
+var results: BenchmarkResults
+
+// Targets per platform
+const TARGET_FRAG_EXTERNAL_PCT: u32 = 15    // <15% external fragmentation
+const TARGET_FRAG_INTERNAL_PCT: u32 = 25    // <25% internal fragmentation
+const TARGET_CACHE_HIT_RATE: u32 = 80       // >80% cache hit rate
+const TARGET_ALLOC_AVG_US: u64 = 10         // <10us average allocation
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn mem_benchmark_init() {
+    // Reset tracking
+    tracked_count = 0
+    benchmark_running = 0
+
+    var i: u32 = 0
+    loop {
+        if i >= MAX_TRACKED_ALLOCS { break }
+        tracked_allocs[i].address = 0
+        tracked_allocs[i].size = 0
+        tracked_allocs[i].timestamp = 0
+        tracked_allocs[i].freed = 1
+        i = i + 1
+    }
+
+    // Reset results
+    reset_results()
+
+    foundation.serial_write_string("[MEM-BENCH] Initialized\n")
+}
+
+fn reset_results() {
+    results.benchmark_type = 0
+    results.workload_type = 0
+    results.duration_ms = 0
+    results.iterations = 0
+
+    results.fragmentation.total_allocated = 0
+    results.fragmentation.total_requested = 0
+    results.fragmentation.external_fragmentation = 0
+    results.fragmentation.internal_fragmentation = 0
+    results.fragmentation.largest_free_block = 0
+    results.fragmentation.free_block_count = 0
+    results.fragmentation.allocation_count = 0
+
+    results.cache.slab_allocs = 0
+    results.cache.slab_hits = 0
+    results.cache.slab_misses = 0
+    results.cache.slab_hit_rate = 0
+    results.cache.pool_allocs = 0
+    results.cache.pool_hits = 0
+    results.cache.pool_misses = 0
+    results.cache.pool_hit_rate = 0
+    results.cache.combined_hit_rate = 0
+
+    results.latency.samples = 0
+    results.latency.total_ns = 0
+    results.latency.min_ns = 0xFFFFFFFFFFFFFFFF
+    results.latency.max_ns = 0
+    results.latency.avg_ns = 0
+
+    var i: u32 = 0
+    loop {
+        if i >= LATENCY_BUCKET_COUNT { break }
+        results.latency.histogram[i] = 0
+        i = i + 1
+    }
+
+    results.passed = 0
+}
+
+// ============================================================================
+// TRACKED ALLOCATION HELPERS
+// ============================================================================
+
+fn track_alloc(addr: u64, size: u32, timestamp: u64) {
+    if tracked_count >= MAX_TRACKED_ALLOCS { return }
+
+    // Find free slot or reuse freed entry
+    var i: u32 = 0
+    loop {
+        if i >= MAX_TRACKED_ALLOCS { break }
+
+        if tracked_allocs[i].freed == 1 {
+            tracked_allocs[i].address = addr
+            tracked_allocs[i].size = size
+            tracked_allocs[i].timestamp = timestamp
+            tracked_allocs[i].freed = 0
+
+            if i >= tracked_count {
+                tracked_count = i + 1
+            }
+            return
+        }
+
+        i = i + 1
+    }
+}
+
+fn track_free(addr: u64) {
+    var i: u32 = 0
+    loop {
+        if i >= tracked_count { break }
+
+        if tracked_allocs[i].address == addr && tracked_allocs[i].freed == 0 {
+            tracked_allocs[i].freed = 1
+            return
+        }
+
+        i = i + 1
+    }
+}
+
+fn get_active_alloc_count(): u32 {
+    var count: u32 = 0
+    var i: u32 = 0
+    loop {
+        if i >= tracked_count { break }
+        if tracked_allocs[i].freed == 0 {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn get_total_allocated(): u64 {
+    var total: u64 = 0
+    var i: u32 = 0
+    loop {
+        if i >= tracked_count { break }
+        if tracked_allocs[i].freed == 0 {
+            total = total + tracked_allocs[i].size
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// ============================================================================
+// TIMESTAMP & LATENCY HELPERS
+// ============================================================================
+
+fn get_timestamp_ns(): u64 {
+    // Would use actual high-resolution timer
+    return foundation.timer_get_ticks()
+}
+
+fn record_latency(latency_ns: u64) {
+    results.latency.samples = results.latency.samples + 1
+    results.latency.total_ns = results.latency.total_ns + latency_ns
+
+    if latency_ns < results.latency.min_ns {
+        results.latency.min_ns = latency_ns
+    }
+    if latency_ns > results.latency.max_ns {
+        results.latency.max_ns = latency_ns
+    }
+
+    // Update histogram
+    if latency_ns < 100 {
+        results.latency.histogram[0] = results.latency.histogram[0] + 1
+    } else if latency_ns < 500 {
+        results.latency.histogram[1] = results.latency.histogram[1] + 1
+    } else if latency_ns < 1000 {
+        results.latency.histogram[2] = results.latency.histogram[2] + 1
+    } else if latency_ns < 5000 {
+        results.latency.histogram[3] = results.latency.histogram[3] + 1
+    } else if latency_ns < 10000 {
+        results.latency.histogram[4] = results.latency.histogram[4] + 1
+    } else if latency_ns < 50000 {
+        results.latency.histogram[5] = results.latency.histogram[5] + 1
+    } else if latency_ns < 100000 {
+        results.latency.histogram[6] = results.latency.histogram[6] + 1
+    } else if latency_ns < 500000 {
+        results.latency.histogram[7] = results.latency.histogram[7] + 1
+    } else if latency_ns < 1000000 {
+        results.latency.histogram[8] = results.latency.histogram[8] + 1
+    } else if latency_ns < 5000000 {
+        results.latency.histogram[9] = results.latency.histogram[9] + 1
+    } else if latency_ns < 10000000 {
+        results.latency.histogram[10] = results.latency.histogram[10] + 1
+    } else {
+        results.latency.histogram[11] = results.latency.histogram[11] + 1
+    }
+}
+
+// ============================================================================
+// FRAGMENTATION BENCHMARK
+// ============================================================================
+
+fn bench_fragmentation(iterations: u32): u32 {
+    foundation.serial_write_string("[MEM-BENCH] Running fragmentation benchmark\n")
+
+    // Allocation patterns to create fragmentation
+    var seed: u32 = 12345
+
+    var i: u32 = 0
+    loop {
+        if i >= iterations { break }
+
+        // Random size (16 to 4096 bytes)
+        seed = seed * 1103515245 + 12345
+        let size: u32 = SIZE_TINY + (seed % (SIZE_HUGE - SIZE_TINY))
+
+        let start: u64 = get_timestamp_ns()
+        let addr: u64 = memory.kmalloc(size)
+        let end: u64 = get_timestamp_ns()
+
+        if addr != 0 {
+            track_alloc(addr, size, start)
+            record_latency(end - start)
+            results.fragmentation.total_requested = results.fragmentation.total_requested + size
+        }
+
+        // Randomly free some allocations (50% chance)
+        seed = seed * 1103515245 + 12345
+        if (seed % 2) == 0 && tracked_count > 0 {
+            // Find a random active allocation
+            let target_idx: u32 = seed % tracked_count
+
+            var j: u32 = 0
+            var freed: u32 = 0
+            loop {
+                if j >= tracked_count { break }
+                if freed == 1 { break }
+
+                let idx: u32 = (target_idx + j) % tracked_count
+                if tracked_allocs[idx].freed == 0 {
+                    memory.kfree(tracked_allocs[idx].address)
+                    track_free(tracked_allocs[idx].address)
+                    freed = 1
+                }
+
+                j = j + 1
+            }
+        }
+
+        i = i + 1
+    }
+
+    // Calculate fragmentation metrics
+    results.fragmentation.allocation_count = get_active_alloc_count()
+    results.fragmentation.total_allocated = get_total_allocated()
+
+    // Query memory system for fragmentation info
+    let mem_stats: memory.MemoryStats = memory.get_stats()
+    results.fragmentation.largest_free_block = mem_stats.largest_free
+    results.fragmentation.free_block_count = mem_stats.free_blocks
+
+    // Calculate external fragmentation
+    // (total free - largest free) / total free * 100
+    let total_free: u64 = mem_stats.total_free
+    if total_free > 0 && total_free > results.fragmentation.largest_free_block {
+        let fragmented: u64 = total_free - results.fragmentation.largest_free_block
+        results.fragmentation.external_fragmentation = @truncate((fragmented * 100) / total_free, u32)
+    }
+
+    // Calculate internal fragmentation
+    // (total allocated - total requested) / total allocated * 100
+    if results.fragmentation.total_allocated > 0 {
+        if results.fragmentation.total_allocated > results.fragmentation.total_requested {
+            let wasted: u64 = results.fragmentation.total_allocated - results.fragmentation.total_requested
+            results.fragmentation.internal_fragmentation = @truncate((wasted * 100) / results.fragmentation.total_allocated, u32)
+        }
+    }
+
+    foundation.serial_write_string("[MEM-BENCH] Fragmentation: external=")
+    foundation.serial_write_u64(results.fragmentation.external_fragmentation)
+    foundation.serial_write_string("%, internal=")
+    foundation.serial_write_u64(results.fragmentation.internal_fragmentation)
+    foundation.serial_write_string("%\n")
+
+    return 0
+}
+
+// ============================================================================
+// CACHE HIT RATE BENCHMARK
+// ============================================================================
+
+fn bench_cache_hit_rate(iterations: u32): u32 {
+    foundation.serial_write_string("[MEM-BENCH] Running cache hit rate benchmark\n")
+
+    // Test slab allocator with common kernel object sizes
+    let slab_sizes: [5]u32 = [32, 64, 128, 256, 512]
+
+    var size_idx: u32 = 0
+    loop {
+        if size_idx >= 5 { break }
+
+        let size: u32 = slab_sizes[size_idx]
+
+        // Warm up the cache
+        var warmup: u32 = 0
+        var warmup_addrs: [32]u64
+
+        loop {
+            if warmup >= 32 { break }
+
+            let start: u64 = get_timestamp_ns()
+            warmup_addrs[warmup] = slab.slab_alloc(size)
+            let end: u64 = get_timestamp_ns()
+
+            if warmup_addrs[warmup] != 0 {
+                record_latency(end - start)
+                results.cache.slab_allocs = results.cache.slab_allocs + 1
+            }
+
+            warmup = warmup + 1
+        }
+
+        // Free all warmup allocations
+        warmup = 0
+        loop {
+            if warmup >= 32 { break }
+            if warmup_addrs[warmup] != 0 {
+                slab.slab_free(warmup_addrs[warmup])
+            }
+            warmup = warmup + 1
+        }
+
+        // Now measure cache hits (should be faster)
+        var alloc_times: [32]u64
+        var free_times: [32]u64
+        var addrs: [32]u64
+
+        var j: u32 = 0
+        loop {
+            if j >= 32 { break }
+
+            let start: u64 = get_timestamp_ns()
+            addrs[j] = slab.slab_alloc(size)
+            let end: u64 = get_timestamp_ns()
+
+            alloc_times[j] = end - start
+            if addrs[j] != 0 {
+                record_latency(end - start)
+                results.cache.slab_allocs = results.cache.slab_allocs + 1
+            }
+
+            j = j + 1
+        }
+
+        // Free
+        j = 0
+        loop {
+            if j >= 32 { break }
+            if addrs[j] != 0 {
+                slab.slab_free(addrs[j])
+            }
+            j = j + 1
+        }
+
+        size_idx = size_idx + 1
+    }
+
+    // Get slab statistics
+    let slab_stats: slab.SlabStats = slab.slab_get_stats()
+    results.cache.slab_hits = slab_stats.cache_hits
+    results.cache.slab_misses = slab_stats.cache_misses
+
+    if results.cache.slab_allocs > 0 {
+        results.cache.slab_hit_rate = @truncate((results.cache.slab_hits * 100) / results.cache.slab_allocs, u32)
+    }
+
+    // Test pool allocator
+    let pool_sizes: [5]u32 = [16, 64, 256, 1024, 4096]
+
+    size_idx = 0
+    loop {
+        if size_idx >= 5 { break }
+
+        let size: u32 = pool_sizes[size_idx]
+        var addrs: [32]u64
+
+        var j: u32 = 0
+        loop {
+            if j >= 32 { break }
+
+            let start: u64 = get_timestamp_ns()
+            addrs[j] = pool.pool_alloc(size)
+            let end: u64 = get_timestamp_ns()
+
+            if addrs[j] != 0 {
+                record_latency(end - start)
+                results.cache.pool_allocs = results.cache.pool_allocs + 1
+            }
+
+            j = j + 1
+        }
+
+        // Free
+        j = 0
+        loop {
+            if j >= 32 { break }
+            if addrs[j] != 0 {
+                pool.pool_free(addrs[j])
+            }
+            j = j + 1
+        }
+
+        size_idx = size_idx + 1
+    }
+
+    // Get pool statistics
+    let pool_stats: pool.PoolStats = pool.pool_get_stats()
+    results.cache.pool_hits = pool_stats.pool_hits
+    results.cache.pool_misses = pool_stats.fallback_allocs
+
+    let pool_total: u64 = results.cache.pool_hits + results.cache.pool_misses
+    if pool_total > 0 {
+        results.cache.pool_hit_rate = @truncate((results.cache.pool_hits * 100) / pool_total, u32)
+    }
+
+    // Combined hit rate
+    let total_allocs: u64 = results.cache.slab_allocs + results.cache.pool_allocs
+    let total_hits: u64 = results.cache.slab_hits + results.cache.pool_hits
+    if total_allocs > 0 {
+        results.cache.combined_hit_rate = @truncate((total_hits * 100) / total_allocs, u32)
+    }
+
+    foundation.serial_write_string("[MEM-BENCH] Cache hit rate: slab=")
+    foundation.serial_write_u64(results.cache.slab_hit_rate)
+    foundation.serial_write_string("%, pool=")
+    foundation.serial_write_u64(results.cache.pool_hit_rate)
+    foundation.serial_write_string("%, combined=")
+    foundation.serial_write_u64(results.cache.combined_hit_rate)
+    foundation.serial_write_string("%\n")
+
+    return 0
+}
+
+// ============================================================================
+// MIXED WORKLOAD BENCHMARK
+// ============================================================================
+
+fn bench_mixed_workload(workload: u32, iterations: u32): u32 {
+    foundation.serial_write_string("[MEM-BENCH] Running mixed workload: ")
+
+    // Define allocation patterns based on workload
+    var tiny_pct: u32 = 25
+    var small_pct: u32 = 25
+    var medium_pct: u32 = 25
+    var large_pct: u32 = 15
+    var huge_pct: u32 = 10
+
+    if workload == WORKLOAD_WEB_SERVER {
+        foundation.serial_write_string("web server\n")
+        // Many small buffers, headers, strings
+        tiny_pct = 40
+        small_pct = 35
+        medium_pct = 15
+        large_pct = 8
+        huge_pct = 2
+    } else if workload == WORKLOAD_DATABASE {
+        foundation.serial_write_string("database\n")
+        // Mixed sizes, more large blocks
+        tiny_pct = 10
+        small_pct = 20
+        medium_pct = 30
+        large_pct = 25
+        huge_pct = 15
+    } else if workload == WORKLOAD_COMPILER {
+        foundation.serial_write_string("compiler\n")
+        // Many small nodes, some large
+        tiny_pct = 35
+        small_pct = 30
+        medium_pct = 20
+        large_pct = 10
+        huge_pct = 5
+    } else {
+        foundation.serial_write_string("kernel typical\n")
+        // Balanced
+    }
+
+    var seed: u32 = 54321
+
+    var i: u32 = 0
+    loop {
+        if i >= iterations { break }
+
+        // Determine size based on probability
+        seed = seed * 1103515245 + 12345
+        let rand_pct: u32 = seed % 100
+
+        var size: u32 = SIZE_TINY
+        if rand_pct < tiny_pct {
+            size = SIZE_TINY
+        } else if rand_pct < tiny_pct + small_pct {
+            size = SIZE_SMALL
+        } else if rand_pct < tiny_pct + small_pct + medium_pct {
+            size = SIZE_MEDIUM
+        } else if rand_pct < tiny_pct + small_pct + medium_pct + large_pct {
+            size = SIZE_LARGE
+        } else {
+            size = SIZE_HUGE
+        }
+
+        // Allocate
+        let start: u64 = get_timestamp_ns()
+        let addr: u64 = memory.kmalloc(size)
+        let end: u64 = get_timestamp_ns()
+
+        if addr != 0 {
+            track_alloc(addr, size, start)
+            record_latency(end - start)
+            results.fragmentation.total_requested = results.fragmentation.total_requested + size
+        }
+
+        results.iterations = results.iterations + 1
+
+        // Periodically free (simulate object lifetime)
+        seed = seed * 1103515245 + 12345
+        if (seed % 3) == 0 && tracked_count > 0 {
+            let target_idx: u32 = seed % tracked_count
+
+            var j: u32 = 0
+            loop {
+                if j >= tracked_count { break }
+
+                let idx: u32 = (target_idx + j) % tracked_count
+                if tracked_allocs[idx].freed == 0 {
+                    memory.kfree(tracked_allocs[idx].address)
+                    track_free(tracked_allocs[idx].address)
+                    break
+                }
+
+                j = j + 1
+            }
+        }
+
+        i = i + 1
+    }
+
+    // Calculate final metrics
+    results.fragmentation.allocation_count = get_active_alloc_count()
+    results.fragmentation.total_allocated = get_total_allocated()
+
+    return 0
+}
+
+// ============================================================================
+// MAIN BENCHMARK ENTRY POINT
+// ============================================================================
+
+export fn mem_benchmark_run(bench_type: u32, workload: u32, iterations: u32): *BenchmarkResults {
+    if benchmark_running == 1 {
+        foundation.serial_write_string("[MEM-BENCH] Benchmark already running\n")
+        return 0
+    }
+
+    benchmark_running = 1
+    reset_results()
+
+    results.benchmark_type = bench_type
+    results.workload_type = workload
+
+    let start_time: u64 = get_timestamp_ns()
+
+    foundation.serial_write_string("\n[MEM-BENCH] ========================================\n")
+    foundation.serial_write_string("[MEM-BENCH] Memory Benchmark Starting\n")
+    foundation.serial_write_string("[MEM-BENCH] Type: ")
+    foundation.serial_write_u64(bench_type)
+    foundation.serial_write_string(", Iterations: ")
+    foundation.serial_write_u64(iterations)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("[MEM-BENCH] ========================================\n\n")
+
+    // Run appropriate benchmark
+    var result: u32 = 0
+
+    if bench_type == BENCH_FRAGMENTATION {
+        result = bench_fragmentation(iterations)
+    } else if bench_type == BENCH_CACHE_HIT {
+        result = bench_cache_hit_rate(iterations)
+    } else if bench_type == BENCH_MIXED_WORKLOAD {
+        result = bench_mixed_workload(workload, iterations)
+    } else {
+        foundation.serial_write_string("[MEM-BENCH] Unknown benchmark type\n")
+        result = 1
+    }
+
+    let end_time: u64 = get_timestamp_ns()
+    results.duration_ms = (end_time - start_time) / 1000000
+
+    // Calculate average latency
+    if results.latency.samples > 0 {
+        results.latency.avg_ns = results.latency.total_ns / results.latency.samples
+    }
+
+    // Evaluate pass/fail
+    results.passed = evaluate_benchmark_results()
+
+    // Cleanup: free all tracked allocations
+    cleanup_allocations()
+
+    benchmark_running = 0
+
+    return &results
+}
+
+fn cleanup_allocations() {
+    var i: u32 = 0
+    loop {
+        if i >= tracked_count { break }
+
+        if tracked_allocs[i].freed == 0 {
+            memory.kfree(tracked_allocs[i].address)
+            tracked_allocs[i].freed = 1
+        }
+
+        i = i + 1
+    }
+    tracked_count = 0
+}
+
+fn evaluate_benchmark_results(): u32 {
+    var passed: u32 = 1
+
+    // Check fragmentation targets
+    if results.fragmentation.external_fragmentation > TARGET_FRAG_EXTERNAL_PCT {
+        foundation.serial_write_string("[MEM-BENCH] FAIL: External fragmentation ")
+        foundation.serial_write_u64(results.fragmentation.external_fragmentation)
+        foundation.serial_write_string("% > target ")
+        foundation.serial_write_u64(TARGET_FRAG_EXTERNAL_PCT)
+        foundation.serial_write_string("%\n")
+        passed = 0
+    }
+
+    if results.fragmentation.internal_fragmentation > TARGET_FRAG_INTERNAL_PCT {
+        foundation.serial_write_string("[MEM-BENCH] FAIL: Internal fragmentation ")
+        foundation.serial_write_u64(results.fragmentation.internal_fragmentation)
+        foundation.serial_write_string("% > target ")
+        foundation.serial_write_u64(TARGET_FRAG_INTERNAL_PCT)
+        foundation.serial_write_string("%\n")
+        passed = 0
+    }
+
+    // Check cache hit rate
+    if results.cache.combined_hit_rate < TARGET_CACHE_HIT_RATE && results.cache.combined_hit_rate > 0 {
+        foundation.serial_write_string("[MEM-BENCH] FAIL: Cache hit rate ")
+        foundation.serial_write_u64(results.cache.combined_hit_rate)
+        foundation.serial_write_string("% < target ")
+        foundation.serial_write_u64(TARGET_CACHE_HIT_RATE)
+        foundation.serial_write_string("%\n")
+        passed = 0
+    }
+
+    // Check allocation latency (convert ns to us)
+    let avg_us: u64 = results.latency.avg_ns / 1000
+    if avg_us > TARGET_ALLOC_AVG_US && results.latency.samples > 0 {
+        foundation.serial_write_string("[MEM-BENCH] FAIL: Average allocation latency ")
+        foundation.serial_write_u64(avg_us)
+        foundation.serial_write_string("us > target ")
+        foundation.serial_write_u64(TARGET_ALLOC_AVG_US)
+        foundation.serial_write_string("us\n")
+        passed = 0
+    }
+
+    return passed
+}
+
+// ============================================================================
+// REPORTING
+// ============================================================================
+
+export fn mem_benchmark_print_report() {
+    foundation.serial_write_string("\n[MEM-BENCH] ========================================\n")
+    foundation.serial_write_string("[MEM-BENCH] Memory Benchmark Report\n")
+    foundation.serial_write_string("[MEM-BENCH] ========================================\n\n")
+
+    foundation.serial_write_string("Duration: ")
+    foundation.serial_write_u64(results.duration_ms)
+    foundation.serial_write_string(" ms\n")
+
+    foundation.serial_write_string("Iterations: ")
+    foundation.serial_write_u64(results.iterations)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\nFragmentation:\n")
+    foundation.serial_write_string("  External: ")
+    foundation.serial_write_u64(results.fragmentation.external_fragmentation)
+    foundation.serial_write_string("% (target: <")
+    foundation.serial_write_u64(TARGET_FRAG_EXTERNAL_PCT)
+    foundation.serial_write_string("%)\n")
+    foundation.serial_write_string("  Internal: ")
+    foundation.serial_write_u64(results.fragmentation.internal_fragmentation)
+    foundation.serial_write_string("% (target: <")
+    foundation.serial_write_u64(TARGET_FRAG_INTERNAL_PCT)
+    foundation.serial_write_string("%)\n")
+    foundation.serial_write_string("  Largest free block: ")
+    foundation.serial_write_u64(results.fragmentation.largest_free_block / 1024)
+    foundation.serial_write_string(" KB\n")
+    foundation.serial_write_string("  Free block count: ")
+    foundation.serial_write_u64(results.fragmentation.free_block_count)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\nCache Performance:\n")
+    foundation.serial_write_string("  Slab hit rate: ")
+    foundation.serial_write_u64(results.cache.slab_hit_rate)
+    foundation.serial_write_string("%\n")
+    foundation.serial_write_string("  Pool hit rate: ")
+    foundation.serial_write_u64(results.cache.pool_hit_rate)
+    foundation.serial_write_string("%\n")
+    foundation.serial_write_string("  Combined: ")
+    foundation.serial_write_u64(results.cache.combined_hit_rate)
+    foundation.serial_write_string("% (target: >")
+    foundation.serial_write_u64(TARGET_CACHE_HIT_RATE)
+    foundation.serial_write_string("%)\n")
+
+    foundation.serial_write_string("\nAllocation Latency:\n")
+    foundation.serial_write_string("  Samples: ")
+    foundation.serial_write_u64(results.latency.samples)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  Average: ")
+    foundation.serial_write_u64(results.latency.avg_ns)
+    foundation.serial_write_string(" ns (")
+    foundation.serial_write_u64(results.latency.avg_ns / 1000)
+    foundation.serial_write_string(" us)\n")
+    foundation.serial_write_string("  Min: ")
+    foundation.serial_write_u64(results.latency.min_ns)
+    foundation.serial_write_string(" ns\n")
+    foundation.serial_write_string("  Max: ")
+    foundation.serial_write_u64(results.latency.max_ns)
+    foundation.serial_write_string(" ns\n")
+
+    foundation.serial_write_string("\nLatency Histogram:\n")
+    foundation.serial_write_string("  <100ns:  ")
+    foundation.serial_write_u64(results.latency.histogram[0])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <500ns:  ")
+    foundation.serial_write_u64(results.latency.histogram[1])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <1us:    ")
+    foundation.serial_write_u64(results.latency.histogram[2])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <5us:    ")
+    foundation.serial_write_u64(results.latency.histogram[3])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <10us:   ")
+    foundation.serial_write_u64(results.latency.histogram[4])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <50us:   ")
+    foundation.serial_write_u64(results.latency.histogram[5])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <100us:  ")
+    foundation.serial_write_u64(results.latency.histogram[6])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <500us:  ")
+    foundation.serial_write_u64(results.latency.histogram[7])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  <1ms:    ")
+    foundation.serial_write_u64(results.latency.histogram[8])
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  >1ms:    ")
+    foundation.serial_write_u64(results.latency.histogram[9] + results.latency.histogram[10] + results.latency.histogram[11])
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\n========================================\n")
+    if results.passed == 1 {
+        foundation.serial_write_string("RESULT: PASSED\n")
+    } else {
+        foundation.serial_write_string("RESULT: FAILED\n")
+    }
+    foundation.serial_write_string("========================================\n\n")
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS
+// ============================================================================
+
+export fn mem_benchmark_fragmentation(): u32 {
+    let result: *BenchmarkResults = mem_benchmark_run(BENCH_FRAGMENTATION, 0, 10000)
+    mem_benchmark_print_report()
+    return if result != 0 && result.passed == 1 { 0 } else { 1 }
+}
+
+export fn mem_benchmark_cache(): u32 {
+    let result: *BenchmarkResults = mem_benchmark_run(BENCH_CACHE_HIT, 0, 1000)
+    mem_benchmark_print_report()
+    return if result != 0 && result.passed == 1 { 0 } else { 1 }
+}
+
+export fn mem_benchmark_workload(workload: u32): u32 {
+    let result: *BenchmarkResults = mem_benchmark_run(BENCH_MIXED_WORKLOAD, workload, 10000)
+    mem_benchmark_print_report()
+    return if result != 0 && result.passed == 1 { 0 } else { 1 }
+}
+
+export fn mem_benchmark_full(): u32 {
+    foundation.serial_write_string("\n[MEM-BENCH] Running full benchmark suite\n")
+    foundation.serial_write_string("==========================================\n\n")
+
+    var all_passed: u32 = 1
+
+    // Fragmentation test
+    if mem_benchmark_fragmentation() != 0 {
+        all_passed = 0
+    }
+
+    // Cache hit rate test
+    if mem_benchmark_cache() != 0 {
+        all_passed = 0
+    }
+
+    // Workload tests
+    if mem_benchmark_workload(WORKLOAD_KERNEL_TYPICAL) != 0 {
+        all_passed = 0
+    }
+
+    foundation.serial_write_string("\n==========================================\n")
+    if all_passed == 1 {
+        foundation.serial_write_string("FULL BENCHMARK SUITE: PASSED\n")
+    } else {
+        foundation.serial_write_string("FULL BENCHMARK SUITE: FAILED\n")
+    }
+    foundation.serial_write_string("==========================================\n\n")
+
+    return if all_passed == 1 { 0 } else { 1 }
+}
+
+// ============================================================================
+// PROC INTERFACE
+// ============================================================================
+
+export fn mem_benchmark_proc_read(buffer: u64, max_len: u32): u32 {
+    var pos: u32 = 0
+
+    pos = pos + proc_str("fragmentation:\n", buffer + pos)
+    pos = pos + proc_str("  external: ", buffer + pos)
+    pos = pos + proc_u32(results.fragmentation.external_fragmentation, buffer + pos)
+    pos = pos + proc_str("%\n", buffer + pos)
+    pos = pos + proc_str("  internal: ", buffer + pos)
+    pos = pos + proc_u32(results.fragmentation.internal_fragmentation, buffer + pos)
+    pos = pos + proc_str("%\n", buffer + pos)
+
+    pos = pos + proc_str("\ncache:\n", buffer + pos)
+    pos = pos + proc_str("  slab_hit_rate: ", buffer + pos)
+    pos = pos + proc_u32(results.cache.slab_hit_rate, buffer + pos)
+    pos = pos + proc_str("%\n", buffer + pos)
+    pos = pos + proc_str("  pool_hit_rate: ", buffer + pos)
+    pos = pos + proc_u32(results.cache.pool_hit_rate, buffer + pos)
+    pos = pos + proc_str("%\n", buffer + pos)
+    pos = pos + proc_str("  combined: ", buffer + pos)
+    pos = pos + proc_u32(results.cache.combined_hit_rate, buffer + pos)
+    pos = pos + proc_str("%\n", buffer + pos)
+
+    pos = pos + proc_str("\nlatency:\n", buffer + pos)
+    pos = pos + proc_str("  avg_ns: ", buffer + pos)
+    pos = pos + proc_u64(results.latency.avg_ns, buffer + pos)
+    pos = pos + proc_str("\n", buffer + pos)
+
+    pos = pos + proc_str("\nresult: ", buffer + pos)
+    if results.passed == 1 {
+        pos = pos + proc_str("passed\n", buffer + pos)
+    } else {
+        pos = pos + proc_str("failed\n", buffer + pos)
+    }
+
+    @ptrStore(buffer + pos, u8, 0)
+    return pos
+}
+
+fn proc_str(str: u64, buffer: u64): u32 {
+    var i: u32 = 0
+    loop {
+        let c: u8 = @ptrLoad(str + i, u8)
+        if c == 0 { break }
+        @ptrStore(buffer + i, u8, c)
+        i = i + 1
+    }
+    return i
+}
+
+fn proc_u32(val: u32, buffer: u64): u32 {
+    var temp: [16]u8
+    var i: u32 = 15
+    var v: u32 = val
+
+    if v == 0 {
+        @ptrStore(buffer, u8, '0')
+        return 1
+    }
+
+    loop {
+        if v == 0 { break }
+        if i == 0 { break }
+        temp[i] = '0' + @truncate(v % 10, u8)
+        v = v / 10
+        i = i - 1
+    }
+
+    var len: u32 = 0
+    i = i + 1
+    loop {
+        if i > 15 { break }
+        @ptrStore(buffer + len, u8, temp[i])
+        len = len + 1
+        i = i + 1
+    }
+
+    return len
+}
+
+fn proc_u64(val: u64, buffer: u64): u32 {
+    return proc_u32(@truncate(val, u32), buffer)
+}
