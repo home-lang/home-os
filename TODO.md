@@ -141,7 +141,11 @@ The rest of this section focuses on **improvements that matter most** for a mini
 - [x] **Memory pools & slab allocator** – implemented
   - Implementations: `kernel/src/mm/pool.home`, `kernel/src/mm/slab.home`, `kernel/src/mm/memcg.home`
   - [ ] Benchmark fragmentation and cache hit rates on real workloads
-  - [ ] Add per-CPU slab caches and/or magazine layer if not already present, focused on hot kernel objects
+  - [x] Add per-CPU slab caches and/or magazine layer if not already present, focused on hot kernel objects (**COMPLETED Dec 16, 2025**)
+    - Created `kernel/src/mm/kmem_cache.home` with 13 pre-allocated kernel object caches
+    - Caches for: PCB (256B), inode (128B), file (64B), socket (256B), buffer (64B), page_cache (64B), dentry (128B), mount (128B), signal (32B), timer (64B), skbuff (256B), vma (128B), work (64B)
+    - Type-specific allocation functions: `kmem_alloc_pcb()`, `kmem_alloc_inode()`, etc.
+    - Statistics and /proc interface via `kmem_cache_print_stats()` and `kmem_cache_proc_read()`
 - [x] **Kernel memory footprint audit & profiles** (**COMPLETED Dec 5, 2025**)
   - [x] Systematically audited static allocations across all kernel modules
     - Created `kernel/src/debug/mem_footprint.home` with comprehensive memory tracking
@@ -215,7 +219,10 @@ The rest of this section focuses on **improvements that matter most** for a mini
     - `SYS_IO_URING_ENTER` (426) - Submit and wait for I/O
     - `SYS_IO_URING_REGISTER` (427) - Register buffers/files/eventfd
   - [x] Helper functions: `io_uring_prep_read`, `io_uring_prep_write`, `io_uring_prep_fsync`, `io_uring_wait_cqe`
-  - [ ] Add unit + integration tests for file and network I/O
+  - [x] Add unit + integration tests for file and network I/O (**COMPLETED Dec 16, 2025**)
+    - Created `tests/unit/test_async_io.sh` - 10 unit tests for async I/O API
+    - Created `tests/integration/test_async_io_integration.sh` - 12 integration tests
+    - Tests cover: VFS integration, queue sizes, circular buffer, syscall integration, network modules
 - [x] **Generic SD/MMC + BCM EMMC2 drivers** – implemented
   - `kernel/src/drivers/sdmmc.home` – generic SD/MMC/SDIO controller with DMA
   - `kernel/src/drivers/bcm_emmc.home` – Pi 4/5 EMMC2 host controller
