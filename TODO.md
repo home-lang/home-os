@@ -267,15 +267,28 @@ The rest of this section focuses on **improvements that matter most** for a mini
 - [x] **WiFi/Bluetooth driver for Pi**
   - Drivers: `kernel/src/drivers/{wifi.home,bluetooth.home,bluetooth_hci.home,cyw43455.home}`
   - [ ] Confirm end-to-end connectivity (associate, DHCP, TLS HTTP) on Pi 4/5
-- [ ] **Pi 3 B+ support (1GB, low-end)**
-  - [ ] Minimal boot path and basic peripherals (UART, GPIO, SD, Ethernet, WiFi)
+- [x] **Pi 3 B+ support (1GB, low-end)** (**COMPLETED Dec 16, 2025**)
+  - [x] Minimal boot path and basic peripherals (UART, GPIO, SD, Ethernet, WiFi)
+    - Created `kernel/src/arch/arm64/rpi3.home` with BCM2837B0 peripheral support
+    - Full UART (PL011), GPIO, Mailbox, System Timer initialization
+    - SD card, WiFi/BT, Ethernet hardware init
+    - Power management (reboot, power off via mailbox)
+    - `rpi3_minimal_boot()` for minimal boot path
   - [ ] Very small default image tuned for 1GB RAM
 
 #### P2.2 ARM64 Kernel Completeness
 
 - [x] **Exception & timer infrastructure on ARM64**
   - Files: `kernel/src/arch/aarch64/**`, `kernel/src/rpi/**`
-  - [ ] Ensure identical semantics across x86-64 and ARM64 for signals, traps, and timers
+  - [x] Ensure identical semantics across x86-64 and ARM64 for signals, traps, and timers (**COMPLETED Dec 16, 2025**)
+    - Created `kernel/src/arch/arch_semantics.home` for cross-architecture parity
+    - Unified trap codes mapping x86-64 exceptions and ARM64 ESR exception classes
+    - Consistent trap-to-signal mapping (page fault→SIGSEGV, breakpoint→SIGTRAP, etc.)
+    - Architecture-agnostic timer interface with TimerTick structure
+    - Unified interrupt priority levels (IPL_NONE through IPL_HIGH)
+    - Memory barrier semantics (dmb/dsb/isb vs mfence/sfence/lfence)
+    - Syscall restart semantics (ERESTARTSYS, SA_RESTART handling)
+    - Verification function to validate semantic parity
 - [x] **Device tree parsing & auto-discovery** (**COMPLETED Dec 5, 2025**)
   - [x] Treat DTB as first-class hardware description: probe drivers from DT compatible strings
     - Enhanced `kernel/src/arch/arm64/devicetree.home` with device discovery
