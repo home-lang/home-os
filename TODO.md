@@ -412,12 +412,17 @@ The rest of this section focuses on **improvements that matter most** for a mini
 
 #### P3.3 Documentation & Architecture
 
-- [ ] **Keep audits and docs current with code**
+- [x] **Keep audits and docs current with code** (**COMPLETED Dec 16, 2025**)
   - [x] Extend the audit pattern from process/VFS to networking, security, power, and drivers (**COMPLETED**)
     - Netfilter (`kernel/src/net/netfilter.home`): firewall rule changes, packet drops, state changes
     - TLS (`kernel/src/net/tls.home`): connection events, handshake success/failure, security alerts
     - Capabilities (`kernel/src/security/capabilities.home`): permission checks, grants, denials
     - Existing coverage: syscalls, file access, process events, auth, security events
+  - [x] Created comprehensive audit documents for all major subsystems:
+    - `docs/audits/networking-audit.md` - 20 network modules, ~6,000 lines (TCP, UDP, TLS, HTTP, WebSocket, etc.)
+    - `docs/audits/security-audit.md` - 12 security modules, ~4,500 lines (capabilities, seccomp, SMEP/SMAP, sandbox, etc.)
+    - `docs/audits/power-audit.md` - 4 power modules, ~2,768 lines (DVFS, thermal, power gating, PM)
+    - `docs/audits/drivers-audit.md` - 65 driver modules, ~22,500 lines (storage, USB, network, GPIO, etc.)
   - [x] Auto-generate syscall & driver reference docs from `.home` sources (**COMPLETED Dec 16, 2025**)
     - Created `scripts/generate-docs.sh` documentation generator
     - Functions: `generate_syscall_docs()`, `generate_driver_docs()`, `generate_module_index()`, `generate_api_reference()`
@@ -594,8 +599,21 @@ Some modules are complete, others still contain explicit stubs. Focus areas:
   - [x] Added `tests/utils/test_utils.sh` for utility verification
   - [x] CI/CD pipeline runs tests automatically
   - [ ] Expand coverage for drivers, networking, and apps; add Pi hardware-in-the-loop jobs
-- [ ] **Performance & stability targets (Pi-first)**
+- [x] **Performance & stability targets (Pi-first)** (**COMPLETED Dec 16, 2025**)
   - Keep and refine the performance and compatibility tables in the **Success Metrics** section below (boot time, RAM usage, uptime, compatibility); enforce them via automated tests over time.
+  - Created `kernel/src/perf/targets.home` - comprehensive performance targets enforcement
+    - Boot time targets: x86 2.0s, Pi3 5.0s, Pi4 3.0s, Pi5 2.0s
+    - Memory targets (headless): x86 96MB, Pi3 64MB, Pi4 96MB, Pi5 128MB
+    - Syscall latency targets: getpid <1us, read <5us, write <5us, mmap <10us
+    - I/O targets: SD read Pi3 23MB/s, Pi4 45MB/s, Pi5 90MB/s
+    - Network targets: Pi3 95Mbps, Pi4+ 940Mbps
+    - Stability: 168h uptime, <1KB/hr memory leak, 0 crashes
+    - Functions: `targets_init()`, `targets_enforce()`, `targets_ci_check()`, `targets_to_json()`
+  - Created `tests/perf/test_performance_targets.sh` - CI/CD integration test
+    - Platform detection (x86-64, Pi 3/4/5)
+    - Live measurements: boot time, memory usage, SD speed, network, temperature
+    - JSON report generation for CI/CD pipelines
+    - Critical failure detection with proper exit codes
 
 ---
 
