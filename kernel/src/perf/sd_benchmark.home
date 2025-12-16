@@ -1,0 +1,820 @@
+// home-os SD Card Benchmark Suite
+// Measures throughput, latency, and IOPS for SD/MMC devices
+// Designed for Pi 3/4/5 performance validation
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+import "../drivers/sdmmc.home" as sdmmc
+
+// ============================================================================
+// BENCHMARK CONFIGURATION
+// ============================================================================
+
+// Test patterns
+const TEST_SEQUENTIAL_READ: u32 = 0
+const TEST_SEQUENTIAL_WRITE: u32 = 1
+const TEST_RANDOM_READ: u32 = 2
+const TEST_RANDOM_WRITE: u32 = 3
+const TEST_MIXED_WORKLOAD: u32 = 4
+
+// Block sizes for testing
+const BLOCK_SIZE_512: u32 = 1      // 512 bytes (1 block)
+const BLOCK_SIZE_4K: u32 = 8       // 4 KB (8 blocks)
+const BLOCK_SIZE_64K: u32 = 128    // 64 KB (128 blocks)
+const BLOCK_SIZE_1M: u32 = 2048    // 1 MB (2048 blocks)
+
+// Test regions (in blocks)
+const TEST_START_BLOCK: u64 = 1000000   // ~512MB offset (avoid boot partition)
+const TEST_REGION_SIZE: u64 = 2097152   // 1GB test region
+
+// Timing
+const TICKS_PER_MS: u64 = 1000          // Assume microsecond timer
+
+// ============================================================================
+// BENCHMARK RESULTS
+// ============================================================================
+
+struct BenchmarkResult {
+  test_type: u32
+  block_size: u32
+  total_blocks: u64
+  total_bytes: u64
+  elapsed_us: u64
+  throughput_kbps: u64        // KB/s
+  avg_latency_us: u64         // Microseconds
+  min_latency_us: u64
+  max_latency_us: u64
+  iops: u64                   // I/O operations per second
+  errors: u32
+}
+
+const MAX_RESULTS: u32 = 32
+var results: [MAX_RESULTS]BenchmarkResult
+var result_count: u32 = 0
+
+// ============================================================================
+// TIMING INFRASTRUCTURE
+// ============================================================================
+
+var timer_start: u64 = 0
+var current_ticks: u64 = 0
+
+// Get current timestamp (microseconds)
+// In real implementation, would read hardware timer
+fn get_timestamp_us(): u64 {
+  // Would read from ARM system timer or x86 TSC
+  // For now, use global counter
+  return current_ticks
+}
+
+// Increment timer (called from timer interrupt)
+export fn sd_benchmark_tick() {
+  current_ticks = current_ticks + 1
+}
+
+fn start_timer() {
+  timer_start = get_timestamp_us()
+}
+
+fn stop_timer(): u64 {
+  return get_timestamp_us() - timer_start
+}
+
+// ============================================================================
+// PSEUDO-RANDOM NUMBER GENERATOR (for random I/O patterns)
+// ============================================================================
+
+var prng_state: u64 = 12345678901234567
+
+fn prng_seed(seed: u64) {
+  prng_state = seed
+  if prng_state == 0 {
+    prng_state = 1
+  }
+}
+
+fn prng_next(): u64 {
+  // xorshift64
+  prng_state = prng_state ^ (prng_state << 13)
+  prng_state = prng_state ^ (prng_state >> 7)
+  prng_state = prng_state ^ (prng_state << 17)
+  return prng_state
+}
+
+// Get random block within test region
+fn random_block(): u64 {
+  return TEST_START_BLOCK + (prng_next() % TEST_REGION_SIZE)
+}
+
+// ============================================================================
+// BENCHMARK TESTS
+// ============================================================================
+
+// Sequential read benchmark
+fn benchmark_sequential_read(ctrl_id: u32, block_count: u32, iterations: u32): BenchmarkResult {
+  var result: BenchmarkResult
+  result.test_type = TEST_SEQUENTIAL_READ
+  result.block_size = block_count
+  result.total_blocks = 0
+  result.total_bytes = 0
+  result.elapsed_us = 0
+  result.min_latency_us = 0xFFFFFFFFFFFFFFFF
+  result.max_latency_us = 0
+  result.errors = 0
+
+  // Allocate read buffer
+  let buffer_size: u32 = block_count * 512
+  let buffer: u64 = memory.kmalloc(buffer_size)
+  if buffer == 0 {
+    result.errors = 1
+    return result
+  }
+
+  var total_latency: u64 = 0
+  var current_block: u64 = TEST_START_BLOCK
+
+  foundation.serial_write_string("[SD Benchmark] Sequential read: ")
+  foundation.serial_write_u64(iterations)
+  foundation.serial_write_string(" iterations, ")
+  foundation.serial_write_u64(block_count)
+  foundation.serial_write_string(" blocks each\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= iterations { break }
+
+    start_timer()
+    let err: u32 = sdmmc.sdmmc_read_blocks(ctrl_id, current_block, block_count, buffer)
+    let latency: u64 = stop_timer()
+
+    if err != 0 {
+      result.errors = result.errors + 1
+    } else {
+      result.total_blocks = result.total_blocks + block_count
+      result.total_bytes = result.total_bytes + buffer_size
+      total_latency = total_latency + latency
+
+      if latency < result.min_latency_us {
+        result.min_latency_us = latency
+      }
+      if latency > result.max_latency_us {
+        result.max_latency_us = latency
+      }
+    }
+
+    // Move to next sequential block
+    current_block = current_block + block_count
+    if current_block >= TEST_START_BLOCK + TEST_REGION_SIZE {
+      current_block = TEST_START_BLOCK
+    }
+
+    i = i + 1
+  }
+
+  result.elapsed_us = total_latency
+  result.avg_latency_us = if iterations > 0 { total_latency / iterations } else { 0 }
+
+  // Calculate throughput (KB/s)
+  if total_latency > 0 {
+    result.throughput_kbps = (result.total_bytes * 1000000) / (total_latency * 1024)
+    result.iops = (iterations * 1000000) / total_latency
+  }
+
+  memory.kfree(buffer)
+
+  return result
+}
+
+// Sequential write benchmark
+fn benchmark_sequential_write(ctrl_id: u32, block_count: u32, iterations: u32): BenchmarkResult {
+  var result: BenchmarkResult
+  result.test_type = TEST_SEQUENTIAL_WRITE
+  result.block_size = block_count
+  result.total_blocks = 0
+  result.total_bytes = 0
+  result.elapsed_us = 0
+  result.min_latency_us = 0xFFFFFFFFFFFFFFFF
+  result.max_latency_us = 0
+  result.errors = 0
+
+  let buffer_size: u32 = block_count * 512
+  let buffer: u64 = memory.kmalloc(buffer_size)
+  if buffer == 0 {
+    result.errors = 1
+    return result
+  }
+
+  // Fill buffer with test pattern
+  var ptr: *u8 = buffer
+  var j: u32 = 0
+  loop {
+    if j >= buffer_size { break }
+    ptr[j] = (j & 0xFF)
+    j = j + 1
+  }
+
+  var total_latency: u64 = 0
+  var current_block: u64 = TEST_START_BLOCK
+
+  foundation.serial_write_string("[SD Benchmark] Sequential write: ")
+  foundation.serial_write_u64(iterations)
+  foundation.serial_write_string(" iterations, ")
+  foundation.serial_write_u64(block_count)
+  foundation.serial_write_string(" blocks each\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= iterations { break }
+
+    start_timer()
+    let err: u32 = sdmmc.sdmmc_write_blocks(ctrl_id, current_block, block_count, buffer)
+    let latency: u64 = stop_timer()
+
+    if err != 0 {
+      result.errors = result.errors + 1
+    } else {
+      result.total_blocks = result.total_blocks + block_count
+      result.total_bytes = result.total_bytes + buffer_size
+      total_latency = total_latency + latency
+
+      if latency < result.min_latency_us {
+        result.min_latency_us = latency
+      }
+      if latency > result.max_latency_us {
+        result.max_latency_us = latency
+      }
+    }
+
+    current_block = current_block + block_count
+    if current_block >= TEST_START_BLOCK + TEST_REGION_SIZE {
+      current_block = TEST_START_BLOCK
+    }
+
+    i = i + 1
+  }
+
+  result.elapsed_us = total_latency
+  result.avg_latency_us = if iterations > 0 { total_latency / iterations } else { 0 }
+
+  if total_latency > 0 {
+    result.throughput_kbps = (result.total_bytes * 1000000) / (total_latency * 1024)
+    result.iops = (iterations * 1000000) / total_latency
+  }
+
+  memory.kfree(buffer)
+
+  return result
+}
+
+// Random read benchmark
+fn benchmark_random_read(ctrl_id: u32, block_count: u32, iterations: u32): BenchmarkResult {
+  var result: BenchmarkResult
+  result.test_type = TEST_RANDOM_READ
+  result.block_size = block_count
+  result.total_blocks = 0
+  result.total_bytes = 0
+  result.elapsed_us = 0
+  result.min_latency_us = 0xFFFFFFFFFFFFFFFF
+  result.max_latency_us = 0
+  result.errors = 0
+
+  let buffer_size: u32 = block_count * 512
+  let buffer: u64 = memory.kmalloc(buffer_size)
+  if buffer == 0 {
+    result.errors = 1
+    return result
+  }
+
+  var total_latency: u64 = 0
+
+  foundation.serial_write_string("[SD Benchmark] Random read: ")
+  foundation.serial_write_u64(iterations)
+  foundation.serial_write_string(" iterations, ")
+  foundation.serial_write_u64(block_count)
+  foundation.serial_write_string(" blocks each\n")
+
+  // Seed PRNG
+  prng_seed(12345)
+
+  var i: u32 = 0
+  loop {
+    if i >= iterations { break }
+
+    let block: u64 = random_block()
+
+    start_timer()
+    let err: u32 = sdmmc.sdmmc_read_blocks(ctrl_id, block, block_count, buffer)
+    let latency: u64 = stop_timer()
+
+    if err != 0 {
+      result.errors = result.errors + 1
+    } else {
+      result.total_blocks = result.total_blocks + block_count
+      result.total_bytes = result.total_bytes + buffer_size
+      total_latency = total_latency + latency
+
+      if latency < result.min_latency_us {
+        result.min_latency_us = latency
+      }
+      if latency > result.max_latency_us {
+        result.max_latency_us = latency
+      }
+    }
+
+    i = i + 1
+  }
+
+  result.elapsed_us = total_latency
+  result.avg_latency_us = if iterations > 0 { total_latency / iterations } else { 0 }
+
+  if total_latency > 0 {
+    result.throughput_kbps = (result.total_bytes * 1000000) / (total_latency * 1024)
+    result.iops = (iterations * 1000000) / total_latency
+  }
+
+  memory.kfree(buffer)
+
+  return result
+}
+
+// Random write benchmark
+fn benchmark_random_write(ctrl_id: u32, block_count: u32, iterations: u32): BenchmarkResult {
+  var result: BenchmarkResult
+  result.test_type = TEST_RANDOM_WRITE
+  result.block_size = block_count
+  result.total_blocks = 0
+  result.total_bytes = 0
+  result.elapsed_us = 0
+  result.min_latency_us = 0xFFFFFFFFFFFFFFFF
+  result.max_latency_us = 0
+  result.errors = 0
+
+  let buffer_size: u32 = block_count * 512
+  let buffer: u64 = memory.kmalloc(buffer_size)
+  if buffer == 0 {
+    result.errors = 1
+    return result
+  }
+
+  // Fill buffer
+  var ptr: *u8 = buffer
+  var j: u32 = 0
+  loop {
+    if j >= buffer_size { break }
+    ptr[j] = (j & 0xFF)
+    j = j + 1
+  }
+
+  var total_latency: u64 = 0
+
+  foundation.serial_write_string("[SD Benchmark] Random write: ")
+  foundation.serial_write_u64(iterations)
+  foundation.serial_write_string(" iterations, ")
+  foundation.serial_write_u64(block_count)
+  foundation.serial_write_string(" blocks each\n")
+
+  prng_seed(12345)
+
+  var i: u32 = 0
+  loop {
+    if i >= iterations { break }
+
+    let block: u64 = random_block()
+
+    start_timer()
+    let err: u32 = sdmmc.sdmmc_write_blocks(ctrl_id, block, block_count, buffer)
+    let latency: u64 = stop_timer()
+
+    if err != 0 {
+      result.errors = result.errors + 1
+    } else {
+      result.total_blocks = result.total_blocks + block_count
+      result.total_bytes = result.total_bytes + buffer_size
+      total_latency = total_latency + latency
+
+      if latency < result.min_latency_us {
+        result.min_latency_us = latency
+      }
+      if latency > result.max_latency_us {
+        result.max_latency_us = latency
+      }
+    }
+
+    i = i + 1
+  }
+
+  result.elapsed_us = total_latency
+  result.avg_latency_us = if iterations > 0 { total_latency / iterations } else { 0 }
+
+  if total_latency > 0 {
+    result.throughput_kbps = (result.total_bytes * 1000000) / (total_latency * 1024)
+    result.iops = (iterations * 1000000) / total_latency
+  }
+
+  memory.kfree(buffer)
+
+  return result
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+export fn sd_benchmark_init() {
+  result_count = 0
+  current_ticks = 0
+  foundation.serial_write_string("[SD Benchmark] Initialized\n")
+}
+
+// Run complete benchmark suite
+export fn sd_benchmark_run_suite(ctrl_id: u32) {
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("==========================================================\n")
+  foundation.serial_write_string("           SD CARD BENCHMARK SUITE - home-os\n")
+  foundation.serial_write_string("==========================================================\n\n")
+
+  result_count = 0
+
+  // Sequential read tests
+  foundation.serial_write_string("--- Sequential Read Tests ---\n")
+  results[result_count] = benchmark_sequential_read(ctrl_id, BLOCK_SIZE_512, 1000)
+  result_count = result_count + 1
+
+  results[result_count] = benchmark_sequential_read(ctrl_id, BLOCK_SIZE_4K, 500)
+  result_count = result_count + 1
+
+  results[result_count] = benchmark_sequential_read(ctrl_id, BLOCK_SIZE_64K, 100)
+  result_count = result_count + 1
+
+  results[result_count] = benchmark_sequential_read(ctrl_id, BLOCK_SIZE_1M, 50)
+  result_count = result_count + 1
+
+  // Sequential write tests
+  foundation.serial_write_string("\n--- Sequential Write Tests ---\n")
+  results[result_count] = benchmark_sequential_write(ctrl_id, BLOCK_SIZE_512, 1000)
+  result_count = result_count + 1
+
+  results[result_count] = benchmark_sequential_write(ctrl_id, BLOCK_SIZE_4K, 500)
+  result_count = result_count + 1
+
+  results[result_count] = benchmark_sequential_write(ctrl_id, BLOCK_SIZE_64K, 100)
+  result_count = result_count + 1
+
+  results[result_count] = benchmark_sequential_write(ctrl_id, BLOCK_SIZE_1M, 50)
+  result_count = result_count + 1
+
+  // Random read tests
+  foundation.serial_write_string("\n--- Random Read Tests (4K) ---\n")
+  results[result_count] = benchmark_random_read(ctrl_id, BLOCK_SIZE_4K, 1000)
+  result_count = result_count + 1
+
+  // Random write tests
+  foundation.serial_write_string("\n--- Random Write Tests (4K) ---\n")
+  results[result_count] = benchmark_random_write(ctrl_id, BLOCK_SIZE_4K, 500)
+  result_count = result_count + 1
+
+  foundation.serial_write_string("\n==========================================================\n")
+  foundation.serial_write_string("                    BENCHMARK COMPLETE\n")
+  foundation.serial_write_string("==========================================================\n\n")
+}
+
+// Run single test
+export fn sd_benchmark_run_single(ctrl_id: u32, test_type: u32, block_count: u32, iterations: u32): u32 {
+  if result_count >= MAX_RESULTS {
+    return 1
+  }
+
+  if test_type == TEST_SEQUENTIAL_READ {
+    results[result_count] = benchmark_sequential_read(ctrl_id, block_count, iterations)
+  } else if test_type == TEST_SEQUENTIAL_WRITE {
+    results[result_count] = benchmark_sequential_write(ctrl_id, block_count, iterations)
+  } else if test_type == TEST_RANDOM_READ {
+    results[result_count] = benchmark_random_read(ctrl_id, block_count, iterations)
+  } else if test_type == TEST_RANDOM_WRITE {
+    results[result_count] = benchmark_random_write(ctrl_id, block_count, iterations)
+  } else {
+    return 1
+  }
+
+  result_count = result_count + 1
+  return 0
+}
+
+// Print results
+export fn sd_benchmark_print_results() {
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("==========================================================\n")
+  foundation.serial_write_string("                   BENCHMARK RESULTS\n")
+  foundation.serial_write_string("==========================================================\n\n")
+
+  foundation.serial_write_string("Test Type          Block Size  Throughput   Avg Lat   IOPS     Errors\n")
+  foundation.serial_write_string("------------------------------------------------------------------------\n")
+
+  var i: u32 = 0
+  loop {
+    if i >= result_count { break }
+
+    let r: *BenchmarkResult = &results[i]
+
+    // Test type
+    if r.test_type == TEST_SEQUENTIAL_READ {
+      foundation.serial_write_string("Seq Read           ")
+    } else if r.test_type == TEST_SEQUENTIAL_WRITE {
+      foundation.serial_write_string("Seq Write          ")
+    } else if r.test_type == TEST_RANDOM_READ {
+      foundation.serial_write_string("Random Read        ")
+    } else if r.test_type == TEST_RANDOM_WRITE {
+      foundation.serial_write_string("Random Write       ")
+    }
+
+    // Block size
+    let bs_kb: u32 = (r.block_size * 512) / 1024
+    if bs_kb == 0 {
+      foundation.serial_write_string("512B        ")
+    } else {
+      foundation.serial_write_u64(bs_kb)
+      foundation.serial_write_string("KB          ")
+    }
+
+    // Throughput
+    foundation.serial_write_u64(r.throughput_kbps)
+    foundation.serial_write_string(" KB/s    ")
+
+    // Average latency
+    foundation.serial_write_u64(r.avg_latency_us)
+    foundation.serial_write_string(" us    ")
+
+    // IOPS
+    foundation.serial_write_u64(r.iops)
+    foundation.serial_write_string("       ")
+
+    // Errors
+    foundation.serial_write_u64(r.errors)
+    foundation.serial_write_string("\n")
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("------------------------------------------------------------------------\n\n")
+}
+
+// Print detailed result for single test
+export fn sd_benchmark_print_detailed(index: u32) {
+  if index >= result_count {
+    foundation.serial_write_string("[SD Benchmark] Invalid result index\n")
+    return
+  }
+
+  let r: *BenchmarkResult = &results[index]
+
+  foundation.serial_write_string("\n--- Detailed Result ---\n")
+
+  foundation.serial_write_string("Test type: ")
+  if r.test_type == TEST_SEQUENTIAL_READ {
+    foundation.serial_write_string("Sequential Read\n")
+  } else if r.test_type == TEST_SEQUENTIAL_WRITE {
+    foundation.serial_write_string("Sequential Write\n")
+  } else if r.test_type == TEST_RANDOM_READ {
+    foundation.serial_write_string("Random Read\n")
+  } else {
+    foundation.serial_write_string("Random Write\n")
+  }
+
+  foundation.serial_write_string("Block size: ")
+  foundation.serial_write_u64(r.block_size * 512)
+  foundation.serial_write_string(" bytes\n")
+
+  foundation.serial_write_string("Total blocks: ")
+  foundation.serial_write_u64(r.total_blocks)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Total bytes: ")
+  foundation.serial_write_u64(r.total_bytes)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Elapsed time: ")
+  foundation.serial_write_u64(r.elapsed_us)
+  foundation.serial_write_string(" us\n")
+
+  foundation.serial_write_string("Throughput: ")
+  foundation.serial_write_u64(r.throughput_kbps)
+  foundation.serial_write_string(" KB/s (")
+  foundation.serial_write_u64(r.throughput_kbps / 1024)
+  foundation.serial_write_string(" MB/s)\n")
+
+  foundation.serial_write_string("Latency (avg): ")
+  foundation.serial_write_u64(r.avg_latency_us)
+  foundation.serial_write_string(" us\n")
+
+  foundation.serial_write_string("Latency (min): ")
+  foundation.serial_write_u64(r.min_latency_us)
+  foundation.serial_write_string(" us\n")
+
+  foundation.serial_write_string("Latency (max): ")
+  foundation.serial_write_u64(r.max_latency_us)
+  foundation.serial_write_string(" us\n")
+
+  foundation.serial_write_string("IOPS: ")
+  foundation.serial_write_u64(r.iops)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Errors: ")
+  foundation.serial_write_u64(r.errors)
+  foundation.serial_write_string("\n\n")
+}
+
+// ============================================================================
+// COMPARISON WITH PI MODELS
+// ============================================================================
+
+// Expected performance targets for Pi models
+const PI3_SEQ_READ_TARGET: u64 = 23000    // ~23 MB/s
+const PI3_SEQ_WRITE_TARGET: u64 = 10000   // ~10 MB/s
+const PI4_SEQ_READ_TARGET: u64 = 45000    // ~45 MB/s
+const PI4_SEQ_WRITE_TARGET: u64 = 25000   // ~25 MB/s
+const PI5_SEQ_READ_TARGET: u64 = 90000    // ~90 MB/s
+const PI5_SEQ_WRITE_TARGET: u64 = 45000   // ~45 MB/s
+
+export fn sd_benchmark_check_targets(pi_model: u32) {
+  foundation.serial_write_string("\n--- Performance Target Check ---\n")
+
+  var read_target: u64 = 0
+  var write_target: u64 = 0
+
+  if pi_model == 3 {
+    read_target = PI3_SEQ_READ_TARGET
+    write_target = PI3_SEQ_WRITE_TARGET
+    foundation.serial_write_string("Target: Raspberry Pi 3\n")
+  } else if pi_model == 4 {
+    read_target = PI4_SEQ_READ_TARGET
+    write_target = PI4_SEQ_WRITE_TARGET
+    foundation.serial_write_string("Target: Raspberry Pi 4\n")
+  } else if pi_model == 5 {
+    read_target = PI5_SEQ_READ_TARGET
+    write_target = PI5_SEQ_WRITE_TARGET
+    foundation.serial_write_string("Target: Raspberry Pi 5\n")
+  } else {
+    foundation.serial_write_string("Unknown Pi model\n")
+    return
+  }
+
+  foundation.serial_write_string("Sequential read target: ")
+  foundation.serial_write_u64(read_target)
+  foundation.serial_write_string(" KB/s\n")
+
+  foundation.serial_write_string("Sequential write target: ")
+  foundation.serial_write_u64(write_target)
+  foundation.serial_write_string(" KB/s\n\n")
+
+  // Find best sequential read/write results
+  var best_read: u64 = 0
+  var best_write: u64 = 0
+
+  var i: u32 = 0
+  loop {
+    if i >= result_count { break }
+
+    let r: *BenchmarkResult = &results[i]
+
+    if r.test_type == TEST_SEQUENTIAL_READ && r.throughput_kbps > best_read {
+      best_read = r.throughput_kbps
+    }
+    if r.test_type == TEST_SEQUENTIAL_WRITE && r.throughput_kbps > best_write {
+      best_write = r.throughput_kbps
+    }
+
+    i = i + 1
+  }
+
+  foundation.serial_write_string("Achieved read: ")
+  foundation.serial_write_u64(best_read)
+  foundation.serial_write_string(" KB/s ")
+  if best_read >= read_target {
+    foundation.serial_write_string("[PASS]\n")
+  } else {
+    foundation.serial_write_string("[BELOW TARGET]\n")
+  }
+
+  foundation.serial_write_string("Achieved write: ")
+  foundation.serial_write_u64(best_write)
+  foundation.serial_write_string(" KB/s ")
+  if best_write >= write_target {
+    foundation.serial_write_string("[PASS]\n")
+  } else {
+    foundation.serial_write_string("[BELOW TARGET]\n")
+  }
+}
+
+// ============================================================================
+// /proc/sd_benchmark interface
+// ============================================================================
+
+export fn sd_benchmark_proc_read(buffer: *u8, size: u32): u32 {
+  var offset: u32 = 0
+
+  // Header
+  let header: []const u8 = "test_type,block_size,throughput_kbps,avg_lat_us,iops,errors\n"
+  var i: u32 = 0
+  loop {
+    if i >= header.len { break }
+    if offset >= size - 1 { break }
+    buffer[offset] = header[i]
+    offset = offset + 1
+    i = i + 1
+  }
+
+  // Results (CSV format for easy parsing)
+  var idx: u32 = 0
+  loop {
+    if idx >= result_count { break }
+    if offset >= size - 100 { break }
+
+    let r: *BenchmarkResult = &results[idx]
+
+    // Type
+    if r.test_type == TEST_SEQUENTIAL_READ {
+      offset = append_string(buffer, offset, size, "seq_read,")
+    } else if r.test_type == TEST_SEQUENTIAL_WRITE {
+      offset = append_string(buffer, offset, size, "seq_write,")
+    } else if r.test_type == TEST_RANDOM_READ {
+      offset = append_string(buffer, offset, size, "rand_read,")
+    } else {
+      offset = append_string(buffer, offset, size, "rand_write,")
+    }
+
+    // Block size
+    offset = append_u64(buffer, offset, size, r.block_size * 512)
+    buffer[offset] = 44  // comma
+    offset = offset + 1
+
+    // Throughput
+    offset = append_u64(buffer, offset, size, r.throughput_kbps)
+    buffer[offset] = 44
+    offset = offset + 1
+
+    // Avg latency
+    offset = append_u64(buffer, offset, size, r.avg_latency_us)
+    buffer[offset] = 44
+    offset = offset + 1
+
+    // IOPS
+    offset = append_u64(buffer, offset, size, r.iops)
+    buffer[offset] = 44
+    offset = offset + 1
+
+    // Errors
+    offset = append_u64(buffer, offset, size, r.errors)
+    buffer[offset] = 10  // newline
+    offset = offset + 1
+
+    idx = idx + 1
+  }
+
+  buffer[offset] = 0
+  return offset
+}
+
+fn append_string(buffer: *u8, offset: u32, size: u32, s: []const u8): u32 {
+  var o: u32 = offset
+  var i: u32 = 0
+  loop {
+    if i >= s.len { break }
+    if o >= size - 1 { break }
+    buffer[o] = s[i]
+    o = o + 1
+    i = i + 1
+  }
+  return o
+}
+
+fn append_u64(buffer: *u8, offset: u32, size: u32, val: u64): u32 {
+  var temp: [20]u8
+  var v: u64 = val
+  var i: u32 = 0
+
+  if v == 0 {
+    if offset < size - 1 {
+      buffer[offset] = 48  // '0'
+      return offset + 1
+    }
+    return offset
+  }
+
+  loop {
+    if v == 0 { break }
+    temp[i] = (v % 10) + 48
+    v = v / 10
+    i = i + 1
+  }
+
+  var o: u32 = offset
+  loop {
+    if i == 0 { break }
+    if o >= size - 1 { break }
+    i = i - 1
+    buffer[o] = temp[i]
+    o = o + 1
+  }
+
+  return o
+}

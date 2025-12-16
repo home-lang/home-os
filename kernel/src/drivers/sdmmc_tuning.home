@@ -1,0 +1,799 @@
+// home-os SD/MMC Tuning Module
+// Configurable request queues, DMA burst sizes, and error handling
+// Optimized for SD card wear leveling and latency
+
+import "../core/foundation.home" as foundation
+import "../core/memory.home" as memory
+
+// ============================================================================
+// TUNING PARAMETERS
+// ============================================================================
+
+// Request queue configuration
+const MAX_QUEUE_DEPTH: u32 = 64          // Maximum pending requests
+const DEFAULT_QUEUE_DEPTH: u32 = 32      // Default queue depth
+const MIN_QUEUE_DEPTH: u32 = 4           // Minimum queue depth
+
+// DMA burst sizes (in bytes)
+const DMA_BURST_16: u32 = 16
+const DMA_BURST_32: u32 = 32
+const DMA_BURST_64: u32 = 64
+const DMA_BURST_128: u32 = 128
+const DMA_BURST_256: u32 = 256
+
+// Optimal burst sizes per Pi model
+const PI3_OPTIMAL_BURST: u32 = DMA_BURST_64
+const PI4_OPTIMAL_BURST: u32 = DMA_BURST_128
+const PI5_OPTIMAL_BURST: u32 = DMA_BURST_256
+
+// Error handling strategies
+const ERR_STRATEGY_RETRY: u32 = 0        // Simple retry
+const ERR_STRATEGY_BACKOFF: u32 = 1      // Exponential backoff
+const ERR_STRATEGY_RESET: u32 = 2        // Reset controller and retry
+
+// Retry configuration
+const DEFAULT_MAX_RETRIES: u32 = 3
+const DEFAULT_RETRY_DELAY_US: u32 = 1000   // 1ms
+const MAX_BACKOFF_DELAY_US: u32 = 100000   // 100ms
+
+// Wear leveling awareness
+const WEAR_LEVEL_NONE: u32 = 0           // No wear awareness
+const WEAR_LEVEL_BASIC: u32 = 1          // Avoid hot spots
+const WEAR_LEVEL_ADVANCED: u32 = 2       // Full wear tracking
+
+// ============================================================================
+// TUNING PROFILE
+// ============================================================================
+
+struct TuningProfile {
+  name: [16]u8
+
+  // Queue settings
+  queue_depth: u32
+  merge_enabled: u32
+  merge_max_blocks: u32
+
+  // DMA settings
+  dma_burst_size: u32
+  dma_alignment: u32
+  dma_max_transfer: u32
+
+  // Timing
+  read_timeout_ms: u32
+  write_timeout_ms: u32
+  cmd_timeout_ms: u32
+
+  // Error handling
+  error_strategy: u32
+  max_retries: u32
+  retry_delay_us: u32
+
+  // Wear leveling
+  wear_level_mode: u32
+
+  // Power management
+  idle_timeout_ms: u32
+  low_power_mode: u32
+
+  // Statistics thresholds
+  latency_warning_us: u32
+  error_rate_warning: u32    // Per 10000 operations
+}
+
+// Pre-defined profiles
+const PROFILE_DEFAULT: u32 = 0
+const PROFILE_PERFORMANCE: u32 = 1
+const PROFILE_BALANCED: u32 = 2
+const PROFILE_POWER_SAVE: u32 = 3
+const PROFILE_PI3: u32 = 4
+const PROFILE_PI4: u32 = 5
+const PROFILE_PI5: u32 = 6
+
+const NUM_PROFILES: u32 = 7
+
+// ============================================================================
+// REQUEST QUEUE
+// ============================================================================
+
+const REQ_TYPE_READ: u32 = 0
+const REQ_TYPE_WRITE: u32 = 1
+
+struct QueuedRequest {
+  req_type: u32
+  block_start: u64
+  block_count: u32
+  buffer: u64
+  priority: u32
+  submit_time: u64
+  retries: u32
+  next: *QueuedRequest
+}
+
+struct RequestQueue {
+  head: *QueuedRequest
+  tail: *QueuedRequest
+  count: u32
+  max_depth: u32
+
+  // Statistics
+  total_submitted: u64
+  total_completed: u64
+  total_merged: u64
+  total_errors: u64
+}
+
+// ============================================================================
+// ERROR TRACKING
+// ============================================================================
+
+struct ErrorStats {
+  read_errors: u64
+  write_errors: u64
+  timeout_errors: u64
+  crc_errors: u64
+  cmd_errors: u64
+
+  last_error_block: u64
+  last_error_time: u64
+  consecutive_errors: u32
+
+  // Error rate tracking (rolling window)
+  error_window: [100]u32      // Last 100 operation results (0=ok, 1=error)
+  error_window_idx: u32
+  error_window_sum: u32
+}
+
+// ============================================================================
+// WEAR LEVEL TRACKING
+// ============================================================================
+
+const WEAR_MAP_SIZE: u32 = 1024          // Track 1024 regions
+const BLOCKS_PER_REGION: u64 = 65536     // 32MB per region
+
+struct WearMap {
+  write_counts: [WEAR_MAP_SIZE]u32
+  erase_counts: [WEAR_MAP_SIZE]u32
+  last_access: [WEAR_MAP_SIZE]u64
+
+  total_writes: u64
+  total_erases: u64
+  hot_region: u32
+  cold_region: u32
+}
+
+// ============================================================================
+// CONTROLLER TUNING STATE
+// ============================================================================
+
+struct ControllerTuning {
+  ctrl_id: u32
+
+  // Active profile
+  profile: TuningProfile
+
+  // Request queue
+  queue: RequestQueue
+
+  // Error tracking
+  errors: ErrorStats
+
+  // Wear map
+  wear: WearMap
+
+  // Runtime stats
+  avg_read_latency_us: u64
+  avg_write_latency_us: u64
+  peak_read_latency_us: u64
+  peak_write_latency_us: u64
+
+  // State
+  initialized: u32
+  low_power_active: u32
+}
+
+const MAX_TUNED_CONTROLLERS: u32 = 4
+
+var tuned_controllers: [MAX_TUNED_CONTROLLERS]ControllerTuning
+var tuned_count: u32 = 0
+
+// Pre-defined profiles storage
+var profiles: [NUM_PROFILES]TuningProfile
+
+// ============================================================================
+// PROFILE INITIALIZATION
+// ============================================================================
+
+fn set_profile_name(p: *TuningProfile, name: []const u8) {
+  var i: u32 = 0
+  loop {
+    if i >= 15 { break }
+    if i >= name.len { break }
+    p.name[i] = name[i]
+    i = i + 1
+  }
+  p.name[i] = 0
+}
+
+fn init_profiles() {
+  // Default profile
+  set_profile_name(&profiles[PROFILE_DEFAULT], "default")
+  profiles[PROFILE_DEFAULT].queue_depth = DEFAULT_QUEUE_DEPTH
+  profiles[PROFILE_DEFAULT].merge_enabled = 1
+  profiles[PROFILE_DEFAULT].merge_max_blocks = 128
+  profiles[PROFILE_DEFAULT].dma_burst_size = DMA_BURST_64
+  profiles[PROFILE_DEFAULT].dma_alignment = 4
+  profiles[PROFILE_DEFAULT].dma_max_transfer = 65536
+  profiles[PROFILE_DEFAULT].read_timeout_ms = 1000
+  profiles[PROFILE_DEFAULT].write_timeout_ms = 2000
+  profiles[PROFILE_DEFAULT].cmd_timeout_ms = 500
+  profiles[PROFILE_DEFAULT].error_strategy = ERR_STRATEGY_RETRY
+  profiles[PROFILE_DEFAULT].max_retries = 3
+  profiles[PROFILE_DEFAULT].retry_delay_us = 1000
+  profiles[PROFILE_DEFAULT].wear_level_mode = WEAR_LEVEL_BASIC
+  profiles[PROFILE_DEFAULT].idle_timeout_ms = 5000
+  profiles[PROFILE_DEFAULT].low_power_mode = 0
+  profiles[PROFILE_DEFAULT].latency_warning_us = 100000
+  profiles[PROFILE_DEFAULT].error_rate_warning = 10
+
+  // Performance profile
+  set_profile_name(&profiles[PROFILE_PERFORMANCE], "performance")
+  profiles[PROFILE_PERFORMANCE].queue_depth = MAX_QUEUE_DEPTH
+  profiles[PROFILE_PERFORMANCE].merge_enabled = 1
+  profiles[PROFILE_PERFORMANCE].merge_max_blocks = 256
+  profiles[PROFILE_PERFORMANCE].dma_burst_size = DMA_BURST_256
+  profiles[PROFILE_PERFORMANCE].dma_alignment = 64
+  profiles[PROFILE_PERFORMANCE].dma_max_transfer = 131072
+  profiles[PROFILE_PERFORMANCE].read_timeout_ms = 500
+  profiles[PROFILE_PERFORMANCE].write_timeout_ms = 1000
+  profiles[PROFILE_PERFORMANCE].cmd_timeout_ms = 250
+  profiles[PROFILE_PERFORMANCE].error_strategy = ERR_STRATEGY_RETRY
+  profiles[PROFILE_PERFORMANCE].max_retries = 2
+  profiles[PROFILE_PERFORMANCE].retry_delay_us = 500
+  profiles[PROFILE_PERFORMANCE].wear_level_mode = WEAR_LEVEL_NONE
+  profiles[PROFILE_PERFORMANCE].idle_timeout_ms = 0
+  profiles[PROFILE_PERFORMANCE].low_power_mode = 0
+  profiles[PROFILE_PERFORMANCE].latency_warning_us = 50000
+  profiles[PROFILE_PERFORMANCE].error_rate_warning = 50
+
+  // Balanced profile
+  set_profile_name(&profiles[PROFILE_BALANCED], "balanced")
+  profiles[PROFILE_BALANCED].queue_depth = 32
+  profiles[PROFILE_BALANCED].merge_enabled = 1
+  profiles[PROFILE_BALANCED].merge_max_blocks = 128
+  profiles[PROFILE_BALANCED].dma_burst_size = DMA_BURST_128
+  profiles[PROFILE_BALANCED].dma_alignment = 4
+  profiles[PROFILE_BALANCED].dma_max_transfer = 65536
+  profiles[PROFILE_BALANCED].read_timeout_ms = 1000
+  profiles[PROFILE_BALANCED].write_timeout_ms = 2000
+  profiles[PROFILE_BALANCED].cmd_timeout_ms = 500
+  profiles[PROFILE_BALANCED].error_strategy = ERR_STRATEGY_BACKOFF
+  profiles[PROFILE_BALANCED].max_retries = 3
+  profiles[PROFILE_BALANCED].retry_delay_us = 1000
+  profiles[PROFILE_BALANCED].wear_level_mode = WEAR_LEVEL_BASIC
+  profiles[PROFILE_BALANCED].idle_timeout_ms = 3000
+  profiles[PROFILE_BALANCED].low_power_mode = 1
+  profiles[PROFILE_BALANCED].latency_warning_us = 100000
+  profiles[PROFILE_BALANCED].error_rate_warning = 20
+
+  // Power save profile
+  set_profile_name(&profiles[PROFILE_POWER_SAVE], "powersave")
+  profiles[PROFILE_POWER_SAVE].queue_depth = 16
+  profiles[PROFILE_POWER_SAVE].merge_enabled = 1
+  profiles[PROFILE_POWER_SAVE].merge_max_blocks = 64
+  profiles[PROFILE_POWER_SAVE].dma_burst_size = DMA_BURST_32
+  profiles[PROFILE_POWER_SAVE].dma_alignment = 4
+  profiles[PROFILE_POWER_SAVE].dma_max_transfer = 32768
+  profiles[PROFILE_POWER_SAVE].read_timeout_ms = 2000
+  profiles[PROFILE_POWER_SAVE].write_timeout_ms = 3000
+  profiles[PROFILE_POWER_SAVE].cmd_timeout_ms = 1000
+  profiles[PROFILE_POWER_SAVE].error_strategy = ERR_STRATEGY_BACKOFF
+  profiles[PROFILE_POWER_SAVE].max_retries = 5
+  profiles[PROFILE_POWER_SAVE].retry_delay_us = 2000
+  profiles[PROFILE_POWER_SAVE].wear_level_mode = WEAR_LEVEL_ADVANCED
+  profiles[PROFILE_POWER_SAVE].idle_timeout_ms = 1000
+  profiles[PROFILE_POWER_SAVE].low_power_mode = 1
+  profiles[PROFILE_POWER_SAVE].latency_warning_us = 200000
+  profiles[PROFILE_POWER_SAVE].error_rate_warning = 10
+
+  // Pi 3 optimized profile
+  set_profile_name(&profiles[PROFILE_PI3], "pi3")
+  profiles[PROFILE_PI3].queue_depth = 16
+  profiles[PROFILE_PI3].merge_enabled = 1
+  profiles[PROFILE_PI3].merge_max_blocks = 64
+  profiles[PROFILE_PI3].dma_burst_size = PI3_OPTIMAL_BURST
+  profiles[PROFILE_PI3].dma_alignment = 4
+  profiles[PROFILE_PI3].dma_max_transfer = 32768
+  profiles[PROFILE_PI3].read_timeout_ms = 1500
+  profiles[PROFILE_PI3].write_timeout_ms = 3000
+  profiles[PROFILE_PI3].cmd_timeout_ms = 750
+  profiles[PROFILE_PI3].error_strategy = ERR_STRATEGY_BACKOFF
+  profiles[PROFILE_PI3].max_retries = 4
+  profiles[PROFILE_PI3].retry_delay_us = 1500
+  profiles[PROFILE_PI3].wear_level_mode = WEAR_LEVEL_BASIC
+  profiles[PROFILE_PI3].idle_timeout_ms = 2000
+  profiles[PROFILE_PI3].low_power_mode = 1
+  profiles[PROFILE_PI3].latency_warning_us = 150000
+  profiles[PROFILE_PI3].error_rate_warning = 15
+
+  // Pi 4 optimized profile
+  set_profile_name(&profiles[PROFILE_PI4], "pi4")
+  profiles[PROFILE_PI4].queue_depth = 32
+  profiles[PROFILE_PI4].merge_enabled = 1
+  profiles[PROFILE_PI4].merge_max_blocks = 128
+  profiles[PROFILE_PI4].dma_burst_size = PI4_OPTIMAL_BURST
+  profiles[PROFILE_PI4].dma_alignment = 16
+  profiles[PROFILE_PI4].dma_max_transfer = 65536
+  profiles[PROFILE_PI4].read_timeout_ms = 1000
+  profiles[PROFILE_PI4].write_timeout_ms = 2000
+  profiles[PROFILE_PI4].cmd_timeout_ms = 500
+  profiles[PROFILE_PI4].error_strategy = ERR_STRATEGY_RETRY
+  profiles[PROFILE_PI4].max_retries = 3
+  profiles[PROFILE_PI4].retry_delay_us = 1000
+  profiles[PROFILE_PI4].wear_level_mode = WEAR_LEVEL_BASIC
+  profiles[PROFILE_PI4].idle_timeout_ms = 3000
+  profiles[PROFILE_PI4].low_power_mode = 0
+  profiles[PROFILE_PI4].latency_warning_us = 100000
+  profiles[PROFILE_PI4].error_rate_warning = 10
+
+  // Pi 5 optimized profile
+  set_profile_name(&profiles[PROFILE_PI5], "pi5")
+  profiles[PROFILE_PI5].queue_depth = MAX_QUEUE_DEPTH
+  profiles[PROFILE_PI5].merge_enabled = 1
+  profiles[PROFILE_PI5].merge_max_blocks = 256
+  profiles[PROFILE_PI5].dma_burst_size = PI5_OPTIMAL_BURST
+  profiles[PROFILE_PI5].dma_alignment = 64
+  profiles[PROFILE_PI5].dma_max_transfer = 131072
+  profiles[PROFILE_PI5].read_timeout_ms = 500
+  profiles[PROFILE_PI5].write_timeout_ms = 1000
+  profiles[PROFILE_PI5].cmd_timeout_ms = 250
+  profiles[PROFILE_PI5].error_strategy = ERR_STRATEGY_RETRY
+  profiles[PROFILE_PI5].max_retries = 2
+  profiles[PROFILE_PI5].retry_delay_us = 500
+  profiles[PROFILE_PI5].wear_level_mode = WEAR_LEVEL_BASIC
+  profiles[PROFILE_PI5].idle_timeout_ms = 5000
+  profiles[PROFILE_PI5].low_power_mode = 0
+  profiles[PROFILE_PI5].latency_warning_us = 50000
+  profiles[PROFILE_PI5].error_rate_warning = 10
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+export fn sdmmc_tuning_init() {
+  tuned_count = 0
+  init_profiles()
+  foundation.serial_write_string("[SD Tuning] Initialized with ")
+  foundation.serial_write_u64(NUM_PROFILES)
+  foundation.serial_write_string(" profiles\n")
+}
+
+export fn sdmmc_tuning_attach(ctrl_id: u32, profile_id: u32): u32 {
+  if tuned_count >= MAX_TUNED_CONTROLLERS {
+    foundation.serial_write_string("[SD Tuning] Maximum tuned controllers reached\n")
+    return 0xFFFFFFFF
+  }
+
+  if profile_id >= NUM_PROFILES {
+    profile_id = PROFILE_DEFAULT
+  }
+
+  let t: *ControllerTuning = &tuned_controllers[tuned_count]
+  t.ctrl_id = ctrl_id
+
+  // Copy profile
+  t.profile = profiles[profile_id]
+
+  // Initialize queue
+  t.queue.head = 0
+  t.queue.tail = 0
+  t.queue.count = 0
+  t.queue.max_depth = t.profile.queue_depth
+  t.queue.total_submitted = 0
+  t.queue.total_completed = 0
+  t.queue.total_merged = 0
+  t.queue.total_errors = 0
+
+  // Initialize error stats
+  t.errors.read_errors = 0
+  t.errors.write_errors = 0
+  t.errors.timeout_errors = 0
+  t.errors.crc_errors = 0
+  t.errors.cmd_errors = 0
+  t.errors.last_error_block = 0
+  t.errors.last_error_time = 0
+  t.errors.consecutive_errors = 0
+  t.errors.error_window_idx = 0
+  t.errors.error_window_sum = 0
+
+  // Initialize wear map
+  t.wear.total_writes = 0
+  t.wear.total_erases = 0
+  t.wear.hot_region = 0
+  t.wear.cold_region = 0
+
+  var i: u32 = 0
+  loop {
+    if i >= WEAR_MAP_SIZE { break }
+    t.wear.write_counts[i] = 0
+    t.wear.erase_counts[i] = 0
+    t.wear.last_access[i] = 0
+    i = i + 1
+  }
+
+  // Initialize runtime stats
+  t.avg_read_latency_us = 0
+  t.avg_write_latency_us = 0
+  t.peak_read_latency_us = 0
+  t.peak_write_latency_us = 0
+
+  t.initialized = 1
+  t.low_power_active = 0
+
+  let id: u32 = tuned_count
+  tuned_count = tuned_count + 1
+
+  foundation.serial_write_string("[SD Tuning] Attached controller ")
+  foundation.serial_write_u64(ctrl_id)
+  foundation.serial_write_string(" with profile '")
+
+  var j: u32 = 0
+  loop {
+    if j >= 16 { break }
+    if t.profile.name[j] == 0 { break }
+    foundation.serial_write_char(t.profile.name[j])
+    j = j + 1
+  }
+
+  foundation.serial_write_string("'\n")
+
+  return id
+}
+
+// Change profile at runtime
+export fn sdmmc_tuning_set_profile(tuning_id: u32, profile_id: u32): u32 {
+  if tuning_id >= tuned_count { return 1 }
+  if profile_id >= NUM_PROFILES { return 1 }
+
+  let t: *ControllerTuning = &tuned_controllers[tuning_id]
+  t.profile = profiles[profile_id]
+  t.queue.max_depth = t.profile.queue_depth
+
+  foundation.serial_write_string("[SD Tuning] Profile changed to '")
+  var j: u32 = 0
+  loop {
+    if j >= 16 { break }
+    if t.profile.name[j] == 0 { break }
+    foundation.serial_write_char(t.profile.name[j])
+    j = j + 1
+  }
+  foundation.serial_write_string("'\n")
+
+  return 0
+}
+
+// Get current DMA burst size for a controller
+export fn sdmmc_tuning_get_burst_size(tuning_id: u32): u32 {
+  if tuning_id >= tuned_count { return DMA_BURST_64 }
+  return tuned_controllers[tuning_id].profile.dma_burst_size
+}
+
+// Get queue depth
+export fn sdmmc_tuning_get_queue_depth(tuning_id: u32): u32 {
+  if tuning_id >= tuned_count { return DEFAULT_QUEUE_DEPTH }
+  return tuned_controllers[tuning_id].profile.queue_depth
+}
+
+// Record error
+export fn sdmmc_tuning_record_error(tuning_id: u32, error_type: u32, block: u64, timestamp: u64) {
+  if tuning_id >= tuned_count { return }
+
+  let t: *ControllerTuning = &tuned_controllers[tuning_id]
+
+  if error_type == REQ_TYPE_READ {
+    t.errors.read_errors = t.errors.read_errors + 1
+  } else {
+    t.errors.write_errors = t.errors.write_errors + 1
+  }
+
+  t.errors.last_error_block = block
+  t.errors.last_error_time = timestamp
+  t.errors.consecutive_errors = t.errors.consecutive_errors + 1
+
+  // Update rolling window
+  t.errors.error_window[t.errors.error_window_idx] = 1
+  t.errors.error_window_sum = t.errors.error_window_sum + 1
+  t.errors.error_window_idx = (t.errors.error_window_idx + 1) % 100
+
+  // Check if old entry was an error and subtract
+  if t.errors.error_window_idx > 0 {
+    if t.errors.error_window[(t.errors.error_window_idx + 99) % 100] == 1 {
+      // Window wrapped, subtract old error
+    }
+  }
+
+  t.queue.total_errors = t.queue.total_errors + 1
+}
+
+// Record successful operation
+export fn sdmmc_tuning_record_success(tuning_id: u32) {
+  if tuning_id >= tuned_count { return }
+
+  let t: *ControllerTuning = &tuned_controllers[tuning_id]
+  t.errors.consecutive_errors = 0
+
+  // Update rolling window
+  t.errors.error_window[t.errors.error_window_idx] = 0
+  t.errors.error_window_idx = (t.errors.error_window_idx + 1) % 100
+}
+
+// Update wear map on write
+export fn sdmmc_tuning_track_write(tuning_id: u32, block: u64, count: u32, timestamp: u64) {
+  if tuning_id >= tuned_count { return }
+
+  let t: *ControllerTuning = &tuned_controllers[tuning_id]
+
+  if t.profile.wear_level_mode == WEAR_LEVEL_NONE { return }
+
+  let region: u32 = (block / BLOCKS_PER_REGION) % WEAR_MAP_SIZE
+
+  t.wear.write_counts[region] = t.wear.write_counts[region] + count
+  t.wear.last_access[region] = timestamp
+  t.wear.total_writes = t.wear.total_writes + count
+
+  // Update hot/cold regions
+  if t.wear.write_counts[region] > t.wear.write_counts[t.wear.hot_region] {
+    t.wear.hot_region = region
+  }
+}
+
+// Get retry parameters based on error strategy
+export fn sdmmc_tuning_get_retry_delay(tuning_id: u32, attempt: u32): u32 {
+  if tuning_id >= tuned_count { return DEFAULT_RETRY_DELAY_US }
+
+  let t: *ControllerTuning = &tuned_controllers[tuning_id]
+
+  if t.profile.error_strategy == ERR_STRATEGY_RETRY {
+    return t.profile.retry_delay_us
+  } else if t.profile.error_strategy == ERR_STRATEGY_BACKOFF {
+    // Exponential backoff: delay * 2^attempt
+    var delay: u32 = t.profile.retry_delay_us << attempt
+    if delay > MAX_BACKOFF_DELAY_US {
+      delay = MAX_BACKOFF_DELAY_US
+    }
+    return delay
+  } else {
+    return t.profile.retry_delay_us
+  }
+}
+
+export fn sdmmc_tuning_should_reset(tuning_id: u32): u32 {
+  if tuning_id >= tuned_count { return 0 }
+
+  let t: *ControllerTuning = &tuned_controllers[tuning_id]
+
+  // Reset if consecutive errors exceed threshold
+  if t.errors.consecutive_errors > t.profile.max_retries {
+    if t.profile.error_strategy == ERR_STRATEGY_RESET {
+      return 1
+    }
+  }
+
+  return 0
+}
+
+// Update latency stats
+export fn sdmmc_tuning_update_latency(tuning_id: u32, req_type: u32, latency_us: u64) {
+  if tuning_id >= tuned_count { return }
+
+  let t: *ControllerTuning = &tuned_controllers[tuning_id]
+
+  if req_type == REQ_TYPE_READ {
+    // Simple moving average
+    t.avg_read_latency_us = (t.avg_read_latency_us * 7 + latency_us) / 8
+    if latency_us > t.peak_read_latency_us {
+      t.peak_read_latency_us = latency_us
+    }
+  } else {
+    t.avg_write_latency_us = (t.avg_write_latency_us * 7 + latency_us) / 8
+    if latency_us > t.peak_write_latency_us {
+      t.peak_write_latency_us = latency_us
+    }
+  }
+
+  // Check warning threshold
+  if latency_us > t.profile.latency_warning_us {
+    foundation.serial_write_string("[SD Tuning] WARNING: High latency detected: ")
+    foundation.serial_write_u64(latency_us)
+    foundation.serial_write_string(" us\n")
+  }
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn sdmmc_tuning_print_stats(tuning_id: u32) {
+  if tuning_id >= tuned_count {
+    foundation.serial_write_string("[SD Tuning] Invalid tuning ID\n")
+    return
+  }
+
+  let t: *ControllerTuning = &tuned_controllers[tuning_id]
+
+  foundation.serial_write_string("\n========== SD TUNING STATISTICS ==========\n\n")
+
+  foundation.serial_write_string("Controller: ")
+  foundation.serial_write_u64(t.ctrl_id)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Profile: ")
+  var j: u32 = 0
+  loop {
+    if j >= 16 { break }
+    if t.profile.name[j] == 0 { break }
+    foundation.serial_write_char(t.profile.name[j])
+    j = j + 1
+  }
+  foundation.serial_write_string("\n\n")
+
+  foundation.serial_write_string("--- Queue Stats ---\n")
+  foundation.serial_write_string("Queue depth: ")
+  foundation.serial_write_u64(t.queue.max_depth)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Total submitted: ")
+  foundation.serial_write_u64(t.queue.total_submitted)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Total completed: ")
+  foundation.serial_write_u64(t.queue.total_completed)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Total merged: ")
+  foundation.serial_write_u64(t.queue.total_merged)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n--- Error Stats ---\n")
+  foundation.serial_write_string("Read errors: ")
+  foundation.serial_write_u64(t.errors.read_errors)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Write errors: ")
+  foundation.serial_write_u64(t.errors.write_errors)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Consecutive errors: ")
+  foundation.serial_write_u64(t.errors.consecutive_errors)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("Error rate (per 100): ")
+  foundation.serial_write_u64(t.errors.error_window_sum)
+  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("\n--- Latency Stats ---\n")
+  foundation.serial_write_string("Avg read latency: ")
+  foundation.serial_write_u64(t.avg_read_latency_us)
+  foundation.serial_write_string(" us\n")
+
+  foundation.serial_write_string("Avg write latency: ")
+  foundation.serial_write_u64(t.avg_write_latency_us)
+  foundation.serial_write_string(" us\n")
+
+  foundation.serial_write_string("Peak read latency: ")
+  foundation.serial_write_u64(t.peak_read_latency_us)
+  foundation.serial_write_string(" us\n")
+
+  foundation.serial_write_string("Peak write latency: ")
+  foundation.serial_write_u64(t.peak_write_latency_us)
+  foundation.serial_write_string(" us\n")
+
+  if t.profile.wear_level_mode != WEAR_LEVEL_NONE {
+    foundation.serial_write_string("\n--- Wear Stats ---\n")
+    foundation.serial_write_string("Total writes tracked: ")
+    foundation.serial_write_u64(t.wear.total_writes)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("Hottest region: ")
+    foundation.serial_write_u64(t.wear.hot_region)
+    foundation.serial_write_string(" (")
+    foundation.serial_write_u64(t.wear.write_counts[t.wear.hot_region])
+    foundation.serial_write_string(" writes)\n")
+  }
+
+  foundation.serial_write_string("\n==========================================\n\n")
+}
+
+// ============================================================================
+// /proc interface
+// ============================================================================
+
+export fn sdmmc_tuning_proc_read(buffer: *u8, size: u32): u32 {
+  var offset: u32 = 0
+
+  var i: u32 = 0
+  loop {
+    if i >= tuned_count { break }
+    if offset >= size - 200 { break }
+
+    let t: *ControllerTuning = &tuned_controllers[i]
+
+    // Controller ID
+    offset = append_str(buffer, offset, size, "ctrl")
+    offset = append_num(buffer, offset, size, t.ctrl_id)
+    offset = append_str(buffer, offset, size, " ")
+
+    // Profile name
+    var j: u32 = 0
+    loop {
+      if j >= 16 { break }
+      if t.profile.name[j] == 0 { break }
+      if offset < size - 1 {
+        buffer[offset] = t.profile.name[j]
+        offset = offset + 1
+      }
+      j = j + 1
+    }
+
+    offset = append_str(buffer, offset, size, " burst=")
+    offset = append_num(buffer, offset, size, t.profile.dma_burst_size)
+
+    offset = append_str(buffer, offset, size, " qdepth=")
+    offset = append_num(buffer, offset, size, t.profile.queue_depth)
+
+    offset = append_str(buffer, offset, size, " errors=")
+    offset = append_num(buffer, offset, size, t.errors.read_errors + t.errors.write_errors)
+
+    offset = append_str(buffer, offset, size, "\n")
+
+    i = i + 1
+  }
+
+  buffer[offset] = 0
+  return offset
+}
+
+fn append_str(buffer: *u8, offset: u32, size: u32, s: []const u8): u32 {
+  var o: u32 = offset
+  var i: u32 = 0
+  loop {
+    if i >= s.len { break }
+    if o >= size - 1 { break }
+    buffer[o] = s[i]
+    o = o + 1
+    i = i + 1
+  }
+  return o
+}
+
+fn append_num(buffer: *u8, offset: u32, size: u32, val: u64): u32 {
+  var temp: [20]u8
+  var v: u64 = val
+  var i: u32 = 0
+
+  if v == 0 {
+    if offset < size - 1 {
+      buffer[offset] = 48
+      return offset + 1
+    }
+    return offset
+  }
+
+  loop {
+    if v == 0 { break }
+    temp[i] = (v % 10) + 48
+    v = v / 10
+    i = i + 1
+  }
+
+  var o: u32 = offset
+  loop {
+    if i == 0 { break }
+    if o >= size - 1 { break }
+    i = i - 1
+    buffer[o] = temp[i]
+    o = o + 1
+  }
+
+  return o
+}
