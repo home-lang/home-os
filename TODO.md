@@ -718,10 +718,30 @@ Build a next-generation operating system that prioritizes:
   - [x] Pass boot parameters to kernel (magic + info_addr)
   - [x] Support for GPT partition tables (Multiboot2)
 - [x] Implement legacy BIOS bootloader (Multiboot2 + GRUB2)
-  - [ ] MBR boot sector code
-  - [ ] Stage 2 loader
-  - [ ] A20 line activation
-  - [ ] Protected mode transition
+  - [x] MBR boot sector code (**COMPLETED Dec 17, 2025**)
+    - Created `kernel/src/boot/mbr.s` - 512-byte MBR boot sector
+    - Relocates to 0x0600, loads Stage 2 at 0x7E00
+    - Supports LBA extended read with CHS fallback
+    - Saves boot drive for kernel
+  - [x] Stage 2 loader (**COMPLETED Dec 17, 2025**)
+    - Created `kernel/src/boot/stage2.s` - 16KB Stage 2 bootloader
+    - Handles A20 line activation (3 methods: BIOS, keyboard controller, fast A20)
+    - Gets E820 memory map from BIOS
+    - Loads kernel from disk using LBA
+  - [x] A20 line activation (**COMPLETED Dec 17, 2025**)
+    - Implemented in Stage 2 with three fallback methods
+    - BIOS INT 15h AX=2401h, 8042 keyboard controller, Port 0x92 fast A20
+    - Verification via memory wrap-around test
+  - [x] Protected mode transition (**COMPLETED Dec 17, 2025**)
+    - 32-bit GDT setup with code/data segments
+    - Copies kernel from low memory to 1MB
+    - Transitions to 64-bit long mode with 4-level page tables
+    - Identity maps first 2GB using 2MB huge pages
+  - [x] Build system integration
+    - Created `kernel/src/boot/mbr.ld` - MBR linker script
+    - Created `kernel/src/boot/stage2.ld` - Stage 2 linker script
+    - Created `scripts/build-legacy-boot.sh` - automated build script
+    - Generates bootable disk image: `build/home-os-legacy.img`
 - [x] Bootloader configuration system
   - [x] Parse boot configuration file (grub.cfg)
   - [x] Support multiple boot entries (normal, debug, safe)
