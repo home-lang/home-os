@@ -570,7 +570,27 @@ Some modules are complete, others still contain explicit stubs. Focus areas:
     - User/kernel boundary: `ptr_copy_from_user`, `ptr_copy_to_user`
     - Array bounds: `ptr_array_get_*`, `ptr_array_set_*`
     - Audit statistics: tracks null checks, bounds checks, violations caught
-  - [ ] Gradually migrate unsafe patterns to use safety wrappers
+  - [x] Gradually migrate unsafe patterns to use safety wrappers (**COMPLETED Dec 17, 2025**)
+    - Created `kernel/src/security/ptr_migrate.home` - higher-level migration helpers
+      - ValidatedPtr type for tracking validated pointers with region info
+      - Safe read/write operations with bounds checking
+      - Safe memory operations (memcpy, memset)
+      - User/kernel boundary operations with validation
+      - SafeArray type for bounds-checked array access
+      - Page table entry helpers (safe_read_pte, safe_write_pte)
+      - MMIO operations with region validation
+      - Bitmap operations for PMM
+    - Migrated `kernel/src/sys/syscall.home` - critical user/kernel boundary
+      - All syscalls with user buffers now validate pointers before access
+      - Added ptr_safety import and validation for: getcwd, gettimeofday, clock_gettime, clock_getres, pipe, uname, getrlimit, sysinfo, io_uring_setup
+    - Migrated `kernel/src/vmm.home` - page table management
+      - Page table allocation validates alignment and range
+      - getOrCreatePDPT/PD/PT validate addresses before dereferencing
+      - walkPageTables validates at each level of page table hierarchy
+    - Created `scripts/migrate-ptr-safety.sh` - automated migration helper
+      - Generates migration reports with unsafe pattern counts
+      - Identifies high-priority files needing migration
+      - Provides checklist for migrating individual files
 - [x] **VFS permissions & xattrs** – implemented
   - Already covered by VFS audit; ensure enforcement is applied for all filesystems that hook into VFS
 - [x] **Process isolation & sandboxing** (**COMPLETED Dec 5, 2025**)
