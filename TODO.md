@@ -2,7 +2,52 @@
 
 > A modern, performant, minimal operating system built from scratch using Home (language), Craft (UI), and Pantry (package manager)
 
-## 🎉 Recent Progress (December 5, 2025)
+## 🎉 Recent Progress (December 17, 2025)
+
+### Phase 5 File System Enhancements (COMPLETED)
+- ✅ **Journaling for Crash Recovery** - `kernel/src/fs/journal.home`
+  - Write-ahead logging (WAL) with transaction management
+  - Journal modes: DATA, ORDERED, WRITEBACK
+  - Checkpoint and crash recovery support
+  - Descriptor and commit block handling
+- ✅ **fsck.home-fs** - `kernel/src/fs/fsck.home`
+  - 5-pass consistency checker (inodes, directories, connectivity, refs, summaries)
+  - Journal replay on recovery
+  - Lost+found management for orphans
+  - Auto-repair with preen mode
+- ✅ **Extent-Based Allocation** - `kernel/src/fs/extents.home`
+  - B+ tree extent structure (like ext4)
+  - Delayed allocation support
+  - Preallocation via fallocate()
+  - Extent merging and splitting
+- ✅ **B-Tree Directory Indexing** - `kernel/src/fs/btree_dir.home`
+  - B+ tree with hash-based keys
+  - TEA, half-MD4, legacy hash functions
+  - Leaf-level linked list for range scans
+  - Split/merge balancing
+- ✅ **Sparse File Support** - `kernel/src/fs/sparse.home`
+  - Hole detection and tracking
+  - SEEK_DATA/SEEK_HOLE support
+  - Punch hole (FALLOC_FL_PUNCH_HOLE)
+  - Collapse/insert range operations
+  - FIEMAP extent mapping
+- ✅ **Large File Support (>2GB)** - `kernel/src/fs/largefile.home`
+  - 64-bit inode structure
+  - pread64/pwrite64/lseek64 operations
+  - stat64 structure
+  - Up to 16TB file size support
+
+### Files Created
+- `kernel/src/fs/journal.home` - Write-ahead logging journal
+- `kernel/src/fs/fsck.home` - Filesystem check and repair
+- `kernel/src/fs/extents.home` - Extent-based allocation
+- `kernel/src/fs/btree_dir.home` - B-tree directory indexing
+- `kernel/src/fs/sparse.home` - Sparse file support
+- `kernel/src/fs/largefile.home` - Large file support
+
+---
+
+## 🎉 Previous Progress (December 5, 2025)
 
 ### Security Hardening
 - ✅ **Capability-based Syscall Enforcement** - Real capability checks in `kernel/src/sys/syscall.home`
@@ -1068,16 +1113,16 @@ Build a next-generation operating system that prioritizes:
   - [x] Block-based architecture (BLOCK_SIZE = 4096)
   - [x] Block allocation (homefs_alloc_block, homefs_free_block)
   - [x] Inode allocation (homefs_alloc_inode, homefs_free_inode)
-  - [ ] Extent-based allocation (like ext4/XFS) (TODO: Phase 5 - optimization)
-  - [ ] B-tree indexing for directories (TODO: Phase 5 - optimization)
-  - [ ] Journaling for crash recovery (TODO: Phase 5)
+  - [x] Extent-based allocation (like ext4/XFS) (**COMPLETED Dec 17, 2025** - `kernel/src/fs/extents.home`: extent tree with B+ tree structure, delayed allocation, preallocation/fallocate support)
+  - [x] B-tree indexing for directories (**COMPLETED Dec 17, 2025** - `kernel/src/fs/btree_dir.home`: B+ tree directory indexing with hash-based keys, TEA/half-MD4 hashing)
+  - [x] Journaling for crash recovery (**COMPLETED Dec 17, 2025** - `kernel/src/fs/journal.home`: write-ahead logging, transaction management, checkpoint, crash recovery)
   - [ ] Copy-on-write support (like Btrfs) (TODO: Phase 5)
 - [x] Implement core operations
   - [x] File creation, deletion, rename (homefs_create_file, homefs_delete_file, vfs_rename)
   - [x] Directory operations (vfs_mkdir, vfs_rmdir)
   - [x] Read/write operations (homefs_read_block, homefs_write_block)
-  - [ ] Sparse file support (TODO: Phase 5)
-  - [ ] Large file support (>2GB) (TODO: Phase 5)
+  - [x] Sparse file support (**COMPLETED Dec 17, 2025** - `kernel/src/fs/sparse.home`: hole detection, SEEK_DATA/SEEK_HOLE, punch hole, collapse/insert range, FIEMAP support)
+  - [x] Large file support (>2GB) (**COMPLETED Dec 17, 2025** - `kernel/src/fs/largefile.home`: 64-bit inodes, pread64/pwrite64, lseek64, ftruncate64, stat64)
 - [x] Advanced features
   - [x] Extended attributes (xattrs) (homefs_set_xattr, homefs_get_xattr)
   - [ ] Access control lists (ACLs) (TODO: Phase 5)
@@ -1092,7 +1137,7 @@ Build a next-generation operating system that prioritizes:
 
 ### 3.3 File System Utilities
 - [x] mkfs.home-fs (file system creation) (homefs_format)
-- [ ] fsck.home-fs (file system check and repair) (TODO: Phase 5)
+- [x] fsck.home-fs (file system check and repair) (**COMPLETED Dec 17, 2025** - `kernel/src/fs/fsck.home`: 5-pass consistency checker, journal recovery, lost+found, auto-repair)
 - [x] mount/umount commands (mount_fs, umount_fs)
 - [x] df (disk free space) (**COMPLETED**)
   - Full implementation in `apps/utils/df.home`

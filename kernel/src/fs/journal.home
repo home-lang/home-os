@@ -1,0 +1,996 @@
+// HomeOS File System Journaling
+// Write-ahead logging for crash recovery
+//
+// This module implements a journaling layer for the home-fs file system,
+// providing crash recovery through write-ahead logging (WAL).
+//
+// Journal modes:
+// - JOURNAL_DATA: All data and metadata journaled (safest, slowest)
+// - JOURNAL_ORDERED: Metadata journaled, data written before commit (default)
+// - JOURNAL_WRITEBACK: Only metadata journaled (fastest, less safe)
+//
+// Transaction lifecycle:
+// 1. Begin transaction
+// 2. Log all modifications (metadata blocks, optionally data)
+// 3. Commit transaction (write commit record)
+// 4. Checkpoint (write actual data to disk)
+// 5. Mark transaction complete
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const JOURNAL_MAGIC: u32 = 0x4A524E4C  // "JRNL"
+const JOURNAL_VERSION: u32 = 2
+
+// Journal block types
+const JBD_DESCRIPTOR: u32 = 1    // Transaction descriptor block
+const JBD_COMMIT: u32 = 2        // Transaction commit block
+const JBD_SUPERBLOCK_V1: u32 = 3 // Journal superblock v1
+const JBD_SUPERBLOCK_V2: u32 = 4 // Journal superblock v2
+const JBD_REVOKE: u32 = 5        // Revocation records
+
+// Journal modes
+pub const JOURNAL_MODE_DATA: u32 = 0      // Full data journaling
+pub const JOURNAL_MODE_ORDERED: u32 = 1   // Ordered mode (default)
+pub const JOURNAL_MODE_WRITEBACK: u32 = 2 // Writeback mode
+
+// Transaction states
+const TXN_FREE: u32 = 0
+const TXN_RUNNING: u32 = 1
+const TXN_LOCKED: u32 = 2        // No more handles
+const TXN_FLUSH: u32 = 3         // Data writeback
+const TXN_COMMIT: u32 = 4        // Writing to journal
+const TXN_COMMIT_DFLUSH: u32 = 5 // Commit data flush
+const TXN_COMMIT_JFLUSH: u32 = 6 // Commit journal flush
+const TXN_COMMIT_CALLBACK: u32 = 7
+const TXN_FINISHED: u32 = 8
+
+// Block size
+const JOURNAL_BLOCK_SIZE: u32 = 4096
+const MAX_BLOCKS_PER_TXN: u32 = 1024
+const MAX_TRANSACTIONS: u32 = 64
+const MAX_HANDLES: u32 = 256
+
+// Journal flags
+const JFS_UNMOUNT: u32 = 0x0001
+const JFS_ABORT: u32 = 0x0002
+const JFS_ACK_ERR: u32 = 0x0004
+const JFS_FLUSHED: u32 = 0x0008
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// Journal superblock (stored at start of journal)
+pub const JournalSuperblock = struct {
+    magic: u32,
+    block_type: u32,
+    sequence: u32,           // First valid transaction ID
+    block_size: u32,
+    block_count: u32,        // Total blocks in journal
+    first_block: u32,        // First usable block
+    first_txn: u32,          // First transaction ID
+    errno: i32,              // Error value
+
+    // Feature flags
+    feature_compat: u32,
+    feature_incompat: u32,
+    feature_ro_compat: u32,
+
+    // UUID and label
+    uuid: [16]u8,
+    nr_users: u32,
+
+    // Dynamic info
+    max_txn: u32,            // Max transaction ID used
+    max_txn_buffers: u32,    // Max buffers per transaction
+
+    // Checksum
+    checksum_type: u8,
+    padding: [3]u8,
+    checksum: u32,
+}
+
+// Transaction descriptor block header
+pub const DescriptorHeader = struct {
+    magic: u32,
+    block_type: u32,
+    sequence: u32,           // Transaction ID
+}
+
+// Block tag in descriptor (describes one journaled block)
+pub const BlockTag = struct {
+    block_nr: u64,           // Block number on disk
+    flags: u16,
+    checksum: u16,
+}
+
+// Commit block
+pub const CommitBlock = struct {
+    header: DescriptorHeader,
+    commit_time_sec: u64,
+    commit_time_nsec: u32,
+    checksum: u32,
+}
+
+// Revoke block (for invalidating journal entries)
+pub const RevokeBlock = struct {
+    header: DescriptorHeader,
+    count: u32,              // Number of revoked blocks
+    // Followed by array of block numbers
+}
+
+// Journal handle (per-operation)
+pub const JournalHandle = struct {
+    transaction: *Transaction,
+    buffer_count: u32,
+    reserved: u32,
+    sync: bool,
+    valid: bool,
+}
+
+// Journaled buffer head
+pub const JournalBuffer = struct {
+    block_nr: u64,           // Original block number
+    data: [JOURNAL_BLOCK_SIZE]u8,
+    transaction: *Transaction,
+    state: u32,
+    next: *JournalBuffer,
+    valid: bool,
+}
+
+// Transaction
+pub const Transaction = struct {
+    tid: u32,                // Transaction ID
+    state: u32,
+
+    // Buffers
+    buffers: [MAX_BLOCKS_PER_TXN]*JournalBuffer,
+    buffer_count: u32,
+
+    // Revoke list
+    revoke_list: [256]u64,
+    revoke_count: u32,
+
+    // Handles
+    handle_count: u32,
+    outstanding_credits: u32,
+
+    // Timing
+    start_time: u64,
+    commit_time: u64,
+
+    // Journal location
+    log_start: u32,          // Starting block in journal
+    log_end: u32,            // Ending block in journal
+
+    // Statistics
+    blocks_logged: u32,
+    blocks_checkpointed: u32,
+}
+
+// Journal state
+pub const Journal = struct {
+    // Superblock
+    superblock: JournalSuperblock,
+    sb_block: u64,           // Block number of superblock
+
+    // Journal location
+    device_block_start: u64, // Start of journal on device
+    block_count: u32,        // Blocks in journal
+
+    // Mode
+    mode: u32,
+    flags: u32,
+
+    // Sequence numbers
+    sequence: u32,           // Next transaction ID
+    commit_sequence: u32,    // Last committed
+    checkpoint_sequence: u32,// Last checkpointed
+
+    // Journal ring buffer pointers
+    head: u32,               // Next block to write
+    tail: u32,               // Oldest block still needed
+    free: u32,               // Free blocks in journal
+
+    // Transactions
+    transactions: [MAX_TRANSACTIONS]Transaction,
+    running_txn: *Transaction,
+    committing_txn: *Transaction,
+
+    // Handles
+    handles: [MAX_HANDLES]JournalHandle,
+
+    // Buffer pool
+    buffers: [MAX_BLOCKS_PER_TXN]JournalBuffer,
+
+    // Statistics
+    total_commits: u64,
+    total_blocks: u64,
+    checkpoint_time_total: u64,
+
+    // State
+    initialized: bool,
+    mounted: bool,
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var journal: Journal = undefined
+var initialized: bool = false
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn journal_init() void {
+    if (initialized) {
+        return
+    }
+
+    serial.write_string("[JOURNAL] Initializing journaling subsystem...\n")
+
+    // Initialize journal structure
+    journal.mode = JOURNAL_MODE_ORDERED
+    journal.flags = 0
+    journal.sequence = 1
+    journal.commit_sequence = 0
+    journal.checkpoint_sequence = 0
+    journal.head = 0
+    journal.tail = 0
+    journal.free = 0
+    journal.running_txn = undefined
+    journal.committing_txn = undefined
+    journal.total_commits = 0
+    journal.total_blocks = 0
+    journal.checkpoint_time_total = 0
+    journal.initialized = false
+    journal.mounted = false
+
+    // Initialize transactions
+    var i: u32 = 0
+    while (i < MAX_TRANSACTIONS) {
+        journal.transactions[i].state = TXN_FREE
+        journal.transactions[i].tid = 0
+        journal.transactions[i].buffer_count = 0
+        journal.transactions[i].revoke_count = 0
+        journal.transactions[i].handle_count = 0
+        i += 1
+    }
+
+    // Initialize handles
+    i = 0
+    while (i < MAX_HANDLES) {
+        journal.handles[i].valid = false
+        i += 1
+    }
+
+    // Initialize buffers
+    i = 0
+    while (i < MAX_BLOCKS_PER_TXN) {
+        journal.buffers[i].valid = false
+        i += 1
+    }
+
+    initialized = true
+    serial.write_string("[JOURNAL] Journaling subsystem initialized\n")
+}
+
+// Create/load journal for a filesystem
+export fn journal_create(
+    device_block: u64,
+    block_count: u32,
+    mode: u32
+) i32 {
+    if (!initialized) {
+        journal_init()
+    }
+
+    serial.write_string("[JOURNAL] Creating journal: ")
+    serial.write_u32(block_count)
+    serial.write_string(" blocks at block ")
+    serial.write_u64(device_block)
+    serial.write_string("\n")
+
+    journal.device_block_start = device_block
+    journal.block_count = block_count
+    journal.mode = mode
+
+    // Initialize superblock
+    journal.superblock.magic = JOURNAL_MAGIC
+    journal.superblock.block_type = JBD_SUPERBLOCK_V2
+    journal.superblock.sequence = 1
+    journal.superblock.block_size = JOURNAL_BLOCK_SIZE
+    journal.superblock.block_count = block_count
+    journal.superblock.first_block = 1  // After superblock
+    journal.superblock.first_txn = 1
+    journal.superblock.errno = 0
+    journal.superblock.feature_compat = 0
+    journal.superblock.feature_incompat = 0
+    journal.superblock.feature_ro_compat = 0
+    journal.superblock.nr_users = 1
+    journal.superblock.max_txn = 0
+    journal.superblock.max_txn_buffers = MAX_BLOCKS_PER_TXN
+    journal.superblock.checksum_type = 1  // CRC32
+
+    // Generate UUID
+    var i: u32 = 0
+    while (i < 16) {
+        journal.superblock.uuid[i] = @as(u8, @truncate(i * 17 + 42))
+        i += 1
+    }
+
+    // Calculate checksum
+    journal.superblock.checksum = calculate_superblock_checksum()
+
+    // Initialize ring buffer
+    journal.head = 1  // Start after superblock
+    journal.tail = 1
+    journal.free = block_count - 1
+
+    // Write superblock to disk
+    write_superblock()
+
+    journal.initialized = true
+    journal.mounted = true
+
+    serial.write_string("[JOURNAL] Journal created, mode: ")
+    print_mode(mode)
+    serial.write_string("\n")
+
+    return 0
+}
+
+// Load existing journal
+export fn journal_load(device_block: u64) i32 {
+    if (!initialized) {
+        journal_init()
+    }
+
+    serial.write_string("[JOURNAL] Loading journal from block ")
+    serial.write_u64(device_block)
+    serial.write_string("\n")
+
+    journal.device_block_start = device_block
+
+    // Read superblock
+    var result: i32 = read_superblock()
+    if (result < 0) {
+        return result
+    }
+
+    // Validate superblock
+    if (journal.superblock.magic != JOURNAL_MAGIC) {
+        serial.write_string("[JOURNAL] Error: invalid magic\n")
+        return -22  // EINVAL
+    }
+
+    // Check for errors
+    if (journal.superblock.errno != 0) {
+        serial.write_string("[JOURNAL] Warning: journal has recorded error\n")
+    }
+
+    journal.block_count = journal.superblock.block_count
+    journal.sequence = journal.superblock.sequence
+    journal.mode = JOURNAL_MODE_ORDERED  // Default
+
+    // Recover if needed
+    result = journal_recover()
+    if (result < 0) {
+        return result
+    }
+
+    journal.initialized = true
+    journal.mounted = true
+
+    serial.write_string("[JOURNAL] Journal loaded, sequence: ")
+    serial.write_u32(journal.sequence)
+    serial.write_string("\n")
+
+    return 0
+}
+
+// ============================================================================
+// Transaction Management
+// ============================================================================
+
+// Start a new transaction (or join running one)
+export fn journal_start(nblocks: u32) *JournalHandle {
+    if (!journal.mounted) {
+        return undefined
+    }
+
+    // Find or create running transaction
+    var txn: *Transaction = get_running_transaction()
+    if (txn == undefined) {
+        txn = start_new_transaction()
+        if (txn == undefined) {
+            return undefined
+        }
+    }
+
+    // Allocate handle
+    var handle: *JournalHandle = alloc_handle()
+    if (handle == undefined) {
+        return undefined
+    }
+
+    handle.transaction = txn
+    handle.buffer_count = 0
+    handle.reserved = nblocks
+    handle.sync = false
+    handle.valid = true
+
+    txn.handle_count += 1
+    txn.outstanding_credits += nblocks
+
+    return handle
+}
+
+// Get a buffer for modification
+export fn journal_get_write_access(handle: *JournalHandle, block_nr: u64) *JournalBuffer {
+    if (handle == undefined or !handle.valid) {
+        return undefined
+    }
+
+    var txn: *Transaction = handle.transaction
+
+    // Check if already journaled in this transaction
+    var i: u32 = 0
+    while (i < txn.buffer_count) {
+        if (txn.buffers[i] != undefined and txn.buffers[i].block_nr == block_nr) {
+            return txn.buffers[i]
+        }
+        i += 1
+    }
+
+    // Allocate new buffer
+    var buf: *JournalBuffer = alloc_buffer()
+    if (buf == undefined) {
+        return undefined
+    }
+
+    buf.block_nr = block_nr
+    buf.transaction = txn
+    buf.state = 0
+    buf.valid = true
+
+    // Read current block data
+    read_block(block_nr, &buf.data)
+
+    // Add to transaction
+    if (txn.buffer_count < MAX_BLOCKS_PER_TXN) {
+        txn.buffers[txn.buffer_count] = buf
+        txn.buffer_count += 1
+    }
+
+    handle.buffer_count += 1
+
+    return buf
+}
+
+// Mark buffer as dirty (modified)
+export fn journal_dirty_metadata(handle: *JournalHandle, buf: *JournalBuffer) i32 {
+    if (handle == undefined or buf == undefined) {
+        return -22
+    }
+
+    buf.state |= 1  // Dirty flag
+
+    return 0
+}
+
+// Stop a handle (release it)
+export fn journal_stop(handle: *JournalHandle) i32 {
+    if (handle == undefined or !handle.valid) {
+        return -22
+    }
+
+    var txn: *Transaction = handle.transaction
+
+    txn.handle_count -= 1
+    handle.valid = false
+
+    // If last handle and sync requested, force commit
+    if (handle.sync and txn.handle_count == 0) {
+        return journal_commit_transaction(txn)
+    }
+
+    return 0
+}
+
+// Force commit of current transaction
+export fn journal_force_commit() i32 {
+    if (!journal.mounted) {
+        return -1
+    }
+
+    var txn: *Transaction = journal.running_txn
+    if (txn == undefined or txn.state == TXN_FREE) {
+        return 0  // Nothing to commit
+    }
+
+    // Wait for handles to finish
+    if (txn.handle_count > 0) {
+        txn.state = TXN_LOCKED
+    }
+
+    return journal_commit_transaction(txn)
+}
+
+// ============================================================================
+// Commit and Checkpoint
+// ============================================================================
+
+fn journal_commit_transaction(txn: *Transaction) i32 {
+    if (txn == undefined or txn.buffer_count == 0) {
+        return 0
+    }
+
+    serial.write_string("[JOURNAL] Committing transaction ")
+    serial.write_u32(txn.tid)
+    serial.write_string(" (")
+    serial.write_u32(txn.buffer_count)
+    serial.write_string(" blocks)\n")
+
+    txn.state = TXN_COMMIT
+    journal.committing_txn = txn
+
+    // Calculate space needed
+    var blocks_needed: u32 = txn.buffer_count + 2  // +descriptor +commit
+
+    // Check journal space
+    if (blocks_needed > journal.free) {
+        // Need to checkpoint old transactions
+        var result: i32 = journal_checkpoint()
+        if (result < 0) {
+            return result
+        }
+    }
+
+    txn.log_start = journal.head
+
+    // Write descriptor block
+    write_descriptor_block(txn)
+
+    // Write data blocks
+    var i: u32 = 0
+    while (i < txn.buffer_count) {
+        if (txn.buffers[i] != undefined and txn.buffers[i].valid) {
+            write_journal_block(journal.head, &txn.buffers[i].data)
+            journal.head = (journal.head + 1) % journal.block_count
+            if (journal.head == 0) journal.head = 1  // Skip superblock
+            txn.blocks_logged += 1
+        }
+        i += 1
+    }
+
+    // Write commit block
+    write_commit_block(txn)
+
+    txn.log_end = journal.head
+    journal.free -= blocks_needed
+
+    // Update sequence
+    journal.commit_sequence = txn.tid
+    journal.sequence += 1
+
+    txn.state = TXN_COMMIT_JFLUSH
+
+    // Flush journal to disk
+    sync_journal()
+
+    txn.state = TXN_FINISHED
+    txn.commit_time = get_time()
+
+    // Update statistics
+    journal.total_commits += 1
+    journal.total_blocks += txn.buffer_count
+
+    // Clear running transaction
+    if (journal.running_txn == txn) {
+        journal.running_txn = undefined
+    }
+    journal.committing_txn = undefined
+
+    serial.write_string("[JOURNAL] Transaction ")
+    serial.write_u32(txn.tid)
+    serial.write_string(" committed\n")
+
+    return 0
+}
+
+// Checkpoint: write journaled data to final locations
+export fn journal_checkpoint() i32 {
+    serial.write_string("[JOURNAL] Checkpointing...\n")
+
+    var checkpointed: u32 = 0
+
+    // Find committed but not checkpointed transactions
+    var i: u32 = 0
+    while (i < MAX_TRANSACTIONS) {
+        var txn: *Transaction = &journal.transactions[i]
+
+        if (txn.state == TXN_FINISHED and txn.tid <= journal.commit_sequence) {
+            // Checkpoint this transaction
+            var j: u32 = 0
+            while (j < txn.buffer_count) {
+                if (txn.buffers[j] != undefined and txn.buffers[j].valid) {
+                    // Write to final location
+                    write_block(txn.buffers[j].block_nr, &txn.buffers[j].data)
+                    txn.blocks_checkpointed += 1
+
+                    // Free buffer
+                    txn.buffers[j].valid = false
+                }
+                j += 1
+            }
+
+            // Free transaction
+            journal.free += txn.log_end - txn.log_start
+            if (journal.free > journal.block_count - 1) {
+                journal.free = journal.block_count - 1
+            }
+
+            journal.tail = txn.log_end
+            journal.checkpoint_sequence = txn.tid
+
+            txn.state = TXN_FREE
+            txn.buffer_count = 0
+
+            checkpointed += 1
+        }
+
+        i += 1
+    }
+
+    // Update superblock
+    journal.superblock.sequence = journal.checkpoint_sequence + 1
+    write_superblock()
+
+    serial.write_string("[JOURNAL] Checkpointed ")
+    serial.write_u32(checkpointed)
+    serial.write_string(" transactions\n")
+
+    return 0
+}
+
+// ============================================================================
+// Recovery
+// ============================================================================
+
+fn journal_recover() i32 {
+    serial.write_string("[JOURNAL] Scanning for recovery...\n")
+
+    var recovered: u32 = 0
+    var block: u32 = journal.superblock.first_block
+    var expected_seq: u32 = journal.superblock.sequence
+
+    // Scan journal for valid transactions
+    while (block < journal.block_count) {
+        var header: DescriptorHeader = undefined
+        read_journal_block(block, @ptrCast(&header))
+
+        if (header.magic != JOURNAL_MAGIC) {
+            break  // End of valid journal
+        }
+
+        if (header.sequence != expected_seq) {
+            break  // Sequence break
+        }
+
+        if (header.block_type == JBD_DESCRIPTOR) {
+            // Replay this transaction
+            var result: i32 = replay_transaction(block, expected_seq)
+            if (result < 0) {
+                serial.write_string("[JOURNAL] Recovery error at block ")
+                serial.write_u32(block)
+                serial.write_string("\n")
+                break
+            }
+
+            recovered += 1
+            expected_seq += 1
+
+            // Skip to after commit block
+            // (would need to parse descriptor to know size)
+            block += 10  // Simplified
+        } else if (header.block_type == JBD_REVOKE) {
+            // Process revoke block
+            process_revoke(block)
+            block += 1
+        } else {
+            block += 1
+        }
+    }
+
+    if (recovered > 0) {
+        serial.write_string("[JOURNAL] Recovered ")
+        serial.write_u32(recovered)
+        serial.write_string(" transactions\n")
+
+        // Sync recovered data
+        sync_filesystem()
+    } else {
+        serial.write_string("[JOURNAL] No recovery needed\n")
+    }
+
+    // Reset journal
+    journal.head = journal.superblock.first_block
+    journal.tail = journal.head
+    journal.free = journal.block_count - 1
+    journal.sequence = expected_seq
+
+    return 0
+}
+
+fn replay_transaction(start_block: u32, sequence: u32) i32 {
+    serial.write_string("[JOURNAL] Replaying transaction ")
+    serial.write_u32(sequence)
+    serial.write_string("\n")
+
+    // Read descriptor to get block list
+    var block: u32 = start_block + 1  // After descriptor
+
+    // Read and replay each block
+    // (simplified: would parse descriptor for block mapping)
+    var i: u32 = 0
+    while (i < 8) {  // Max blocks per transaction for recovery
+        var data: [JOURNAL_BLOCK_SIZE]u8 = undefined
+        read_journal_block(block, &data)
+
+        // Would get actual block number from descriptor
+        var dest_block: u64 = @as(u64, block) * 100  // Placeholder
+
+        // Write to final location
+        write_block(dest_block, &data)
+
+        block += 1
+        i += 1
+    }
+
+    return 0
+}
+
+fn process_revoke(block: u32) void {
+    // Read revoke block and invalidate listed blocks
+    _ = block
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn get_running_transaction() *Transaction {
+    if (journal.running_txn != undefined and
+        journal.running_txn.state == TXN_RUNNING) {
+        return journal.running_txn
+    }
+    return undefined
+}
+
+fn start_new_transaction() *Transaction {
+    // Find free transaction slot
+    var i: u32 = 0
+    while (i < MAX_TRANSACTIONS) {
+        if (journal.transactions[i].state == TXN_FREE) {
+            var txn: *Transaction = &journal.transactions[i]
+
+            txn.tid = journal.sequence
+            txn.state = TXN_RUNNING
+            txn.buffer_count = 0
+            txn.revoke_count = 0
+            txn.handle_count = 0
+            txn.outstanding_credits = 0
+            txn.start_time = get_time()
+            txn.blocks_logged = 0
+            txn.blocks_checkpointed = 0
+
+            journal.running_txn = txn
+
+            return txn
+        }
+        i += 1
+    }
+    return undefined
+}
+
+fn alloc_handle() *JournalHandle {
+    var i: u32 = 0
+    while (i < MAX_HANDLES) {
+        if (!journal.handles[i].valid) {
+            return &journal.handles[i]
+        }
+        i += 1
+    }
+    return undefined
+}
+
+fn alloc_buffer() *JournalBuffer {
+    var i: u32 = 0
+    while (i < MAX_BLOCKS_PER_TXN) {
+        if (!journal.buffers[i].valid) {
+            return &journal.buffers[i]
+        }
+        i += 1
+    }
+    return undefined
+}
+
+fn write_descriptor_block(txn: *Transaction) void {
+    var desc: DescriptorHeader = undefined
+    desc.magic = JOURNAL_MAGIC
+    desc.block_type = JBD_DESCRIPTOR
+    desc.sequence = txn.tid
+
+    var data: [JOURNAL_BLOCK_SIZE]u8 = undefined
+
+    // Copy header
+    var header_ptr: [*]u8 = @ptrCast(&desc)
+    var i: u32 = 0
+    while (i < @sizeOf(DescriptorHeader)) {
+        data[i] = header_ptr[i]
+        i += 1
+    }
+
+    // Add block tags
+    var tag_offset: u32 = @sizeOf(DescriptorHeader)
+    i = 0
+    while (i < txn.buffer_count and tag_offset + @sizeOf(BlockTag) < JOURNAL_BLOCK_SIZE) {
+        if (txn.buffers[i] != undefined) {
+            var tag: BlockTag = undefined
+            tag.block_nr = txn.buffers[i].block_nr
+            tag.flags = 0
+            tag.checksum = 0
+
+            var tag_ptr: [*]u8 = @ptrCast(&tag)
+            var j: u32 = 0
+            while (j < @sizeOf(BlockTag)) {
+                data[tag_offset + j] = tag_ptr[j]
+                j += 1
+            }
+            tag_offset += @sizeOf(BlockTag)
+        }
+        i += 1
+    }
+
+    write_journal_block(journal.head, &data)
+    journal.head = (journal.head + 1) % journal.block_count
+    if (journal.head == 0) journal.head = 1
+}
+
+fn write_commit_block(txn: *Transaction) void {
+    var commit: CommitBlock = undefined
+    commit.header.magic = JOURNAL_MAGIC
+    commit.header.block_type = JBD_COMMIT
+    commit.header.sequence = txn.tid
+    commit.commit_time_sec = get_time()
+    commit.commit_time_nsec = 0
+    commit.checksum = 0  // Would calculate
+
+    var data: [JOURNAL_BLOCK_SIZE]u8 = undefined
+    var commit_ptr: [*]u8 = @ptrCast(&commit)
+    var i: u32 = 0
+    while (i < @sizeOf(CommitBlock)) {
+        data[i] = commit_ptr[i]
+        i += 1
+    }
+
+    write_journal_block(journal.head, &data)
+    journal.head = (journal.head + 1) % journal.block_count
+    if (journal.head == 0) journal.head = 1
+}
+
+fn calculate_superblock_checksum() u32 {
+    // CRC32 of superblock
+    return 0  // Placeholder
+}
+
+fn read_superblock() i32 {
+    // Would read from disk
+    return 0
+}
+
+fn write_superblock() void {
+    // Would write to disk
+}
+
+fn read_block(block_nr: u64, data: *[JOURNAL_BLOCK_SIZE]u8) void {
+    _ = block_nr
+    _ = data
+    // Would read from disk
+}
+
+fn write_block(block_nr: u64, data: *[JOURNAL_BLOCK_SIZE]u8) void {
+    _ = block_nr
+    _ = data
+    // Would write to disk
+}
+
+fn read_journal_block(offset: u32, data: *[JOURNAL_BLOCK_SIZE]u8) void {
+    read_block(journal.device_block_start + @as(u64, offset), data)
+}
+
+fn write_journal_block(offset: u32, data: *[JOURNAL_BLOCK_SIZE]u8) void {
+    write_block(journal.device_block_start + @as(u64, offset), data)
+}
+
+fn sync_journal() void {
+    // Would flush journal to disk
+}
+
+fn sync_filesystem() void {
+    // Would flush filesystem to disk
+}
+
+fn get_time() u64 {
+    // Would get current time
+    var static_time: u64 = 0
+    static_time += 1
+    return static_time
+}
+
+fn print_mode(mode: u32) void {
+    if (mode == JOURNAL_MODE_DATA) {
+        serial.write_string("data")
+    } else if (mode == JOURNAL_MODE_ORDERED) {
+        serial.write_string("ordered")
+    } else if (mode == JOURNAL_MODE_WRITEBACK) {
+        serial.write_string("writeback")
+    }
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn journal_stats() void {
+    serial.write_string("\n[JOURNAL] Journal Statistics:\n")
+    serial.write_string("  Mode: ")
+    print_mode(journal.mode)
+    serial.write_string("\n")
+    serial.write_string("  Sequence: ")
+    serial.write_u32(journal.sequence)
+    serial.write_string("\n")
+    serial.write_string("  Committed: ")
+    serial.write_u32(journal.commit_sequence)
+    serial.write_string("\n")
+    serial.write_string("  Checkpointed: ")
+    serial.write_u32(journal.checkpoint_sequence)
+    serial.write_string("\n")
+    serial.write_string("  Head: ")
+    serial.write_u32(journal.head)
+    serial.write_string("\n")
+    serial.write_string("  Tail: ")
+    serial.write_u32(journal.tail)
+    serial.write_string("\n")
+    serial.write_string("  Free blocks: ")
+    serial.write_u32(journal.free)
+    serial.write_string("/")
+    serial.write_u32(journal.block_count)
+    serial.write_string("\n")
+    serial.write_string("  Total commits: ")
+    serial.write_u64(journal.total_commits)
+    serial.write_string("\n")
+    serial.write_string("  Total blocks: ")
+    serial.write_u64(journal.total_blocks)
+    serial.write_string("\n")
+}
+
+export fn journal_is_mounted() bool {
+    return journal.mounted
+}
+
+export fn journal_abort(errno: i32) void {
+    journal.flags |= JFS_ABORT
+    journal.superblock.errno = errno
+    write_superblock()
+    serial.write_string("[JOURNAL] Journal aborted with error ")
+    serial.write_u32(@as(u32, @intCast(-errno)))
+    serial.write_string("\n")
+}

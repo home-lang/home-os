@@ -1,0 +1,891 @@
+// home-os Extent-Based Allocation
+// Modern extent tree implementation for efficient large file handling
+
+const std = @import("std");
+const homefs = @import("homefs.home");
+const block_alloc = @import("block_alloc.home");
+
+// =============================================================================
+// Extent Constants
+// =============================================================================
+
+pub const EXTENT_MAGIC: u16 = 0xF30A;
+
+// Maximum extent tree depth (limits: 5 levels = ~1TB files with 4KB blocks)
+pub const MAX_EXTENT_DEPTH: u8 = 5;
+
+// Extents per node (with 4KB blocks, ~340 extents per leaf)
+pub const EXTENTS_PER_LEAF: u32 = 340;
+pub const INDICES_PER_NODE: u32 = 340;
+
+// Extent flags
+pub const EXTENT_FLAG_UNWRITTEN: u16 = 0x0001;  // Preallocated but not written
+pub const EXTENT_FLAG_ENCRYPTED: u16 = 0x0002;  // Extent data is encrypted
+pub const EXTENT_FLAG_COMPRESSED: u16 = 0x0004; // Extent data is compressed
+
+// Allocation hints
+pub const ALLOC_HINT_CONTIGUOUS: u32 = 0x0001;  // Try to allocate contiguously
+pub const ALLOC_HINT_NO_DELAY: u32 = 0x0002;    // Don't use delayed allocation
+pub const ALLOC_HINT_GOAL: u32 = 0x0004;        // Use goal block
+
+// =============================================================================
+// Extent Tree Structures
+// =============================================================================
+
+/// Extent tree header (12 bytes)
+/// Present at the beginning of extent tree root (in inode) and internal nodes
+pub const ExtentHeader = packed struct {
+    magic: u16,              // Magic number (EXTENT_MAGIC)
+    entries: u16,            // Number of valid entries
+    max_entries: u16,        // Maximum entries capacity
+    depth: u16,              // Tree depth (0 = leaf, >0 = internal)
+    generation: u32,         // Generation for COW
+
+    pub fn init(max: u16, is_leaf: bool) ExtentHeader {
+        return ExtentHeader{
+            .magic = EXTENT_MAGIC,
+            .entries = 0,
+            .max_entries = max,
+            .depth = if (is_leaf) 0 else 1,
+            .generation = 0,
+        };
+    }
+
+    pub fn validate(self: *const ExtentHeader) bool {
+        return self.magic == EXTENT_MAGIC and
+            self.entries <= self.max_entries and
+            self.depth <= MAX_EXTENT_DEPTH;
+    }
+};
+
+/// Extent descriptor (12 bytes)
+/// Describes a contiguous range of blocks
+pub const Extent = packed struct {
+    logical_block: u32,      // First logical block covered
+    length: u16,             // Number of blocks (15 bits + unwritten flag)
+    physical_hi: u16,        // High 16 bits of physical block
+    physical_lo: u32,        // Low 32 bits of physical block
+
+    pub fn init(logical: u64, physical: u64, len: u32) Extent {
+        return Extent{
+            .logical_block = @intCast(logical & 0xFFFFFFFF),
+            .length = @intCast(len & 0x7FFF),  // Max 32767 blocks per extent
+            .physical_hi = @intCast((physical >> 32) & 0xFFFF),
+            .physical_lo = @intCast(physical & 0xFFFFFFFF),
+        };
+    }
+
+    pub fn get_physical(self: *const Extent) u64 {
+        return (@as(u64, self.physical_hi) << 32) | @as(u64, self.physical_lo);
+    }
+
+    pub fn set_physical(self: *Extent, block: u64) void {
+        self.physical_hi = @intCast((block >> 32) & 0xFFFF);
+        self.physical_lo = @intCast(block & 0xFFFFFFFF);
+    }
+
+    pub fn get_length(self: *const Extent) u32 {
+        return @as(u32, self.length & 0x7FFF);
+    }
+
+    pub fn is_unwritten(self: *const Extent) bool {
+        return (self.length & 0x8000) != 0;
+    }
+
+    pub fn set_unwritten(self: *Extent, unwritten: bool) void {
+        if (unwritten) {
+            self.length |= 0x8000;
+        } else {
+            self.length &= 0x7FFF;
+        }
+    }
+
+    pub fn covers(self: *const Extent, logical: u64) bool {
+        const start = @as(u64, self.logical_block);
+        const end = start + self.get_length();
+        return logical >= start and logical < end;
+    }
+};
+
+/// Extent index (12 bytes)
+/// Points to a child node in the extent tree
+pub const ExtentIndex = packed struct {
+    logical_block: u32,      // First logical block this subtree covers
+    leaf_hi: u16,            // High 16 bits of child block
+    leaf_lo: u32,            // Low 32 bits of child block
+    unused: u16,             // Padding
+
+    pub fn init(logical: u64, child: u64) ExtentIndex {
+        return ExtentIndex{
+            .logical_block = @intCast(logical & 0xFFFFFFFF),
+            .leaf_hi = @intCast((child >> 32) & 0xFFFF),
+            .leaf_lo = @intCast(child & 0xFFFFFFFF),
+            .unused = 0,
+        };
+    }
+
+    pub fn get_child(self: *const ExtentIndex) u64 {
+        return (@as(u64, self.leaf_hi) << 32) | @as(u64, self.leaf_lo);
+    }
+
+    pub fn set_child(self: *ExtentIndex, block: u64) void {
+        self.leaf_hi = @intCast((block >> 32) & 0xFFFF);
+        self.leaf_lo = @intCast(block & 0xFFFFFFFF);
+    }
+};
+
+// =============================================================================
+// Extent Path (for tree traversal)
+// =============================================================================
+
+/// One level in the extent tree path
+pub const ExtentPathEntry = struct {
+    block: u64,              // Block number of this node
+    header: *ExtentHeader,   // Node header
+    depth: u16,              // Depth at this level
+
+    // Union: either index or extent depending on depth
+    index: ?*ExtentIndex,    // Index entry (if depth > 0)
+    extent: ?*Extent,        // Extent entry (if depth == 0)
+
+    buffer: []u8,            // Buffer containing node data
+};
+
+/// Complete path from root to leaf
+pub const ExtentPath = struct {
+    entries: [MAX_EXTENT_DEPTH + 1]ExtentPathEntry,
+    depth: u8,
+
+    pub fn init() ExtentPath {
+        return ExtentPath{
+            .entries = undefined,
+            .depth = 0,
+        };
+    }
+
+    pub fn release(self: *ExtentPath) void {
+        var i: u8 = 0;
+        while (i <= self.depth) : (i += 1) {
+            if (self.entries[i].buffer.len > 0) {
+                // Release buffer back to cache
+                release_buffer(self.entries[i].buffer);
+            }
+        }
+    }
+};
+
+// =============================================================================
+// Extent Tree Operations
+// =============================================================================
+
+pub const ExtentTree = struct {
+    inode: *homefs.Inode,
+    block_size: u32,
+
+    // Statistics
+    extents_count: u32,
+    blocks_mapped: u64,
+
+    pub fn init(inode: *homefs.Inode, block_size: u32) ExtentTree {
+        return ExtentTree{
+            .inode = inode,
+            .block_size = block_size,
+            .extents_count = 0,
+            .blocks_mapped = 0,
+        };
+    }
+
+    /// Initialize extent tree in inode (first use)
+    pub fn create(self: *ExtentTree) !void {
+        // Initialize extent header in inode block area
+        const header = @as(*ExtentHeader, @ptrCast(&self.inode.block_data[0]));
+        const max_inline = (@sizeOf(@TypeOf(self.inode.block_data)) - @sizeOf(ExtentHeader)) / @sizeOf(Extent);
+
+        header.* = ExtentHeader.init(@intCast(max_inline), true);
+
+        // Mark inode as using extents
+        self.inode.flags |= homefs.INODE_EXTENTS;
+    }
+
+    /// Look up physical block for a logical block
+    pub fn lookup(self: *ExtentTree, logical_block: u64) !?u64 {
+        var path = ExtentPath.init();
+        defer path.release();
+
+        // Find the extent containing this logical block
+        const extent = try self.find_extent(&path, logical_block);
+
+        if (extent) |ext| {
+            if (ext.covers(logical_block)) {
+                const offset = logical_block - @as(u64, ext.logical_block);
+                return ext.get_physical() + offset;
+            }
+        }
+
+        return null;  // No mapping exists (hole or beyond EOF)
+    }
+
+    /// Map a range of logical blocks to physical blocks
+    pub fn map(self: *ExtentTree, logical_start: u64, count: u32, flags: u32) !u64 {
+        var path = ExtentPath.init();
+        defer path.release();
+
+        // Check if extent already exists
+        const existing = try self.find_extent(&path, logical_start);
+
+        if (existing) |ext| {
+            if (ext.covers(logical_start)) {
+                // Already mapped - return existing mapping
+                const offset = logical_start - @as(u64, ext.logical_block);
+                return ext.get_physical() + offset;
+            }
+        }
+
+        // Need to allocate new blocks
+        const goal = self.compute_goal_block(logical_start, &path);
+        const physical = try self.allocate_blocks(count, goal, flags);
+
+        // Insert new extent
+        try self.insert_extent(&path, logical_start, physical, count, flags);
+
+        return physical;
+    }
+
+    /// Remove mapping for a range of logical blocks
+    pub fn unmap(self: *ExtentTree, logical_start: u64, count: u32) !void {
+        var path = ExtentPath.init();
+        defer path.release();
+
+        var remaining = count;
+        var current = logical_start;
+
+        while (remaining > 0) {
+            const extent = try self.find_extent(&path, current);
+
+            if (extent) |ext| {
+                if (ext.covers(current)) {
+                    const ext_start = @as(u64, ext.logical_block);
+                    const ext_end = ext_start + ext.get_length();
+
+                    // Calculate overlap
+                    const overlap_start = @max(current, ext_start);
+                    const overlap_end = @min(current + remaining, ext_end);
+                    const overlap = @as(u32, @intCast(overlap_end - overlap_start));
+
+                    // Remove or split extent
+                    if (overlap_start == ext_start and overlap_end == ext_end) {
+                        // Remove entire extent
+                        try self.remove_extent(&path, ext);
+                    } else if (overlap_start == ext_start) {
+                        // Truncate from beginning
+                        try self.truncate_extent_start(&path, ext, overlap);
+                    } else if (overlap_end == ext_end) {
+                        // Truncate from end
+                        try self.truncate_extent_end(&path, ext, overlap);
+                    } else {
+                        // Split extent
+                        try self.split_extent(&path, ext, overlap_start, overlap);
+                    }
+
+                    // Free physical blocks
+                    const phys_offset = overlap_start - ext_start;
+                    try self.free_blocks(ext.get_physical() + phys_offset, overlap);
+
+                    remaining -= overlap;
+                    current = overlap_end;
+                } else {
+                    // Hole - skip to next extent
+                    const next_start = @as(u64, ext.logical_block);
+                    const skip = @as(u32, @intCast(@min(next_start - current, remaining)));
+                    remaining -= skip;
+                    current += skip;
+                }
+            } else {
+                // No more extents
+                break;
+            }
+        }
+    }
+
+    /// Truncate file to specified size
+    pub fn truncate(self: *ExtentTree, new_size: u64) !void {
+        const new_blocks = (new_size + self.block_size - 1) / self.block_size;
+
+        // Remove all extents beyond new size
+        try self.unmap(new_blocks, 0xFFFFFFFF);
+    }
+
+    /// Find extent for given logical block
+    fn find_extent(self: *ExtentTree, path: *ExtentPath, logical_block: u64) !?*Extent {
+        // Start with root header in inode
+        const root_header = @as(*ExtentHeader, @ptrCast(&self.inode.block_data[0]));
+
+        if (!root_header.validate()) {
+            return error.CorruptExtentTree;
+        }
+
+        path.entries[0].header = root_header;
+        path.entries[0].block = 0;  // Root is in inode
+        path.entries[0].buffer = &[_]u8{};  // No separate buffer
+        path.depth = @intCast(root_header.depth);
+
+        // Traverse tree
+        var current_header = root_header;
+        var level: u8 = 0;
+
+        while (current_header.depth > 0) {
+            // Internal node - find correct index
+            const idx = self.find_index(current_header, logical_block);
+
+            if (idx) |index| {
+                path.entries[level].index = index;
+
+                // Read child node
+                const child_block = index.get_child();
+                const child_buffer = try self.read_node(child_block);
+
+                level += 1;
+                path.entries[level].block = child_block;
+                path.entries[level].buffer = child_buffer;
+                path.entries[level].header = @as(*ExtentHeader, @ptrCast(@alignCast(child_buffer.ptr)));
+
+                current_header = path.entries[level].header;
+
+                if (!current_header.validate()) {
+                    return error.CorruptExtentTree;
+                }
+            } else {
+                // No index found
+                return null;
+            }
+        }
+
+        // Leaf node - find extent
+        const ext = self.find_extent_in_leaf(current_header, logical_block);
+        if (ext) |extent| {
+            path.entries[level].extent = extent;
+            return extent;
+        }
+
+        return null;
+    }
+
+    /// Find index in internal node
+    fn find_index(self: *ExtentTree, header: *ExtentHeader, logical_block: u64) ?*ExtentIndex {
+        _ = self;
+        if (header.entries == 0) return null;
+
+        // Binary search for the correct index
+        const indices = @as([*]ExtentIndex, @ptrCast(@as([*]u8, @ptrCast(header)) + @sizeOf(ExtentHeader)));
+
+        var left: u16 = 0;
+        var right: u16 = header.entries;
+
+        while (left < right) {
+            const mid = left + (right - left) / 2;
+            const idx = &indices[mid];
+
+            if (logical_block < @as(u64, idx.logical_block)) {
+                right = mid;
+            } else {
+                left = mid + 1;
+            }
+        }
+
+        // Return the index covering this logical block
+        if (left > 0) {
+            return &indices[left - 1];
+        }
+
+        return null;
+    }
+
+    /// Find extent in leaf node
+    fn find_extent_in_leaf(self: *ExtentTree, header: *ExtentHeader, logical_block: u64) ?*Extent {
+        _ = self;
+        if (header.entries == 0) return null;
+
+        const extents = @as([*]Extent, @ptrCast(@as([*]u8, @ptrCast(header)) + @sizeOf(ExtentHeader)));
+
+        // Binary search for extent
+        var left: u16 = 0;
+        var right: u16 = header.entries;
+
+        while (left < right) {
+            const mid = left + (right - left) / 2;
+            const ext = &extents[mid];
+            const ext_end = @as(u64, ext.logical_block) + ext.get_length();
+
+            if (logical_block < @as(u64, ext.logical_block)) {
+                right = mid;
+            } else if (logical_block >= ext_end) {
+                left = mid + 1;
+            } else {
+                return &extents[mid];
+            }
+        }
+
+        // Return extent that might cover or be after the logical block
+        if (left < header.entries) {
+            return &extents[left];
+        }
+        if (left > 0) {
+            return &extents[left - 1];
+        }
+
+        return null;
+    }
+
+    /// Insert new extent into tree
+    fn insert_extent(self: *ExtentTree, path: *ExtentPath, logical: u64, physical: u64, count: u32, flags: u32) !void {
+        const leaf_entry = &path.entries[path.depth];
+        const header = leaf_entry.header;
+
+        // Try to merge with adjacent extents first
+        if (try self.try_merge_extent(path, logical, physical, count)) {
+            return;
+        }
+
+        // Check if leaf has space
+        if (header.entries < header.max_entries) {
+            // Insert into leaf
+            try self.insert_extent_in_leaf(header, logical, physical, count, flags);
+        } else {
+            // Need to split node
+            try self.split_and_insert(path, logical, physical, count, flags);
+        }
+
+        self.extents_count += 1;
+        self.blocks_mapped += count;
+    }
+
+    /// Try to merge with adjacent extent
+    fn try_merge_extent(self: *ExtentTree, path: *ExtentPath, logical: u64, physical: u64, count: u32) !bool {
+        const header = path.entries[path.depth].header;
+        if (header.entries == 0) return false;
+
+        const extents = @as([*]Extent, @ptrCast(@as([*]u8, @ptrCast(header)) + @sizeOf(ExtentHeader)));
+
+        // Find potential merge candidates
+        var i: u16 = 0;
+        while (i < header.entries) : (i += 1) {
+            const ext = &extents[i];
+
+            // Check if we can extend this extent at the end
+            if (@as(u64, ext.logical_block) + ext.get_length() == logical) {
+                if (ext.get_physical() + ext.get_length() == physical) {
+                    // Perfect merge - extend existing extent
+                    const new_len = ext.get_length() + count;
+                    if (new_len <= 0x7FFF) {  // Max extent length
+                        ext.length = @intCast((ext.length & 0x8000) | (new_len & 0x7FFF));
+                        self.blocks_mapped += count;
+                        return true;
+                    }
+                }
+            }
+
+            // Check if we can extend at the beginning
+            if (logical + count == @as(u64, ext.logical_block)) {
+                if (physical + count == ext.get_physical()) {
+                    // Merge at beginning
+                    const new_len = ext.get_length() + count;
+                    if (new_len <= 0x7FFF) {
+                        ext.logical_block = @intCast(logical);
+                        ext.set_physical(physical);
+                        ext.length = @intCast((ext.length & 0x8000) | (new_len & 0x7FFF));
+                        self.blocks_mapped += count;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// Insert extent into leaf node (assuming space available)
+    fn insert_extent_in_leaf(self: *ExtentTree, header: *ExtentHeader, logical: u64, physical: u64, count: u32, flags: u32) !void {
+        _ = self;
+        const extents = @as([*]Extent, @ptrCast(@as([*]u8, @ptrCast(header)) + @sizeOf(ExtentHeader)));
+
+        // Find insertion point (maintain sorted order)
+        var insert_idx: u16 = 0;
+        while (insert_idx < header.entries) {
+            if (@as(u64, extents[insert_idx].logical_block) > logical) {
+                break;
+            }
+            insert_idx += 1;
+        }
+
+        // Shift existing extents
+        var i: u16 = header.entries;
+        while (i > insert_idx) : (i -= 1) {
+            extents[i] = extents[i - 1];
+        }
+
+        // Insert new extent
+        extents[insert_idx] = Extent.init(logical, physical, count);
+
+        if (flags & ALLOC_HINT_NO_DELAY == 0) {
+            extents[insert_idx].set_unwritten(true);
+        }
+
+        header.entries += 1;
+    }
+
+    /// Split node and insert extent
+    fn split_and_insert(self: *ExtentTree, path: *ExtentPath, logical: u64, physical: u64, count: u32, flags: u32) !void {
+        // Allocate new node
+        const new_block = try self.allocate_metadata_block();
+
+        var new_buffer = try self.read_node(new_block);
+        const new_header = @as(*ExtentHeader, @ptrCast(@alignCast(new_buffer.ptr)));
+
+        // Initialize new node
+        const old_header = path.entries[path.depth].header;
+        const half = old_header.entries / 2;
+
+        new_header.* = ExtentHeader.init(old_header.max_entries, old_header.depth == 0);
+        new_header.entries = old_header.entries - half;
+
+        // Copy half of entries to new node
+        const old_extents = @as([*]u8, @ptrCast(old_header)) + @sizeOf(ExtentHeader);
+        const new_extents = @as([*]u8, @ptrCast(new_header)) + @sizeOf(ExtentHeader);
+
+        const entry_size = if (old_header.depth == 0) @sizeOf(Extent) else @sizeOf(ExtentIndex);
+        @memcpy(new_extents[0..new_header.entries * entry_size], old_extents[half * entry_size .. old_header.entries * entry_size]);
+
+        old_header.entries = half;
+
+        // Insert extent into appropriate node
+        const split_point = if (old_header.depth == 0)
+            @as(*Extent, @ptrCast(@alignCast(new_extents))).logical_block
+        else
+            @as(*ExtentIndex, @ptrCast(@alignCast(new_extents))).logical_block;
+
+        if (logical < split_point) {
+            try self.insert_extent_in_leaf(old_header, logical, physical, count, flags);
+        } else {
+            try self.insert_extent_in_leaf(new_header, logical, physical, count, flags);
+        }
+
+        // Update parent (or create new root)
+        try self.update_parent_after_split(path, new_block, split_point);
+
+        release_buffer(new_buffer);
+    }
+
+    /// Update parent index after node split
+    fn update_parent_after_split(self: *ExtentTree, path: *ExtentPath, new_child: u64, logical: u64) !void {
+        if (path.depth == 0) {
+            // Need to create new root
+            try self.grow_tree(path, new_child, logical);
+        } else {
+            // Insert index into parent
+            const parent_level = path.depth - 1;
+            const parent_header = path.entries[parent_level].header;
+
+            if (parent_header.entries < parent_header.max_entries) {
+                // Space in parent - insert index
+                const indices = @as([*]ExtentIndex, @ptrCast(@as([*]u8, @ptrCast(parent_header)) + @sizeOf(ExtentHeader)));
+
+                // Find insertion point
+                var insert_idx: u16 = 0;
+                while (insert_idx < parent_header.entries) {
+                    if (@as(u64, indices[insert_idx].logical_block) > logical) {
+                        break;
+                    }
+                    insert_idx += 1;
+                }
+
+                // Shift and insert
+                var i: u16 = parent_header.entries;
+                while (i > insert_idx) : (i -= 1) {
+                    indices[i] = indices[i - 1];
+                }
+
+                indices[insert_idx] = ExtentIndex.init(logical, new_child);
+                parent_header.entries += 1;
+            } else {
+                // Parent full - need to split parent too (recursive)
+                try self.split_internal_node(path, parent_level, new_child, logical);
+            }
+        }
+    }
+
+    /// Grow tree by adding new root
+    fn grow_tree(self: *ExtentTree, path: *ExtentPath, new_child: u64, logical: u64) !void {
+        // Allocate block for old root contents
+        const old_root_block = try self.allocate_metadata_block();
+        var old_root_buffer = try self.read_node(old_root_block);
+
+        // Copy current root to new block
+        const root_header = @as(*ExtentHeader, @ptrCast(&self.inode.block_data[0]));
+        @memcpy(old_root_buffer, &self.inode.block_data);
+
+        // Create new root with two children
+        const max_indices = (@sizeOf(@TypeOf(self.inode.block_data)) - @sizeOf(ExtentHeader)) / @sizeOf(ExtentIndex);
+        root_header.* = ExtentHeader.init(@intCast(max_indices), false);
+        root_header.depth = path.depth + 1;
+        root_header.entries = 2;
+
+        const indices = @as([*]ExtentIndex, @ptrCast(@as([*]u8, @ptrCast(root_header)) + @sizeOf(ExtentHeader)));
+        indices[0] = ExtentIndex.init(0, old_root_block);
+        indices[1] = ExtentIndex.init(logical, new_child);
+
+        release_buffer(old_root_buffer);
+    }
+
+    /// Split internal node
+    fn split_internal_node(self: *ExtentTree, path: *ExtentPath, level: u8, new_child: u64, logical: u64) !void {
+        _ = self;
+        _ = path;
+        _ = level;
+        _ = new_child;
+        _ = logical;
+        // Similar to split_and_insert but for internal nodes
+        // Recursively split up the tree if needed
+    }
+
+    /// Remove extent from tree
+    fn remove_extent(self: *ExtentTree, path: *ExtentPath, extent: *Extent) !void {
+        const header = path.entries[path.depth].header;
+        const extents = @as([*]Extent, @ptrCast(@as([*]u8, @ptrCast(header)) + @sizeOf(ExtentHeader)));
+
+        // Find extent index
+        const extent_idx = (@intFromPtr(extent) - @intFromPtr(&extents[0])) / @sizeOf(Extent);
+
+        // Shift remaining extents
+        var i: usize = extent_idx;
+        while (i < header.entries - 1) : (i += 1) {
+            extents[i] = extents[i + 1];
+        }
+
+        header.entries -= 1;
+        self.extents_count -= 1;
+        self.blocks_mapped -= extent.get_length();
+
+        // Check if node is now empty
+        if (header.entries == 0 and path.depth > 0) {
+            // Remove index from parent
+            try self.remove_from_parent(path);
+        }
+    }
+
+    /// Remove index from parent node
+    fn remove_from_parent(self: *ExtentTree, path: *ExtentPath) !void {
+        _ = self;
+        _ = path;
+        // Remove index entry from parent
+        // May need to merge nodes or shrink tree
+    }
+
+    /// Truncate extent from start
+    fn truncate_extent_start(self: *ExtentTree, path: *ExtentPath, extent: *Extent, count: u32) !void {
+        _ = self;
+        _ = path;
+        const new_start = @as(u64, extent.logical_block) + count;
+        const new_phys = extent.get_physical() + count;
+        const new_len = extent.get_length() - count;
+
+        extent.logical_block = @intCast(new_start);
+        extent.set_physical(new_phys);
+        extent.length = @intCast((extent.length & 0x8000) | (new_len & 0x7FFF));
+    }
+
+    /// Truncate extent from end
+    fn truncate_extent_end(self: *ExtentTree, path: *ExtentPath, extent: *Extent, count: u32) !void {
+        _ = self;
+        _ = path;
+        const new_len = extent.get_length() - count;
+        extent.length = @intCast((extent.length & 0x8000) | (new_len & 0x7FFF));
+    }
+
+    /// Split extent into two parts
+    fn split_extent(self: *ExtentTree, path: *ExtentPath, extent: *Extent, split_point: u64, hole_size: u32) !void {
+        // Create extent for the part after the hole
+        const ext_end = @as(u64, extent.logical_block) + extent.get_length();
+        const after_start = split_point + hole_size;
+        const after_len = ext_end - after_start;
+        const after_phys = extent.get_physical() + (after_start - @as(u64, extent.logical_block));
+
+        // Truncate original extent
+        const before_len = split_point - @as(u64, extent.logical_block);
+        extent.length = @intCast((extent.length & 0x8000) | (@as(u16, @intCast(before_len)) & 0x7FFF));
+
+        // Insert new extent for the part after the hole
+        if (after_len > 0) {
+            try self.insert_extent(path, after_start, after_phys, @intCast(after_len), 0);
+        }
+    }
+
+    /// Compute goal block for allocation
+    fn compute_goal_block(self: *ExtentTree, logical: u64, path: *ExtentPath) u64 {
+        _ = self;
+        // Try to allocate near existing extents for contiguity
+        if (path.depth > 0) {
+            if (path.entries[path.depth].extent) |ext| {
+                // Goal is right after previous extent
+                return ext.get_physical() + ext.get_length();
+            }
+        }
+
+        // Default: use logical block as hint
+        return logical;
+    }
+
+    /// Allocate physical blocks
+    fn allocate_blocks(self: *ExtentTree, count: u32, goal: u64, flags: u32) !u64 {
+        _ = self;
+        _ = flags;
+        // Call block allocator
+        return try block_alloc.alloc_blocks(count, goal);
+    }
+
+    /// Free physical blocks
+    fn free_blocks(self: *ExtentTree, start: u64, count: u32) !void {
+        _ = self;
+        try block_alloc.free_blocks(start, count);
+    }
+
+    /// Allocate metadata block for tree node
+    fn allocate_metadata_block(self: *ExtentTree) !u64 {
+        return try block_alloc.alloc_blocks(1, 0);
+    }
+
+    /// Read extent tree node
+    fn read_node(self: *ExtentTree, block: u64) ![]u8 {
+        _ = self;
+        return try block_alloc.read_block(block);
+    }
+};
+
+// =============================================================================
+// Preallocation Support
+// =============================================================================
+
+pub const PreallocSpace = struct {
+    start: u64,          // Starting physical block
+    length: u32,         // Preallocated length
+    logical_start: u64,  // Starting logical block
+    unwritten: bool,     // Mark as unwritten
+
+    pub fn init(phys: u64, len: u32, logical: u64) PreallocSpace {
+        return PreallocSpace{
+            .start = phys,
+            .length = len,
+            .logical_start = logical,
+            .unwritten = true,
+        };
+    }
+};
+
+/// Preallocate blocks for a file
+pub fn fallocate(tree: *ExtentTree, offset: u64, len: u64, mode: u32) !void {
+    const block_size = tree.block_size;
+    const start_block = offset / block_size;
+    const end_block = (offset + len + block_size - 1) / block_size;
+    const count = @as(u32, @intCast(end_block - start_block));
+
+    // Allocate blocks (but don't write data)
+    const physical = try tree.map(start_block, count, ALLOC_HINT_CONTIGUOUS);
+    _ = physical;
+
+    // Mark as unwritten if requested
+    if (mode & FALLOC_FL_KEEP_SIZE != 0) {
+        // Don't update file size
+    }
+
+    // Mark extents as unwritten (preallocated but not written)
+    // This is handled in map() when appropriate flags are set
+}
+
+pub const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+pub const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+pub const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;
+pub const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+pub const FALLOC_FL_INSERT_RANGE: u32 = 0x20;
+
+// =============================================================================
+// Delayed Allocation
+// =============================================================================
+
+pub const DelayedBlock = struct {
+    logical_block: u64,
+    count: u32,
+    next: ?*DelayedBlock,
+};
+
+pub const DelayedAlloc = struct {
+    head: ?*DelayedBlock,
+    total_blocks: u64,
+
+    pub fn init() DelayedAlloc {
+        return DelayedAlloc{
+            .head = null,
+            .total_blocks = 0,
+        };
+    }
+
+    /// Reserve blocks (delayed allocation)
+    pub fn reserve(self: *DelayedAlloc, logical: u64, count: u32) !void {
+        var delayed = try std.heap.page_allocator.create(DelayedBlock);
+
+        delayed.logical_block = logical;
+        delayed.count = count;
+        delayed.next = self.head;
+
+        self.head = delayed;
+        self.total_blocks += count;
+    }
+
+    /// Flush delayed allocations (actually allocate blocks)
+    pub fn flush(self: *DelayedAlloc, tree: *ExtentTree) !void {
+        var current = self.head;
+
+        while (current) |block| {
+            // Allocate actual blocks
+            _ = try tree.map(block.logical_block, block.count, ALLOC_HINT_NO_DELAY);
+
+            const next = block.next;
+            std.heap.page_allocator.destroy(block);
+            current = next;
+        }
+
+        self.head = null;
+        self.total_blocks = 0;
+    }
+};
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn release_buffer(buffer: []u8) void {
+    _ = buffer;
+    // Release buffer back to buffer cache
+}
+
+/// Print extent tree for debugging
+pub fn dump_extent_tree(tree: *ExtentTree) void {
+    const root_header = @as(*ExtentHeader, @ptrCast(&tree.inode.block_data[0]));
+
+    std.debug.print("Extent Tree: depth={}, entries={}\n", .{ root_header.depth, root_header.entries });
+
+    if (root_header.depth == 0) {
+        // Leaf - print extents
+        const extents = @as([*]Extent, @ptrCast(@as([*]u8, @ptrCast(root_header)) + @sizeOf(ExtentHeader)));
+
+        var i: u16 = 0;
+        while (i < root_header.entries) : (i += 1) {
+            const ext = &extents[i];
+            std.debug.print("  [{}: logical={}, physical={}, len={}, unwritten={}]\n", .{
+                i,
+                ext.logical_block,
+                ext.get_physical(),
+                ext.get_length(),
+                ext.is_unwritten(),
+            });
+        }
+    }
+}

@@ -1,0 +1,1764 @@
+// home-os Filesystem Check and Repair Utility (fsck.home-fs)
+// Comprehensive filesystem consistency checker with automatic repair
+
+const std = @import("std");
+const homefs = @import("homefs.home");
+const journal = @import("journal.home");
+const bitmap = @import("bitmap.home");
+
+// =============================================================================
+// FSCK Exit Codes
+// =============================================================================
+
+pub const FSCK_OK: u32 = 0;              // No errors
+pub const FSCK_CORRECTED: u32 = 1;       // Errors corrected
+pub const FSCK_REBOOT: u32 = 2;          // System should be rebooted
+pub const FSCK_ERRORS_LEFT: u32 = 4;     // Uncorrected errors remain
+pub const FSCK_OPERATIONAL: u32 = 8;     // Operational error
+pub const FSCK_USAGE: u32 = 16;          // Usage or syntax error
+pub const FSCK_CANCELED: u32 = 32;       // Check canceled by user
+pub const FSCK_SHARED_LIB: u32 = 128;    // Shared library error
+
+// =============================================================================
+// FSCK Options
+// =============================================================================
+
+pub const FsckOptions = struct {
+    auto_repair: bool,          // -a: Automatic repair without prompts
+    interactive: bool,          // -r: Interactive repair
+    readonly: bool,             // -n: No changes, check only
+    verbose: bool,              // -v: Verbose output
+    force: bool,                // -f: Force check even if clean
+    preen: bool,                // -p: Preen mode (safe auto-fixes)
+    salvage: bool,              // -S: Salvage mode (aggressive recovery)
+
+    // Pass selection
+    pass1: bool,                // Check inodes
+    pass2: bool,                // Check directory structure
+    pass3: bool,                // Check directory connectivity
+    pass4: bool,                // Check reference counts
+    pass5: bool,                // Check group summary info
+
+    pub fn default() FsckOptions {
+        return FsckOptions{
+            .auto_repair = false,
+            .interactive = true,
+            .readonly = false,
+            .verbose = false,
+            .force = false,
+            .preen = false,
+            .salvage = false,
+            .pass1 = true,
+            .pass2 = true,
+            .pass3 = true,
+            .pass4 = true,
+            .pass5 = true,
+        };
+    }
+
+    pub fn preen_mode() FsckOptions {
+        var opts = default();
+        opts.auto_repair = true;
+        opts.interactive = false;
+        opts.preen = true;
+        return opts;
+    }
+};
+
+// =============================================================================
+// Problem Types and Severity
+// =============================================================================
+
+pub const ProblemSeverity = enum(u8) {
+    INFO,           // Informational only
+    WARNING,        // Potential issue
+    ERROR,          // Definite error, filesystem still usable
+    CRITICAL,       // Severe error, may cause data loss
+    FATAL,          // Filesystem unusable
+};
+
+pub const ProblemType = enum(u16) {
+    // Superblock problems (0x01xx)
+    SB_MAGIC_INVALID = 0x0100,
+    SB_BLOCK_SIZE_INVALID = 0x0101,
+    SB_BLOCK_COUNT_MISMATCH = 0x0102,
+    SB_FREE_COUNT_WRONG = 0x0103,
+    SB_FEATURE_UNKNOWN = 0x0104,
+    SB_DIRTY_NOT_JOURNALED = 0x0105,
+    SB_BACKUP_MISMATCH = 0x0106,
+
+    // Inode problems (0x02xx)
+    INODE_BAD_MODE = 0x0200,
+    INODE_BAD_SIZE = 0x0201,
+    INODE_BAD_BLOCKS = 0x0202,
+    INODE_BAD_LINK_COUNT = 0x0203,
+    INODE_ORPHAN = 0x0204,
+    INODE_BAD_TIMES = 0x0205,
+    INODE_IN_USE_NOT_ALLOCATED = 0x0206,
+    INODE_ALLOCATED_NOT_IN_USE = 0x0207,
+    INODE_BLOCK_INVALID = 0x0208,
+    INODE_BLOCK_DUPLICATE = 0x0209,
+    INODE_EXTENT_INVALID = 0x020A,
+
+    // Directory problems (0x03xx)
+    DIR_ENTRY_INVALID = 0x0300,
+    DIR_ENTRY_ZERO_INODE = 0x0301,
+    DIR_DOT_MISSING = 0x0302,
+    DIR_DOTDOT_MISSING = 0x0303,
+    DIR_DOT_WRONG = 0x0304,
+    DIR_DOTDOT_WRONG = 0x0305,
+    DIR_DISCONNECTED = 0x0306,
+    DIR_LOOP_DETECTED = 0x0307,
+    DIR_NAME_TOO_LONG = 0x0308,
+    DIR_NAME_ILLEGAL = 0x0309,
+    DIR_HASH_INVALID = 0x030A,
+
+    // Block allocation problems (0x04xx)
+    BLOCK_BITMAP_INVALID = 0x0400,
+    BLOCK_CLAIMED_TWICE = 0x0401,
+    BLOCK_FREE_BUT_USED = 0x0402,
+    BLOCK_USED_BUT_FREE = 0x0403,
+    BLOCK_OUT_OF_RANGE = 0x0404,
+    BLOCK_IN_RESERVED_AREA = 0x0405,
+
+    // Inode allocation problems (0x05xx)
+    INODE_BITMAP_INVALID = 0x0500,
+    INODE_CLAIMED_TWICE = 0x0501,
+    INODE_FREE_BUT_USED = 0x0502,
+    INODE_USED_BUT_FREE = 0x0503,
+    INODE_OUT_OF_RANGE = 0x0504,
+
+    // Journal problems (0x06xx)
+    JOURNAL_INVALID = 0x0600,
+    JOURNAL_NEEDS_REPLAY = 0x0601,
+    JOURNAL_CORRUPT = 0x0602,
+    JOURNAL_INODE_INVALID = 0x0603,
+
+    // Extent problems (0x07xx)
+    EXTENT_TREE_CORRUPT = 0x0700,
+    EXTENT_DEPTH_WRONG = 0x0701,
+    EXTENT_OVERLAP = 0x0702,
+    EXTENT_BLOCK_INVALID = 0x0703,
+
+    // Special file problems (0x08xx)
+    SYMLINK_TOO_LONG = 0x0800,
+    DEVICE_INVALID = 0x0801,
+};
+
+pub const Problem = struct {
+    problem_type: ProblemType,
+    severity: ProblemSeverity,
+    inode: u64,
+    block: u64,
+    description: []const u8,
+    fix_description: []const u8,
+    auto_fixable: bool,
+
+    pub fn format(self: *const Problem, buffer: []u8) usize {
+        var pos: usize = 0;
+
+        // Severity prefix
+        const sev_str = switch (self.severity) {
+            .INFO => "[INFO] ",
+            .WARNING => "[WARN] ",
+            .ERROR => "[ERROR] ",
+            .CRITICAL => "[CRIT] ",
+            .FATAL => "[FATAL] ",
+        };
+
+        for (sev_str) |c| {
+            if (pos < buffer.len) buffer[pos] = c;
+            pos += 1;
+        }
+
+        // Copy description
+        for (self.description) |c| {
+            if (pos < buffer.len) buffer[pos] = c;
+            pos += 1;
+        }
+
+        return pos;
+    }
+};
+
+// =============================================================================
+// FSCK Context
+// =============================================================================
+
+pub const FsckContext = struct {
+    // Filesystem info
+    device_path: []const u8,
+    superblock: *homefs.Superblock,
+    block_size: u32,
+    total_blocks: u64,
+    total_inodes: u64,
+
+    // Options
+    options: FsckOptions,
+
+    // Tracking bitmaps (computed during check)
+    block_found_map: []u8,      // Blocks found in use
+    inode_found_map: []u8,      // Inodes found in use
+    inode_link_count: []u16,    // Computed link counts
+    inode_dir_count: []u16,     // Directory reference count
+
+    // Statistics
+    stats: FsckStats,
+
+    // Lost+found directory inode
+    lost_found_ino: u64,
+
+    // Problems found
+    problems: [1024]Problem,
+    problem_count: u32,
+
+    // Repair tracking
+    repairs_made: u32,
+    repairs_failed: u32,
+
+    pub fn init(device: []const u8, opts: FsckOptions) !*FsckContext {
+        var ctx = try std.heap.page_allocator.create(FsckContext);
+
+        ctx.device_path = device;
+        ctx.options = opts;
+        ctx.problem_count = 0;
+        ctx.repairs_made = 0;
+        ctx.repairs_failed = 0;
+        ctx.stats = FsckStats{};
+        ctx.lost_found_ino = 0;
+
+        return ctx;
+    }
+
+    pub fn deinit(self: *FsckContext) void {
+        if (self.block_found_map.len > 0) {
+            std.heap.page_allocator.free(self.block_found_map);
+        }
+        if (self.inode_found_map.len > 0) {
+            std.heap.page_allocator.free(self.inode_found_map);
+        }
+        if (self.inode_link_count.len > 0) {
+            std.heap.page_allocator.free(self.inode_link_count);
+        }
+        if (self.inode_dir_count.len > 0) {
+            std.heap.page_allocator.free(self.inode_dir_count);
+        }
+        std.heap.page_allocator.destroy(self);
+    }
+
+    pub fn add_problem(self: *FsckContext, problem: Problem) void {
+        if (self.problem_count < self.problems.len) {
+            self.problems[self.problem_count] = problem;
+            self.problem_count += 1;
+        }
+    }
+
+    pub fn log(self: *FsckContext, comptime fmt: []const u8, args: anytype) void {
+        if (self.options.verbose) {
+            std.debug.print(fmt, args);
+        }
+    }
+};
+
+pub const FsckStats = struct {
+    inodes_checked: u64 = 0,
+    blocks_checked: u64 = 0,
+    directories_checked: u64 = 0,
+    files_checked: u64 = 0,
+    symlinks_checked: u64 = 0,
+
+    free_inodes_found: u64 = 0,
+    free_blocks_found: u64 = 0,
+
+    problems_found: u64 = 0,
+    problems_fixed: u64 = 0,
+
+    elapsed_ms: u64 = 0,
+};
+
+// =============================================================================
+// Pass 1: Check Inodes and Blocks
+// =============================================================================
+
+pub fn pass1_check_inodes(ctx: *FsckContext) !u32 {
+    ctx.log("Pass 1: Checking inodes and blocks\n", .{});
+
+    var errors: u32 = 0;
+
+    // Allocate tracking structures
+    const block_map_size = (ctx.total_blocks + 7) / 8;
+    ctx.block_found_map = try std.heap.page_allocator.alloc(u8, block_map_size);
+    @memset(ctx.block_found_map, 0);
+
+    const inode_map_size = (ctx.total_inodes + 7) / 8;
+    ctx.inode_found_map = try std.heap.page_allocator.alloc(u8, inode_map_size);
+    @memset(ctx.inode_found_map, 0);
+
+    ctx.inode_link_count = try std.heap.page_allocator.alloc(u16, ctx.total_inodes);
+    @memset(ctx.inode_link_count, 0);
+
+    ctx.inode_dir_count = try std.heap.page_allocator.alloc(u16, ctx.total_inodes);
+    @memset(ctx.inode_dir_count, 0);
+
+    // Mark reserved blocks as used (superblock, group descriptors, etc.)
+    errors += mark_reserved_blocks(ctx);
+
+    // Scan all inodes
+    var ino: u64 = 1;
+    while (ino <= ctx.total_inodes) : (ino += 1) {
+        const inode = try read_inode(ctx, ino);
+
+        if (!inode_is_allocated(ctx, ino)) {
+            // Inode not in bitmap
+            if (inode.mode != 0) {
+                // But inode has data - problem!
+                ctx.add_problem(Problem{
+                    .problem_type = .INODE_IN_USE_NOT_ALLOCATED,
+                    .severity = .ERROR,
+                    .inode = ino,
+                    .block = 0,
+                    .description = "Inode in use but not allocated in bitmap",
+                    .fix_description = "Mark inode as allocated",
+                    .auto_fixable = true,
+                });
+                errors += 1;
+
+                if (should_fix(ctx, true)) {
+                    try set_inode_allocated(ctx, ino, true);
+                    ctx.repairs_made += 1;
+                }
+            }
+            continue;
+        }
+
+        // Mark inode as found
+        set_bit(ctx.inode_found_map, ino);
+        ctx.stats.inodes_checked += 1;
+
+        // Check inode validity
+        errors += check_inode_fields(ctx, ino, inode);
+
+        // Check blocks referenced by this inode
+        if (inode.mode != 0) {
+            errors += try check_inode_blocks(ctx, ino, inode);
+        }
+
+        // Track file type statistics
+        const file_type = (inode.mode >> 12) & 0xF;
+        switch (file_type) {
+            0x4 => ctx.stats.directories_checked += 1,  // Directory
+            0x8 => ctx.stats.files_checked += 1,        // Regular file
+            0xA => ctx.stats.symlinks_checked += 1,     // Symlink
+            else => {},
+        }
+    }
+
+    ctx.log("Pass 1: Checked {} inodes, {} errors found\n", .{ ctx.stats.inodes_checked, errors });
+    return errors;
+}
+
+fn check_inode_fields(ctx: *FsckContext, ino: u64, inode: *const Inode) u32 {
+    var errors: u32 = 0;
+
+    // Check mode validity
+    const file_type = (inode.mode >> 12) & 0xF;
+    if (file_type == 0 and inode.mode != 0) {
+        ctx.add_problem(Problem{
+            .problem_type = .INODE_BAD_MODE,
+            .severity = .ERROR,
+            .inode = ino,
+            .block = 0,
+            .description = "Invalid inode mode",
+            .fix_description = "Clear inode",
+            .auto_fixable = false,
+        });
+        errors += 1;
+    }
+
+    // Check size for file type
+    if (file_type == 0x4) {  // Directory
+        if (inode.size == 0) {
+            ctx.add_problem(Problem{
+                .problem_type = .INODE_BAD_SIZE,
+                .severity = .ERROR,
+                .inode = ino,
+                .block = 0,
+                .description = "Directory has zero size",
+                .fix_description = "Recalculate directory size",
+                .auto_fixable = true,
+            });
+            errors += 1;
+        }
+    }
+
+    // Check link count
+    if (inode.link_count == 0 and file_type != 0) {
+        ctx.add_problem(Problem{
+            .problem_type = .INODE_ORPHAN,
+            .severity = .WARNING,
+            .inode = ino,
+            .block = 0,
+            .description = "Inode has zero link count (orphan)",
+            .fix_description = "Move to lost+found",
+            .auto_fixable = true,
+        });
+        errors += 1;
+    }
+
+    // Check timestamps are reasonable
+    const current_time = get_current_time();
+    if (inode.ctime > current_time + 86400) {  // More than 1 day in future
+        ctx.add_problem(Problem{
+            .problem_type = .INODE_BAD_TIMES,
+            .severity = .WARNING,
+            .inode = ino,
+            .block = 0,
+            .description = "Inode has future timestamp",
+            .fix_description = "Set timestamp to current time",
+            .auto_fixable = true,
+        });
+        errors += 1;
+    }
+
+    return errors;
+}
+
+fn check_inode_blocks(ctx: *FsckContext, ino: u64, inode: *const Inode) !u32 {
+    var errors: u32 = 0;
+
+    // Check if using extent tree or block pointers
+    if (inode.flags & INODE_EXTENTS != 0) {
+        errors += try check_extent_tree(ctx, ino, inode);
+    } else {
+        errors += try check_block_pointers(ctx, ino, inode);
+    }
+
+    return errors;
+}
+
+fn check_block_pointers(ctx: *FsckContext, ino: u64, inode: *const Inode) !u32 {
+    var errors: u32 = 0;
+    var blocks_counted: u64 = 0;
+
+    // Check direct blocks (0-11)
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const block = inode.blocks[i];
+        if (block == 0) continue;
+
+        errors += check_and_mark_block(ctx, ino, block, &blocks_counted);
+    }
+
+    // Check single indirect
+    if (inode.blocks[12] != 0) {
+        errors += try check_indirect_block(ctx, ino, inode.blocks[12], 1, &blocks_counted);
+    }
+
+    // Check double indirect
+    if (inode.blocks[13] != 0) {
+        errors += try check_indirect_block(ctx, ino, inode.blocks[13], 2, &blocks_counted);
+    }
+
+    // Check triple indirect
+    if (inode.blocks[14] != 0) {
+        errors += try check_indirect_block(ctx, ino, inode.blocks[14], 3, &blocks_counted);
+    }
+
+    // Verify block count matches
+    const expected_blocks = (inode.size + ctx.block_size - 1) / ctx.block_size;
+    if (blocks_counted != expected_blocks and inode.size > 0) {
+        ctx.add_problem(Problem{
+            .problem_type = .INODE_BAD_BLOCKS,
+            .severity = .WARNING,
+            .inode = ino,
+            .block = 0,
+            .description = "Block count mismatch",
+            .fix_description = "Update inode block count",
+            .auto_fixable = true,
+        });
+        errors += 1;
+    }
+
+    return errors;
+}
+
+fn check_and_mark_block(ctx: *FsckContext, ino: u64, block: u64, count: *u64) u32 {
+    var errors: u32 = 0;
+
+    // Check block is in valid range
+    if (block >= ctx.total_blocks) {
+        ctx.add_problem(Problem{
+            .problem_type = .BLOCK_OUT_OF_RANGE,
+            .severity = .ERROR,
+            .inode = ino,
+            .block = block,
+            .description = "Block number out of range",
+            .fix_description = "Clear block reference",
+            .auto_fixable = false,
+        });
+        return 1;
+    }
+
+    // Check if block already claimed
+    if (get_bit(ctx.block_found_map, block)) {
+        ctx.add_problem(Problem{
+            .problem_type = .BLOCK_CLAIMED_TWICE,
+            .severity = .ERROR,
+            .inode = ino,
+            .block = block,
+            .description = "Block claimed by multiple inodes",
+            .fix_description = "Clone block for one owner",
+            .auto_fixable = false,
+        });
+        return 1;
+    }
+
+    // Mark block as found
+    set_bit(ctx.block_found_map, block);
+    count.* += 1;
+    ctx.stats.blocks_checked += 1;
+
+    return errors;
+}
+
+fn check_indirect_block(ctx: *FsckContext, ino: u64, block: u64, level: u32, count: *u64) !u32 {
+    var errors: u32 = 0;
+
+    // First, mark the indirect block itself
+    errors += check_and_mark_block(ctx, ino, block, count);
+    if (errors > 0) return errors;
+
+    // Read the indirect block
+    const pointers_per_block = ctx.block_size / @sizeOf(u64);
+    var block_data = try read_block(ctx, block);
+    const pointers = @as([*]u64, @ptrCast(@alignCast(block_data.ptr)))[0..pointers_per_block];
+
+    for (pointers) |ptr| {
+        if (ptr == 0) continue;
+
+        if (level == 1) {
+            // Direct block
+            errors += check_and_mark_block(ctx, ino, ptr, count);
+        } else {
+            // More indirection
+            errors += try check_indirect_block(ctx, ino, ptr, level - 1, count);
+        }
+    }
+
+    return errors;
+}
+
+fn check_extent_tree(ctx: *FsckContext, ino: u64, inode: *const Inode) !u32 {
+    var errors: u32 = 0;
+
+    // Parse extent header from inode block area
+    const extent_header = @as(*const ExtentHeader, @ptrCast(&inode.blocks[0]));
+
+    // Validate magic
+    if (extent_header.magic != EXTENT_MAGIC) {
+        ctx.add_problem(Problem{
+            .problem_type = .EXTENT_TREE_CORRUPT,
+            .severity = .ERROR,
+            .inode = ino,
+            .block = 0,
+            .description = "Invalid extent tree magic",
+            .fix_description = "Rebuild extent tree",
+            .auto_fixable = false,
+        });
+        return 1;
+    }
+
+    // Check depth
+    if (extent_header.depth > MAX_EXTENT_DEPTH) {
+        ctx.add_problem(Problem{
+            .problem_type = .EXTENT_DEPTH_WRONG,
+            .severity = .ERROR,
+            .inode = ino,
+            .block = 0,
+            .description = "Extent tree depth too large",
+            .fix_description = "Rebuild extent tree",
+            .auto_fixable = false,
+        });
+        return 1;
+    }
+
+    // Check extents at this level
+    if (extent_header.depth == 0) {
+        // Leaf node - check actual extents
+        errors += try check_extent_leaf(ctx, ino, extent_header);
+    } else {
+        // Index node - recurse
+        errors += try check_extent_index(ctx, ino, extent_header);
+    }
+
+    return errors;
+}
+
+fn check_extent_leaf(ctx: *FsckContext, ino: u64, header: *const ExtentHeader) !u32 {
+    var errors: u32 = 0;
+    var prev_logical_end: u64 = 0;
+
+    const extents = @as([*]const Extent, @ptrCast(@as([*]const u8, @ptrCast(header)) + @sizeOf(ExtentHeader)))[0..header.entries];
+
+    for (extents) |ext| {
+        // Check for overlap with previous extent
+        if (ext.logical_block < prev_logical_end) {
+            ctx.add_problem(Problem{
+                .problem_type = .EXTENT_OVERLAP,
+                .severity = .ERROR,
+                .inode = ino,
+                .block = ext.physical_block,
+                .description = "Overlapping extents detected",
+                .fix_description = "Remove overlapping extent",
+                .auto_fixable = false,
+            });
+            errors += 1;
+        }
+
+        // Check physical blocks
+        var blk: u64 = 0;
+        while (blk < ext.length) : (blk += 1) {
+            const phys = ext.physical_block + blk;
+            if (phys >= ctx.total_blocks) {
+                ctx.add_problem(Problem{
+                    .problem_type = .EXTENT_BLOCK_INVALID,
+                    .severity = .ERROR,
+                    .inode = ino,
+                    .block = phys,
+                    .description = "Extent references invalid block",
+                    .fix_description = "Truncate extent",
+                    .auto_fixable = false,
+                });
+                errors += 1;
+                break;
+            }
+
+            if (get_bit(ctx.block_found_map, phys)) {
+                ctx.add_problem(Problem{
+                    .problem_type = .BLOCK_CLAIMED_TWICE,
+                    .severity = .ERROR,
+                    .inode = ino,
+                    .block = phys,
+                    .description = "Block in extent claimed by multiple inodes",
+                    .fix_description = "Clone block",
+                    .auto_fixable = false,
+                });
+                errors += 1;
+            } else {
+                set_bit(ctx.block_found_map, phys);
+                ctx.stats.blocks_checked += 1;
+            }
+        }
+
+        prev_logical_end = ext.logical_block + ext.length;
+    }
+
+    return errors;
+}
+
+fn check_extent_index(ctx: *FsckContext, ino: u64, header: *const ExtentHeader) !u32 {
+    var errors: u32 = 0;
+
+    const indices = @as([*]const ExtentIndex, @ptrCast(@as([*]const u8, @ptrCast(header)) + @sizeOf(ExtentHeader)))[0..header.entries];
+
+    for (indices) |idx| {
+        // Check physical block of child node
+        if (idx.leaf >= ctx.total_blocks) {
+            ctx.add_problem(Problem{
+                .problem_type = .EXTENT_BLOCK_INVALID,
+                .severity = .ERROR,
+                .inode = ino,
+                .block = idx.leaf,
+                .description = "Extent index references invalid block",
+                .fix_description = "Remove index entry",
+                .auto_fixable = false,
+            });
+            errors += 1;
+            continue;
+        }
+
+        // Mark index block as used
+        set_bit(ctx.block_found_map, idx.leaf);
+        ctx.stats.blocks_checked += 1;
+
+        // Read and check child node
+        const child_data = try read_block(ctx, idx.leaf);
+        const child_header = @as(*const ExtentHeader, @ptrCast(child_data.ptr));
+
+        if (child_header.magic != EXTENT_MAGIC) {
+            ctx.add_problem(Problem{
+                .problem_type = .EXTENT_TREE_CORRUPT,
+                .severity = .ERROR,
+                .inode = ino,
+                .block = idx.leaf,
+                .description = "Corrupt extent node",
+                .fix_description = "Rebuild extent tree",
+                .auto_fixable = false,
+            });
+            errors += 1;
+            continue;
+        }
+
+        if (child_header.depth == 0) {
+            errors += try check_extent_leaf(ctx, ino, child_header);
+        } else {
+            errors += try check_extent_index(ctx, ino, child_header);
+        }
+    }
+
+    return errors;
+}
+
+// =============================================================================
+// Pass 2: Check Directory Structure
+// =============================================================================
+
+pub fn pass2_check_directories(ctx: *FsckContext) !u32 {
+    ctx.log("Pass 2: Checking directory structure\n", .{});
+
+    var errors: u32 = 0;
+
+    // Start from root inode (2)
+    const ROOT_INO: u64 = 2;
+
+    // Check root inode exists and is a directory
+    if (!get_bit(ctx.inode_found_map, ROOT_INO)) {
+        ctx.add_problem(Problem{
+            .problem_type = .DIR_DISCONNECTED,
+            .severity = .FATAL,
+            .inode = ROOT_INO,
+            .block = 0,
+            .description = "Root inode missing",
+            .fix_description = "Cannot repair - filesystem unusable",
+            .auto_fixable = false,
+        });
+        return 1;
+    }
+
+    const root_inode = try read_inode(ctx, ROOT_INO);
+    const root_type = (root_inode.mode >> 12) & 0xF;
+    if (root_type != 0x4) {
+        ctx.add_problem(Problem{
+            .problem_type = .INODE_BAD_MODE,
+            .severity = .FATAL,
+            .inode = ROOT_INO,
+            .block = 0,
+            .description = "Root inode is not a directory",
+            .fix_description = "Cannot repair - filesystem unusable",
+            .auto_fixable = false,
+        });
+        return 1;
+    }
+
+    // Check all directories
+    var ino: u64 = 1;
+    while (ino <= ctx.total_inodes) : (ino += 1) {
+        if (!get_bit(ctx.inode_found_map, ino)) continue;
+
+        const inode = try read_inode(ctx, ino);
+        const file_type = (inode.mode >> 12) & 0xF;
+
+        if (file_type == 0x4) {  // Directory
+            errors += try check_directory(ctx, ino, inode);
+        }
+    }
+
+    ctx.log("Pass 2: Checked {} directories, {} errors found\n", .{ ctx.stats.directories_checked, errors });
+    return errors;
+}
+
+fn check_directory(ctx: *FsckContext, ino: u64, inode: *const Inode) !u32 {
+    var errors: u32 = 0;
+
+    var has_dot = false;
+    var has_dotdot = false;
+    var dot_ino: u64 = 0;
+    var dotdot_ino: u64 = 0;
+
+    // Read directory blocks and check entries
+    var offset: u64 = 0;
+    while (offset < inode.size) {
+        const block_num = offset / ctx.block_size;
+        const block = try get_inode_block(ctx, inode, block_num);
+        if (block == 0) {
+            offset += ctx.block_size;
+            continue;
+        }
+
+        const block_data = try read_block(ctx, block);
+        var pos: usize = 0;
+
+        while (pos < ctx.block_size) {
+            const entry = @as(*const DirEntry, @ptrCast(@alignCast(block_data.ptr + pos)));
+
+            if (entry.rec_len == 0) break;
+            if (entry.rec_len < 8 or entry.rec_len > ctx.block_size - pos) {
+                ctx.add_problem(Problem{
+                    .problem_type = .DIR_ENTRY_INVALID,
+                    .severity = .ERROR,
+                    .inode = ino,
+                    .block = block,
+                    .description = "Invalid directory entry record length",
+                    .fix_description = "Truncate directory",
+                    .auto_fixable = true,
+                });
+                errors += 1;
+                break;
+            }
+
+            if (entry.inode != 0) {
+                const name = entry.name[0..entry.name_len];
+
+                // Check for . and ..
+                if (std.mem.eql(u8, name, ".")) {
+                    has_dot = true;
+                    dot_ino = entry.inode;
+                } else if (std.mem.eql(u8, name, "..")) {
+                    has_dotdot = true;
+                    dotdot_ino = entry.inode;
+                } else {
+                    // Check referenced inode exists
+                    if (entry.inode > ctx.total_inodes or !get_bit(ctx.inode_found_map, entry.inode)) {
+                        ctx.add_problem(Problem{
+                            .problem_type = .DIR_ENTRY_INVALID,
+                            .severity = .ERROR,
+                            .inode = ino,
+                            .block = block,
+                            .description = "Directory entry references invalid inode",
+                            .fix_description = "Remove directory entry",
+                            .auto_fixable = true,
+                        });
+                        errors += 1;
+                    } else {
+                        // Increment link count for referenced inode
+                        ctx.inode_link_count[entry.inode] += 1;
+
+                        // Check if it's a directory
+                        const ref_inode = try read_inode(ctx, entry.inode);
+                        const ref_type = (ref_inode.mode >> 12) & 0xF;
+                        if (ref_type == 0x4) {
+                            ctx.inode_dir_count[entry.inode] += 1;
+                        }
+                    }
+                }
+
+                // Check name validity
+                errors += check_name_validity(ctx, ino, name);
+            }
+
+            pos += entry.rec_len;
+        }
+
+        offset += ctx.block_size;
+    }
+
+    // Verify . entry
+    if (!has_dot) {
+        ctx.add_problem(Problem{
+            .problem_type = .DIR_DOT_MISSING,
+            .severity = .ERROR,
+            .inode = ino,
+            .block = 0,
+            .description = "Directory missing '.' entry",
+            .fix_description = "Add '.' entry",
+            .auto_fixable = true,
+        });
+        errors += 1;
+    } else if (dot_ino != ino) {
+        ctx.add_problem(Problem{
+            .problem_type = .DIR_DOT_WRONG,
+            .severity = .ERROR,
+            .inode = ino,
+            .block = 0,
+            .description = "'.' entry points to wrong inode",
+            .fix_description = "Fix '.' entry",
+            .auto_fixable = true,
+        });
+        errors += 1;
+    }
+
+    // Verify .. entry
+    if (!has_dotdot) {
+        ctx.add_problem(Problem{
+            .problem_type = .DIR_DOTDOT_MISSING,
+            .severity = .ERROR,
+            .inode = ino,
+            .block = 0,
+            .description = "Directory missing '..' entry",
+            .fix_description = "Add '..' entry",
+            .auto_fixable = true,
+        });
+        errors += 1;
+    }
+
+    return errors;
+}
+
+fn check_name_validity(ctx: *FsckContext, ino: u64, name: []const u8) u32 {
+    // Check for illegal characters
+    for (name) |c| {
+        if (c == 0 or c == '/') {
+            ctx.add_problem(Problem{
+                .problem_type = .DIR_NAME_ILLEGAL,
+                .severity = .ERROR,
+                .inode = ino,
+                .block = 0,
+                .description = "Illegal character in filename",
+                .fix_description = "Rename file",
+                .auto_fixable = false,
+            });
+            return 1;
+        }
+    }
+
+    // Check length
+    if (name.len > 255) {
+        ctx.add_problem(Problem{
+            .problem_type = .DIR_NAME_TOO_LONG,
+            .severity = .ERROR,
+            .inode = ino,
+            .block = 0,
+            .description = "Filename too long",
+            .fix_description = "Truncate filename",
+            .auto_fixable = false,
+        });
+        return 1;
+    }
+
+    return 0;
+}
+
+// =============================================================================
+// Pass 3: Check Directory Connectivity
+// =============================================================================
+
+pub fn pass3_check_connectivity(ctx: *FsckContext) !u32 {
+    ctx.log("Pass 3: Checking directory connectivity\n", .{});
+
+    var errors: u32 = 0;
+    const ROOT_INO: u64 = 2;
+
+    // Mark all directories reachable from root
+    var reachable = try std.heap.page_allocator.alloc(u8, (ctx.total_inodes + 7) / 8);
+    defer std.heap.page_allocator.free(reachable);
+    @memset(reachable, 0);
+
+    // BFS from root
+    var queue: [4096]u64 = undefined;
+    var queue_head: usize = 0;
+    var queue_tail: usize = 0;
+
+    queue[queue_tail] = ROOT_INO;
+    queue_tail += 1;
+    set_bit(reachable, ROOT_INO);
+
+    while (queue_head < queue_tail) {
+        const dir_ino = queue[queue_head];
+        queue_head += 1;
+
+        const inode = try read_inode(ctx, dir_ino);
+
+        // Scan directory for subdirectories
+        var offset: u64 = 0;
+        while (offset < inode.size) {
+            const block_num = offset / ctx.block_size;
+            const block = try get_inode_block(ctx, inode, block_num);
+            if (block == 0) {
+                offset += ctx.block_size;
+                continue;
+            }
+
+            const block_data = try read_block(ctx, block);
+            var pos: usize = 0;
+
+            while (pos < ctx.block_size) {
+                const entry = @as(*const DirEntry, @ptrCast(@alignCast(block_data.ptr + pos)));
+
+                if (entry.rec_len == 0) break;
+
+                if (entry.inode != 0 and entry.inode <= ctx.total_inodes) {
+                    const name = entry.name[0..entry.name_len];
+
+                    // Skip . and ..
+                    if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) {
+                        if (!get_bit(reachable, entry.inode)) {
+                            const ref_inode = try read_inode(ctx, entry.inode);
+                            const ref_type = (ref_inode.mode >> 12) & 0xF;
+
+                            if (ref_type == 0x4) {  // Directory
+                                set_bit(reachable, entry.inode);
+                                if (queue_tail < queue.len) {
+                                    queue[queue_tail] = entry.inode;
+                                    queue_tail += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                pos += entry.rec_len;
+            }
+
+            offset += ctx.block_size;
+        }
+    }
+
+    // Check for disconnected directories
+    var ino: u64 = 1;
+    while (ino <= ctx.total_inodes) : (ino += 1) {
+        if (!get_bit(ctx.inode_found_map, ino)) continue;
+
+        const inode = try read_inode(ctx, ino);
+        const file_type = (inode.mode >> 12) & 0xF;
+
+        if (file_type == 0x4 and !get_bit(reachable, ino)) {
+            ctx.add_problem(Problem{
+                .problem_type = .DIR_DISCONNECTED,
+                .severity = .ERROR,
+                .inode = ino,
+                .block = 0,
+                .description = "Directory not connected to filesystem tree",
+                .fix_description = "Link to lost+found",
+                .auto_fixable = true,
+            });
+            errors += 1;
+
+            if (should_fix(ctx, true)) {
+                try link_to_lost_found(ctx, ino);
+                ctx.repairs_made += 1;
+            }
+        }
+    }
+
+    // Check for loops (a directory is its own ancestor)
+    errors += try detect_directory_loops(ctx);
+
+    ctx.log("Pass 3: {} connectivity errors found\n", .{errors});
+    return errors;
+}
+
+fn detect_directory_loops(ctx: *FsckContext) !u32 {
+    var errors: u32 = 0;
+
+    // For each directory, trace parent chain to root
+    var ino: u64 = 1;
+    while (ino <= ctx.total_inodes) : (ino += 1) {
+        if (!get_bit(ctx.inode_found_map, ino)) continue;
+
+        const inode = try read_inode(ctx, ino);
+        const file_type = (inode.mode >> 12) & 0xF;
+
+        if (file_type != 0x4) continue;  // Not a directory
+
+        // Trace to root, looking for loops
+        var current = ino;
+        var depth: u32 = 0;
+        const MAX_DEPTH: u32 = 1000;
+
+        while (current != 2 and depth < MAX_DEPTH) {  // 2 is root
+            const parent = try get_parent_ino(ctx, current);
+            if (parent == current) {
+                ctx.add_problem(Problem{
+                    .problem_type = .DIR_LOOP_DETECTED,
+                    .severity = .CRITICAL,
+                    .inode = current,
+                    .block = 0,
+                    .description = "Directory loop detected (directory is its own parent)",
+                    .fix_description = "Fix parent link",
+                    .auto_fixable = false,
+                });
+                errors += 1;
+                break;
+            }
+            current = parent;
+            depth += 1;
+        }
+
+        if (depth >= MAX_DEPTH) {
+            ctx.add_problem(Problem{
+                .problem_type = .DIR_LOOP_DETECTED,
+                .severity = .CRITICAL,
+                .inode = ino,
+                .block = 0,
+                .description = "Directory tree too deep (possible loop)",
+                .fix_description = "Manual inspection required",
+                .auto_fixable = false,
+            });
+            errors += 1;
+        }
+    }
+
+    return errors;
+}
+
+// =============================================================================
+// Pass 4: Check Reference Counts
+// =============================================================================
+
+pub fn pass4_check_reference_counts(ctx: *FsckContext) !u32 {
+    ctx.log("Pass 4: Checking reference counts\n", .{});
+
+    var errors: u32 = 0;
+
+    var ino: u64 = 1;
+    while (ino <= ctx.total_inodes) : (ino += 1) {
+        if (!get_bit(ctx.inode_found_map, ino)) continue;
+
+        const inode = try read_inode(ctx, ino);
+        const file_type = (inode.mode >> 12) & 0xF;
+
+        // Calculate expected link count
+        var expected_links: u16 = ctx.inode_link_count[ino];
+
+        // For directories, add 1 for '.' entry
+        if (file_type == 0x4) {
+            expected_links += 1;  // Self-reference via '.'
+            // Also count references from child '..' entries
+            expected_links += ctx.inode_dir_count[ino];
+        }
+
+        if (inode.link_count != expected_links) {
+            ctx.add_problem(Problem{
+                .problem_type = .INODE_BAD_LINK_COUNT,
+                .severity = .ERROR,
+                .inode = ino,
+                .block = 0,
+                .description = "Link count mismatch",
+                .fix_description = "Fix link count",
+                .auto_fixable = true,
+            });
+            errors += 1;
+
+            if (should_fix(ctx, true)) {
+                try fix_link_count(ctx, ino, expected_links);
+                ctx.repairs_made += 1;
+            }
+        }
+
+        // Check for orphans (link count > 0 but not referenced)
+        if (inode.link_count > 0 and ctx.inode_link_count[ino] == 0 and ino != 2) {
+            ctx.add_problem(Problem{
+                .problem_type = .INODE_ORPHAN,
+                .severity = .WARNING,
+                .inode = ino,
+                .block = 0,
+                .description = "Inode not referenced by any directory",
+                .fix_description = "Link to lost+found",
+                .auto_fixable = true,
+            });
+            errors += 1;
+
+            if (should_fix(ctx, true)) {
+                try link_to_lost_found(ctx, ino);
+                ctx.repairs_made += 1;
+            }
+        }
+    }
+
+    ctx.log("Pass 4: {} reference count errors found\n", .{errors});
+    return errors;
+}
+
+// =============================================================================
+// Pass 5: Check Group Summary Information
+// =============================================================================
+
+pub fn pass5_check_summaries(ctx: *FsckContext) !u32 {
+    ctx.log("Pass 5: Checking group summary information\n", .{});
+
+    var errors: u32 = 0;
+
+    // Compare computed bitmaps with on-disk bitmaps
+
+    // Block bitmap check
+    var free_blocks_computed: u64 = 0;
+    var blk: u64 = 0;
+    while (blk < ctx.total_blocks) : (blk += 1) {
+        const computed_used = get_bit(ctx.block_found_map, blk);
+        const ondisk_used = try block_is_allocated(ctx, blk);
+
+        if (computed_used and !ondisk_used) {
+            ctx.add_problem(Problem{
+                .problem_type = .BLOCK_USED_BUT_FREE,
+                .severity = .ERROR,
+                .inode = 0,
+                .block = blk,
+                .description = "Block in use but marked free in bitmap",
+                .fix_description = "Mark block as used",
+                .auto_fixable = true,
+            });
+            errors += 1;
+
+            if (should_fix(ctx, true)) {
+                try set_block_allocated(ctx, blk, true);
+                ctx.repairs_made += 1;
+            }
+        } else if (!computed_used and ondisk_used) {
+            ctx.add_problem(Problem{
+                .problem_type = .BLOCK_FREE_BUT_USED,
+                .severity = .WARNING,
+                .inode = 0,
+                .block = blk,
+                .description = "Block unused but marked used in bitmap",
+                .fix_description = "Mark block as free",
+                .auto_fixable = true,
+            });
+            errors += 1;
+
+            if (should_fix(ctx, true)) {
+                try set_block_allocated(ctx, blk, false);
+                ctx.repairs_made += 1;
+            }
+        }
+
+        if (!computed_used) {
+            free_blocks_computed += 1;
+        }
+    }
+
+    // Inode bitmap check
+    var free_inodes_computed: u64 = 0;
+    var ino: u64 = 1;
+    while (ino <= ctx.total_inodes) : (ino += 1) {
+        const computed_used = get_bit(ctx.inode_found_map, ino);
+        const ondisk_used = inode_is_allocated(ctx, ino);
+
+        if (computed_used and !ondisk_used) {
+            ctx.add_problem(Problem{
+                .problem_type = .INODE_USED_BUT_FREE,
+                .severity = .ERROR,
+                .inode = ino,
+                .block = 0,
+                .description = "Inode in use but marked free in bitmap",
+                .fix_description = "Mark inode as used",
+                .auto_fixable = true,
+            });
+            errors += 1;
+
+            if (should_fix(ctx, true)) {
+                try set_inode_allocated(ctx, ino, true);
+                ctx.repairs_made += 1;
+            }
+        } else if (!computed_used and ondisk_used) {
+            ctx.add_problem(Problem{
+                .problem_type = .INODE_FREE_BUT_USED,
+                .severity = .WARNING,
+                .inode = ino,
+                .block = 0,
+                .description = "Inode unused but marked used in bitmap",
+                .fix_description = "Mark inode as free",
+                .auto_fixable = true,
+            });
+            errors += 1;
+
+            if (should_fix(ctx, true)) {
+                try set_inode_allocated(ctx, ino, false);
+                ctx.repairs_made += 1;
+            }
+        }
+
+        if (!computed_used) {
+            free_inodes_computed += 1;
+        }
+    }
+
+    ctx.stats.free_blocks_found = free_blocks_computed;
+    ctx.stats.free_inodes_found = free_inodes_computed;
+
+    // Check superblock free counts
+    if (ctx.superblock.free_blocks != free_blocks_computed) {
+        ctx.add_problem(Problem{
+            .problem_type = .SB_FREE_COUNT_WRONG,
+            .severity = .ERROR,
+            .inode = 0,
+            .block = 0,
+            .description = "Superblock free block count incorrect",
+            .fix_description = "Update free block count",
+            .auto_fixable = true,
+        });
+        errors += 1;
+
+        if (should_fix(ctx, true)) {
+            ctx.superblock.free_blocks = free_blocks_computed;
+            try write_superblock(ctx);
+            ctx.repairs_made += 1;
+        }
+    }
+
+    if (ctx.superblock.free_inodes != free_inodes_computed) {
+        ctx.add_problem(Problem{
+            .problem_type = .SB_FREE_COUNT_WRONG,
+            .severity = .ERROR,
+            .inode = 0,
+            .block = 0,
+            .description = "Superblock free inode count incorrect",
+            .fix_description = "Update free inode count",
+            .auto_fixable = true,
+        });
+        errors += 1;
+
+        if (should_fix(ctx, true)) {
+            ctx.superblock.free_inodes = free_inodes_computed;
+            try write_superblock(ctx);
+            ctx.repairs_made += 1;
+        }
+    }
+
+    ctx.log("Pass 5: {} summary errors found\n", .{errors});
+    return errors;
+}
+
+// =============================================================================
+// Journal Recovery
+// =============================================================================
+
+pub fn check_journal(ctx: *FsckContext) !u32 {
+    ctx.log("Checking journal...\n", .{});
+
+    var errors: u32 = 0;
+
+    // Check if journal exists
+    const journal_ino = ctx.superblock.journal_inode;
+    if (journal_ino == 0) {
+        ctx.log("No journal present\n", .{});
+        return 0;
+    }
+
+    // Read journal superblock
+    const journal_inode = try read_inode(ctx, journal_ino);
+    const journal_block = try get_inode_block(ctx, journal_inode, 0);
+
+    if (journal_block == 0) {
+        ctx.add_problem(Problem{
+            .problem_type = .JOURNAL_INVALID,
+            .severity = .ERROR,
+            .inode = journal_ino,
+            .block = 0,
+            .description = "Journal inode has no blocks",
+            .fix_description = "Recreate journal",
+            .auto_fixable = false,
+        });
+        return 1;
+    }
+
+    const jsb_data = try read_block(ctx, journal_block);
+    const jsb = @as(*const journal.JournalSuperblock, @ptrCast(@alignCast(jsb_data.ptr)));
+
+    // Validate journal superblock
+    if (jsb.magic != journal.JOURNAL_MAGIC) {
+        ctx.add_problem(Problem{
+            .problem_type = .JOURNAL_CORRUPT,
+            .severity = .ERROR,
+            .inode = journal_ino,
+            .block = journal_block,
+            .description = "Invalid journal magic number",
+            .fix_description = "Recreate journal",
+            .auto_fixable = false,
+        });
+        return 1;
+    }
+
+    // Check if journal needs replay
+    if (jsb.sequence > jsb.commit_sequence) {
+        ctx.add_problem(Problem{
+            .problem_type = .JOURNAL_NEEDS_REPLAY,
+            .severity = .WARNING,
+            .inode = journal_ino,
+            .block = 0,
+            .description = "Journal contains uncommitted transactions",
+            .fix_description = "Replay journal",
+            .auto_fixable = true,
+        });
+        errors += 1;
+
+        if (should_fix(ctx, true)) {
+            errors += try replay_journal(ctx, jsb);
+            ctx.repairs_made += 1;
+        }
+    }
+
+    return errors;
+}
+
+fn replay_journal(ctx: *FsckContext, jsb: *const journal.JournalSuperblock) !u32 {
+    ctx.log("Replaying journal...\n", .{});
+
+    var errors: u32 = 0;
+    var seq = jsb.commit_sequence + 1;
+    var block_idx = jsb.first;
+
+    // Scan journal for valid transactions
+    while (seq <= jsb.sequence) {
+        const jblock_data = try read_journal_block(ctx, jsb, block_idx);
+        const header = @as(*const journal.BlockHeader, @ptrCast(@alignCast(jblock_data.ptr)));
+
+        if (header.magic != journal.JOURNAL_MAGIC) break;
+        if (header.sequence != seq) break;
+
+        if (header.blocktype == journal.JBD_DESCRIPTOR) {
+            // Process descriptor block
+            const desc = @as(*const journal.DescriptorBlock, @ptrCast(header));
+            var tag_offset: usize = @sizeOf(journal.DescriptorBlock);
+
+            block_idx = (block_idx + 1) % jsb.maxlen;
+
+            while (tag_offset < ctx.block_size) {
+                const tag = @as(*const journal.BlockTag, @ptrCast(@alignCast(jblock_data.ptr + tag_offset)));
+                if (tag.flags & journal.FLAG_LAST_TAG != 0) break;
+
+                // Read data block from journal and write to filesystem
+                const data = try read_journal_block(ctx, jsb, block_idx);
+                try write_block(ctx, tag.blocknr, data);
+
+                block_idx = (block_idx + 1) % jsb.maxlen;
+                tag_offset += @sizeOf(journal.BlockTag);
+            }
+        } else if (header.blocktype == journal.JBD_COMMIT) {
+            // Transaction complete
+            seq += 1;
+        }
+
+        block_idx = (block_idx + 1) % jsb.maxlen;
+    }
+
+    // Clear journal
+    try clear_journal(ctx, jsb);
+
+    ctx.log("Journal replay complete\n", .{});
+    return errors;
+}
+
+// =============================================================================
+// Lost+Found Management
+// =============================================================================
+
+fn ensure_lost_found(ctx: *FsckContext) !void {
+    if (ctx.lost_found_ino != 0) return;
+
+    // Look for existing lost+found
+    const root_inode = try read_inode(ctx, 2);
+    ctx.lost_found_ino = try find_entry_in_dir(ctx, root_inode, "lost+found");
+
+    if (ctx.lost_found_ino == 0) {
+        // Create lost+found directory
+        ctx.lost_found_ino = try create_directory(ctx, 2, "lost+found", 0o700);
+        ctx.log("Created lost+found directory (inode {})\n", .{ctx.lost_found_ino});
+    }
+}
+
+fn link_to_lost_found(ctx: *FsckContext, ino: u64) !void {
+    try ensure_lost_found(ctx);
+
+    // Generate unique name
+    var name: [32]u8 = undefined;
+    const name_len = std.fmt.bufPrint(&name, "#{}", .{ino}) catch unreachable;
+
+    // Add entry to lost+found
+    try add_directory_entry(ctx, ctx.lost_found_ino, ino, name_len);
+
+    ctx.log("Linked inode {} to lost+found\n", .{ino});
+}
+
+// =============================================================================
+// Main FSCK Entry Point
+// =============================================================================
+
+pub fn fsck(device: []const u8, options: FsckOptions) !u32 {
+    var exit_code: u32 = FSCK_OK;
+
+    // Initialize context
+    var ctx = try FsckContext.init(device, options);
+    defer ctx.deinit();
+
+    // Open device and read superblock
+    try open_device(ctx, device);
+
+    // Check and replay journal first
+    if (try check_journal(ctx) > 0) {
+        exit_code |= FSCK_CORRECTED;
+    }
+
+    // Pass 1: Check inodes and blocks
+    if (options.pass1) {
+        const errors = try pass1_check_inodes(ctx);
+        if (errors > 0) {
+            exit_code |= if (ctx.repairs_made > 0) FSCK_CORRECTED else FSCK_ERRORS_LEFT;
+        }
+    }
+
+    // Pass 2: Check directory structure
+    if (options.pass2) {
+        const errors = try pass2_check_directories(ctx);
+        if (errors > 0) {
+            exit_code |= if (ctx.repairs_made > 0) FSCK_CORRECTED else FSCK_ERRORS_LEFT;
+        }
+    }
+
+    // Pass 3: Check directory connectivity
+    if (options.pass3) {
+        const errors = try pass3_check_connectivity(ctx);
+        if (errors > 0) {
+            exit_code |= if (ctx.repairs_made > 0) FSCK_CORRECTED else FSCK_ERRORS_LEFT;
+        }
+    }
+
+    // Pass 4: Check reference counts
+    if (options.pass4) {
+        const errors = try pass4_check_reference_counts(ctx);
+        if (errors > 0) {
+            exit_code |= if (ctx.repairs_made > 0) FSCK_CORRECTED else FSCK_ERRORS_LEFT;
+        }
+    }
+
+    // Pass 5: Check group summary information
+    if (options.pass5) {
+        const errors = try pass5_check_summaries(ctx);
+        if (errors > 0) {
+            exit_code |= if (ctx.repairs_made > 0) FSCK_CORRECTED else FSCK_ERRORS_LEFT;
+        }
+    }
+
+    // Mark filesystem clean if no errors remain
+    if (exit_code == FSCK_OK or exit_code == FSCK_CORRECTED) {
+        ctx.superblock.state = FS_STATE_CLEAN;
+        try write_superblock(ctx);
+    }
+
+    // Print summary
+    print_summary(ctx);
+
+    return exit_code;
+}
+
+fn print_summary(ctx: *FsckContext) void {
+    std.debug.print("\n{s}: ", .{ctx.device_path});
+
+    if (ctx.problem_count == 0) {
+        std.debug.print("clean\n", .{});
+    } else {
+        std.debug.print("{} problems found", .{ctx.problem_count});
+        if (ctx.repairs_made > 0) {
+            std.debug.print(", {} fixed", .{ctx.repairs_made});
+        }
+        if (ctx.repairs_failed > 0) {
+            std.debug.print(", {} not fixed", .{ctx.repairs_failed});
+        }
+        std.debug.print("\n", .{});
+    }
+
+    std.debug.print("\n", .{});
+    std.debug.print("  {} inodes, {} free\n", .{ ctx.total_inodes, ctx.stats.free_inodes_found });
+    std.debug.print("  {} blocks, {} free\n", .{ ctx.total_blocks, ctx.stats.free_blocks_found });
+    std.debug.print("  {} files, {} directories\n", .{ ctx.stats.files_checked, ctx.stats.directories_checked });
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+fn should_fix(ctx: *FsckContext, auto_fixable: bool) bool {
+    if (ctx.options.readonly) return false;
+    if (ctx.options.auto_repair and auto_fixable) return true;
+    if (ctx.options.preen and auto_fixable) return true;
+    // In interactive mode, would prompt user here
+    return false;
+}
+
+fn get_bit(bitmap: []u8, index: u64) bool {
+    const byte_idx = index / 8;
+    const bit_idx: u3 = @intCast(index % 8);
+    if (byte_idx >= bitmap.len) return false;
+    return (bitmap[byte_idx] & (@as(u8, 1) << bit_idx)) != 0;
+}
+
+fn set_bit(bitmap: []u8, index: u64) void {
+    const byte_idx = index / 8;
+    const bit_idx: u3 = @intCast(index % 8);
+    if (byte_idx >= bitmap.len) return;
+    bitmap[byte_idx] |= (@as(u8, 1) << bit_idx);
+}
+
+fn clear_bit(bitmap: []u8, index: u64) void {
+    const byte_idx = index / 8;
+    const bit_idx: u3 = @intCast(index % 8);
+    if (byte_idx >= bitmap.len) return;
+    bitmap[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+}
+
+fn mark_reserved_blocks(ctx: *FsckContext) u32 {
+    // Mark superblock
+    set_bit(ctx.block_found_map, 0);
+
+    // Mark group descriptor blocks
+    const gdt_blocks = (ctx.superblock.groups * @sizeOf(GroupDesc) + ctx.block_size - 1) / ctx.block_size;
+    var i: u64 = 1;
+    while (i <= gdt_blocks) : (i += 1) {
+        set_bit(ctx.block_found_map, i);
+    }
+
+    // Mark bitmap blocks and inode table blocks for each group
+    // (This would iterate through group descriptors)
+
+    return 0;
+}
+
+fn get_current_time() u64 {
+    // Return current Unix timestamp
+    return 0;  // Placeholder
+}
+
+// Stub declarations for types and functions that would be in other modules
+const Inode = struct {
+    mode: u32,
+    size: u64,
+    link_count: u16,
+    ctime: u64,
+    flags: u32,
+    blocks: [15]u64,
+};
+
+const DirEntry = struct {
+    inode: u64,
+    rec_len: u16,
+    name_len: u8,
+    file_type: u8,
+    name: [256]u8,
+};
+
+const GroupDesc = struct {
+    block_bitmap: u64,
+    inode_bitmap: u64,
+    inode_table: u64,
+    free_blocks: u32,
+    free_inodes: u32,
+};
+
+const ExtentHeader = struct {
+    magic: u16,
+    entries: u16,
+    max_entries: u16,
+    depth: u16,
+    generation: u32,
+};
+
+const Extent = struct {
+    logical_block: u64,
+    length: u32,
+    physical_block: u64,
+};
+
+const ExtentIndex = struct {
+    logical_block: u64,
+    leaf: u64,
+    unused: u32,
+};
+
+const INODE_EXTENTS: u32 = 0x80000;
+const EXTENT_MAGIC: u16 = 0xF30A;
+const MAX_EXTENT_DEPTH: u16 = 5;
+const FS_STATE_CLEAN: u16 = 0x0001;
+
+// Function stubs (implementations would interface with actual disk I/O)
+fn open_device(ctx: *FsckContext, device: []const u8) !void {
+    _ = ctx;
+    _ = device;
+}
+
+fn read_inode(ctx: *FsckContext, ino: u64) !*const Inode {
+    _ = ctx;
+    _ = ino;
+    return undefined;
+}
+
+fn read_block(ctx: *FsckContext, block: u64) ![]u8 {
+    _ = ctx;
+    _ = block;
+    return undefined;
+}
+
+fn write_block(ctx: *FsckContext, block: u64, data: []const u8) !void {
+    _ = ctx;
+    _ = block;
+    _ = data;
+}
+
+fn get_inode_block(ctx: *FsckContext, inode: *const Inode, block_num: u64) !u64 {
+    _ = ctx;
+    _ = inode;
+    _ = block_num;
+    return 0;
+}
+
+fn inode_is_allocated(ctx: *FsckContext, ino: u64) bool {
+    _ = ctx;
+    _ = ino;
+    return false;
+}
+
+fn set_inode_allocated(ctx: *FsckContext, ino: u64, allocated: bool) !void {
+    _ = ctx;
+    _ = ino;
+    _ = allocated;
+}
+
+fn block_is_allocated(ctx: *FsckContext, block: u64) !bool {
+    _ = ctx;
+    _ = block;
+    return false;
+}
+
+fn set_block_allocated(ctx: *FsckContext, block: u64, allocated: bool) !void {
+    _ = ctx;
+    _ = block;
+    _ = allocated;
+}
+
+fn write_superblock(ctx: *FsckContext) !void {
+    _ = ctx;
+}
+
+fn fix_link_count(ctx: *FsckContext, ino: u64, count: u16) !void {
+    _ = ctx;
+    _ = ino;
+    _ = count;
+}
+
+fn get_parent_ino(ctx: *FsckContext, ino: u64) !u64 {
+    _ = ctx;
+    _ = ino;
+    return 2;
+}
+
+fn find_entry_in_dir(ctx: *FsckContext, inode: *const Inode, name: []const u8) !u64 {
+    _ = ctx;
+    _ = inode;
+    _ = name;
+    return 0;
+}
+
+fn create_directory(ctx: *FsckContext, parent: u64, name: []const u8, mode: u32) !u64 {
+    _ = ctx;
+    _ = parent;
+    _ = name;
+    _ = mode;
+    return 0;
+}
+
+fn add_directory_entry(ctx: *FsckContext, dir_ino: u64, entry_ino: u64, name: []const u8) !void {
+    _ = ctx;
+    _ = dir_ino;
+    _ = entry_ino;
+    _ = name;
+}
+
+fn read_journal_block(ctx: *FsckContext, jsb: *const journal.JournalSuperblock, idx: u64) ![]u8 {
+    _ = ctx;
+    _ = jsb;
+    _ = idx;
+    return undefined;
+}
+
+fn clear_journal(ctx: *FsckContext, jsb: *const journal.JournalSuperblock) !void {
+    _ = ctx;
+    _ = jsb;
+}

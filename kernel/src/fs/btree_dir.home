@@ -1,0 +1,977 @@
+// home-os B-Tree Directory Indexing
+// High-performance directory lookups using B+ tree structure
+
+const std = @import("std");
+const homefs = @import("homefs.home");
+const block_alloc = @import("block_alloc.home");
+
+// =============================================================================
+// B-Tree Constants
+// =============================================================================
+
+pub const BTREE_MAGIC: u32 = 0x42545245;  // "BTRE"
+
+// Tree parameters (tuned for 4KB blocks)
+pub const BTREE_MIN_DEGREE: u32 = 128;     // Minimum keys per node
+pub const BTREE_MAX_KEYS: u32 = 255;       // Maximum keys per node
+pub const BTREE_MAX_CHILDREN: u32 = 256;   // Maximum children per internal node
+
+// Node types
+pub const NODE_TYPE_LEAF: u8 = 0;
+pub const NODE_TYPE_INTERNAL: u8 = 1;
+pub const NODE_TYPE_ROOT: u8 = 2;
+
+// Hash types for directory names
+pub const HASH_TYPE_LEGACY: u8 = 0;        // Simple hash
+pub const HASH_TYPE_HALF_MD4: u8 = 1;      // Half MD4
+pub const HASH_TYPE_TEA: u8 = 2;           // TEA hash
+pub const HASH_TYPE_UNSIGNED: u8 = 3;      // Unsigned legacy
+
+// =============================================================================
+// B-Tree Node Structures
+// =============================================================================
+
+/// B-tree node header (common to all node types)
+pub const BTreeHeader = packed struct {
+    magic: u32,              // Magic number
+    node_type: u8,           // NODE_TYPE_*
+    num_keys: u8,            // Number of keys in this node
+    level: u16,              // Level in tree (0 = leaf)
+    parent: u64,             // Parent node block (0 for root)
+    prev: u64,               // Previous sibling (for leaf traversal)
+    next: u64,               // Next sibling (for leaf traversal)
+    checksum: u32,           // Node checksum
+
+    pub fn init(node_type: u8, level: u16) BTreeHeader {
+        return BTreeHeader{
+            .magic = BTREE_MAGIC,
+            .node_type = node_type,
+            .num_keys = 0,
+            .level = level,
+            .parent = 0,
+            .prev = 0,
+            .next = 0,
+            .checksum = 0,
+        };
+    }
+
+    pub fn validate(self: *const BTreeHeader) bool {
+        return self.magic == BTREE_MAGIC and
+            self.num_keys <= BTREE_MAX_KEYS;
+    }
+};
+
+/// Directory entry key (for B-tree)
+pub const DirEntryKey = packed struct {
+    hash: u32,               // Filename hash
+    minor_hash: u32,         // Secondary hash for collisions
+    name_len: u8,            // Name length
+    name: [247]u8,           // Filename (padded to align)
+
+    pub fn init(name: []const u8, hash_type: u8) DirEntryKey {
+        var key = DirEntryKey{
+            .hash = 0,
+            .minor_hash = 0,
+            .name_len = @intCast(name.len),
+            .name = [_]u8{0} ** 247,
+        };
+
+        // Copy name
+        @memcpy(key.name[0..name.len], name);
+
+        // Compute hash
+        key.hash = compute_hash(name, hash_type);
+        key.minor_hash = compute_minor_hash(name, hash_type);
+
+        return key;
+    }
+
+    pub fn compare(self: *const DirEntryKey, other: *const DirEntryKey) i32 {
+        // First compare by hash
+        if (self.hash < other.hash) return -1;
+        if (self.hash > other.hash) return 1;
+
+        // Hash collision - compare minor hash
+        if (self.minor_hash < other.minor_hash) return -1;
+        if (self.minor_hash > other.minor_hash) return 1;
+
+        // Same hash - compare names directly
+        const self_name = self.name[0..self.name_len];
+        const other_name = other.name[0..other.name_len];
+
+        return std.mem.order(u8, self_name, other_name).compare(.lt);
+    }
+
+    pub fn equals_name(self: *const DirEntryKey, name: []const u8) bool {
+        if (self.name_len != name.len) return false;
+        return std.mem.eql(u8, self.name[0..self.name_len], name);
+    }
+};
+
+/// Directory entry value (stored in leaf nodes)
+pub const DirEntryValue = packed struct {
+    inode: u64,              // Inode number
+    file_type: u8,           // File type (DT_REG, DT_DIR, etc.)
+    reserved: [7]u8,         // Reserved for future use
+
+    pub fn init(inode: u64, file_type: u8) DirEntryValue {
+        return DirEntryValue{
+            .inode = inode,
+            .file_type = file_type,
+            .reserved = [_]u8{0} ** 7,
+        };
+    }
+};
+
+/// B-tree leaf entry (key + value)
+pub const BTreeLeafEntry = packed struct {
+    key: DirEntryKey,
+    value: DirEntryValue,
+};
+
+/// B-tree internal entry (key + child pointer)
+pub const BTreeInternalEntry = packed struct {
+    key: DirEntryKey,
+    child: u64,              // Block number of child node
+};
+
+// =============================================================================
+// B-Tree Node
+// =============================================================================
+
+pub const BTreeNode = struct {
+    header: *BTreeHeader,
+    block: u64,              // Block number of this node
+    buffer: []u8,            // Raw block data
+    dirty: bool,
+
+    pub fn init_from_buffer(buffer: []u8, block: u64) BTreeNode {
+        return BTreeNode{
+            .header = @as(*BTreeHeader, @ptrCast(@alignCast(buffer.ptr))),
+            .block = block,
+            .buffer = buffer,
+            .dirty = false,
+        };
+    }
+
+    pub fn is_leaf(self: *const BTreeNode) bool {
+        return self.header.level == 0;
+    }
+
+    pub fn is_full(self: *const BTreeNode) bool {
+        return self.header.num_keys >= BTREE_MAX_KEYS;
+    }
+
+    pub fn is_underflow(self: *const BTreeNode) bool {
+        return self.header.num_keys < BTREE_MIN_DEGREE;
+    }
+
+    /// Get leaf entries array
+    pub fn leaf_entries(self: *BTreeNode) []BTreeLeafEntry {
+        const data = self.buffer[@sizeOf(BTreeHeader)..];
+        const entries = @as([*]BTreeLeafEntry, @ptrCast(@alignCast(data.ptr)));
+        return entries[0..self.header.num_keys];
+    }
+
+    /// Get internal entries array
+    pub fn internal_entries(self: *BTreeNode) []BTreeInternalEntry {
+        const data = self.buffer[@sizeOf(BTreeHeader)..];
+        const entries = @as([*]BTreeInternalEntry, @ptrCast(@alignCast(data.ptr)));
+        return entries[0..self.header.num_keys];
+    }
+
+    /// Get child pointers (internal node only, one more than keys)
+    pub fn children(self: *BTreeNode) []u64 {
+        const data = self.buffer[@sizeOf(BTreeHeader)..];
+        const offset = @sizeOf(BTreeInternalEntry) * BTREE_MAX_KEYS;
+        const ptrs = @as([*]u64, @ptrCast(@alignCast(data.ptr + offset)));
+        return ptrs[0 .. self.header.num_keys + 1];
+    }
+
+    /// Binary search for key in leaf node
+    pub fn search_leaf(self: *BTreeNode, key: *const DirEntryKey) ?usize {
+        const entries = self.leaf_entries();
+        var left: usize = 0;
+        var right: usize = entries.len;
+
+        while (left < right) {
+            const mid = left + (right - left) / 2;
+            const cmp = key.compare(&entries[mid].key);
+
+            if (cmp == 0) {
+                return mid;
+            } else if (cmp < 0) {
+                right = mid;
+            } else {
+                left = mid + 1;
+            }
+        }
+
+        return null;
+    }
+
+    /// Find child index for key in internal node
+    pub fn find_child_index(self: *BTreeNode, key: *const DirEntryKey) usize {
+        const entries = self.internal_entries();
+        var i: usize = 0;
+
+        while (i < entries.len) {
+            if (key.compare(&entries[i].key) < 0) {
+                break;
+            }
+            i += 1;
+        }
+
+        return i;
+    }
+
+    /// Insert entry into leaf node (assumes not full)
+    pub fn insert_leaf(self: *BTreeNode, key: *const DirEntryKey, value: *const DirEntryValue) void {
+        const data = self.buffer[@sizeOf(BTreeHeader)..];
+        const entries = @as([*]BTreeLeafEntry, @ptrCast(@alignCast(data.ptr)));
+
+        // Find insertion point
+        var insert_idx: usize = 0;
+        while (insert_idx < self.header.num_keys) {
+            if (key.compare(&entries[insert_idx].key) < 0) {
+                break;
+            }
+            insert_idx += 1;
+        }
+
+        // Shift entries right
+        var i: usize = self.header.num_keys;
+        while (i > insert_idx) : (i -= 1) {
+            entries[i] = entries[i - 1];
+        }
+
+        // Insert new entry
+        entries[insert_idx] = BTreeLeafEntry{
+            .key = key.*,
+            .value = value.*,
+        };
+
+        self.header.num_keys += 1;
+        self.dirty = true;
+    }
+
+    /// Remove entry from leaf node
+    pub fn remove_leaf(self: *BTreeNode, index: usize) void {
+        const data = self.buffer[@sizeOf(BTreeHeader)..];
+        const entries = @as([*]BTreeLeafEntry, @ptrCast(@alignCast(data.ptr)));
+
+        // Shift entries left
+        var i: usize = index;
+        while (i < self.header.num_keys - 1) : (i += 1) {
+            entries[i] = entries[i + 1];
+        }
+
+        self.header.num_keys -= 1;
+        self.dirty = true;
+    }
+};
+
+// =============================================================================
+// B-Tree Implementation
+// =============================================================================
+
+pub const BTree = struct {
+    root_block: u64,
+    block_size: u32,
+    hash_type: u8,
+
+    // Statistics
+    height: u32,
+    total_entries: u64,
+    total_nodes: u64,
+
+    // Cached root node
+    root: ?BTreeNode,
+
+    pub fn init(root_block: u64, block_size: u32) BTree {
+        return BTree{
+            .root_block = root_block,
+            .block_size = block_size,
+            .hash_type = HASH_TYPE_HALF_MD4,
+            .height = 1,
+            .total_entries = 0,
+            .total_nodes = 1,
+            .root = null,
+        };
+    }
+
+    /// Create a new B-tree
+    pub fn create(block_size: u32) !BTree {
+        // Allocate root block
+        const root_block = try block_alloc.alloc_blocks(1, 0);
+        var root_buffer = try block_alloc.read_block(root_block);
+
+        // Initialize root as empty leaf
+        @memset(root_buffer, 0);
+        const header = @as(*BTreeHeader, @ptrCast(@alignCast(root_buffer.ptr)));
+        header.* = BTreeHeader.init(NODE_TYPE_ROOT | NODE_TYPE_LEAF, 0);
+
+        try block_alloc.write_block(root_block, root_buffer);
+
+        return BTree.init(root_block, block_size);
+    }
+
+    /// Search for entry by name
+    pub fn search(self: *BTree, name: []const u8) !?DirEntryValue {
+        const key = DirEntryKey.init(name, self.hash_type);
+        return try self.search_key(&key);
+    }
+
+    /// Search for entry by key
+    pub fn search_key(self: *BTree, key: *const DirEntryKey) !?DirEntryValue {
+        var current_block = self.root_block;
+
+        while (true) {
+            var node = try self.read_node(current_block);
+            defer self.release_node(&node);
+
+            if (node.is_leaf()) {
+                // Search in leaf
+                if (node.search_leaf(key)) |idx| {
+                    return node.leaf_entries()[idx].value;
+                }
+                return null;
+            } else {
+                // Navigate to child
+                const child_idx = node.find_child_index(key);
+                current_block = node.children()[child_idx];
+            }
+        }
+    }
+
+    /// Insert entry
+    pub fn insert(self: *BTree, name: []const u8, inode: u64, file_type: u8) !void {
+        const key = DirEntryKey.init(name, self.hash_type);
+        const value = DirEntryValue.init(inode, file_type);
+
+        try self.insert_key(&key, &value);
+        self.total_entries += 1;
+    }
+
+    /// Insert key-value pair
+    fn insert_key(self: *BTree, key: *const DirEntryKey, value: *const DirEntryValue) !void {
+        var root = try self.read_node(self.root_block);
+
+        // Check if root is full
+        if (root.is_full()) {
+            // Split root
+            const new_root_block = try self.split_root(&root);
+            self.root_block = new_root_block;
+            self.height += 1;
+            self.release_node(&root);
+            root = try self.read_node(new_root_block);
+        }
+
+        try self.insert_non_full(&root, key, value);
+        self.release_node(&root);
+    }
+
+    /// Insert into non-full node
+    fn insert_non_full(self: *BTree, node: *BTreeNode, key: *const DirEntryKey, value: *const DirEntryValue) !void {
+        if (node.is_leaf()) {
+            // Insert directly
+            node.insert_leaf(key, value);
+            try self.write_node(node);
+        } else {
+            // Find child to descend into
+            var child_idx = node.find_child_index(key);
+            const child_block = node.children()[child_idx];
+
+            var child = try self.read_node(child_block);
+            defer self.release_node(&child);
+
+            if (child.is_full()) {
+                // Split child first
+                try self.split_child(node, child_idx, &child);
+
+                // Determine which child to descend into
+                const entries = node.internal_entries();
+                if (key.compare(&entries[child_idx].key) > 0) {
+                    child_idx += 1;
+                }
+
+                self.release_node(&child);
+                const new_child_block = node.children()[child_idx];
+                child = try self.read_node(new_child_block);
+            }
+
+            try self.insert_non_full(&child, key, value);
+        }
+    }
+
+    /// Split full root node
+    fn split_root(self: *BTree, old_root: *BTreeNode) !u64 {
+        // Allocate new root
+        const new_root_block = try block_alloc.alloc_blocks(1, 0);
+        var new_root_buffer = try block_alloc.read_block(new_root_block);
+        @memset(new_root_buffer, 0);
+
+        var new_root = BTreeNode.init_from_buffer(new_root_buffer, new_root_block);
+        new_root.header.* = BTreeHeader.init(NODE_TYPE_ROOT | NODE_TYPE_INTERNAL, old_root.header.level + 1);
+
+        // Split old root
+        const mid_key = try self.split_node(old_root);
+
+        // Set up new root with old root as left child
+        const children = new_root.children();
+        children[0] = old_root.block;
+
+        // Create right sibling
+        const right_block = try block_alloc.alloc_blocks(1, 0);
+        children[1] = right_block;
+
+        // Move half of entries to right sibling
+        try self.move_half_to_sibling(old_root, right_block);
+
+        // Add separator key
+        const entries = @as([*]BTreeInternalEntry, @ptrCast(@alignCast(new_root.buffer[@sizeOf(BTreeHeader)..].ptr)));
+        entries[0].key = mid_key;
+        entries[0].child = right_block;
+        new_root.header.num_keys = 1;
+
+        try self.write_node(&new_root);
+        try self.write_node(old_root);
+
+        self.total_nodes += 2;
+
+        return new_root_block;
+    }
+
+    /// Split child node
+    fn split_child(self: *BTree, parent: *BTreeNode, child_idx: usize, child: *BTreeNode) !void {
+        // Allocate new sibling
+        const sibling_block = try block_alloc.alloc_blocks(1, 0);
+        var sibling_buffer = try block_alloc.read_block(sibling_block);
+        @memset(sibling_buffer, 0);
+
+        var sibling = BTreeNode.init_from_buffer(sibling_buffer, sibling_block);
+        sibling.header.* = BTreeHeader.init(child.header.node_type & ~NODE_TYPE_ROOT, child.header.level);
+
+        // Split child
+        const mid_key = try self.split_node(child);
+
+        // Move half entries to sibling
+        try self.move_half_to_sibling(child, sibling_block);
+
+        // Insert separator key into parent
+        const parent_entries = @as([*]BTreeInternalEntry, @ptrCast(@alignCast(parent.buffer[@sizeOf(BTreeHeader)..].ptr)));
+
+        // Shift entries right
+        var i: usize = parent.header.num_keys;
+        while (i > child_idx) : (i -= 1) {
+            parent_entries[i] = parent_entries[i - 1];
+        }
+
+        parent_entries[child_idx].key = mid_key;
+        parent_entries[child_idx].child = sibling_block;
+
+        // Shift children right
+        const parent_children = parent.children();
+        i = parent.header.num_keys + 1;
+        while (i > child_idx + 1) : (i -= 1) {
+            parent_children[i] = parent_children[i - 1];
+        }
+        parent_children[child_idx + 1] = sibling_block;
+
+        parent.header.num_keys += 1;
+        parent.dirty = true;
+
+        // Update sibling links for leaf nodes
+        if (child.is_leaf()) {
+            sibling.header.next = child.header.next;
+            sibling.header.prev = child.block;
+            child.header.next = sibling_block;
+        }
+
+        try self.write_node(parent);
+        try self.write_node(child);
+        try self.write_node(&sibling);
+
+        self.total_nodes += 1;
+    }
+
+    /// Split node and return middle key
+    fn split_node(self: *BTree, node: *BTreeNode) !DirEntryKey {
+        _ = self;
+        const mid = node.header.num_keys / 2;
+
+        if (node.is_leaf()) {
+            const entries = node.leaf_entries();
+            return entries[mid].key;
+        } else {
+            const entries = node.internal_entries();
+            return entries[mid].key;
+        }
+    }
+
+    /// Move half of entries to sibling
+    fn move_half_to_sibling(self: *BTree, node: *BTreeNode, sibling_block: u64) !void {
+        const mid = node.header.num_keys / 2;
+        var sibling_buffer = try block_alloc.read_block(sibling_block);
+        var sibling = BTreeNode.init_from_buffer(sibling_buffer, sibling_block);
+
+        if (node.is_leaf()) {
+            const src_entries = node.leaf_entries();
+            const dst_data = sibling.buffer[@sizeOf(BTreeHeader)..];
+            const dst_entries = @as([*]BTreeLeafEntry, @ptrCast(@alignCast(dst_data.ptr)));
+
+            var i: usize = 0;
+            while (i < node.header.num_keys - mid) : (i += 1) {
+                dst_entries[i] = src_entries[mid + i];
+            }
+
+            sibling.header.num_keys = @intCast(node.header.num_keys - mid);
+            node.header.num_keys = @intCast(mid);
+        } else {
+            const src_entries = node.internal_entries();
+            const dst_data = sibling.buffer[@sizeOf(BTreeHeader)..];
+            const dst_entries = @as([*]BTreeInternalEntry, @ptrCast(@alignCast(dst_data.ptr)));
+
+            var i: usize = 0;
+            while (i < node.header.num_keys - mid - 1) : (i += 1) {
+                dst_entries[i] = src_entries[mid + 1 + i];
+            }
+
+            // Copy children
+            const src_children = node.children();
+            const dst_children = sibling.children();
+            i = 0;
+            while (i <= node.header.num_keys - mid - 1) : (i += 1) {
+                dst_children[i] = src_children[mid + 1 + i];
+            }
+
+            sibling.header.num_keys = @intCast(node.header.num_keys - mid - 1);
+            node.header.num_keys = @intCast(mid);
+        }
+
+        node.dirty = true;
+        sibling.dirty = true;
+
+        try self.write_node(&sibling);
+    }
+
+    /// Delete entry
+    pub fn delete(self: *BTree, name: []const u8) !bool {
+        const key = DirEntryKey.init(name, self.hash_type);
+        const deleted = try self.delete_key(&key);
+
+        if (deleted) {
+            self.total_entries -= 1;
+        }
+
+        return deleted;
+    }
+
+    /// Delete by key
+    fn delete_key(self: *BTree, key: *const DirEntryKey) !bool {
+        var root = try self.read_node(self.root_block);
+        defer self.release_node(&root);
+
+        const deleted = try self.delete_from_node(&root, key);
+
+        // Shrink tree if root has only one child
+        if (!root.is_leaf() and root.header.num_keys == 0) {
+            const new_root_block = root.children()[0];
+            try block_alloc.free_blocks(self.root_block, 1);
+            self.root_block = new_root_block;
+            self.height -= 1;
+            self.total_nodes -= 1;
+        }
+
+        return deleted;
+    }
+
+    /// Delete from node
+    fn delete_from_node(self: *BTree, node: *BTreeNode, key: *const DirEntryKey) !bool {
+        if (node.is_leaf()) {
+            // Find and remove from leaf
+            if (node.search_leaf(key)) |idx| {
+                node.remove_leaf(idx);
+                try self.write_node(node);
+                return true;
+            }
+            return false;
+        }
+
+        // Internal node - find child
+        const child_idx = node.find_child_index(key);
+        const child_block = node.children()[child_idx];
+
+        var child = try self.read_node(child_block);
+        defer self.release_node(&child);
+
+        // Ensure child has enough entries
+        if (child.is_underflow()) {
+            try self.fix_underflow(node, child_idx, &child);
+        }
+
+        return try self.delete_from_node(&child, key);
+    }
+
+    /// Fix underflow in child node
+    fn fix_underflow(self: *BTree, parent: *BTreeNode, child_idx: usize, child: *BTreeNode) !void {
+        // Try borrowing from siblings or merge
+        if (child_idx > 0) {
+            // Try left sibling
+            const left_block = parent.children()[child_idx - 1];
+            var left = try self.read_node(left_block);
+            defer self.release_node(&left);
+
+            if (left.header.num_keys > BTREE_MIN_DEGREE) {
+                try self.borrow_from_left(parent, child_idx, &left, child);
+                return;
+            }
+        }
+
+        if (child_idx < parent.header.num_keys) {
+            // Try right sibling
+            const right_block = parent.children()[child_idx + 1];
+            var right = try self.read_node(right_block);
+            defer self.release_node(&right);
+
+            if (right.header.num_keys > BTREE_MIN_DEGREE) {
+                try self.borrow_from_right(parent, child_idx, child, &right);
+                return;
+            }
+        }
+
+        // Must merge
+        if (child_idx < parent.header.num_keys) {
+            const right_block = parent.children()[child_idx + 1];
+            var right = try self.read_node(right_block);
+            try self.merge_nodes(parent, child_idx, child, &right);
+            self.release_node(&right);
+        } else {
+            const left_block = parent.children()[child_idx - 1];
+            var left = try self.read_node(left_block);
+            try self.merge_nodes(parent, child_idx - 1, &left, child);
+            self.release_node(&left);
+        }
+    }
+
+    /// Borrow entry from left sibling
+    fn borrow_from_left(self: *BTree, parent: *BTreeNode, child_idx: usize, left: *BTreeNode, right: *BTreeNode) !void {
+        // Move separator from parent to right child
+        // Move last entry from left to parent
+
+        if (right.is_leaf()) {
+            const left_entries = left.leaf_entries();
+            const last_entry = left_entries[left.header.num_keys - 1];
+
+            // Insert at beginning of right
+            const right_data = right.buffer[@sizeOf(BTreeHeader)..];
+            const right_entries = @as([*]BTreeLeafEntry, @ptrCast(@alignCast(right_data.ptr)));
+
+            var i: usize = right.header.num_keys;
+            while (i > 0) : (i -= 1) {
+                right_entries[i] = right_entries[i - 1];
+            }
+            right_entries[0] = last_entry;
+
+            right.header.num_keys += 1;
+            left.header.num_keys -= 1;
+
+            // Update parent separator
+            const parent_entries = parent.internal_entries();
+            parent_entries[child_idx - 1].key = right_entries[0].key;
+        }
+
+        left.dirty = true;
+        right.dirty = true;
+        parent.dirty = true;
+
+        try self.write_node(left);
+        try self.write_node(right);
+        try self.write_node(parent);
+    }
+
+    /// Borrow entry from right sibling
+    fn borrow_from_right(self: *BTree, parent: *BTreeNode, child_idx: usize, left: *BTreeNode, right: *BTreeNode) !void {
+        if (left.is_leaf()) {
+            const right_entries = right.leaf_entries();
+            const first_entry = right_entries[0];
+
+            // Append to left
+            const left_data = left.buffer[@sizeOf(BTreeHeader)..];
+            const left_entries = @as([*]BTreeLeafEntry, @ptrCast(@alignCast(left_data.ptr)));
+            left_entries[left.header.num_keys] = first_entry;
+
+            // Remove from right
+            var i: usize = 0;
+            while (i < right.header.num_keys - 1) : (i += 1) {
+                right_entries[i] = right_entries[i + 1];
+            }
+
+            left.header.num_keys += 1;
+            right.header.num_keys -= 1;
+
+            // Update parent separator
+            const parent_entries = parent.internal_entries();
+            parent_entries[child_idx].key = right_entries[0].key;
+        }
+
+        left.dirty = true;
+        right.dirty = true;
+        parent.dirty = true;
+
+        try self.write_node(left);
+        try self.write_node(right);
+        try self.write_node(parent);
+    }
+
+    /// Merge two nodes
+    fn merge_nodes(self: *BTree, parent: *BTreeNode, sep_idx: usize, left: *BTreeNode, right: *BTreeNode) !void {
+        if (left.is_leaf()) {
+            // Copy all entries from right to left
+            const left_data = left.buffer[@sizeOf(BTreeHeader)..];
+            const left_entries = @as([*]BTreeLeafEntry, @ptrCast(@alignCast(left_data.ptr)));
+            const right_entries = right.leaf_entries();
+
+            var i: usize = 0;
+            while (i < right.header.num_keys) : (i += 1) {
+                left_entries[left.header.num_keys + i] = right_entries[i];
+            }
+
+            left.header.num_keys += right.header.num_keys;
+
+            // Update sibling links
+            left.header.next = right.header.next;
+        }
+
+        // Remove separator from parent
+        const parent_entries = @as([*]BTreeInternalEntry, @ptrCast(@alignCast(parent.buffer[@sizeOf(BTreeHeader)..].ptr)));
+        var i: usize = sep_idx;
+        while (i < parent.header.num_keys - 1) : (i += 1) {
+            parent_entries[i] = parent_entries[i + 1];
+        }
+
+        // Remove right child pointer
+        const parent_children = parent.children();
+        i = sep_idx + 1;
+        while (i < parent.header.num_keys) : (i += 1) {
+            parent_children[i] = parent_children[i + 1];
+        }
+
+        parent.header.num_keys -= 1;
+
+        // Free right node
+        try block_alloc.free_blocks(right.block, 1);
+        self.total_nodes -= 1;
+
+        left.dirty = true;
+        parent.dirty = true;
+
+        try self.write_node(left);
+        try self.write_node(parent);
+    }
+
+    /// Iterate over all entries
+    pub fn iterate(self: *BTree, callback: *const fn (*const DirEntryKey, *const DirEntryValue) bool) !void {
+        // Find leftmost leaf
+        var current_block = self.root_block;
+
+        while (true) {
+            var node = try self.read_node(current_block);
+
+            if (node.is_leaf()) {
+                // Iterate through leaves using next pointers
+                while (true) {
+                    const entries = node.leaf_entries();
+                    for (entries) |entry| {
+                        if (!callback(&entry.key, &entry.value)) {
+                            self.release_node(&node);
+                            return;
+                        }
+                    }
+
+                    if (node.header.next == 0) {
+                        self.release_node(&node);
+                        return;
+                    }
+
+                    self.release_node(&node);
+                    node = try self.read_node(node.header.next);
+                }
+            } else {
+                // Go to leftmost child
+                current_block = node.children()[0];
+                self.release_node(&node);
+            }
+        }
+    }
+
+    /// Read node from disk
+    fn read_node(self: *BTree, block: u64) !BTreeNode {
+        _ = self;
+        const buffer = try block_alloc.read_block(block);
+        var node = BTreeNode.init_from_buffer(buffer, block);
+
+        if (!node.header.validate()) {
+            return error.CorruptBTree;
+        }
+
+        return node;
+    }
+
+    /// Write node to disk
+    fn write_node(self: *BTree, node: *BTreeNode) !void {
+        _ = self;
+        if (node.dirty) {
+            try block_alloc.write_block(node.block, node.buffer);
+            node.dirty = false;
+        }
+    }
+
+    /// Release node buffer
+    fn release_node(self: *BTree, node: *BTreeNode) void {
+        _ = self;
+        _ = node;
+        // Return buffer to cache
+    }
+};
+
+// =============================================================================
+// Hash Functions
+// =============================================================================
+
+fn compute_hash(name: []const u8, hash_type: u8) u32 {
+    switch (hash_type) {
+        HASH_TYPE_LEGACY => return legacy_hash(name),
+        HASH_TYPE_HALF_MD4 => return half_md4_hash(name),
+        HASH_TYPE_TEA => return tea_hash(name),
+        else => return legacy_hash(name),
+    }
+}
+
+fn compute_minor_hash(name: []const u8, hash_type: u8) u32 {
+    // Secondary hash to handle collisions
+    _ = hash_type;
+    var hash: u32 = 0;
+    for (name) |c| {
+        hash = hash *% 31 +% c;
+    }
+    return hash;
+}
+
+fn legacy_hash(name: []const u8) u32 {
+    var hash: u32 = 0;
+    for (name) |c| {
+        hash = (hash << 4) +% c;
+        const g = hash & 0xF0000000;
+        if (g != 0) {
+            hash ^= (g >> 24);
+        }
+        hash &= ~g;
+    }
+    return hash;
+}
+
+fn half_md4_hash(name: []const u8) u32 {
+    // Simplified half-MD4 hash
+    var a: u32 = 0x67452301;
+    var b: u32 = 0xEFCDAB89;
+    var c: u32 = 0x98BADCFE;
+    var d: u32 = 0x10325476;
+
+    var i: usize = 0;
+    while (i < name.len) : (i += 1) {
+        const k = @as(u32, name[i]);
+        a = (a +% k) *% 0x5A827999;
+        b = (b ^ a) *% 0x6ED9EBA1;
+        c = (c +% b) *% 0x8F1BBCDC;
+        d = (d ^ c) *% 0xCA62C1D6;
+    }
+
+    return a ^ b ^ c ^ d;
+}
+
+fn tea_hash(name: []const u8) u32 {
+    // Tiny Encryption Algorithm based hash
+    var v0: u32 = 0;
+    var v1: u32 = 0;
+    const delta: u32 = 0x9E3779B9;
+    var sum: u32 = 0;
+
+    // Pack name into v0, v1
+    var i: usize = 0;
+    while (i < @min(4, name.len)) : (i += 1) {
+        v0 |= @as(u32, name[i]) << @intCast(i * 8);
+    }
+    while (i < @min(8, name.len)) : (i += 1) {
+        v1 |= @as(u32, name[i]) << @intCast((i - 4) * 8);
+    }
+
+    // TEA rounds
+    var round: u32 = 0;
+    while (round < 32) : (round += 1) {
+        sum +%= delta;
+        v0 +%= ((v1 << 4) +% 0xA341316C) ^ (v1 +% sum) ^ ((v1 >> 5) +% 0xC8013EA4);
+        v1 +%= ((v0 << 4) +% 0xAD90777D) ^ (v0 +% sum) ^ ((v0 >> 5) +% 0x7E95761E);
+    }
+
+    return v0 ^ v1;
+}
+
+// =============================================================================
+// Directory Interface using B-Tree
+// =============================================================================
+
+pub const BTreeDirectory = struct {
+    inode: *homefs.Inode,
+    tree: BTree,
+
+    pub fn init(inode: *homefs.Inode) !BTreeDirectory {
+        // Get B-tree root from inode
+        const root_block = inode.btree_root;
+
+        return BTreeDirectory{
+            .inode = inode,
+            .tree = BTree.init(root_block, 4096),
+        };
+    }
+
+    pub fn create(inode: *homefs.Inode) !BTreeDirectory {
+        // Create new B-tree
+        var tree = try BTree.create(4096);
+
+        // Store root in inode
+        inode.btree_root = tree.root_block;
+        inode.flags |= homefs.INODE_BTREE_DIR;
+
+        return BTreeDirectory{
+            .inode = inode,
+            .tree = tree,
+        };
+    }
+
+    pub fn lookup(self: *BTreeDirectory, name: []const u8) !?u64 {
+        const result = try self.tree.search(name);
+        if (result) |value| {
+            return value.inode;
+        }
+        return null;
+    }
+
+    pub fn add_entry(self: *BTreeDirectory, name: []const u8, inode: u64, file_type: u8) !void {
+        try self.tree.insert(name, inode, file_type);
+    }
+
+    pub fn remove_entry(self: *BTreeDirectory, name: []const u8) !bool {
+        return try self.tree.delete(name);
+    }
+
+    pub fn iterate_entries(self: *BTreeDirectory, callback: *const fn (name: []const u8, inode: u64, file_type: u8) bool) !void {
+        const wrapper = struct {
+            fn call(key: *const DirEntryKey, value: *const DirEntryValue) bool {
+                return callback(key.name[0..key.name_len], value.inode, value.file_type);
+            }
+        };
+
+        try self.tree.iterate(wrapper.call);
+    }
+};

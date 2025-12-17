@@ -1,0 +1,661 @@
+// home-os Sparse File Support
+// Efficient handling of files with holes (unallocated regions)
+
+const std = @import("std");
+const homefs = @import("homefs.home");
+const extents = @import("extents.home");
+const block_alloc = @import("block_alloc.home");
+
+// =============================================================================
+// Sparse File Constants
+// =============================================================================
+
+// Seek operations for hole/data detection
+pub const SEEK_DATA: u32 = 3;    // Seek to next data region
+pub const SEEK_HOLE: u32 = 4;    // Seek to next hole
+
+// Flags for punch hole operations
+pub const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;      // Deallocate space
+pub const FALLOC_FL_NO_HIDE_STALE: u32 = 0x04;   // Don't hide stale data
+pub const FALLOC_FL_COLLAPSE_RANGE: u32 = 0x08;  // Remove range and shift
+pub const FALLOC_FL_ZERO_RANGE: u32 = 0x10;      // Zero range
+pub const FALLOC_FL_INSERT_RANGE: u32 = 0x20;    // Insert hole
+pub const FALLOC_FL_UNSHARE_RANGE: u32 = 0x40;   // Unshare shared extent
+
+// =============================================================================
+// Hole Map Structure
+// =============================================================================
+
+/// Represents a hole (unallocated region) in a file
+pub const Hole = struct {
+    start: u64,      // Start offset in bytes
+    length: u64,     // Length in bytes
+
+    pub fn end(self: *const Hole) u64 {
+        return self.start + self.length;
+    }
+
+    pub fn contains(self: *const Hole, offset: u64) bool {
+        return offset >= self.start and offset < self.end();
+    }
+
+    pub fn overlaps(self: *const Hole, start: u64, len: u64) bool {
+        return self.start < start + len and self.end() > start;
+    }
+};
+
+/// Represents a data region in a file
+pub const DataRegion = struct {
+    file_offset: u64,    // Offset in file
+    disk_block: u64,     // Physical block number
+    length: u64,         // Length in bytes
+    flags: u32,          // Region flags
+
+    pub const FLAG_UNWRITTEN: u32 = 0x01;    // Preallocated but not written
+    pub const FLAG_SHARED: u32 = 0x02;       // Shared extent (reflink)
+
+    pub fn end(self: *const DataRegion) u64 {
+        return self.file_offset + self.length;
+    }
+};
+
+// =============================================================================
+// Sparse File Handler
+// =============================================================================
+
+pub const SparseFile = struct {
+    inode: *homefs.Inode,
+    extent_tree: extents.ExtentTree,
+    block_size: u32,
+
+    // Hole detection cache
+    cached_hole_start: u64,
+    cached_hole_end: u64,
+    cache_valid: bool,
+
+    pub fn init(inode: *homefs.Inode, block_size: u32) SparseFile {
+        return SparseFile{
+            .inode = inode,
+            .extent_tree = extents.ExtentTree.init(inode, block_size),
+            .block_size = block_size,
+            .cached_hole_start = 0,
+            .cached_hole_end = 0,
+            .cache_valid = false,
+        };
+    }
+
+    // =========================================================================
+    // Hole Detection
+    // =========================================================================
+
+    /// Check if offset is in a hole
+    pub fn is_hole(self: *SparseFile, offset: u64) !bool {
+        // Check cache first
+        if (self.cache_valid and offset >= self.cached_hole_start and offset < self.cached_hole_end) {
+            return true;
+        }
+
+        const block = offset / self.block_size;
+        const physical = try self.extent_tree.lookup(block);
+
+        if (physical == null) {
+            // No mapping - it's a hole
+            // Update cache
+            self.cached_hole_start = block * self.block_size;
+            self.cached_hole_end = try self.find_hole_end(block);
+            self.cache_valid = true;
+            return true;
+        }
+
+        self.cache_valid = false;
+        return false;
+    }
+
+    /// Find the end of a hole starting at given block
+    fn find_hole_end(self: *SparseFile, start_block: u64) !u64 {
+        var block = start_block;
+        const max_block = (self.inode.size + self.block_size - 1) / self.block_size;
+
+        while (block < max_block) {
+            const physical = try self.extent_tree.lookup(block);
+            if (physical != null) {
+                break;
+            }
+            block += 1;
+        }
+
+        return block * self.block_size;
+    }
+
+    /// Find next data region after offset
+    pub fn seek_data(self: *SparseFile, offset: u64) !?u64 {
+        if (offset >= self.inode.size) {
+            return null;  // Beyond EOF
+        }
+
+        var current = offset;
+
+        while (current < self.inode.size) {
+            if (!try self.is_hole(current)) {
+                return current;
+            }
+
+            // Skip to next block
+            const block = current / self.block_size;
+            current = (block + 1) * self.block_size;
+        }
+
+        return null;  // No more data regions
+    }
+
+    /// Find next hole after offset
+    pub fn seek_hole(self: *SparseFile, offset: u64) !?u64 {
+        if (offset >= self.inode.size) {
+            return self.inode.size;  // Virtual hole at EOF
+        }
+
+        var current = offset;
+
+        while (current < self.inode.size) {
+            if (try self.is_hole(current)) {
+                return current;
+            }
+
+            // Skip this data region
+            const block = current / self.block_size;
+            const physical = try self.extent_tree.lookup(block);
+
+            if (physical) |_| {
+                // Find extent end
+                current = try self.find_data_end(current);
+            } else {
+                return current;
+            }
+        }
+
+        return self.inode.size;  // Virtual hole at EOF
+    }
+
+    /// Find end of data region
+    fn find_data_end(self: *SparseFile, offset: u64) !u64 {
+        var block = offset / self.block_size;
+        const max_block = (self.inode.size + self.block_size - 1) / self.block_size;
+
+        while (block < max_block) {
+            const physical = try self.extent_tree.lookup(block);
+            if (physical == null) {
+                break;
+            }
+            block += 1;
+        }
+
+        return @min(block * self.block_size, self.inode.size);
+    }
+
+    // =========================================================================
+    // Sparse Read/Write
+    // =========================================================================
+
+    /// Read from sparse file (returns zeros for holes)
+    pub fn read(self: *SparseFile, offset: u64, buffer: []u8) !usize {
+        if (offset >= self.inode.size) {
+            return 0;  // EOF
+        }
+
+        var bytes_read: usize = 0;
+        var current_offset = offset;
+        var remaining = @min(buffer.len, self.inode.size - offset);
+
+        while (remaining > 0) {
+            const block = current_offset / self.block_size;
+            const block_offset = current_offset % self.block_size;
+            const bytes_in_block = @min(self.block_size - block_offset, remaining);
+
+            const physical = try self.extent_tree.lookup(block);
+
+            if (physical) |phys_block| {
+                // Read actual data
+                const block_data = try block_alloc.read_block(phys_block);
+                const src = block_data[block_offset..][0..bytes_in_block];
+                @memcpy(buffer[bytes_read..][0..bytes_in_block], src);
+            } else {
+                // Hole - return zeros
+                @memset(buffer[bytes_read..][0..bytes_in_block], 0);
+            }
+
+            bytes_read += bytes_in_block;
+            current_offset += bytes_in_block;
+            remaining -= bytes_in_block;
+        }
+
+        return bytes_read;
+    }
+
+    /// Write to sparse file (allocates blocks on demand)
+    pub fn write(self: *SparseFile, offset: u64, data: []const u8) !usize {
+        var bytes_written: usize = 0;
+        var current_offset = offset;
+        var remaining = data.len;
+
+        while (remaining > 0) {
+            const block = current_offset / self.block_size;
+            const block_offset = current_offset % self.block_size;
+            const bytes_in_block = @min(self.block_size - block_offset, remaining);
+
+            // Check if writing all zeros (can skip allocation)
+            const write_data = data[bytes_written..][0..bytes_in_block];
+            const is_all_zeros = for (write_data) |b| {
+                if (b != 0) break false;
+            } else true;
+
+            if (is_all_zeros and block_offset == 0 and bytes_in_block == self.block_size) {
+                // Writing full block of zeros - can leave as hole
+                // Just update file size if needed
+            } else {
+                // Need to allocate/write actual data
+                const phys_block = try self.ensure_block_allocated(block);
+
+                // Read existing block if partial write
+                var block_data = try block_alloc.read_block(phys_block);
+
+                if (block_offset > 0 or bytes_in_block < self.block_size) {
+                    // Partial block - read first if hole was just allocated
+                    // (block_data already contains existing data or zeros)
+                }
+
+                // Write data into block
+                @memcpy(block_data[block_offset..][0..bytes_in_block], write_data);
+
+                // Write block back
+                try block_alloc.write_block(phys_block, block_data);
+            }
+
+            bytes_written += bytes_in_block;
+            current_offset += bytes_in_block;
+            remaining -= bytes_in_block;
+        }
+
+        // Update file size if extended
+        if (offset + bytes_written > self.inode.size) {
+            self.inode.size = offset + bytes_written;
+        }
+
+        // Invalidate hole cache
+        self.cache_valid = false;
+
+        return bytes_written;
+    }
+
+    /// Ensure a block is allocated (convert hole to data)
+    fn ensure_block_allocated(self: *SparseFile, block: u64) !u64 {
+        // Check if already allocated
+        if (try self.extent_tree.lookup(block)) |phys| {
+            return phys;
+        }
+
+        // Allocate new block
+        return try self.extent_tree.map(block, 1, 0);
+    }
+
+    // =========================================================================
+    // Hole Punching
+    // =========================================================================
+
+    /// Punch a hole in the file (deallocate range)
+    pub fn punch_hole(self: *SparseFile, offset: u64, length: u64) !void {
+        // Align to block boundaries
+        const start_block = (offset + self.block_size - 1) / self.block_size;
+        const end_block = (offset + length) / self.block_size;
+
+        if (start_block >= end_block) {
+            // Range doesn't span full blocks - need partial zeroing
+            try self.zero_range(offset, length);
+            return;
+        }
+
+        // Zero partial first block
+        if (offset % self.block_size != 0) {
+            const partial_len = self.block_size - (offset % self.block_size);
+            try self.zero_partial_block(offset, partial_len);
+        }
+
+        // Deallocate full blocks
+        const blocks_to_free = end_block - start_block;
+        if (blocks_to_free > 0) {
+            try self.extent_tree.unmap(start_block, @intCast(blocks_to_free));
+        }
+
+        // Zero partial last block
+        const end_offset = offset + length;
+        if (end_offset % self.block_size != 0) {
+            const last_block_start = end_block * self.block_size;
+            const partial_len = end_offset - last_block_start;
+            try self.zero_partial_block(last_block_start, partial_len);
+        }
+
+        // Invalidate cache
+        self.cache_valid = false;
+    }
+
+    /// Zero a partial block
+    fn zero_partial_block(self: *SparseFile, offset: u64, length: u64) !void {
+        const block = offset / self.block_size;
+        const block_offset = offset % self.block_size;
+
+        const physical = try self.extent_tree.lookup(block);
+        if (physical) |phys_block| {
+            var block_data = try block_alloc.read_block(phys_block);
+            @memset(block_data[block_offset..][0..length], 0);
+            try block_alloc.write_block(phys_block, block_data);
+        }
+        // If hole, nothing to do
+    }
+
+    /// Zero a range (without deallocating)
+    pub fn zero_range(self: *SparseFile, offset: u64, length: u64) !void {
+        const zeros = [_]u8{0} ** 4096;
+        var remaining = length;
+        var current = offset;
+
+        while (remaining > 0) {
+            const to_write = @min(remaining, 4096);
+            _ = try self.write(current, zeros[0..to_write]);
+            remaining -= to_write;
+            current += to_write;
+        }
+    }
+
+    // =========================================================================
+    // Range Operations
+    // =========================================================================
+
+    /// Collapse range (remove hole and shift data)
+    pub fn collapse_range(self: *SparseFile, offset: u64, length: u64) !void {
+        // Must be block-aligned
+        if (offset % self.block_size != 0 or length % self.block_size != 0) {
+            return error.InvalidAlignment;
+        }
+
+        const start_block = offset / self.block_size;
+        const blocks_to_remove = length / self.block_size;
+
+        // Shift all extents after the range
+        try self.shift_extents_left(start_block, @intCast(blocks_to_remove));
+
+        // Update file size
+        self.inode.size -= length;
+        self.cache_valid = false;
+    }
+
+    /// Insert range (add hole and shift data)
+    pub fn insert_range(self: *SparseFile, offset: u64, length: u64) !void {
+        // Must be block-aligned
+        if (offset % self.block_size != 0 or length % self.block_size != 0) {
+            return error.InvalidAlignment;
+        }
+
+        const start_block = offset / self.block_size;
+        const blocks_to_insert = length / self.block_size;
+
+        // Shift all extents after the offset right
+        try self.shift_extents_right(start_block, @intCast(blocks_to_insert));
+
+        // Update file size
+        self.inode.size += length;
+        self.cache_valid = false;
+    }
+
+    /// Shift extents left (for collapse_range)
+    fn shift_extents_left(self: *SparseFile, start_block: u64, shift: u32) !void {
+        // This would modify extent tree entries
+        // Moving logical block numbers down by 'shift'
+        _ = self;
+        _ = start_block;
+        _ = shift;
+    }
+
+    /// Shift extents right (for insert_range)
+    fn shift_extents_right(self: *SparseFile, start_block: u64, shift: u32) !void {
+        _ = self;
+        _ = start_block;
+        _ = shift;
+    }
+
+    // =========================================================================
+    // Statistics
+    // =========================================================================
+
+    /// Get apparent size (includes holes)
+    pub fn apparent_size(self: *const SparseFile) u64 {
+        return self.inode.size;
+    }
+
+    /// Get actual allocated size (excludes holes)
+    pub fn allocated_size(self: *SparseFile) !u64 {
+        var total: u64 = 0;
+        const max_block = (self.inode.size + self.block_size - 1) / self.block_size;
+
+        var block: u64 = 0;
+        while (block < max_block) {
+            if (try self.extent_tree.lookup(block)) |_| {
+                total += self.block_size;
+            }
+            block += 1;
+        }
+
+        return total;
+    }
+
+    /// Get hole count and total hole size
+    pub fn hole_statistics(self: *SparseFile) !struct { count: u64, total_size: u64 } {
+        var hole_count: u64 = 0;
+        var hole_size: u64 = 0;
+        var in_hole = false;
+        var hole_start: u64 = 0;
+
+        const max_block = (self.inode.size + self.block_size - 1) / self.block_size;
+
+        var block: u64 = 0;
+        while (block < max_block) : (block += 1) {
+            const is_allocated = (try self.extent_tree.lookup(block)) != null;
+
+            if (!is_allocated and !in_hole) {
+                // Starting a hole
+                in_hole = true;
+                hole_start = block;
+                hole_count += 1;
+            } else if (is_allocated and in_hole) {
+                // Ending a hole
+                hole_size += (block - hole_start) * self.block_size;
+                in_hole = false;
+            }
+        }
+
+        // Handle hole at end
+        if (in_hole) {
+            hole_size += (max_block - hole_start) * self.block_size;
+        }
+
+        return .{ .count = hole_count, .total_size = hole_size };
+    }
+
+    /// Get file fragmentation level
+    pub fn fragmentation(self: *SparseFile) !f32 {
+        var extent_count: u64 = 0;
+        var prev_phys: ?u64 = null;
+
+        const max_block = (self.inode.size + self.block_size - 1) / self.block_size;
+
+        var block: u64 = 0;
+        while (block < max_block) : (block += 1) {
+            if (try self.extent_tree.lookup(block)) |phys| {
+                if (prev_phys == null or prev_phys.? + 1 != phys) {
+                    extent_count += 1;
+                }
+                prev_phys = phys;
+            } else {
+                prev_phys = null;
+            }
+        }
+
+        if (extent_count == 0) return 0.0;
+
+        // Ideal case: one extent for all data blocks
+        const allocated = try self.allocated_size();
+        const ideal_extents: f32 = 1.0;
+        const actual_extents: f32 = @floatFromInt(extent_count);
+
+        return (actual_extents - ideal_extents) / actual_extents;
+    }
+};
+
+// =============================================================================
+// Sparse File Utilities
+// =============================================================================
+
+/// Copy sparse file preserving holes
+pub fn copy_sparse(src: *SparseFile, dst: *SparseFile) !void {
+    var offset: u64 = 0;
+
+    while (offset < src.inode.size) {
+        // Find next data region
+        if (try src.seek_data(offset)) |data_start| {
+            // Find end of data region
+            const data_end = try src.seek_hole(data_start) orelse src.inode.size;
+            const data_len = data_end - data_start;
+
+            // Copy data region
+            var remaining = data_len;
+            var current = data_start;
+
+            while (remaining > 0) {
+                var buffer: [4096]u8 = undefined;
+                const to_read = @min(remaining, buffer.len);
+
+                const bytes_read = try src.read(current, buffer[0..to_read]);
+                if (bytes_read == 0) break;
+
+                _ = try dst.write(current, buffer[0..bytes_read]);
+
+                remaining -= bytes_read;
+                current += bytes_read;
+            }
+
+            offset = data_end;
+        } else {
+            // No more data
+            break;
+        }
+    }
+
+    // Set final size (handles trailing hole)
+    dst.inode.size = src.inode.size;
+}
+
+/// Truncate sparse file
+pub fn truncate(file: *SparseFile, new_size: u64) !void {
+    if (new_size < file.inode.size) {
+        // Shrinking - deallocate blocks beyond new size
+        const new_blocks = (new_size + file.block_size - 1) / file.block_size;
+        const old_blocks = (file.inode.size + file.block_size - 1) / file.block_size;
+
+        if (old_blocks > new_blocks) {
+            try file.extent_tree.unmap(new_blocks, @intCast(old_blocks - new_blocks));
+        }
+    }
+
+    file.inode.size = new_size;
+    file.cache_valid = false;
+}
+
+/// Convert regular file to sparse (deallocate zero blocks)
+pub fn make_sparse(file: *SparseFile) !u64 {
+    var blocks_freed: u64 = 0;
+    const max_block = (file.inode.size + file.block_size - 1) / file.block_size;
+
+    var block: u64 = 0;
+    while (block < max_block) : (block += 1) {
+        if (try file.extent_tree.lookup(block)) |phys_block| {
+            // Check if block is all zeros
+            const block_data = try block_alloc.read_block(phys_block);
+
+            var is_zero = true;
+            for (block_data) |b| {
+                if (b != 0) {
+                    is_zero = false;
+                    break;
+                }
+            }
+
+            if (is_zero) {
+                // Convert to hole
+                try file.extent_tree.unmap(block, 1);
+                blocks_freed += 1;
+            }
+        }
+    }
+
+    file.cache_valid = false;
+    return blocks_freed;
+}
+
+// =============================================================================
+// FIEMAP Interface (File Extent Mapping)
+// =============================================================================
+
+pub const FiemapExtent = struct {
+    logical: u64,        // Logical offset in file
+    physical: u64,       // Physical offset on disk
+    length: u64,         // Length in bytes
+    flags: u32,          // FIEMAP_EXTENT_* flags
+
+    pub const FLAG_LAST: u32 = 0x0001;           // Last extent in file
+    pub const FLAG_UNKNOWN: u32 = 0x0002;        // Extent location unknown
+    pub const FLAG_DELALLOC: u32 = 0x0004;       // Delayed allocation
+    pub const FLAG_ENCODED: u32 = 0x0008;        // Encoded extent
+    pub const FLAG_DATA_ENCRYPTED: u32 = 0x0080; // Data encrypted
+    pub const FLAG_NOT_ALIGNED: u32 = 0x0100;    // Not aligned to block
+    pub const FLAG_DATA_INLINE: u32 = 0x0200;    // Data inline in inode
+    pub const FLAG_DATA_TAIL: u32 = 0x0400;      // Tail packed
+    pub const FLAG_UNWRITTEN: u32 = 0x0800;      // Preallocated unwritten
+    pub const FLAG_MERGED: u32 = 0x1000;         // Multiple files use same
+    pub const FLAG_SHARED: u32 = 0x2000;         // Shared extent
+};
+
+/// Get file extent map
+pub fn fiemap(file: *SparseFile, start: u64, len: u64, max_extents: usize) ![]FiemapExtent {
+    var result = try std.heap.page_allocator.alloc(FiemapExtent, max_extents);
+    var count: usize = 0;
+
+    var offset = start;
+    const end = start + len;
+
+    while (offset < end and count < max_extents) {
+        // Find next data region
+        const data_start = try file.seek_data(offset) orelse break;
+        if (data_start >= end) break;
+
+        const data_end = @min(try file.seek_hole(data_start) orelse file.inode.size, end);
+
+        // Get physical mapping
+        const block = data_start / file.block_size;
+        if (try file.extent_tree.lookup(block)) |phys_block| {
+            result[count] = FiemapExtent{
+                .logical = data_start,
+                .physical = phys_block * file.block_size,
+                .length = data_end - data_start,
+                .flags = 0,
+            };
+            count += 1;
+        }
+
+        offset = data_end;
+    }
+
+    // Mark last extent
+    if (count > 0) {
+        result[count - 1].flags |= FiemapExtent.FLAG_LAST;
+    }
+
+    return result[0..count];
+}

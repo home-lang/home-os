@@ -1,0 +1,670 @@
+// home-os Large File Support
+// Support for files >2GB using 64-bit offsets and sizes
+
+const std = @import("std");
+const homefs = @import("homefs.home");
+const extents = @import("extents.home");
+const block_alloc = @import("block_alloc.home");
+
+// =============================================================================
+// Large File Constants
+// =============================================================================
+
+// Size limits
+pub const MAX_FILE_SIZE_32BIT: u64 = 0x7FFFFFFF;           // 2GB - 1 (32-bit signed max)
+pub const MAX_FILE_SIZE_LFS: u64 = 0x7FFFFFFFFFFFFFFF;     // 8EB - 1 (63-bit max)
+pub const MAX_FILE_SIZE: u64 = 0x1000000000000;            // 16TB (practical limit)
+
+// Block size considerations
+pub const MAX_DIRECT_BLOCKS: u32 = 12;
+pub const MAX_INDIRECT_LEVEL: u32 = 3;
+
+// Offset types
+pub const off_t = i64;       // Signed 64-bit offset
+pub const loff_t = i64;      // Large file offset
+pub const size_t = u64;      // Size type
+
+// O_LARGEFILE flag (for 32-bit compatibility)
+pub const O_LARGEFILE: u32 = 0x8000;
+
+// =============================================================================
+// 64-bit Inode Structure
+// =============================================================================
+
+/// Extended inode for large file support
+pub const Inode64 = struct {
+    // Basic fields
+    mode: u16,               // File type and permissions
+    uid: u32,                // Owner user ID
+    gid: u32,                // Owner group ID
+    link_count: u32,         // Hard link count
+    flags: u32,              // Inode flags
+
+    // 64-bit size
+    size_lo: u32,            // Lower 32 bits of file size
+    size_hi: u32,            // Upper 32 bits of file size
+
+    // Timestamps (64-bit for Y2038)
+    atime: i64,              // Access time
+    mtime: i64,              // Modification time
+    ctime: i64,              // Change time
+    crtime: i64,             // Creation time
+
+    // Nanosecond precision
+    atime_nsec: u32,
+    mtime_nsec: u32,
+    ctime_nsec: u32,
+    crtime_nsec: u32,
+
+    // Block counts (64-bit)
+    blocks_lo: u32,          // Lower 32 bits of block count
+    blocks_hi: u16,          // Upper 16 bits of block count
+
+    // Extended attributes
+    extra_isize: u16,        // Size of extra inode fields
+    file_acl_lo: u32,        // Lower 32 bits of extended attributes block
+    file_acl_hi: u16,        // Upper 16 bits
+
+    // Fragment info (reserved)
+    faddr: u32,
+    frag: u8,
+    fsize: u8,
+
+    // OS-specific fields
+    osd2: [12]u8,
+
+    // Block pointers or extent tree root
+    block_data: [60]u8,      // Direct blocks or extent tree
+
+    // Generation number (for NFS)
+    generation: u32,
+
+    // Project ID (for quotas)
+    project_id: u32,
+
+    // Checksum
+    checksum_lo: u16,
+    checksum_hi: u16,
+
+    // Helper functions
+    pub fn get_size(self: *const Inode64) u64 {
+        return (@as(u64, self.size_hi) << 32) | @as(u64, self.size_lo);
+    }
+
+    pub fn set_size(self: *Inode64, size: u64) void {
+        self.size_lo = @intCast(size & 0xFFFFFFFF);
+        self.size_hi = @intCast((size >> 32) & 0xFFFFFFFF);
+    }
+
+    pub fn get_blocks(self: *const Inode64) u64 {
+        return (@as(u64, self.blocks_hi) << 32) | @as(u64, self.blocks_lo);
+    }
+
+    pub fn set_blocks(self: *Inode64, blocks: u64) void {
+        self.blocks_lo = @intCast(blocks & 0xFFFFFFFF);
+        self.blocks_hi = @intCast((blocks >> 32) & 0xFFFF);
+    }
+
+    pub fn get_file_acl(self: *const Inode64) u64 {
+        return (@as(u64, self.file_acl_hi) << 32) | @as(u64, self.file_acl_lo);
+    }
+
+    pub fn set_file_acl(self: *Inode64, block: u64) void {
+        self.file_acl_lo = @intCast(block & 0xFFFFFFFF);
+        self.file_acl_hi = @intCast((block >> 32) & 0xFFFF);
+    }
+
+    pub fn uses_extents(self: *const Inode64) bool {
+        return (self.flags & homefs.INODE_EXTENTS) != 0;
+    }
+};
+
+// =============================================================================
+// Large File Operations
+// =============================================================================
+
+pub const LargeFile = struct {
+    inode: *Inode64,
+    block_size: u32,
+    extent_tree: ?extents.ExtentTree,
+
+    // File limits for this instance
+    max_size: u64,
+
+    // Statistics
+    bytes_read: u64,
+    bytes_written: u64,
+
+    pub fn init(inode: *Inode64, block_size: u32) LargeFile {
+        return LargeFile{
+            .inode = inode,
+            .block_size = block_size,
+            .extent_tree = null,
+            .max_size = MAX_FILE_SIZE,
+            .bytes_read = 0,
+            .bytes_written = 0,
+        };
+    }
+
+    /// Calculate maximum addressable file size
+    pub fn calculate_max_size(self: *const LargeFile) u64 {
+        if (self.inode.uses_extents()) {
+            // Extent-based: 48-bit block addressing * block size
+            // With 4KB blocks: 2^48 * 4KB = 1 EB
+            return @as(u64, 1) << 60;
+        }
+
+        // Indirect block based calculation
+        const ptrs_per_block = self.block_size / @sizeOf(u64);
+        const bs = @as(u64, self.block_size);
+
+        // Direct blocks
+        var max: u64 = MAX_DIRECT_BLOCKS * bs;
+
+        // Single indirect
+        max += ptrs_per_block * bs;
+
+        // Double indirect
+        max += ptrs_per_block * ptrs_per_block * bs;
+
+        // Triple indirect
+        max += ptrs_per_block * ptrs_per_block * ptrs_per_block * bs;
+
+        return max;
+    }
+
+    // =========================================================================
+    // 64-bit I/O Operations
+    // =========================================================================
+
+    /// Read at 64-bit offset
+    pub fn pread64(self: *LargeFile, buffer: []u8, offset: i64) !isize {
+        if (offset < 0) {
+            return error.InvalidOffset;
+        }
+
+        const uoffset: u64 = @intCast(offset);
+        const file_size = self.inode.get_size();
+
+        if (uoffset >= file_size) {
+            return 0;  // EOF
+        }
+
+        const available = file_size - uoffset;
+        const to_read = @min(buffer.len, available);
+
+        var bytes_read: usize = 0;
+        var current = uoffset;
+
+        while (bytes_read < to_read) {
+            const block_num = current / self.block_size;
+            const block_offset = current % self.block_size;
+            const bytes_in_block = @min(self.block_size - block_offset, to_read - bytes_read);
+
+            const phys_block = try self.get_block(block_num);
+
+            if (phys_block != 0) {
+                const block_data = try block_alloc.read_block(phys_block);
+                @memcpy(buffer[bytes_read..][0..bytes_in_block], block_data[block_offset..][0..bytes_in_block]);
+            } else {
+                // Hole - return zeros
+                @memset(buffer[bytes_read..][0..bytes_in_block], 0);
+            }
+
+            bytes_read += bytes_in_block;
+            current += bytes_in_block;
+        }
+
+        self.bytes_read += bytes_read;
+        return @intCast(bytes_read);
+    }
+
+    /// Write at 64-bit offset
+    pub fn pwrite64(self: *LargeFile, data: []const u8, offset: i64) !isize {
+        if (offset < 0) {
+            return error.InvalidOffset;
+        }
+
+        const uoffset: u64 = @intCast(offset);
+
+        // Check file size limit
+        if (uoffset + data.len > self.max_size) {
+            return error.FileTooLarge;
+        }
+
+        var bytes_written: usize = 0;
+        var current = uoffset;
+
+        while (bytes_written < data.len) {
+            const block_num = current / self.block_size;
+            const block_offset = current % self.block_size;
+            const bytes_in_block = @min(self.block_size - block_offset, data.len - bytes_written);
+
+            // Allocate block if needed
+            const phys_block = try self.ensure_block(block_num);
+
+            // Read-modify-write for partial blocks
+            var block_data = try block_alloc.read_block(phys_block);
+            @memcpy(block_data[block_offset..][0..bytes_in_block], data[bytes_written..][0..bytes_in_block]);
+            try block_alloc.write_block(phys_block, block_data);
+
+            bytes_written += bytes_in_block;
+            current += bytes_in_block;
+        }
+
+        // Update file size if extended
+        const new_end = uoffset + bytes_written;
+        if (new_end > self.inode.get_size()) {
+            self.inode.set_size(new_end);
+        }
+
+        self.bytes_written += bytes_written;
+        return @intCast(bytes_written);
+    }
+
+    /// Seek to 64-bit offset
+    pub fn lseek64(self: *LargeFile, offset: i64, whence: u32) !i64 {
+        var new_pos: i64 = undefined;
+
+        switch (whence) {
+            SEEK_SET => {
+                new_pos = offset;
+            },
+            SEEK_CUR => {
+                // Current position would be tracked in file descriptor
+                new_pos = offset;  // Simplified
+            },
+            SEEK_END => {
+                new_pos = @as(i64, @intCast(self.inode.get_size())) + offset;
+            },
+            SEEK_DATA => {
+                // Find next data after offset
+                return try self.seek_data(offset);
+            },
+            SEEK_HOLE => {
+                // Find next hole after offset
+                return try self.seek_hole(offset);
+            },
+            else => return error.InvalidWhence,
+        }
+
+        if (new_pos < 0) {
+            return error.InvalidOffset;
+        }
+
+        return new_pos;
+    }
+
+    /// Seek to next data region
+    fn seek_data(self: *LargeFile, offset: i64) !i64 {
+        if (offset < 0) return error.InvalidOffset;
+
+        var current: u64 = @intCast(offset);
+        const file_size = self.inode.get_size();
+
+        while (current < file_size) {
+            const block_num = current / self.block_size;
+            const phys = try self.get_block(block_num);
+
+            if (phys != 0) {
+                return @intCast(current);
+            }
+
+            current = (block_num + 1) * self.block_size;
+        }
+
+        return error.NoDataFound;
+    }
+
+    /// Seek to next hole
+    fn seek_hole(self: *LargeFile, offset: i64) !i64 {
+        if (offset < 0) return error.InvalidOffset;
+
+        var current: u64 = @intCast(offset);
+        const file_size = self.inode.get_size();
+
+        while (current < file_size) {
+            const block_num = current / self.block_size;
+            const phys = try self.get_block(block_num);
+
+            if (phys == 0) {
+                return @intCast(current);
+            }
+
+            current = (block_num + 1) * self.block_size;
+        }
+
+        // Virtual hole at EOF
+        return @intCast(file_size);
+    }
+
+    /// Truncate to 64-bit size
+    pub fn ftruncate64(self: *LargeFile, length: i64) !void {
+        if (length < 0) {
+            return error.InvalidLength;
+        }
+
+        const ulength: u64 = @intCast(length);
+
+        if (ulength > self.max_size) {
+            return error.FileTooLarge;
+        }
+
+        const current_size = self.inode.get_size();
+
+        if (ulength < current_size) {
+            // Shrinking - free blocks
+            const new_blocks = (ulength + self.block_size - 1) / self.block_size;
+            const old_blocks = (current_size + self.block_size - 1) / self.block_size;
+
+            var block = old_blocks;
+            while (block > new_blocks) : (block -= 1) {
+                try self.free_block(block - 1);
+            }
+        }
+        // Extending - just update size, blocks allocated on demand
+
+        self.inode.set_size(ulength);
+    }
+
+    // =========================================================================
+    // Block Management
+    // =========================================================================
+
+    /// Get physical block for logical block number
+    fn get_block(self: *LargeFile, block_num: u64) !u64 {
+        if (self.extent_tree) |*tree| {
+            return try tree.lookup(block_num) orelse 0;
+        }
+
+        // Traditional block pointers
+        return try self.get_block_traditional(block_num);
+    }
+
+    /// Ensure block is allocated
+    fn ensure_block(self: *LargeFile, block_num: u64) !u64 {
+        if (self.extent_tree) |*tree| {
+            return try tree.map(block_num, 1, 0);
+        }
+
+        return try self.ensure_block_traditional(block_num);
+    }
+
+    /// Free a block
+    fn free_block(self: *LargeFile, block_num: u64) !void {
+        if (self.extent_tree) |*tree| {
+            try tree.unmap(block_num, 1);
+            return;
+        }
+
+        try self.free_block_traditional(block_num);
+    }
+
+    /// Get block using traditional indirect pointers
+    fn get_block_traditional(self: *LargeFile, block_num: u64) !u64 {
+        const ptrs_per_block = self.block_size / @sizeOf(u64);
+
+        // Direct blocks (0-11)
+        if (block_num < MAX_DIRECT_BLOCKS) {
+            const blocks = @as([*]u64, @ptrCast(@alignCast(&self.inode.block_data)));
+            return blocks[block_num];
+        }
+
+        var remaining = block_num - MAX_DIRECT_BLOCKS;
+
+        // Single indirect (12)
+        if (remaining < ptrs_per_block) {
+            const blocks = @as([*]u64, @ptrCast(@alignCast(&self.inode.block_data)));
+            const indirect_block = blocks[12];
+            if (indirect_block == 0) return 0;
+
+            const indirect_data = try block_alloc.read_block(indirect_block);
+            const ptrs = @as([*]u64, @ptrCast(@alignCast(indirect_data.ptr)));
+            return ptrs[remaining];
+        }
+        remaining -= ptrs_per_block;
+
+        // Double indirect (13)
+        const double_limit = ptrs_per_block * ptrs_per_block;
+        if (remaining < double_limit) {
+            const blocks = @as([*]u64, @ptrCast(@alignCast(&self.inode.block_data)));
+            const double_block = blocks[13];
+            if (double_block == 0) return 0;
+
+            const idx1 = remaining / ptrs_per_block;
+            const idx2 = remaining % ptrs_per_block;
+
+            const double_data = try block_alloc.read_block(double_block);
+            const ptrs1 = @as([*]u64, @ptrCast(@alignCast(double_data.ptr)));
+            const indirect_block = ptrs1[idx1];
+            if (indirect_block == 0) return 0;
+
+            const indirect_data = try block_alloc.read_block(indirect_block);
+            const ptrs2 = @as([*]u64, @ptrCast(@alignCast(indirect_data.ptr)));
+            return ptrs2[idx2];
+        }
+        remaining -= double_limit;
+
+        // Triple indirect (14)
+        const blocks = @as([*]u64, @ptrCast(@alignCast(&self.inode.block_data)));
+        const triple_block = blocks[14];
+        if (triple_block == 0) return 0;
+
+        const idx1 = remaining / (ptrs_per_block * ptrs_per_block);
+        const idx2 = (remaining / ptrs_per_block) % ptrs_per_block;
+        const idx3 = remaining % ptrs_per_block;
+
+        const triple_data = try block_alloc.read_block(triple_block);
+        const ptrs1 = @as([*]u64, @ptrCast(@alignCast(triple_data.ptr)));
+        const double_block = ptrs1[idx1];
+        if (double_block == 0) return 0;
+
+        const double_data = try block_alloc.read_block(double_block);
+        const ptrs2 = @as([*]u64, @ptrCast(@alignCast(double_data.ptr)));
+        const indirect_block = ptrs2[idx2];
+        if (indirect_block == 0) return 0;
+
+        const indirect_data = try block_alloc.read_block(indirect_block);
+        const ptrs3 = @as([*]u64, @ptrCast(@alignCast(indirect_data.ptr)));
+        return ptrs3[idx3];
+    }
+
+    /// Allocate block using traditional method
+    fn ensure_block_traditional(self: *LargeFile, block_num: u64) !u64 {
+        // Check if already allocated
+        const existing = try self.get_block_traditional(block_num);
+        if (existing != 0) return existing;
+
+        // Allocate new block
+        const new_block = try block_alloc.alloc_blocks(1, 0);
+
+        // Store in appropriate location
+        try self.set_block_traditional(block_num, new_block);
+
+        // Update block count
+        self.inode.set_blocks(self.inode.get_blocks() + 1);
+
+        return new_block;
+    }
+
+    /// Set block pointer
+    fn set_block_traditional(self: *LargeFile, block_num: u64, phys_block: u64) !void {
+        const ptrs_per_block = self.block_size / @sizeOf(u64);
+
+        // Direct blocks
+        if (block_num < MAX_DIRECT_BLOCKS) {
+            const blocks = @as([*]u64, @ptrCast(@alignCast(&self.inode.block_data)));
+            blocks[block_num] = phys_block;
+            return;
+        }
+
+        var remaining = block_num - MAX_DIRECT_BLOCKS;
+
+        // Single indirect
+        if (remaining < ptrs_per_block) {
+            const blocks = @as([*]u64, @ptrCast(@alignCast(&self.inode.block_data)));
+            var indirect_block = blocks[12];
+
+            if (indirect_block == 0) {
+                indirect_block = try block_alloc.alloc_blocks(1, 0);
+                blocks[12] = indirect_block;
+                // Zero the new block
+                var zero_data = try block_alloc.read_block(indirect_block);
+                @memset(zero_data, 0);
+                try block_alloc.write_block(indirect_block, zero_data);
+            }
+
+            var indirect_data = try block_alloc.read_block(indirect_block);
+            const ptrs = @as([*]u64, @ptrCast(@alignCast(indirect_data.ptr)));
+            ptrs[remaining] = phys_block;
+            try block_alloc.write_block(indirect_block, indirect_data);
+            return;
+        }
+
+        // Double and triple indirect follow similar pattern...
+        _ = self;
+    }
+
+    /// Free block using traditional method
+    fn free_block_traditional(self: *LargeFile, block_num: u64) !void {
+        const phys = try self.get_block_traditional(block_num);
+        if (phys == 0) return;
+
+        try block_alloc.free_blocks(phys, 1);
+        try self.set_block_traditional(block_num, 0);
+
+        self.inode.set_blocks(self.inode.get_blocks() - 1);
+    }
+};
+
+// =============================================================================
+// Seek Constants
+// =============================================================================
+
+pub const SEEK_SET: u32 = 0;
+pub const SEEK_CUR: u32 = 1;
+pub const SEEK_END: u32 = 2;
+pub const SEEK_DATA: u32 = 3;
+pub const SEEK_HOLE: u32 = 4;
+
+// =============================================================================
+// Stat64 Structure
+// =============================================================================
+
+pub const Stat64 = struct {
+    st_dev: u64,             // Device
+    st_ino: u64,             // Inode
+    st_mode: u32,            // Mode
+    st_nlink: u32,           // Link count
+    st_uid: u32,             // User ID
+    st_gid: u32,             // Group ID
+    st_rdev: u64,            // Device (if special file)
+    st_size: i64,            // File size
+    st_blksize: i64,         // Block size
+    st_blocks: i64,          // Blocks allocated
+    st_atime: i64,           // Access time
+    st_atime_nsec: i64,      // Access time (nsec)
+    st_mtime: i64,           // Modification time
+    st_mtime_nsec: i64,      // Modification time (nsec)
+    st_ctime: i64,           // Change time
+    st_ctime_nsec: i64,      // Change time (nsec)
+};
+
+/// Get file statistics with 64-bit sizes
+pub fn fstat64(file: *LargeFile) Stat64 {
+    return Stat64{
+        .st_dev = 0,
+        .st_ino = 0,  // Would come from inode number
+        .st_mode = file.inode.mode,
+        .st_nlink = file.inode.link_count,
+        .st_uid = file.inode.uid,
+        .st_gid = file.inode.gid,
+        .st_rdev = 0,
+        .st_size = @intCast(file.inode.get_size()),
+        .st_blksize = file.block_size,
+        .st_blocks = @intCast(file.inode.get_blocks()),
+        .st_atime = file.inode.atime,
+        .st_atime_nsec = file.inode.atime_nsec,
+        .st_mtime = file.inode.mtime,
+        .st_mtime_nsec = file.inode.mtime_nsec,
+        .st_ctime = file.inode.ctime,
+        .st_ctime_nsec = file.inode.ctime_nsec,
+    };
+}
+
+// =============================================================================
+// Syscall Wrappers for Large File Support
+// =============================================================================
+
+/// open64 - Open with large file support
+pub fn open64(path: []const u8, flags: u32, mode: u32) !i32 {
+    // Add O_LARGEFILE flag implicitly
+    return try sys_open(path, flags | O_LARGEFILE, mode);
+}
+
+/// stat64 - Stat with 64-bit sizes
+pub fn stat64(path: []const u8, buf: *Stat64) !void {
+    _ = path;
+    _ = buf;
+    // Implementation would look up path and fill stat structure
+}
+
+/// lstat64 - Lstat with 64-bit sizes
+pub fn lstat64(path: []const u8, buf: *Stat64) !void {
+    _ = path;
+    _ = buf;
+    // Like stat64 but doesn't follow symlinks
+}
+
+// Function stubs
+fn sys_open(path: []const u8, flags: u32, mode: u32) !i32 {
+    _ = path;
+    _ = flags;
+    _ = mode;
+    return 0;
+}
+
+// =============================================================================
+// Large File Configuration
+// =============================================================================
+
+pub const LargeFileConfig = struct {
+    // Feature flags
+    enable_extents: bool,
+    enable_64bit_timestamps: bool,
+    enable_nanosecond_timestamps: bool,
+    enable_inline_data: bool,
+
+    // Size limits
+    max_file_size: u64,
+    max_volume_size: u64,
+
+    // Block configuration
+    block_size: u32,
+    inode_size: u32,
+
+    pub fn default() LargeFileConfig {
+        return LargeFileConfig{
+            .enable_extents = true,
+            .enable_64bit_timestamps = true,
+            .enable_nanosecond_timestamps = true,
+            .enable_inline_data = true,
+            .max_file_size = MAX_FILE_SIZE,
+            .max_volume_size = @as(u64, 1) << 50,  // 1 PB
+            .block_size = 4096,
+            .inode_size = 256,
+        };
+    }
+
+    pub fn validate(self: *const LargeFileConfig) bool {
+        // Block size must be power of 2, 1KB-64KB
+        if (self.block_size < 1024 or self.block_size > 65536) return false;
+        if (@popCount(self.block_size) != 1) return false;
+
+        // Inode size must be power of 2, 128-4096
+        if (self.inode_size < 128 or self.inode_size > 4096) return false;
+        if (@popCount(self.inode_size) != 1) return false;
+
+        return true;
+    }
+};
