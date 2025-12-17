@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown option: $1"
-      echo "Usage: $0 [--suite unit|integration|system|all] [--arch aarch64] [--verbose] [--serial] [--output DIR]"
+      echo "Usage: $0 [--suite unit|integration|system|perf|stress|all] [--arch aarch64] [--verbose] [--serial] [--output DIR]"
       exit 1
       ;;
   esac
@@ -189,6 +189,38 @@ if [ "$TEST_SUITE" == "all" ] || [ "$TEST_SUITE" == "system" ]; then
       test_name=$(basename "$test" .sh)
       # System tests run serially due to QEMU resource usage
       run_test "system-$test_name" "$test"
+    fi
+  done
+fi
+
+# Run performance tests
+if [ "$TEST_SUITE" == "all" ] || [ "$TEST_SUITE" == "perf" ]; then
+  log_info "Running performance tests..."
+
+  for test in "$SCRIPT_DIR"/perf/*.sh; do
+    if [ -f "$test" ]; then
+      test_name=$(basename "$test" .sh)
+      run_test "perf-$test_name" "$test" &
+      if [ $PARALLEL -eq 0 ]; then
+        wait
+      fi
+    fi
+  done
+
+  if [ $PARALLEL -eq 1 ]; then
+    wait
+  fi
+fi
+
+# Run stress tests
+if [ "$TEST_SUITE" == "all" ] || [ "$TEST_SUITE" == "stress" ]; then
+  log_info "Running stress tests..."
+
+  for test in "$SCRIPT_DIR"/stress/*.sh; do
+    if [ -f "$test" ]; then
+      test_name=$(basename "$test" .sh)
+      # Stress tests run serially to avoid resource contention
+      run_test "stress-$test_name" "$test"
     fi
   done
 fi

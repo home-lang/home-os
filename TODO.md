@@ -609,7 +609,22 @@ Some modules are complete, others still contain explicit stubs. Focus areas:
   - Files: `tests/{unit,system,integration}/`, `tests/run-tests.sh`
   - [x] Added `tests/utils/test_utils.sh` for utility verification
   - [x] CI/CD pipeline runs tests automatically
-  - [ ] Expand coverage for drivers, networking, and apps; add Pi hardware-in-the-loop jobs
+  - [x] Expand coverage for drivers, networking, and apps (**COMPLETED Dec 16, 2025**)
+    - Created `tests/unit/test_drivers_comprehensive.sh` - comprehensive driver test suite
+      - Tests 60+ drivers across 10 categories: USB, Storage, Network, Input, Display, Sensors, Power, Bus, Peripheral, Raspberry Pi
+      - Verifies driver files, init functions, key constants, and data structures
+    - Created `tests/integration/test_networking_comprehensive.sh` - comprehensive networking test suite
+      - Tests all protocol layers: L2 (ARP), L3 (ICMP, IPv6), L4 (TCP, UDP, Socket), L5-6 (TLS), L7 (HTTP, WebSocket, DNS, DHCP)
+      - Tests IoT protocols (MQTT, CoAP), file sharing (NFS, SMB), wireless (NFC, WiFi/BT)
+      - Tests network management: Netfilter, QoS, Network Namespace
+      - Live network tests when connectivity available
+    - Created `tests/integration/test_apps_comprehensive.sh` - comprehensive apps test suite
+      - Tests 19+ apps: Shell, Terminal, Task Manager, File Manager, Calculator, Browser, etc.
+      - Tests games: Snake, Tetris, Pong
+      - Tests app libraries: syscalls
+      - Validates imports, functions, and syntax consistency
+    - Updated `tests/run-tests.sh` to support perf and stress test suites
+  - [ ] Add Pi hardware-in-the-loop CI jobs
 - [x] **Performance & stability targets (Pi-first)** (**COMPLETED Dec 16, 2025**)
   - Keep and refine the performance and compatibility tables in the **Success Metrics** section below (boot time, RAM usage, uptime, compatibility); enforce them via automated tests over time.
   - Created `kernel/src/perf/targets.home` - comprehensive performance targets enforcement
