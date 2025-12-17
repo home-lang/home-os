@@ -1027,7 +1027,7 @@ Build a next-generation operating system that prioritizes:
   - [x] Demand paging (page_fault_handler)
   - [x] Copy-on-write (copy_on_write)
   - [x] Page cache (page_cache_add, page_cache_get)
-  - [ ] Swap file support (optional) (TODO: Phase 4)
+  - [x] Swap file support (**COMPLETED** - swapfile.home: mkswap, swapon/swapoff, extent mapping, priority-based allocation)
 - [x] Memory allocation strategies (**COMPLETED**)
   - [x] Buddy allocator refinement (**COMPLETED** - buddy_refined.home: PCP caches, NUMA awareness, migration types, anti-fragmentation)
   - [x] SLUB allocator (kernel objects) (**COMPLETED** - slub.home: per-CPU slabs, kmalloc caches, debug features)

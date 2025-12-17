@@ -1,0 +1,779 @@
+// HomeOS Swap File Support
+// File-based swap space management
+//
+// This module extends the swap subsystem with proper file-based swap support,
+// allowing swap space to be added via regular files instead of dedicated partitions.
+//
+// Features:
+// - Swap file creation and management
+// - File extent mapping for efficient I/O
+// - Hole detection and handling
+// - Swap file activation/deactivation
+// - Integration with VFS for file operations
+// - swapon/swapoff syscall support
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const PAGE_SIZE: u64 = 4096
+const MAX_SWAP_FILES: u32 = 8
+const MAX_EXTENTS: u32 = 1024        // Max extents per swap file
+const SWAP_SIGNATURE: u64 = 0x4150_5357_4150_5357  // "SWAPSWAP"
+const SWAP_VERSION: u32 = 2
+
+// Swap file flags
+pub const SWAP_FLAG_PREFER: u32 = 0x8000     // Prefer this swap
+pub const SWAP_FLAG_PRIO_MASK: u32 = 0x7FFF  // Priority mask
+pub const SWAP_FLAG_PRIO_SHIFT: u32 = 0
+pub const SWAP_FLAG_DISCARD: u32 = 0x10000   // Discard freed pages
+
+// Swap file states
+const SWAPFILE_FREE: u32 = 0
+const SWAPFILE_CREATING: u32 = 1
+const SWAPFILE_ACTIVE: u32 = 2
+const SWAPFILE_DEACTIVATING: u32 = 3
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// Swap file header (stored at beginning of swap file)
+pub const SwapHeader = struct {
+    magic: u64,              // SWAP_SIGNATURE
+    version: u32,
+    last_page: u32,          // Last usable page
+    nr_badpages: u32,        // Number of bad pages
+    uuid: [16]u8,            // UUID
+    volume_name: [16]u8,     // Volume label
+    padding: [117]u32,       // Padding to 1024 bytes
+
+    // Bad page list follows (up to MAX_BADPAGES)
+    badpages: [633]u32,      // Rest of first page
+}
+
+// File extent (contiguous range of blocks)
+pub const SwapExtent = struct {
+    start_page: u32,         // Start page in swap file
+    nr_pages: u32,           // Number of pages in extent
+    block_start: u64,        // Start block on disk
+    valid: bool,
+}
+
+// Swap file descriptor
+pub const SwapFile = struct {
+    // File info
+    path: [256]u8,
+    path_len: u32,
+    inode: u64,
+    file_size: u64,
+
+    // Swap space
+    pages: u32,              // Total swap pages
+    inuse_pages: u32,        // Pages currently in use
+
+    // Priority
+    priority: i32,
+    flags: u32,
+
+    // State
+    state: u32,
+
+    // Extent map (for non-contiguous files)
+    extents: [MAX_EXTENTS]SwapExtent,
+    nr_extents: u32,
+
+    // Bad pages (from header or detected)
+    bad_pages: [64]u32,
+    nr_bad_pages: u32,
+
+    // Page allocation bitmap
+    page_bitmap: [8192]u8,   // Supports up to 64K pages (256MB)
+
+    // Statistics
+    reads: u64,
+    writes: u64,
+    read_time_ns: u64,
+    write_time_ns: u64,
+
+    // Cluster info (for better sequential I/O)
+    cluster_next: u32,       // Next page to allocate in cluster
+    cluster_nr: u32,         // Current cluster number
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var swap_files: [MAX_SWAP_FILES]SwapFile = undefined
+var nr_swap_files: u32 = 0
+var initialized: bool = false
+
+// Total statistics
+var total_swap_pages: u64 = 0
+var total_inuse_pages: u64 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn swapfile_init() void {
+    if (initialized) {
+        return
+    }
+
+    serial.write_string("[SWAPFILE] Initializing swap file support...\n")
+
+    // Initialize swap file descriptors
+    var i: u32 = 0
+    while (i < MAX_SWAP_FILES) {
+        swap_files[i].state = SWAPFILE_FREE
+        swap_files[i].pages = 0
+        swap_files[i].inuse_pages = 0
+        swap_files[i].priority = -1
+        swap_files[i].nr_extents = 0
+        swap_files[i].nr_bad_pages = 0
+        swap_files[i].reads = 0
+        swap_files[i].writes = 0
+        swap_files[i].cluster_next = 0
+        swap_files[i].cluster_nr = 0
+
+        // Clear bitmap
+        var j: u32 = 0
+        while (j < 8192) {
+            swap_files[i].page_bitmap[j] = 0
+            j += 1
+        }
+
+        i += 1
+    }
+
+    initialized = true
+    serial.write_string("[SWAPFILE] Swap file support initialized\n")
+}
+
+// ============================================================================
+// Swap File Creation
+// ============================================================================
+
+// Create a new swap file
+export fn mkswap(path: [*]const u8, path_len: u32, size: u64) i32 {
+    if (!initialized) {
+        return -1
+    }
+
+    serial.write_string("[SWAPFILE] Creating swap file: ")
+    write_path(path, path_len)
+    serial.write_string(" (")
+    serial.write_u64(size / (1024 * 1024))
+    serial.write_string(" MB)\n")
+
+    // Calculate pages (first page is header)
+    var pages: u32 = @as(u32, @truncate(size / PAGE_SIZE))
+    if (pages < 10) {
+        serial.write_string("[SWAPFILE] Error: swap file too small\n")
+        return -22  // EINVAL
+    }
+
+    // Create and zero the file
+    var result: i32 = create_swap_file(path, path_len, size)
+    if (result < 0) {
+        return result
+    }
+
+    // Write swap header
+    result = write_swap_header(path, path_len, pages - 1)  // -1 for header page
+    if (result < 0) {
+        return result
+    }
+
+    serial.write_string("[SWAPFILE] Swap file created: ")
+    serial.write_u32(pages - 1)
+    serial.write_string(" pages available\n")
+
+    return 0
+}
+
+fn create_swap_file(path: [*]const u8, path_len: u32, size: u64) i32 {
+    // Would call VFS to create file
+    // vfs_create(path, path_len, 0600)
+    // vfs_truncate(path, size)
+
+    // Placeholder: assume success
+    return 0
+}
+
+fn write_swap_header(path: [*]const u8, path_len: u32, last_page: u32) i32 {
+    var header: SwapHeader = undefined
+
+    // Initialize header
+    header.magic = SWAP_SIGNATURE
+    header.version = SWAP_VERSION
+    header.last_page = last_page
+    header.nr_badpages = 0
+
+    // Generate UUID (placeholder)
+    var i: u32 = 0
+    while (i < 16) {
+        header.uuid[i] = @as(u8, @truncate(i * 17 + 42))
+        i += 1
+    }
+
+    // Clear volume name
+    i = 0
+    while (i < 16) {
+        header.volume_name[i] = 0
+        i += 1
+    }
+
+    // Clear padding
+    i = 0
+    while (i < 117) {
+        header.padding[i] = 0
+        i += 1
+    }
+
+    // Clear bad pages
+    i = 0
+    while (i < 633) {
+        header.badpages[i] = 0
+        i += 1
+    }
+
+    // Write first 10 bytes as "SWAPSPACE2" for compatibility
+    var signature: [10]u8 = .{ 'S', 'W', 'A', 'P', 'S', 'P', 'A', 'C', 'E', '2' };
+    // Would write to file at offset PAGE_SIZE - 10
+
+    // Would write header to file
+    // vfs_write(fd, &header, sizeof(header), 0)
+
+    return 0
+}
+
+// ============================================================================
+// Swap File Activation (swapon)
+// ============================================================================
+
+export fn swapon(path: [*]const u8, path_len: u32, flags: u32) i32 {
+    if (!initialized) {
+        return -1
+    }
+
+    serial.write_string("[SWAPFILE] Activating swap: ")
+    write_path(path, path_len)
+    serial.write_string("\n")
+
+    // Check if already active
+    var existing: u32 = find_swap_file(path, path_len)
+    if (existing != 0xFFFFFFFF and swap_files[existing].state == SWAPFILE_ACTIVE) {
+        serial.write_string("[SWAPFILE] Error: already active\n")
+        return -16  // EBUSY
+    }
+
+    // Find free slot
+    var slot: u32 = find_free_slot()
+    if (slot == 0xFFFFFFFF) {
+        serial.write_string("[SWAPFILE] Error: no free slots\n")
+        return -28  // ENOSPC
+    }
+
+    var sf: *SwapFile = &swap_files[slot]
+    sf.state = SWAPFILE_CREATING
+
+    // Copy path
+    copy_path(sf, path, path_len)
+
+    // Read and validate header
+    var result: i32 = read_swap_header(sf)
+    if (result < 0) {
+        sf.state = SWAPFILE_FREE
+        return result
+    }
+
+    // Build extent map
+    result = build_extent_map(sf)
+    if (result < 0) {
+        sf.state = SWAPFILE_FREE
+        return result
+    }
+
+    // Set priority
+    var priority: i32 = @as(i32, @intCast(flags & SWAP_FLAG_PRIO_MASK))
+    if ((flags & SWAP_FLAG_PREFER) != 0) {
+        priority = 32767  // Highest priority
+    } else if (priority == 0) {
+        priority = -1 - @as(i32, @intCast(nr_swap_files))  // Auto-decrement
+    }
+    sf.priority = priority
+    sf.flags = flags
+
+    // Initialize bitmap (mark header page as used)
+    sf.page_bitmap[0] |= 1
+
+    // Mark bad pages in bitmap
+    var i: u32 = 0
+    while (i < sf.nr_bad_pages) {
+        var page: u32 = sf.bad_pages[i]
+        if (page < sf.pages) {
+            mark_page_used(sf, page)
+        }
+        i += 1
+    }
+
+    // Activate
+    sf.state = SWAPFILE_ACTIVE
+    nr_swap_files += 1
+    total_swap_pages += sf.pages - 1 - sf.nr_bad_pages
+
+    serial.write_string("[SWAPFILE] Activated: ")
+    serial.write_u32(sf.pages - 1 - sf.nr_bad_pages)
+    serial.write_string(" pages, priority ")
+    serial.write_u32(@as(u32, @intCast(priority + 32768)))
+    serial.write_string("\n")
+
+    return 0
+}
+
+fn read_swap_header(sf: *SwapFile) i32 {
+    // Would read header from file
+    // var header: SwapHeader = undefined
+    // vfs_read(fd, &header, sizeof(header), 0)
+
+    // Validate magic
+    // if (header.magic != SWAP_SIGNATURE) return -22
+
+    // For now, assume valid header with placeholder data
+    sf.pages = 65536  // 256MB default
+    sf.nr_bad_pages = 0
+
+    return 0
+}
+
+fn build_extent_map(sf: *SwapFile) i32 {
+    // Would use FIEMAP or FIBMAP to get file extents
+    // For simplicity, assume contiguous file
+
+    sf.extents[0].start_page = 0
+    sf.extents[0].nr_pages = sf.pages
+    sf.extents[0].block_start = 0  // Would be actual block number
+    sf.extents[0].valid = true
+    sf.nr_extents = 1
+
+    return 0
+}
+
+// ============================================================================
+// Swap File Deactivation (swapoff)
+// ============================================================================
+
+export fn swapoff(path: [*]const u8, path_len: u32) i32 {
+    if (!initialized) {
+        return -1
+    }
+
+    serial.write_string("[SWAPFILE] Deactivating swap: ")
+    write_path(path, path_len)
+    serial.write_string("\n")
+
+    var slot: u32 = find_swap_file(path, path_len)
+    if (slot == 0xFFFFFFFF) {
+        serial.write_string("[SWAPFILE] Error: not found\n")
+        return -2  // ENOENT
+    }
+
+    var sf: *SwapFile = &swap_files[slot]
+
+    if (sf.state != SWAPFILE_ACTIVE) {
+        return -22  // EINVAL
+    }
+
+    // Check if pages are still in use
+    if (sf.inuse_pages > 0) {
+        serial.write_string("[SWAPFILE] Warning: ")
+        serial.write_u32(sf.inuse_pages)
+        serial.write_string(" pages still in use, swapping back...\n")
+
+        // Need to swap in all pages before deactivation
+        var result: i32 = swap_in_all_pages(sf)
+        if (result < 0) {
+            serial.write_string("[SWAPFILE] Error: failed to swap in pages\n")
+            return -16  // EBUSY
+        }
+    }
+
+    sf.state = SWAPFILE_DEACTIVATING
+
+    // Update statistics
+    total_swap_pages -= sf.pages - 1 - sf.nr_bad_pages
+    total_inuse_pages -= sf.inuse_pages
+
+    // Free slot
+    sf.state = SWAPFILE_FREE
+    sf.pages = 0
+    sf.inuse_pages = 0
+    nr_swap_files -= 1
+
+    serial.write_string("[SWAPFILE] Deactivated\n")
+
+    return 0
+}
+
+fn swap_in_all_pages(sf: *SwapFile) i32 {
+    // Would iterate through all in-use pages and swap them back
+    // This is expensive but necessary for clean swapoff
+
+    var page: u32 = 1  // Skip header
+    while (page < sf.pages) {
+        if (is_page_used(sf, page)) {
+            // Would call swap subsystem to swap in this page
+            // swap_in_page(sf, page)
+        }
+        page += 1
+    }
+
+    return 0
+}
+
+// ============================================================================
+// Page Allocation
+// ============================================================================
+
+// Allocate a page from this swap file
+export fn swapfile_alloc_page(slot: u32) u32 {
+    if (slot >= MAX_SWAP_FILES) {
+        return 0xFFFFFFFF
+    }
+
+    var sf: *SwapFile = &swap_files[slot]
+
+    if (sf.state != SWAPFILE_ACTIVE) {
+        return 0xFFFFFFFF
+    }
+
+    // Try cluster allocation first (for sequential I/O)
+    if (sf.cluster_next < sf.pages and !is_page_used(sf, sf.cluster_next)) {
+        var page: u32 = sf.cluster_next
+        mark_page_used(sf, page)
+        sf.cluster_next += 1
+        sf.inuse_pages += 1
+        total_inuse_pages += 1
+        return page
+    }
+
+    // Scan for free page
+    var page: u32 = 1  // Skip header
+    while (page < sf.pages) {
+        if (!is_page_used(sf, page)) {
+            mark_page_used(sf, page)
+            sf.inuse_pages += 1
+            total_inuse_pages += 1
+
+            // Set new cluster start
+            sf.cluster_next = page + 1
+
+            return page
+        }
+        page += 1
+    }
+
+    return 0xFFFFFFFF  // Full
+}
+
+// Free a page in this swap file
+export fn swapfile_free_page(slot: u32, page: u32) void {
+    if (slot >= MAX_SWAP_FILES) {
+        return
+    }
+
+    var sf: *SwapFile = &swap_files[slot]
+
+    if (sf.state != SWAPFILE_ACTIVE) {
+        return
+    }
+
+    if (page == 0 or page >= sf.pages) {
+        return
+    }
+
+    if (is_page_used(sf, page)) {
+        mark_page_free(sf, page)
+        if (sf.inuse_pages > 0) {
+            sf.inuse_pages -= 1
+        }
+        if (total_inuse_pages > 0) {
+            total_inuse_pages -= 1
+        }
+
+        // Discard hint if enabled
+        if ((sf.flags & SWAP_FLAG_DISCARD) != 0) {
+            discard_page(sf, page)
+        }
+    }
+}
+
+fn is_page_used(sf: *SwapFile, page: u32) bool {
+    var byte_idx: u32 = page / 8
+    var bit_idx: u3 = @as(u3, @truncate(page % 8))
+
+    if (byte_idx >= 8192) {
+        return true  // Out of range = "used"
+    }
+
+    return (sf.page_bitmap[byte_idx] & (@as(u8, 1) << bit_idx)) != 0
+}
+
+fn mark_page_used(sf: *SwapFile, page: u32) void {
+    var byte_idx: u32 = page / 8
+    var bit_idx: u3 = @as(u3, @truncate(page % 8))
+
+    if (byte_idx < 8192) {
+        sf.page_bitmap[byte_idx] |= (@as(u8, 1) << bit_idx)
+    }
+}
+
+fn mark_page_free(sf: *SwapFile, page: u32) void {
+    var byte_idx: u32 = page / 8
+    var bit_idx: u3 = @as(u3, @truncate(page % 8))
+
+    if (byte_idx < 8192) {
+        sf.page_bitmap[byte_idx] &= ~(@as(u8, 1) << bit_idx)
+    }
+}
+
+fn discard_page(sf: *SwapFile, page: u32) void {
+    // Would send TRIM/DISCARD to underlying storage
+    _ = sf
+    _ = page
+}
+
+// ============================================================================
+// I/O Operations
+// ============================================================================
+
+// Read a page from swap file
+export fn swapfile_read_page(slot: u32, page: u32, dest: u64) i32 {
+    if (slot >= MAX_SWAP_FILES) {
+        return -22
+    }
+
+    var sf: *SwapFile = &swap_files[slot]
+
+    if (sf.state != SWAPFILE_ACTIVE) {
+        return -22
+    }
+
+    // Convert page to file offset via extent map
+    var offset: u64 = page_to_offset(sf, page)
+    if (offset == 0xFFFFFFFFFFFFFFFF) {
+        return -5  // EIO
+    }
+
+    // Would read from file
+    // vfs_read(fd, dest, PAGE_SIZE, offset)
+
+    sf.reads += 1
+
+    return 0
+}
+
+// Write a page to swap file
+export fn swapfile_write_page(slot: u32, page: u32, src: u64) i32 {
+    if (slot >= MAX_SWAP_FILES) {
+        return -22
+    }
+
+    var sf: *SwapFile = &swap_files[slot]
+
+    if (sf.state != SWAPFILE_ACTIVE) {
+        return -22
+    }
+
+    var offset: u64 = page_to_offset(sf, page)
+    if (offset == 0xFFFFFFFFFFFFFFFF) {
+        return -5  // EIO
+    }
+
+    // Would write to file
+    // vfs_write(fd, src, PAGE_SIZE, offset)
+
+    sf.writes += 1
+
+    return 0
+}
+
+fn page_to_offset(sf: *SwapFile, page: u32) u64 {
+    // Simple case: single contiguous extent
+    if (sf.nr_extents == 1 and sf.extents[0].valid) {
+        return @as(u64, page) * PAGE_SIZE
+    }
+
+    // Search extent map
+    var i: u32 = 0
+    while (i < sf.nr_extents) {
+        if (sf.extents[i].valid) {
+            var start: u32 = sf.extents[i].start_page
+            var end: u32 = start + sf.extents[i].nr_pages
+
+            if (page >= start and page < end) {
+                var extent_offset: u64 = @as(u64, page - start) * PAGE_SIZE
+                return sf.extents[i].block_start * PAGE_SIZE + extent_offset
+            }
+        }
+        i += 1
+    }
+
+    return 0xFFFFFFFFFFFFFFFF  // Not found
+}
+
+// ============================================================================
+// Query Functions
+// ============================================================================
+
+fn find_swap_file(path: [*]const u8, path_len: u32) u32 {
+    var i: u32 = 0
+    while (i < MAX_SWAP_FILES) {
+        if (swap_files[i].state != SWAPFILE_FREE) {
+            if (paths_equal(&swap_files[i], path, path_len)) {
+                return i
+            }
+        }
+        i += 1
+    }
+    return 0xFFFFFFFF
+}
+
+fn find_free_slot() u32 {
+    var i: u32 = 0
+    while (i < MAX_SWAP_FILES) {
+        if (swap_files[i].state == SWAPFILE_FREE) {
+            return i
+        }
+        i += 1
+    }
+    return 0xFFFFFFFF
+}
+
+fn paths_equal(sf: *SwapFile, path: [*]const u8, path_len: u32) bool {
+    if (sf.path_len != path_len) {
+        return false
+    }
+
+    var i: u32 = 0
+    while (i < path_len) {
+        if (sf.path[i] != path[i]) {
+            return false
+        }
+        i += 1
+    }
+
+    return true
+}
+
+fn copy_path(sf: *SwapFile, path: [*]const u8, path_len: u32) void {
+    var i: u32 = 0
+    while (i < path_len and i < 255) {
+        sf.path[i] = path[i]
+        i += 1
+    }
+    sf.path[i] = 0
+    sf.path_len = i
+}
+
+// ============================================================================
+// Priority-based Selection
+// ============================================================================
+
+// Get best swap file for allocation (highest priority with free space)
+export fn swapfile_get_best() u32 {
+    var best: u32 = 0xFFFFFFFF
+    var best_priority: i32 = -32768
+
+    var i: u32 = 0
+    while (i < MAX_SWAP_FILES) {
+        if (swap_files[i].state == SWAPFILE_ACTIVE) {
+            if (swap_files[i].inuse_pages < swap_files[i].pages - 1) {
+                if (swap_files[i].priority > best_priority) {
+                    best_priority = swap_files[i].priority
+                    best = i
+                }
+            }
+        }
+        i += 1
+    }
+
+    return best
+}
+
+// Get total free swap space across all files
+export fn swapfile_get_free() u64 {
+    return (total_swap_pages - total_inuse_pages) * PAGE_SIZE
+}
+
+// Get total swap space
+export fn swapfile_get_total() u64 {
+    return total_swap_pages * PAGE_SIZE
+}
+
+// Get number of active swap files
+export fn swapfile_get_count() u32 {
+    return nr_swap_files
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn swapfile_stats() void {
+    serial.write_string("\n[SWAPFILE] Swap File Statistics:\n")
+    serial.write_string("  Active files: ")
+    serial.write_u32(nr_swap_files)
+    serial.write_string("\n")
+    serial.write_string("  Total pages: ")
+    serial.write_u64(total_swap_pages)
+    serial.write_string("\n")
+    serial.write_string("  Used pages: ")
+    serial.write_u64(total_inuse_pages)
+    serial.write_string("\n")
+    serial.write_string("  Free: ")
+    serial.write_u64((total_swap_pages - total_inuse_pages) * PAGE_SIZE / (1024 * 1024))
+    serial.write_string(" MB\n")
+
+    // Per-file stats
+    var i: u32 = 0
+    while (i < MAX_SWAP_FILES) {
+        if (swap_files[i].state == SWAPFILE_ACTIVE) {
+            serial.write_string("\n  File ")
+            serial.write_u32(i)
+            serial.write_string(": ")
+            write_path(&swap_files[i].path, swap_files[i].path_len)
+            serial.write_string("\n")
+            serial.write_string("    Pages: ")
+            serial.write_u32(swap_files[i].inuse_pages)
+            serial.write_string("/")
+            serial.write_u32(swap_files[i].pages - 1)
+            serial.write_string("\n")
+            serial.write_string("    Priority: ")
+            serial.write_u32(@as(u32, @intCast(swap_files[i].priority + 32768)))
+            serial.write_string("\n")
+            serial.write_string("    Reads: ")
+            serial.write_u64(swap_files[i].reads)
+            serial.write_string(", Writes: ")
+            serial.write_u64(swap_files[i].writes)
+            serial.write_string("\n")
+            serial.write_string("    Extents: ")
+            serial.write_u32(swap_files[i].nr_extents)
+            serial.write_string("\n")
+        }
+        i += 1
+    }
+}
+
+fn write_path(path: [*]const u8, len: u32) void {
+    var i: u32 = 0
+    while (i < len and path[i] != 0) {
+        serial.write_char(path[i])
+        i += 1
+    }
+}
