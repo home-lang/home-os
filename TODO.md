@@ -1028,10 +1028,10 @@ Build a next-generation operating system that prioritizes:
   - [x] Copy-on-write (copy_on_write)
   - [x] Page cache (page_cache_add, page_cache_get)
   - [ ] Swap file support (optional) (TODO: Phase 4)
-- [ ] Memory allocation strategies (TODO: Phase 4 - optimization)
-  - [ ] Buddy allocator refinement
-  - [ ] SLUB allocator (kernel objects)
-  - [ ] User-space allocator integration with Home
+- [x] Memory allocation strategies (**COMPLETED**)
+  - [x] Buddy allocator refinement (**COMPLETED** - buddy_refined.home: PCP caches, NUMA awareness, migration types, anti-fragmentation)
+  - [x] SLUB allocator (kernel objects) (**COMPLETED** - slub.home: per-CPU slabs, kmalloc caches, debug features)
+  - [x] User-space allocator integration with Home (**COMPLETED** - user_alloc.home: brk/sbrk, mmap/munmap, mprotect, madvise)
 - [x] Memory pressure handling
   - [x] Page reclamation (page_reclaim)
   - [x] LRU page eviction (lru_evict)

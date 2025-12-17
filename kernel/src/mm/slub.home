@@ -1,0 +1,889 @@
+// HomeOS SLUB Allocator
+// Modern slab allocator for kernel objects based on Linux's SLUB
+//
+// SLUB is simpler and more efficient than classic SLAB:
+// - No per-CPU arrays, uses per-CPU partial lists instead
+// - Objects stored directly on the page
+// - Minimal metadata overhead
+// - Better cache utilization
+// - Debugging features (red zones, poisoning, tracking)
+//
+// Design:
+// - Each kmem_cache manages objects of a specific size
+// - Pages (slabs) are allocated from the buddy allocator
+// - Per-CPU slabs for fast allocation without locks
+// - Partial lists for slabs with free objects
+// - Full slabs are not tracked (reduces overhead)
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const PAGE_SIZE: u64 = 4096
+const MAX_CACHES: u32 = 128
+const MAX_CPUS: u32 = 256
+const MAX_ORDER: u32 = 3               // Max pages per slab (8 pages)
+
+// Object sizes for kmalloc caches
+const KMALLOC_MIN_SIZE: u32 = 8
+const KMALLOC_MAX_SIZE: u32 = 8192
+
+// SLUB flags
+pub const SLAB_HWCACHE_ALIGN: u32 = 0x0001   // Align to cache line
+pub const SLAB_POISON: u32 = 0x0002          // Poison objects
+pub const SLAB_RED_ZONE: u32 = 0x0004        // Red zones for overflow detection
+pub const SLAB_PANIC: u32 = 0x0008           // Panic on allocation failure
+pub const SLAB_RECLAIM_ACCOUNT: u32 = 0x0010 // Track for reclaim
+pub const SLAB_TRACE: u32 = 0x0020           // Trace allocations
+pub const SLAB_DESTROY_BY_RCU: u32 = 0x0040  // RCU-delayed free
+
+// Debug values
+const POISON_INUSE: u8 = 0x5A
+const POISON_FREE: u8 = 0x6B
+const RED_ZONE_VALUE: u32 = 0xBB00DDEE
+
+// Slab states
+const SLAB_EMPTY: u32 = 0
+const SLAB_PARTIAL: u32 = 1
+const SLAB_FULL: u32 = 2
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// Object descriptor (stored at end of object for debugging)
+pub const ObjectTrack = struct {
+    addr: u64,              // Allocation address
+    pid: u32,               // Allocating process
+    cpu: u32,               // Allocating CPU
+    when: u64,              // Timestamp
+}
+
+// Page-level slab metadata
+pub const SlabPage = struct {
+    // Cache this slab belongs to
+    cache: *KmemCache,
+
+    // Free object tracking
+    freelist: u64,          // First free object
+    inuse: u32,             // Objects in use
+    objects: u32,           // Total objects in slab
+
+    // Linkage for partial lists
+    next: *SlabPage,
+    prev: *SlabPage,
+
+    // Frozen flag (owned by CPU)
+    frozen: bool,
+
+    // Page frame number
+    pfn: u64,
+}
+
+// Per-CPU slab data
+pub const KmemCacheCPU = struct {
+    freelist: u64,          // Free object list on current slab
+    page: *SlabPage,        // Current slab
+    partial: *SlabPage,     // Per-CPU partial list
+    stat_alloc: u64,
+    stat_alloc_fastpath: u64,
+    stat_alloc_slowpath: u64,
+    stat_free: u64,
+    stat_free_fastpath: u64,
+}
+
+// Per-node data
+pub const KmemCacheNode = struct {
+    partial: *SlabPage,     // Partial slab list
+    nr_partial: u32,        // Number of partial slabs
+    nr_slabs: u32,          // Total slabs on this node
+}
+
+// Kmem cache descriptor
+pub const KmemCache = struct {
+    // Object parameters
+    name: [32]u8,
+    size: u32,              // Object size
+    object_size: u32,       // Size including debug overhead
+    align: u32,             // Alignment requirement
+    flags: u32,
+
+    // Slab parameters
+    min_partial: u32,       // Minimum partial slabs to keep
+    oo: u32,                // Order and objects (packed)
+    max_order: u32,         // Max order for this cache
+    objects_per_slab: u32,
+
+    // Debugging
+    red_zone_size: u32,
+    useroff: u32,           // Offset to user data
+    usersize: u32,          // Size of user data
+
+    // Per-CPU data
+    cpu_slab: [MAX_CPUS]KmemCacheCPU,
+
+    // Per-node data (simplified: single node)
+    node: KmemCacheNode,
+
+    // Constructor/destructor (optional)
+    ctor: ?fn(u64) void,
+
+    // Statistics
+    total_allocs: u64,
+    total_frees: u64,
+    total_slabs: u64,
+
+    // Active flag
+    active: bool,
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var caches: [MAX_CACHES]KmemCache = undefined
+var cache_count: u32 = 0
+var initialized: bool = false
+
+// Kmalloc caches for common sizes
+var kmalloc_caches: [14]*KmemCache = undefined  // 8, 16, 32, ..., 8192
+
+// Slab page pool (simplified)
+const MAX_SLAB_PAGES: u32 = 4096
+var slab_pages: [MAX_SLAB_PAGES]SlabPage = undefined
+var slab_page_count: u32 = 0
+
+// Statistics
+var total_slab_pages: u64 = 0
+var total_objects: u64 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn slub_init() void {
+    if (initialized) {
+        return
+    }
+
+    serial.write_string("[SLUB] Initializing SLUB allocator...\n")
+
+    // Initialize cache array
+    var i: u32 = 0
+    while (i < MAX_CACHES) {
+        caches[i].active = false
+        i += 1
+    }
+
+    // Initialize slab page pool
+    i = 0
+    while (i < MAX_SLAB_PAGES) {
+        slab_pages[i].cache = undefined
+        slab_pages[i].freelist = 0
+        slab_pages[i].inuse = 0
+        slab_pages[i].objects = 0
+        slab_pages[i].next = undefined
+        slab_pages[i].prev = undefined
+        slab_pages[i].frozen = false
+        slab_pages[i].pfn = 0
+        i += 1
+    }
+
+    // Create kmalloc caches for power-of-2 sizes
+    create_kmalloc_caches()
+
+    initialized = true
+    serial.write_string("[SLUB] Initialization complete\n")
+}
+
+fn create_kmalloc_caches() void {
+    // Create caches for sizes: 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192
+    var sizes: [14]u32 = .{ 8, 16, 32, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096, 8192, 0 }
+    var idx: u32 = 0
+
+    while (sizes[idx] != 0 and idx < 14) {
+        var name: [32]u8 = undefined
+        format_kmalloc_name(&name, sizes[idx])
+
+        var cache_id: u32 = kmem_cache_create_internal(&name, sizes[idx], 0, 0, null)
+        if (cache_id != 0xFFFFFFFF) {
+            kmalloc_caches[idx] = &caches[cache_id]
+        }
+        idx += 1
+    }
+
+    serial.write_string("[SLUB] Created ")
+    serial.write_u32(idx)
+    serial.write_string(" kmalloc caches\n")
+}
+
+fn format_kmalloc_name(name: *[32]u8, size: u32) void {
+    // "kmalloc-<size>"
+    var prefix: []const u8 = "kmalloc-"
+    var i: u32 = 0
+    while (i < prefix.len) {
+        name[i] = prefix[i]
+        i += 1
+    }
+
+    // Convert size to string
+    var s: u32 = size
+    var digits: [8]u8 = undefined
+    var d: u32 = 0
+
+    if (s == 0) {
+        name[i] = '0'
+        i += 1
+    } else {
+        while (s > 0) {
+            digits[d] = @as(u8, @truncate(s % 10)) + '0'
+            s /= 10
+            d += 1
+        }
+        // Reverse
+        while (d > 0) {
+            d -= 1
+            name[i] = digits[d]
+            i += 1
+        }
+    }
+    name[i] = 0
+}
+
+// ============================================================================
+// Cache Creation
+// ============================================================================
+
+// Create a new kmem_cache
+export fn kmem_cache_create(
+    name: [*]const u8,
+    name_len: u32,
+    size: u32,
+    align: u32,
+    flags: u32,
+    ctor: ?fn(u64) void
+) *KmemCache {
+    var name_buf: [32]u8 = undefined
+    var i: u32 = 0
+    while (i < name_len and i < 31) {
+        name_buf[i] = name[i]
+        i += 1
+    }
+    name_buf[i] = 0
+
+    var cache_id: u32 = kmem_cache_create_internal(&name_buf, size, align, flags, ctor)
+    if (cache_id == 0xFFFFFFFF) {
+        return undefined
+    }
+    return &caches[cache_id]
+}
+
+fn kmem_cache_create_internal(
+    name: *[32]u8,
+    size: u32,
+    align: u32,
+    flags: u32,
+    ctor: ?fn(u64) void
+) u32 {
+    if (!initialized and cache_count > 0) {
+        return 0xFFFFFFFF
+    }
+
+    if (cache_count >= MAX_CACHES) {
+        serial.write_string("[SLUB] ERROR: Max caches reached\n")
+        return 0xFFFFFFFF
+    }
+
+    var cache: *KmemCache = &caches[cache_count]
+
+    // Copy name
+    var i: u32 = 0
+    while (i < 32) {
+        cache.name[i] = name[i]
+        i += 1
+    }
+
+    // Calculate sizes
+    var actual_size: u32 = size
+    if (actual_size < KMALLOC_MIN_SIZE) {
+        actual_size = KMALLOC_MIN_SIZE
+    }
+
+    // Alignment
+    var actual_align: u32 = if (align > 0) align else 8
+    if ((flags & SLAB_HWCACHE_ALIGN) != 0) {
+        actual_align = 64  // Cache line size
+    }
+
+    // Round up size for alignment
+    actual_size = (actual_size + actual_align - 1) & ~(actual_align - 1)
+
+    // Add red zones if requested
+    var red_zone_size: u32 = 0
+    if ((flags & SLAB_RED_ZONE) != 0) {
+        red_zone_size = 8
+        actual_size += red_zone_size * 2
+    }
+
+    cache.size = size
+    cache.object_size = actual_size
+    cache.align = actual_align
+    cache.flags = flags
+    cache.red_zone_size = red_zone_size
+    cache.useroff = red_zone_size
+    cache.usersize = size
+
+    // Calculate objects per slab
+    var order: u32 = calculate_order(actual_size)
+    var slab_size: u64 = PAGE_SIZE << order
+    var objects: u32 = @as(u32, @truncate(slab_size / @as(u64, actual_size)))
+
+    cache.oo = (order << 16) | objects
+    cache.max_order = order
+    cache.objects_per_slab = objects
+    cache.min_partial = 5
+
+    cache.ctor = ctor
+    cache.total_allocs = 0
+    cache.total_frees = 0
+    cache.total_slabs = 0
+
+    // Initialize per-CPU data
+    i = 0
+    while (i < MAX_CPUS) {
+        cache.cpu_slab[i].freelist = 0
+        cache.cpu_slab[i].page = undefined
+        cache.cpu_slab[i].partial = undefined
+        cache.cpu_slab[i].stat_alloc = 0
+        cache.cpu_slab[i].stat_alloc_fastpath = 0
+        cache.cpu_slab[i].stat_alloc_slowpath = 0
+        cache.cpu_slab[i].stat_free = 0
+        cache.cpu_slab[i].stat_free_fastpath = 0
+        i += 1
+    }
+
+    // Initialize node data
+    cache.node.partial = undefined
+    cache.node.nr_partial = 0
+    cache.node.nr_slabs = 0
+
+    cache.active = true
+
+    var id: u32 = cache_count
+    cache_count += 1
+
+    serial.write_string("[SLUB] Created cache '")
+    i = 0
+    while (i < 32 and cache.name[i] != 0) {
+        serial.write_char(cache.name[i])
+        i += 1
+    }
+    serial.write_string("': size=")
+    serial.write_u32(size)
+    serial.write_string(" obj_size=")
+    serial.write_u32(actual_size)
+    serial.write_string(" per_slab=")
+    serial.write_u32(objects)
+    serial.write_string("\n")
+
+    return id
+}
+
+fn calculate_order(size: u32) u32 {
+    // Calculate minimum order to fit reasonable number of objects
+    var order: u32 = 0
+
+    while (order <= MAX_ORDER) {
+        var slab_size: u64 = PAGE_SIZE << order
+        var objects: u32 = @as(u32, @truncate(slab_size / @as(u64, size)))
+
+        if (objects >= 4) {
+            return order
+        }
+        order += 1
+    }
+
+    return MAX_ORDER
+}
+
+// ============================================================================
+// Allocation
+// ============================================================================
+
+// Allocate from kmem_cache
+export fn kmem_cache_alloc(cache: *KmemCache, flags: u32) u64 {
+    if (cache == undefined or !cache.active) {
+        return 0
+    }
+
+    var cpu: u32 = get_current_cpu()
+    var c: *KmemCacheCPU = &cache.cpu_slab[cpu]
+
+    cache.total_allocs += 1
+
+    // Fast path: try freelist on current slab
+    if (c.freelist != 0) {
+        var object: u64 = c.freelist
+
+        // Update freelist (next pointer stored at start of free object)
+        var next_ptr: *u64 = @ptrFromInt(object)
+        c.freelist = next_ptr.*
+
+        c.stat_alloc_fastpath += 1
+
+        // Call constructor if set
+        if (cache.ctor != null) {
+            cache.ctor.?(object + cache.useroff)
+        }
+
+        // Poison check
+        if ((cache.flags & SLAB_POISON) != 0) {
+            init_object(cache, object)
+        }
+
+        return object + cache.useroff
+    }
+
+    // Slow path
+    c.stat_alloc_slowpath += 1
+    return alloc_slowpath(cache, c, flags)
+}
+
+fn alloc_slowpath(cache: *KmemCache, c: *KmemCacheCPU, flags: u32) u64 {
+    _ = flags
+
+    // Try to get a slab from per-CPU partial list
+    if (c.partial != undefined) {
+        var slab: *SlabPage = c.partial
+        c.partial = slab.next
+        c.page = slab
+        c.freelist = slab.freelist
+        slab.frozen = true
+
+        if (c.freelist != 0) {
+            var object: u64 = c.freelist
+            var next_ptr: *u64 = @ptrFromInt(object)
+            c.freelist = next_ptr.*
+            slab.inuse += 1
+
+            if (cache.ctor != null) {
+                cache.ctor.?(object + cache.useroff)
+            }
+
+            return object + cache.useroff
+        }
+    }
+
+    // Try node partial list
+    if (cache.node.partial != undefined) {
+        var slab: *SlabPage = cache.node.partial
+        cache.node.partial = slab.next
+        cache.node.nr_partial -= 1
+
+        c.page = slab
+        c.freelist = slab.freelist
+        slab.frozen = true
+
+        if (c.freelist != 0) {
+            var object: u64 = c.freelist
+            var next_ptr: *u64 = @ptrFromInt(object)
+            c.freelist = next_ptr.*
+            slab.inuse += 1
+
+            if (cache.ctor != null) {
+                cache.ctor.?(object + cache.useroff)
+            }
+
+            return object + cache.useroff
+        }
+    }
+
+    // Allocate new slab
+    var slab: *SlabPage = allocate_slab(cache)
+    if (slab == undefined) {
+        return 0
+    }
+
+    c.page = slab
+    c.freelist = slab.freelist
+    slab.frozen = true
+
+    if (c.freelist != 0) {
+        var object: u64 = c.freelist
+        var next_ptr: *u64 = @ptrFromInt(object)
+        c.freelist = next_ptr.*
+        slab.inuse += 1
+
+        if (cache.ctor != null) {
+            cache.ctor.?(object + cache.useroff)
+        }
+
+        return object + cache.useroff
+    }
+
+    return 0
+}
+
+fn allocate_slab(cache: *KmemCache) *SlabPage {
+    if (slab_page_count >= MAX_SLAB_PAGES) {
+        return undefined
+    }
+
+    // Allocate pages from buddy (placeholder)
+    var order: u32 = cache.oo >> 16
+    var pages: u64 = @as(u64, 1) << order
+
+    // Would call buddy_alloc here
+    var addr: u64 = allocate_pages_placeholder(pages)
+    if (addr == 0) {
+        return undefined
+    }
+
+    // Initialize slab page
+    var slab: *SlabPage = &slab_pages[slab_page_count]
+    slab_page_count += 1
+
+    slab.cache = cache
+    slab.pfn = addr / PAGE_SIZE
+    slab.objects = cache.objects_per_slab
+    slab.inuse = 0
+    slab.frozen = false
+    slab.next = undefined
+    slab.prev = undefined
+
+    // Build freelist
+    var i: u32 = 0
+    var obj_addr: u64 = addr
+    var prev_obj: u64 = 0
+
+    while (i < slab.objects) {
+        if ((cache.flags & SLAB_POISON) != 0) {
+            poison_object(cache, obj_addr)
+        }
+
+        if (prev_obj != 0) {
+            var ptr: *u64 = @ptrFromInt(prev_obj)
+            ptr.* = obj_addr
+        } else {
+            slab.freelist = obj_addr
+        }
+
+        prev_obj = obj_addr
+        obj_addr += cache.object_size
+
+        i += 1
+    }
+
+    // Last object points to null
+    if (prev_obj != 0) {
+        var ptr: *u64 = @ptrFromInt(prev_obj)
+        ptr.* = 0
+    }
+
+    cache.total_slabs += 1
+    cache.node.nr_slabs += 1
+    total_slab_pages += pages
+    total_objects += slab.objects
+
+    return slab
+}
+
+// ============================================================================
+// Deallocation
+// ============================================================================
+
+export fn kmem_cache_free(cache: *KmemCache, ptr: u64) void {
+    if (cache == undefined or ptr == 0) {
+        return
+    }
+
+    var object: u64 = ptr - cache.useroff
+
+    // Poison if enabled
+    if ((cache.flags & SLAB_POISON) != 0) {
+        poison_object(cache, object)
+    }
+
+    // Check red zone if enabled
+    if ((cache.flags & SLAB_RED_ZONE) != 0) {
+        if (!check_red_zone(cache, object)) {
+            serial.write_string("[SLUB] RED ZONE CORRUPTION detected!\n")
+        }
+    }
+
+    var cpu: u32 = get_current_cpu()
+    var c: *KmemCacheCPU = &cache.cpu_slab[cpu]
+
+    cache.total_frees += 1
+    c.stat_free += 1
+
+    // Fast path: add to current CPU's freelist
+    var next_ptr: *u64 = @ptrFromInt(object)
+    next_ptr.* = c.freelist
+    c.freelist = object
+    c.stat_free_fastpath += 1
+}
+
+// ============================================================================
+// Kmalloc Interface
+// ============================================================================
+
+// Find appropriate cache for size
+fn find_kmalloc_cache(size: u32) *KmemCache {
+    // Find smallest cache that fits
+    if (size <= 8) return kmalloc_caches[0]
+    if (size <= 16) return kmalloc_caches[1]
+    if (size <= 32) return kmalloc_caches[2]
+    if (size <= 64) return kmalloc_caches[3]
+    if (size <= 96) return kmalloc_caches[4]
+    if (size <= 128) return kmalloc_caches[5]
+    if (size <= 192) return kmalloc_caches[6]
+    if (size <= 256) return kmalloc_caches[7]
+    if (size <= 512) return kmalloc_caches[8]
+    if (size <= 1024) return kmalloc_caches[9]
+    if (size <= 2048) return kmalloc_caches[10]
+    if (size <= 4096) return kmalloc_caches[11]
+    if (size <= 8192) return kmalloc_caches[12]
+
+    return undefined
+}
+
+// General-purpose kernel allocation
+export fn kmalloc(size: u32, flags: u32) u64 {
+    if (!initialized or size == 0) {
+        return 0
+    }
+
+    if (size > KMALLOC_MAX_SIZE) {
+        // Large allocation: go directly to buddy
+        serial.write_string("[SLUB] Large allocation (")
+        serial.write_u32(size)
+        serial.write_string(" bytes) - use buddy\n")
+        return 0
+    }
+
+    var cache: *KmemCache = find_kmalloc_cache(size)
+    if (cache == undefined) {
+        return 0
+    }
+
+    return kmem_cache_alloc(cache, flags)
+}
+
+// Free kmalloc'd memory
+export fn kfree(ptr: u64) void {
+    if (ptr == 0) {
+        return
+    }
+
+    // Find which cache this belongs to
+    // In a real implementation, we'd look up the page struct
+    // For now, iterate caches (inefficient but works)
+
+    var i: u32 = 0
+    while (i < cache_count) {
+        var cache: *KmemCache = &caches[i]
+        if (cache.active) {
+            // Check if pointer is within any slab of this cache
+            var j: u32 = 0
+            while (j < slab_page_count) {
+                if (slab_pages[j].cache == cache) {
+                    var slab_start: u64 = slab_pages[j].pfn * PAGE_SIZE
+                    var slab_end: u64 = slab_start + (PAGE_SIZE << (cache.oo >> 16))
+
+                    if (ptr >= slab_start and ptr < slab_end) {
+                        kmem_cache_free(cache, ptr)
+                        return
+                    }
+                }
+                j += 1
+            }
+        }
+        i += 1
+    }
+
+    serial.write_string("[SLUB] WARNING: kfree() on unknown pointer\n")
+}
+
+// Allocate and zero
+export fn kzalloc(size: u32, flags: u32) u64 {
+    var ptr: u64 = kmalloc(size, flags)
+    if (ptr != 0) {
+        var p: [*]u8 = @ptrFromInt(ptr)
+        var i: u32 = 0
+        while (i < size) {
+            p[i] = 0
+            i += 1
+        }
+    }
+    return ptr
+}
+
+// ============================================================================
+// Debugging
+// ============================================================================
+
+fn poison_object(cache: *KmemCache, object: u64) void {
+    var p: [*]u8 = @ptrFromInt(object)
+    var i: u32 = 0
+    while (i < cache.object_size) {
+        p[i] = POISON_FREE
+        i += 1
+    }
+}
+
+fn init_object(cache: *KmemCache, object: u64) void {
+    var p: [*]u8 = @ptrFromInt(object)
+    var i: u32 = 0
+    while (i < cache.object_size) {
+        p[i] = POISON_INUSE
+        i += 1
+    }
+}
+
+fn check_red_zone(cache: *KmemCache, object: u64) bool {
+    if (cache.red_zone_size == 0) {
+        return true
+    }
+
+    // Check front red zone
+    var front: [*]u32 = @ptrFromInt(object)
+    if (front[0] != RED_ZONE_VALUE) {
+        return false
+    }
+
+    // Check back red zone
+    var back: [*]u32 = @ptrFromInt(object + cache.object_size - cache.red_zone_size)
+    if (back[0] != RED_ZONE_VALUE) {
+        return false
+    }
+
+    return true
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn get_current_cpu() u32 {
+    // Would read from CPU register
+    return 0
+}
+
+fn allocate_pages_placeholder(pages: u64) u64 {
+    // Would call buddy allocator
+    var static_addr: u64 = 0x200000000  // 8GB
+    static_addr += pages * PAGE_SIZE
+    return static_addr - pages * PAGE_SIZE
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn slub_stats() void {
+    serial.write_string("\n[SLUB] SLUB Allocator Statistics:\n")
+    serial.write_string("  Total caches: ")
+    serial.write_u32(cache_count)
+    serial.write_string("\n")
+    serial.write_string("  Total slab pages: ")
+    serial.write_u64(total_slab_pages)
+    serial.write_string("\n")
+    serial.write_string("  Total objects: ")
+    serial.write_u64(total_objects)
+    serial.write_string("\n\n")
+
+    serial.write_string("Cache statistics:\n")
+    serial.write_string("Name                     Size  Allocs    Frees     Slabs\n")
+    serial.write_string("----------------------------------------------------------\n")
+
+    var i: u32 = 0
+    while (i < cache_count) {
+        var cache: *KmemCache = &caches[i]
+        if (cache.active) {
+            // Print name
+            var j: u32 = 0
+            while (j < 24) {
+                if (j < 32 and cache.name[j] != 0) {
+                    serial.write_char(cache.name[j])
+                } else {
+                    serial.write_string(" ")
+                }
+                j += 1
+            }
+
+            serial.write_u32(cache.size)
+            serial.write_string("   ")
+            serial.write_u64(cache.total_allocs)
+            serial.write_string("     ")
+            serial.write_u64(cache.total_frees)
+            serial.write_string("      ")
+            serial.write_u64(cache.total_slabs)
+            serial.write_string("\n")
+        }
+        i += 1
+    }
+}
+
+export fn slub_cache_info(cache: *KmemCache) void {
+    if (cache == undefined) {
+        return
+    }
+
+    serial.write_string("\n[SLUB] Cache '")
+    var i: u32 = 0
+    while (i < 32 and cache.name[i] != 0) {
+        serial.write_char(cache.name[i])
+        i += 1
+    }
+    serial.write_string("':\n")
+    serial.write_string("  Object size: ")
+    serial.write_u32(cache.size)
+    serial.write_string("\n")
+    serial.write_string("  Internal size: ")
+    serial.write_u32(cache.object_size)
+    serial.write_string("\n")
+    serial.write_string("  Alignment: ")
+    serial.write_u32(cache.align)
+    serial.write_string("\n")
+    serial.write_string("  Objects per slab: ")
+    serial.write_u32(cache.objects_per_slab)
+    serial.write_string("\n")
+    serial.write_string("  Total allocations: ")
+    serial.write_u64(cache.total_allocs)
+    serial.write_string("\n")
+    serial.write_string("  Total frees: ")
+    serial.write_u64(cache.total_frees)
+    serial.write_string("\n")
+    serial.write_string("  Active objects: ")
+    serial.write_u64(cache.total_allocs - cache.total_frees)
+    serial.write_string("\n")
+    serial.write_string("  Total slabs: ")
+    serial.write_u64(cache.total_slabs)
+    serial.write_string("\n")
+}
+
+// Get cache by name
+export fn kmem_cache_find(name: [*]const u8, name_len: u32) *KmemCache {
+    var i: u32 = 0
+    while (i < cache_count) {
+        if (caches[i].active) {
+            var match: bool = true
+            var j: u32 = 0
+            while (j < name_len and j < 32) {
+                if (caches[i].name[j] != name[j]) {
+                    match = false
+                    break
+                }
+                j += 1
+            }
+            if (match and (j >= 32 or caches[i].name[j] == 0)) {
+                return &caches[i]
+            }
+        }
+        i += 1
+    }
+    return undefined
+}

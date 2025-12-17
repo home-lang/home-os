@@ -1,0 +1,794 @@
+// HomeOS User-Space Allocator Integration
+// Kernel support for user-space memory allocation via brk/mmap syscalls
+//
+// This module provides the kernel-side support for user-space memory
+// allocation, enabling standard allocators (like Home's malloc) to work.
+//
+// Features:
+// - brk/sbrk syscall implementation for heap management
+// - Anonymous mmap for large allocations
+// - Memory region tracking per process
+// - Integration with virtual memory management
+// - Support for memory hints (MADV_*)
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const PAGE_SIZE: u64 = 4096
+const MAX_PROCESSES: u32 = 1024
+const MAX_REGIONS: u32 = 256
+
+// Default heap limits
+const HEAP_MIN_ADDR: u64 = 0x0000_0001_0000_0000  // 64GB
+const HEAP_MAX_SIZE: u64 = 1024 * 1024 * 1024     // 1GB max heap
+const MMAP_BASE: u64 = 0x0000_0002_0000_0000      // 128GB
+
+// mmap protection flags
+pub const PROT_NONE: u32 = 0x0
+pub const PROT_READ: u32 = 0x1
+pub const PROT_WRITE: u32 = 0x2
+pub const PROT_EXEC: u32 = 0x4
+
+// mmap flags
+pub const MAP_SHARED: u32 = 0x01
+pub const MAP_PRIVATE: u32 = 0x02
+pub const MAP_FIXED: u32 = 0x10
+pub const MAP_ANONYMOUS: u32 = 0x20
+pub const MAP_GROWSDOWN: u32 = 0x100
+pub const MAP_STACK: u32 = 0x20000
+pub const MAP_HUGETLB: u32 = 0x40000
+pub const MAP_POPULATE: u32 = 0x8000
+pub const MAP_NORESERVE: u32 = 0x4000
+
+// madvise hints
+pub const MADV_NORMAL: u32 = 0
+pub const MADV_RANDOM: u32 = 1
+pub const MADV_SEQUENTIAL: u32 = 2
+pub const MADV_WILLNEED: u32 = 3
+pub const MADV_DONTNEED: u32 = 4
+pub const MADV_FREE: u32 = 8
+pub const MADV_HUGEPAGE: u32 = 14
+pub const MADV_NOHUGEPAGE: u32 = 15
+
+// Region types
+pub const REGION_HEAP: u32 = 1
+pub const REGION_MMAP: u32 = 2
+pub const REGION_STACK: u32 = 3
+pub const REGION_CODE: u32 = 4
+pub const REGION_DATA: u32 = 5
+pub const REGION_SHARED: u32 = 6
+
+// Error codes
+pub const ENOMEM: i64 = -12
+pub const EINVAL: i64 = -22
+pub const EACCES: i64 = -13
+pub const EEXIST: i64 = -17
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// Virtual memory region
+pub const VmRegion = struct {
+    start: u64,
+    end: u64,
+    prot: u32,
+    flags: u32,
+    region_type: u32,
+
+    // For file-backed mappings
+    file_offset: u64,
+    file_inode: u64,
+
+    // Advice
+    advice: u32,
+
+    // Statistics
+    pages_resident: u64,
+    pages_swapped: u64,
+
+    valid: bool,
+}
+
+// Process memory context
+pub const ProcessMm = struct {
+    // Heap management
+    heap_start: u64,        // Start of heap (after data segment)
+    heap_brk: u64,          // Current brk (end of heap)
+    heap_max: u64,          // Maximum heap address
+
+    // mmap management
+    mmap_base: u64,         // Base for mmap allocations
+    mmap_legacy: bool,      // Use legacy mmap layout
+
+    // Virtual memory regions
+    regions: [MAX_REGIONS]VmRegion,
+    region_count: u32,
+
+    // Stack
+    stack_start: u64,
+    stack_end: u64,
+    stack_limit: u64,
+
+    // Code/data segments
+    code_start: u64,
+    code_end: u64,
+    data_start: u64,
+    data_end: u64,
+
+    // Statistics
+    total_vm: u64,          // Total virtual memory size
+    rss: u64,               // Resident set size
+    shared: u64,            // Shared pages
+    text: u64,              // Code pages
+
+    // Process ID
+    pid: u32,
+    valid: bool,
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var process_mm: [MAX_PROCESSES]ProcessMm = undefined
+var initialized: bool = false
+
+// Statistics
+var total_heap_allocs: u64 = 0
+var total_mmap_allocs: u64 = 0
+var total_pages_mapped: u64 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn user_alloc_init() void {
+    if (initialized) {
+        return
+    }
+
+    serial.write_string("[USER-ALLOC] Initializing user-space allocator support...\n")
+
+    // Initialize process memory contexts
+    var i: u32 = 0
+    while (i < MAX_PROCESSES) {
+        process_mm[i].valid = false
+        process_mm[i].pid = 0
+        process_mm[i].heap_start = 0
+        process_mm[i].heap_brk = 0
+        process_mm[i].region_count = 0
+        i += 1
+    }
+
+    initialized = true
+    serial.write_string("[USER-ALLOC] Initialization complete\n")
+}
+
+// Initialize memory context for a new process
+export fn mm_init_process(pid: u32, code_start: u64, code_end: u64, data_end: u64) bool {
+    if (!initialized or pid >= MAX_PROCESSES) {
+        return false
+    }
+
+    var mm: *ProcessMm = &process_mm[pid]
+
+    // Set up segments
+    mm.code_start = code_start
+    mm.code_end = code_end
+    mm.data_start = code_end
+    mm.data_end = data_end
+
+    // Set up heap (starts after data segment, page-aligned)
+    mm.heap_start = (data_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+    mm.heap_brk = mm.heap_start
+    mm.heap_max = mm.heap_start + HEAP_MAX_SIZE
+
+    // Set up mmap base
+    mm.mmap_base = MMAP_BASE
+    mm.mmap_legacy = false
+
+    // Initialize stack (would be set by exec)
+    mm.stack_start = 0x0000_7FFF_FFFF_0000  // Near top of user space
+    mm.stack_end = mm.stack_start
+    mm.stack_limit = mm.stack_start - (8 * 1024 * 1024)  // 8MB stack limit
+
+    // Clear regions
+    var i: u32 = 0
+    while (i < MAX_REGIONS) {
+        mm.regions[i].valid = false
+        i += 1
+    }
+    mm.region_count = 0
+
+    // Add initial regions
+    add_region(mm, code_start, code_end, PROT_READ | PROT_EXEC, 0, REGION_CODE)
+    add_region(mm, mm.data_start, data_end, PROT_READ | PROT_WRITE, 0, REGION_DATA)
+
+    // Statistics
+    mm.total_vm = (code_end - code_start) + (data_end - mm.data_start)
+    mm.rss = 0
+    mm.shared = 0
+    mm.text = (code_end - code_start) / PAGE_SIZE
+
+    mm.pid = pid
+    mm.valid = true
+
+    serial.write_string("[USER-ALLOC] Initialized MM for PID ")
+    serial.write_u32(pid)
+    serial.write_string(": heap=0x")
+    serial.write_hex(mm.heap_start)
+    serial.write_string("\n")
+
+    return true
+}
+
+// Clean up process memory context
+export fn mm_destroy_process(pid: u32) void {
+    if (!initialized or pid >= MAX_PROCESSES) {
+        return
+    }
+
+    var mm: *ProcessMm = &process_mm[pid]
+    if (!mm.valid) {
+        return
+    }
+
+    // Unmap all regions
+    var i: u32 = 0
+    while (i < MAX_REGIONS) {
+        if (mm.regions[i].valid) {
+            // Would call VMM to unmap pages
+            mm.regions[i].valid = false
+        }
+        i += 1
+    }
+
+    mm.valid = false
+    mm.region_count = 0
+
+    serial.write_string("[USER-ALLOC] Destroyed MM for PID ")
+    serial.write_u32(pid)
+    serial.write_string("\n")
+}
+
+// ============================================================================
+// brk/sbrk Implementation
+// ============================================================================
+
+// Set program break (brk syscall)
+export fn sys_brk(pid: u32, addr: u64) i64 {
+    if (!initialized or pid >= MAX_PROCESSES) {
+        return EINVAL
+    }
+
+    var mm: *ProcessMm = &process_mm[pid]
+    if (!mm.valid) {
+        return EINVAL
+    }
+
+    total_heap_allocs += 1
+
+    // Query current brk
+    if (addr == 0) {
+        return @as(i64, @intCast(mm.heap_brk))
+    }
+
+    // Check bounds
+    if (addr < mm.heap_start) {
+        return @as(i64, @intCast(mm.heap_brk))  // Return current brk on invalid
+    }
+
+    if (addr > mm.heap_max) {
+        serial.write_string("[USER-ALLOC] brk: exceeded max heap for PID ")
+        serial.write_u32(pid)
+        serial.write_string("\n")
+        return ENOMEM
+    }
+
+    var old_brk: u64 = mm.heap_brk
+    var new_brk: u64 = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)  // Page align
+
+    if (new_brk > old_brk) {
+        // Expanding heap - need to map new pages
+        var pages: u64 = (new_brk - old_brk) / PAGE_SIZE
+
+        // Would call VMM to map pages
+        // For now, just update the brk
+        mm.heap_brk = new_brk
+        mm.total_vm += new_brk - old_brk
+        total_pages_mapped += pages
+
+        // Update or create heap region
+        update_heap_region(mm)
+
+    } else if (new_brk < old_brk) {
+        // Shrinking heap - unmap pages
+        var pages: u64 = (old_brk - new_brk) / PAGE_SIZE
+
+        // Would call VMM to unmap pages
+        mm.heap_brk = new_brk
+        mm.total_vm -= old_brk - new_brk
+        if (total_pages_mapped >= pages) {
+            total_pages_mapped -= pages
+        }
+
+        update_heap_region(mm)
+    }
+
+    return @as(i64, @intCast(mm.heap_brk))
+}
+
+// Increment program break (sbrk)
+export fn sys_sbrk(pid: u32, increment: i64) i64 {
+    if (!initialized or pid >= MAX_PROCESSES) {
+        return EINVAL
+    }
+
+    var mm: *ProcessMm = &process_mm[pid]
+    if (!mm.valid) {
+        return EINVAL
+    }
+
+    var old_brk: u64 = mm.heap_brk
+    var new_brk: u64 = undefined
+
+    if (increment >= 0) {
+        new_brk = old_brk + @as(u64, @intCast(increment))
+    } else {
+        var dec: u64 = @as(u64, @intCast(-increment))
+        if (dec > old_brk - mm.heap_start) {
+            return EINVAL
+        }
+        new_brk = old_brk - dec
+    }
+
+    var result: i64 = sys_brk(pid, new_brk)
+    if (result < 0) {
+        return result
+    }
+
+    return @as(i64, @intCast(old_brk))  // Return old brk on success
+}
+
+fn update_heap_region(mm: *ProcessMm) void {
+    // Find or create heap region
+    var i: u32 = 0
+    while (i < MAX_REGIONS) {
+        if (mm.regions[i].valid and mm.regions[i].region_type == REGION_HEAP) {
+            mm.regions[i].end = mm.heap_brk
+            return
+        }
+        i += 1
+    }
+
+    // Create new heap region
+    add_region(mm, mm.heap_start, mm.heap_brk, PROT_READ | PROT_WRITE, 0, REGION_HEAP)
+}
+
+// ============================================================================
+// mmap Implementation
+// ============================================================================
+
+// Memory map (mmap syscall)
+export fn sys_mmap(
+    pid: u32,
+    addr: u64,
+    length: u64,
+    prot: u32,
+    flags: u32,
+    fd: i32,
+    offset: u64
+) i64 {
+    if (!initialized or pid >= MAX_PROCESSES) {
+        return EINVAL
+    }
+
+    var mm: *ProcessMm = &process_mm[pid]
+    if (!mm.valid) {
+        return EINVAL
+    }
+
+    if (length == 0) {
+        return EINVAL
+    }
+
+    total_mmap_allocs += 1
+
+    // Round up length to page boundary
+    var len: u64 = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+
+    // Determine mapping address
+    var map_addr: u64 = undefined
+
+    if ((flags & MAP_FIXED) != 0) {
+        // Use requested address
+        if (addr == 0 or (addr & (PAGE_SIZE - 1)) != 0) {
+            return EINVAL
+        }
+
+        // Check for overlap with existing regions
+        if (region_overlaps(mm, addr, addr + len)) {
+            if ((flags & MAP_FIXED) != 0) {
+                // MAP_FIXED: unmap existing
+                munmap_range(mm, addr, len)
+            } else {
+                return EEXIST
+            }
+        }
+
+        map_addr = addr
+    } else {
+        // Find free address
+        map_addr = find_free_region(mm, len, addr)
+        if (map_addr == 0) {
+            return ENOMEM
+        }
+    }
+
+    // Check if anonymous or file-backed
+    if ((flags & MAP_ANONYMOUS) != 0) {
+        // Anonymous mapping
+        fd = -1
+    } else {
+        // File-backed mapping (not fully implemented)
+        if (fd < 0) {
+            return EINVAL
+        }
+    }
+
+    // Create region
+    var region_type: u32 = if ((flags & MAP_STACK) != 0) REGION_STACK
+                          else if ((flags & MAP_SHARED) != 0) REGION_SHARED
+                          else REGION_MMAP
+
+    if (!add_region(mm, map_addr, map_addr + len, prot, flags, region_type)) {
+        return ENOMEM
+    }
+
+    // Update statistics
+    mm.total_vm += len
+    total_pages_mapped += len / PAGE_SIZE
+
+    // If MAP_POPULATE, fault in pages now
+    if ((flags & MAP_POPULATE) != 0) {
+        // Would call VMM to pre-fault pages
+    }
+
+    serial.write_string("[USER-ALLOC] mmap: PID ")
+    serial.write_u32(pid)
+    serial.write_string(" addr=0x")
+    serial.write_hex(map_addr)
+    serial.write_string(" len=")
+    serial.write_u64(len)
+    serial.write_string("\n")
+
+    return @as(i64, @intCast(map_addr))
+}
+
+// Unmap memory (munmap syscall)
+export fn sys_munmap(pid: u32, addr: u64, length: u64) i64 {
+    if (!initialized or pid >= MAX_PROCESSES) {
+        return EINVAL
+    }
+
+    var mm: *ProcessMm = &process_mm[pid]
+    if (!mm.valid) {
+        return EINVAL
+    }
+
+    if ((addr & (PAGE_SIZE - 1)) != 0) {
+        return EINVAL
+    }
+
+    var len: u64 = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+
+    munmap_range(mm, addr, len)
+
+    serial.write_string("[USER-ALLOC] munmap: PID ")
+    serial.write_u32(pid)
+    serial.write_string(" addr=0x")
+    serial.write_hex(addr)
+    serial.write_string(" len=")
+    serial.write_u64(len)
+    serial.write_string("\n")
+
+    return 0
+}
+
+fn munmap_range(mm: *ProcessMm, addr: u64, length: u64) void {
+    var end: u64 = addr + length
+
+    var i: u32 = 0
+    while (i < MAX_REGIONS) {
+        if (mm.regions[i].valid) {
+            var r: *VmRegion = &mm.regions[i]
+
+            // Check for overlap
+            if (r.start < end and r.end > addr) {
+                // Calculate overlap
+                var overlap_start: u64 = if (addr > r.start) addr else r.start
+                var overlap_end: u64 = if (end < r.end) end else r.end
+
+                if (overlap_start == r.start and overlap_end == r.end) {
+                    // Complete removal
+                    r.valid = false
+                    mm.region_count -= 1
+                    mm.total_vm -= r.end - r.start
+                } else if (overlap_start == r.start) {
+                    // Remove front
+                    mm.total_vm -= overlap_end - r.start
+                    r.start = overlap_end
+                } else if (overlap_end == r.end) {
+                    // Remove back
+                    mm.total_vm -= r.end - overlap_start
+                    r.end = overlap_start
+                } else {
+                    // Split region (create hole)
+                    var new_end: u64 = r.end
+                    r.end = overlap_start
+                    mm.total_vm -= overlap_end - overlap_start
+
+                    // Add new region for the back part
+                    add_region(mm, overlap_end, new_end, r.prot, r.flags, r.region_type)
+                }
+            }
+        }
+        i += 1
+    }
+}
+
+// ============================================================================
+// mprotect Implementation
+// ============================================================================
+
+export fn sys_mprotect(pid: u32, addr: u64, length: u64, prot: u32) i64 {
+    if (!initialized or pid >= MAX_PROCESSES) {
+        return EINVAL
+    }
+
+    var mm: *ProcessMm = &process_mm[pid]
+    if (!mm.valid) {
+        return EINVAL
+    }
+
+    if ((addr & (PAGE_SIZE - 1)) != 0) {
+        return EINVAL
+    }
+
+    var len: u64 = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+    var end: u64 = addr + len
+
+    // Find and update overlapping regions
+    var i: u32 = 0
+    while (i < MAX_REGIONS) {
+        if (mm.regions[i].valid) {
+            var r: *VmRegion = &mm.regions[i]
+
+            if (r.start < end and r.end > addr) {
+                // Update protection
+                r.prot = prot
+
+                // Would call VMM to update page table entries
+            }
+        }
+        i += 1
+    }
+
+    return 0
+}
+
+// ============================================================================
+// madvise Implementation
+// ============================================================================
+
+export fn sys_madvise(pid: u32, addr: u64, length: u64, advice: u32) i64 {
+    if (!initialized or pid >= MAX_PROCESSES) {
+        return EINVAL
+    }
+
+    var mm: *ProcessMm = &process_mm[pid]
+    if (!mm.valid) {
+        return EINVAL
+    }
+
+    var len: u64 = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+    var end: u64 = addr + len
+
+    var i: u32 = 0
+    while (i < MAX_REGIONS) {
+        if (mm.regions[i].valid) {
+            var r: *VmRegion = &mm.regions[i]
+
+            if (r.start < end and r.end > addr) {
+                r.advice = advice
+
+                // Handle specific advice
+                if (advice == MADV_DONTNEED) {
+                    // Can free physical pages
+                    // Would call VMM to release pages
+                } else if (advice == MADV_WILLNEED) {
+                    // Pre-fault pages
+                    // Would call VMM to fault in pages
+                } else if (advice == MADV_FREE) {
+                    // Mark pages as free (lazy free)
+                    // Would mark pages for lazy reclaim
+                }
+            }
+        }
+        i += 1
+    }
+
+    return 0
+}
+
+// ============================================================================
+// Region Management
+// ============================================================================
+
+fn add_region(mm: *ProcessMm, start: u64, end: u64, prot: u32, flags: u32, region_type: u32) bool {
+    if (mm.region_count >= MAX_REGIONS) {
+        return false
+    }
+
+    // Find free slot
+    var i: u32 = 0
+    while (i < MAX_REGIONS) {
+        if (!mm.regions[i].valid) {
+            mm.regions[i].start = start
+            mm.regions[i].end = end
+            mm.regions[i].prot = prot
+            mm.regions[i].flags = flags
+            mm.regions[i].region_type = region_type
+            mm.regions[i].file_offset = 0
+            mm.regions[i].file_inode = 0
+            mm.regions[i].advice = MADV_NORMAL
+            mm.regions[i].pages_resident = 0
+            mm.regions[i].pages_swapped = 0
+            mm.regions[i].valid = true
+
+            mm.region_count += 1
+            return true
+        }
+        i += 1
+    }
+
+    return false
+}
+
+fn region_overlaps(mm: *ProcessMm, start: u64, end: u64) bool {
+    var i: u32 = 0
+    while (i < MAX_REGIONS) {
+        if (mm.regions[i].valid) {
+            if (mm.regions[i].start < end and mm.regions[i].end > start) {
+                return true
+            }
+        }
+        i += 1
+    }
+    return false
+}
+
+fn find_free_region(mm: *ProcessMm, length: u64, hint: u64) u64 {
+    // Start from mmap base or hint
+    var addr: u64 = if (hint != 0 and hint >= mm.mmap_base) hint else mm.mmap_base
+
+    // Page align
+    addr = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+
+    // Simple first-fit search
+    var attempts: u32 = 0
+    while (attempts < 1000) {
+        var end: u64 = addr + length
+
+        // Check if this range is free
+        if (!region_overlaps(mm, addr, end)) {
+            // Check it doesn't overlap with heap
+            if (end <= mm.heap_start or addr >= mm.heap_max) {
+                return addr
+            }
+        }
+
+        // Try next aligned address
+        addr = (addr + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
+        attempts += 1
+    }
+
+    return 0  // No free region found
+}
+
+// ============================================================================
+// Statistics and Info
+// ============================================================================
+
+export fn mm_get_info(pid: u32, total_vm: *u64, rss: *u64, shared: *u64) bool {
+    if (!initialized or pid >= MAX_PROCESSES) {
+        return false
+    }
+
+    var mm: *ProcessMm = &process_mm[pid]
+    if (!mm.valid) {
+        return false
+    }
+
+    total_vm.* = mm.total_vm
+    rss.* = mm.rss
+    shared.* = mm.shared
+
+    return true
+}
+
+export fn mm_print_maps(pid: u32) void {
+    if (!initialized or pid >= MAX_PROCESSES) {
+        return
+    }
+
+    var mm: *ProcessMm = &process_mm[pid]
+    if (!mm.valid) {
+        return
+    }
+
+    serial.write_string("\n[USER-ALLOC] Memory map for PID ")
+    serial.write_u32(pid)
+    serial.write_string(":\n")
+    serial.write_string("Start            End              Prot  Type\n")
+    serial.write_string("-----------------------------------------------\n")
+
+    var i: u32 = 0
+    while (i < MAX_REGIONS) {
+        if (mm.regions[i].valid) {
+            var r: *VmRegion = &mm.regions[i]
+
+            serial.write_hex(r.start)
+            serial.write_string(" ")
+            serial.write_hex(r.end)
+            serial.write_string(" ")
+
+            // Protection
+            if ((r.prot & PROT_READ) != 0) serial.write_string("r") else serial.write_string("-")
+            if ((r.prot & PROT_WRITE) != 0) serial.write_string("w") else serial.write_string("-")
+            if ((r.prot & PROT_EXEC) != 0) serial.write_string("x") else serial.write_string("-")
+
+            serial.write_string("   ")
+
+            // Type
+            if (r.region_type == REGION_HEAP) serial.write_string("[heap]")
+            else if (r.region_type == REGION_MMAP) serial.write_string("[mmap]")
+            else if (r.region_type == REGION_STACK) serial.write_string("[stack]")
+            else if (r.region_type == REGION_CODE) serial.write_string("[code]")
+            else if (r.region_type == REGION_DATA) serial.write_string("[data]")
+            else if (r.region_type == REGION_SHARED) serial.write_string("[shared]")
+
+            serial.write_string("\n")
+        }
+        i += 1
+    }
+
+    serial.write_string("\nHeap: 0x")
+    serial.write_hex(mm.heap_start)
+    serial.write_string(" - 0x")
+    serial.write_hex(mm.heap_brk)
+    serial.write_string(" (")
+    serial.write_u64((mm.heap_brk - mm.heap_start) / 1024)
+    serial.write_string(" KB)\n")
+
+    serial.write_string("Total VM: ")
+    serial.write_u64(mm.total_vm / 1024)
+    serial.write_string(" KB\n")
+}
+
+export fn user_alloc_stats() void {
+    serial.write_string("\n[USER-ALLOC] Statistics:\n")
+    serial.write_string("  Total heap allocs (brk calls): ")
+    serial.write_u64(total_heap_allocs)
+    serial.write_string("\n")
+    serial.write_string("  Total mmap allocs: ")
+    serial.write_u64(total_mmap_allocs)
+    serial.write_string("\n")
+    serial.write_string("  Total pages mapped: ")
+    serial.write_u64(total_pages_mapped)
+    serial.write_string("\n")
+}

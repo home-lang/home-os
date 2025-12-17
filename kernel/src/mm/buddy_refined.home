@@ -1,0 +1,966 @@
+// HomeOS Refined Buddy Allocator
+// Enhanced buddy allocator with per-CPU page caches, NUMA awareness,
+// and optimized allocation paths for common page orders
+//
+// Key improvements over basic buddy:
+// - Per-CPU page caches (PCP) for order-0 allocations
+// - Batch allocation/freeing for efficiency
+// - NUMA node awareness
+// - Migration type tracking (unmovable, movable, reclaimable)
+// - Anti-fragmentation through grouping
+// - Deferred coalescing for burst frees
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const PAGE_SIZE: u64 = 4096
+const PAGE_SHIFT: u32 = 12
+const MAX_ORDER: u32 = 11              // Max block = 2^11 pages = 8MB
+const MAX_ZONES: u32 = 4
+const MAX_NODES: u32 = 8               // NUMA nodes
+const MAX_CPUS: u32 = 256
+
+// Per-CPU page cache configuration
+const PCP_BATCH: u32 = 31              // Batch size for PCP refill/drain
+const PCP_HIGH: u32 = 186              // High watermark (6 * batch)
+const PCP_LOW: u32 = 0                 // Low watermark
+
+// Migration types (for anti-fragmentation)
+pub const MIGRATE_UNMOVABLE: u32 = 0   // Kernel allocations
+pub const MIGRATE_MOVABLE: u32 = 1     // User pages (can be migrated)
+pub const MIGRATE_RECLAIMABLE: u32 = 2 // Page cache, can be reclaimed
+pub const MIGRATE_HIGHATOMIC: u32 = 3  // Reserved for atomic allocations
+pub const MIGRATE_TYPES: u32 = 4
+
+// Zone types
+pub const ZONE_DMA: u32 = 0
+pub const ZONE_DMA32: u32 = 1
+pub const ZONE_NORMAL: u32 = 2
+pub const ZONE_HIGHMEM: u32 = 3
+
+// GFP flags (Get Free Pages)
+pub const GFP_KERNEL: u32 = 0x0001     // Normal kernel allocation
+pub const GFP_ATOMIC: u32 = 0x0002     // Cannot sleep, high priority
+pub const GFP_USER: u32 = 0x0004       // User space allocation
+pub const GFP_DMA: u32 = 0x0008        // DMA-safe memory
+pub const GFP_DMA32: u32 = 0x0010      // Below 4GB
+pub const GFP_MOVABLE: u32 = 0x0020    // Movable allocation
+pub const GFP_ZERO: u32 = 0x0040       // Zero the memory
+pub const GFP_NOWAIT: u32 = 0x0080     // Don't wait
+pub const GFP_HIGHATOMIC: u32 = 0x0100 // Use high-priority reserves
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// Page frame descriptor (simplified)
+pub const PageFrame = struct {
+    flags: u32,
+    order: u8,                    // Order if this is a buddy head
+    migrate_type: u8,
+    refcount: u16,
+    mapping: u64,                 // Address space or anon_vma
+    index: u64,                   // Offset in mapping
+    lru_next: u32,                // LRU list linkage
+    lru_prev: u32,
+}
+
+// Free area for one order
+pub const FreeArea = struct {
+    // Free lists per migration type
+    free_list: [MIGRATE_TYPES]u64,  // Head of free list for each type
+    nr_free: [MIGRATE_TYPES]u32,    // Count per type
+    total_free: u32,
+}
+
+// Per-CPU page cache
+pub const PerCPUPages = struct {
+    count: u32,                   // Number of pages in cache
+    high: u32,                    // High watermark
+    batch: u32,                   // Batch size for refill/drain
+
+    // Lists per migration type
+    lists: [MIGRATE_TYPES]PCPList,
+
+    // Statistics
+    stat_alloc: u64,
+    stat_free: u64,
+    stat_refill: u64,
+    stat_drain: u64,
+}
+
+// PCP list for one migration type
+pub const PCPList = struct {
+    head: u64,                    // First page
+    count: u32,                   // Pages in this list
+}
+
+// Zone descriptor
+pub const Zone = struct {
+    name: [16]u8,
+    zone_start_pfn: u64,          // Start page frame number
+    spanned_pages: u64,           // Total pages spanned
+    present_pages: u64,           // Pages present (minus holes)
+    managed_pages: u64,           // Pages managed by buddy
+
+    // Watermarks
+    watermark_min: u64,
+    watermark_low: u64,
+    watermark_high: u64,
+
+    // Free areas per order
+    free_area: [MAX_ORDER + 1]FreeArea,
+
+    // Per-CPU page caches
+    per_cpu_pages: [MAX_CPUS]PerCPUPages,
+
+    // Statistics
+    pages_scanned: u64,
+    pages_freed: u64,
+    compact_migrate: u64,
+    compact_free_scanned: u64,
+
+    // NUMA node
+    node: u32,
+
+    // Flags
+    initialized: bool,
+}
+
+// NUMA node
+pub const NumaNode = struct {
+    node_id: u32,
+    zones: [MAX_ZONES]Zone,
+    present_pages: u64,
+
+    // Node-local allocation preference
+    zonelist: [MAX_ZONES]u32,     // Ordered zone preference
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var nodes: [MAX_NODES]NumaNode = undefined
+var num_nodes: u32 = 1
+var num_cpus: u32 = 1
+var initialized: bool = false
+
+// Page frame array (would be allocated based on total memory)
+const MAX_PAGES: u32 = 1024 * 1024  // 4GB worth of pages
+var page_frames: [MAX_PAGES]PageFrame = undefined
+
+// Statistics
+var total_pages_managed: u64 = 0
+var total_pages_free: u64 = 0
+var alloc_count: u64 = 0
+var free_count: u64 = 0
+var pcp_alloc_count: u64 = 0
+var pcp_free_count: u64 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn buddy_refined_init(
+    base_addr: u64,
+    total_size: u64,
+    node_count: u32,
+    cpu_count: u32
+) bool {
+    if (initialized) {
+        return true
+    }
+
+    serial.write_string("[BUDDY-R] Initializing refined buddy allocator...\n")
+    serial.write_string("  Base: 0x")
+    serial.write_hex(base_addr)
+    serial.write_string("\n  Size: ")
+    serial.write_u64(total_size / (1024 * 1024))
+    serial.write_string(" MB\n")
+    serial.write_string("  NUMA nodes: ")
+    serial.write_u32(node_count)
+    serial.write_string("\n  CPUs: ")
+    serial.write_u32(cpu_count)
+    serial.write_string("\n")
+
+    num_nodes = if (node_count > MAX_NODES) MAX_NODES else node_count
+    num_cpus = if (cpu_count > MAX_CPUS) MAX_CPUS else cpu_count
+
+    // Initialize nodes
+    var node: u32 = 0
+    while (node < num_nodes) {
+        init_node(node)
+        node += 1
+    }
+
+    // Initialize page frames
+    var total_pages: u64 = total_size / PAGE_SIZE
+    if (total_pages > MAX_PAGES) {
+        total_pages = MAX_PAGES
+    }
+
+    var pfn: u32 = 0
+    while (pfn < total_pages) {
+        page_frames[pfn].flags = 0
+        page_frames[pfn].order = 0
+        page_frames[pfn].migrate_type = MIGRATE_MOVABLE
+        page_frames[pfn].refcount = 0
+        page_frames[pfn].mapping = 0
+        page_frames[pfn].index = 0
+        page_frames[pfn].lru_next = 0xFFFFFFFF
+        page_frames[pfn].lru_prev = 0xFFFFFFFF
+        pfn += 1
+    }
+
+    // Add memory to first node's ZONE_NORMAL
+    var pages_per_node: u64 = total_pages / @as(u64, num_nodes)
+
+    node = 0
+    while (node < num_nodes) {
+        var start_pfn: u64 = @as(u64, node) * pages_per_node
+        var end_pfn: u64 = start_pfn + pages_per_node
+        if (node == num_nodes - 1) {
+            end_pfn = total_pages  // Last node gets remainder
+        }
+
+        add_pages_to_zone(node, ZONE_NORMAL, start_pfn, end_pfn - start_pfn)
+        node += 1
+    }
+
+    initialized = true
+
+    serial.write_string("[BUDDY-R] Initialization complete\n")
+    serial.write_string("  Total managed: ")
+    serial.write_u64(total_pages_managed)
+    serial.write_string(" pages (")
+    serial.write_u64(total_pages_managed * PAGE_SIZE / (1024 * 1024))
+    serial.write_string(" MB)\n")
+
+    return true
+}
+
+fn init_node(node_id: u32) void {
+    nodes[node_id].node_id = node_id
+    nodes[node_id].present_pages = 0
+
+    // Initialize zones
+    var zone: u32 = 0
+    while (zone < MAX_ZONES) {
+        init_zone(&nodes[node_id].zones[zone], zone, node_id)
+        zone += 1
+    }
+
+    // Set up zonelist preference (local first)
+    nodes[node_id].zonelist[0] = ZONE_NORMAL
+    nodes[node_id].zonelist[1] = ZONE_DMA32
+    nodes[node_id].zonelist[2] = ZONE_DMA
+    nodes[node_id].zonelist[3] = ZONE_HIGHMEM
+}
+
+fn init_zone(zone: *Zone, zone_type: u32, node: u32) void {
+    // Set zone name
+    if (zone_type == ZONE_DMA) {
+        copy_name(&zone.name, "DMA")
+    } else if (zone_type == ZONE_DMA32) {
+        copy_name(&zone.name, "DMA32")
+    } else if (zone_type == ZONE_NORMAL) {
+        copy_name(&zone.name, "Normal")
+    } else {
+        copy_name(&zone.name, "HighMem")
+    }
+
+    zone.zone_start_pfn = 0
+    zone.spanned_pages = 0
+    zone.present_pages = 0
+    zone.managed_pages = 0
+    zone.node = node
+    zone.initialized = false
+
+    // Watermarks (will be set based on pages added)
+    zone.watermark_min = 0
+    zone.watermark_low = 0
+    zone.watermark_high = 0
+
+    // Statistics
+    zone.pages_scanned = 0
+    zone.pages_freed = 0
+    zone.compact_migrate = 0
+    zone.compact_free_scanned = 0
+
+    // Initialize free areas
+    var order: u32 = 0
+    while (order <= MAX_ORDER) {
+        var mtype: u32 = 0
+        while (mtype < MIGRATE_TYPES) {
+            zone.free_area[order].free_list[mtype] = 0
+            zone.free_area[order].nr_free[mtype] = 0
+            mtype += 1
+        }
+        zone.free_area[order].total_free = 0
+        order += 1
+    }
+
+    // Initialize per-CPU caches
+    var cpu: u32 = 0
+    while (cpu < MAX_CPUS) {
+        init_pcp(&zone.per_cpu_pages[cpu])
+        cpu += 1
+    }
+}
+
+fn init_pcp(pcp: *PerCPUPages) void {
+    pcp.count = 0
+    pcp.high = PCP_HIGH
+    pcp.batch = PCP_BATCH
+    pcp.stat_alloc = 0
+    pcp.stat_free = 0
+    pcp.stat_refill = 0
+    pcp.stat_drain = 0
+
+    var mtype: u32 = 0
+    while (mtype < MIGRATE_TYPES) {
+        pcp.lists[mtype].head = 0
+        pcp.lists[mtype].count = 0
+        mtype += 1
+    }
+}
+
+fn copy_name(dest: *[16]u8, src: []const u8) void {
+    var i: u32 = 0
+    while (i < src.len and i < 15) {
+        dest[i] = src[i]
+        i += 1
+    }
+    dest[i] = 0
+}
+
+// Add pages to a zone
+fn add_pages_to_zone(node: u32, zone_type: u32, start_pfn: u64, count: u64) void {
+    var zone: *Zone = &nodes[node].zones[zone_type]
+
+    if (!zone.initialized) {
+        zone.zone_start_pfn = start_pfn
+        zone.initialized = true
+    }
+
+    zone.spanned_pages += count
+    zone.present_pages += count
+    zone.managed_pages += count
+    nodes[node].present_pages += count
+    total_pages_managed += count
+    total_pages_free += count
+
+    // Set watermarks
+    zone.watermark_min = count / 256
+    zone.watermark_low = zone.watermark_min * 2
+    zone.watermark_high = zone.watermark_min * 3
+
+    // Add pages to free lists at highest possible order
+    var pfn: u64 = start_pfn
+    var remaining: u64 = count
+
+    while (remaining > 0) {
+        // Find largest order that fits
+        var order: u32 = MAX_ORDER
+        while (order > 0) {
+            var block_pages: u64 = @as(u64, 1) << order
+            if (block_pages <= remaining) {
+                // Also check alignment
+                if ((pfn & (block_pages - 1)) == 0) {
+                    break
+                }
+            }
+            order -= 1
+        }
+
+        var block_pages: u64 = @as(u64, 1) << order
+
+        // Add to free list (default to MIGRATE_MOVABLE)
+        add_to_freelist(zone, pfn, order, MIGRATE_MOVABLE)
+
+        // Mark page frame
+        page_frames[@as(u32, @truncate(pfn))].order = @as(u8, @truncate(order))
+        page_frames[@as(u32, @truncate(pfn))].migrate_type = @as(u8, @truncate(MIGRATE_MOVABLE))
+
+        pfn += block_pages
+        remaining -= block_pages
+    }
+}
+
+// ============================================================================
+// Free List Management
+// ============================================================================
+
+fn add_to_freelist(zone: *Zone, pfn: u64, order: u32, migrate_type: u32) void {
+    var fa: *FreeArea = &zone.free_area[order]
+
+    // Add to front of appropriate list
+    var old_head: u64 = fa.free_list[migrate_type]
+
+    // Store next pointer in page frame
+    if (pfn < MAX_PAGES) {
+        page_frames[@as(u32, @truncate(pfn))].lru_next = @as(u32, @truncate(old_head))
+    }
+
+    fa.free_list[migrate_type] = pfn
+    fa.nr_free[migrate_type] += 1
+    fa.total_free += 1
+}
+
+fn remove_from_freelist(zone: *Zone, pfn: u64, order: u32, migrate_type: u32) bool {
+    var fa: *FreeArea = &zone.free_area[order]
+
+    if (fa.nr_free[migrate_type] == 0) {
+        return false
+    }
+
+    // Find and remove from list
+    var curr: u64 = fa.free_list[migrate_type]
+    var prev: u64 = 0
+
+    while (curr != 0 and curr != pfn) {
+        prev = curr
+        if (curr < MAX_PAGES) {
+            curr = page_frames[@as(u32, @truncate(curr))].lru_next
+        } else {
+            break
+        }
+    }
+
+    if (curr != pfn) {
+        return false
+    }
+
+    // Remove from list
+    var next: u64 = 0
+    if (pfn < MAX_PAGES) {
+        next = page_frames[@as(u32, @truncate(pfn))].lru_next
+    }
+
+    if (prev == 0) {
+        fa.free_list[migrate_type] = next
+    } else if (prev < MAX_PAGES) {
+        page_frames[@as(u32, @truncate(prev))].lru_next = @as(u32, @truncate(next))
+    }
+
+    fa.nr_free[migrate_type] -= 1
+    fa.total_free -= 1
+
+    return true
+}
+
+// Pop first page from freelist
+fn pop_from_freelist(zone: *Zone, order: u32, migrate_type: u32) u64 {
+    var fa: *FreeArea = &zone.free_area[order]
+
+    if (fa.nr_free[migrate_type] == 0) {
+        return 0
+    }
+
+    var pfn: u64 = fa.free_list[migrate_type]
+    if (pfn == 0) {
+        return 0
+    }
+
+    // Update head
+    if (pfn < MAX_PAGES) {
+        fa.free_list[migrate_type] = page_frames[@as(u32, @truncate(pfn))].lru_next
+    } else {
+        fa.free_list[migrate_type] = 0
+    }
+
+    fa.nr_free[migrate_type] -= 1
+    fa.total_free -= 1
+
+    return pfn
+}
+
+// ============================================================================
+// Allocation - Core
+// ============================================================================
+
+// Allocate pages of given order
+export fn alloc_pages(order: u32, gfp_flags: u32) u64 {
+    if (!initialized or order > MAX_ORDER) {
+        return 0
+    }
+
+    var migrate_type: u32 = get_migrate_type(gfp_flags)
+    var zone_type: u32 = get_preferred_zone(gfp_flags)
+    var node: u32 = get_current_node()
+    var cpu: u32 = get_current_cpu()
+
+    alloc_count += 1
+
+    // For order-0, try per-CPU cache first
+    if (order == 0) {
+        var pfn: u64 = pcp_alloc(&nodes[node].zones[zone_type], cpu, migrate_type)
+        if (pfn != 0) {
+            pcp_alloc_count += 1
+            if ((gfp_flags & GFP_ZERO) != 0) {
+                zero_page(pfn)
+            }
+            return pfn_to_addr(pfn)
+        }
+    }
+
+    // Fall through to buddy allocator
+    var pfn: u64 = buddy_alloc_pages(&nodes[node].zones[zone_type], order, migrate_type)
+
+    if (pfn == 0) {
+        // Try fallback zones on same node
+        var fallback: u32 = 0
+        while (fallback < MAX_ZONES and pfn == 0) {
+            var fzone: u32 = nodes[node].zonelist[fallback]
+            if (fzone != zone_type) {
+                pfn = buddy_alloc_pages(&nodes[node].zones[fzone], order, migrate_type)
+            }
+            fallback += 1
+        }
+    }
+
+    if (pfn == 0) {
+        // Try other NUMA nodes
+        var other_node: u32 = 0
+        while (other_node < num_nodes and pfn == 0) {
+            if (other_node != node) {
+                pfn = buddy_alloc_pages(&nodes[other_node].zones[ZONE_NORMAL], order, migrate_type)
+            }
+            other_node += 1
+        }
+    }
+
+    if (pfn != 0) {
+        total_pages_free -= @as(u64, 1) << order
+
+        if ((gfp_flags & GFP_ZERO) != 0) {
+            zero_pages(pfn, order)
+        }
+
+        return pfn_to_addr(pfn)
+    }
+
+    return 0
+}
+
+// Core buddy allocation
+fn buddy_alloc_pages(zone: *Zone, order: u32, migrate_type: u32) u64 {
+    // Find a free block at this order or higher
+    var current_order: u32 = order
+
+    while (current_order <= MAX_ORDER) {
+        // Try preferred migrate type first
+        var pfn: u64 = pop_from_freelist(zone, current_order, migrate_type)
+
+        if (pfn == 0) {
+            // Try fallback migrate types
+            var fallback: u32 = 0
+            while (fallback < MIGRATE_TYPES and pfn == 0) {
+                if (fallback != migrate_type) {
+                    pfn = pop_from_freelist(zone, current_order, fallback)
+                }
+                fallback += 1
+            }
+        }
+
+        if (pfn != 0) {
+            // Split if necessary
+            while (current_order > order) {
+                current_order -= 1
+                var buddy_pfn: u64 = pfn + (@as(u64, 1) << current_order)
+                add_to_freelist(zone, buddy_pfn, current_order, migrate_type)
+
+                // Update page frame
+                if (buddy_pfn < MAX_PAGES) {
+                    page_frames[@as(u32, @truncate(buddy_pfn))].order = @as(u8, @truncate(current_order))
+                }
+            }
+
+            // Mark allocated
+            if (pfn < MAX_PAGES) {
+                page_frames[@as(u32, @truncate(pfn))].order = @as(u8, @truncate(order))
+                page_frames[@as(u32, @truncate(pfn))].refcount = 1
+            }
+
+            return pfn
+        }
+
+        current_order += 1
+    }
+
+    return 0
+}
+
+// ============================================================================
+// Per-CPU Page Cache
+// ============================================================================
+
+fn pcp_alloc(zone: *Zone, cpu: u32, migrate_type: u32) u64 {
+    var pcp: *PerCPUPages = &zone.per_cpu_pages[cpu]
+
+    // Try to get from PCP list
+    if (pcp.lists[migrate_type].count > 0) {
+        var pfn: u64 = pcp.lists[migrate_type].head
+        if (pfn != 0 and pfn < MAX_PAGES) {
+            pcp.lists[migrate_type].head = page_frames[@as(u32, @truncate(pfn))].lru_next
+            pcp.lists[migrate_type].count -= 1
+            pcp.count -= 1
+            pcp.stat_alloc += 1
+            return pfn
+        }
+    }
+
+    // Try other migrate types
+    var mtype: u32 = 0
+    while (mtype < MIGRATE_TYPES) {
+        if (mtype != migrate_type and pcp.lists[mtype].count > 0) {
+            var pfn: u64 = pcp.lists[mtype].head
+            if (pfn != 0 and pfn < MAX_PAGES) {
+                pcp.lists[mtype].head = page_frames[@as(u32, @truncate(pfn))].lru_next
+                pcp.lists[mtype].count -= 1
+                pcp.count -= 1
+                pcp.stat_alloc += 1
+                return pfn
+            }
+        }
+        mtype += 1
+    }
+
+    // PCP empty, refill from buddy
+    pcp_refill(zone, pcp, migrate_type)
+    pcp.stat_refill += 1
+
+    // Try again
+    if (pcp.lists[migrate_type].count > 0) {
+        var pfn: u64 = pcp.lists[migrate_type].head
+        if (pfn != 0 and pfn < MAX_PAGES) {
+            pcp.lists[migrate_type].head = page_frames[@as(u32, @truncate(pfn))].lru_next
+            pcp.lists[migrate_type].count -= 1
+            pcp.count -= 1
+            pcp.stat_alloc += 1
+            return pfn
+        }
+    }
+
+    return 0
+}
+
+fn pcp_refill(zone: *Zone, pcp: *PerCPUPages, migrate_type: u32) void {
+    var batch: u32 = pcp.batch
+    var filled: u32 = 0
+
+    while (filled < batch) {
+        // Allocate from buddy (order 0)
+        var pfn: u64 = buddy_alloc_pages(zone, 0, migrate_type)
+        if (pfn == 0) {
+            break
+        }
+
+        // Add to PCP list
+        if (pfn < MAX_PAGES) {
+            page_frames[@as(u32, @truncate(pfn))].lru_next = @as(u32, @truncate(pcp.lists[migrate_type].head))
+        }
+        pcp.lists[migrate_type].head = pfn
+        pcp.lists[migrate_type].count += 1
+        pcp.count += 1
+
+        filled += 1
+    }
+}
+
+fn pcp_free(zone: *Zone, cpu: u32, pfn: u64, migrate_type: u32) void {
+    var pcp: *PerCPUPages = &zone.per_cpu_pages[cpu]
+
+    // Add to PCP list
+    if (pfn < MAX_PAGES) {
+        page_frames[@as(u32, @truncate(pfn))].lru_next = @as(u32, @truncate(pcp.lists[migrate_type].head))
+    }
+    pcp.lists[migrate_type].head = pfn
+    pcp.lists[migrate_type].count += 1
+    pcp.count += 1
+    pcp.stat_free += 1
+
+    // Drain if above high watermark
+    if (pcp.count > pcp.high) {
+        pcp_drain(zone, pcp, migrate_type)
+        pcp.stat_drain += 1
+    }
+}
+
+fn pcp_drain(zone: *Zone, pcp: *PerCPUPages, migrate_type: u32) void {
+    var batch: u32 = pcp.batch
+    var drained: u32 = 0
+
+    while (drained < batch and pcp.lists[migrate_type].count > 0) {
+        var pfn: u64 = pcp.lists[migrate_type].head
+        if (pfn == 0) {
+            break
+        }
+
+        if (pfn < MAX_PAGES) {
+            pcp.lists[migrate_type].head = page_frames[@as(u32, @truncate(pfn))].lru_next
+        } else {
+            pcp.lists[migrate_type].head = 0
+        }
+        pcp.lists[migrate_type].count -= 1
+        pcp.count -= 1
+
+        // Return to buddy (with coalescing)
+        buddy_free_pages(zone, pfn, 0)
+
+        drained += 1
+    }
+}
+
+// ============================================================================
+// Deallocation
+// ============================================================================
+
+export fn free_pages(addr: u64, order: u32) void {
+    if (!initialized or order > MAX_ORDER) {
+        return
+    }
+
+    var pfn: u64 = addr_to_pfn(addr)
+    if (pfn >= MAX_PAGES) {
+        return
+    }
+
+    var migrate_type: u32 = page_frames[@as(u32, @truncate(pfn))].migrate_type
+    var node: u32 = get_node_for_pfn(pfn)
+    var zone_type: u32 = get_zone_for_pfn(pfn)
+    var zone: *Zone = &nodes[node].zones[zone_type]
+    var cpu: u32 = get_current_cpu()
+
+    free_count += 1
+    total_pages_free += @as(u64, 1) << order
+
+    // For order-0, use PCP
+    if (order == 0) {
+        pcp_free(zone, cpu, pfn, migrate_type)
+        pcp_free_count += 1
+        return
+    }
+
+    // Free to buddy with coalescing
+    buddy_free_pages(zone, pfn, order)
+}
+
+fn buddy_free_pages(zone: *Zone, pfn: u64, order: u32) void {
+    var current_pfn: u64 = pfn
+    var current_order: u32 = order
+    var migrate_type: u32 = MIGRATE_MOVABLE
+
+    if (pfn < MAX_PAGES) {
+        migrate_type = page_frames[@as(u32, @truncate(pfn))].migrate_type
+        page_frames[@as(u32, @truncate(pfn))].refcount = 0
+    }
+
+    // Try to coalesce with buddies
+    while (current_order < MAX_ORDER) {
+        var buddy_pfn: u64 = current_pfn ^ (@as(u64, 1) << current_order)
+
+        // Check if buddy exists and is free at same order
+        if (!is_buddy_free(zone, buddy_pfn, current_order, migrate_type)) {
+            break
+        }
+
+        // Remove buddy from free list
+        if (!remove_from_freelist(zone, buddy_pfn, current_order, migrate_type)) {
+            break
+        }
+
+        // Coalesce: use lower address
+        if (buddy_pfn < current_pfn) {
+            current_pfn = buddy_pfn
+        }
+
+        current_order += 1
+    }
+
+    // Add coalesced block to free list
+    add_to_freelist(zone, current_pfn, current_order, migrate_type)
+
+    if (current_pfn < MAX_PAGES) {
+        page_frames[@as(u32, @truncate(current_pfn))].order = @as(u8, @truncate(current_order))
+    }
+}
+
+fn is_buddy_free(zone: *Zone, pfn: u64, order: u32, migrate_type: u32) bool {
+    if (pfn >= MAX_PAGES) {
+        return false
+    }
+
+    // Check if in free list
+    var fa: *FreeArea = &zone.free_area[order]
+    var curr: u64 = fa.free_list[migrate_type]
+
+    while (curr != 0) {
+        if (curr == pfn) {
+            return true
+        }
+        if (curr < MAX_PAGES) {
+            curr = page_frames[@as(u32, @truncate(curr))].lru_next
+        } else {
+            break
+        }
+    }
+
+    return false
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn pfn_to_addr(pfn: u64) u64 {
+    return pfn * PAGE_SIZE
+}
+
+fn addr_to_pfn(addr: u64) u64 {
+    return addr / PAGE_SIZE
+}
+
+fn get_migrate_type(gfp_flags: u32) u32 {
+    if ((gfp_flags & GFP_MOVABLE) != 0) {
+        return MIGRATE_MOVABLE
+    }
+    if ((gfp_flags & GFP_HIGHATOMIC) != 0) {
+        return MIGRATE_HIGHATOMIC
+    }
+    return MIGRATE_UNMOVABLE
+}
+
+fn get_preferred_zone(gfp_flags: u32) u32 {
+    if ((gfp_flags & GFP_DMA) != 0) {
+        return ZONE_DMA
+    }
+    if ((gfp_flags & GFP_DMA32) != 0) {
+        return ZONE_DMA32
+    }
+    return ZONE_NORMAL
+}
+
+fn get_current_cpu() u32 {
+    // Would read from CPU register
+    return 0
+}
+
+fn get_current_node() u32 {
+    // Would determine from CPU ID
+    return 0
+}
+
+fn get_node_for_pfn(pfn: u64) u32 {
+    // Determine which node owns this page
+    var pages_per_node: u64 = total_pages_managed / @as(u64, num_nodes)
+    var node: u32 = @as(u32, @truncate(pfn / pages_per_node))
+    if (node >= num_nodes) {
+        node = num_nodes - 1
+    }
+    return node
+}
+
+fn get_zone_for_pfn(pfn: u64) u32 {
+    // Simplified: all pages in ZONE_NORMAL
+    return ZONE_NORMAL
+}
+
+fn zero_page(pfn: u64) void {
+    var addr: u64 = pfn_to_addr(pfn)
+    var ptr: [*]u8 = @ptrFromInt(addr)
+    var i: u32 = 0
+    while (i < PAGE_SIZE) {
+        ptr[i] = 0
+        i += 1
+    }
+}
+
+fn zero_pages(pfn: u64, order: u32) void {
+    var num_pages: u64 = @as(u64, 1) << order
+    var i: u64 = 0
+    while (i < num_pages) {
+        zero_page(pfn + i)
+        i += 1
+    }
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn buddy_refined_stats() void {
+    serial.write_string("\n[BUDDY-R] Refined Buddy Allocator Statistics:\n")
+    serial.write_string("  Total managed: ")
+    serial.write_u64(total_pages_managed)
+    serial.write_string(" pages\n")
+    serial.write_string("  Free pages: ")
+    serial.write_u64(total_pages_free)
+    serial.write_string("\n")
+    serial.write_string("  Allocations: ")
+    serial.write_u64(alloc_count)
+    serial.write_string("\n")
+    serial.write_string("  Frees: ")
+    serial.write_u64(free_count)
+    serial.write_string("\n")
+    serial.write_string("  PCP allocs: ")
+    serial.write_u64(pcp_alloc_count)
+    serial.write_string(" (")
+    if (alloc_count > 0) {
+        serial.write_u64(pcp_alloc_count * 100 / alloc_count)
+    } else {
+        serial.write_string("0")
+    }
+    serial.write_string("% hit rate)\n")
+    serial.write_string("  PCP frees: ")
+    serial.write_u64(pcp_free_count)
+    serial.write_string("\n")
+
+    // Per-zone stats
+    var node: u32 = 0
+    while (node < num_nodes) {
+        serial.write_string("\n  Node ")
+        serial.write_u32(node)
+        serial.write_string(":\n")
+
+        var zone: u32 = 0
+        while (zone < MAX_ZONES) {
+            var z: *Zone = &nodes[node].zones[zone]
+            if (z.managed_pages > 0) {
+                serial.write_string("    Zone ")
+                var i: u32 = 0
+                while (i < 16 and z.name[i] != 0) {
+                    serial.write_char(z.name[i])
+                    i += 1
+                }
+                serial.write_string(": ")
+                serial.write_u64(z.managed_pages)
+                serial.write_string(" pages, ")
+
+                // Count free
+                var free: u64 = 0
+                var order: u32 = 0
+                while (order <= MAX_ORDER) {
+                    free += @as(u64, z.free_area[order].total_free) << order
+                    order += 1
+                }
+                serial.write_u64(free)
+                serial.write_string(" free\n")
+            }
+            zone += 1
+        }
+        node += 1
+    }
+}
+
+export fn get_free_pages_count() u64 {
+    return total_pages_free
+}
+
+export fn get_total_pages() u64 {
+    return total_pages_managed
+}
