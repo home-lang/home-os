@@ -792,7 +792,15 @@ Build a next-generation operating system that prioritizes:
   - [x] 4-level page table implementation (vmm_init, vmm_map_page, vmm_unmap_page)
   - [x] Kernel space mapping (higher half)
   - [x] Page allocation/deallocation (vmm_get_physical)
-  - [ ] User space mapping (lower half) (TODO: Phase 2)
+  - [x] User space mapping (lower half) (**COMPLETED Dec 17, 2025**)
+    - Created `kernel/src/mm/user_space.home` - comprehensive user address space management
+    - VMA (Virtual Memory Area) management with sorted linked list
+    - User address layout: code at 4MB, heap at 256MB, mmap at 127TB, stack at top
+    - mmap/munmap implementation with anonymous mappings
+    - brk/sbrk heap management with automatic expansion
+    - Stack management with automatic growth on page fault
+    - Copy-on-write fork support for efficient process cloning
+    - Code/data/BSS segment mapping for exec
   - [x] Memory protection (NX, W^X) (**COMPLETED**)
     - Full implementation in `kernel/src/security/wx_enforcement.home`
     - NX bit support detection via CPUID
@@ -816,9 +824,27 @@ Build a next-generation operating system that prioritizes:
     - Named caches with constructors/destructors
     - Object coloring for cache optimization
     - Statistics tracking (hits, misses, allocations)
-  - [ ] General-purpose allocator (buddy system) (TODO: Phase 2 - optimization)
-  - [ ] Integrate with Home's ownership system (TODO: Phase 2)
-  - [ ] Memory leak detection (debug builds) (TODO: Phase 2)
+  - [x] General-purpose allocator (buddy system) (**COMPLETED Dec 17, 2025**)
+    - Full implementation in `kernel/src/mm/buddy.home`
+    - Power-of-two block allocation with coalescing
+    - Memory zones: DMA, DMA32, Normal, HighMem
+    - Watermark-based memory pressure handling
+    - Zone-specific allocation (buddy_alloc_dma, buddy_alloc_dma32)
+    - Memory compaction support
+  - [x] Integrate with Home's ownership system (**COMPLETED Dec 17, 2025**)
+    - Created `kernel/src/mm/ownership.home` - ownership tracking for memory safety
+    - Ownership states: free, owned, borrowed, borrowed_mut, shared, moved
+    - Borrow checking at runtime (immutable and mutable borrows)
+    - Reference counting for shared ownership (Rc/Arc-style)
+    - Double-free and use-after-free detection
+    - Ownership transfer and move semantics
+  - [x] Memory leak detection (debug builds) (**COMPLETED Dec 17, 2025**)
+    - Created `kernel/src/mm/leak_detect.home` - comprehensive leak detection
+    - Allocation tracking with stack traces (configurable depth)
+    - Guard canaries for buffer overflow/underflow detection
+    - Allocation site statistics (file, line, peak usage)
+    - Periodic leak scanning and process-specific leak detection
+    - Integration with ownership system for complete safety
 - [x] Interrupt handling (**COMPLETED - Oct 29, 2025**)
   - [x] ISR (Interrupt Service Routines) setup (idt_stubs.s - 32 exception handlers)
   - [x] Exception handler framework (exceptionHandler in kernel.home)

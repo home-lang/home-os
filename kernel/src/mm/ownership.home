@@ -1,0 +1,806 @@
+// home-os Memory Ownership System
+// Integrates with Home language's ownership model for memory safety
+//
+// Provides:
+//   - Ownership tracking for allocated memory
+//   - Borrow checking at runtime (debug builds)
+//   - Automatic resource cleanup (RAII-style)
+//   - Use-after-free detection
+//   - Double-free prevention
+//   - Reference counting for shared ownership
+
+import "../core/foundation.home" as foundation
+
+// Ownership states
+const OWNER_STATE_FREE: u8 = 0          // Memory is free
+const OWNER_STATE_OWNED: u8 = 1         // Single owner
+const OWNER_STATE_BORROWED: u8 = 2      // Borrowed (immutable)
+const OWNER_STATE_BORROWED_MUT: u8 = 3  // Borrowed (mutable)
+const OWNER_STATE_SHARED: u8 = 4        // Shared ownership (Rc/Arc)
+const OWNER_STATE_MOVED: u8 = 5         // Ownership moved (invalid)
+
+// Allocation metadata flags
+const ALLOC_FLAG_KERNEL: u32 = 1 << 0
+const ALLOC_FLAG_USER: u32 = 1 << 1
+const ALLOC_FLAG_HEAP: u32 = 1 << 2
+const ALLOC_FLAG_STACK: u32 = 1 << 3
+const ALLOC_FLAG_ZEROED: u32 = 1 << 4
+const ALLOC_FLAG_ALIGNED: u32 = 1 << 5
+const ALLOC_FLAG_DEBUG: u32 = 1 << 6
+const ALLOC_FLAG_TRACKED: u32 = 1 << 7
+
+// Magic values for validation
+const ALLOC_MAGIC_ACTIVE: u32 = 0xALLOCATE
+const ALLOC_MAGIC_FREED: u32 = 0xDEADBEEF
+const GUARD_MAGIC: u64 = 0xFEEDFACECAFEBABE
+
+// Maximum tracked allocations
+const MAX_TRACKED_ALLOCS: u32 = 16384
+const MAX_BORROW_DEPTH: u32 = 16
+
+// Allocation tracking entry
+struct AllocEntry {
+    addr: u64               // Allocation address
+    size: u64               // Allocation size
+    magic: u32              // Validation magic
+    state: u8               // Ownership state
+    borrow_count: u8        // Number of active borrows
+    mut_borrowed: bool      // Has mutable borrow
+    flags: u32              // Allocation flags
+
+    // Owner tracking
+    owner_id: u64           // Owner identifier (process/thread)
+    owner_line: u32         // Source line (debug)
+    owner_file: u32         // Source file hash (debug)
+
+    // Borrow stack (for nested borrows in debug mode)
+    borrow_stack: [MAX_BORROW_DEPTH]u64
+
+    // Timestamps
+    alloc_time: u64
+    free_time: u64
+
+    // Reference counting (for shared ownership)
+    ref_count: u32
+    weak_count: u32
+
+    // Linked list for hash bucket
+    next: *AllocEntry
+}
+
+// Hash table for fast lookup
+const HASH_BUCKETS: u32 = 1024
+var alloc_table: [HASH_BUCKETS]*AllocEntry
+
+// Allocation entry pool
+var alloc_pool: [MAX_TRACKED_ALLOCS]AllocEntry
+var alloc_bitmap: [MAX_TRACKED_ALLOCS / 8]u8
+var pool_initialized: bool = false
+
+// Statistics
+struct OwnershipStats {
+    total_allocs: u64
+    total_frees: u64
+    active_allocs: u64
+    peak_allocs: u64
+
+    // Error tracking
+    double_frees: u64
+    use_after_free: u64
+    borrow_violations: u64
+    null_derefs: u64
+    overflow_detected: u64
+
+    // Ownership tracking
+    ownership_transfers: u64
+    borrows_created: u64
+    borrows_released: u64
+
+    // Reference counting
+    ref_increments: u64
+    ref_decrements: u64
+    weak_refs: u64
+}
+var stats: OwnershipStats
+
+// Debug mode flag
+var debug_mode: bool = true
+
+// Current owner context (per-CPU in SMP)
+var current_owner_id: u64 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn ownership_init() {
+    foundation.serial_write_string("[OWNERSHIP] Initializing ownership tracking\n")
+
+    // Initialize hash table
+    var i: u32 = 0
+    loop {
+        if i >= HASH_BUCKETS {
+            break
+        }
+        alloc_table[i] = null
+        i = i + 1
+    }
+
+    // Initialize allocation pool bitmap
+    i = 0
+    loop {
+        if i >= MAX_TRACKED_ALLOCS / 8 {
+            break
+        }
+        alloc_bitmap[i] = 0
+        i = i + 1
+    }
+
+    // Initialize statistics
+    stats.total_allocs = 0
+    stats.total_frees = 0
+    stats.active_allocs = 0
+    stats.peak_allocs = 0
+    stats.double_frees = 0
+    stats.use_after_free = 0
+    stats.borrow_violations = 0
+    stats.null_derefs = 0
+    stats.overflow_detected = 0
+    stats.ownership_transfers = 0
+    stats.borrows_created = 0
+    stats.borrows_released = 0
+    stats.ref_increments = 0
+    stats.ref_decrements = 0
+    stats.weak_refs = 0
+
+    pool_initialized = true
+
+    foundation.serial_write_string("[OWNERSHIP] Initialization complete\n")
+}
+
+// ============================================================================
+// Entry Pool Management
+// ============================================================================
+
+fn alloc_entry(): *AllocEntry {
+    var i: u32 = 0
+    loop {
+        if i >= MAX_TRACKED_ALLOCS {
+            break
+        }
+
+        var byte_idx: u32 = i / 8
+        var bit_idx: u32 = i % 8
+        var mask: u8 = 1 << @truncate(bit_idx, u8)
+
+        if (alloc_bitmap[byte_idx] & mask) == 0 {
+            alloc_bitmap[byte_idx] = alloc_bitmap[byte_idx] | mask
+            return &alloc_pool[i]
+        }
+
+        i = i + 1
+    }
+
+    foundation.serial_write_string("[OWNERSHIP] WARNING: Entry pool exhausted\n")
+    return null
+}
+
+fn free_entry(entry: *AllocEntry) {
+    var addr: u64 = @intFromPtr(entry)
+    var pool_start: u64 = @intFromPtr(&alloc_pool[0])
+    var entry_size: u64 = @sizeOf(AllocEntry)
+
+    if addr >= pool_start and addr < pool_start + (MAX_TRACKED_ALLOCS * entry_size) {
+        var idx: u32 = @truncate((addr - pool_start) / entry_size, u32)
+        var byte_idx: u32 = idx / 8
+        var bit_idx: u32 = idx % 8
+        var mask: u8 = 1 << @truncate(bit_idx, u8)
+        alloc_bitmap[byte_idx] = alloc_bitmap[byte_idx] & (~mask)
+    }
+}
+
+// ============================================================================
+// Hash Table Operations
+// ============================================================================
+
+fn hash_addr(addr: u64): u32 {
+    // Simple hash function
+    var hash: u64 = addr >> 12  // Remove page offset
+    hash = hash ^ (hash >> 16)
+    hash = hash * 0x85EBCA6B
+    hash = hash ^ (hash >> 13)
+    return @truncate(hash % HASH_BUCKETS, u32)
+}
+
+fn insert_entry(entry: *AllocEntry) {
+    var bucket: u32 = hash_addr(entry.addr)
+    entry.next = alloc_table[bucket]
+    alloc_table[bucket] = entry
+}
+
+fn find_entry(addr: u64): *AllocEntry {
+    var bucket: u32 = hash_addr(addr)
+    var entry: *AllocEntry = alloc_table[bucket]
+
+    loop {
+        if entry == null {
+            break
+        }
+
+        if entry.addr == addr {
+            return entry
+        }
+
+        entry = entry.next
+    }
+
+    return null
+}
+
+fn remove_entry(addr: u64): *AllocEntry {
+    var bucket: u32 = hash_addr(addr)
+    var entry: *AllocEntry = alloc_table[bucket]
+    var prev: *AllocEntry = null
+
+    loop {
+        if entry == null {
+            break
+        }
+
+        if entry.addr == addr {
+            if prev != null {
+                prev.next = entry.next
+            } else {
+                alloc_table[bucket] = entry.next
+            }
+            return entry
+        }
+
+        prev = entry
+        entry = entry.next
+    }
+
+    return null
+}
+
+// ============================================================================
+// Ownership Tracking API
+// ============================================================================
+
+// Track a new allocation
+export fn track_alloc(addr: u64, size: u64, flags: u32): bool {
+    if !pool_initialized {
+        return false
+    }
+
+    var entry: *AllocEntry = alloc_entry()
+    if entry == null {
+        return false
+    }
+
+    // Initialize entry
+    entry.addr = addr
+    entry.size = size
+    entry.magic = ALLOC_MAGIC_ACTIVE
+    entry.state = OWNER_STATE_OWNED
+    entry.borrow_count = 0
+    entry.mut_borrowed = false
+    entry.flags = flags | ALLOC_FLAG_TRACKED
+
+    entry.owner_id = current_owner_id
+    entry.owner_line = 0
+    entry.owner_file = 0
+
+    entry.alloc_time = get_timestamp()
+    entry.free_time = 0
+
+    entry.ref_count = 1
+    entry.weak_count = 0
+
+    // Clear borrow stack
+    var i: u32 = 0
+    loop {
+        if i >= MAX_BORROW_DEPTH {
+            break
+        }
+        entry.borrow_stack[i] = 0
+        i = i + 1
+    }
+
+    // Insert into hash table
+    insert_entry(entry)
+
+    // Update statistics
+    stats.total_allocs = stats.total_allocs + 1
+    stats.active_allocs = stats.active_allocs + 1
+    if stats.active_allocs > stats.peak_allocs {
+        stats.peak_allocs = stats.active_allocs
+    }
+
+    return true
+}
+
+// Track allocation with debug info
+export fn track_alloc_debug(addr: u64, size: u64, flags: u32, file_hash: u32, line: u32): bool {
+    var result: bool = track_alloc(addr, size, flags | ALLOC_FLAG_DEBUG)
+    if result {
+        var entry: *AllocEntry = find_entry(addr)
+        if entry != null {
+            entry.owner_file = file_hash
+            entry.owner_line = line
+        }
+    }
+    return result
+}
+
+// Track deallocation
+export fn track_free(addr: u64): bool {
+    var entry: *AllocEntry = find_entry(addr)
+
+    if entry == null {
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] WARNING: Freeing untracked address 0x")
+            foundation.serial_write_hex(@truncate(addr, u32))
+            foundation.serial_write_string("\n")
+        }
+        return false
+    }
+
+    // Check for double-free
+    if entry.magic == ALLOC_MAGIC_FREED {
+        stats.double_frees = stats.double_frees + 1
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] ERROR: Double-free detected at 0x")
+            foundation.serial_write_hex(@truncate(addr, u32))
+            foundation.serial_write_string("\n")
+            print_entry_info(entry)
+        }
+        return false
+    }
+
+    // Check for active borrows
+    if entry.borrow_count > 0 {
+        stats.borrow_violations = stats.borrow_violations + 1
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] ERROR: Free with active borrows at 0x")
+            foundation.serial_write_hex(@truncate(addr, u32))
+            foundation.serial_write_string("\n")
+        }
+        return false
+    }
+
+    // Check for moved ownership
+    if entry.state == OWNER_STATE_MOVED {
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] ERROR: Free of moved ownership at 0x")
+            foundation.serial_write_hex(@truncate(addr, u32))
+            foundation.serial_write_string("\n")
+        }
+        return false
+    }
+
+    // Mark as freed
+    entry.magic = ALLOC_MAGIC_FREED
+    entry.state = OWNER_STATE_FREE
+    entry.free_time = get_timestamp()
+
+    // Remove from hash table but keep in pool for use-after-free detection
+    remove_entry(addr)
+
+    // Update statistics
+    stats.total_frees = stats.total_frees + 1
+    stats.active_allocs = stats.active_allocs - 1
+
+    // Actually free the entry after delay (or immediately in release mode)
+    if !debug_mode {
+        free_entry(entry)
+    }
+
+    return true
+}
+
+// Check if address is valid (not freed)
+export fn check_valid(addr: u64): bool {
+    var entry: *AllocEntry = find_entry(addr)
+
+    if entry == null {
+        // Check if it was recently freed (use-after-free detection)
+        var i: u32 = 0
+        loop {
+            if i >= MAX_TRACKED_ALLOCS {
+                break
+            }
+
+            if (alloc_bitmap[i / 8] & (1 << (i % 8))) != 0 {
+                if alloc_pool[i].addr == addr and alloc_pool[i].magic == ALLOC_MAGIC_FREED {
+                    stats.use_after_free = stats.use_after_free + 1
+                    if debug_mode {
+                        foundation.serial_write_string("[OWNERSHIP] ERROR: Use-after-free at 0x")
+                        foundation.serial_write_hex(@truncate(addr, u32))
+                        foundation.serial_write_string("\n")
+                    }
+                    return false
+                }
+            }
+
+            i = i + 1
+        }
+
+        return false  // Unknown address
+    }
+
+    if entry.magic != ALLOC_MAGIC_ACTIVE {
+        return false
+    }
+
+    if entry.state == OWNER_STATE_FREE or entry.state == OWNER_STATE_MOVED {
+        return false
+    }
+
+    return true
+}
+
+// ============================================================================
+// Borrow Checking
+// ============================================================================
+
+// Create immutable borrow
+export fn borrow(addr: u64): bool {
+    var entry: *AllocEntry = find_entry(addr)
+    if entry == null or entry.magic != ALLOC_MAGIC_ACTIVE {
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] ERROR: Borrow of invalid address\n")
+        }
+        return false
+    }
+
+    // Cannot borrow if mutably borrowed
+    if entry.mut_borrowed {
+        stats.borrow_violations = stats.borrow_violations + 1
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] ERROR: Cannot borrow - already mutably borrowed\n")
+        }
+        return false
+    }
+
+    // Add to borrow stack
+    if entry.borrow_count < MAX_BORROW_DEPTH {
+        entry.borrow_stack[entry.borrow_count] = current_owner_id
+    }
+
+    entry.borrow_count = entry.borrow_count + 1
+    entry.state = OWNER_STATE_BORROWED
+
+    stats.borrows_created = stats.borrows_created + 1
+    return true
+}
+
+// Create mutable borrow
+export fn borrow_mut(addr: u64): bool {
+    var entry: *AllocEntry = find_entry(addr)
+    if entry == null or entry.magic != ALLOC_MAGIC_ACTIVE {
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] ERROR: Mutable borrow of invalid address\n")
+        }
+        return false
+    }
+
+    // Cannot mutably borrow if any borrows exist
+    if entry.borrow_count > 0 or entry.mut_borrowed {
+        stats.borrow_violations = stats.borrow_violations + 1
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] ERROR: Cannot mutably borrow - already borrowed\n")
+        }
+        return false
+    }
+
+    entry.mut_borrowed = true
+    entry.borrow_count = 1
+    entry.state = OWNER_STATE_BORROWED_MUT
+    entry.borrow_stack[0] = current_owner_id
+
+    stats.borrows_created = stats.borrows_created + 1
+    return true
+}
+
+// Release borrow
+export fn release_borrow(addr: u64): bool {
+    var entry: *AllocEntry = find_entry(addr)
+    if entry == null {
+        return false
+    }
+
+    if entry.borrow_count == 0 {
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] WARNING: Release of non-existent borrow\n")
+        }
+        return false
+    }
+
+    entry.borrow_count = entry.borrow_count - 1
+
+    if entry.mut_borrowed and entry.borrow_count == 0 {
+        entry.mut_borrowed = false
+    }
+
+    if entry.borrow_count == 0 {
+        entry.state = OWNER_STATE_OWNED
+    }
+
+    stats.borrows_released = stats.borrows_released + 1
+    return true
+}
+
+// ============================================================================
+// Ownership Transfer
+// ============================================================================
+
+// Transfer ownership to new owner
+export fn transfer_ownership(addr: u64, new_owner: u64): bool {
+    var entry: *AllocEntry = find_entry(addr)
+    if entry == null or entry.magic != ALLOC_MAGIC_ACTIVE {
+        return false
+    }
+
+    // Cannot transfer if borrowed
+    if entry.borrow_count > 0 {
+        stats.borrow_violations = stats.borrow_violations + 1
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] ERROR: Cannot transfer - active borrows\n")
+        }
+        return false
+    }
+
+    entry.owner_id = new_owner
+    stats.ownership_transfers = stats.ownership_transfers + 1
+
+    return true
+}
+
+// Move ownership (invalidates source)
+export fn move_ownership(addr: u64, new_owner: u64): bool {
+    var entry: *AllocEntry = find_entry(addr)
+    if entry == null or entry.magic != ALLOC_MAGIC_ACTIVE {
+        return false
+    }
+
+    if entry.borrow_count > 0 {
+        stats.borrow_violations = stats.borrow_violations + 1
+        return false
+    }
+
+    // Mark old entry as moved (will trigger error if used)
+    var old_state: u8 = entry.state
+    entry.state = OWNER_STATE_MOVED
+    entry.owner_id = new_owner
+
+    stats.ownership_transfers = stats.ownership_transfers + 1
+    return true
+}
+
+// ============================================================================
+// Reference Counting (Shared Ownership)
+// ============================================================================
+
+// Increment reference count
+export fn ref_inc(addr: u64): u32 {
+    var entry: *AllocEntry = find_entry(addr)
+    if entry == null or entry.magic != ALLOC_MAGIC_ACTIVE {
+        return 0
+    }
+
+    entry.ref_count = entry.ref_count + 1
+    entry.state = OWNER_STATE_SHARED
+
+    stats.ref_increments = stats.ref_increments + 1
+    return entry.ref_count
+}
+
+// Decrement reference count
+export fn ref_dec(addr: u64): u32 {
+    var entry: *AllocEntry = find_entry(addr)
+    if entry == null or entry.magic != ALLOC_MAGIC_ACTIVE {
+        return 0
+    }
+
+    if entry.ref_count == 0 {
+        if debug_mode {
+            foundation.serial_write_string("[OWNERSHIP] ERROR: Ref count underflow\n")
+        }
+        return 0
+    }
+
+    entry.ref_count = entry.ref_count - 1
+    stats.ref_decrements = stats.ref_decrements + 1
+
+    if entry.ref_count == 0 and entry.weak_count == 0 {
+        // Can be freed now
+        entry.state = OWNER_STATE_FREE
+    }
+
+    return entry.ref_count
+}
+
+// Get reference count
+export fn ref_count(addr: u64): u32 {
+    var entry: *AllocEntry = find_entry(addr)
+    if entry == null {
+        return 0
+    }
+    return entry.ref_count
+}
+
+// Create weak reference
+export fn weak_ref_inc(addr: u64): u32 {
+    var entry: *AllocEntry = find_entry(addr)
+    if entry == null or entry.magic != ALLOC_MAGIC_ACTIVE {
+        return 0
+    }
+
+    entry.weak_count = entry.weak_count + 1
+    stats.weak_refs = stats.weak_refs + 1
+
+    return entry.weak_count
+}
+
+// Release weak reference
+export fn weak_ref_dec(addr: u64): u32 {
+    var entry: *AllocEntry = find_entry(addr)
+    if entry == null {
+        return 0
+    }
+
+    if entry.weak_count == 0 {
+        return 0
+    }
+
+    entry.weak_count = entry.weak_count - 1
+    return entry.weak_count
+}
+
+// ============================================================================
+// Owner Context
+// ============================================================================
+
+export fn set_owner_context(owner_id: u64) {
+    current_owner_id = owner_id
+}
+
+export fn get_owner_context(): u64 {
+    return current_owner_id
+}
+
+// ============================================================================
+// Debug Mode Control
+// ============================================================================
+
+export fn set_debug_mode(enabled: bool) {
+    debug_mode = enabled
+}
+
+export fn is_debug_mode(): bool {
+    return debug_mode
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn get_timestamp(): u64 {
+    // Simple timestamp - could use TSC or other timer
+    return stats.total_allocs + stats.total_frees
+}
+
+fn print_entry_info(entry: *AllocEntry) {
+    foundation.serial_write_string("  Address: 0x")
+    foundation.serial_write_hex(@truncate(entry.addr, u32))
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  Size: ")
+    foundation.serial_write_u64(entry.size)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  State: ")
+    foundation.serial_write_u64(@intCast(entry.state, u64))
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("  Owner: ")
+    foundation.serial_write_u64(entry.owner_id)
+    foundation.serial_write_string("\n")
+    if entry.owner_line > 0 {
+        foundation.serial_write_string("  Line: ")
+        foundation.serial_write_u64(@intCast(entry.owner_line, u64))
+        foundation.serial_write_string("\n")
+    }
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn print_stats() {
+    foundation.serial_write_string("\n=== Ownership Tracking Statistics ===\n")
+    foundation.serial_write_string("Total allocations:   ")
+    foundation.serial_write_u64(stats.total_allocs)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Total frees:         ")
+    foundation.serial_write_u64(stats.total_frees)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Active allocations:  ")
+    foundation.serial_write_u64(stats.active_allocs)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Peak allocations:    ")
+    foundation.serial_write_u64(stats.peak_allocs)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\n--- Errors ---\n")
+    foundation.serial_write_string("Double frees:        ")
+    foundation.serial_write_u64(stats.double_frees)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Use-after-free:      ")
+    foundation.serial_write_u64(stats.use_after_free)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Borrow violations:   ")
+    foundation.serial_write_u64(stats.borrow_violations)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\n--- Ownership ---\n")
+    foundation.serial_write_string("Transfers:           ")
+    foundation.serial_write_u64(stats.ownership_transfers)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Borrows created:     ")
+    foundation.serial_write_u64(stats.borrows_created)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Borrows released:    ")
+    foundation.serial_write_u64(stats.borrows_released)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\n--- Reference Counting ---\n")
+    foundation.serial_write_string("Ref increments:      ")
+    foundation.serial_write_u64(stats.ref_increments)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Ref decrements:      ")
+    foundation.serial_write_u64(stats.ref_decrements)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Weak references:     ")
+    foundation.serial_write_u64(stats.weak_refs)
+    foundation.serial_write_string("\n")
+}
+
+export fn get_stats(): *OwnershipStats {
+    return &stats
+}
+
+// Check for memory leaks at shutdown
+export fn check_leaks(): u64 {
+    var leaks: u64 = 0
+
+    var i: u32 = 0
+    loop {
+        if i >= MAX_TRACKED_ALLOCS {
+            break
+        }
+
+        var byte_idx: u32 = i / 8
+        var bit_idx: u32 = i % 8
+        var mask: u8 = 1 << @truncate(bit_idx, u8)
+
+        if (alloc_bitmap[byte_idx] & mask) != 0 {
+            var entry: *AllocEntry = &alloc_pool[i]
+            if entry.magic == ALLOC_MAGIC_ACTIVE and entry.state != OWNER_STATE_FREE {
+                leaks = leaks + 1
+                if debug_mode {
+                    foundation.serial_write_string("[OWNERSHIP] LEAK: ")
+                    print_entry_info(entry)
+                }
+            }
+        }
+
+        i = i + 1
+    }
+
+    if leaks > 0 {
+        foundation.serial_write_string("[OWNERSHIP] Total memory leaks detected: ")
+        foundation.serial_write_u64(leaks)
+        foundation.serial_write_string("\n")
+    }
+
+    return leaks
+}

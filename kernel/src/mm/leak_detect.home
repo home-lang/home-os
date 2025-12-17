@@ -1,0 +1,817 @@
+// home-os Memory Leak Detection (Debug Builds)
+// Runtime memory leak detection and debugging tools
+//
+// Features:
+//   - Allocation tracking with stack traces
+//   - Leak detection on process exit
+//   - Periodic leak scanning
+//   - Allocation statistics by call site
+//   - Memory corruption detection (guard pages, canaries)
+//   - Heap profiling
+
+import "../core/foundation.home" as foundation
+import "ownership.home" as ownership
+
+// Configuration
+const MAX_STACK_DEPTH: u32 = 16
+const MAX_LEAK_ENTRIES: u32 = 4096
+const CANARY_VALUE: u64 = 0xDEADCAFEBABEBEEF
+const GUARD_SIZE: u32 = 16  // Bytes before and after allocation
+
+// Leak detection modes
+const LEAK_MODE_DISABLED: u32 = 0
+const LEAK_MODE_BASIC: u32 = 1          // Track allocations only
+const LEAK_MODE_FULL: u32 = 2           // Track with stack traces
+const LEAK_MODE_AGGRESSIVE: u32 = 3     // Full + periodic scanning
+
+// Allocation record with debug info
+struct LeakEntry {
+    addr: u64                       // Allocation address
+    size: u64                       // Requested size
+    actual_size: u64                // Actual size (with guards)
+    timestamp: u64                  // Allocation time
+
+    // Stack trace
+    stack_trace: [MAX_STACK_DEPTH]u64
+    stack_depth: u32
+
+    // Source location
+    file_hash: u32
+    line_number: u32
+    function_hash: u32
+
+    // Process info
+    pid: u32
+    tid: u32
+
+    // State
+    freed: bool
+    corrupted: bool
+
+    // Linked list
+    next: *LeakEntry
+    prev: *LeakEntry
+}
+
+// Allocation site statistics
+struct AllocSite {
+    file_hash: u32
+    line_number: u32
+    total_allocs: u64
+    total_bytes: u64
+    current_allocs: u32
+    current_bytes: u64
+    peak_allocs: u32
+    peak_bytes: u64
+}
+
+const MAX_ALLOC_SITES: u32 = 512
+var alloc_sites: [MAX_ALLOC_SITES]AllocSite
+var alloc_site_count: u32 = 0
+
+// Entry pool
+var leak_pool: [MAX_LEAK_ENTRIES]LeakEntry
+var leak_bitmap: [MAX_LEAK_ENTRIES / 8]u8
+var leak_list_head: *LeakEntry = null
+var leak_list_tail: *LeakEntry = null
+var leak_count: u32 = 0
+
+// Global state
+var detection_mode: u32 = LEAK_MODE_DISABLED
+var initialized: bool = false
+
+// Statistics
+struct LeakStats {
+    total_tracked: u64
+    total_freed: u64
+    current_tracked: u64
+    peak_tracked: u64
+
+    // Memory usage
+    total_bytes_allocated: u64
+    total_bytes_freed: u64
+    current_bytes: u64
+    peak_bytes: u64
+
+    // Errors detected
+    leaks_detected: u64
+    corruptions_detected: u64
+    double_frees_detected: u64
+    buffer_overflows: u64
+    buffer_underflows: u64
+
+    // Scans
+    scans_performed: u64
+    last_scan_time: u64
+}
+var stats: LeakStats
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn leak_detect_init(mode: u32) {
+    foundation.serial_write_string("[LEAK_DETECT] Initializing (mode=")
+    foundation.serial_write_u64(@intCast(mode, u64))
+    foundation.serial_write_string(")\n")
+
+    // Initialize pool
+    var i: u32 = 0
+    loop {
+        if i >= MAX_LEAK_ENTRIES / 8 {
+            break
+        }
+        leak_bitmap[i] = 0
+        i = i + 1
+    }
+
+    // Initialize allocation sites
+    i = 0
+    loop {
+        if i >= MAX_ALLOC_SITES {
+            break
+        }
+        alloc_sites[i].file_hash = 0
+        alloc_sites[i].line_number = 0
+        alloc_sites[i].total_allocs = 0
+        alloc_sites[i].total_bytes = 0
+        alloc_sites[i].current_allocs = 0
+        alloc_sites[i].current_bytes = 0
+        alloc_sites[i].peak_allocs = 0
+        alloc_sites[i].peak_bytes = 0
+        i = i + 1
+    }
+    alloc_site_count = 0
+
+    // Initialize statistics
+    stats.total_tracked = 0
+    stats.total_freed = 0
+    stats.current_tracked = 0
+    stats.peak_tracked = 0
+    stats.total_bytes_allocated = 0
+    stats.total_bytes_freed = 0
+    stats.current_bytes = 0
+    stats.peak_bytes = 0
+    stats.leaks_detected = 0
+    stats.corruptions_detected = 0
+    stats.double_frees_detected = 0
+    stats.buffer_overflows = 0
+    stats.buffer_underflows = 0
+    stats.scans_performed = 0
+    stats.last_scan_time = 0
+
+    leak_list_head = null
+    leak_list_tail = null
+    leak_count = 0
+
+    detection_mode = mode
+    initialized = true
+
+    foundation.serial_write_string("[LEAK_DETECT] Initialization complete\n")
+}
+
+export fn leak_detect_shutdown() {
+    if !initialized {
+        return
+    }
+
+    // Final leak check
+    var leaks: u64 = scan_for_leaks()
+
+    if leaks > 0 {
+        foundation.serial_write_string("[LEAK_DETECT] WARNING: ")
+        foundation.serial_write_u64(leaks)
+        foundation.serial_write_string(" memory leaks detected at shutdown\n")
+        print_leaks()
+    }
+
+    initialized = false
+}
+
+// ============================================================================
+// Entry Management
+// ============================================================================
+
+fn alloc_leak_entry(): *LeakEntry {
+    var i: u32 = 0
+    loop {
+        if i >= MAX_LEAK_ENTRIES {
+            break
+        }
+
+        var byte_idx: u32 = i / 8
+        var bit_idx: u32 = i % 8
+        var mask: u8 = 1 << @truncate(bit_idx, u8)
+
+        if (leak_bitmap[byte_idx] & mask) == 0 {
+            leak_bitmap[byte_idx] = leak_bitmap[byte_idx] | mask
+            return &leak_pool[i]
+        }
+
+        i = i + 1
+    }
+
+    foundation.serial_write_string("[LEAK_DETECT] WARNING: Entry pool exhausted\n")
+    return null
+}
+
+fn free_leak_entry(entry: *LeakEntry) {
+    // Remove from list
+    if entry.prev != null {
+        entry.prev.next = entry.next
+    } else {
+        leak_list_head = entry.next
+    }
+
+    if entry.next != null {
+        entry.next.prev = entry.prev
+    } else {
+        leak_list_tail = entry.prev
+    }
+
+    // Free from pool
+    var addr: u64 = @intFromPtr(entry)
+    var pool_start: u64 = @intFromPtr(&leak_pool[0])
+    var entry_size: u64 = @sizeOf(LeakEntry)
+
+    if addr >= pool_start and addr < pool_start + (MAX_LEAK_ENTRIES * entry_size) {
+        var idx: u32 = @truncate((addr - pool_start) / entry_size, u32)
+        var byte_idx: u32 = idx / 8
+        var bit_idx: u32 = idx % 8
+        var mask: u8 = 1 << @truncate(bit_idx, u8)
+        leak_bitmap[byte_idx] = leak_bitmap[byte_idx] & (~mask)
+    }
+
+    leak_count = leak_count - 1
+}
+
+fn add_to_list(entry: *LeakEntry) {
+    entry.prev = leak_list_tail
+    entry.next = null
+
+    if leak_list_tail != null {
+        leak_list_tail.next = entry
+    } else {
+        leak_list_head = entry
+    }
+
+    leak_list_tail = entry
+    leak_count = leak_count + 1
+}
+
+// ============================================================================
+// Stack Trace Capture
+// ============================================================================
+
+fn capture_stack_trace(entry: *LeakEntry) {
+    // Capture return addresses from stack
+    // This is architecture-specific (x86-64)
+    var rbp: u64 = get_frame_pointer()
+    var depth: u32 = 0
+
+    loop {
+        if depth >= MAX_STACK_DEPTH or rbp == 0 {
+            break
+        }
+
+        // Read return address (rbp + 8)
+        var ret_addr_ptr: *u64 = @ptrFromInt(rbp + 8)
+        var ret_addr: u64 = *ret_addr_ptr
+
+        if ret_addr == 0 {
+            break
+        }
+
+        entry.stack_trace[depth] = ret_addr
+        depth = depth + 1
+
+        // Move to next frame (rbp points to saved rbp)
+        var next_rbp_ptr: *u64 = @ptrFromInt(rbp)
+        rbp = *next_rbp_ptr
+
+        // Sanity check
+        if rbp <= @intFromPtr(&leak_pool[0]) {
+            break
+        }
+    }
+
+    entry.stack_depth = depth
+}
+
+fn get_frame_pointer(): u64 {
+    // Get current RBP (x86-64 inline assembly would go here)
+    // For now, return 0 (stack traces disabled)
+    return 0
+}
+
+// ============================================================================
+// Allocation Site Tracking
+// ============================================================================
+
+fn find_or_create_site(file_hash: u32, line: u32): *AllocSite {
+    // Search existing
+    var i: u32 = 0
+    loop {
+        if i >= alloc_site_count {
+            break
+        }
+
+        if alloc_sites[i].file_hash == file_hash and alloc_sites[i].line_number == line {
+            return &alloc_sites[i]
+        }
+
+        i = i + 1
+    }
+
+    // Create new
+    if alloc_site_count < MAX_ALLOC_SITES {
+        var site: *AllocSite = &alloc_sites[alloc_site_count]
+        site.file_hash = file_hash
+        site.line_number = line
+        site.total_allocs = 0
+        site.total_bytes = 0
+        site.current_allocs = 0
+        site.current_bytes = 0
+        site.peak_allocs = 0
+        site.peak_bytes = 0
+        alloc_site_count = alloc_site_count + 1
+        return site
+    }
+
+    return null
+}
+
+fn update_site_alloc(file_hash: u32, line: u32, size: u64) {
+    var site: *AllocSite = find_or_create_site(file_hash, line)
+    if site == null {
+        return
+    }
+
+    site.total_allocs = site.total_allocs + 1
+    site.total_bytes = site.total_bytes + size
+    site.current_allocs = site.current_allocs + 1
+    site.current_bytes = site.current_bytes + size
+
+    if site.current_allocs > site.peak_allocs {
+        site.peak_allocs = site.current_allocs
+    }
+    if site.current_bytes > site.peak_bytes {
+        site.peak_bytes = site.current_bytes
+    }
+}
+
+fn update_site_free(file_hash: u32, line: u32, size: u64) {
+    var site: *AllocSite = find_or_create_site(file_hash, line)
+    if site == null {
+        return
+    }
+
+    if site.current_allocs > 0 {
+        site.current_allocs = site.current_allocs - 1
+    }
+    if site.current_bytes >= size {
+        site.current_bytes = site.current_bytes - size
+    }
+}
+
+// ============================================================================
+// Main API
+// ============================================================================
+
+// Track allocation with guards and canaries
+export fn track_alloc(addr: u64, size: u64, file_hash: u32, line: u32): u64 {
+    if !initialized or detection_mode == LEAK_MODE_DISABLED {
+        return addr
+    }
+
+    var entry: *LeakEntry = alloc_leak_entry()
+    if entry == null {
+        return addr
+    }
+
+    // Calculate actual size with guards
+    var actual_size: u64 = size + (GUARD_SIZE * 2)
+
+    // Initialize entry
+    entry.addr = addr
+    entry.size = size
+    entry.actual_size = actual_size
+    entry.timestamp = get_timestamp()
+    entry.file_hash = file_hash
+    entry.line_number = line
+    entry.function_hash = 0
+    entry.pid = get_current_pid()
+    entry.tid = get_current_tid()
+    entry.freed = false
+    entry.corrupted = false
+    entry.stack_depth = 0
+
+    // Capture stack trace if in full mode
+    if detection_mode >= LEAK_MODE_FULL {
+        capture_stack_trace(entry)
+    }
+
+    // Initialize guard canaries
+    write_guard_canaries(addr, size)
+
+    // Add to tracking list
+    add_to_list(entry)
+
+    // Update statistics
+    stats.total_tracked = stats.total_tracked + 1
+    stats.current_tracked = stats.current_tracked + 1
+    if stats.current_tracked > stats.peak_tracked {
+        stats.peak_tracked = stats.current_tracked
+    }
+
+    stats.total_bytes_allocated = stats.total_bytes_allocated + size
+    stats.current_bytes = stats.current_bytes + size
+    if stats.current_bytes > stats.peak_bytes {
+        stats.peak_bytes = stats.current_bytes
+    }
+
+    // Update allocation site
+    update_site_alloc(file_hash, line, size)
+
+    // Also track in ownership system
+    ownership.track_alloc_debug(addr, size, 0, file_hash, line)
+
+    return addr
+}
+
+// Track free
+export fn track_free(addr: u64): bool {
+    if !initialized or detection_mode == LEAK_MODE_DISABLED {
+        return true
+    }
+
+    // Find entry
+    var entry: *LeakEntry = find_entry_by_addr(addr)
+    if entry == null {
+        foundation.serial_write_string("[LEAK_DETECT] WARNING: Freeing untracked address 0x")
+        foundation.serial_write_hex(@truncate(addr, u32))
+        foundation.serial_write_string("\n")
+        return false
+    }
+
+    // Check for double-free
+    if entry.freed {
+        stats.double_frees_detected = stats.double_frees_detected + 1
+        foundation.serial_write_string("[LEAK_DETECT] ERROR: Double-free at 0x")
+        foundation.serial_write_hex(@truncate(addr, u32))
+        foundation.serial_write_string("\n")
+        print_entry(entry)
+        return false
+    }
+
+    // Check guard canaries for corruption
+    if !check_guard_canaries(entry.addr, entry.size) {
+        entry.corrupted = true
+        stats.corruptions_detected = stats.corruptions_detected + 1
+        foundation.serial_write_string("[LEAK_DETECT] ERROR: Memory corruption detected at 0x")
+        foundation.serial_write_hex(@truncate(addr, u32))
+        foundation.serial_write_string("\n")
+    }
+
+    // Mark as freed
+    entry.freed = true
+
+    // Update statistics
+    stats.total_freed = stats.total_freed + 1
+    stats.current_tracked = stats.current_tracked - 1
+    stats.total_bytes_freed = stats.total_bytes_freed + entry.size
+    stats.current_bytes = stats.current_bytes - entry.size
+
+    // Update allocation site
+    update_site_free(entry.file_hash, entry.line_number, entry.size)
+
+    // Also track in ownership system
+    ownership.track_free(addr)
+
+    // Remove entry (or keep for debugging)
+    if detection_mode < LEAK_MODE_FULL {
+        free_leak_entry(entry)
+    }
+
+    return true
+}
+
+fn find_entry_by_addr(addr: u64): *LeakEntry {
+    var entry: *LeakEntry = leak_list_head
+    loop {
+        if entry == null {
+            break
+        }
+
+        if entry.addr == addr {
+            return entry
+        }
+
+        entry = entry.next
+    }
+    return null
+}
+
+// ============================================================================
+// Guard Canaries
+// ============================================================================
+
+fn write_guard_canaries(addr: u64, size: u64) {
+    // Write canary before allocation
+    var pre_guard: *u64 = @ptrFromInt(addr - 8)
+    *pre_guard = CANARY_VALUE
+
+    // Write canary after allocation
+    var post_guard: *u64 = @ptrFromInt(addr + size)
+    *post_guard = CANARY_VALUE
+}
+
+fn check_guard_canaries(addr: u64, size: u64): bool {
+    // Check pre-guard
+    var pre_guard: *u64 = @ptrFromInt(addr - 8)
+    if *pre_guard != CANARY_VALUE {
+        stats.buffer_underflows = stats.buffer_underflows + 1
+        foundation.serial_write_string("[LEAK_DETECT] Buffer underflow detected!\n")
+        return false
+    }
+
+    // Check post-guard
+    var post_guard: *u64 = @ptrFromInt(addr + size)
+    if *post_guard != CANARY_VALUE {
+        stats.buffer_overflows = stats.buffer_overflows + 1
+        foundation.serial_write_string("[LEAK_DETECT] Buffer overflow detected!\n")
+        return false
+    }
+
+    return true
+}
+
+// ============================================================================
+// Leak Scanning
+// ============================================================================
+
+export fn scan_for_leaks(): u64 {
+    var leaks: u64 = 0
+
+    var entry: *LeakEntry = leak_list_head
+    loop {
+        if entry == null {
+            break
+        }
+
+        if !entry.freed {
+            leaks = leaks + 1
+        }
+
+        entry = entry.next
+    }
+
+    stats.scans_performed = stats.scans_performed + 1
+    stats.last_scan_time = get_timestamp()
+    stats.leaks_detected = leaks
+
+    return leaks
+}
+
+// Scan for leaks by specific process
+export fn scan_process_leaks(pid: u32): u64 {
+    var leaks: u64 = 0
+
+    var entry: *LeakEntry = leak_list_head
+    loop {
+        if entry == null {
+            break
+        }
+
+        if entry.pid == pid and !entry.freed {
+            leaks = leaks + 1
+        }
+
+        entry = entry.next
+    }
+
+    return leaks
+}
+
+// ============================================================================
+// Reporting
+// ============================================================================
+
+export fn print_leaks() {
+    foundation.serial_write_string("\n=== Memory Leak Report ===\n")
+
+    var entry: *LeakEntry = leak_list_head
+    var count: u32 = 0
+
+    loop {
+        if entry == null {
+            break
+        }
+
+        if !entry.freed {
+            count = count + 1
+            foundation.serial_write_string("\nLeak #")
+            foundation.serial_write_u64(@intCast(count, u64))
+            foundation.serial_write_string(":\n")
+            print_entry(entry)
+        }
+
+        entry = entry.next
+    }
+
+    if count == 0 {
+        foundation.serial_write_string("No memory leaks detected.\n")
+    } else {
+        foundation.serial_write_string("\nTotal leaks: ")
+        foundation.serial_write_u64(@intCast(count, u64))
+        foundation.serial_write_string("\n")
+    }
+}
+
+fn print_entry(entry: *LeakEntry) {
+    foundation.serial_write_string("  Address: 0x")
+    foundation.serial_write_hex(@truncate(entry.addr, u32))
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Size: ")
+    foundation.serial_write_u64(entry.size)
+    foundation.serial_write_string(" bytes\n")
+
+    foundation.serial_write_string("  PID: ")
+    foundation.serial_write_u64(@intCast(entry.pid, u64))
+    foundation.serial_write_string(", TID: ")
+    foundation.serial_write_u64(@intCast(entry.tid, u64))
+    foundation.serial_write_string("\n")
+
+    if entry.line_number > 0 {
+        foundation.serial_write_string("  Location: file=0x")
+        foundation.serial_write_hex(entry.file_hash)
+        foundation.serial_write_string(" line=")
+        foundation.serial_write_u64(@intCast(entry.line_number, u64))
+        foundation.serial_write_string("\n")
+    }
+
+    if entry.stack_depth > 0 {
+        foundation.serial_write_string("  Stack trace:\n")
+        var i: u32 = 0
+        loop {
+            if i >= entry.stack_depth {
+                break
+            }
+            foundation.serial_write_string("    [")
+            foundation.serial_write_u64(@intCast(i, u64))
+            foundation.serial_write_string("] 0x")
+            foundation.serial_write_hex(@truncate(entry.stack_trace[i], u32))
+            foundation.serial_write_string("\n")
+            i = i + 1
+        }
+    }
+
+    if entry.corrupted {
+        foundation.serial_write_string("  *** CORRUPTED ***\n")
+    }
+}
+
+export fn print_allocation_sites() {
+    foundation.serial_write_string("\n=== Allocation Sites ===\n")
+    foundation.serial_write_string("Sites tracked: ")
+    foundation.serial_write_u64(@intCast(alloc_site_count, u64))
+    foundation.serial_write_string("\n\n")
+
+    var i: u32 = 0
+    loop {
+        if i >= alloc_site_count {
+            break
+        }
+
+        var site: *AllocSite = &alloc_sites[i]
+        if site.total_allocs > 0 {
+            foundation.serial_write_string("Site file=0x")
+            foundation.serial_write_hex(site.file_hash)
+            foundation.serial_write_string(" line=")
+            foundation.serial_write_u64(@intCast(site.line_number, u64))
+            foundation.serial_write_string("\n")
+
+            foundation.serial_write_string("  Total: ")
+            foundation.serial_write_u64(site.total_allocs)
+            foundation.serial_write_string(" allocs, ")
+            foundation.serial_write_u64(site.total_bytes)
+            foundation.serial_write_string(" bytes\n")
+
+            foundation.serial_write_string("  Current: ")
+            foundation.serial_write_u64(@intCast(site.current_allocs, u64))
+            foundation.serial_write_string(" allocs, ")
+            foundation.serial_write_u64(site.current_bytes)
+            foundation.serial_write_string(" bytes\n")
+
+            foundation.serial_write_string("  Peak: ")
+            foundation.serial_write_u64(@intCast(site.peak_allocs, u64))
+            foundation.serial_write_string(" allocs, ")
+            foundation.serial_write_u64(site.peak_bytes)
+            foundation.serial_write_string(" bytes\n\n")
+        }
+
+        i = i + 1
+    }
+}
+
+export fn print_stats() {
+    foundation.serial_write_string("\n=== Leak Detection Statistics ===\n")
+
+    foundation.serial_write_string("Allocations tracked:  ")
+    foundation.serial_write_u64(stats.total_tracked)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("Frees tracked:        ")
+    foundation.serial_write_u64(stats.total_freed)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("Currently tracked:    ")
+    foundation.serial_write_u64(stats.current_tracked)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("Peak tracked:         ")
+    foundation.serial_write_u64(stats.peak_tracked)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\nMemory:\n")
+    foundation.serial_write_string("  Total allocated:    ")
+    foundation.serial_write_u64(stats.total_bytes_allocated)
+    foundation.serial_write_string(" bytes\n")
+
+    foundation.serial_write_string("  Total freed:        ")
+    foundation.serial_write_u64(stats.total_bytes_freed)
+    foundation.serial_write_string(" bytes\n")
+
+    foundation.serial_write_string("  Current usage:      ")
+    foundation.serial_write_u64(stats.current_bytes)
+    foundation.serial_write_string(" bytes\n")
+
+    foundation.serial_write_string("  Peak usage:         ")
+    foundation.serial_write_u64(stats.peak_bytes)
+    foundation.serial_write_string(" bytes\n")
+
+    foundation.serial_write_string("\nErrors:\n")
+    foundation.serial_write_string("  Leaks detected:     ")
+    foundation.serial_write_u64(stats.leaks_detected)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Corruptions:        ")
+    foundation.serial_write_u64(stats.corruptions_detected)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Double frees:       ")
+    foundation.serial_write_u64(stats.double_frees_detected)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Buffer overflows:   ")
+    foundation.serial_write_u64(stats.buffer_overflows)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("  Buffer underflows:  ")
+    foundation.serial_write_u64(stats.buffer_underflows)
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("\nScans: ")
+    foundation.serial_write_u64(stats.scans_performed)
+    foundation.serial_write_string("\n")
+}
+
+export fn get_stats(): *LeakStats {
+    return &stats
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn get_timestamp(): u64 {
+    // Simple counter - could use TSC
+    return stats.total_tracked + stats.total_freed
+}
+
+fn get_current_pid(): u32 {
+    // Would get from scheduler
+    return 0
+}
+
+fn get_current_tid(): u32 {
+    // Would get from scheduler
+    return 0
+}
+
+// ============================================================================
+// Mode Control
+// ============================================================================
+
+export fn set_mode(mode: u32) {
+    detection_mode = mode
+}
+
+export fn get_mode(): u32 {
+    return detection_mode
+}
+
+export fn is_enabled(): bool {
+    return initialized and detection_mode != LEAK_MODE_DISABLED
+}

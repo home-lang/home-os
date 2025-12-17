@@ -1,0 +1,1251 @@
+// home-os User Space Memory Management
+// Manages user-space virtual memory (lower half: 0x0 - 0x7FFFFFFFFFFF)
+//
+// Provides:
+//   - User address space creation and destruction
+//   - Virtual memory area (VMA) management
+//   - User page mapping (stack, heap, mmap, code)
+//   - Copy-on-write fork support
+//   - brk/sbrk heap management
+//   - mmap/munmap implementation
+
+import "../core/foundation.home" as foundation
+import "../vmm.home" as vmm
+import "../pmm.home" as pmm
+
+// User space address layout (canonical 48-bit addressing)
+// Lower half: 0x0000_0000_0000_0000 - 0x0000_7FFF_FFFF_FFFF
+const USER_SPACE_START: u64 = 0x0000_0000_0000_0000
+const USER_SPACE_END: u64 = 0x0000_7FFF_FFFF_FFFF
+
+// Default memory regions (can be randomized with ASLR)
+const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000      // Stack grows down
+const USER_STACK_SIZE: u64 = 8 * 1024 * 1024           // 8MB default stack
+const USER_HEAP_START: u64 = 0x0000_0000_1000_0000     // Heap start at 256MB
+const USER_HEAP_MAX: u64 = 0x0000_0000_8000_0000       // Max heap at 2GB
+const USER_MMAP_START: u64 = 0x0000_7F00_0000_0000     // mmap region
+const USER_MMAP_END: u64 = 0x0000_7FFF_0000_0000       // mmap end
+const USER_CODE_START: u64 = 0x0000_0000_0040_0000     // Code at 4MB (ELF default)
+
+const PAGE_SIZE: u64 = 4096
+
+// VMA (Virtual Memory Area) flags
+const VMA_READ: u32 = 1 << 0
+const VMA_WRITE: u32 = 1 << 1
+const VMA_EXEC: u32 = 1 << 2
+const VMA_SHARED: u32 = 1 << 3
+const VMA_PRIVATE: u32 = 1 << 4
+const VMA_GROWSDOWN: u32 = 1 << 5   // Stack
+const VMA_GROWSUP: u32 = 1 << 6     // Heap
+const VMA_ANONYMOUS: u32 = 1 << 7
+const VMA_FILE: u32 = 1 << 8
+const VMA_STACK: u32 = 1 << 9
+const VMA_HEAP: u32 = 1 << 10
+
+// VMA types
+const VMA_TYPE_CODE: u32 = 0
+const VMA_TYPE_DATA: u32 = 1
+const VMA_TYPE_BSS: u32 = 2
+const VMA_TYPE_HEAP: u32 = 3
+const VMA_TYPE_STACK: u32 = 4
+const VMA_TYPE_MMAP: u32 = 5
+const VMA_TYPE_SHARED: u32 = 6
+const VMA_TYPE_VDSO: u32 = 7
+
+// Maximum VMAs per process
+const MAX_VMAS: u32 = 256
+
+// Virtual Memory Area descriptor
+struct VMA {
+    start: u64              // Start virtual address
+    end: u64                // End virtual address (exclusive)
+    flags: u32              // VMA flags
+    vma_type: u32           // VMA type
+    file_offset: u64        // Offset in file (for file-backed mappings)
+    file_inode: u64         // Inode number (for file-backed mappings)
+    ref_count: u32          // Reference count (for shared mappings)
+    cow_count: u32          // Copy-on-write reference count
+    next: *VMA              // Next VMA in list
+    prev: *VMA              // Previous VMA in list
+}
+
+// User address space descriptor
+struct UserAddressSpace {
+    pml4: u64               // PML4 table physical address
+    vma_list: *VMA          // List of VMAs (sorted by address)
+    vma_count: u32          // Number of VMAs
+
+    // Heap management
+    heap_start: u64         // Heap start address
+    heap_end: u64           // Current heap end (brk)
+    heap_max: u64           // Maximum heap address
+
+    // Stack
+    stack_top: u64          // Stack top address
+    stack_bottom: u64       // Stack bottom (grows down)
+    stack_max: u64          // Maximum stack size
+
+    // mmap region
+    mmap_base: u64          // mmap region base
+    mmap_end: u64           // mmap region end
+
+    // Statistics
+    total_vm: u64           // Total virtual memory mapped
+    resident: u64           // Resident pages
+    shared: u64             // Shared pages
+
+    // Flags
+    flags: u32
+
+    // Reference count
+    ref_count: u32
+}
+
+// VMA pool for allocation
+var vma_pool: [MAX_VMAS * 64]VMA     // Support 64 processes
+var vma_bitmap: [MAX_VMAS * 64 / 8]u8
+var vma_pool_initialized: bool = false
+
+// Address space pool
+const MAX_ADDRESS_SPACES: u32 = 64
+var address_space_pool: [MAX_ADDRESS_SPACES]UserAddressSpace
+var address_space_bitmap: [MAX_ADDRESS_SPACES / 8]u8
+var address_space_initialized: bool = false
+
+// Statistics
+struct UserSpaceStats {
+    address_spaces_created: u64
+    address_spaces_destroyed: u64
+    vmas_created: u64
+    vmas_destroyed: u64
+    pages_mapped: u64
+    pages_unmapped: u64
+    cow_faults: u64
+    heap_expansions: u64
+    stack_expansions: u64
+}
+var stats: UserSpaceStats
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn user_space_init() {
+    foundation.serial_write_string("[USER_SPACE] Initializing user space manager\n")
+
+    // Initialize VMA pool
+    var i: u32 = 0
+    loop {
+        if i >= MAX_VMAS * 64 / 8 {
+            break
+        }
+        vma_bitmap[i] = 0
+        i = i + 1
+    }
+    vma_pool_initialized = true
+
+    // Initialize address space pool
+    i = 0
+    loop {
+        if i >= MAX_ADDRESS_SPACES / 8 {
+            break
+        }
+        address_space_bitmap[i] = 0
+        i = i + 1
+    }
+    address_space_initialized = true
+
+    // Initialize statistics
+    stats.address_spaces_created = 0
+    stats.address_spaces_destroyed = 0
+    stats.vmas_created = 0
+    stats.vmas_destroyed = 0
+    stats.pages_mapped = 0
+    stats.pages_unmapped = 0
+    stats.cow_faults = 0
+    stats.heap_expansions = 0
+    stats.stack_expansions = 0
+
+    foundation.serial_write_string("[USER_SPACE] Initialization complete\n")
+}
+
+// ============================================================================
+// VMA Pool Management
+// ============================================================================
+
+fn alloc_vma(): *VMA {
+    var i: u32 = 0
+    loop {
+        if i >= MAX_VMAS * 64 {
+            break
+        }
+
+        var byte_idx: u32 = i / 8
+        var bit_idx: u32 = i % 8
+        var mask: u8 = 1 << @truncate(bit_idx, u8)
+
+        if (vma_bitmap[byte_idx] & mask) == 0 {
+            vma_bitmap[byte_idx] = vma_bitmap[byte_idx] | mask
+            stats.vmas_created = stats.vmas_created + 1
+
+            // Initialize VMA
+            var vma: *VMA = &vma_pool[i]
+            vma.start = 0
+            vma.end = 0
+            vma.flags = 0
+            vma.vma_type = 0
+            vma.file_offset = 0
+            vma.file_inode = 0
+            vma.ref_count = 1
+            vma.cow_count = 0
+            vma.next = null
+            vma.prev = null
+
+            return vma
+        }
+
+        i = i + 1
+    }
+
+    foundation.serial_write_string("[USER_SPACE] ERROR: VMA pool exhausted\n")
+    return null
+}
+
+fn free_vma(vma: *VMA) {
+    var addr: u64 = @intFromPtr(vma)
+    var pool_start: u64 = @intFromPtr(&vma_pool[0])
+    var vma_size: u64 = @sizeOf(VMA)
+
+    if addr >= pool_start and addr < pool_start + (MAX_VMAS * 64 * vma_size) {
+        var idx: u32 = @truncate((addr - pool_start) / vma_size, u32)
+        var byte_idx: u32 = idx / 8
+        var bit_idx: u32 = idx % 8
+        var mask: u8 = 1 << @truncate(bit_idx, u8)
+        vma_bitmap[byte_idx] = vma_bitmap[byte_idx] & (~mask)
+        stats.vmas_destroyed = stats.vmas_destroyed + 1
+    }
+}
+
+// ============================================================================
+// Address Space Management
+// ============================================================================
+
+fn alloc_address_space(): *UserAddressSpace {
+    var i: u32 = 0
+    loop {
+        if i >= MAX_ADDRESS_SPACES {
+            break
+        }
+
+        var byte_idx: u32 = i / 8
+        var bit_idx: u32 = i % 8
+        var mask: u8 = 1 << @truncate(bit_idx, u8)
+
+        if (address_space_bitmap[byte_idx] & mask) == 0 {
+            address_space_bitmap[byte_idx] = address_space_bitmap[byte_idx] | mask
+            stats.address_spaces_created = stats.address_spaces_created + 1
+            return &address_space_pool[i]
+        }
+
+        i = i + 1
+    }
+
+    foundation.serial_write_string("[USER_SPACE] ERROR: Address space pool exhausted\n")
+    return null
+}
+
+fn free_address_space_slot(as: *UserAddressSpace) {
+    var addr: u64 = @intFromPtr(as)
+    var pool_start: u64 = @intFromPtr(&address_space_pool[0])
+    var as_size: u64 = @sizeOf(UserAddressSpace)
+
+    if addr >= pool_start and addr < pool_start + (MAX_ADDRESS_SPACES * as_size) {
+        var idx: u32 = @truncate((addr - pool_start) / as_size, u32)
+        var byte_idx: u32 = idx / 8
+        var bit_idx: u32 = idx % 8
+        var mask: u8 = 1 << @truncate(bit_idx, u8)
+        address_space_bitmap[byte_idx] = address_space_bitmap[byte_idx] & (~mask)
+        stats.address_spaces_destroyed = stats.address_spaces_destroyed + 1
+    }
+}
+
+// Create a new user address space
+export fn create_address_space(): *UserAddressSpace {
+    var as: *UserAddressSpace = alloc_address_space()
+    if as == null {
+        return null
+    }
+
+    // Allocate new PML4 table
+    as.pml4 = vmm.createAddressSpace()
+    if as.pml4 == 0 {
+        free_address_space_slot(as)
+        return null
+    }
+
+    // Initialize fields
+    as.vma_list = null
+    as.vma_count = 0
+
+    as.heap_start = USER_HEAP_START
+    as.heap_end = USER_HEAP_START
+    as.heap_max = USER_HEAP_MAX
+
+    as.stack_top = USER_STACK_TOP
+    as.stack_bottom = USER_STACK_TOP
+    as.stack_max = USER_STACK_SIZE
+
+    as.mmap_base = USER_MMAP_START
+    as.mmap_end = USER_MMAP_START
+
+    as.total_vm = 0
+    as.resident = 0
+    as.shared = 0
+
+    as.flags = 0
+    as.ref_count = 1
+
+    foundation.serial_write_string("[USER_SPACE] Created address space with PML4 at 0x")
+    foundation.serial_write_hex(@truncate(as.pml4, u32))
+    foundation.serial_write_string("\n")
+
+    return as
+}
+
+// Destroy a user address space
+export fn destroy_address_space(as: *UserAddressSpace) {
+    if as == null {
+        return
+    }
+
+    as.ref_count = as.ref_count - 1
+    if as.ref_count > 0 {
+        return
+    }
+
+    // Free all VMAs and their pages
+    var vma: *VMA = as.vma_list
+    loop {
+        if vma == null {
+            break
+        }
+
+        var next: *VMA = vma.next
+
+        // Unmap and free pages
+        unmap_vma_pages(as, vma)
+
+        // Free VMA
+        free_vma(vma)
+
+        vma = next
+    }
+
+    // Destroy page tables
+    vmm.destroyAddressSpace(as.pml4)
+
+    // Free address space slot
+    free_address_space_slot(as)
+
+    foundation.serial_write_string("[USER_SPACE] Destroyed address space\n")
+}
+
+// Clone address space (for fork)
+export fn clone_address_space(src: *UserAddressSpace): *UserAddressSpace {
+    var dst: *UserAddressSpace = create_address_space()
+    if dst == null {
+        return null
+    }
+
+    // Copy address space settings
+    dst.heap_start = src.heap_start
+    dst.heap_end = src.heap_end
+    dst.heap_max = src.heap_max
+    dst.stack_top = src.stack_top
+    dst.stack_bottom = src.stack_bottom
+    dst.stack_max = src.stack_max
+    dst.mmap_base = src.mmap_base
+    dst.mmap_end = src.mmap_end
+
+    // Clone VMAs with copy-on-write
+    var src_vma: *VMA = src.vma_list
+    loop {
+        if src_vma == null {
+            break
+        }
+
+        // Create new VMA
+        var dst_vma: *VMA = alloc_vma()
+        if dst_vma == null {
+            destroy_address_space(dst)
+            return null
+        }
+
+        // Copy VMA fields
+        dst_vma.start = src_vma.start
+        dst_vma.end = src_vma.end
+        dst_vma.flags = src_vma.flags
+        dst_vma.vma_type = src_vma.vma_type
+        dst_vma.file_offset = src_vma.file_offset
+        dst_vma.file_inode = src_vma.file_inode
+
+        // Mark as copy-on-write if private and writable
+        if (src_vma.flags & VMA_PRIVATE) != 0 and (src_vma.flags & VMA_WRITE) != 0 {
+            src_vma.cow_count = src_vma.cow_count + 1
+            dst_vma.cow_count = 1
+
+            // Mark pages as read-only in both address spaces
+            mark_vma_cow(src, src_vma)
+            clone_vma_mappings_cow(src, src_vma, dst, dst_vma)
+        } else {
+            // Just clone mappings
+            clone_vma_mappings(src, src_vma, dst, dst_vma)
+        }
+
+        // Add to destination VMA list
+        add_vma_to_list(dst, dst_vma)
+
+        src_vma = src_vma.next
+    }
+
+    foundation.serial_write_string("[USER_SPACE] Cloned address space (COW)\n")
+    return dst
+}
+
+// ============================================================================
+// VMA Operations
+// ============================================================================
+
+// Add VMA to sorted list
+fn add_vma_to_list(as: *UserAddressSpace, vma: *VMA) {
+    if as.vma_list == null {
+        as.vma_list = vma
+        vma.prev = null
+        vma.next = null
+        as.vma_count = 1
+        return
+    }
+
+    // Find insertion point (sorted by address)
+    var curr: *VMA = as.vma_list
+    var prev: *VMA = null
+
+    loop {
+        if curr == null or vma.start < curr.start {
+            break
+        }
+        prev = curr
+        curr = curr.next
+    }
+
+    // Insert
+    vma.prev = prev
+    vma.next = curr
+
+    if prev != null {
+        prev.next = vma
+    } else {
+        as.vma_list = vma
+    }
+
+    if curr != null {
+        curr.prev = vma
+    }
+
+    as.vma_count = as.vma_count + 1
+}
+
+// Remove VMA from list
+fn remove_vma_from_list(as: *UserAddressSpace, vma: *VMA) {
+    if vma.prev != null {
+        vma.prev.next = vma.next
+    } else {
+        as.vma_list = vma.next
+    }
+
+    if vma.next != null {
+        vma.next.prev = vma.prev
+    }
+
+    as.vma_count = as.vma_count - 1
+}
+
+// Find VMA containing address
+export fn find_vma(as: *UserAddressSpace, addr: u64): *VMA {
+    var vma: *VMA = as.vma_list
+    loop {
+        if vma == null {
+            break
+        }
+
+        if addr >= vma.start and addr < vma.end {
+            return vma
+        }
+
+        // VMAs are sorted, stop if we're past the address
+        if vma.start > addr {
+            break
+        }
+
+        vma = vma.next
+    }
+    return null
+}
+
+// Find VMA at or after address
+export fn find_vma_at_or_after(as: *UserAddressSpace, addr: u64): *VMA {
+    var vma: *VMA = as.vma_list
+    loop {
+        if vma == null {
+            break
+        }
+
+        if vma.end > addr {
+            return vma
+        }
+
+        vma = vma.next
+    }
+    return null
+}
+
+// Check if region overlaps with existing VMAs
+fn region_overlaps(as: *UserAddressSpace, start: u64, end: u64): bool {
+    var vma: *VMA = as.vma_list
+    loop {
+        if vma == null {
+            break
+        }
+
+        // Check overlap
+        if start < vma.end and end > vma.start {
+            return true
+        }
+
+        vma = vma.next
+    }
+    return false
+}
+
+// ============================================================================
+// Page Mapping
+// ============================================================================
+
+fn map_vma_pages(as: *UserAddressSpace, vma: *VMA) {
+    var addr: u64 = vma.start
+    var writable: bool = (vma.flags & VMA_WRITE) != 0
+    var no_exec: bool = (vma.flags & VMA_EXEC) == 0
+
+    // Switch to target address space
+    var old_pml4: u64 = vmm.getCurrentAddressSpace()
+    vmm.switchAddressSpace(as.pml4)
+
+    loop {
+        if addr >= vma.end {
+            break
+        }
+
+        // Allocate physical page
+        var phys: u64 = pmm.alloc_page()
+        if phys == 0 {
+            foundation.serial_write_string("[USER_SPACE] ERROR: Out of physical memory\n")
+            break
+        }
+
+        // Zero the page
+        var page_ptr: *u8 = @ptrFromInt(phys)
+        var i: u32 = 0
+        loop {
+            if i >= PAGE_SIZE {
+                break
+            }
+            page_ptr[i] = 0
+            i = i + 1
+        }
+
+        // Map the page
+        vmm.mapPageNX(addr, phys, writable, true)
+
+        stats.pages_mapped = stats.pages_mapped + 1
+        as.resident = as.resident + 1
+
+        addr = addr + PAGE_SIZE
+    }
+
+    // Restore address space
+    vmm.switchAddressSpace(old_pml4)
+}
+
+fn unmap_vma_pages(as: *UserAddressSpace, vma: *VMA) {
+    var addr: u64 = vma.start
+
+    // Switch to target address space
+    var old_pml4: u64 = vmm.getCurrentAddressSpace()
+    vmm.switchAddressSpace(as.pml4)
+
+    loop {
+        if addr >= vma.end {
+            break
+        }
+
+        // Get physical address before unmapping
+        var phys: u64 = vmm.getPhysicalAddr(addr)
+
+        if phys != 0 {
+            // Unmap the page
+            vmm.unmapPage(addr)
+
+            // Free physical page (if not COW shared)
+            if vma.cow_count <= 1 {
+                pmm.free_page(phys)
+            }
+
+            stats.pages_unmapped = stats.pages_unmapped + 1
+            as.resident = as.resident - 1
+        }
+
+        addr = addr + PAGE_SIZE
+    }
+
+    // Restore address space
+    vmm.switchAddressSpace(old_pml4)
+}
+
+fn mark_vma_cow(as: *UserAddressSpace, vma: *VMA) {
+    var addr: u64 = vma.start
+
+    var old_pml4: u64 = vmm.getCurrentAddressSpace()
+    vmm.switchAddressSpace(as.pml4)
+
+    loop {
+        if addr >= vma.end {
+            break
+        }
+
+        // Mark page as read-only
+        vmm.setPageFlags(addr, false, true, (vma.flags & VMA_EXEC) == 0)
+
+        addr = addr + PAGE_SIZE
+    }
+
+    vmm.switchAddressSpace(old_pml4)
+}
+
+fn clone_vma_mappings(src_as: *UserAddressSpace, src_vma: *VMA, dst_as: *UserAddressSpace, dst_vma: *VMA) {
+    var addr: u64 = src_vma.start
+
+    loop {
+        if addr >= src_vma.end {
+            break
+        }
+
+        // Get physical address from source
+        vmm.switchAddressSpace(src_as.pml4)
+        var phys: u64 = vmm.getPhysicalAddr(addr)
+
+        if phys != 0 {
+            // Map same physical page in destination
+            vmm.switchAddressSpace(dst_as.pml4)
+            vmm.mapPageNX(addr, phys, (dst_vma.flags & VMA_WRITE) != 0, true)
+            dst_as.resident = dst_as.resident + 1
+        }
+
+        addr = addr + PAGE_SIZE
+    }
+}
+
+fn clone_vma_mappings_cow(src_as: *UserAddressSpace, src_vma: *VMA, dst_as: *UserAddressSpace, dst_vma: *VMA) {
+    var addr: u64 = src_vma.start
+
+    loop {
+        if addr >= src_vma.end {
+            break
+        }
+
+        vmm.switchAddressSpace(src_as.pml4)
+        var phys: u64 = vmm.getPhysicalAddr(addr)
+
+        if phys != 0 {
+            // Map same physical page in destination (read-only for COW)
+            vmm.switchAddressSpace(dst_as.pml4)
+            vmm.mapPageNX(addr, phys, false, true)
+            dst_as.resident = dst_as.resident + 1
+            dst_as.shared = dst_as.shared + 1
+        }
+
+        addr = addr + PAGE_SIZE
+    }
+}
+
+// ============================================================================
+// mmap / munmap
+// ============================================================================
+
+export fn user_mmap(as: *UserAddressSpace, addr: u64, length: u64, flags: u32): u64 {
+    // Align length to page size
+    var aligned_length: u64 = (length + PAGE_SIZE - 1) & (~(PAGE_SIZE - 1))
+
+    // Find address if not specified
+    var map_addr: u64 = addr
+    if map_addr == 0 {
+        map_addr = find_free_region(as, aligned_length)
+        if map_addr == 0 {
+            return 0  // No space
+        }
+    } else {
+        // Align requested address
+        map_addr = map_addr & (~(PAGE_SIZE - 1))
+
+        // Check if region is available
+        if region_overlaps(as, map_addr, map_addr + aligned_length) {
+            return 0  // Region in use
+        }
+    }
+
+    // Create VMA
+    var vma: *VMA = alloc_vma()
+    if vma == null {
+        return 0
+    }
+
+    vma.start = map_addr
+    vma.end = map_addr + aligned_length
+    vma.flags = flags | VMA_ANONYMOUS | VMA_PRIVATE
+    vma.vma_type = VMA_TYPE_MMAP
+
+    // Add to list
+    add_vma_to_list(as, vma)
+
+    // Map pages
+    map_vma_pages(as, vma)
+
+    as.total_vm = as.total_vm + aligned_length
+
+    foundation.serial_write_string("[USER_SPACE] mmap: 0x")
+    foundation.serial_write_hex(@truncate(map_addr, u32))
+    foundation.serial_write_string(" size=")
+    foundation.serial_write_u64(aligned_length)
+    foundation.serial_write_string("\n")
+
+    return map_addr
+}
+
+export fn user_munmap(as: *UserAddressSpace, addr: u64, length: u64): i32 {
+    var aligned_length: u64 = (length + PAGE_SIZE - 1) & (~(PAGE_SIZE - 1))
+    var end_addr: u64 = addr + aligned_length
+
+    // Find and remove overlapping VMAs
+    var vma: *VMA = as.vma_list
+    loop {
+        if vma == null {
+            break
+        }
+
+        var next: *VMA = vma.next
+
+        // Check if VMA overlaps with region
+        if addr < vma.end and end_addr > vma.start {
+            // Unmap pages
+            unmap_vma_pages(as, vma)
+
+            // Remove from list
+            remove_vma_from_list(as, vma)
+
+            as.total_vm = as.total_vm - (vma.end - vma.start)
+
+            // Free VMA
+            free_vma(vma)
+        }
+
+        vma = next
+    }
+
+    return 0
+}
+
+fn find_free_region(as: *UserAddressSpace, length: u64): u64 {
+    // Search in mmap region
+    var addr: u64 = as.mmap_base
+
+    loop {
+        if addr + length > USER_MMAP_END {
+            break
+        }
+
+        if !region_overlaps(as, addr, addr + length) {
+            return addr
+        }
+
+        // Try next page-aligned address
+        addr = addr + PAGE_SIZE
+    }
+
+    return 0
+}
+
+// ============================================================================
+// brk / sbrk (Heap Management)
+// ============================================================================
+
+export fn user_brk(as: *UserAddressSpace, new_brk: u64): u64 {
+    // Get current brk
+    if new_brk == 0 {
+        return as.heap_end
+    }
+
+    // Align to page boundary
+    var aligned_brk: u64 = (new_brk + PAGE_SIZE - 1) & (~(PAGE_SIZE - 1))
+
+    // Check bounds
+    if aligned_brk < as.heap_start or aligned_brk > as.heap_max {
+        return as.heap_end  // Invalid
+    }
+
+    // Expanding heap
+    if aligned_brk > as.heap_end {
+        // Find or create heap VMA
+        var heap_vma: *VMA = find_vma(as, as.heap_start)
+
+        if heap_vma == null {
+            // Create initial heap VMA
+            heap_vma = alloc_vma()
+            if heap_vma == null {
+                return as.heap_end
+            }
+
+            heap_vma.start = as.heap_start
+            heap_vma.end = aligned_brk
+            heap_vma.flags = VMA_READ | VMA_WRITE | VMA_ANONYMOUS | VMA_PRIVATE | VMA_HEAP | VMA_GROWSUP
+            heap_vma.vma_type = VMA_TYPE_HEAP
+
+            add_vma_to_list(as, heap_vma)
+            map_vma_pages(as, heap_vma)
+        } else {
+            // Expand existing heap VMA
+            var old_end: u64 = heap_vma.end
+            heap_vma.end = aligned_brk
+
+            // Map new pages
+            var addr: u64 = old_end
+            var old_pml4: u64 = vmm.getCurrentAddressSpace()
+            vmm.switchAddressSpace(as.pml4)
+
+            loop {
+                if addr >= aligned_brk {
+                    break
+                }
+
+                var phys: u64 = pmm.alloc_page()
+                if phys != 0 {
+                    // Zero the page
+                    var page_ptr: *u8 = @ptrFromInt(phys)
+                    var i: u32 = 0
+                    loop {
+                        if i >= PAGE_SIZE {
+                            break
+                        }
+                        page_ptr[i] = 0
+                        i = i + 1
+                    }
+
+                    vmm.mapPageNX(addr, phys, true, true)
+                    stats.pages_mapped = stats.pages_mapped + 1
+                    as.resident = as.resident + 1
+                }
+
+                addr = addr + PAGE_SIZE
+            }
+
+            vmm.switchAddressSpace(old_pml4)
+        }
+
+        stats.heap_expansions = stats.heap_expansions + 1
+        as.total_vm = as.total_vm + (aligned_brk - as.heap_end)
+    }
+    // Shrinking heap
+    else if aligned_brk < as.heap_end {
+        var heap_vma: *VMA = find_vma(as, as.heap_start)
+        if heap_vma != null {
+            // Unmap pages
+            var addr: u64 = aligned_brk
+            var old_pml4: u64 = vmm.getCurrentAddressSpace()
+            vmm.switchAddressSpace(as.pml4)
+
+            loop {
+                if addr >= as.heap_end {
+                    break
+                }
+
+                var phys: u64 = vmm.getPhysicalAddr(addr)
+                if phys != 0 {
+                    vmm.unmapPage(addr)
+                    pmm.free_page(phys)
+                    stats.pages_unmapped = stats.pages_unmapped + 1
+                    as.resident = as.resident - 1
+                }
+
+                addr = addr + PAGE_SIZE
+            }
+
+            vmm.switchAddressSpace(old_pml4)
+            heap_vma.end = aligned_brk
+        }
+
+        as.total_vm = as.total_vm - (as.heap_end - aligned_brk)
+    }
+
+    as.heap_end = aligned_brk
+    return aligned_brk
+}
+
+export fn user_sbrk(as: *UserAddressSpace, increment: i64): u64 {
+    var old_brk: u64 = as.heap_end
+
+    if increment == 0 {
+        return old_brk
+    }
+
+    var new_brk: u64
+    if increment > 0 {
+        new_brk = old_brk + @intCast(increment, u64)
+    } else {
+        new_brk = old_brk - @intCast(-increment, u64)
+    }
+
+    var result: u64 = user_brk(as, new_brk)
+    if result == old_brk and new_brk != old_brk {
+        return @intCast(-1, u64)  // Error
+    }
+
+    return old_brk
+}
+
+// ============================================================================
+// Stack Management
+// ============================================================================
+
+export fn setup_user_stack(as: *UserAddressSpace, initial_size: u64): u64 {
+    var size: u64 = initial_size
+    if size == 0 {
+        size = 4 * PAGE_SIZE  // Default 16KB initial stack
+    }
+
+    // Align size
+    size = (size + PAGE_SIZE - 1) & (~(PAGE_SIZE - 1))
+
+    // Stack grows down from stack_top
+    var stack_bottom: u64 = as.stack_top - size
+
+    // Create stack VMA
+    var vma: *VMA = alloc_vma()
+    if vma == null {
+        return 0
+    }
+
+    vma.start = stack_bottom
+    vma.end = as.stack_top
+    vma.flags = VMA_READ | VMA_WRITE | VMA_ANONYMOUS | VMA_PRIVATE | VMA_STACK | VMA_GROWSDOWN
+    vma.vma_type = VMA_TYPE_STACK
+
+    add_vma_to_list(as, vma)
+    map_vma_pages(as, vma)
+
+    as.stack_bottom = stack_bottom
+    as.total_vm = as.total_vm + size
+
+    foundation.serial_write_string("[USER_SPACE] Stack: 0x")
+    foundation.serial_write_hex(@truncate(stack_bottom, u32))
+    foundation.serial_write_string(" - 0x")
+    foundation.serial_write_hex(@truncate(as.stack_top, u32))
+    foundation.serial_write_string("\n")
+
+    return as.stack_top  // Return stack pointer (top of stack)
+}
+
+// Expand stack on page fault (stack grows down)
+export fn expand_stack(as: *UserAddressSpace, fault_addr: u64): bool {
+    // Check if fault is in stack region
+    if fault_addr >= as.stack_top or fault_addr < as.stack_top - as.stack_max {
+        return false
+    }
+
+    // Find stack VMA
+    var stack_vma: *VMA = find_vma(as, as.stack_bottom)
+    if stack_vma == null or (stack_vma.flags & VMA_STACK) == 0 {
+        return false
+    }
+
+    // Calculate new stack bottom (page aligned)
+    var new_bottom: u64 = fault_addr & (~(PAGE_SIZE - 1))
+
+    // Check if within limits
+    if as.stack_top - new_bottom > as.stack_max {
+        return false
+    }
+
+    // Expand VMA
+    var old_bottom: u64 = stack_vma.start
+    stack_vma.start = new_bottom
+
+    // Map new pages
+    var addr: u64 = new_bottom
+    var old_pml4: u64 = vmm.getCurrentAddressSpace()
+    vmm.switchAddressSpace(as.pml4)
+
+    loop {
+        if addr >= old_bottom {
+            break
+        }
+
+        var phys: u64 = pmm.alloc_page()
+        if phys != 0 {
+            // Zero the page
+            var page_ptr: *u8 = @ptrFromInt(phys)
+            var i: u32 = 0
+            loop {
+                if i >= PAGE_SIZE {
+                    break
+                }
+                page_ptr[i] = 0
+                i = i + 1
+            }
+
+            vmm.mapPageNX(addr, phys, true, true)
+            stats.pages_mapped = stats.pages_mapped + 1
+            as.resident = as.resident + 1
+        }
+
+        addr = addr + PAGE_SIZE
+    }
+
+    vmm.switchAddressSpace(old_pml4)
+
+    as.stack_bottom = new_bottom
+    as.total_vm = as.total_vm + (old_bottom - new_bottom)
+    stats.stack_expansions = stats.stack_expansions + 1
+
+    return true
+}
+
+// ============================================================================
+// Copy-on-Write Page Fault Handler
+// ============================================================================
+
+export fn handle_cow_fault(as: *UserAddressSpace, fault_addr: u64): bool {
+    var vma: *VMA = find_vma(as, fault_addr)
+    if vma == null {
+        return false
+    }
+
+    // Check if COW
+    if vma.cow_count == 0 {
+        return false
+    }
+
+    // Get page-aligned address
+    var page_addr: u64 = fault_addr & (~(PAGE_SIZE - 1))
+
+    // Get current physical page
+    vmm.switchAddressSpace(as.pml4)
+    var old_phys: u64 = vmm.getPhysicalAddr(page_addr)
+
+    if old_phys == 0 {
+        return false
+    }
+
+    // Allocate new physical page
+    var new_phys: u64 = pmm.alloc_page()
+    if new_phys == 0 {
+        return false
+    }
+
+    // Copy page contents
+    var src: *u8 = @ptrFromInt(old_phys)
+    var dst: *u8 = @ptrFromInt(new_phys)
+    var i: u32 = 0
+    loop {
+        if i >= PAGE_SIZE {
+            break
+        }
+        dst[i] = src[i]
+        i = i + 1
+    }
+
+    // Remap with new physical page (now writable)
+    vmm.unmapPage(page_addr)
+    vmm.mapPageNX(page_addr, new_phys, true, true)
+
+    // Decrement COW count
+    vma.cow_count = vma.cow_count - 1
+
+    stats.cow_faults = stats.cow_faults + 1
+
+    return true
+}
+
+// ============================================================================
+// Code/Data Mapping (for exec)
+// ============================================================================
+
+export fn map_code_segment(as: *UserAddressSpace, virt_addr: u64, size: u64): *VMA {
+    var aligned_size: u64 = (size + PAGE_SIZE - 1) & (~(PAGE_SIZE - 1))
+
+    var vma: *VMA = alloc_vma()
+    if vma == null {
+        return null
+    }
+
+    vma.start = virt_addr
+    vma.end = virt_addr + aligned_size
+    vma.flags = VMA_READ | VMA_EXEC | VMA_PRIVATE
+    vma.vma_type = VMA_TYPE_CODE
+
+    add_vma_to_list(as, vma)
+    map_vma_pages(as, vma)
+
+    as.total_vm = as.total_vm + aligned_size
+
+    return vma
+}
+
+export fn map_data_segment(as: *UserAddressSpace, virt_addr: u64, size: u64): *VMA {
+    var aligned_size: u64 = (size + PAGE_SIZE - 1) & (~(PAGE_SIZE - 1))
+
+    var vma: *VMA = alloc_vma()
+    if vma == null {
+        return null
+    }
+
+    vma.start = virt_addr
+    vma.end = virt_addr + aligned_size
+    vma.flags = VMA_READ | VMA_WRITE | VMA_PRIVATE
+    vma.vma_type = VMA_TYPE_DATA
+
+    add_vma_to_list(as, vma)
+    map_vma_pages(as, vma)
+
+    as.total_vm = as.total_vm + aligned_size
+
+    return vma
+}
+
+export fn map_bss_segment(as: *UserAddressSpace, virt_addr: u64, size: u64): *VMA {
+    var aligned_size: u64 = (size + PAGE_SIZE - 1) & (~(PAGE_SIZE - 1))
+
+    var vma: *VMA = alloc_vma()
+    if vma == null {
+        return null
+    }
+
+    vma.start = virt_addr
+    vma.end = virt_addr + aligned_size
+    vma.flags = VMA_READ | VMA_WRITE | VMA_ANONYMOUS | VMA_PRIVATE
+    vma.vma_type = VMA_TYPE_BSS
+
+    add_vma_to_list(as, vma)
+    map_vma_pages(as, vma)  // Pages are zeroed by map_vma_pages
+
+    as.total_vm = as.total_vm + aligned_size
+
+    return vma
+}
+
+// ============================================================================
+// Statistics and Debugging
+// ============================================================================
+
+export fn print_address_space(as: *UserAddressSpace) {
+    foundation.serial_write_string("\n=== User Address Space ===\n")
+    foundation.serial_write_string("PML4: 0x")
+    foundation.serial_write_hex(@truncate(as.pml4, u32))
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("Heap: 0x")
+    foundation.serial_write_hex(@truncate(as.heap_start, u32))
+    foundation.serial_write_string(" - 0x")
+    foundation.serial_write_hex(@truncate(as.heap_end, u32))
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("Stack: 0x")
+    foundation.serial_write_hex(@truncate(as.stack_bottom, u32))
+    foundation.serial_write_string(" - 0x")
+    foundation.serial_write_hex(@truncate(as.stack_top, u32))
+    foundation.serial_write_string("\n")
+
+    foundation.serial_write_string("Total VM: ")
+    foundation.serial_write_u64(as.total_vm / 1024)
+    foundation.serial_write_string(" KB\n")
+
+    foundation.serial_write_string("Resident: ")
+    foundation.serial_write_u64(as.resident)
+    foundation.serial_write_string(" pages\n")
+
+    foundation.serial_write_string("\nVMAs:\n")
+    var vma: *VMA = as.vma_list
+    loop {
+        if vma == null {
+            break
+        }
+
+        foundation.serial_write_string("  0x")
+        foundation.serial_write_hex(@truncate(vma.start, u32))
+        foundation.serial_write_string(" - 0x")
+        foundation.serial_write_hex(@truncate(vma.end, u32))
+        foundation.serial_write_string(" [")
+
+        if (vma.flags & VMA_READ) != 0 {
+            foundation.serial_write_string("r")
+        } else {
+            foundation.serial_write_string("-")
+        }
+        if (vma.flags & VMA_WRITE) != 0 {
+            foundation.serial_write_string("w")
+        } else {
+            foundation.serial_write_string("-")
+        }
+        if (vma.flags & VMA_EXEC) != 0 {
+            foundation.serial_write_string("x")
+        } else {
+            foundation.serial_write_string("-")
+        }
+
+        foundation.serial_write_string("]\n")
+
+        vma = vma.next
+    }
+}
+
+export fn print_stats() {
+    foundation.serial_write_string("\n=== User Space Statistics ===\n")
+    foundation.serial_write_string("Address spaces created:  ")
+    foundation.serial_write_u64(stats.address_spaces_created)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Address spaces destroyed: ")
+    foundation.serial_write_u64(stats.address_spaces_destroyed)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("VMAs created:   ")
+    foundation.serial_write_u64(stats.vmas_created)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("VMAs destroyed: ")
+    foundation.serial_write_u64(stats.vmas_destroyed)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Pages mapped:   ")
+    foundation.serial_write_u64(stats.pages_mapped)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Pages unmapped: ")
+    foundation.serial_write_u64(stats.pages_unmapped)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("COW faults:     ")
+    foundation.serial_write_u64(stats.cow_faults)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Heap expansions:  ")
+    foundation.serial_write_u64(stats.heap_expansions)
+    foundation.serial_write_string("\n")
+    foundation.serial_write_string("Stack expansions: ")
+    foundation.serial_write_u64(stats.stack_expansions)
+    foundation.serial_write_string("\n")
+}
+
+export fn get_stats(): *UserSpaceStats {
+    return &stats
+}
