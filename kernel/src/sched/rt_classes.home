@@ -1,0 +1,933 @@
+// HomeOS Real-Time Scheduling Classes
+// POSIX-compatible real-time scheduling with SCHED_FIFO, SCHED_RR, and SCHED_DEADLINE
+//
+// This module implements proper real-time scheduling classes that integrate
+// with the main scheduler. Real-time tasks always preempt normal tasks.
+//
+// Scheduling classes (in priority order):
+// 1. SCHED_DEADLINE - Earliest Deadline First (EDF) with CBS
+// 2. SCHED_FIFO - First In First Out, priority-based preemptive
+// 3. SCHED_RR - Round Robin with time slices
+// 4. SCHED_NORMAL - CFS (handled by main scheduler)
+// 5. SCHED_BATCH - Background batch processing
+// 6. SCHED_IDLE - Only runs when system is idle
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const MAX_RT_TASKS: u32 = 128
+const MAX_RT_PRIORITY: u32 = 99          // RT priorities 0-99
+const MIN_RT_PRIORITY: u32 = 1
+const DEFAULT_RR_TIMESLICE_MS: u32 = 100 // 100ms default RR quantum
+const TICK_NS: u64 = 10_000_000          // 10ms tick
+
+// Scheduling policies (POSIX compatible)
+pub const SCHED_NORMAL: u32 = 0
+pub const SCHED_FIFO: u32 = 1
+pub const SCHED_RR: u32 = 2
+pub const SCHED_BATCH: u32 = 3
+pub const SCHED_ISO: u32 = 4             // Isochronous (reserved)
+pub const SCHED_IDLE: u32 = 5
+pub const SCHED_DEADLINE: u32 = 6
+
+// RT task states
+const RT_TASK_FREE: u32 = 0
+const RT_TASK_READY: u32 = 1
+const RT_TASK_RUNNING: u32 = 2
+const RT_TASK_BLOCKED: u32 = 3
+
+// Priority inheritance protocol
+const PI_NONE: u32 = 0
+const PI_INHERIT: u32 = 1
+const PI_CEILING: u32 = 2
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// SCHED_DEADLINE parameters (Constant Bandwidth Server)
+pub const DeadlineParams = struct {
+    runtime: u64,       // Worst-case execution time (ns)
+    deadline: u64,      // Relative deadline (ns)
+    period: u64,        // Period (ns)
+
+    // CBS runtime tracking
+    remaining_runtime: u64,
+    current_deadline: u64,  // Absolute deadline
+
+    // Flags
+    flags: u32,         // DL_FLAG_*
+}
+
+// Real-time task descriptor
+pub const RTTask = struct {
+    // Identity
+    pid: u32,
+    state: u32,
+
+    // Scheduling parameters
+    policy: u32,
+    priority: u32,          // 0-99 for RT, nice value for normal
+
+    // Round-robin time slice
+    time_slice: u32,        // Remaining time slice (ms)
+    time_slice_orig: u32,   // Original time slice
+
+    // SCHED_DEADLINE parameters
+    dl_params: DeadlineParams,
+
+    // Statistics
+    total_runtime: u64,     // Total CPU time consumed
+    switches: u64,          // Context switch count
+    preemptions: u64,       // Times preempted
+    deadline_misses: u64,   // DEADLINE: missed deadlines
+
+    // Priority inheritance
+    pi_protocol: u32,
+    boosted_priority: u32,  // Temporary priority boost
+    pi_chain: u32,          // PID of task we're boosting
+
+    // Run queue linkage
+    next: u32,              // Next task in priority queue
+    prev: u32,              // Previous task
+}
+
+// Per-priority run queue (bitmap + list heads)
+pub const RTRunQueue = struct {
+    // Bitmap of active priorities (64-bit for efficiency)
+    bitmap_low: u64,        // Priorities 0-63
+    bitmap_high: u64,       // Priorities 64-99 (+ reserved)
+
+    // Head of list for each priority level
+    queue_head: [MAX_RT_PRIORITY + 1]u32,  // PID of first task
+    queue_tail: [MAX_RT_PRIORITY + 1]u32,  // PID of last task
+
+    // DEADLINE run queue (EDF ordered)
+    dl_head: u32,           // First DEADLINE task (earliest deadline)
+    dl_count: u32,          // Number of DEADLINE tasks
+
+    // Statistics
+    nr_running: u32,
+    nr_fifo: u32,
+    nr_rr: u32,
+    nr_deadline: u32,
+
+    // Current running RT task
+    current: u32,
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var rt_tasks: [MAX_RT_TASKS]RTTask = undefined
+var rt_rq: RTRunQueue = undefined
+var initialized: bool = false
+
+// Statistics
+var total_rt_switches: u64 = 0
+var total_deadline_misses: u64 = 0
+var total_preemptions: u64 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn rt_classes_init() void {
+    if (initialized) {
+        return
+    }
+
+    serial.write_string("[RT-CLASS] Initializing real-time scheduling classes...\n")
+
+    // Initialize task pool
+    var i: u32 = 0
+    while (i < MAX_RT_TASKS) {
+        rt_tasks[i].pid = 0
+        rt_tasks[i].state = RT_TASK_FREE
+        rt_tasks[i].policy = SCHED_NORMAL
+        rt_tasks[i].priority = 0
+        rt_tasks[i].time_slice = 0
+        rt_tasks[i].time_slice_orig = DEFAULT_RR_TIMESLICE_MS
+        rt_tasks[i].total_runtime = 0
+        rt_tasks[i].switches = 0
+        rt_tasks[i].preemptions = 0
+        rt_tasks[i].deadline_misses = 0
+        rt_tasks[i].pi_protocol = PI_NONE
+        rt_tasks[i].boosted_priority = 0
+        rt_tasks[i].pi_chain = 0
+        rt_tasks[i].next = 0xFFFFFFFF
+        rt_tasks[i].prev = 0xFFFFFFFF
+
+        // DEADLINE defaults
+        rt_tasks[i].dl_params.runtime = 0
+        rt_tasks[i].dl_params.deadline = 0
+        rt_tasks[i].dl_params.period = 0
+        rt_tasks[i].dl_params.remaining_runtime = 0
+        rt_tasks[i].dl_params.current_deadline = 0
+        rt_tasks[i].dl_params.flags = 0
+
+        i += 1
+    }
+
+    // Initialize run queue
+    rt_rq.bitmap_low = 0
+    rt_rq.bitmap_high = 0
+    rt_rq.dl_head = 0xFFFFFFFF
+    rt_rq.dl_count = 0
+    rt_rq.nr_running = 0
+    rt_rq.nr_fifo = 0
+    rt_rq.nr_rr = 0
+    rt_rq.nr_deadline = 0
+    rt_rq.current = 0xFFFFFFFF
+
+    i = 0
+    while (i <= MAX_RT_PRIORITY) {
+        rt_rq.queue_head[i] = 0xFFFFFFFF
+        rt_rq.queue_tail[i] = 0xFFFFFFFF
+        i += 1
+    }
+
+    initialized = true
+    serial.write_string("[RT-CLASS] Real-time scheduler initialized\n")
+    serial.write_string("  Max RT priority: ")
+    serial.write_u32(MAX_RT_PRIORITY)
+    serial.write_string("\n")
+    serial.write_string("  Default RR timeslice: ")
+    serial.write_u32(DEFAULT_RR_TIMESLICE_MS)
+    serial.write_string(" ms\n")
+    serial.write_string("  Supported policies: FIFO, RR, DEADLINE\n")
+}
+
+// ============================================================================
+// Task Management
+// ============================================================================
+
+// Find task slot by PID
+fn find_task(pid: u32) u32 {
+    var i: u32 = 0
+    while (i < MAX_RT_TASKS) {
+        if (rt_tasks[i].pid == pid and rt_tasks[i].state != RT_TASK_FREE) {
+            return i
+        }
+        i += 1
+    }
+    return 0xFFFFFFFF
+}
+
+// Find free task slot
+fn alloc_task_slot() u32 {
+    var i: u32 = 0
+    while (i < MAX_RT_TASKS) {
+        if (rt_tasks[i].state == RT_TASK_FREE) {
+            return i
+        }
+        i += 1
+    }
+    return 0xFFFFFFFF
+}
+
+// Set scheduling policy for a task
+export fn sched_setscheduler(pid: u32, policy: u32, priority: u32) i32 {
+    if (!initialized) {
+        return -1  // EINVAL
+    }
+
+    // Validate policy
+    if (policy != SCHED_FIFO and policy != SCHED_RR and
+        policy != SCHED_DEADLINE and policy != SCHED_NORMAL) {
+        return -22  // EINVAL
+    }
+
+    // Validate priority for RT policies
+    if (policy == SCHED_FIFO or policy == SCHED_RR) {
+        if (priority < MIN_RT_PRIORITY or priority > MAX_RT_PRIORITY) {
+            return -22  // EINVAL
+        }
+    }
+
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        // New RT task
+        slot = alloc_task_slot()
+        if (slot == 0xFFFFFFFF) {
+            return -12  // ENOMEM
+        }
+        rt_tasks[slot].pid = pid
+        rt_tasks[slot].state = RT_TASK_READY
+    }
+
+    // Remove from current queue if changing policy
+    if (rt_tasks[slot].state == RT_TASK_READY) {
+        dequeue_task(slot)
+    }
+
+    // Set new policy
+    rt_tasks[slot].policy = policy
+    rt_tasks[slot].priority = priority
+
+    if (policy == SCHED_RR) {
+        rt_tasks[slot].time_slice = DEFAULT_RR_TIMESLICE_MS
+        rt_tasks[slot].time_slice_orig = DEFAULT_RR_TIMESLICE_MS
+    }
+
+    // Re-enqueue if ready
+    if (rt_tasks[slot].state == RT_TASK_READY) {
+        enqueue_task(slot)
+    }
+
+    serial.write_string("[RT-CLASS] PID ")
+    serial.write_u32(pid)
+    serial.write_string(" set to policy ")
+    print_policy_name(policy)
+    serial.write_string(" priority ")
+    serial.write_u32(priority)
+    serial.write_string("\n")
+
+    return 0
+}
+
+// Get scheduling policy
+export fn sched_getscheduler(pid: u32) i32 {
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        return SCHED_NORMAL  // Default
+    }
+    return @as(i32, @intCast(rt_tasks[slot].policy))
+}
+
+// Set SCHED_DEADLINE parameters
+export fn sched_setattr_deadline(
+    pid: u32,
+    runtime_ns: u64,
+    deadline_ns: u64,
+    period_ns: u64
+) i32 {
+    if (!initialized) {
+        return -1
+    }
+
+    // Validate parameters (runtime <= deadline <= period)
+    if (runtime_ns > deadline_ns or deadline_ns > period_ns) {
+        return -22  // EINVAL
+    }
+
+    // Check bandwidth (runtime/period <= some limit, e.g., 95%)
+    var bandwidth: u64 = (runtime_ns * 100) / period_ns
+    if (bandwidth > 95) {
+        serial.write_string("[RT-CLASS] WARNING: DEADLINE task exceeds 95% bandwidth\n")
+    }
+
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        slot = alloc_task_slot()
+        if (slot == 0xFFFFFFFF) {
+            return -12  // ENOMEM
+        }
+        rt_tasks[slot].pid = pid
+        rt_tasks[slot].state = RT_TASK_READY
+    }
+
+    rt_tasks[slot].policy = SCHED_DEADLINE
+    rt_tasks[slot].dl_params.runtime = runtime_ns
+    rt_tasks[slot].dl_params.deadline = deadline_ns
+    rt_tasks[slot].dl_params.period = period_ns
+    rt_tasks[slot].dl_params.remaining_runtime = runtime_ns
+    rt_tasks[slot].dl_params.current_deadline = get_time_ns() + deadline_ns
+
+    if (rt_tasks[slot].state == RT_TASK_READY) {
+        enqueue_task(slot)
+    }
+
+    serial.write_string("[RT-CLASS] DEADLINE task PID ")
+    serial.write_u32(pid)
+    serial.write_string(": runtime=")
+    serial.write_u64(runtime_ns / 1000000)
+    serial.write_string("ms deadline=")
+    serial.write_u64(deadline_ns / 1000000)
+    serial.write_string("ms period=")
+    serial.write_u64(period_ns / 1000000)
+    serial.write_string("ms\n")
+
+    return 0
+}
+
+// Set RR time slice
+export fn sched_rr_get_interval(pid: u32) u32 {
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        return 0
+    }
+    return rt_tasks[slot].time_slice_orig
+}
+
+export fn sched_rr_set_interval(pid: u32, ms: u32) i32 {
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        return -3  // ESRCH
+    }
+
+    if (ms == 0 or ms > 10000) {  // Max 10 seconds
+        return -22  // EINVAL
+    }
+
+    rt_tasks[slot].time_slice_orig = ms
+    rt_tasks[slot].time_slice = ms
+
+    return 0
+}
+
+// ============================================================================
+// Run Queue Operations
+// ============================================================================
+
+// Set bitmap bit for priority
+fn set_bitmap(priority: u32) void {
+    if (priority < 64) {
+        rt_rq.bitmap_low |= (@as(u64, 1) << @as(u6, @truncate(priority)))
+    } else {
+        rt_rq.bitmap_high |= (@as(u64, 1) << @as(u6, @truncate(priority - 64)))
+    }
+}
+
+// Clear bitmap bit for priority
+fn clear_bitmap(priority: u32) void {
+    if (priority < 64) {
+        rt_rq.bitmap_low &= ~(@as(u64, 1) << @as(u6, @truncate(priority)))
+    } else {
+        rt_rq.bitmap_high &= ~(@as(u64, 1) << @as(u6, @truncate(priority - 64)))
+    }
+}
+
+// Find highest set bit (highest priority)
+fn find_highest_priority() u32 {
+    // Check high bitmap first (priorities 64-99)
+    if (rt_rq.bitmap_high != 0) {
+        var bit: u32 = 63
+        var mask: u64 = @as(u64, 1) << 63
+        while (mask != 0) {
+            if ((rt_rq.bitmap_high & mask) != 0) {
+                return bit + 64
+            }
+            mask >>= 1
+            if (bit > 0) bit -= 1
+        }
+    }
+
+    // Check low bitmap
+    if (rt_rq.bitmap_low != 0) {
+        var bit: u32 = 63
+        var mask: u64 = @as(u64, 1) << 63
+        while (mask != 0) {
+            if ((rt_rq.bitmap_low & mask) != 0) {
+                return bit
+            }
+            mask >>= 1
+            if (bit > 0) bit -= 1
+        }
+    }
+
+    return 0xFFFFFFFF  // No RT tasks
+}
+
+// Enqueue task to appropriate run queue
+fn enqueue_task(slot: u32) void {
+    var policy: u32 = rt_tasks[slot].policy
+
+    if (policy == SCHED_DEADLINE) {
+        // Insert in EDF order (earliest deadline first)
+        enqueue_deadline(slot)
+        rt_rq.nr_deadline += 1
+    } else if (policy == SCHED_FIFO or policy == SCHED_RR) {
+        // Insert at tail of priority queue
+        var prio: u32 = rt_tasks[slot].priority
+
+        if (rt_rq.queue_head[prio] == 0xFFFFFFFF) {
+            // Empty queue
+            rt_rq.queue_head[prio] = slot
+            rt_rq.queue_tail[prio] = slot
+            rt_tasks[slot].next = 0xFFFFFFFF
+            rt_tasks[slot].prev = 0xFFFFFFFF
+        } else {
+            // Add to tail
+            var tail: u32 = rt_rq.queue_tail[prio]
+            rt_tasks[tail].next = slot
+            rt_tasks[slot].prev = tail
+            rt_tasks[slot].next = 0xFFFFFFFF
+            rt_rq.queue_tail[prio] = slot
+        }
+
+        set_bitmap(prio)
+
+        if (policy == SCHED_FIFO) {
+            rt_rq.nr_fifo += 1
+        } else {
+            rt_rq.nr_rr += 1
+        }
+    }
+
+    rt_rq.nr_running += 1
+}
+
+// Enqueue DEADLINE task in EDF order
+fn enqueue_deadline(slot: u32) void {
+    var deadline: u64 = rt_tasks[slot].dl_params.current_deadline
+
+    if (rt_rq.dl_head == 0xFFFFFFFF) {
+        // Empty queue
+        rt_rq.dl_head = slot
+        rt_tasks[slot].next = 0xFFFFFFFF
+        rt_tasks[slot].prev = 0xFFFFFFFF
+        return
+    }
+
+    // Find insertion point
+    var curr: u32 = rt_rq.dl_head
+    var prev: u32 = 0xFFFFFFFF
+
+    while (curr != 0xFFFFFFFF) {
+        if (deadline < rt_tasks[curr].dl_params.current_deadline) {
+            // Insert before curr
+            if (prev == 0xFFFFFFFF) {
+                rt_rq.dl_head = slot
+            } else {
+                rt_tasks[prev].next = slot
+            }
+            rt_tasks[slot].prev = prev
+            rt_tasks[slot].next = curr
+            rt_tasks[curr].prev = slot
+            return
+        }
+        prev = curr
+        curr = rt_tasks[curr].next
+    }
+
+    // Insert at end
+    rt_tasks[prev].next = slot
+    rt_tasks[slot].prev = prev
+    rt_tasks[slot].next = 0xFFFFFFFF
+}
+
+// Dequeue task from run queue
+fn dequeue_task(slot: u32) void {
+    var policy: u32 = rt_tasks[slot].policy
+
+    if (policy == SCHED_DEADLINE) {
+        dequeue_deadline(slot)
+        if (rt_rq.nr_deadline > 0) rt_rq.nr_deadline -= 1
+    } else if (policy == SCHED_FIFO or policy == SCHED_RR) {
+        var prio: u32 = rt_tasks[slot].priority
+
+        // Update linked list
+        if (rt_tasks[slot].prev != 0xFFFFFFFF) {
+            rt_tasks[rt_tasks[slot].prev].next = rt_tasks[slot].next
+        } else {
+            rt_rq.queue_head[prio] = rt_tasks[slot].next
+        }
+
+        if (rt_tasks[slot].next != 0xFFFFFFFF) {
+            rt_tasks[rt_tasks[slot].next].prev = rt_tasks[slot].prev
+        } else {
+            rt_rq.queue_tail[prio] = rt_tasks[slot].prev
+        }
+
+        // Clear bitmap if queue is now empty
+        if (rt_rq.queue_head[prio] == 0xFFFFFFFF) {
+            clear_bitmap(prio)
+        }
+
+        if (policy == SCHED_FIFO) {
+            if (rt_rq.nr_fifo > 0) rt_rq.nr_fifo -= 1
+        } else {
+            if (rt_rq.nr_rr > 0) rt_rq.nr_rr -= 1
+        }
+    }
+
+    rt_tasks[slot].next = 0xFFFFFFFF
+    rt_tasks[slot].prev = 0xFFFFFFFF
+
+    if (rt_rq.nr_running > 0) rt_rq.nr_running -= 1
+}
+
+// Dequeue DEADLINE task
+fn dequeue_deadline(slot: u32) void {
+    if (rt_tasks[slot].prev != 0xFFFFFFFF) {
+        rt_tasks[rt_tasks[slot].prev].next = rt_tasks[slot].next
+    } else {
+        rt_rq.dl_head = rt_tasks[slot].next
+    }
+
+    if (rt_tasks[slot].next != 0xFFFFFFFF) {
+        rt_tasks[rt_tasks[slot].next].prev = rt_tasks[slot].prev
+    }
+}
+
+// ============================================================================
+// Scheduling
+// ============================================================================
+
+// Pick next RT task to run
+// Returns PID or 0xFFFFFFFF if no RT task
+export fn rt_pick_next_task() u32 {
+    if (!initialized or rt_rq.nr_running == 0) {
+        return 0xFFFFFFFF
+    }
+
+    // DEADLINE tasks have highest priority
+    if (rt_rq.dl_head != 0xFFFFFFFF) {
+        var slot: u32 = rt_rq.dl_head
+
+        // Check if task has remaining runtime
+        if (rt_tasks[slot].dl_params.remaining_runtime > 0) {
+            return rt_tasks[slot].pid
+        }
+
+        // CBS: task exhausted runtime, check for deadline
+        var now: u64 = get_time_ns()
+        if (now >= rt_tasks[slot].dl_params.current_deadline) {
+            // Replenish at new period
+            rt_tasks[slot].dl_params.remaining_runtime = rt_tasks[slot].dl_params.runtime
+            rt_tasks[slot].dl_params.current_deadline = now + rt_tasks[slot].dl_params.deadline
+
+            // Re-insert in deadline order
+            dequeue_deadline(slot)
+            enqueue_deadline(slot)
+        }
+    }
+
+    // FIFO/RR: find highest priority task
+    var prio: u32 = find_highest_priority()
+    if (prio != 0xFFFFFFFF) {
+        var slot: u32 = rt_rq.queue_head[prio]
+        if (slot != 0xFFFFFFFF) {
+            return rt_tasks[slot].pid
+        }
+    }
+
+    return 0xFFFFFFFF
+}
+
+// Check if RT task should preempt current
+export fn rt_check_preempt(current_pid: u32) bool {
+    if (!initialized) {
+        return false
+    }
+
+    var next: u32 = rt_pick_next_task()
+    if (next == 0xFFFFFFFF) {
+        return false
+    }
+
+    if (next == current_pid) {
+        return false
+    }
+
+    var current_slot: u32 = find_task(current_pid)
+    var next_slot: u32 = find_task(next)
+
+    if (next_slot == 0xFFFFFFFF) {
+        return false
+    }
+
+    // DEADLINE always preempts non-DEADLINE
+    if (rt_tasks[next_slot].policy == SCHED_DEADLINE) {
+        if (current_slot == 0xFFFFFFFF or
+            rt_tasks[current_slot].policy != SCHED_DEADLINE) {
+            return true
+        }
+        // Earlier deadline preempts
+        return rt_tasks[next_slot].dl_params.current_deadline <
+               rt_tasks[current_slot].dl_params.current_deadline
+    }
+
+    // RT preempts non-RT
+    if (current_slot == 0xFFFFFFFF) {
+        return true
+    }
+
+    // Higher priority preempts (higher number = higher priority)
+    return rt_tasks[next_slot].priority > rt_tasks[current_slot].priority
+}
+
+// Timer tick handler for RT tasks
+export fn rt_tick() void {
+    if (!initialized or rt_rq.current == 0xFFFFFFFF) {
+        return
+    }
+
+    var slot: u32 = find_task(rt_rq.current)
+    if (slot == 0xFFFFFFFF) {
+        return
+    }
+
+    // Update runtime
+    rt_tasks[slot].total_runtime += TICK_NS
+
+    if (rt_tasks[slot].policy == SCHED_RR) {
+        // Decrement time slice
+        if (rt_tasks[slot].time_slice > 0) {
+            rt_tasks[slot].time_slice -= 1
+        }
+
+        // Time slice expired - move to end of queue
+        if (rt_tasks[slot].time_slice == 0) {
+            rt_tasks[slot].time_slice = rt_tasks[slot].time_slice_orig
+
+            // Requeue at tail
+            dequeue_task(slot)
+            enqueue_task(slot)
+
+            total_preemptions += 1
+            rt_tasks[slot].preemptions += 1
+        }
+    } else if (rt_tasks[slot].policy == SCHED_DEADLINE) {
+        // Decrement remaining runtime
+        if (rt_tasks[slot].dl_params.remaining_runtime >= TICK_NS) {
+            rt_tasks[slot].dl_params.remaining_runtime -= TICK_NS
+        } else {
+            rt_tasks[slot].dl_params.remaining_runtime = 0
+        }
+
+        // Check for deadline miss
+        var now: u64 = get_time_ns()
+        if (now > rt_tasks[slot].dl_params.current_deadline) {
+            serial.write_string("[RT-CLASS] DEADLINE MISS: PID ")
+            serial.write_u32(rt_tasks[slot].pid)
+            serial.write_string("\n")
+
+            rt_tasks[slot].deadline_misses += 1
+            total_deadline_misses += 1
+
+            // Replenish for next period
+            rt_tasks[slot].dl_params.remaining_runtime = rt_tasks[slot].dl_params.runtime
+            rt_tasks[slot].dl_params.current_deadline = now + rt_tasks[slot].dl_params.deadline
+
+            // Re-order in queue
+            dequeue_deadline(slot)
+            enqueue_deadline(slot)
+        }
+    }
+    // SCHED_FIFO: no action needed (runs until blocks or yields)
+}
+
+// Mark task as running
+export fn rt_task_running(pid: u32) void {
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        return
+    }
+
+    rt_tasks[slot].state = RT_TASK_RUNNING
+    rt_tasks[slot].switches += 1
+    rt_rq.current = pid
+    total_rt_switches += 1
+}
+
+// Mark task as blocked
+export fn rt_task_blocked(pid: u32) void {
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        return
+    }
+
+    rt_tasks[slot].state = RT_TASK_BLOCKED
+    dequeue_task(slot)
+
+    if (rt_rq.current == pid) {
+        rt_rq.current = 0xFFFFFFFF
+    }
+}
+
+// Wake up blocked task
+export fn rt_task_wake(pid: u32) void {
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        return
+    }
+
+    if (rt_tasks[slot].state == RT_TASK_BLOCKED) {
+        rt_tasks[slot].state = RT_TASK_READY
+        enqueue_task(slot)
+    }
+}
+
+// Remove task completely
+export fn rt_task_exit(pid: u32) void {
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        return
+    }
+
+    if (rt_tasks[slot].state != RT_TASK_FREE) {
+        dequeue_task(slot)
+    }
+
+    rt_tasks[slot].state = RT_TASK_FREE
+    rt_tasks[slot].pid = 0
+
+    if (rt_rq.current == pid) {
+        rt_rq.current = 0xFFFFFFFF
+    }
+}
+
+// ============================================================================
+// Priority Inheritance
+// ============================================================================
+
+// Boost priority when holding mutex needed by higher-priority task
+export fn rt_pi_boost(holder_pid: u32, waiter_pid: u32) void {
+    var holder_slot: u32 = find_task(holder_pid)
+    var waiter_slot: u32 = find_task(waiter_pid)
+
+    if (holder_slot == 0xFFFFFFFF or waiter_slot == 0xFFFFFFFF) {
+        return
+    }
+
+    // Only boost if waiter has higher priority
+    if (rt_tasks[waiter_slot].priority > rt_tasks[holder_slot].priority) {
+        rt_tasks[holder_slot].boosted_priority = rt_tasks[waiter_slot].priority
+        rt_tasks[holder_slot].pi_chain = waiter_pid
+
+        serial.write_string("[RT-CLASS] PI: boosting PID ")
+        serial.write_u32(holder_pid)
+        serial.write_string(" to priority ")
+        serial.write_u32(rt_tasks[waiter_slot].priority)
+        serial.write_string("\n")
+
+        // Re-enqueue at new priority
+        if (rt_tasks[holder_slot].state == RT_TASK_READY) {
+            dequeue_task(holder_slot)
+            var old_prio: u32 = rt_tasks[holder_slot].priority
+            rt_tasks[holder_slot].priority = rt_tasks[waiter_slot].priority
+            enqueue_task(holder_slot)
+            rt_tasks[holder_slot].priority = old_prio  // Keep original
+        }
+    }
+}
+
+// Restore original priority after releasing mutex
+export fn rt_pi_unboost(pid: u32) void {
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        return
+    }
+
+    if (rt_tasks[slot].boosted_priority != 0) {
+        serial.write_string("[RT-CLASS] PI: unboosting PID ")
+        serial.write_u32(pid)
+        serial.write_string("\n")
+
+        rt_tasks[slot].boosted_priority = 0
+        rt_tasks[slot].pi_chain = 0
+
+        // Re-enqueue at original priority
+        if (rt_tasks[slot].state == RT_TASK_READY) {
+            dequeue_task(slot)
+            enqueue_task(slot)
+        }
+    }
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn get_time_ns() u64 {
+    // Would use actual timer
+    // Placeholder returns incrementing value
+    var static_time: u64 = 0
+    static_time += TICK_NS
+    return static_time
+}
+
+fn print_policy_name(policy: u32) void {
+    if (policy == SCHED_NORMAL) {
+        serial.write_string("NORMAL")
+    } else if (policy == SCHED_FIFO) {
+        serial.write_string("FIFO")
+    } else if (policy == SCHED_RR) {
+        serial.write_string("RR")
+    } else if (policy == SCHED_BATCH) {
+        serial.write_string("BATCH")
+    } else if (policy == SCHED_IDLE) {
+        serial.write_string("IDLE")
+    } else if (policy == SCHED_DEADLINE) {
+        serial.write_string("DEADLINE")
+    } else {
+        serial.write_string("UNKNOWN")
+    }
+}
+
+// ============================================================================
+// Statistics and Debugging
+// ============================================================================
+
+export fn rt_print_stats() void {
+    serial.write_string("\n[RT-CLASS] Real-Time Scheduler Statistics:\n")
+    serial.write_string("  Running RT tasks: ")
+    serial.write_u32(rt_rq.nr_running)
+    serial.write_string("\n")
+    serial.write_string("    FIFO: ")
+    serial.write_u32(rt_rq.nr_fifo)
+    serial.write_string("\n")
+    serial.write_string("    RR: ")
+    serial.write_u32(rt_rq.nr_rr)
+    serial.write_string("\n")
+    serial.write_string("    DEADLINE: ")
+    serial.write_u32(rt_rq.nr_deadline)
+    serial.write_string("\n")
+    serial.write_string("  Context switches: ")
+    serial.write_u64(total_rt_switches)
+    serial.write_string("\n")
+    serial.write_string("  Preemptions: ")
+    serial.write_u64(total_preemptions)
+    serial.write_string("\n")
+    serial.write_string("  Deadline misses: ")
+    serial.write_u64(total_deadline_misses)
+    serial.write_string("\n")
+}
+
+export fn rt_print_tasks() void {
+    serial.write_string("\n[RT-CLASS] Active RT Tasks:\n")
+    serial.write_string("PID     Policy     Priority  Runtime(ms)  Misses\n")
+    serial.write_string("--------------------------------------------------\n")
+
+    var i: u32 = 0
+    while (i < MAX_RT_TASKS) {
+        if (rt_tasks[i].state != RT_TASK_FREE) {
+            serial.write_u32(rt_tasks[i].pid)
+            serial.write_string("    ")
+            print_policy_name(rt_tasks[i].policy)
+            serial.write_string("    ")
+            serial.write_u32(rt_tasks[i].priority)
+            serial.write_string("         ")
+            serial.write_u64(rt_tasks[i].total_runtime / 1000000)
+            serial.write_string("          ")
+            serial.write_u64(rt_tasks[i].deadline_misses)
+            serial.write_string("\n")
+        }
+        i += 1
+    }
+}
+
+export fn rt_get_nr_running() u32 {
+    return rt_rq.nr_running
+}
+
+export fn rt_is_rt_task(pid: u32) bool {
+    var slot: u32 = find_task(pid)
+    if (slot == 0xFFFFFFFF) {
+        return false
+    }
+    return rt_tasks[slot].policy == SCHED_FIFO or
+           rt_tasks[slot].policy == SCHED_RR or
+           rt_tasks[slot].policy == SCHED_DEADLINE
+}
+
+// Check if any RT task is runnable (for main scheduler)
+export fn rt_has_runnable() bool {
+    return rt_rq.nr_running > 0
+}

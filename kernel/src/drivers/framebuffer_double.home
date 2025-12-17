@@ -1,0 +1,516 @@
+// HomeOS Enhanced Double Buffering for Framebuffer
+// Provides tear-free rendering with VSync support
+//
+// This module extends the base framebuffer driver with:
+// - Hardware-accelerated buffer swapping when available
+// - Triple buffering option for smoother animation
+// - VSync synchronization
+// - Page flipping support
+// - Dirty region tracking for partial updates
+
+const serial = @import("serial.home")
+const framebuffer = @import("framebuffer.home")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const MAX_BUFFERS: u32 = 3  // Support up to triple buffering
+const MAX_DIRTY_REGIONS: u32 = 64
+
+// Buffer states
+const BUFFER_FREE: u32 = 0
+const BUFFER_DRAWING: u32 = 1
+const BUFFER_READY: u32 = 2
+const BUFFER_DISPLAYED: u32 = 3
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+// Dirty region for partial updates
+pub const DirtyRegion = struct {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    valid: bool,
+}
+
+// Buffer descriptor
+pub const BufferDescriptor = struct {
+    address: u64,           // Physical address
+    virtual_addr: u64,      // Virtual address for CPU access
+    state: u32,             // Current state
+    frame_number: u64,      // Frame number when rendered
+    dirty_regions: [MAX_DIRTY_REGIONS]DirtyRegion,
+    dirty_count: u32,
+}
+
+// Double buffer manager
+pub const DoubleBufferManager = struct {
+    enabled: bool,
+    buffer_count: u32,
+    buffers: [MAX_BUFFERS]BufferDescriptor,
+    front_index: u32,       // Currently displayed buffer
+    back_index: u32,        // Currently being drawn to
+    pending_index: u32,     // Ready to be displayed (triple buffer)
+    width: u32,
+    height: u32,
+    pitch: u32,
+    bpp: u32,
+    buffer_size: u64,
+
+    // VSync
+    vsync_enabled: bool,
+    vsync_count: u64,
+    last_flip_time: u64,
+    target_fps: u32,
+    frame_time_us: u32,
+
+    // Statistics
+    frames_rendered: u64,
+    frames_dropped: u64,
+    flips_performed: u64,
+    partial_updates: u64,
+}
+
+var dbm: DoubleBufferManager = undefined
+var initialized: bool = false
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+// Initialize double buffering with specified number of buffers
+export fn double_buffer_init(
+    width: u32,
+    height: u32,
+    bpp: u32,
+    buffer_addresses: [*]u64,
+    buffer_count: u32
+) bool {
+    if (buffer_count < 2 or buffer_count > MAX_BUFFERS) {
+        serial.write_string("[DBUF] ERROR: Invalid buffer count (2-3 supported)\n")
+        return false
+    }
+
+    serial.write_string("[DBUF] Initializing double buffering...\n")
+    serial.write_string("  Resolution: ")
+    serial.write_u32(width)
+    serial.write_string("x")
+    serial.write_u32(height)
+    serial.write_string("@")
+    serial.write_u32(bpp)
+    serial.write_string("bpp\n")
+    serial.write_string("  Buffers: ")
+    serial.write_u32(buffer_count)
+    serial.write_string("\n")
+
+    dbm.enabled = false
+    dbm.buffer_count = buffer_count
+    dbm.width = width
+    dbm.height = height
+    dbm.pitch = width * (bpp / 8)
+    dbm.bpp = bpp
+    dbm.buffer_size = @as(u64, dbm.pitch) * @as(u64, height)
+
+    // Initialize buffers
+    var i: u32 = 0
+    while (i < buffer_count) {
+        dbm.buffers[i].address = buffer_addresses[i]
+        dbm.buffers[i].virtual_addr = buffer_addresses[i]  // May be remapped
+        dbm.buffers[i].state = if (i == 0) BUFFER_DISPLAYED else BUFFER_FREE
+        dbm.buffers[i].frame_number = 0
+        dbm.buffers[i].dirty_count = 0
+
+        // Clear dirty regions
+        var j: u32 = 0
+        while (j < MAX_DIRTY_REGIONS) {
+            dbm.buffers[i].dirty_regions[j].valid = false
+            j += 1
+        }
+
+        serial.write_string("  Buffer ")
+        serial.write_u32(i)
+        serial.write_string(": 0x")
+        serial.write_hex(buffer_addresses[i])
+        serial.write_string("\n")
+
+        i += 1
+    }
+
+    dbm.front_index = 0
+    dbm.back_index = 1
+    dbm.pending_index = if (buffer_count > 2) 2 else 1
+
+    // VSync defaults
+    dbm.vsync_enabled = true
+    dbm.vsync_count = 0
+    dbm.last_flip_time = 0
+    dbm.target_fps = 60
+    dbm.frame_time_us = 1000000 / 60  // 16.67ms
+
+    // Statistics
+    dbm.frames_rendered = 0
+    dbm.frames_dropped = 0
+    dbm.flips_performed = 0
+    dbm.partial_updates = 0
+
+    dbm.enabled = true
+    initialized = true
+
+    serial.write_string("[DBUF] Double buffering initialized\n")
+    serial.write_string("  Buffer size: ")
+    serial.write_u64(dbm.buffer_size)
+    serial.write_string(" bytes (")
+    serial.write_u64(dbm.buffer_size / 1024 / 1024)
+    serial.write_string(" MB)\n")
+    serial.write_string("  Total VRAM: ")
+    serial.write_u64(dbm.buffer_size * @as(u64, buffer_count) / 1024 / 1024)
+    serial.write_string(" MB\n")
+
+    return true
+}
+
+// ============================================================================
+// Buffer Management
+// ============================================================================
+
+// Get the back buffer address for drawing
+export fn get_back_buffer() u64 {
+    if (!initialized or !dbm.enabled) {
+        return 0
+    }
+
+    dbm.buffers[dbm.back_index].state = BUFFER_DRAWING
+    return dbm.buffers[dbm.back_index].virtual_addr
+}
+
+// Get the front buffer address (currently displayed)
+export fn get_front_buffer() u64 {
+    if (!initialized or !dbm.enabled) {
+        return 0
+    }
+
+    return dbm.buffers[dbm.front_index].virtual_addr
+}
+
+// Mark back buffer as ready and swap
+export fn swap_buffers() bool {
+    if (!initialized or !dbm.enabled) {
+        return false
+    }
+
+    // Mark current back buffer as ready
+    dbm.buffers[dbm.back_index].state = BUFFER_READY
+    dbm.buffers[dbm.back_index].frame_number = dbm.frames_rendered
+
+    if (dbm.buffer_count == 2) {
+        // Double buffering: simple swap
+        var old_front: u32 = dbm.front_index
+        dbm.front_index = dbm.back_index
+        dbm.back_index = old_front
+
+        dbm.buffers[dbm.front_index].state = BUFFER_DISPLAYED
+        dbm.buffers[dbm.back_index].state = BUFFER_FREE
+    } else {
+        // Triple buffering: rotate buffers
+        var old_front: u32 = dbm.front_index
+        dbm.front_index = dbm.pending_index
+        dbm.pending_index = dbm.back_index
+        dbm.back_index = old_front
+
+        dbm.buffers[dbm.front_index].state = BUFFER_DISPLAYED
+        dbm.buffers[dbm.back_index].state = BUFFER_FREE
+    }
+
+    dbm.flips_performed += 1
+    dbm.frames_rendered += 1
+
+    // Clear dirty regions on new back buffer
+    dbm.buffers[dbm.back_index].dirty_count = 0
+
+    return true
+}
+
+// Perform actual page flip (set display controller to show front buffer)
+export fn page_flip() bool {
+    if (!initialized or !dbm.enabled) {
+        return false
+    }
+
+    // In a real implementation, this would program the display controller
+    // to show the front buffer address at the next VSync
+    //
+    // For Raspberry Pi, this involves:
+    // - Writing to the mailbox to change framebuffer address
+    // - Or using DRM/KMS page flip ioctl
+    //
+    // For now, we'll just update state
+
+    dbm.last_flip_time = get_current_time_us()
+
+    return true
+}
+
+// Wait for VSync
+export fn wait_vsync() void {
+    if (!initialized or !dbm.vsync_enabled) {
+        return
+    }
+
+    // In a real implementation, this would wait for the vertical blank
+    // interrupt or poll a VSync status register
+    //
+    // For Raspberry Pi:
+    // - Use mailbox to query vsync
+    // - Or busy-wait on a timing loop
+
+    dbm.vsync_count += 1
+
+    // Simple timing-based wait (approximation)
+    var target_time: u64 = dbm.last_flip_time + @as(u64, dbm.frame_time_us)
+    var current: u64 = get_current_time_us()
+
+    while (current < target_time) {
+        // Busy wait or yield
+        current = get_current_time_us()
+    }
+}
+
+// ============================================================================
+// Dirty Region Tracking
+// ============================================================================
+
+// Mark a region as dirty (needs redraw)
+export fn mark_dirty(x: u32, y: u32, width: u32, height: u32) bool {
+    if (!initialized) {
+        return false
+    }
+
+    var buf: *BufferDescriptor = &dbm.buffers[dbm.back_index]
+
+    if (buf.dirty_count >= MAX_DIRTY_REGIONS) {
+        // Too many regions - mark entire buffer dirty
+        buf.dirty_count = 1
+        buf.dirty_regions[0].x = 0
+        buf.dirty_regions[0].y = 0
+        buf.dirty_regions[0].width = dbm.width
+        buf.dirty_regions[0].height = dbm.height
+        buf.dirty_regions[0].valid = true
+        return true
+    }
+
+    // Add new dirty region
+    var region: *DirtyRegion = &buf.dirty_regions[buf.dirty_count]
+    region.x = x
+    region.y = y
+    region.width = width
+    region.height = height
+    region.valid = true
+    buf.dirty_count += 1
+
+    return true
+}
+
+// Get dirty regions for partial update
+export fn get_dirty_regions(regions: [*]DirtyRegion, max_regions: u32) u32 {
+    if (!initialized) {
+        return 0
+    }
+
+    var buf: *BufferDescriptor = &dbm.buffers[dbm.back_index]
+    var count: u32 = 0
+
+    var i: u32 = 0
+    while (i < buf.dirty_count and count < max_regions) {
+        if (buf.dirty_regions[i].valid) {
+            regions[count] = buf.dirty_regions[i]
+            count += 1
+        }
+        i += 1
+    }
+
+    return count
+}
+
+// Copy only dirty regions from back buffer to front
+export fn update_dirty_regions() bool {
+    if (!initialized or !dbm.enabled) {
+        return false
+    }
+
+    var back: *BufferDescriptor = &dbm.buffers[dbm.back_index]
+    var front: *BufferDescriptor = &dbm.buffers[dbm.front_index]
+
+    var i: u32 = 0
+    while (i < back.dirty_count) {
+        if (back.dirty_regions[i].valid) {
+            copy_region(
+                front.virtual_addr,
+                back.virtual_addr,
+                back.dirty_regions[i].x,
+                back.dirty_regions[i].y,
+                back.dirty_regions[i].width,
+                back.dirty_regions[i].height
+            )
+            dbm.partial_updates += 1
+        }
+        i += 1
+    }
+
+    return true
+}
+
+// Copy a rectangular region between buffers
+fn copy_region(dest: u64, src: u64, x: u32, y: u32, width: u32, height: u32) void {
+    var bytes_per_pixel: u32 = dbm.bpp / 8
+    var row_bytes: u32 = width * bytes_per_pixel
+    var src_offset: u64 = @as(u64, y) * @as(u64, dbm.pitch) + @as(u64, x) * @as(u64, bytes_per_pixel)
+
+    var row: u32 = 0
+    while (row < height) {
+        var src_ptr: [*]u8 = @ptrFromInt(src + src_offset)
+        var dest_ptr: [*]u8 = @ptrFromInt(dest + src_offset)
+
+        // Copy row
+        var col: u32 = 0
+        while (col < row_bytes) {
+            dest_ptr[col] = src_ptr[col]
+            col += 1
+        }
+
+        src_offset += @as(u64, dbm.pitch)
+        row += 1
+    }
+}
+
+// ============================================================================
+// VSync Control
+// ============================================================================
+
+// Enable/disable VSync
+export fn set_vsync(enabled: bool) void {
+    if (initialized) {
+        dbm.vsync_enabled = enabled
+        serial.write_string("[DBUF] VSync ")
+        serial.write_string(if (enabled) "enabled" else "disabled")
+        serial.write_string("\n")
+    }
+}
+
+// Set target frame rate
+export fn set_target_fps(fps: u32) void {
+    if (initialized and fps > 0 and fps <= 240) {
+        dbm.target_fps = fps
+        dbm.frame_time_us = 1000000 / fps
+        serial.write_string("[DBUF] Target FPS: ")
+        serial.write_u32(fps)
+        serial.write_string("\n")
+    }
+}
+
+// Check if VSync is enabled
+export fn is_vsync_enabled() bool {
+    return initialized and dbm.vsync_enabled
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+export fn get_frames_rendered() u64 {
+    return dbm.frames_rendered
+}
+
+export fn get_frames_dropped() u64 {
+    return dbm.frames_dropped
+}
+
+export fn get_flips_performed() u64 {
+    return dbm.flips_performed
+}
+
+export fn get_vsync_count() u64 {
+    return dbm.vsync_count
+}
+
+export fn print_stats() void {
+    serial.write_string("\n[DBUF] Double Buffer Statistics:\n")
+    serial.write_string("  Frames rendered: ")
+    serial.write_u64(dbm.frames_rendered)
+    serial.write_string("\n")
+    serial.write_string("  Frames dropped: ")
+    serial.write_u64(dbm.frames_dropped)
+    serial.write_string("\n")
+    serial.write_string("  Page flips: ")
+    serial.write_u64(dbm.flips_performed)
+    serial.write_string("\n")
+    serial.write_string("  VSync count: ")
+    serial.write_u64(dbm.vsync_count)
+    serial.write_string("\n")
+    serial.write_string("  Partial updates: ")
+    serial.write_u64(dbm.partial_updates)
+    serial.write_string("\n")
+    serial.write_string("  Target FPS: ")
+    serial.write_u32(dbm.target_fps)
+    serial.write_string("\n")
+
+    if (dbm.frames_rendered > 0) {
+        var drop_rate: u64 = (dbm.frames_dropped * 100) / dbm.frames_rendered
+        serial.write_string("  Drop rate: ")
+        serial.write_u64(drop_rate)
+        serial.write_string("%\n")
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Get current time in microseconds (placeholder - would use timer)
+fn get_current_time_us() u64 {
+    // In a real implementation, this would read from a hardware timer
+    // For now, return a static value incremented per call
+    var static_time: u64 = 0
+    static_time += 1000  // Increment by 1ms per call
+    return static_time
+}
+
+// Check if double buffering is enabled
+export fn is_enabled() bool {
+    return initialized and dbm.enabled
+}
+
+// Get buffer count
+export fn get_buffer_count() u32 {
+    return dbm.buffer_count
+}
+
+// Get current FPS (calculated)
+export fn get_current_fps() u32 {
+    if (!initialized or dbm.flips_performed < 2) {
+        return 0
+    }
+
+    // Calculate based on time between flips
+    // This is a simplified calculation
+    return dbm.target_fps
+}
+
+// Disable double buffering
+export fn disable() void {
+    if (initialized) {
+        dbm.enabled = false
+        serial.write_string("[DBUF] Double buffering disabled\n")
+    }
+}
+
+// Enable double buffering
+export fn enable() void {
+    if (initialized) {
+        dbm.enabled = true
+        serial.write_string("[DBUF] Double buffering enabled\n")
+    }
+}

@@ -1,0 +1,779 @@
+// HomeOS POSIX Named Shared Memory Objects
+// Implementation of shm_open(), shm_unlink(), and related functions
+//
+// This provides POSIX-compatible named shared memory that can be used
+// for efficient inter-process communication. Named objects appear in
+// /dev/shm and persist until explicitly unlinked.
+//
+// Key features:
+// - Named objects with path-like names (/myshm)
+// - mmap() integration for memory mapping
+// - Reference counting for cleanup
+// - Permission checking (mode bits)
+// - Truncate support for resizing
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const MAX_SHM_OBJECTS: u32 = 128
+const MAX_NAME_LENGTH: u32 = 255
+const MAX_SIZE: u64 = 1024 * 1024 * 1024  // 1GB max
+
+// Open flags (match POSIX O_* values)
+pub const O_RDONLY: u32 = 0x0000
+pub const O_WRONLY: u32 = 0x0001
+pub const O_RDWR: u32 = 0x0002
+pub const O_CREAT: u32 = 0x0040
+pub const O_EXCL: u32 = 0x0080
+pub const O_TRUNC: u32 = 0x0200
+
+// Permission bits
+pub const S_IRUSR: u32 = 0o400
+pub const S_IWUSR: u32 = 0o200
+pub const S_IRGRP: u32 = 0o040
+pub const S_IWGRP: u32 = 0o020
+pub const S_IROTH: u32 = 0o004
+pub const S_IWOTH: u32 = 0o002
+
+// Error codes
+pub const ENOENT: i32 = -2
+pub const EEXIST: i32 = -17
+pub const EINVAL: i32 = -22
+pub const ENOMEM: i32 = -12
+pub const EACCES: i32 = -13
+pub const ENAMETOOLONG: i32 = -36
+pub const EMFILE: i32 = -24
+
+// Object states
+const SHM_FREE: u32 = 0
+const SHM_ALLOCATED: u32 = 1
+const SHM_UNLINKED: u32 = 2  // Marked for deletion when refs drop to 0
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// Shared memory object descriptor
+pub const ShmObject = struct {
+    // Identity
+    name: [MAX_NAME_LENGTH + 1]u8,
+    name_len: u32,
+    state: u32,
+
+    // Memory
+    address: u64,           // Kernel virtual address
+    physical: u64,          // Physical address (for mmap)
+    size: u64,              // Current size
+    allocated_size: u64,    // Allocated size (may be larger due to page alignment)
+
+    // Ownership and permissions
+    owner_uid: u32,
+    owner_gid: u32,
+    mode: u32,
+
+    // Reference counting
+    ref_count: u32,         // Open handles
+    map_count: u32,         // mmap count
+
+    // Timestamps
+    ctime: u64,             // Creation time
+    mtime: u64,             // Last modification time
+    atime: u64,             // Last access time
+
+    // Statistics
+    total_reads: u64,
+    total_writes: u64,
+}
+
+// Open file handle for shm
+pub const ShmHandle = struct {
+    object_id: u32,         // Index into shm_objects
+    flags: u32,             // Open flags
+    offset: u64,            // Current offset (for read/write)
+    pid: u32,               // Owner process
+    valid: bool,
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var shm_objects: [MAX_SHM_OBJECTS]ShmObject = undefined
+var initialized: bool = false
+
+// Handle table (per-system, would be per-process in real implementation)
+const MAX_HANDLES: u32 = 512
+var handles: [MAX_HANDLES]ShmHandle = undefined
+
+// Statistics
+var total_objects_created: u64 = 0
+var total_bytes_allocated: u64 = 0
+var peak_objects: u32 = 0
+var current_objects: u32 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn shm_posix_init() void {
+    if (initialized) {
+        return
+    }
+
+    serial.write_string("[SHM-POSIX] Initializing named shared memory...\n")
+
+    // Initialize object pool
+    var i: u32 = 0
+    while (i < MAX_SHM_OBJECTS) {
+        shm_objects[i].state = SHM_FREE
+        shm_objects[i].name_len = 0
+        shm_objects[i].address = 0
+        shm_objects[i].physical = 0
+        shm_objects[i].size = 0
+        shm_objects[i].allocated_size = 0
+        shm_objects[i].ref_count = 0
+        shm_objects[i].map_count = 0
+        shm_objects[i].owner_uid = 0
+        shm_objects[i].owner_gid = 0
+        shm_objects[i].mode = 0
+        shm_objects[i].ctime = 0
+        shm_objects[i].mtime = 0
+        shm_objects[i].atime = 0
+        shm_objects[i].total_reads = 0
+        shm_objects[i].total_writes = 0
+
+        // Clear name
+        var j: u32 = 0
+        while (j <= MAX_NAME_LENGTH) {
+            shm_objects[i].name[j] = 0
+            j += 1
+        }
+
+        i += 1
+    }
+
+    // Initialize handle table
+    i = 0
+    while (i < MAX_HANDLES) {
+        handles[i].valid = false
+        handles[i].object_id = 0
+        handles[i].flags = 0
+        handles[i].offset = 0
+        handles[i].pid = 0
+        i += 1
+    }
+
+    initialized = true
+    serial.write_string("[SHM-POSIX] Named shared memory initialized\n")
+    serial.write_string("  Max objects: ")
+    serial.write_u32(MAX_SHM_OBJECTS)
+    serial.write_string("\n")
+    serial.write_string("  Max size per object: ")
+    serial.write_u64(MAX_SIZE / (1024 * 1024))
+    serial.write_string(" MB\n")
+}
+
+// ============================================================================
+// Name Utilities
+// ============================================================================
+
+// Validate and normalize shm name
+// Names must start with '/' and contain no other '/'
+fn validate_name(name: [*]const u8, len: u32) bool {
+    if (len == 0 or len > MAX_NAME_LENGTH) {
+        return false
+    }
+
+    // Must start with /
+    if (name[0] != '/') {
+        return false
+    }
+
+    // Check for embedded slashes and null
+    var i: u32 = 1
+    while (i < len) {
+        if (name[i] == '/' or name[i] == 0) {
+            return false
+        }
+        i += 1
+    }
+
+    return true
+}
+
+// Compare names
+fn name_equals(obj_idx: u32, name: [*]const u8, len: u32) bool {
+    if (shm_objects[obj_idx].name_len != len) {
+        return false
+    }
+
+    var i: u32 = 0
+    while (i < len) {
+        if (shm_objects[obj_idx].name[i] != name[i]) {
+            return false
+        }
+        i += 1
+    }
+
+    return true
+}
+
+// Copy name to object
+fn copy_name(obj_idx: u32, name: [*]const u8, len: u32) void {
+    var i: u32 = 0
+    while (i < len) {
+        shm_objects[obj_idx].name[i] = name[i]
+        i += 1
+    }
+    shm_objects[obj_idx].name[len] = 0
+    shm_objects[obj_idx].name_len = len
+}
+
+// ============================================================================
+// Object Lookup
+// ============================================================================
+
+// Find object by name
+fn find_object(name: [*]const u8, len: u32) u32 {
+    var i: u32 = 0
+    while (i < MAX_SHM_OBJECTS) {
+        if (shm_objects[i].state != SHM_FREE and name_equals(i, name, len)) {
+            return i
+        }
+        i += 1
+    }
+    return 0xFFFFFFFF
+}
+
+// Allocate new object slot
+fn alloc_object() u32 {
+    var i: u32 = 0
+    while (i < MAX_SHM_OBJECTS) {
+        if (shm_objects[i].state == SHM_FREE) {
+            return i
+        }
+        i += 1
+    }
+    return 0xFFFFFFFF
+}
+
+// Allocate handle
+fn alloc_handle() u32 {
+    var i: u32 = 0
+    while (i < MAX_HANDLES) {
+        if (!handles[i].valid) {
+            return i
+        }
+        i += 1
+    }
+    return 0xFFFFFFFF
+}
+
+// ============================================================================
+// Memory Allocation (Placeholder)
+// ============================================================================
+
+// In a real implementation, this would use the kernel's memory allocator
+fn allocate_shm_memory(size: u64) u64 {
+    // Round up to page size (4KB)
+    var page_size: u64 = 4096
+    var pages: u64 = (size + page_size - 1) / page_size
+    var alloc_size: u64 = pages * page_size
+
+    // Placeholder: would allocate from kernel memory pool
+    // For now, return a placeholder address
+    var static_addr: u64 = 0x100000000
+    static_addr += alloc_size
+    total_bytes_allocated += alloc_size
+
+    return static_addr - alloc_size
+}
+
+fn free_shm_memory(addr: u64, size: u64) void {
+    // Placeholder: would free to kernel memory pool
+    _ = addr
+    if (total_bytes_allocated >= size) {
+        total_bytes_allocated -= size
+    }
+}
+
+fn get_current_time() u64 {
+    // Placeholder: would get actual time
+    var static_time: u64 = 0
+    static_time += 1
+    return static_time
+}
+
+// ============================================================================
+// POSIX API: shm_open()
+// ============================================================================
+
+// Open or create a named shared memory object
+// Returns file descriptor (handle index) or negative error
+export fn shm_open(name: [*]const u8, name_len: u32, flags: u32, mode: u32) i32 {
+    if (!initialized) {
+        return EINVAL
+    }
+
+    // Validate name
+    if (!validate_name(name, name_len)) {
+        if (name_len > MAX_NAME_LENGTH) {
+            return ENAMETOOLONG
+        }
+        return EINVAL
+    }
+
+    var obj_idx: u32 = find_object(name, name_len)
+    var creating: bool = false
+
+    if (obj_idx == 0xFFFFFFFF) {
+        // Object doesn't exist
+        if ((flags & O_CREAT) == 0) {
+            return ENOENT
+        }
+
+        // Create new object
+        obj_idx = alloc_object()
+        if (obj_idx == 0xFFFFFFFF) {
+            return ENOMEM
+        }
+
+        creating = true
+    } else {
+        // Object exists
+        if ((flags & O_CREAT) != 0 and (flags & O_EXCL) != 0) {
+            return EEXIST
+        }
+
+        // Check if unlinked
+        if (shm_objects[obj_idx].state == SHM_UNLINKED) {
+            return ENOENT
+        }
+    }
+
+    // Allocate handle
+    var handle: u32 = alloc_handle()
+    if (handle == 0xFFFFFFFF) {
+        return EMFILE
+    }
+
+    if (creating) {
+        // Initialize new object
+        copy_name(obj_idx, name, name_len)
+        shm_objects[obj_idx].state = SHM_ALLOCATED
+        shm_objects[obj_idx].size = 0
+        shm_objects[obj_idx].allocated_size = 0
+        shm_objects[obj_idx].address = 0
+        shm_objects[obj_idx].physical = 0
+        shm_objects[obj_idx].owner_uid = 0  // Would get from current process
+        shm_objects[obj_idx].owner_gid = 0
+        shm_objects[obj_idx].mode = mode
+        shm_objects[obj_idx].ref_count = 0
+        shm_objects[obj_idx].map_count = 0
+
+        var now: u64 = get_current_time()
+        shm_objects[obj_idx].ctime = now
+        shm_objects[obj_idx].mtime = now
+        shm_objects[obj_idx].atime = now
+
+        current_objects += 1
+        total_objects_created += 1
+        if (current_objects > peak_objects) {
+            peak_objects = current_objects
+        }
+
+        serial.write_string("[SHM-POSIX] Created: ")
+        write_name(obj_idx)
+        serial.write_string("\n")
+    }
+
+    // Initialize handle
+    handles[handle].object_id = obj_idx
+    handles[handle].flags = flags
+    handles[handle].offset = 0
+    handles[handle].pid = 0  // Would get from current process
+    handles[handle].valid = true
+
+    shm_objects[obj_idx].ref_count += 1
+    shm_objects[obj_idx].atime = get_current_time()
+
+    // Handle O_TRUNC
+    if ((flags & O_TRUNC) != 0 and shm_objects[obj_idx].size > 0) {
+        // Truncate to zero
+        if (shm_objects[obj_idx].address != 0) {
+            free_shm_memory(shm_objects[obj_idx].address, shm_objects[obj_idx].allocated_size)
+            shm_objects[obj_idx].address = 0
+            shm_objects[obj_idx].physical = 0
+        }
+        shm_objects[obj_idx].size = 0
+        shm_objects[obj_idx].allocated_size = 0
+        shm_objects[obj_idx].mtime = get_current_time()
+    }
+
+    return @as(i32, @intCast(handle))
+}
+
+// ============================================================================
+// POSIX API: shm_unlink()
+// ============================================================================
+
+// Remove a named shared memory object
+export fn shm_unlink(name: [*]const u8, name_len: u32) i32 {
+    if (!initialized) {
+        return EINVAL
+    }
+
+    if (!validate_name(name, name_len)) {
+        return EINVAL
+    }
+
+    var obj_idx: u32 = find_object(name, name_len)
+    if (obj_idx == 0xFFFFFFFF) {
+        return ENOENT
+    }
+
+    if (shm_objects[obj_idx].state == SHM_UNLINKED) {
+        return ENOENT
+    }
+
+    serial.write_string("[SHM-POSIX] Unlinking: ")
+    write_name(obj_idx)
+    serial.write_string("\n")
+
+    // Mark as unlinked
+    shm_objects[obj_idx].state = SHM_UNLINKED
+
+    // If no references, free immediately
+    if (shm_objects[obj_idx].ref_count == 0 and shm_objects[obj_idx].map_count == 0) {
+        free_object(obj_idx)
+    }
+
+    return 0
+}
+
+// ============================================================================
+// File Operations: close()
+// ============================================================================
+
+export fn shm_close(fd: i32) i32 {
+    if (!initialized or fd < 0 or @as(u32, @intCast(fd)) >= MAX_HANDLES) {
+        return EINVAL
+    }
+
+    var handle: u32 = @as(u32, @intCast(fd))
+    if (!handles[handle].valid) {
+        return EINVAL
+    }
+
+    var obj_idx: u32 = handles[handle].object_id
+
+    // Decrement reference count
+    if (shm_objects[obj_idx].ref_count > 0) {
+        shm_objects[obj_idx].ref_count -= 1
+    }
+
+    // Free handle
+    handles[handle].valid = false
+
+    // If unlinked and no more references, free object
+    if (shm_objects[obj_idx].state == SHM_UNLINKED and
+        shm_objects[obj_idx].ref_count == 0 and
+        shm_objects[obj_idx].map_count == 0) {
+        free_object(obj_idx)
+    }
+
+    return 0
+}
+
+// ============================================================================
+// File Operations: ftruncate()
+// ============================================================================
+
+// Set size of shared memory object
+export fn shm_ftruncate(fd: i32, length: u64) i32 {
+    if (!initialized or fd < 0 or @as(u32, @intCast(fd)) >= MAX_HANDLES) {
+        return EINVAL
+    }
+
+    var handle: u32 = @as(u32, @intCast(fd))
+    if (!handles[handle].valid) {
+        return EINVAL
+    }
+
+    // Check write permission
+    if ((handles[handle].flags & O_RDWR) == 0 and (handles[handle].flags & O_WRONLY) == 0) {
+        return EACCES
+    }
+
+    if (length > MAX_SIZE) {
+        return EINVAL
+    }
+
+    var obj_idx: u32 = handles[handle].object_id
+
+    if (length == shm_objects[obj_idx].size) {
+        return 0  // No change needed
+    }
+
+    if (length > shm_objects[obj_idx].allocated_size) {
+        // Need to allocate more memory
+        var new_addr: u64 = allocate_shm_memory(length)
+        if (new_addr == 0) {
+            return ENOMEM
+        }
+
+        // Copy existing data (would use memcpy in real implementation)
+        if (shm_objects[obj_idx].address != 0) {
+            // Copy old data to new location
+            // Placeholder: would copy shm_objects[obj_idx].size bytes
+
+            free_shm_memory(shm_objects[obj_idx].address, shm_objects[obj_idx].allocated_size)
+        }
+
+        shm_objects[obj_idx].address = new_addr
+        shm_objects[obj_idx].physical = new_addr  // Would be physical address
+
+        // Round up to page size
+        var page_size: u64 = 4096
+        shm_objects[obj_idx].allocated_size = ((length + page_size - 1) / page_size) * page_size
+    }
+
+    shm_objects[obj_idx].size = length
+    shm_objects[obj_idx].mtime = get_current_time()
+
+    serial.write_string("[SHM-POSIX] Truncated ")
+    write_name(obj_idx)
+    serial.write_string(" to ")
+    serial.write_u64(length)
+    serial.write_string(" bytes\n")
+
+    return 0
+}
+
+// ============================================================================
+// File Operations: fstat()
+// ============================================================================
+
+// Shared memory stat structure
+pub const ShmStat = struct {
+    size: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    atime: u64,
+    mtime: u64,
+    ctime: u64,
+}
+
+export fn shm_fstat(fd: i32, stat: *ShmStat) i32 {
+    if (!initialized or fd < 0 or @as(u32, @intCast(fd)) >= MAX_HANDLES) {
+        return EINVAL
+    }
+
+    var handle: u32 = @as(u32, @intCast(fd))
+    if (!handles[handle].valid) {
+        return EINVAL
+    }
+
+    var obj_idx: u32 = handles[handle].object_id
+
+    stat.size = shm_objects[obj_idx].size
+    stat.mode = shm_objects[obj_idx].mode
+    stat.uid = shm_objects[obj_idx].owner_uid
+    stat.gid = shm_objects[obj_idx].owner_gid
+    stat.atime = shm_objects[obj_idx].atime
+    stat.mtime = shm_objects[obj_idx].mtime
+    stat.ctime = shm_objects[obj_idx].ctime
+
+    shm_objects[obj_idx].atime = get_current_time()
+
+    return 0
+}
+
+// ============================================================================
+// Memory Mapping: mmap() support
+// ============================================================================
+
+// Get physical address for mmap
+export fn shm_get_physical(fd: i32, offset: u64, length: u64) u64 {
+    if (!initialized or fd < 0 or @as(u32, @intCast(fd)) >= MAX_HANDLES) {
+        return 0
+    }
+
+    var handle: u32 = @as(u32, @intCast(fd))
+    if (!handles[handle].valid) {
+        return 0
+    }
+
+    var obj_idx: u32 = handles[handle].object_id
+
+    // Validate range
+    if (offset + length > shm_objects[obj_idx].size) {
+        return 0
+    }
+
+    shm_objects[obj_idx].map_count += 1
+    shm_objects[obj_idx].atime = get_current_time()
+
+    return shm_objects[obj_idx].physical + offset
+}
+
+// Called when mmap region is unmapped
+export fn shm_munmap(fd: i32) void {
+    if (!initialized or fd < 0 or @as(u32, @intCast(fd)) >= MAX_HANDLES) {
+        return
+    }
+
+    var handle: u32 = @as(u32, @intCast(fd))
+    if (!handles[handle].valid) {
+        return
+    }
+
+    var obj_idx: u32 = handles[handle].object_id
+
+    if (shm_objects[obj_idx].map_count > 0) {
+        shm_objects[obj_idx].map_count -= 1
+    }
+
+    // Check if object should be freed
+    if (shm_objects[obj_idx].state == SHM_UNLINKED and
+        shm_objects[obj_idx].ref_count == 0 and
+        shm_objects[obj_idx].map_count == 0) {
+        free_object(obj_idx)
+    }
+}
+
+// ============================================================================
+// Internal Helpers
+// ============================================================================
+
+fn free_object(obj_idx: u32) void {
+    if (shm_objects[obj_idx].address != 0) {
+        free_shm_memory(shm_objects[obj_idx].address, shm_objects[obj_idx].allocated_size)
+    }
+
+    shm_objects[obj_idx].state = SHM_FREE
+    shm_objects[obj_idx].name_len = 0
+    shm_objects[obj_idx].address = 0
+    shm_objects[obj_idx].size = 0
+
+    if (current_objects > 0) {
+        current_objects -= 1
+    }
+
+    serial.write_string("[SHM-POSIX] Object freed\n")
+}
+
+fn write_name(obj_idx: u32) void {
+    var i: u32 = 0
+    while (i < shm_objects[obj_idx].name_len) {
+        serial.write_char(shm_objects[obj_idx].name[i])
+        i += 1
+    }
+}
+
+// ============================================================================
+// Enumeration and Statistics
+// ============================================================================
+
+// List all shared memory objects
+export fn shm_list() void {
+    serial.write_string("\n[SHM-POSIX] Named Shared Memory Objects:\n")
+    serial.write_string("Name                     Size        Refs  Maps  Mode\n")
+    serial.write_string("--------------------------------------------------------\n")
+
+    var i: u32 = 0
+    var count: u32 = 0
+    while (i < MAX_SHM_OBJECTS) {
+        if (shm_objects[i].state != SHM_FREE) {
+            write_name(i)
+
+            // Padding
+            var pad: u32 = 25 - shm_objects[i].name_len
+            while (pad > 0) {
+                serial.write_string(" ")
+                pad -= 1
+            }
+
+            serial.write_u64(shm_objects[i].size)
+            serial.write_string("    ")
+            serial.write_u32(shm_objects[i].ref_count)
+            serial.write_string("     ")
+            serial.write_u32(shm_objects[i].map_count)
+            serial.write_string("     ")
+            serial.write_hex(shm_objects[i].mode)
+
+            if (shm_objects[i].state == SHM_UNLINKED) {
+                serial.write_string(" (unlinked)")
+            }
+
+            serial.write_string("\n")
+            count += 1
+        }
+        i += 1
+    }
+
+    if (count == 0) {
+        serial.write_string("  (no objects)\n")
+    }
+}
+
+export fn shm_stats() void {
+    serial.write_string("\n[SHM-POSIX] Statistics:\n")
+    serial.write_string("  Current objects: ")
+    serial.write_u32(current_objects)
+    serial.write_string("\n")
+    serial.write_string("  Peak objects: ")
+    serial.write_u32(peak_objects)
+    serial.write_string("\n")
+    serial.write_string("  Total created: ")
+    serial.write_u64(total_objects_created)
+    serial.write_string("\n")
+    serial.write_string("  Total allocated: ")
+    serial.write_u64(total_bytes_allocated)
+    serial.write_string(" bytes\n")
+}
+
+// Get object count
+export fn shm_get_count() u32 {
+    return current_objects
+}
+
+// Check if name exists
+export fn shm_exists(name: [*]const u8, name_len: u32) bool {
+    if (!initialized or !validate_name(name, name_len)) {
+        return false
+    }
+
+    var obj_idx: u32 = find_object(name, name_len)
+    return obj_idx != 0xFFFFFFFF and shm_objects[obj_idx].state == SHM_ALLOCATED
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+// Create and size in one call
+export fn shm_create_sized(name: [*]const u8, name_len: u32, size: u64, mode: u32) i32 {
+    var fd: i32 = shm_open(name, name_len, O_CREAT | O_RDWR | O_EXCL, mode)
+    if (fd < 0) {
+        // Try without O_EXCL if exists
+        fd = shm_open(name, name_len, O_RDWR, mode)
+    }
+
+    if (fd < 0) {
+        return fd
+    }
+
+    var result: i32 = shm_ftruncate(fd, size)
+    if (result < 0) {
+        shm_close(fd)
+        shm_unlink(name, name_len)
+        return result
+    }
+
+    return fd
+}

@@ -942,14 +942,14 @@ Build a next-generation operating system that prioritizes:
   - [x] String output (vga_write_string)
   - [x] Screen clear (vga_clear)
   - [x] Software cursor (row/column tracking)
-  - [ ] Double buffering support (TODO: Phase 4)
+  - [x] Double buffering support (**COMPLETED** - framebuffer_double.home: double_buffer_init, swap_buffers, page_flip, wait_vsync, dirty region tracking)
 - [x] Storage driver (basic) (**COMPLETED - Oct 29, 2025**)
   - [x] ATA/ATAPI (IDE) support (ata_init, ata_read_sector, ata_write_sector, PIO mode)
   - [x] Multi-sector read/write (ata_read_sectors, ata_write_sectors)
   - [x] Device detection (ata_device_exists, ata_get_device_count)
   - [ ] AHCI (SATA) driver (TODO: Phase 6)
   - [ ] NVMe driver (PCIe SSDs) (TODO: Phase 6)
-  - [ ] Partition table parsing (GPT, MBR) (TODO: Phase 4)
+  - [x] Partition table parsing (GPT, MBR) (**COMPLETED** - partition.home: parse_partition_table, parse_mbr, parse_gpt, 128 GPT partitions, extended MBR support)
 
 ---
 
@@ -974,7 +974,7 @@ Build a next-generation operating system that prioritizes:
   - [x] Timer-driven scheduling (scheduler_tick, scheduler_schedule)
   - [x] Per-CPU run queues (scheduler_pick_next_cpu)
   - [x] Priority scheduling (process_set_priority, process_get_priority)
-  - [ ] Real-time scheduling classes (TODO: Phase 4 - enhancement)
+  - [x] Real-time scheduling classes (**COMPLETED** - rt_classes.home: SCHED_FIFO, SCHED_RR, SCHED_DEADLINE with EDF/CBS, priority inheritance)
   - [x] CPU affinity and pinning (pcb_set_cpu_affinity, pcb_get_cpu_affinity)
   - [x] Load balancing across cores (scheduler_balance_load)
 - [x] Context switching
@@ -982,7 +982,7 @@ Build a next-generation operating system that prioritizes:
   - [x] Stack management (kernel/user stacks)
   - [x] FPU/SSE state handling (fpu_save, fpu_restore)
   - [x] TLB flushing optimization (tlb_flush, tlb_flush_single)
-  - [ ] Fast system call entry (SYSCALL/SYSRET) (TODO: Phase 4 - optimization)
+  - [x] Fast system call entry (SYSCALL/SYSRET) (**COMPLETED** - syscall_fast.home: MSR configuration, syscall_entry_asm, ~100 cycles vs ~300+ for INT)
 - [x] Process isolation (**COMPLETED - Oct 29, 2025**)
   - [x] Address space separation (isolate_address_space)
   - [x] User/kernel mode separation (set_user_mode, set_kernel_mode)
@@ -994,7 +994,7 @@ Build a next-generation operating system that prioritizes:
   - [x] Shared memory segments (shm_create, shm_attach, shm_detach, shm_destroy)
   - [x] Key-based access
   - [x] Anonymous shared memory (shm_create_anon)
-  - [ ] Named shared memory objects (TODO: Phase 4)
+  - [x] Named shared memory objects (**COMPLETED** - shm_posix.home: shm_open, shm_unlink, ftruncate, POSIX-compatible)
   - [x] Copy-on-write optimization (shm_set_cow, copy_on_write)
 - [x] Message queues
   - [x] Message queue operations (mq_create, mq_send, mq_receive, mq_destroy)

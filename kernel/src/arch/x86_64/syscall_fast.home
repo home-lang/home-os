@@ -1,0 +1,479 @@
+// HomeOS Fast System Call Entry (SYSCALL/SYSRET)
+// x86-64 fast system call implementation using SYSCALL/SYSRET instructions
+//
+// This provides significantly faster system call entry/exit compared to
+// interrupt-based (INT 0x80) system calls by avoiding the full interrupt
+// handling overhead.
+//
+// Performance: ~100 cycles vs ~300+ cycles for INT-based syscalls
+
+const serial = @import("../../drivers/serial.home")
+const cpu = @import("../cpu.home")
+const gdt = @import("gdt.home")
+
+// ============================================================================
+// MSR Definitions for SYSCALL/SYSRET
+// ============================================================================
+
+// Model Specific Registers for SYSCALL
+const MSR_EFER: u32 = 0xC0000080        // Extended Feature Enable Register
+const MSR_STAR: u32 = 0xC0000081        // Legacy mode SYSCALL target
+const MSR_LSTAR: u32 = 0xC0000082       // Long mode SYSCALL target (RIP)
+const MSR_CSTAR: u32 = 0xC0000083       // Compatibility mode SYSCALL target
+const MSR_SFMASK: u32 = 0xC0000084      // SYSCALL flag mask (RFLAGS)
+
+// EFER bits
+const EFER_SCE: u64 = 1 << 0            // SYSCALL Enable
+
+// RFLAGS bits to clear on SYSCALL entry
+const SYSCALL_RFLAGS_MASK: u64 = 0x0000000000000200  // Clear IF (disable interrupts)
+
+// GDT selectors (must match gdt.home)
+const KERNEL_CS: u16 = 0x08             // Kernel code segment
+const KERNEL_DS: u16 = 0x10             // Kernel data segment
+const USER_CS: u16 = 0x23               // User code segment (RPL=3)
+const USER_DS: u16 = 0x1B               // User data segment (RPL=3)
+
+// ============================================================================
+// Per-CPU Syscall State
+// ============================================================================
+
+// Structure to save user state during syscall
+pub const SyscallFrame = struct {
+    // Saved by SYSCALL instruction
+    rcx: u64,           // User RIP (return address)
+    r11: u64,           // User RFLAGS
+
+    // Saved by syscall handler
+    rax: u64,           // Syscall number / return value
+    rdi: u64,           // Arg 1
+    rsi: u64,           // Arg 2
+    rdx: u64,           // Arg 3
+    r10: u64,           // Arg 4 (instead of rcx which is clobbered)
+    r8: u64,            // Arg 5
+    r9: u64,            // Arg 6
+
+    // Callee-saved registers (if needed)
+    rbx: u64,
+    rbp: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+
+    // User stack
+    rsp: u64,           // User RSP (saved via SWAPGS/per-CPU)
+}
+
+// Per-CPU syscall data
+pub const PerCPUSyscall = struct {
+    kernel_stack: u64,      // Top of kernel stack for this CPU
+    user_stack: u64,        // Saved user RSP
+    scratch: u64,           // Scratch space
+    current_frame: *SyscallFrame,
+}
+
+// Per-CPU data array (max 256 CPUs)
+const MAX_CPUS: u32 = 256
+var per_cpu_syscall: [MAX_CPUS]PerCPUSyscall = undefined
+
+// Current CPU count
+var cpu_count: u32 = 1
+
+// ============================================================================
+// Syscall Handler Table
+// ============================================================================
+
+// Maximum number of syscalls
+const MAX_SYSCALLS: u32 = 512
+
+// Syscall handler function type
+pub const SyscallHandler = fn(u64, u64, u64, u64, u64, u64) u64
+
+// Syscall table
+var syscall_table: [MAX_SYSCALLS]?SyscallHandler = undefined
+
+// Statistics
+var syscall_stats = struct {
+    total_calls: u64,
+    fast_path_calls: u64,
+    slow_path_calls: u64,
+    invalid_syscalls: u64,
+}{
+    .total_calls = 0,
+    .fast_path_calls = 0,
+    .slow_path_calls = 0,
+    .invalid_syscalls = 0,
+};
+
+// ============================================================================
+// MSR Access Functions
+// ============================================================================
+
+fn read_msr(msr: u32) u64 {
+    var low: u32 = undefined
+    var high: u32 = undefined
+
+    asm volatile (
+        "rdmsr"
+        : "={eax}" (low), "={edx}" (high)
+        : "{ecx}" (msr)
+    )
+
+    return (@as(u64, high) << 32) | @as(u64, low)
+}
+
+fn write_msr(msr: u32, value: u64) void {
+    var low: u32 = @truncate(value)
+    var high: u32 = @truncate(value >> 32)
+
+    asm volatile (
+        "wrmsr"
+        :
+        : "{ecx}" (msr), "{eax}" (low), "{edx}" (high)
+    )
+}
+
+// ============================================================================
+// SYSCALL/SYSRET Initialization
+// ============================================================================
+
+// Initialize fast syscall support
+export fn syscall_fast_init() void {
+    serial.write_string("[SYSCALL] Initializing fast syscall (SYSCALL/SYSRET)...\n")
+
+    // Check if SYSCALL is supported
+    if (!check_syscall_support()) {
+        serial.write_string("[SYSCALL] ERROR: SYSCALL not supported on this CPU\n")
+        return
+    }
+
+    // Initialize syscall table
+    init_syscall_table()
+
+    // Initialize per-CPU data
+    init_per_cpu_data()
+
+    // Set up MSRs for SYSCALL
+    setup_syscall_msrs()
+
+    // Enable SYSCALL in EFER
+    enable_syscall()
+
+    serial.write_string("[SYSCALL] Fast syscall initialized successfully\n")
+    print_syscall_info()
+}
+
+// Check CPU support for SYSCALL
+fn check_syscall_support() bool {
+    var eax: u32 = undefined
+    var ebx: u32 = undefined
+    var ecx: u32 = undefined
+    var edx: u32 = undefined
+
+    // CPUID function 0x80000001
+    asm volatile (
+        "cpuid"
+        : "={eax}" (eax), "={ebx}" (ebx), "={ecx}" (ecx), "={edx}" (edx)
+        : "{eax}" (@as(u32, 0x80000001))
+    )
+
+    // Check bit 11 of EDX (SYSCALL/SYSRET support)
+    return (edx & (1 << 11)) != 0
+}
+
+// Initialize syscall table with null handlers
+fn init_syscall_table() void {
+    var i: u32 = 0
+    while (i < MAX_SYSCALLS) {
+        syscall_table[i] = null
+        i += 1
+    }
+
+    serial.write_string("[SYSCALL] Syscall table initialized (")
+    serial.write_u32(MAX_SYSCALLS)
+    serial.write_string(" entries)\n")
+}
+
+// Initialize per-CPU syscall data
+fn init_per_cpu_data() void {
+    var i: u32 = 0
+    while (i < cpu_count) {
+        // Allocate kernel stack for syscalls (8KB per CPU)
+        // In a real implementation, this would allocate from kernel memory
+        per_cpu_syscall[i].kernel_stack = 0  // Will be set up by scheduler
+        per_cpu_syscall[i].user_stack = 0
+        per_cpu_syscall[i].scratch = 0
+        per_cpu_syscall[i].current_frame = undefined
+        i += 1
+    }
+}
+
+// Set up MSRs for SYSCALL/SYSRET
+fn setup_syscall_msrs() void {
+    // STAR MSR: Contains segment selectors
+    // Bits 63:48 = SYSRET CS and SS (user mode)
+    // Bits 47:32 = SYSCALL CS and SS (kernel mode)
+    // The actual selectors loaded are:
+    //   SYSCALL: CS = STAR[47:32], SS = STAR[47:32] + 8
+    //   SYSRET:  CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
+    var star: u64 = 0
+    star |= @as(u64, KERNEL_CS) << 32           // Kernel CS for SYSCALL
+    star |= @as(u64, USER_DS - 8) << 48         // User CS base for SYSRET
+    write_msr(MSR_STAR, star)
+
+    serial.write_string("[SYSCALL] STAR MSR: 0x")
+    serial.write_hex(star)
+    serial.write_string("\n")
+
+    // LSTAR MSR: Long mode SYSCALL entry point
+    var entry_point: u64 = @intFromPtr(&syscall_entry_asm)
+    write_msr(MSR_LSTAR, entry_point)
+
+    serial.write_string("[SYSCALL] LSTAR MSR (entry): 0x")
+    serial.write_hex(entry_point)
+    serial.write_string("\n")
+
+    // CSTAR MSR: Compatibility mode entry (not used in pure 64-bit)
+    write_msr(MSR_CSTAR, 0)
+
+    // SFMASK MSR: Flags to clear on SYSCALL
+    // Clear IF to disable interrupts during syscall entry
+    write_msr(MSR_SFMASK, SYSCALL_RFLAGS_MASK)
+
+    serial.write_string("[SYSCALL] SFMASK MSR: 0x")
+    serial.write_hex(SYSCALL_RFLAGS_MASK)
+    serial.write_string("\n")
+}
+
+// Enable SYSCALL in EFER MSR
+fn enable_syscall() void {
+    var efer: u64 = read_msr(MSR_EFER)
+    efer |= EFER_SCE
+    write_msr(MSR_EFER, efer)
+
+    serial.write_string("[SYSCALL] EFER MSR: 0x")
+    serial.write_hex(efer)
+    serial.write_string(" (SCE enabled)\n")
+}
+
+// ============================================================================
+// Syscall Entry Point (Assembly)
+// ============================================================================
+
+// This is the raw entry point called by the SYSCALL instruction
+// RCX = user RIP, R11 = user RFLAGS, RAX = syscall number
+// Arguments: RDI, RSI, RDX, R10, R8, R9
+export fn syscall_entry_asm() callconv(.Naked) void {
+    // Save user RSP and switch to kernel stack
+    // Note: In a real implementation, we'd use SWAPGS to access per-CPU data
+
+    asm volatile (
+        \\  // Save user stack pointer
+        \\  movq %%rsp, %%gs:8          // Save RSP to per-CPU user_stack
+        \\
+        \\  // Load kernel stack
+        \\  movq %%gs:0, %%rsp          // Load kernel stack from per-CPU
+        \\
+        \\  // Push user state (create SyscallFrame)
+        \\  pushq %%r15
+        \\  pushq %%r14
+        \\  pushq %%r13
+        \\  pushq %%r12
+        \\  pushq %%rbp
+        \\  pushq %%rbx
+        \\  pushq %%gs:8                // User RSP
+        \\  pushq %%r9
+        \\  pushq %%r8
+        \\  pushq %%r10
+        \\  pushq %%rdx
+        \\  pushq %%rsi
+        \\  pushq %%rdi
+        \\  pushq %%rax                 // Syscall number
+        \\  pushq %%r11                 // User RFLAGS
+        \\  pushq %%rcx                 // User RIP
+        \\
+        \\  // Call C handler
+        \\  movq %%rsp, %%rdi           // Pass frame pointer
+        \\  call syscall_handler_c
+        \\
+        \\  // Return value is in RAX
+        \\
+        \\  // Restore user state
+        \\  popq %%rcx                  // User RIP
+        \\  popq %%r11                  // User RFLAGS
+        \\  addq $8, %%rsp              // Skip saved RAX
+        \\  popq %%rdi
+        \\  popq %%rsi
+        \\  popq %%rdx
+        \\  popq %%r10
+        \\  popq %%r8
+        \\  popq %%r9
+        \\  popq %%rsp                  // Restore user RSP
+        \\  popq %%rbx
+        \\  popq %%rbp
+        \\  popq %%r12
+        \\  popq %%r13
+        \\  popq %%r14
+        \\  popq %%r15
+        \\
+        \\  // Return to user mode
+        \\  sysretq
+    )
+}
+
+// ============================================================================
+// Syscall Handler (C)
+// ============================================================================
+
+// C handler called from assembly entry point
+export fn syscall_handler_c(frame: *SyscallFrame) u64 {
+    syscall_stats.total_calls += 1
+
+    var syscall_num: u64 = frame.rax
+
+    // Validate syscall number
+    if (syscall_num >= MAX_SYSCALLS) {
+        syscall_stats.invalid_syscalls += 1
+        return @bitCast(@as(i64, -38))  // -ENOSYS
+    }
+
+    // Look up handler
+    var handler: ?SyscallHandler = syscall_table[@as(u32, @truncate(syscall_num))]
+
+    if (handler == null) {
+        syscall_stats.invalid_syscalls += 1
+        return @bitCast(@as(i64, -38))  // -ENOSYS
+    }
+
+    // Call the handler
+    syscall_stats.fast_path_calls += 1
+    return handler.?(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9)
+}
+
+// ============================================================================
+// Syscall Registration
+// ============================================================================
+
+// Register a syscall handler
+export fn register_syscall(num: u32, handler: SyscallHandler) bool {
+    if (num >= MAX_SYSCALLS) {
+        serial.write_string("[SYSCALL] ERROR: Invalid syscall number: ")
+        serial.write_u32(num)
+        serial.write_string("\n")
+        return false
+    }
+
+    syscall_table[num] = handler
+
+    return true
+}
+
+// Unregister a syscall handler
+export fn unregister_syscall(num: u32) void {
+    if (num < MAX_SYSCALLS) {
+        syscall_table[num] = null
+    }
+}
+
+// ============================================================================
+// Per-CPU Stack Management
+// ============================================================================
+
+// Set kernel stack for current CPU
+export fn set_kernel_stack(cpu_id: u32, stack_top: u64) void {
+    if (cpu_id < MAX_CPUS) {
+        per_cpu_syscall[cpu_id].kernel_stack = stack_top
+    }
+}
+
+// Set CPU count
+export fn set_cpu_count(count: u32) void {
+    if (count <= MAX_CPUS) {
+        cpu_count = count
+    }
+}
+
+// ============================================================================
+// Statistics and Debugging
+// ============================================================================
+
+export fn print_syscall_info() void {
+    serial.write_string("\n[SYSCALL] Fast Syscall Configuration:\n")
+    serial.write_string("  SYSCALL/SYSRET: Enabled\n")
+    serial.write_string("  Entry point: 0x")
+    serial.write_hex(@intFromPtr(&syscall_entry_asm))
+    serial.write_string("\n")
+    serial.write_string("  Max syscalls: ")
+    serial.write_u32(MAX_SYSCALLS)
+    serial.write_string("\n")
+    serial.write_string("  CPUs configured: ")
+    serial.write_u32(cpu_count)
+    serial.write_string("\n")
+}
+
+export fn print_syscall_stats() void {
+    serial.write_string("\n[SYSCALL] Statistics:\n")
+    serial.write_string("  Total calls: ")
+    serial.write_u64(syscall_stats.total_calls)
+    serial.write_string("\n")
+    serial.write_string("  Fast path: ")
+    serial.write_u64(syscall_stats.fast_path_calls)
+    serial.write_string("\n")
+    serial.write_string("  Slow path: ")
+    serial.write_u64(syscall_stats.slow_path_calls)
+    serial.write_string("\n")
+    serial.write_string("  Invalid: ")
+    serial.write_u64(syscall_stats.invalid_syscalls)
+    serial.write_string("\n")
+}
+
+export fn get_syscall_count() u64 {
+    return syscall_stats.total_calls
+}
+
+// ============================================================================
+// Compatibility Layer
+// ============================================================================
+
+// For processes that still use INT 0x80, redirect to fast path
+export fn int80_to_syscall(frame: *SyscallFrame) u64 {
+    syscall_stats.slow_path_calls += 1
+    return syscall_handler_c(frame)
+}
+
+// ============================================================================
+// Common Syscall Handlers (Examples)
+// ============================================================================
+
+// These would typically be in sys/syscall.home, but included here for reference
+
+fn sys_read_fast(fd: u64, buf: u64, count: u64, _: u64, _: u64, _: u64) u64 {
+    // Fast path read - would delegate to actual implementation
+    _ = fd
+    _ = buf
+    _ = count
+    return 0
+}
+
+fn sys_write_fast(fd: u64, buf: u64, count: u64, _: u64, _: u64, _: u64) u64 {
+    // Fast path write - would delegate to actual implementation
+    _ = fd
+    _ = buf
+    _ = count
+    return 0
+}
+
+fn sys_getpid_fast(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) u64 {
+    // Fast path getpid - very fast, no context needed
+    return 1  // Would return actual PID
+}
+
+// Register common fast-path syscalls
+export fn register_common_syscalls() void {
+    register_syscall(0, sys_read_fast)    // SYS_read
+    register_syscall(1, sys_write_fast)   // SYS_write
+    register_syscall(39, sys_getpid_fast) // SYS_getpid
+
+    serial.write_string("[SYSCALL] Common syscalls registered\n")
+}

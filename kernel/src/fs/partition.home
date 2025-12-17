@@ -1,0 +1,581 @@
+// HomeOS Partition Table Parser
+// Supports both MBR (Master Boot Record) and GPT (GUID Partition Table)
+//
+// This module parses partition tables from block devices and provides
+// a unified interface to access partitions regardless of the table format.
+
+const serial = @import("../drivers/serial.home")
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const SECTOR_SIZE: u32 = 512
+const MBR_SIGNATURE: u16 = 0xAA55
+const GPT_SIGNATURE: u64 = 0x5452415020494645  // "EFI PART" in little-endian
+
+// MBR partition types
+pub const PART_TYPE_EMPTY: u8 = 0x00
+pub const PART_TYPE_FAT12: u8 = 0x01
+pub const PART_TYPE_FAT16_SMALL: u8 = 0x04
+pub const PART_TYPE_EXTENDED: u8 = 0x05
+pub const PART_TYPE_FAT16: u8 = 0x06
+pub const PART_TYPE_NTFS: u8 = 0x07
+pub const PART_TYPE_FAT32: u8 = 0x0B
+pub const PART_TYPE_FAT32_LBA: u8 = 0x0C
+pub const PART_TYPE_FAT16_LBA: u8 = 0x0E
+pub const PART_TYPE_EXTENDED_LBA: u8 = 0x0F
+pub const PART_TYPE_LINUX_SWAP: u8 = 0x82
+pub const PART_TYPE_LINUX: u8 = 0x83
+pub const PART_TYPE_LINUX_LVM: u8 = 0x8E
+pub const PART_TYPE_GPT_PROTECTIVE: u8 = 0xEE
+pub const PART_TYPE_EFI_SYSTEM: u8 = 0xEF
+
+// GPT partition type GUIDs (common ones)
+pub const GPT_TYPE_UNUSED = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+pub const GPT_TYPE_EFI_SYSTEM = [16]u8{ 0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B }
+pub const GPT_TYPE_LINUX_FS = [16]u8{ 0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4 }
+pub const GPT_TYPE_LINUX_SWAP = [16]u8{ 0x6D, 0xFD, 0x57, 0x06, 0xAB, 0xA4, 0xC4, 0x43, 0x84, 0xE5, 0x09, 0x33, 0xC8, 0x4B, 0x4F, 0x4F }
+pub const GPT_TYPE_LINUX_HOME = [16]u8{ 0x33, 0x3D, 0xAC, 0x93, 0x3B, 0x43, 0xB0, 0x4B, 0xB4, 0x30, 0x35, 0x79, 0xCC, 0xBA, 0x45, 0x8B }
+pub const GPT_TYPE_MS_BASIC_DATA = [16]u8{ 0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7 }
+
+// Maximum partitions
+const MAX_MBR_PARTITIONS: u32 = 4
+const MAX_GPT_PARTITIONS: u32 = 128
+const MAX_PARTITIONS: u32 = 128
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+// Partition table type
+pub const PartitionTableType = enum(u8) {
+    NONE = 0,
+    MBR = 1,
+    GPT = 2,
+}
+
+// Unified partition descriptor
+pub const Partition = struct {
+    valid: bool,
+    bootable: bool,
+    part_index: u32,
+    start_lba: u64,
+    size_sectors: u64,
+    type_mbr: u8,           // MBR type code (or 0 for GPT)
+    type_guid: [16]u8,      // GPT type GUID (or zeros for MBR)
+    part_guid: [16]u8,      // GPT partition GUID (or zeros for MBR)
+    name: [72]u8,           // GPT partition name (UTF-16LE, 36 chars max)
+    attributes: u64,        // GPT attributes
+}
+
+// MBR partition entry (16 bytes)
+pub const MBRPartitionEntry = packed struct {
+    status: u8,             // 0x80 = bootable, 0x00 = not bootable
+    first_chs: [3]u8,       // First sector CHS address
+    type_code: u8,          // Partition type
+    last_chs: [3]u8,        // Last sector CHS address
+    first_lba: u32,         // First sector LBA
+    sector_count: u32,      // Number of sectors
+}
+
+// MBR structure (512 bytes)
+pub const MBR = packed struct {
+    bootstrap: [446]u8,     // Bootstrap code
+    partitions: [4]MBRPartitionEntry,
+    signature: u16,         // Should be 0xAA55
+}
+
+// GPT Header (92 bytes, padded to sector)
+pub const GPTHeader = packed struct {
+    signature: u64,         // "EFI PART"
+    revision: u32,          // Usually 0x00010000
+    header_size: u32,       // Usually 92
+    header_crc32: u32,      // CRC32 of header
+    reserved: u32,          // Must be 0
+    current_lba: u64,       // LBA of this header
+    backup_lba: u64,        // LBA of backup header
+    first_usable_lba: u64,  // First usable LBA for partitions
+    last_usable_lba: u64,   // Last usable LBA
+    disk_guid: [16]u8,      // Disk GUID
+    partition_entry_lba: u64,   // Starting LBA of partition entries
+    num_partition_entries: u32, // Number of partition entries
+    partition_entry_size: u32,  // Size of each entry (usually 128)
+    partition_array_crc32: u32, // CRC32 of partition array
+}
+
+// GPT Partition Entry (128 bytes)
+pub const GPTPartitionEntry = packed struct {
+    type_guid: [16]u8,      // Partition type GUID
+    part_guid: [16]u8,      // Unique partition GUID
+    first_lba: u64,         // First LBA
+    last_lba: u64,          // Last LBA (inclusive)
+    attributes: u64,        // Attribute flags
+    name: [72]u8,           // Partition name (UTF-16LE)
+}
+
+// Partition table
+pub const PartitionTable = struct {
+    table_type: PartitionTableType,
+    disk_guid: [16]u8,      // GPT disk GUID (zeros for MBR)
+    partition_count: u32,
+    partitions: [MAX_PARTITIONS]Partition,
+}
+
+// ============================================================================
+// Block Device Read Callback
+// ============================================================================
+
+// Function type for reading sectors from block device
+pub const BlockReadFn = fn(lba: u64, count: u32, buffer: [*]u8) bool
+
+// Current block read function
+var block_read_fn: ?BlockReadFn = null
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn partition_init() void {
+    serial.write_string("[PARTITION] Partition table parser initialized\n")
+}
+
+// Set the block read function
+export fn set_block_reader(reader: BlockReadFn) void {
+    block_read_fn = reader
+}
+
+// ============================================================================
+// Partition Table Parsing
+// ============================================================================
+
+// Parse partition table from a block device
+export fn parse_partition_table(table: *PartitionTable) bool {
+    if (block_read_fn == null) {
+        serial.write_string("[PARTITION] ERROR: No block read function set\n")
+        return false
+    }
+
+    // Initialize table
+    table.table_type = .NONE
+    table.partition_count = 0
+    var i: u32 = 0
+    while (i < MAX_PARTITIONS) {
+        table.partitions[i].valid = false
+        i += 1
+    }
+
+    // Read MBR (sector 0)
+    var mbr_buffer: [SECTOR_SIZE]u8 = undefined
+    if (!block_read_fn.?(0, 1, &mbr_buffer)) {
+        serial.write_string("[PARTITION] ERROR: Failed to read MBR\n")
+        return false
+    }
+
+    var mbr: *MBR = @ptrCast(@alignCast(&mbr_buffer))
+
+    // Check MBR signature
+    if (mbr.signature != MBR_SIGNATURE) {
+        serial.write_string("[PARTITION] No valid MBR signature found\n")
+        return false
+    }
+
+    // Check for protective MBR (indicates GPT)
+    if (mbr.partitions[0].type_code == PART_TYPE_GPT_PROTECTIVE) {
+        serial.write_string("[PARTITION] GPT protective MBR detected\n")
+        return parse_gpt(table)
+    }
+
+    // Parse as MBR
+    serial.write_string("[PARTITION] Parsing MBR partition table\n")
+    return parse_mbr(table, mbr)
+}
+
+// Parse MBR partition table
+fn parse_mbr(table: *PartitionTable, mbr: *MBR) bool {
+    table.table_type = .MBR
+
+    var count: u32 = 0
+    var i: u32 = 0
+
+    while (i < MAX_MBR_PARTITIONS) {
+        var entry: *MBRPartitionEntry = &mbr.partitions[i]
+
+        if (entry.type_code != PART_TYPE_EMPTY) {
+            var part: *Partition = &table.partitions[count]
+
+            part.valid = true
+            part.bootable = (entry.status == 0x80)
+            part.part_index = i
+            part.start_lba = @as(u64, entry.first_lba)
+            part.size_sectors = @as(u64, entry.sector_count)
+            part.type_mbr = entry.type_code
+            part.attributes = 0
+
+            // Clear GPT-specific fields
+            var j: u32 = 0
+            while (j < 16) {
+                part.type_guid[j] = 0
+                part.part_guid[j] = 0
+                j += 1
+            }
+            j = 0
+            while (j < 72) {
+                part.name[j] = 0
+                j += 1
+            }
+
+            serial.write_string("[PARTITION] MBR Partition ")
+            serial.write_u32(i)
+            serial.write_string(": type=0x")
+            serial.write_hex(@as(u64, entry.type_code))
+            serial.write_string(" start=")
+            serial.write_u64(part.start_lba)
+            serial.write_string(" size=")
+            serial.write_u64(part.size_sectors)
+            serial.write_string(" sectors")
+            if (part.bootable) {
+                serial.write_string(" [bootable]")
+            }
+            serial.write_string("\n")
+
+            // Handle extended partitions
+            if (entry.type_code == PART_TYPE_EXTENDED or entry.type_code == PART_TYPE_EXTENDED_LBA) {
+                parse_extended_partitions(table, entry.first_lba, &count)
+            }
+
+            count += 1
+        }
+
+        i += 1
+    }
+
+    table.partition_count = count
+
+    serial.write_string("[PARTITION] Found ")
+    serial.write_u32(count)
+    serial.write_string(" MBR partition(s)\n")
+
+    return count > 0
+}
+
+// Parse extended partition chain
+fn parse_extended_partitions(table: *PartitionTable, ext_start: u32, count: *u32) void {
+    var current_lba: u64 = @as(u64, ext_start)
+    var logical_num: u32 = 5  // Logical partitions start at 5
+
+    while (current_lba != 0 and count.* < MAX_PARTITIONS) {
+        // Read EBR (Extended Boot Record)
+        var ebr_buffer: [SECTOR_SIZE]u8 = undefined
+        if (!block_read_fn.?(current_lba, 1, &ebr_buffer)) {
+            break
+        }
+
+        var ebr: *MBR = @ptrCast(@alignCast(&ebr_buffer))
+
+        if (ebr.signature != MBR_SIGNATURE) {
+            break
+        }
+
+        // First entry is the logical partition
+        if (ebr.partitions[0].type_code != PART_TYPE_EMPTY) {
+            var part: *Partition = &table.partitions[count.*]
+
+            part.valid = true
+            part.bootable = false
+            part.part_index = logical_num
+            part.start_lba = current_lba + @as(u64, ebr.partitions[0].first_lba)
+            part.size_sectors = @as(u64, ebr.partitions[0].sector_count)
+            part.type_mbr = ebr.partitions[0].type_code
+            part.attributes = 0
+
+            serial.write_string("[PARTITION] Logical Partition ")
+            serial.write_u32(logical_num)
+            serial.write_string(": type=0x")
+            serial.write_hex(@as(u64, ebr.partitions[0].type_code))
+            serial.write_string(" start=")
+            serial.write_u64(part.start_lba)
+            serial.write_string("\n")
+
+            count.* += 1
+            logical_num += 1
+        }
+
+        // Second entry points to next EBR
+        if (ebr.partitions[1].type_code != PART_TYPE_EMPTY) {
+            current_lba = @as(u64, ext_start) + @as(u64, ebr.partitions[1].first_lba)
+        } else {
+            break
+        }
+    }
+}
+
+// Parse GPT partition table
+fn parse_gpt(table: *PartitionTable) bool {
+    // Read GPT header (sector 1)
+    var header_buffer: [SECTOR_SIZE]u8 = undefined
+    if (!block_read_fn.?(1, 1, &header_buffer)) {
+        serial.write_string("[PARTITION] ERROR: Failed to read GPT header\n")
+        return false
+    }
+
+    var header: *GPTHeader = @ptrCast(@alignCast(&header_buffer))
+
+    // Verify GPT signature
+    if (header.signature != GPT_SIGNATURE) {
+        serial.write_string("[PARTITION] Invalid GPT signature\n")
+        return false
+    }
+
+    serial.write_string("[PARTITION] GPT Header:\n")
+    serial.write_string("  Revision: 0x")
+    serial.write_hex(@as(u64, header.revision))
+    serial.write_string("\n")
+    serial.write_string("  Partition entries: ")
+    serial.write_u32(header.num_partition_entries)
+    serial.write_string("\n")
+    serial.write_string("  Entry size: ")
+    serial.write_u32(header.partition_entry_size)
+    serial.write_string(" bytes\n")
+
+    table.table_type = .GPT
+
+    // Copy disk GUID
+    var i: u32 = 0
+    while (i < 16) {
+        table.disk_guid[i] = header.disk_guid[i]
+        i += 1
+    }
+
+    // Read partition entries
+    var entries_per_sector: u32 = SECTOR_SIZE / header.partition_entry_size
+    var num_sectors: u32 = (header.num_partition_entries + entries_per_sector - 1) / entries_per_sector
+
+    var count: u32 = 0
+    var sector: u32 = 0
+
+    while (sector < num_sectors and count < MAX_PARTITIONS) {
+        var entry_buffer: [SECTOR_SIZE]u8 = undefined
+        if (!block_read_fn.?(header.partition_entry_lba + @as(u64, sector), 1, &entry_buffer)) {
+            break
+        }
+
+        var entry_idx: u32 = 0
+        while (entry_idx < entries_per_sector and count < MAX_PARTITIONS) {
+            var offset: u32 = entry_idx * header.partition_entry_size
+            var entry: *GPTPartitionEntry = @ptrCast(@alignCast(&entry_buffer[offset]))
+
+            // Check if entry is used (non-zero type GUID)
+            if (!is_guid_zero(&entry.type_guid)) {
+                var part: *Partition = &table.partitions[count]
+
+                part.valid = true
+                part.bootable = false
+                part.part_index = (sector * entries_per_sector) + entry_idx
+                part.start_lba = entry.first_lba
+                part.size_sectors = entry.last_lba - entry.first_lba + 1
+                part.type_mbr = 0
+                part.attributes = entry.attributes
+
+                // Copy GUIDs
+                i = 0
+                while (i < 16) {
+                    part.type_guid[i] = entry.type_guid[i]
+                    part.part_guid[i] = entry.part_guid[i]
+                    i += 1
+                }
+
+                // Copy name
+                i = 0
+                while (i < 72) {
+                    part.name[i] = entry.name[i]
+                    i += 1
+                }
+
+                serial.write_string("[PARTITION] GPT Partition ")
+                serial.write_u32(part.part_index)
+                serial.write_string(": start=")
+                serial.write_u64(part.start_lba)
+                serial.write_string(" size=")
+                serial.write_u64(part.size_sectors)
+                serial.write_string(" sectors")
+
+                // Print partition type
+                if (guid_equals(&entry.type_guid, &GPT_TYPE_EFI_SYSTEM)) {
+                    serial.write_string(" [EFI System]")
+                } else if (guid_equals(&entry.type_guid, &GPT_TYPE_LINUX_FS)) {
+                    serial.write_string(" [Linux FS]")
+                } else if (guid_equals(&entry.type_guid, &GPT_TYPE_LINUX_SWAP)) {
+                    serial.write_string(" [Linux Swap]")
+                } else if (guid_equals(&entry.type_guid, &GPT_TYPE_MS_BASIC_DATA)) {
+                    serial.write_string(" [Basic Data]")
+                }
+                serial.write_string("\n")
+
+                count += 1
+            }
+
+            entry_idx += 1
+        }
+
+        sector += 1
+    }
+
+    table.partition_count = count
+
+    serial.write_string("[PARTITION] Found ")
+    serial.write_u32(count)
+    serial.write_string(" GPT partition(s)\n")
+
+    return count > 0
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn is_guid_zero(guid: *const [16]u8) bool {
+    var i: u32 = 0
+    while (i < 16) {
+        if (guid[i] != 0) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn guid_equals(a: *const [16]u8, b: *const [16]u8) bool {
+    var i: u32 = 0
+    while (i < 16) {
+        if (a[i] != b[i]) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// Get partition by index
+export fn get_partition(table: *PartitionTable, index: u32) ?*Partition {
+    if (index >= table.partition_count) {
+        return null
+    }
+
+    var count: u32 = 0
+    var i: u32 = 0
+    while (i < MAX_PARTITIONS) {
+        if (table.partitions[i].valid) {
+            if (count == index) {
+                return &table.partitions[i]
+            }
+            count += 1
+        }
+        i += 1
+    }
+
+    return null
+}
+
+// Find partition by type (MBR)
+export fn find_partition_by_type(table: *PartitionTable, type_code: u8) ?*Partition {
+    var i: u32 = 0
+    while (i < MAX_PARTITIONS) {
+        if (table.partitions[i].valid and table.partitions[i].type_mbr == type_code) {
+            return &table.partitions[i]
+        }
+        i += 1
+    }
+    return null
+}
+
+// Find partition by GUID type (GPT)
+export fn find_partition_by_guid_type(table: *PartitionTable, type_guid: *const [16]u8) ?*Partition {
+    var i: u32 = 0
+    while (i < MAX_PARTITIONS) {
+        if (table.partitions[i].valid and guid_equals(&table.partitions[i].type_guid, type_guid)) {
+            return &table.partitions[i]
+        }
+        i += 1
+    }
+    return null
+}
+
+// Get partition type name
+export fn get_partition_type_name(part: *Partition) []const u8 {
+    if (part.type_mbr != 0) {
+        // MBR type
+        return switch (part.type_mbr) {
+            PART_TYPE_FAT12 => "FAT12",
+            PART_TYPE_FAT16_SMALL => "FAT16 (<32MB)",
+            PART_TYPE_FAT16 => "FAT16",
+            PART_TYPE_FAT16_LBA => "FAT16 LBA",
+            PART_TYPE_FAT32 => "FAT32",
+            PART_TYPE_FAT32_LBA => "FAT32 LBA",
+            PART_TYPE_NTFS => "NTFS/exFAT",
+            PART_TYPE_EXTENDED => "Extended",
+            PART_TYPE_EXTENDED_LBA => "Extended LBA",
+            PART_TYPE_LINUX => "Linux",
+            PART_TYPE_LINUX_SWAP => "Linux Swap",
+            PART_TYPE_LINUX_LVM => "Linux LVM",
+            PART_TYPE_EFI_SYSTEM => "EFI System",
+            PART_TYPE_GPT_PROTECTIVE => "GPT Protective",
+            else => "Unknown",
+        }
+    } else {
+        // GPT type
+        if (guid_equals(&part.type_guid, &GPT_TYPE_EFI_SYSTEM)) {
+            return "EFI System"
+        } else if (guid_equals(&part.type_guid, &GPT_TYPE_LINUX_FS)) {
+            return "Linux Filesystem"
+        } else if (guid_equals(&part.type_guid, &GPT_TYPE_LINUX_SWAP)) {
+            return "Linux Swap"
+        } else if (guid_equals(&part.type_guid, &GPT_TYPE_LINUX_HOME)) {
+            return "Linux Home"
+        } else if (guid_equals(&part.type_guid, &GPT_TYPE_MS_BASIC_DATA)) {
+            return "Basic Data"
+        } else {
+            return "Unknown GPT"
+        }
+    }
+}
+
+// Print partition table
+export fn print_partition_table(table: *PartitionTable) void {
+    serial.write_string("\n[PARTITION] Partition Table Summary:\n")
+    serial.write_string("  Type: ")
+    serial.write_string(switch (table.table_type) {
+        .NONE => "None",
+        .MBR => "MBR",
+        .GPT => "GPT",
+    })
+    serial.write_string("\n")
+    serial.write_string("  Partitions: ")
+    serial.write_u32(table.partition_count)
+    serial.write_string("\n\n")
+
+    var i: u32 = 0
+    while (i < MAX_PARTITIONS) {
+        if (table.partitions[i].valid) {
+            var part: *Partition = &table.partitions[i]
+            serial.write_string("  Partition ")
+            serial.write_u32(part.part_index)
+            serial.write_string(":\n")
+            serial.write_string("    Start LBA: ")
+            serial.write_u64(part.start_lba)
+            serial.write_string("\n")
+            serial.write_string("    Size: ")
+            serial.write_u64(part.size_sectors)
+            serial.write_string(" sectors (")
+            serial.write_u64((part.size_sectors * SECTOR_SIZE) / 1024 / 1024)
+            serial.write_string(" MB)\n")
+            serial.write_string("    Type: ")
+            serial.write_string(get_partition_type_name(part))
+            serial.write_string("\n")
+            if (part.bootable) {
+                serial.write_string("    Bootable: Yes\n")
+            }
+        }
+        i += 1
+    }
+}
