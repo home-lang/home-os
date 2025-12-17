@@ -1,0 +1,453 @@
+name: Raspberry Pi Hardware-in-the-Loop Testing
+
+# This workflow runs on self-hosted Raspberry Pi runners
+# Configure Pi runners with label 'pi4' or 'pi5'
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'kernel/src/arch/arm64/**'
+      - 'kernel/src/drivers/**'
+      - 'tests/integration/test_pi_*.sh'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'kernel/src/arch/arm64/**'
+      - 'kernel/src/drivers/**'
+  workflow_dispatch:
+    inputs:
+      test_suite:
+        description: 'Test suite to run'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - boot
+          - gpio
+          - display
+          - network
+          - storage
+          - stress
+      pi_model:
+        description: 'Pi model to test on'
+        required: false
+        default: 'pi4'
+        type: choice
+        options:
+          - pi4
+          - pi5
+          - both
+
+env:
+  PI_TEST_TIMEOUT: 300
+  KERNEL_IMAGE: kernel8.img
+  SD_MOUNT_POINT: /mnt/pi-sd
+
+jobs:
+  # ============================================================================
+  # Build ARM64 Kernel for Pi
+  # ============================================================================
+
+  build-pi-kernel:
+    name: Build Pi Kernel
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install ARM64 cross-compiler
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc-aarch64-linux-gnu \
+          binutils-aarch64-linux-gnu
+
+    - name: Install Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.11.0
+
+    - name: Build kernel for Raspberry Pi
+      run: |
+        ./scripts/build-unified.sh arm64 --target=rpi4 --release
+
+        # Also build for Pi 5 if different
+        if [ -f "./scripts/build-unified.sh" ]; then
+          ./scripts/build-unified.sh arm64 --target=rpi5 --release || true
+        fi
+
+    - name: Prepare boot files
+      run: |
+        mkdir -p build/pi-boot
+
+        # Copy kernel image
+        cp build/arm64/kernel8.img build/pi-boot/ || \
+        cp build/arm64/home-kernel.elf build/pi-boot/kernel8.img
+
+        # Create config.txt
+        cat > build/pi-boot/config.txt << 'EOF'
+        # HomeOS Raspberry Pi Configuration
+
+        # Use 64-bit kernel
+        arm_64bit=1
+
+        # Kernel image name
+        kernel=kernel8.img
+
+        # Enable UART for serial console
+        enable_uart=1
+
+        # Disable Bluetooth on UART (use mini UART instead)
+        dtoverlay=disable-bt
+
+        # GPU memory (minimum for headless testing)
+        gpu_mem=64
+
+        # Disable splash screen for faster boot
+        disable_splash=1
+
+        # Boot parameters passed to kernel
+        # Format: console=serial0,115200 root=/dev/mmcblk0p2 rootwait
+        EOF
+
+        # Create cmdline.txt
+        echo "console=serial0,115200 earlycon=pl011,mmio32,0xfe201000 root=/dev/mmcblk0p2 rootwait" > build/pi-boot/cmdline.txt
+
+    - name: Upload Pi boot artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: pi-boot-files
+        path: build/pi-boot/
+        retention-days: 7
+
+  # ============================================================================
+  # Raspberry Pi 4 Hardware Tests
+  # ============================================================================
+
+  test-pi4-boot:
+    name: Pi 4 Boot Test
+    runs-on: [self-hosted, pi4]
+    needs: build-pi-kernel
+    if: github.event.inputs.pi_model != 'pi5'
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download kernel
+      uses: actions/download-artifact@v4
+      with:
+        name: pi-boot-files
+        path: /tmp/pi-boot/
+
+    - name: Deploy to test SD card
+      run: |
+        # This assumes the Pi runner has a secondary SD card for testing
+        # or uses network boot (PXE/TFTP)
+
+        echo "Deploying kernel to test partition..."
+
+        if [ -d "$SD_MOUNT_POINT" ]; then
+          sudo cp /tmp/pi-boot/kernel8.img "$SD_MOUNT_POINT/boot/"
+          sudo cp /tmp/pi-boot/config.txt "$SD_MOUNT_POINT/boot/"
+          sudo cp /tmp/pi-boot/cmdline.txt "$SD_MOUNT_POINT/boot/"
+          sudo sync
+        else
+          echo "Using network boot or existing deployment"
+        fi
+
+    - name: Run boot test
+      run: |
+        ./tests/hardware/pi_boot_test.sh --model=pi4 --timeout=$PI_TEST_TIMEOUT
+
+    - name: Collect boot logs
+      if: always()
+      run: |
+        mkdir -p test-results
+
+        # Collect serial log if available
+        if [ -f /tmp/pi-serial.log ]; then
+          cp /tmp/pi-serial.log test-results/
+        fi
+
+        # Collect dmesg if kernel booted
+        dmesg > test-results/dmesg.log 2>/dev/null || true
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pi4-boot-results
+        path: test-results/
+
+  test-pi4-gpio:
+    name: Pi 4 GPIO Test
+    runs-on: [self-hosted, pi4]
+    needs: test-pi4-boot
+    if: github.event.inputs.test_suite == 'full' || github.event.inputs.test_suite == 'gpio'
+    timeout-minutes: 5
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run GPIO tests
+      run: |
+        ./tests/hardware/pi_gpio_test.sh --model=pi4
+
+    - name: Upload GPIO test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pi4-gpio-results
+        path: test-results/
+
+  test-pi4-display:
+    name: Pi 4 Display Test
+    runs-on: [self-hosted, pi4]
+    needs: test-pi4-boot
+    if: github.event.inputs.test_suite == 'full' || github.event.inputs.test_suite == 'display'
+    timeout-minutes: 5
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run display tests
+      run: |
+        ./tests/hardware/pi_display_test.sh --model=pi4
+
+    - name: Capture framebuffer screenshot
+      if: always()
+      run: |
+        mkdir -p test-results
+
+        # Capture framebuffer if available
+        if [ -e /dev/fb0 ]; then
+          cat /dev/fb0 > test-results/framebuffer.raw || true
+        fi
+
+    - name: Upload display test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pi4-display-results
+        path: test-results/
+
+  test-pi4-network:
+    name: Pi 4 Network Test
+    runs-on: [self-hosted, pi4]
+    needs: test-pi4-boot
+    if: github.event.inputs.test_suite == 'full' || github.event.inputs.test_suite == 'network'
+    timeout-minutes: 5
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run network tests
+      run: |
+        ./tests/hardware/pi_network_test.sh --model=pi4
+
+    - name: Upload network test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pi4-network-results
+        path: test-results/
+
+  test-pi4-storage:
+    name: Pi 4 Storage Test
+    runs-on: [self-hosted, pi4]
+    needs: test-pi4-boot
+    if: github.event.inputs.test_suite == 'full' || github.event.inputs.test_suite == 'storage'
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run storage tests
+      run: |
+        ./tests/hardware/pi_storage_test.sh --model=pi4
+
+    - name: Upload storage test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pi4-storage-results
+        path: test-results/
+
+  # ============================================================================
+  # Raspberry Pi 5 Hardware Tests
+  # ============================================================================
+
+  test-pi5-boot:
+    name: Pi 5 Boot Test
+    runs-on: [self-hosted, pi5]
+    needs: build-pi-kernel
+    if: github.event.inputs.pi_model == 'pi5' || github.event.inputs.pi_model == 'both'
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download kernel
+      uses: actions/download-artifact@v4
+      with:
+        name: pi-boot-files
+        path: /tmp/pi-boot/
+
+    - name: Deploy to test SD card
+      run: |
+        echo "Deploying kernel for Pi 5..."
+
+        if [ -d "$SD_MOUNT_POINT" ]; then
+          sudo cp /tmp/pi-boot/kernel8.img "$SD_MOUNT_POINT/boot/"
+          # Pi 5 specific config
+          cat > /tmp/config-pi5.txt << 'EOF'
+        arm_64bit=1
+        kernel=kernel8.img
+        enable_uart=1
+        dtoverlay=disable-bt
+        gpu_mem=64
+        disable_splash=1
+        # Pi 5 specific: Enable PCIe
+        dtparam=pciex1
+        EOF
+          sudo cp /tmp/config-pi5.txt "$SD_MOUNT_POINT/boot/config.txt"
+          sudo sync
+        fi
+
+    - name: Run boot test
+      run: |
+        ./tests/hardware/pi_boot_test.sh --model=pi5 --timeout=$PI_TEST_TIMEOUT
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pi5-boot-results
+        path: test-results/
+
+  # ============================================================================
+  # Stress Testing
+  # ============================================================================
+
+  test-pi4-stress:
+    name: Pi 4 Stress Test
+    runs-on: [self-hosted, pi4]
+    needs: [test-pi4-boot, test-pi4-gpio, test-pi4-display, test-pi4-network]
+    if: github.event.inputs.test_suite == 'full' || github.event.inputs.test_suite == 'stress'
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run stress tests
+      run: |
+        ./tests/hardware/pi_stress_test.sh --model=pi4 --duration=600
+
+    - name: Collect thermal data
+      if: always()
+      run: |
+        mkdir -p test-results
+
+        # Collect temperature log
+        ./tests/hardware/pi_thermal_monitor.sh --output=test-results/thermal.log &
+        THERMAL_PID=$!
+
+        sleep 60
+        kill $THERMAL_PID 2>/dev/null || true
+
+    - name: Upload stress test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: pi4-stress-results
+        path: test-results/
+
+  # ============================================================================
+  # Benchmark Tests
+  # ============================================================================
+
+  benchmark-pi4:
+    name: Pi 4 Benchmarks
+    runs-on: [self-hosted, pi4]
+    needs: test-pi4-boot
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run benchmarks
+      run: |
+        mkdir -p test-results/benchmarks
+
+        ./tests/perf/test_pi_benchmark.sh --model=pi4 --output=test-results/benchmarks/
+
+    - name: Generate benchmark report
+      run: |
+        ./scripts/generate-benchmark-report.sh test-results/benchmarks/ > test-results/benchmark-report.md
+
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
+      with:
+        name: pi4-benchmark-results
+        path: test-results/
+
+  # ============================================================================
+  # Summary Job
+  # ============================================================================
+
+  hardware-test-summary:
+    name: Hardware Test Summary
+    runs-on: ubuntu-latest
+    needs: [test-pi4-boot, test-pi4-gpio, test-pi4-display, test-pi4-network, test-pi4-storage]
+    if: always()
+
+    steps:
+    - name: Download all results
+      uses: actions/download-artifact@v4
+      with:
+        path: all-results/
+
+    - name: Generate summary
+      run: |
+        echo "# Hardware Test Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Count results
+        TOTAL=0
+        PASSED=0
+        FAILED=0
+
+        for dir in all-results/*/; do
+          if [ -d "$dir" ]; then
+            TOTAL=$((TOTAL + 1))
+            if [ -f "$dir/PASSED" ] || grep -q "PASS" "$dir"/*.log 2>/dev/null; then
+              PASSED=$((PASSED + 1))
+              echo "- ✅ $(basename $dir)" >> $GITHUB_STEP_SUMMARY
+            else
+              FAILED=$((FAILED + 1))
+              echo "- ❌ $(basename $dir)" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+        done
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- Total: $TOTAL" >> $GITHUB_STEP_SUMMARY
+        echo "- Passed: $PASSED" >> $GITHUB_STEP_SUMMARY
+        echo "- Failed: $FAILED" >> $GITHUB_STEP_SUMMARY
+
+    - name: Check for failures
+      run: |
+        # Fail the workflow if any hardware tests failed
+        for dir in all-results/*/; do
+          if [ -f "$dir/FAILED" ]; then
+            echo "Hardware test failure detected in $dir"
+            exit 1
+          fi
+        done

@@ -660,7 +660,25 @@ Some modules are complete, others still contain explicit stubs. Focus areas:
       - Tests app libraries: syscalls
       - Validates imports, functions, and syntax consistency
     - Updated `tests/run-tests.sh` to support perf and stress test suites
-  - [ ] Add Pi hardware-in-the-loop CI jobs
+  - [x] Add Pi hardware-in-the-loop CI jobs (**COMPLETED Dec 17, 2025**)
+    - Created `.github/workflows/pi-hardware-test.yml` - comprehensive CI workflow
+      - Self-hosted runner support for Pi 4 and Pi 5 hardware
+      - ARM64 kernel build and deployment
+      - Boot, GPIO, display, network, storage, stress test jobs
+      - Benchmark collection and reporting
+      - Summary generation with pass/fail status
+    - Created `tests/hardware/` directory with test scripts:
+      - `pi_boot_test.sh` - Kernel boot verification (9 tests)
+      - `pi_gpio_test.sh` - GPIO/I2C/SPI testing (10 tests)
+      - `pi_display_test.sh` - Framebuffer/DRM testing (9 tests)
+      - `pi_network_test.sh` - Network connectivity (10 tests)
+      - `pi_storage_test.sh` - Storage/filesystem testing (10 tests)
+      - `pi_stress_test.sh` - CPU/memory/IO stress with thermal monitoring
+    - Created `tests/hardware/README.md` - complete setup documentation
+      - Self-hosted runner setup instructions
+      - Test SD card configuration
+      - Manual trigger commands
+      - Result interpretation guide
 - [x] **Performance & stability targets (Pi-first)** (**COMPLETED Dec 16, 2025**)
   - Keep and refine the performance and compatibility tables in the **Success Metrics** section below (boot time, RAM usage, uptime, compatibility); enforce them via automated tests over time.
   - Created `kernel/src/perf/targets.home` - comprehensive performance targets enforcement
