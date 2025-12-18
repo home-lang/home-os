@@ -1,0 +1,644 @@
+// home-os Hardened Usercopy
+// Prevent kernel memory corruption via copy_to/from_user
+
+const std = @import("std");
+const mm = @import("../mm/mm.home");
+const vmalloc = @import("../mm/vmalloc.home");
+const slab = @import("../mm/slab.home");
+
+// =============================================================================
+// Usercopy Protection Constants
+// =============================================================================
+
+// Memory region types
+pub const RegionType = enum(u8) {
+    UNKNOWN = 0,
+    KERNEL_TEXT,        // Kernel code
+    KERNEL_RODATA,      // Read-only kernel data
+    KERNEL_DATA,        // Kernel data
+    KERNEL_BSS,         // Kernel BSS
+    KERNEL_STACK,       // Kernel stacks
+    KERNEL_HEAP,        // kmalloc/slab allocations
+    VMALLOC,            // vmalloc regions
+    MODULE_TEXT,        // Module code
+    MODULE_DATA,        // Module data
+    USER_MAPPING,       // User-space mappings in kernel
+    PERCPU,             // Per-CPU data
+    PAGE_TABLE,         // Page tables
+};
+
+// Protection flags
+pub const USERCOPY_ALLOW_READ: u32 = 0x01;
+pub const USERCOPY_ALLOW_WRITE: u32 = 0x02;
+pub const USERCOPY_WHITELISTED: u32 = 0x04;
+
+// Error types
+pub const UsercopyError = error{
+    BadKernelAddress,
+    BadUserAddress,
+    KernelTextAccess,
+    KernelRodataWrite,
+    StackOverflow,
+    HeapOverflow,
+    NotWhitelisted,
+    CrossObjectCopy,
+    NullPointer,
+    SizeOverflow,
+};
+
+// =============================================================================
+// Memory Region Tracking
+// =============================================================================
+
+/// Kernel memory region descriptor
+pub const MemoryRegion = struct {
+    start: usize,
+    end: usize,
+    region_type: RegionType,
+    flags: u32,
+    name: [32]u8,
+};
+
+/// Tracked kernel memory regions
+var kernel_regions: [64]MemoryRegion = undefined;
+var region_count: u32 = 0;
+
+// Kernel section boundaries (set at boot)
+var kernel_text_start: usize = 0;
+var kernel_text_end: usize = 0;
+var kernel_rodata_start: usize = 0;
+var kernel_rodata_end: usize = 0;
+var kernel_data_start: usize = 0;
+var kernel_data_end: usize = 0;
+var kernel_bss_start: usize = 0;
+var kernel_bss_end: usize = 0;
+
+/// Initialize usercopy protection
+pub fn init(
+    text_start: usize,
+    text_end: usize,
+    rodata_start: usize,
+    rodata_end: usize,
+    data_start: usize,
+    data_end: usize,
+    bss_start: usize,
+    bss_end: usize,
+) void {
+    kernel_text_start = text_start;
+    kernel_text_end = text_end;
+    kernel_rodata_start = rodata_start;
+    kernel_rodata_end = rodata_end;
+    kernel_data_start = data_start;
+    kernel_data_end = data_end;
+    kernel_bss_start = bss_start;
+    kernel_bss_end = bss_end;
+
+    // Register kernel regions
+    register_region(text_start, text_end, .KERNEL_TEXT, 0, "kernel_text");
+    register_region(rodata_start, rodata_end, .KERNEL_RODATA, USERCOPY_ALLOW_READ, "kernel_rodata");
+    register_region(data_start, data_end, .KERNEL_DATA, USERCOPY_ALLOW_READ, "kernel_data");
+    register_region(bss_start, bss_end, .KERNEL_BSS, USERCOPY_ALLOW_READ, "kernel_bss");
+}
+
+fn register_region(start: usize, end: usize, rtype: RegionType, flags: u32, name: []const u8) void {
+    if (region_count >= 64) return;
+
+    var region = &kernel_regions[region_count];
+    region.start = start;
+    region.end = end;
+    region.region_type = rtype;
+    region.flags = flags;
+    @memset(&region.name, 0);
+    const copy_len = @min(name.len, 31);
+    @memcpy(region.name[0..copy_len], name[0..copy_len]);
+
+    region_count += 1;
+}
+
+// =============================================================================
+// Address Validation
+// =============================================================================
+
+/// Check if address is in kernel space
+pub fn is_kernel_address(addr: usize) bool {
+    // Architecture specific - assume high addresses are kernel
+    return addr >= 0xFFFF800000000000;  // x86_64 kernel space
+}
+
+/// Check if address is in user space
+pub fn is_user_address(addr: usize) bool {
+    return addr < 0x0000800000000000;  // x86_64 user space
+}
+
+/// Get region type for kernel address
+pub fn get_region_type(addr: usize) RegionType {
+    // Check registered regions
+    var i: u32 = 0;
+    while (i < region_count) : (i += 1) {
+        if (addr >= kernel_regions[i].start and addr < kernel_regions[i].end) {
+            return kernel_regions[i].region_type;
+        }
+    }
+
+    // Check static kernel sections
+    if (addr >= kernel_text_start and addr < kernel_text_end) return .KERNEL_TEXT;
+    if (addr >= kernel_rodata_start and addr < kernel_rodata_end) return .KERNEL_RODATA;
+    if (addr >= kernel_data_start and addr < kernel_data_end) return .KERNEL_DATA;
+    if (addr >= kernel_bss_start and addr < kernel_bss_end) return .KERNEL_BSS;
+
+    // Check vmalloc area
+    if (vmalloc.is_vmalloc_addr(addr)) return .VMALLOC;
+
+    // Check if it's a slab allocation
+    if (slab.is_slab_addr(addr)) return .KERNEL_HEAP;
+
+    return .UNKNOWN;
+}
+
+/// Validate kernel buffer for usercopy
+pub fn check_kernel_buffer(ptr: usize, size: usize, write: bool) UsercopyError!void {
+    // Null pointer check
+    if (ptr == 0) return UsercopyError.NullPointer;
+
+    // Size overflow check
+    if (ptr > std.math.maxInt(usize) - size) return UsercopyError.SizeOverflow;
+
+    // Must be kernel address
+    if (!is_kernel_address(ptr)) return UsercopyError.BadKernelAddress;
+
+    const region_type = get_region_type(ptr);
+
+    switch (region_type) {
+        .KERNEL_TEXT, .MODULE_TEXT => {
+            // Never allow copy to/from kernel text
+            return UsercopyError.KernelTextAccess;
+        },
+
+        .KERNEL_RODATA => {
+            if (write) {
+                return UsercopyError.KernelRodataWrite;
+            }
+            // Read from rodata is okay
+        },
+
+        .KERNEL_STACK => {
+            // Validate stack bounds
+            try check_stack_bounds(ptr, size);
+        },
+
+        .KERNEL_HEAP => {
+            // Validate object bounds
+            try check_heap_object_bounds(ptr, size);
+        },
+
+        .PAGE_TABLE => {
+            // Never allow access to page tables
+            return UsercopyError.BadKernelAddress;
+        },
+
+        .UNKNOWN => {
+            // Unknown region - check whitelist
+            if (!is_whitelisted(ptr, size)) {
+                return UsercopyError.NotWhitelisted;
+            }
+        },
+
+        else => {
+            // Other regions require whitelist check
+            if (!is_region_allowed(ptr, size, write)) {
+                return UsercopyError.NotWhitelisted;
+            }
+        },
+    }
+}
+
+/// Validate user buffer
+pub fn check_user_buffer(ptr: usize, size: usize) UsercopyError!void {
+    // Null pointer check
+    if (ptr == 0) return UsercopyError.NullPointer;
+
+    // Size overflow check
+    if (ptr > std.math.maxInt(usize) - size) return UsercopyError.SizeOverflow;
+
+    // Must be user address
+    if (!is_user_address(ptr)) return UsercopyError.BadUserAddress;
+
+    // Check end address doesn't overflow into kernel space
+    if (!is_user_address(ptr + size - 1)) return UsercopyError.BadUserAddress;
+}
+
+// =============================================================================
+// Stack Bounds Checking
+// =============================================================================
+
+/// Per-CPU stack info
+const StackInfo = struct {
+    stack_base: usize,
+    stack_end: usize,
+    irq_stack_base: usize,
+    irq_stack_end: usize,
+};
+
+var cpu_stacks: [256]StackInfo = undefined;
+
+/// Register CPU stack
+pub fn register_cpu_stack(cpu: u32, base: usize, size: usize) void {
+    if (cpu >= 256) return;
+    cpu_stacks[cpu].stack_base = base;
+    cpu_stacks[cpu].stack_end = base + size;
+}
+
+/// Register IRQ stack
+pub fn register_irq_stack(cpu: u32, base: usize, size: usize) void {
+    if (cpu >= 256) return;
+    cpu_stacks[cpu].irq_stack_base = base;
+    cpu_stacks[cpu].irq_stack_end = base + size;
+}
+
+fn check_stack_bounds(ptr: usize, size: usize) UsercopyError!void {
+    // Get current CPU
+    const cpu = get_current_cpu();
+    if (cpu >= 256) return;
+
+    const stack = &cpu_stacks[cpu];
+
+    // Check kernel stack
+    if (ptr >= stack.stack_base and ptr < stack.stack_end) {
+        if (ptr + size > stack.stack_end) {
+            return UsercopyError.StackOverflow;
+        }
+        return;
+    }
+
+    // Check IRQ stack
+    if (ptr >= stack.irq_stack_base and ptr < stack.irq_stack_end) {
+        if (ptr + size > stack.irq_stack_end) {
+            return UsercopyError.StackOverflow;
+        }
+        return;
+    }
+
+    // Not on a known stack
+    return UsercopyError.BadKernelAddress;
+}
+
+fn get_current_cpu() u32 {
+    // Architecture specific - read from GS/FS or similar
+    return 0;
+}
+
+// =============================================================================
+// Heap Object Bounds Checking
+// =============================================================================
+
+fn check_heap_object_bounds(ptr: usize, size: usize) UsercopyError!void {
+    // Get slab object info
+    const obj_info = slab.get_object_info(ptr) orelse {
+        return UsercopyError.BadKernelAddress;
+    };
+
+    // Check copy doesn't exceed object bounds
+    const offset = ptr - obj_info.object_start;
+    if (offset + size > obj_info.object_size) {
+        return UsercopyError.HeapOverflow;
+    }
+
+    // Check for cross-object copy (adjacent objects in same slab)
+    if (size > obj_info.usercopy_size and obj_info.usercopy_size > 0) {
+        return UsercopyError.CrossObjectCopy;
+    }
+}
+
+// =============================================================================
+// Whitelist Management
+// =============================================================================
+
+/// Whitelisted region for usercopy
+pub const WhitelistEntry = struct {
+    start: usize,
+    size: usize,
+    allow_read: bool,
+    allow_write: bool,
+};
+
+var whitelist: [256]WhitelistEntry = undefined;
+var whitelist_count: u32 = 0;
+
+/// Add whitelist entry
+pub fn whitelist_add(start: usize, size: usize, allow_read: bool, allow_write: bool) !void {
+    if (whitelist_count >= 256) return error.WhitelistFull;
+
+    whitelist[whitelist_count] = WhitelistEntry{
+        .start = start,
+        .size = size,
+        .allow_read = allow_read,
+        .allow_write = allow_write,
+    };
+    whitelist_count += 1;
+}
+
+/// Remove whitelist entry
+pub fn whitelist_remove(start: usize) void {
+    var i: u32 = 0;
+    while (i < whitelist_count) : (i += 1) {
+        if (whitelist[i].start == start) {
+            // Shift remaining entries
+            var j = i;
+            while (j < whitelist_count - 1) : (j += 1) {
+                whitelist[j] = whitelist[j + 1];
+            }
+            whitelist_count -= 1;
+            return;
+        }
+    }
+}
+
+fn is_whitelisted(ptr: usize, size: usize) bool {
+    var i: u32 = 0;
+    while (i < whitelist_count) : (i += 1) {
+        const entry = &whitelist[i];
+        if (ptr >= entry.start and ptr + size <= entry.start + entry.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn is_region_allowed(ptr: usize, size: usize, write: bool) bool {
+    // Check registered regions
+    var i: u32 = 0;
+    while (i < region_count) : (i += 1) {
+        const region = &kernel_regions[i];
+        if (ptr >= region.start and ptr + size <= region.end) {
+            if (write) {
+                return (region.flags & USERCOPY_ALLOW_WRITE) != 0;
+            } else {
+                return (region.flags & USERCOPY_ALLOW_READ) != 0;
+            }
+        }
+    }
+
+    return is_whitelisted(ptr, size);
+}
+
+// =============================================================================
+// Hardened Copy Functions
+// =============================================================================
+
+/// Copy from user space to kernel (hardened)
+pub fn copy_from_user(kernel_dst: [*]u8, user_src: [*]const u8, size: usize) UsercopyError!usize {
+    const dst_addr = @intFromPtr(kernel_dst);
+    const src_addr = @intFromPtr(user_src);
+
+    // Validate addresses
+    try check_kernel_buffer(dst_addr, size, true);
+    try check_user_buffer(src_addr, size);
+
+    // Perform copy with fault handling
+    const copied = do_copy_from_user(kernel_dst, user_src, size);
+
+    return copied;
+}
+
+/// Copy from kernel to user space (hardened)
+pub fn copy_to_user(user_dst: [*]u8, kernel_src: [*]const u8, size: usize) UsercopyError!usize {
+    const dst_addr = @intFromPtr(user_dst);
+    const src_addr = @intFromPtr(kernel_src);
+
+    // Validate addresses
+    try check_user_buffer(dst_addr, size);
+    try check_kernel_buffer(src_addr, size, false);
+
+    // Perform copy with fault handling
+    const copied = do_copy_to_user(user_dst, kernel_src, size);
+
+    return copied;
+}
+
+/// Copy string from user space (hardened)
+pub fn strncpy_from_user(kernel_dst: [*]u8, user_src: [*]const u8, max_len: usize) UsercopyError!usize {
+    const dst_addr = @intFromPtr(kernel_dst);
+    const src_addr = @intFromPtr(user_src);
+
+    // Validate kernel buffer
+    try check_kernel_buffer(dst_addr, max_len, true);
+
+    // Validate user source (check page by page)
+    var len: usize = 0;
+    while (len < max_len) {
+        // Check each page as we go
+        const page_offset = (src_addr + len) % 4096;
+        const bytes_in_page = @min(4096 - page_offset, max_len - len);
+
+        try check_user_buffer(src_addr + len, bytes_in_page);
+
+        // Copy and look for null terminator
+        var i: usize = 0;
+        while (i < bytes_in_page) : (i += 1) {
+            const c = do_get_user_byte(user_src + len + i);
+            kernel_dst[len + i] = c;
+            if (c == 0) {
+                return len + i;  // Found terminator
+            }
+        }
+        len += bytes_in_page;
+    }
+
+    return len;
+}
+
+/// Clear user memory (hardened)
+pub fn clear_user(user_dst: [*]u8, size: usize) UsercopyError!usize {
+    const dst_addr = @intFromPtr(user_dst);
+
+    try check_user_buffer(dst_addr, size);
+
+    return do_clear_user(user_dst, size);
+}
+
+// =============================================================================
+// Low-Level Copy with Fault Handling
+// =============================================================================
+
+/// Copy from user with page fault handling
+fn do_copy_from_user(dst: [*]u8, src: [*]const u8, size: usize) usize {
+    // Set up exception handler for page faults
+    var copied: usize = 0;
+
+    // Use asm with exception handling for actual copy
+    // This is architecture-specific
+    while (copied < size) {
+        // Try to copy byte
+        const result = try_copy_byte_from_user(dst + copied, src + copied);
+        if (!result) {
+            // Page fault occurred
+            break;
+        }
+        copied += 1;
+    }
+
+    return copied;
+}
+
+fn do_copy_to_user(dst: [*]u8, src: [*]const u8, size: usize) usize {
+    var copied: usize = 0;
+
+    while (copied < size) {
+        const result = try_copy_byte_to_user(dst + copied, src + copied);
+        if (!result) {
+            break;
+        }
+        copied += 1;
+    }
+
+    return copied;
+}
+
+fn do_get_user_byte(src: [*]const u8) u8 {
+    // Would use exception handling
+    return src[0];
+}
+
+fn do_clear_user(dst: [*]u8, size: usize) usize {
+    var cleared: usize = 0;
+
+    while (cleared < size) {
+        const result = try_put_user_byte(dst + cleared, 0);
+        if (!result) {
+            break;
+        }
+        cleared += 1;
+    }
+
+    return cleared;
+}
+
+// Architecture-specific helpers (would use asm)
+fn try_copy_byte_from_user(dst: [*]u8, src: [*]const u8) bool {
+    // Would set up exception entry and try copy
+    dst[0] = src[0];
+    return true;
+}
+
+fn try_copy_byte_to_user(dst: [*]u8, src: [*]const u8) bool {
+    dst[0] = src[0];
+    return true;
+}
+
+fn try_put_user_byte(dst: [*]u8, value: u8) bool {
+    dst[0] = value;
+    return true;
+}
+
+// =============================================================================
+// SLAB Integration for Usercopy Bounds
+// =============================================================================
+
+/// Create slab cache with usercopy bounds
+pub fn create_usercopy_cache(
+    name: []const u8,
+    size: usize,
+    align_val: usize,
+    usercopy_offset: usize,
+    usercopy_size: usize,
+) !*slab.Cache {
+    return slab.create_cache_usercopy(name, size, align_val, usercopy_offset, usercopy_size);
+}
+
+// =============================================================================
+// Debug and Statistics
+// =============================================================================
+
+pub const UsercopyStats = struct {
+    copy_from_user_count: u64,
+    copy_to_user_count: u64,
+    copy_from_user_bytes: u64,
+    copy_to_user_bytes: u64,
+    violations_caught: u64,
+    stack_overflow_caught: u64,
+    heap_overflow_caught: u64,
+};
+
+var stats: UsercopyStats = .{
+    .copy_from_user_count = 0,
+    .copy_to_user_count = 0,
+    .copy_from_user_bytes = 0,
+    .copy_to_user_bytes = 0,
+    .violations_caught = 0,
+    .stack_overflow_caught = 0,
+    .heap_overflow_caught = 0,
+};
+
+pub fn get_stats() *const UsercopyStats {
+    return &stats;
+}
+
+pub fn report_violation(err: UsercopyError, addr: usize, size: usize) void {
+    stats.violations_caught += 1;
+
+    switch (err) {
+        .StackOverflow => stats.stack_overflow_caught += 1,
+        .HeapOverflow => stats.heap_overflow_caught += 1,
+        else => {},
+    }
+
+    // Log violation
+    _ = addr;
+    _ = size;
+    // kprintf("[usercopy] Violation: {s} at {x}, size {}\n", .{@errorName(err), addr, size});
+}
+
+/// Format stats for /proc/usercopy
+pub fn format_stats(buffer: []u8) usize {
+    var pos: usize = 0;
+
+    const lines = [_][]const u8{
+        "copy_from_user: ",
+        "copy_to_user: ",
+        "violations: ",
+        "stack_overflow: ",
+        "heap_overflow: ",
+    };
+
+    const values = [_]u64{
+        stats.copy_from_user_count,
+        stats.copy_to_user_count,
+        stats.violations_caught,
+        stats.stack_overflow_caught,
+        stats.heap_overflow_caught,
+    };
+
+    for (lines, 0..) |line, i| {
+        @memcpy(buffer[pos..][0..line.len], line);
+        pos += line.len;
+        pos += format_u64(buffer[pos..], values[i]);
+        buffer[pos] = '\n';
+        pos += 1;
+    }
+
+    return pos;
+}
+
+fn format_u64(buffer: []u8, value: u64) usize {
+    var tmp: [20]u8 = undefined;
+    var v = value;
+    var len: usize = 0;
+
+    if (v == 0) {
+        buffer[0] = '0';
+        return 1;
+    }
+
+    while (v > 0) {
+        tmp[len] = @as(u8, @intCast(v % 10)) + '0';
+        v /= 10;
+        len += 1;
+    }
+
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        buffer[i] = tmp[len - 1 - i];
+    }
+
+    return len;
+}

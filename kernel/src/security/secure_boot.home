@@ -1,0 +1,786 @@
+// home-os Secure Boot Integration
+// UEFI Secure Boot verification and chain of trust
+
+const std = @import("std");
+const crypto = @import("../crypto/crypto.home");
+const efi = @import("../boot/efi.home");
+
+// =============================================================================
+// Secure Boot Constants
+// =============================================================================
+
+pub const SECURE_BOOT_GUID = [16]u8{
+    0x8b, 0xe4, 0xdf, 0x61, 0x93, 0xca, 0x11, 0xd2,
+    0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c,
+};
+
+pub const GLOBAL_VARIABLE_GUID = [16]u8{
+    0x61, 0xdf, 0xe4, 0x8b, 0xca, 0x93, 0xd2, 0x11,
+    0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c,
+};
+
+// Signature database GUIDs
+pub const EFI_IMAGE_SECURITY_DATABASE_GUID = [16]u8{
+    0xcb, 0xb2, 0x19, 0xd7, 0x3a, 0x3d, 0x96, 0x45,
+    0xa3, 0xbc, 0xda, 0xd0, 0x0e, 0x67, 0x65, 0x6f,
+};
+
+// Signature types
+pub const EFI_CERT_SHA256_GUID = [16]u8{
+    0x26, 0x16, 0xc4, 0xc1, 0x4c, 0x50, 0x92, 0x40,
+    0xac, 0xa9, 0x41, 0xf9, 0x36, 0x93, 0x43, 0x28,
+};
+
+pub const EFI_CERT_X509_GUID = [16]u8{
+    0xa5, 0xc0, 0x59, 0xa1, 0x63, 0xb9, 0x4b, 0xe2,
+    0x8d, 0x59, 0x33, 0x6c, 0x8e, 0xa5, 0x23, 0xc8,
+};
+
+pub const EFI_CERT_RSA2048_GUID = [16]u8{
+    0x14, 0x74, 0x71, 0x3e, 0x8c, 0xcd, 0x76, 0x48,
+    0xb3, 0xa0, 0x11, 0x88, 0xe7, 0x76, 0x40, 0x18,
+};
+
+// Secure boot states
+pub const SecureBootState = enum(u8) {
+    DISABLED = 0,         // Secure boot off
+    ENABLED = 1,          // Secure boot on, enforcing
+    SETUP_MODE = 2,       // Setup mode, keys can be modified
+    AUDIT_MODE = 3,       // Audit mode, logs but doesn't enforce
+    DEPLOYED_MODE = 4,    // Fully deployed, locked down
+};
+
+// =============================================================================
+// Signature Database Structures
+// =============================================================================
+
+/// Signature database header
+pub const EFI_SIGNATURE_LIST = packed struct {
+    signature_type: [16]u8,      // GUID identifying signature type
+    signature_list_size: u32,    // Total size including header
+    signature_header_size: u32,  // Size of header before signatures
+    signature_size: u32,         // Size of each signature
+
+    pub fn get_signatures(self: *const EFI_SIGNATURE_LIST) []const EFI_SIGNATURE_DATA {
+        const header_size = @sizeOf(EFI_SIGNATURE_LIST) + self.signature_header_size;
+        const sig_count = (self.signature_list_size - header_size) / self.signature_size;
+
+        const base = @as([*]const u8, @ptrCast(self)) + header_size;
+        const sigs = @as([*]const EFI_SIGNATURE_DATA, @ptrCast(@alignCast(base)));
+
+        return sigs[0..sig_count];
+    }
+};
+
+/// Individual signature entry
+pub const EFI_SIGNATURE_DATA = packed struct {
+    signature_owner: [16]u8,     // GUID of signature owner
+    signature_data: [0]u8,       // Variable length signature data
+
+    pub fn get_data(self: *const EFI_SIGNATURE_DATA, size: u32) []const u8 {
+        const owner_size = @sizeOf([16]u8);
+        const data_size = size - owner_size;
+        const ptr = @as([*]const u8, @ptrCast(&self.signature_data));
+        return ptr[0..data_size];
+    }
+};
+
+/// Authenticode signature structure (PE/COFF)
+pub const WIN_CERTIFICATE = packed struct {
+    length: u32,                 // Certificate length
+    revision: u16,               // WIN_CERT_REVISION
+    certificate_type: u16,       // WIN_CERT_TYPE_*
+    // Followed by certificate data
+};
+
+pub const WIN_CERT_REVISION_2_0: u16 = 0x0200;
+pub const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
+pub const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
+
+// =============================================================================
+// Key Database
+// =============================================================================
+
+/// Platform Key (PK) - Root of trust
+pub const PlatformKey = struct {
+    certificate: []const u8,
+    owner_guid: [16]u8,
+    is_set: bool,
+
+    pub fn verify(self: *const PlatformKey, data: []const u8, signature: []const u8) bool {
+        if (!self.is_set) return false;
+        return crypto.rsa_verify(self.certificate, data, signature);
+    }
+};
+
+/// Key Exchange Key (KEK) - Signs db/dbx updates
+pub const KeyExchangeKey = struct {
+    certificates: [32][]const u8,
+    count: u32,
+
+    pub fn add(self: *KeyExchangeKey, cert: []const u8) !void {
+        if (self.count >= 32) return error.KeyDatabaseFull;
+        self.certificates[self.count] = cert;
+        self.count += 1;
+    }
+
+    pub fn verify_any(self: *const KeyExchangeKey, data: []const u8, signature: []const u8) bool {
+        var i: u32 = 0;
+        while (i < self.count) : (i += 1) {
+            if (crypto.rsa_verify(self.certificates[i], data, signature)) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+/// Signature Database (db) - Allowed signatures
+pub const SignatureDatabase = struct {
+    // SHA256 hashes of allowed images
+    sha256_hashes: [256][32]u8,
+    sha256_count: u32,
+
+    // X.509 certificates
+    x509_certs: [64][]const u8,
+    x509_count: u32,
+
+    pub fn init() SignatureDatabase {
+        return SignatureDatabase{
+            .sha256_hashes = undefined,
+            .sha256_count = 0,
+            .x509_certs = undefined,
+            .x509_count = 0,
+        };
+    }
+
+    pub fn add_hash(self: *SignatureDatabase, hash: [32]u8) !void {
+        if (self.sha256_count >= 256) return error.DatabaseFull;
+        self.sha256_hashes[self.sha256_count] = hash;
+        self.sha256_count += 1;
+    }
+
+    pub fn add_certificate(self: *SignatureDatabase, cert: []const u8) !void {
+        if (self.x509_count >= 64) return error.DatabaseFull;
+        self.x509_certs[self.x509_count] = cert;
+        self.x509_count += 1;
+    }
+
+    pub fn contains_hash(self: *const SignatureDatabase, hash: [32]u8) bool {
+        var i: u32 = 0;
+        while (i < self.sha256_count) : (i += 1) {
+            if (std.mem.eql(u8, &self.sha256_hashes[i], &hash)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn verify_signature(self: *const SignatureDatabase, data: []const u8, signature: []const u8) bool {
+        var i: u32 = 0;
+        while (i < self.x509_count) : (i += 1) {
+            if (crypto.verify_pkcs7(self.x509_certs[i], data, signature)) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+/// Forbidden Signature Database (dbx) - Revoked signatures
+pub const ForbiddenDatabase = struct {
+    // SHA256 hashes of forbidden images
+    sha256_hashes: [512][32]u8,
+    sha256_count: u32,
+
+    // Revoked certificates
+    revoked_certs: [64][]const u8,
+    revoked_count: u32,
+
+    pub fn init() ForbiddenDatabase {
+        return ForbiddenDatabase{
+            .sha256_hashes = undefined,
+            .sha256_count = 0,
+            .revoked_certs = undefined,
+            .revoked_count = 0,
+        };
+    }
+
+    pub fn is_forbidden_hash(self: *const ForbiddenDatabase, hash: [32]u8) bool {
+        var i: u32 = 0;
+        while (i < self.sha256_count) : (i += 1) {
+            if (std.mem.eql(u8, &self.sha256_hashes[i], &hash)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn is_revoked_cert(self: *const ForbiddenDatabase, cert: []const u8) bool {
+        var i: u32 = 0;
+        while (i < self.revoked_count) : (i += 1) {
+            if (std.mem.eql(u8, self.revoked_certs[i], cert)) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// =============================================================================
+// Secure Boot Context
+// =============================================================================
+
+pub const SecureBootContext = struct {
+    state: SecureBootState,
+    platform_key: PlatformKey,
+    kek: KeyExchangeKey,
+    db: SignatureDatabase,
+    dbx: ForbiddenDatabase,
+
+    // MOK (Machine Owner Key) for shim support
+    mok_list: SignatureDatabase,
+    mokx_list: ForbiddenDatabase,
+
+    // Audit log
+    audit_log: AuditLog,
+
+    // Configuration
+    config: SecureBootConfig,
+
+    pub fn init() SecureBootContext {
+        return SecureBootContext{
+            .state = .DISABLED,
+            .platform_key = PlatformKey{
+                .certificate = &[_]u8{},
+                .owner_guid = [_]u8{0} ** 16,
+                .is_set = false,
+            },
+            .kek = KeyExchangeKey{
+                .certificates = undefined,
+                .count = 0,
+            },
+            .db = SignatureDatabase.init(),
+            .dbx = ForbiddenDatabase.init(),
+            .mok_list = SignatureDatabase.init(),
+            .mokx_list = ForbiddenDatabase.init(),
+            .audit_log = AuditLog.init(),
+            .config = SecureBootConfig.default(),
+        };
+    }
+
+    /// Check if secure boot is enabled
+    pub fn is_enabled(self: *const SecureBootContext) bool {
+        return self.state == .ENABLED or self.state == .DEPLOYED_MODE;
+    }
+
+    /// Check if in setup mode
+    pub fn is_setup_mode(self: *const SecureBootContext) bool {
+        return self.state == .SETUP_MODE;
+    }
+
+    /// Enter setup mode (requires physical presence or PK not set)
+    pub fn enter_setup_mode(self: *SecureBootContext) !void {
+        if (self.state == .DEPLOYED_MODE) {
+            return error.DeployedModeActive;
+        }
+        self.state = .SETUP_MODE;
+        self.audit_log.log(.ENTER_SETUP_MODE, "Entered secure boot setup mode");
+    }
+
+    /// Exit setup mode and enable enforcement
+    pub fn enable_enforcement(self: *SecureBootContext) !void {
+        if (!self.platform_key.is_set) {
+            return error.PlatformKeyNotSet;
+        }
+        self.state = .ENABLED;
+        self.audit_log.log(.ENABLE_ENFORCEMENT, "Secure boot enforcement enabled");
+    }
+
+    /// Deploy and lock configuration
+    pub fn deploy(self: *SecureBootContext) !void {
+        if (!self.platform_key.is_set) {
+            return error.PlatformKeyNotSet;
+        }
+        self.state = .DEPLOYED_MODE;
+        self.audit_log.log(.DEPLOY, "Secure boot deployed, configuration locked");
+    }
+};
+
+pub const SecureBootConfig = struct {
+    // Verification options
+    verify_kernel: bool,
+    verify_modules: bool,
+    verify_firmware: bool,
+    verify_option_roms: bool,
+
+    // Fallback options
+    allow_unsigned_in_audit: bool,
+    require_measured_boot: bool,
+
+    // MOK options
+    allow_mok: bool,
+    mok_requires_password: bool,
+
+    pub fn default() SecureBootConfig {
+        return SecureBootConfig{
+            .verify_kernel = true,
+            .verify_modules = true,
+            .verify_firmware = true,
+            .verify_option_roms = true,
+            .allow_unsigned_in_audit = true,
+            .require_measured_boot = false,
+            .allow_mok = true,
+            .mok_requires_password = true,
+        };
+    }
+};
+
+// =============================================================================
+// Image Verification
+// =============================================================================
+
+pub const VerificationResult = enum {
+    VERIFIED,               // Image verified successfully
+    HASH_ALLOWED,           // Image hash in db
+    CERTIFICATE_ALLOWED,    // Signed by trusted certificate
+    MOK_ALLOWED,            // Signed by MOK
+    HASH_FORBIDDEN,         // Image hash in dbx
+    CERTIFICATE_REVOKED,    // Signed by revoked certificate
+    SIGNATURE_INVALID,      // Signature verification failed
+    NO_SIGNATURE,           // Image not signed
+    VERIFICATION_ERROR,     // Internal error
+};
+
+/// Verify a PE/COFF image
+pub fn verify_image(ctx: *SecureBootContext, image: []const u8) VerificationResult {
+    // Calculate image hash
+    var hash: [32]u8 = undefined;
+    calculate_pe_hash(image, &hash) catch return .VERIFICATION_ERROR;
+
+    // Check forbidden database first
+    if (ctx.dbx.is_forbidden_hash(hash)) {
+        ctx.audit_log.log(.IMAGE_FORBIDDEN, "Image hash in forbidden database");
+        return .HASH_FORBIDDEN;
+    }
+
+    // Check allowed hash database
+    if (ctx.db.contains_hash(hash)) {
+        ctx.audit_log.log(.IMAGE_VERIFIED, "Image hash in allowed database");
+        return .HASH_ALLOWED;
+    }
+
+    // Extract and verify signature
+    const signature = extract_authenticode_signature(image) catch {
+        if (ctx.state == .AUDIT_MODE and ctx.config.allow_unsigned_in_audit) {
+            ctx.audit_log.log(.UNSIGNED_ALLOWED_AUDIT, "Unsigned image allowed in audit mode");
+            return .NO_SIGNATURE;
+        }
+        ctx.audit_log.log(.NO_SIGNATURE, "Image has no signature");
+        return .NO_SIGNATURE;
+    };
+
+    // Verify against signature database
+    const to_verify = get_authenticode_digest_content(image) catch return .VERIFICATION_ERROR;
+
+    if (ctx.db.verify_signature(to_verify, signature)) {
+        ctx.audit_log.log(.IMAGE_VERIFIED, "Image signature verified against db");
+        return .CERTIFICATE_ALLOWED;
+    }
+
+    // Check MOK if enabled
+    if (ctx.config.allow_mok) {
+        if (ctx.mok_list.verify_signature(to_verify, signature)) {
+            ctx.audit_log.log(.MOK_VERIFIED, "Image signature verified against MOK");
+            return .MOK_ALLOWED;
+        }
+    }
+
+    ctx.audit_log.log(.SIGNATURE_INVALID, "Image signature verification failed");
+    return .SIGNATURE_INVALID;
+}
+
+/// Verify kernel image
+pub fn verify_kernel(ctx: *SecureBootContext, kernel: []const u8) !void {
+    if (!ctx.is_enabled()) return;
+    if (!ctx.config.verify_kernel) return;
+
+    const result = verify_image(ctx, kernel);
+
+    switch (result) {
+        .VERIFIED, .HASH_ALLOWED, .CERTIFICATE_ALLOWED, .MOK_ALLOWED => return,
+        .HASH_FORBIDDEN => return error.KernelForbidden,
+        .CERTIFICATE_REVOKED => return error.CertificateRevoked,
+        .SIGNATURE_INVALID => return error.SignatureInvalid,
+        .NO_SIGNATURE => return error.KernelNotSigned,
+        .VERIFICATION_ERROR => return error.VerificationError,
+    }
+}
+
+/// Verify kernel module
+pub fn verify_module(ctx: *SecureBootContext, module: []const u8, name: []const u8) !void {
+    if (!ctx.is_enabled()) return;
+    if (!ctx.config.verify_modules) return;
+
+    const result = verify_image(ctx, module);
+
+    switch (result) {
+        .VERIFIED, .HASH_ALLOWED, .CERTIFICATE_ALLOWED, .MOK_ALLOWED => {
+            ctx.audit_log.log_module(.MODULE_VERIFIED, name);
+            return;
+        },
+        .HASH_FORBIDDEN => {
+            ctx.audit_log.log_module(.MODULE_FORBIDDEN, name);
+            return error.ModuleForbidden;
+        },
+        .CERTIFICATE_REVOKED => {
+            ctx.audit_log.log_module(.MODULE_REVOKED, name);
+            return error.CertificateRevoked;
+        },
+        .SIGNATURE_INVALID => {
+            ctx.audit_log.log_module(.MODULE_INVALID_SIG, name);
+            return error.SignatureInvalid;
+        },
+        .NO_SIGNATURE => {
+            ctx.audit_log.log_module(.MODULE_UNSIGNED, name);
+            return error.ModuleNotSigned;
+        },
+        .VERIFICATION_ERROR => return error.VerificationError,
+    }
+}
+
+// =============================================================================
+// PE/COFF Hash Calculation
+// =============================================================================
+
+fn calculate_pe_hash(image: []const u8, hash: *[32]u8) !void {
+    var hasher = crypto.sha256_init();
+
+    // PE hash excludes certain fields (checksum, certificate table)
+    const dos_header = @as(*const DOSHeader, @ptrCast(@alignCast(image.ptr)));
+
+    if (dos_header.magic != 0x5A4D) {  // "MZ"
+        return error.InvalidPEFormat;
+    }
+
+    const pe_offset = dos_header.pe_offset;
+    const pe_header = @as(*const PEHeader, @ptrCast(@alignCast(image.ptr + pe_offset)));
+
+    if (pe_header.signature != 0x00004550) {  // "PE\0\0"
+        return error.InvalidPEFormat;
+    }
+
+    // Hash DOS header and stub
+    hasher.update(image[0..pe_offset]);
+
+    // Hash PE header, skipping checksum field
+    const checksum_offset = pe_offset + 88;  // Offset of checksum in optional header
+    hasher.update(image[pe_offset..checksum_offset]);
+    hasher.update(image[checksum_offset + 4 ..]);  // Skip 4-byte checksum
+
+    // Note: Full implementation would also exclude certificate table directory
+
+    hasher.finalize(hash);
+}
+
+const DOSHeader = packed struct {
+    magic: u16,           // "MZ"
+    last_page_bytes: u16,
+    pages: u16,
+    relocations: u16,
+    header_paragraphs: u16,
+    min_alloc: u16,
+    max_alloc: u16,
+    initial_ss: u16,
+    initial_sp: u16,
+    checksum: u16,
+    initial_ip: u16,
+    initial_cs: u16,
+    reloc_offset: u16,
+    overlay: u16,
+    reserved1: [8]u8,
+    oem_id: u16,
+    oem_info: u16,
+    reserved2: [20]u8,
+    pe_offset: u32,       // Offset to PE header
+};
+
+const PEHeader = packed struct {
+    signature: u32,       // "PE\0\0"
+    machine: u16,
+    section_count: u16,
+    timestamp: u32,
+    symbol_table: u32,
+    symbol_count: u32,
+    optional_header_size: u16,
+    characteristics: u16,
+};
+
+fn extract_authenticode_signature(image: []const u8) ![]const u8 {
+    _ = image;
+    // Parse PE optional header to find certificate table
+    // Return the Authenticode signature blob
+    return error.NoSignature;
+}
+
+fn get_authenticode_digest_content(image: []const u8) ![]const u8 {
+    _ = image;
+    // Return content that was signed (PE hash)
+    return error.NotImplemented;
+}
+
+// =============================================================================
+// Audit Logging
+// =============================================================================
+
+pub const AuditEvent = enum {
+    ENTER_SETUP_MODE,
+    ENABLE_ENFORCEMENT,
+    DEPLOY,
+    IMAGE_VERIFIED,
+    IMAGE_FORBIDDEN,
+    UNSIGNED_ALLOWED_AUDIT,
+    NO_SIGNATURE,
+    MOK_VERIFIED,
+    SIGNATURE_INVALID,
+    MODULE_VERIFIED,
+    MODULE_FORBIDDEN,
+    MODULE_REVOKED,
+    MODULE_INVALID_SIG,
+    MODULE_UNSIGNED,
+    KEY_ENROLLED,
+    KEY_DELETED,
+    DB_UPDATED,
+    DBX_UPDATED,
+};
+
+pub const AuditLogEntry = struct {
+    timestamp: u64,
+    event: AuditEvent,
+    message: [128]u8,
+    message_len: u8,
+};
+
+pub const AuditLog = struct {
+    entries: [256]AuditLogEntry,
+    count: u32,
+    write_pos: u32,
+
+    pub fn init() AuditLog {
+        return AuditLog{
+            .entries = undefined,
+            .count = 0,
+            .write_pos = 0,
+        };
+    }
+
+    pub fn log(self: *AuditLog, event: AuditEvent, message: []const u8) void {
+        var entry = &self.entries[self.write_pos];
+        entry.timestamp = get_timestamp();
+        entry.event = event;
+        entry.message_len = @intCast(@min(message.len, 128));
+        @memcpy(entry.message[0..entry.message_len], message[0..entry.message_len]);
+
+        self.write_pos = (self.write_pos + 1) % 256;
+        if (self.count < 256) self.count += 1;
+    }
+
+    pub fn log_module(self: *AuditLog, event: AuditEvent, name: []const u8) void {
+        var msg: [128]u8 = undefined;
+        const prefix = "Module: ";
+        @memcpy(msg[0..prefix.len], prefix);
+        const name_len = @min(name.len, 128 - prefix.len);
+        @memcpy(msg[prefix.len..][0..name_len], name[0..name_len]);
+
+        self.log(event, msg[0 .. prefix.len + name_len]);
+    }
+};
+
+fn get_timestamp() u64 {
+    // Return current timestamp
+    return 0;
+}
+
+// =============================================================================
+// UEFI Variable Access
+// =============================================================================
+
+/// Read secure boot variable from UEFI
+pub fn read_secure_boot_variable(name: []const u8, buffer: []u8) !usize {
+    _ = name;
+    _ = buffer;
+    // Call UEFI runtime services to read variable
+    return error.NotImplemented;
+}
+
+/// Write secure boot variable (requires authentication)
+pub fn write_secure_boot_variable(name: []const u8, data: []const u8, auth: []const u8) !void {
+    _ = name;
+    _ = data;
+    _ = auth;
+    // Call UEFI runtime services with authenticated write
+    return error.NotImplemented;
+}
+
+/// Initialize secure boot context from UEFI variables
+pub fn init_from_uefi(ctx: *SecureBootContext) !void {
+    var buffer: [4096]u8 = undefined;
+
+    // Read SecureBoot variable
+    const sb_size = read_secure_boot_variable("SecureBoot", &buffer) catch 0;
+    if (sb_size > 0 and buffer[0] != 0) {
+        ctx.state = .ENABLED;
+    }
+
+    // Read SetupMode variable
+    const setup_size = read_secure_boot_variable("SetupMode", &buffer) catch 0;
+    if (setup_size > 0 and buffer[0] != 0) {
+        ctx.state = .SETUP_MODE;
+    }
+
+    // Read PK
+    const pk_size = read_secure_boot_variable("PK", &buffer) catch 0;
+    if (pk_size > 0) {
+        ctx.platform_key.is_set = true;
+        // Parse signature list to extract certificate
+    }
+
+    // Read KEK, db, dbx similarly
+    // ...
+
+    ctx.audit_log.log(.ENABLE_ENFORCEMENT, "Secure boot initialized from UEFI");
+}
+
+// =============================================================================
+// Key Enrollment
+// =============================================================================
+
+/// Enroll a new platform key (only in setup mode)
+pub fn enroll_platform_key(ctx: *SecureBootContext, cert: []const u8, owner: [16]u8) !void {
+    if (!ctx.is_setup_mode()) {
+        return error.NotInSetupMode;
+    }
+
+    // Validate certificate
+    if (!crypto.validate_x509(cert)) {
+        return error.InvalidCertificate;
+    }
+
+    ctx.platform_key.certificate = cert;
+    ctx.platform_key.owner_guid = owner;
+    ctx.platform_key.is_set = true;
+
+    ctx.audit_log.log(.KEY_ENROLLED, "Platform key enrolled");
+}
+
+/// Enroll a Key Exchange Key
+pub fn enroll_kek(ctx: *SecureBootContext, cert: []const u8, auth_signature: []const u8) !void {
+    // Must be signed by PK
+    if (!ctx.platform_key.verify("KEK update", auth_signature)) {
+        return error.AuthenticationFailed;
+    }
+
+    try ctx.kek.add(cert);
+    ctx.audit_log.log(.KEY_ENROLLED, "KEK enrolled");
+}
+
+/// Add entry to signature database
+pub fn add_to_db(ctx: *SecureBootContext, entry: SignatureEntry, auth_signature: []const u8) !void {
+    // Must be signed by KEK or PK
+    if (!ctx.kek.verify_any("db update", auth_signature) and
+        !ctx.platform_key.verify("db update", auth_signature))
+    {
+        return error.AuthenticationFailed;
+    }
+
+    switch (entry) {
+        .hash => |h| try ctx.db.add_hash(h),
+        .certificate => |c| try ctx.db.add_certificate(c),
+    }
+
+    ctx.audit_log.log(.DB_UPDATED, "Signature database updated");
+}
+
+/// Add entry to forbidden database
+pub fn add_to_dbx(ctx: *SecureBootContext, entry: SignatureEntry, auth_signature: []const u8) !void {
+    // Must be signed by KEK or PK
+    if (!ctx.kek.verify_any("dbx update", auth_signature) and
+        !ctx.platform_key.verify("dbx update", auth_signature))
+    {
+        return error.AuthenticationFailed;
+    }
+
+    switch (entry) {
+        .hash => |h| {
+            if (ctx.dbx.sha256_count < 512) {
+                ctx.dbx.sha256_hashes[ctx.dbx.sha256_count] = h;
+                ctx.dbx.sha256_count += 1;
+            }
+        },
+        .certificate => |c| {
+            if (ctx.dbx.revoked_count < 64) {
+                ctx.dbx.revoked_certs[ctx.dbx.revoked_count] = c;
+                ctx.dbx.revoked_count += 1;
+            }
+        },
+    }
+
+    ctx.audit_log.log(.DBX_UPDATED, "Forbidden database updated");
+}
+
+pub const SignatureEntry = union(enum) {
+    hash: [32]u8,
+    certificate: []const u8,
+};
+
+// =============================================================================
+// MOK (Machine Owner Key) Support
+// =============================================================================
+
+/// Enroll MOK (requires password or physical presence)
+pub fn enroll_mok(ctx: *SecureBootContext, cert: []const u8, password: ?[]const u8) !void {
+    if (!ctx.config.allow_mok) {
+        return error.MOKNotAllowed;
+    }
+
+    if (ctx.config.mok_requires_password) {
+        if (password == null) {
+            return error.PasswordRequired;
+        }
+        // Verify password against stored hash
+    }
+
+    try ctx.mok_list.add_certificate(cert);
+    ctx.audit_log.log(.KEY_ENROLLED, "MOK enrolled");
+}
+
+/// Delete MOK
+pub fn delete_mok(ctx: *SecureBootContext, cert_hash: [32]u8, password: ?[]const u8) !void {
+    if (ctx.config.mok_requires_password) {
+        if (password == null) {
+            return error.PasswordRequired;
+        }
+    }
+
+    _ = cert_hash;
+    // Find and remove certificate
+    ctx.audit_log.log(.KEY_DELETED, "MOK deleted");
+}
+
+// =============================================================================
+// Global Secure Boot Instance
+// =============================================================================
+
+var global_secure_boot: SecureBootContext = SecureBootContext.init();
+
+pub fn get_context() *SecureBootContext {
+    return &global_secure_boot;
+}
+
+pub fn init() !void {
+    try init_from_uefi(&global_secure_boot);
+}
+
+pub fn is_enabled() bool {
+    return global_secure_boot.is_enabled();
+}

@@ -1,0 +1,639 @@
+// home-os Filesystem Encryption (fscrypt)
+// Per-file and per-directory encryption support
+
+const std = @import("std");
+const crypto = @import("../crypto/crypto.home");
+const vfs = @import("../fs/vfs.home");
+
+// =============================================================================
+// Encryption Constants
+// =============================================================================
+
+// Encryption modes
+pub const FSCRYPT_MODE_AES_256_XTS: u8 = 1;      // For file contents
+pub const FSCRYPT_MODE_AES_256_CTS: u8 = 4;      // For filenames
+pub const FSCRYPT_MODE_AES_128_CBC: u8 = 5;      // Legacy
+pub const FSCRYPT_MODE_AES_128_CTS: u8 = 6;      // Legacy filenames
+pub const FSCRYPT_MODE_ADIANTUM: u8 = 9;         // For devices without AES
+
+// Key sizes
+pub const FSCRYPT_MAX_KEY_SIZE: usize = 64;
+pub const AES_256_KEY_SIZE: usize = 32;
+pub const AES_128_KEY_SIZE: usize = 16;
+
+// Policy versions
+pub const FSCRYPT_POLICY_V1: u8 = 0;
+pub const FSCRYPT_POLICY_V2: u8 = 2;
+
+// Key derivation
+pub const FSCRYPT_KEY_IDENTIFIER_SIZE: usize = 16;
+pub const FSCRYPT_KEY_DESCRIPTOR_SIZE: usize = 8;
+pub const FSCRYPT_MAX_LABEL_SIZE: usize = 32;
+
+// Inode encryption context
+pub const FSCRYPT_FILE_NONCE_SIZE: usize = 16;
+pub const FSCRYPT_IV_SIZE: usize = 16;
+
+// Encryption flags
+pub const FSCRYPT_POLICY_FLAG_DIRECT_KEY: u32 = 0x04;
+pub const FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64: u32 = 0x08;
+pub const FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32: u32 = 0x10;
+
+// =============================================================================
+// Encryption Policy Structures
+// =============================================================================
+
+/// V1 Encryption Policy (legacy)
+pub const FscryptPolicyV1 = packed struct {
+    version: u8,                             // 0
+    contents_encryption_mode: u8,
+    filenames_encryption_mode: u8,
+    flags: u8,
+    master_key_descriptor: [8]u8,
+};
+
+/// V2 Encryption Policy (current)
+pub const FscryptPolicyV2 = packed struct {
+    version: u8,                             // 2
+    contents_encryption_mode: u8,
+    filenames_encryption_mode: u8,
+    flags: u8,
+    _reserved: [4]u8,
+    master_key_identifier: [16]u8,
+};
+
+/// Union of both policy versions
+pub const FscryptPolicy = union {
+    v1: FscryptPolicyV1,
+    v2: FscryptPolicyV2,
+
+    pub fn get_version(self: *const FscryptPolicy) u8 {
+        return self.v1.version;  // First byte is version in both
+    }
+};
+
+/// Context stored in inode xattr
+pub const FscryptContext = packed struct {
+    format: u8,
+    contents_encryption_mode: u8,
+    filenames_encryption_mode: u8,
+    flags: u8,
+    master_key_identifier: [16]u8,
+    nonce: [16]u8,
+};
+
+// =============================================================================
+// Key Management
+// =============================================================================
+
+/// Master key (held in kernel keyring)
+pub const FscryptMasterKey = struct {
+    identifier: [16]u8,
+    raw: [64]u8,
+    raw_size: usize,
+
+    // Derived keys cache
+    derived_keys: [16]DerivedKey,
+    derived_count: u32,
+
+    // Usage tracking
+    use_count: u32,
+
+    pub fn init(raw: []const u8) !FscryptMasterKey {
+        if (raw.len > 64) return error.KeyTooLong;
+
+        var mk = FscryptMasterKey{
+            .identifier = undefined,
+            .raw = [_]u8{0} ** 64,
+            .raw_size = raw.len,
+            .derived_keys = undefined,
+            .derived_count = 0,
+            .use_count = 0,
+        };
+
+        @memcpy(mk.raw[0..raw.len], raw);
+
+        // Compute identifier as HKDF-SHA512(key, info="fscrypt")
+        compute_key_identifier(&mk.raw, raw.len, &mk.identifier);
+
+        return mk;
+    }
+
+    pub fn derive_key(self: *FscryptMasterKey, mode: u8, nonce: *const [16]u8) ![32]u8 {
+        // Check cache first
+        var i: u32 = 0;
+        while (i < self.derived_count) : (i += 1) {
+            if (self.derived_keys[i].mode == mode and
+                std.mem.eql(u8, &self.derived_keys[i].nonce, nonce)) {
+                return self.derived_keys[i].key;
+            }
+        }
+
+        // Derive new key
+        var derived: [32]u8 = undefined;
+        try hkdf_derive(
+            self.raw[0..self.raw_size],
+            nonce,
+            mode,
+            &derived,
+        );
+
+        // Cache if space available
+        if (self.derived_count < 16) {
+            self.derived_keys[self.derived_count] = .{
+                .mode = mode,
+                .nonce = nonce.*,
+                .key = derived,
+            };
+            self.derived_count += 1;
+        }
+
+        return derived;
+    }
+
+    pub fn wipe(self: *FscryptMasterKey) void {
+        // Secure erase all key material
+        crypto.secure_zero(&self.raw);
+        for (&self.derived_keys) |*dk| {
+            crypto.secure_zero(&dk.key);
+        }
+        self.derived_count = 0;
+        self.raw_size = 0;
+    }
+};
+
+const DerivedKey = struct {
+    mode: u8,
+    nonce: [16]u8,
+    key: [32]u8,
+};
+
+/// Keyring holding all master keys
+pub const FscryptKeyring = struct {
+    keys: [64]FscryptMasterKey,
+    count: u32,
+
+    pub fn init() FscryptKeyring {
+        return FscryptKeyring{
+            .keys = undefined,
+            .count = 0,
+        };
+    }
+
+    pub fn add_key(self: *FscryptKeyring, raw: []const u8) !*const [16]u8 {
+        if (self.count >= 64) return error.KeyringFull;
+
+        self.keys[self.count] = try FscryptMasterKey.init(raw);
+        const id = &self.keys[self.count].identifier;
+        self.count += 1;
+
+        return id;
+    }
+
+    pub fn find_key(self: *FscryptKeyring, identifier: *const [16]u8) ?*FscryptMasterKey {
+        var i: u32 = 0;
+        while (i < self.count) : (i += 1) {
+            if (std.mem.eql(u8, &self.keys[i].identifier, identifier)) {
+                return &self.keys[i];
+            }
+        }
+        return null;
+    }
+
+    pub fn remove_key(self: *FscryptKeyring, identifier: *const [16]u8) bool {
+        var i: u32 = 0;
+        while (i < self.count) : (i += 1) {
+            if (std.mem.eql(u8, &self.keys[i].identifier, identifier)) {
+                // Wipe key
+                self.keys[i].wipe();
+
+                // Remove from keyring
+                var j = i;
+                while (j < self.count - 1) : (j += 1) {
+                    self.keys[j] = self.keys[j + 1];
+                }
+                self.count -= 1;
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// =============================================================================
+// Per-File Encryption Info
+// =============================================================================
+
+/// Encryption info for an open file
+pub const FscryptInfo = struct {
+    // Encryption mode
+    contents_mode: u8,
+    filenames_mode: u8,
+    flags: u32,
+
+    // Derived key for this file
+    contents_key: [32]u8,
+    filenames_key: [32]u8,
+
+    // Per-file nonce
+    nonce: [16]u8,
+
+    // Cipher contexts
+    contents_cipher: ?*CipherContext,
+    filenames_cipher: ?*CipherContext,
+
+    pub fn init(ctx: *const FscryptContext, master_key: *FscryptMasterKey) !FscryptInfo {
+        var info = FscryptInfo{
+            .contents_mode = ctx.contents_encryption_mode,
+            .filenames_mode = ctx.filenames_encryption_mode,
+            .flags = ctx.flags,
+            .nonce = ctx.nonce,
+            .contents_key = undefined,
+            .filenames_key = undefined,
+            .contents_cipher = null,
+            .filenames_cipher = null,
+        };
+
+        // Derive content key
+        info.contents_key = try master_key.derive_key(ctx.contents_encryption_mode, &ctx.nonce);
+
+        // Derive filename key
+        info.filenames_key = try master_key.derive_key(ctx.filenames_encryption_mode, &ctx.nonce);
+
+        // Initialize ciphers
+        info.contents_cipher = try create_cipher(ctx.contents_encryption_mode, &info.contents_key);
+        info.filenames_cipher = try create_cipher(ctx.filenames_encryption_mode, &info.filenames_key);
+
+        return info;
+    }
+
+    pub fn deinit(self: *FscryptInfo) void {
+        crypto.secure_zero(&self.contents_key);
+        crypto.secure_zero(&self.filenames_key);
+
+        if (self.contents_cipher) |c| {
+            destroy_cipher(c);
+        }
+        if (self.filenames_cipher) |c| {
+            destroy_cipher(c);
+        }
+    }
+};
+
+// =============================================================================
+// Cipher Implementation
+// =============================================================================
+
+pub const CipherContext = struct {
+    mode: u8,
+    key: [32]u8,
+    key_size: usize,
+    // Internal cipher state
+    state: [256]u8,
+};
+
+fn create_cipher(mode: u8, key: *const [32]u8) !*CipherContext {
+    var ctx = try std.heap.page_allocator.create(CipherContext);
+
+    ctx.mode = mode;
+    ctx.key = key.*;
+    ctx.key_size = switch (mode) {
+        FSCRYPT_MODE_AES_256_XTS, FSCRYPT_MODE_AES_256_CTS => 32,
+        FSCRYPT_MODE_AES_128_CBC, FSCRYPT_MODE_AES_128_CTS => 16,
+        FSCRYPT_MODE_ADIANTUM => 32,
+        else => return error.UnsupportedMode,
+    };
+
+    // Initialize cipher state
+    @memset(&ctx.state, 0);
+
+    return ctx;
+}
+
+fn destroy_cipher(ctx: *CipherContext) void {
+    crypto.secure_zero(&ctx.key);
+    crypto.secure_zero(&ctx.state);
+    std.heap.page_allocator.destroy(ctx);
+}
+
+// =============================================================================
+// Encryption/Decryption
+// =============================================================================
+
+/// Encrypt file data block
+pub fn encrypt_block(
+    info: *const FscryptInfo,
+    plaintext: []const u8,
+    ciphertext: []u8,
+    block_num: u64,
+) !void {
+    if (plaintext.len != ciphertext.len) return error.SizeMismatch;
+
+    // Generate IV from block number
+    var iv: [16]u8 = undefined;
+    generate_iv(info, block_num, &iv);
+
+    // Encrypt based on mode
+    switch (info.contents_mode) {
+        FSCRYPT_MODE_AES_256_XTS => {
+            try aes_xts_encrypt(&info.contents_key, &iv, plaintext, ciphertext);
+        },
+        FSCRYPT_MODE_AES_256_CTS => {
+            try aes_cts_encrypt(&info.contents_key, &iv, plaintext, ciphertext);
+        },
+        FSCRYPT_MODE_ADIANTUM => {
+            try adiantum_encrypt(&info.contents_key, &iv, plaintext, ciphertext);
+        },
+        else => return error.UnsupportedMode,
+    }
+}
+
+/// Decrypt file data block
+pub fn decrypt_block(
+    info: *const FscryptInfo,
+    ciphertext: []const u8,
+    plaintext: []u8,
+    block_num: u64,
+) !void {
+    if (plaintext.len != ciphertext.len) return error.SizeMismatch;
+
+    var iv: [16]u8 = undefined;
+    generate_iv(info, block_num, &iv);
+
+    switch (info.contents_mode) {
+        FSCRYPT_MODE_AES_256_XTS => {
+            try aes_xts_decrypt(&info.contents_key, &iv, ciphertext, plaintext);
+        },
+        FSCRYPT_MODE_AES_256_CTS => {
+            try aes_cts_decrypt(&info.contents_key, &iv, ciphertext, plaintext);
+        },
+        FSCRYPT_MODE_ADIANTUM => {
+            try adiantum_decrypt(&info.contents_key, &iv, ciphertext, plaintext);
+        },
+        else => return error.UnsupportedMode,
+    }
+}
+
+/// Encrypt filename
+pub fn encrypt_filename(
+    info: *const FscryptInfo,
+    plaintext_name: []const u8,
+    encrypted_name: []u8,
+) !usize {
+    // Pad to block boundary
+    const padded_len = ((plaintext_name.len + 15) / 16) * 16;
+    var padded: [256]u8 = undefined;
+
+    @memcpy(padded[0..plaintext_name.len], plaintext_name);
+    @memset(padded[plaintext_name.len..padded_len], 0);
+
+    // Encrypt
+    var iv: [16]u8 = [_]u8{0} ** 16;
+
+    switch (info.filenames_mode) {
+        FSCRYPT_MODE_AES_256_CTS => {
+            try aes_cts_encrypt(&info.filenames_key, &iv, padded[0..padded_len], encrypted_name[0..padded_len]);
+        },
+        else => return error.UnsupportedMode,
+    }
+
+    return padded_len;
+}
+
+/// Decrypt filename
+pub fn decrypt_filename(
+    info: *const FscryptInfo,
+    encrypted_name: []const u8,
+    plaintext_name: []u8,
+) !usize {
+    var iv: [16]u8 = [_]u8{0} ** 16;
+
+    switch (info.filenames_mode) {
+        FSCRYPT_MODE_AES_256_CTS => {
+            try aes_cts_decrypt(&info.filenames_key, &iv, encrypted_name, plaintext_name[0..encrypted_name.len]);
+        },
+        else => return error.UnsupportedMode,
+    }
+
+    // Find actual length (remove padding)
+    var len = encrypted_name.len;
+    while (len > 0 and plaintext_name[len - 1] == 0) {
+        len -= 1;
+    }
+
+    return len;
+}
+
+/// Generate IV for block encryption
+fn generate_iv(info: *const FscryptInfo, block_num: u64, iv: *[16]u8) void {
+    if (info.flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64 != 0) {
+        // Use inode + block number
+        @memset(iv, 0);
+        const bn_bytes = @as([*]const u8, @ptrCast(&block_num))[0..8];
+        @memcpy(iv[0..8], bn_bytes);
+    } else if (info.flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY != 0) {
+        // Use nonce + block number
+        @memcpy(iv[0..8], info.nonce[0..8]);
+        const bn_bytes = @as([*]const u8, @ptrCast(&block_num))[0..8];
+        @memcpy(iv[8..16], bn_bytes);
+    } else {
+        // Simple block number IV
+        @memset(iv, 0);
+        const bn_bytes = @as([*]const u8, @ptrCast(&block_num))[0..8];
+        @memcpy(iv[0..8], bn_bytes);
+    }
+}
+
+// =============================================================================
+// Key Derivation
+// =============================================================================
+
+fn compute_key_identifier(key: *const [64]u8, key_len: usize, id: *[16]u8) void {
+    // HKDF-SHA512 with info = "fscrypt"
+    var prk: [64]u8 = undefined;
+    const salt = "fscrypt";
+    const info = "fscrypt\x00identifier";
+
+    crypto.hkdf_sha512(key[0..key_len], salt, info, &prk);
+    @memcpy(id, prk[0..16]);
+}
+
+fn hkdf_derive(master: []const u8, nonce: *const [16]u8, mode: u8, output: *[32]u8) !void {
+    // Construct info string
+    var info: [32]u8 = undefined;
+    info[0] = mode;
+    @memcpy(info[1..17], nonce);
+    @memset(info[17..32], 0);
+
+    // HKDF-SHA256
+    var prk: [32]u8 = undefined;
+    crypto.hkdf_sha256(master, "", info[0..17], &prk);
+    @memcpy(output, &prk);
+}
+
+// =============================================================================
+// Cipher Implementations (placeholders)
+// =============================================================================
+
+fn aes_xts_encrypt(key: *const [32]u8, iv: *const [16]u8, input: []const u8, output: []u8) !void {
+    _ = key;
+    _ = iv;
+    @memcpy(output[0..input.len], input);
+    // Would call actual AES-XTS
+}
+
+fn aes_xts_decrypt(key: *const [32]u8, iv: *const [16]u8, input: []const u8, output: []u8) !void {
+    _ = key;
+    _ = iv;
+    @memcpy(output[0..input.len], input);
+}
+
+fn aes_cts_encrypt(key: *const [32]u8, iv: *const [16]u8, input: []const u8, output: []u8) !void {
+    _ = key;
+    _ = iv;
+    @memcpy(output[0..input.len], input);
+}
+
+fn aes_cts_decrypt(key: *const [32]u8, iv: *const [16]u8, input: []const u8, output: []u8) !void {
+    _ = key;
+    _ = iv;
+    @memcpy(output[0..input.len], input);
+}
+
+fn adiantum_encrypt(key: *const [32]u8, iv: *const [16]u8, input: []const u8, output: []u8) !void {
+    _ = key;
+    _ = iv;
+    @memcpy(output[0..input.len], input);
+}
+
+fn adiantum_decrypt(key: *const [32]u8, iv: *const [16]u8, input: []const u8, output: []u8) !void {
+    _ = key;
+    _ = iv;
+    @memcpy(output[0..input.len], input);
+}
+
+// =============================================================================
+// Policy Management
+// =============================================================================
+
+/// Set encryption policy on directory
+pub fn set_policy(inode: *vfs.Inode, policy: *const FscryptPolicy) !void {
+    // Verify directory is empty (except . and ..)
+    if (!vfs.is_empty_dir(inode)) {
+        return error.DirectoryNotEmpty;
+    }
+
+    // Verify master key is available
+    const version = policy.get_version();
+    const identifier = if (version == FSCRYPT_POLICY_V2)
+        &policy.v2.master_key_identifier
+    else
+        &[_]u8{0} ** 16;
+
+    if (global_keyring.find_key(identifier) == null) {
+        return error.MasterKeyNotFound;
+    }
+
+    // Create context
+    var ctx = FscryptContext{
+        .format = version,
+        .contents_encryption_mode = if (version == FSCRYPT_POLICY_V2)
+            policy.v2.contents_encryption_mode
+        else
+            policy.v1.contents_encryption_mode,
+        .filenames_encryption_mode = if (version == FSCRYPT_POLICY_V2)
+            policy.v2.filenames_encryption_mode
+        else
+            policy.v1.filenames_encryption_mode,
+        .flags = if (version == FSCRYPT_POLICY_V2)
+            policy.v2.flags
+        else
+            policy.v1.flags,
+        .master_key_identifier = identifier.*,
+        .nonce = undefined,
+    };
+
+    // Generate random nonce
+    crypto.random_bytes(&ctx.nonce);
+
+    // Store as xattr
+    const ctx_bytes = @as([*]const u8, @ptrCast(&ctx))[0..@sizeOf(FscryptContext)];
+    try vfs.set_xattr(inode, "encryption.c", ctx_bytes, 0);
+}
+
+/// Get encryption policy from directory
+pub fn get_policy(inode: *vfs.Inode, policy: *FscryptPolicy) !void {
+    var ctx: FscryptContext = undefined;
+    const ctx_bytes = @as([*]u8, @ptrCast(&ctx))[0..@sizeOf(FscryptContext)];
+
+    const size = try vfs.get_xattr(inode, "encryption.c", ctx_bytes);
+    if (size != @sizeOf(FscryptContext)) {
+        return error.InvalidContext;
+    }
+
+    // Convert context to policy
+    if (ctx.format == FSCRYPT_POLICY_V2) {
+        policy.v2 = FscryptPolicyV2{
+            .version = FSCRYPT_POLICY_V2,
+            .contents_encryption_mode = ctx.contents_encryption_mode,
+            .filenames_encryption_mode = ctx.filenames_encryption_mode,
+            .flags = ctx.flags,
+            ._reserved = [_]u8{0} ** 4,
+            .master_key_identifier = ctx.master_key_identifier,
+        };
+    } else {
+        policy.v1 = FscryptPolicyV1{
+            .version = FSCRYPT_POLICY_V1,
+            .contents_encryption_mode = ctx.contents_encryption_mode,
+            .filenames_encryption_mode = ctx.filenames_encryption_mode,
+            .flags = ctx.flags,
+            .master_key_descriptor = ctx.master_key_identifier[0..8].*,
+        };
+    }
+}
+
+// =============================================================================
+// Global State
+// =============================================================================
+
+var global_keyring: FscryptKeyring = FscryptKeyring.init();
+
+pub fn get_keyring() *FscryptKeyring {
+    return &global_keyring;
+}
+
+/// Add master key via ioctl
+pub fn ioctl_add_key(raw: []const u8) !*const [16]u8 {
+    return try global_keyring.add_key(raw);
+}
+
+/// Remove master key via ioctl
+pub fn ioctl_remove_key(identifier: *const [16]u8) bool {
+    return global_keyring.remove_key(identifier);
+}
+
+/// Get encryption status for inode
+pub fn get_crypt_info(inode: *vfs.Inode) !*FscryptInfo {
+    // Check if already set up
+    if (inode.crypt_info) |info| {
+        return info;
+    }
+
+    // Read context from xattr
+    var ctx: FscryptContext = undefined;
+    const ctx_bytes = @as([*]u8, @ptrCast(&ctx))[0..@sizeOf(FscryptContext)];
+
+    _ = try vfs.get_xattr(inode, "encryption.c", ctx_bytes);
+
+    // Find master key
+    const master_key = global_keyring.find_key(&ctx.master_key_identifier) orelse {
+        return error.MasterKeyNotFound;
+    };
+
+    // Create info
+    var info = try std.heap.page_allocator.create(FscryptInfo);
+    info.* = try FscryptInfo.init(&ctx, master_key);
+
+    inode.crypt_info = info;
+    return info;
+}

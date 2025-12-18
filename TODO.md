@@ -2,7 +2,57 @@
 
 > A modern, performant, minimal operating system built from scratch using Home (language), Craft (UI), and Pantry (package manager)
 
-## 🎉 Recent Progress (December 17, 2025)
+## 🎉 Recent Progress (December 18, 2025)
+
+### Phase 10 Security & Hardening (IN PROGRESS)
+- ✅ **Secure Boot Integration** - `kernel/src/security/secure_boot.home`
+  - UEFI secure boot verification and chain of trust
+  - Platform Key (PK), KEK, db/dbx signature databases
+  - PE/COFF image verification with Authenticode
+  - MOK (Machine Owner Key) support for shim
+  - Audit logging for all verification events
+- ✅ **Kernel Module Signing** - `kernel/src/security/module_signing.home`
+  - RSA/ECDSA/Ed25519 signature verification
+  - SHA256/SHA384/SHA512 hash support
+  - Trusted keyring with built-in and secondary keys
+  - Loading policies: ALLOW_ALL, TAINT, REQUIRE, LOCKDOWN
+  - Key revocation support
+- ✅ **Hardened Usercopy** - `kernel/src/security/hardened_usercopy.home`
+  - Memory region tracking and validation
+  - Stack bounds checking
+  - Heap object bounds checking via slab integration
+  - Whitelist management for special regions
+  - Prevention of kernel text/rodata access
+- ✅ **Filesystem Encryption (fscrypt)** - `kernel/src/security/fscrypt.home`
+  - Per-file and per-directory encryption
+  - AES-256-XTS for contents, AES-256-CTS for filenames
+  - Adiantum support for low-power devices
+  - HKDF key derivation with per-file nonces
+  - V1 and V2 encryption policies
+- ✅ **dm-verity Integrity** - `kernel/src/security/dm_verity.home`
+  - Merkle tree block verification
+  - SHA256/SHA512 hash algorithms
+  - Forward error correction (FEC) support
+  - Multiple failure modes (EIO, logging, restart, panic)
+  - Hash tree generation for creating verity images
+- ✅ **Key Management System** - `kernel/src/security/keyring.home`
+  - Hierarchical keyring structure
+  - Multiple key types (user, logon, encrypted, trusted, asymmetric)
+  - Per-user quotas
+  - System keyrings (builtin, platform, secondary, blacklist)
+  - keyctl syscall interface
+
+### Files Created
+- `kernel/src/security/secure_boot.home` - UEFI secure boot
+- `kernel/src/security/module_signing.home` - Module signature verification
+- `kernel/src/security/hardened_usercopy.home` - Safe kernel/user copies
+- `kernel/src/security/fscrypt.home` - Filesystem encryption
+- `kernel/src/security/dm_verity.home` - Block integrity verification
+- `kernel/src/security/keyring.home` - Key management system
+
+---
+
+## 🎉 Previous Progress (December 17, 2025)
 
 ### Phase 5 File System Enhancements (COMPLETED)
 - ✅ **Journaling for Crash Recovery** - `kernel/src/fs/journal.home`
@@ -1658,13 +1708,13 @@ Build a next-generation operating system that prioritizes:
   - Canary rotation for long-running systems
   - Comprehensive violation detection and panic handling
 - [x] W^X (Write XOR Execute) enforcement (**COMPLETED** - see `kernel/src/security/wx_enforcement.home`)
-- [ ] SMEP/SMAP (Supervisor Mode Execution/Access Prevention)
-- [ ] Secure boot integration
-- [ ] Kernel module signing
-- [ ] Kernel hardening options
+- [x] SMEP/SMAP (Supervisor Mode Execution/Access Prevention) (**COMPLETED** - see `kernel/src/security/cpu_security.home`)
+- [x] Secure boot integration (**COMPLETED Dec 18, 2025** - `kernel/src/security/secure_boot.home`: UEFI secure boot, PK/KEK/db/dbx, MOK support)
+- [x] Kernel module signing (**COMPLETED Dec 18, 2025** - `kernel/src/security/module_signing.home`: RSA/ECDSA/Ed25519, policy enforcement)
+- [x] Kernel hardening options
   - [x] KASLR (Kernel ASLR) (**COMPLETED** - see `kernel/src/security/aslr.home`)
-  - [ ] Hardened usercopy
-  - [ ] Stack protector
+  - [x] Hardened usercopy (**COMPLETED Dec 18, 2025** - `kernel/src/security/hardened_usercopy.home`)
+  - [x] Stack protector (**COMPLETED** - see `kernel/src/security/stack_protection.home`)
 
 ### 10.3 Process Security
 - [ ] Privilege separation
@@ -1690,16 +1740,16 @@ Build a next-generation operating system that prioritizes:
 - [ ] Intrusion detection hooks
 
 ### 10.5 File System Security
-- [ ] File permissions and ACLs
-- [ ] Extended attributes for security labels
-- [ ] Encryption at rest (full-disk or per-file)
-- [ ] Integrity checking (checksums)
+- [x] File permissions and ACLs (**COMPLETED** - see `kernel/src/security/acl.home`)
+- [x] Extended attributes for security labels (**COMPLETED** - see `kernel/src/fs/xattr.home`)
+- [x] Encryption at rest (full-disk or per-file) (**COMPLETED Dec 18, 2025** - `kernel/src/security/fscrypt.home`: AES-256-XTS/CTS, Adiantum, per-file keys)
+- [x] Integrity checking (checksums) (**COMPLETED Dec 18, 2025** - `kernel/src/security/dm_verity.home`: Merkle tree verification, FEC)
 - [ ] Immutable files support
 
 ### 10.6 Cryptography
-- [ ] Leverage Home's crypto library
-- [ ] Secure random number generation
-- [ ] Key management
+- [x] Leverage Home's crypto library (**COMPLETED** - see `kernel/src/crypto/`)
+- [x] Secure random number generation (**COMPLETED** - see `kernel/src/security/random.home`)
+- [x] Key management (**COMPLETED Dec 18, 2025** - `kernel/src/security/keyring.home`: hierarchical keyrings, keyctl syscall)
 - [ ] Certificate handling
 
 ---

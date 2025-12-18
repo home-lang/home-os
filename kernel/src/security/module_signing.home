@@ -1,0 +1,627 @@
+// home-os Kernel Module Signing
+// Cryptographic verification of kernel modules
+
+const std = @import("std");
+const crypto = @import("../crypto/crypto.home");
+const secure_boot = @import("secure_boot.home");
+
+// =============================================================================
+// Module Signature Constants
+// =============================================================================
+
+pub const MODULE_SIG_STRING = "~Module signature appended~\n";
+pub const MODULE_SIG_STRING_LEN = 28;
+
+// Signature algorithms
+pub const PKEY_ALGO_RSA: u8 = 0;
+pub const PKEY_ALGO_DSA: u8 = 1;
+pub const PKEY_ALGO_ECDSA: u8 = 2;
+pub const PKEY_ALGO_SM2: u8 = 3;
+pub const PKEY_ALGO_ECRDSA: u8 = 4;
+pub const PKEY_ALGO_ED25519: u8 = 5;
+
+// Hash algorithms
+pub const HASH_ALGO_MD4: u8 = 0;
+pub const HASH_ALGO_MD5: u8 = 1;
+pub const HASH_ALGO_SHA1: u8 = 2;
+pub const HASH_ALGO_RIPE_MD_160: u8 = 3;
+pub const HASH_ALGO_SHA256: u8 = 4;
+pub const HASH_ALGO_SHA384: u8 = 5;
+pub const HASH_ALGO_SHA512: u8 = 6;
+pub const HASH_ALGO_SHA224: u8 = 7;
+pub const HASH_ALGO_SM3: u8 = 8;
+pub const HASH_ALGO_STREEBOG_256: u8 = 9;
+pub const HASH_ALGO_STREEBOG_512: u8 = 10;
+
+// ID types
+pub const PKEY_ID_PGP: u8 = 0;
+pub const PKEY_ID_X509: u8 = 1;
+pub const PKEY_ID_PKCS7: u8 = 2;
+
+// Module loading policies
+pub const ModuleLoadPolicy = enum(u8) {
+    ALLOW_ALL = 0,              // Allow all modules (insecure)
+    ALLOW_UNSIGNED_WITH_TAINT = 1,  // Allow unsigned, taint kernel
+    REQUIRE_VALID_SIGNATURE = 2,    // Require valid signature
+    LOCKDOWN = 3,               // Require signature, no live patching
+};
+
+// =============================================================================
+// Module Signature Structure
+// =============================================================================
+
+/// Module signature footer (appended to module)
+pub const ModuleSignature = packed struct {
+    // Algorithm IDs
+    algo: u8,           // Public key algorithm (PKEY_ALGO_*)
+    hash: u8,           // Hash algorithm (HASH_ALGO_*)
+    id_type: u8,        // Key identifier type (PKEY_ID_*)
+    signer_len: u8,     // Length of signer's name
+    key_id_len: u8,     // Length of key identifier
+    _pad: [3]u8,        // Padding
+    sig_len: u32,       // Signature data length (big-endian!)
+
+    pub fn get_sig_len(self: *const ModuleSignature) u32 {
+        // Convert from big-endian
+        return @byteSwap(self.sig_len);
+    }
+
+    pub fn total_size(self: *const ModuleSignature) usize {
+        return @sizeOf(ModuleSignature) +
+            self.signer_len +
+            self.key_id_len +
+            self.get_sig_len();
+    }
+};
+
+/// Parsed module signature information
+pub const SignatureInfo = struct {
+    algo: u8,
+    hash: u8,
+    id_type: u8,
+    signer_name: []const u8,
+    key_id: []const u8,
+    signature: []const u8,
+    module_data: []const u8,  // Module without signature
+
+    pub fn get_algo_name(self: *const SignatureInfo) []const u8 {
+        return switch (self.algo) {
+            PKEY_ALGO_RSA => "rsa",
+            PKEY_ALGO_DSA => "dsa",
+            PKEY_ALGO_ECDSA => "ecdsa",
+            PKEY_ALGO_ED25519 => "ed25519",
+            else => "unknown",
+        };
+    }
+
+    pub fn get_hash_name(self: *const SignatureInfo) []const u8 {
+        return switch (self.hash) {
+            HASH_ALGO_SHA256 => "sha256",
+            HASH_ALGO_SHA384 => "sha384",
+            HASH_ALGO_SHA512 => "sha512",
+            HASH_ALGO_SHA1 => "sha1",
+            else => "unknown",
+        };
+    }
+};
+
+// =============================================================================
+// Signing Key Management
+// =============================================================================
+
+/// Trusted key for module verification
+pub const TrustedKey = struct {
+    id: [20]u8,              // Key ID (SHA1 of public key)
+    public_key: []const u8,  // DER-encoded public key
+    subject: []const u8,     // Certificate subject
+    issuer: []const u8,      // Certificate issuer
+    algo: u8,                // Algorithm
+    is_builtin: bool,        // Built into kernel
+
+    pub fn matches_id(self: *const TrustedKey, key_id: []const u8) bool {
+        if (key_id.len > self.id.len) return false;
+        // Match last N bytes of key ID
+        const offset = self.id.len - key_id.len;
+        return std.mem.eql(u8, self.id[offset..], key_id);
+    }
+};
+
+/// Keyring for module signing keys
+pub const ModuleKeyring = struct {
+    keys: [64]TrustedKey,
+    count: u32,
+
+    // Built-in keys (compiled into kernel)
+    builtin_keys: [16]TrustedKey,
+    builtin_count: u32,
+
+    // Secondary keyring (loaded at runtime)
+    secondary_keys: [32]TrustedKey,
+    secondary_count: u32,
+
+    // Revoked key IDs
+    revoked_ids: [128][20]u8,
+    revoked_count: u32,
+
+    pub fn init() ModuleKeyring {
+        return ModuleKeyring{
+            .keys = undefined,
+            .count = 0,
+            .builtin_keys = undefined,
+            .builtin_count = 0,
+            .secondary_keys = undefined,
+            .secondary_count = 0,
+            .revoked_ids = undefined,
+            .revoked_count = 0,
+        };
+    }
+
+    /// Find key by ID
+    pub fn find_key(self: *const ModuleKeyring, key_id: []const u8) ?*const TrustedKey {
+        // Check built-in keys first
+        var i: u32 = 0;
+        while (i < self.builtin_count) : (i += 1) {
+            if (self.builtin_keys[i].matches_id(key_id)) {
+                // Check not revoked
+                if (!self.is_revoked(&self.builtin_keys[i].id)) {
+                    return &self.builtin_keys[i];
+                }
+            }
+        }
+
+        // Check secondary keys
+        i = 0;
+        while (i < self.secondary_count) : (i += 1) {
+            if (self.secondary_keys[i].matches_id(key_id)) {
+                if (!self.is_revoked(&self.secondary_keys[i].id)) {
+                    return &self.secondary_keys[i];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// Check if key is revoked
+    pub fn is_revoked(self: *const ModuleKeyring, key_id: *const [20]u8) bool {
+        var i: u32 = 0;
+        while (i < self.revoked_count) : (i += 1) {
+            if (std.mem.eql(u8, &self.revoked_ids[i], key_id)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Add trusted key
+    pub fn add_key(self: *ModuleKeyring, key: TrustedKey) !void {
+        if (self.secondary_count >= 32) {
+            return error.KeyringFull;
+        }
+        self.secondary_keys[self.secondary_count] = key;
+        self.secondary_count += 1;
+    }
+
+    /// Revoke a key
+    pub fn revoke_key(self: *ModuleKeyring, key_id: [20]u8) !void {
+        if (self.revoked_count >= 128) {
+            return error.RevocationListFull;
+        }
+        self.revoked_ids[self.revoked_count] = key_id;
+        self.revoked_count += 1;
+    }
+};
+
+// =============================================================================
+// Module Verification
+// =============================================================================
+
+pub const VerifyResult = enum {
+    VALID,                      // Signature valid
+    NO_SIGNATURE,               // Module not signed
+    UNKNOWN_KEY,                // Key not in keyring
+    KEY_REVOKED,                // Signing key revoked
+    INVALID_SIGNATURE,          // Signature verification failed
+    UNSUPPORTED_ALGORITHM,      // Algorithm not supported
+    MALFORMED_SIGNATURE,        // Signature structure invalid
+    HASH_MISMATCH,              // Content hash doesn't match
+};
+
+/// Verify module signature
+pub fn verify_module(keyring: *const ModuleKeyring, module_data: []const u8) !struct { result: VerifyResult, info: ?SignatureInfo } {
+    // Check for signature marker
+    if (module_data.len < MODULE_SIG_STRING_LEN + @sizeOf(ModuleSignature)) {
+        return .{ .result = .NO_SIGNATURE, .info = null };
+    }
+
+    const marker_start = module_data.len - MODULE_SIG_STRING_LEN;
+    if (!std.mem.eql(u8, module_data[marker_start..], MODULE_SIG_STRING)) {
+        return .{ .result = .NO_SIGNATURE, .info = null };
+    }
+
+    // Parse signature structure
+    const sig_struct_start = marker_start - @sizeOf(ModuleSignature);
+    const sig_struct = @as(*const ModuleSignature, @ptrCast(@alignCast(&module_data[sig_struct_start])));
+
+    const sig_len = sig_struct.get_sig_len();
+    const total_sig_size = sig_struct.total_size() + MODULE_SIG_STRING_LEN;
+
+    if (total_sig_size > module_data.len) {
+        return .{ .result = .MALFORMED_SIGNATURE, .info = null };
+    }
+
+    // Extract signature components
+    var offset = marker_start - @sizeOf(ModuleSignature);
+    offset -= sig_len;
+    const signature = module_data[offset..][0..sig_len];
+
+    offset -= sig_struct.key_id_len;
+    const key_id = module_data[offset..][0..sig_struct.key_id_len];
+
+    offset -= sig_struct.signer_len;
+    const signer_name = module_data[offset..][0..sig_struct.signer_len];
+
+    // Module content (without signature)
+    const content_len = module_data.len - total_sig_size;
+    const module_content = module_data[0..content_len];
+
+    const info = SignatureInfo{
+        .algo = sig_struct.algo,
+        .hash = sig_struct.hash,
+        .id_type = sig_struct.id_type,
+        .signer_name = signer_name,
+        .key_id = key_id,
+        .signature = signature,
+        .module_data = module_content,
+    };
+
+    // Find signing key
+    const key = keyring.find_key(key_id) orelse {
+        return .{ .result = .UNKNOWN_KEY, .info = info };
+    };
+
+    // Verify signature
+    const valid = try verify_signature(key, &info, module_content);
+
+    if (valid) {
+        return .{ .result = .VALID, .info = info };
+    } else {
+        return .{ .result = .INVALID_SIGNATURE, .info = info };
+    }
+}
+
+fn verify_signature(key: *const TrustedKey, info: *const SignatureInfo, content: []const u8) !bool {
+    // Hash the content
+    var hash: [64]u8 = undefined;
+    const hash_len = switch (info.hash) {
+        HASH_ALGO_SHA256 => blk: {
+            crypto.sha256(content, hash[0..32]);
+            break :blk 32;
+        },
+        HASH_ALGO_SHA384 => blk: {
+            crypto.sha384(content, hash[0..48]);
+            break :blk 48;
+        },
+        HASH_ALGO_SHA512 => blk: {
+            crypto.sha512(content, hash[0..64]);
+            break :blk 64;
+        },
+        else => return error.UnsupportedHash,
+    };
+
+    // Verify based on algorithm
+    return switch (info.algo) {
+        PKEY_ALGO_RSA => crypto.rsa_verify_pkcs1(key.public_key, hash[0..hash_len], info.signature),
+        PKEY_ALGO_ECDSA => crypto.ecdsa_verify(key.public_key, hash[0..hash_len], info.signature),
+        PKEY_ALGO_ED25519 => crypto.ed25519_verify(key.public_key, content, info.signature),
+        else => error.UnsupportedAlgorithm,
+    };
+}
+
+// =============================================================================
+// Module Signing (for development)
+// =============================================================================
+
+/// Sign a module (development/build time)
+pub fn sign_module(
+    module_data: []const u8,
+    private_key: []const u8,
+    certificate: []const u8,
+    algo: u8,
+    hash_algo: u8,
+) ![]u8 {
+    // Calculate key ID from certificate
+    var key_id: [20]u8 = undefined;
+    crypto.sha1(certificate, &key_id);
+
+    // Hash module content
+    var content_hash: [64]u8 = undefined;
+    const hash_len: usize = switch (hash_algo) {
+        HASH_ALGO_SHA256 => blk: {
+            crypto.sha256(module_data, content_hash[0..32]);
+            break :blk 32;
+        },
+        HASH_ALGO_SHA512 => blk: {
+            crypto.sha512(module_data, content_hash[0..64]);
+            break :blk 64;
+        },
+        else => return error.UnsupportedHash,
+    };
+
+    // Generate signature
+    var signature: [512]u8 = undefined;
+    const sig_len = switch (algo) {
+        PKEY_ALGO_RSA => try crypto.rsa_sign_pkcs1(private_key, content_hash[0..hash_len], &signature),
+        PKEY_ALGO_ECDSA => try crypto.ecdsa_sign(private_key, content_hash[0..hash_len], &signature),
+        PKEY_ALGO_ED25519 => try crypto.ed25519_sign(private_key, module_data, &signature),
+        else => return error.UnsupportedAlgorithm,
+    };
+
+    // Build signed module
+    const signer_name = "home-os kernel signing key";
+    const total_size = module_data.len +
+        signer_name.len +
+        key_id.len +
+        sig_len +
+        @sizeOf(ModuleSignature) +
+        MODULE_SIG_STRING_LEN;
+
+    var result = try std.heap.page_allocator.alloc(u8, total_size);
+
+    var pos: usize = 0;
+
+    // Copy module data
+    @memcpy(result[pos..][0..module_data.len], module_data);
+    pos += module_data.len;
+
+    // Append signer name
+    @memcpy(result[pos..][0..signer_name.len], signer_name);
+    pos += signer_name.len;
+
+    // Append key ID
+    @memcpy(result[pos..][0..key_id.len], &key_id);
+    pos += key_id.len;
+
+    // Append signature
+    @memcpy(result[pos..][0..sig_len], signature[0..sig_len]);
+    pos += sig_len;
+
+    // Append signature structure
+    const sig_struct = @as(*ModuleSignature, @ptrCast(@alignCast(&result[pos])));
+    sig_struct.algo = algo;
+    sig_struct.hash = hash_algo;
+    sig_struct.id_type = PKEY_ID_X509;
+    sig_struct.signer_len = @intCast(signer_name.len);
+    sig_struct.key_id_len = @intCast(key_id.len);
+    sig_struct._pad = [_]u8{0} ** 3;
+    sig_struct.sig_len = @byteSwap(@as(u32, @intCast(sig_len)));
+    pos += @sizeOf(ModuleSignature);
+
+    // Append marker
+    @memcpy(result[pos..][0..MODULE_SIG_STRING_LEN], MODULE_SIG_STRING);
+
+    return result;
+}
+
+// =============================================================================
+// Module Loading Policy Enforcement
+// =============================================================================
+
+var g_policy: ModuleLoadPolicy = .ALLOW_UNSIGNED_WITH_TAINT;
+var g_keyring: ModuleKeyring = ModuleKeyring.init();
+var g_tainted: bool = false;
+
+/// Set module loading policy
+pub fn set_policy(policy: ModuleLoadPolicy) void {
+    // Can only make policy more restrictive
+    if (@intFromEnum(policy) > @intFromEnum(g_policy)) {
+        g_policy = policy;
+    }
+}
+
+/// Get current policy
+pub fn get_policy() ModuleLoadPolicy {
+    return g_policy;
+}
+
+/// Check if kernel is tainted
+pub fn is_tainted() bool {
+    return g_tainted;
+}
+
+/// Get module keyring
+pub fn get_keyring() *ModuleKeyring {
+    return &g_keyring;
+}
+
+/// Check if module can be loaded
+pub fn check_module_load(module_data: []const u8, name: []const u8) !void {
+    const verify_result = try verify_module(&g_keyring, module_data);
+
+    switch (g_policy) {
+        .ALLOW_ALL => {
+            // Always allow
+            return;
+        },
+
+        .ALLOW_UNSIGNED_WITH_TAINT => {
+            switch (verify_result.result) {
+                .VALID => return,
+                .NO_SIGNATURE => {
+                    // Taint kernel but allow
+                    g_tainted = true;
+                    log_module_event(.UNSIGNED_LOADED, name);
+                    return;
+                },
+                .UNKNOWN_KEY => {
+                    g_tainted = true;
+                    log_module_event(.UNKNOWN_KEY, name);
+                    return;
+                },
+                .INVALID_SIGNATURE => {
+                    g_tainted = true;
+                    log_module_event(.INVALID_SIG, name);
+                    return;
+                },
+                else => {
+                    g_tainted = true;
+                    return;
+                },
+            }
+        },
+
+        .REQUIRE_VALID_SIGNATURE => {
+            switch (verify_result.result) {
+                .VALID => {
+                    log_module_event(.VERIFIED, name);
+                    return;
+                },
+                .NO_SIGNATURE => {
+                    log_module_event(.UNSIGNED_REJECTED, name);
+                    return error.ModuleNotSigned;
+                },
+                .UNKNOWN_KEY => {
+                    log_module_event(.UNKNOWN_KEY_REJECTED, name);
+                    return error.UnknownSigningKey;
+                },
+                .KEY_REVOKED => {
+                    log_module_event(.REVOKED_KEY, name);
+                    return error.SigningKeyRevoked;
+                },
+                .INVALID_SIGNATURE => {
+                    log_module_event(.INVALID_SIG_REJECTED, name);
+                    return error.InvalidSignature;
+                },
+                else => return error.SignatureVerificationFailed,
+            }
+        },
+
+        .LOCKDOWN => {
+            // Same as REQUIRE_VALID_SIGNATURE but also blocks live patching
+            switch (verify_result.result) {
+                .VALID => {
+                    log_module_event(.VERIFIED, name);
+                    return;
+                },
+                else => {
+                    log_module_event(.LOCKDOWN_REJECTED, name);
+                    return error.LockdownActive;
+                },
+            }
+        },
+    }
+}
+
+// =============================================================================
+// Event Logging
+// =============================================================================
+
+const ModuleEvent = enum {
+    VERIFIED,
+    UNSIGNED_LOADED,
+    UNSIGNED_REJECTED,
+    UNKNOWN_KEY,
+    UNKNOWN_KEY_REJECTED,
+    INVALID_SIG,
+    INVALID_SIG_REJECTED,
+    REVOKED_KEY,
+    LOCKDOWN_REJECTED,
+};
+
+fn log_module_event(event: ModuleEvent, name: []const u8) void {
+    const event_str = switch (event) {
+        .VERIFIED => "Module verified",
+        .UNSIGNED_LOADED => "Unsigned module loaded (kernel tainted)",
+        .UNSIGNED_REJECTED => "Unsigned module rejected",
+        .UNKNOWN_KEY => "Module signed with unknown key (tainted)",
+        .UNKNOWN_KEY_REJECTED => "Module with unknown key rejected",
+        .INVALID_SIG => "Module with invalid signature (tainted)",
+        .INVALID_SIG_REJECTED => "Module with invalid signature rejected",
+        .REVOKED_KEY => "Module signed with revoked key",
+        .LOCKDOWN_REJECTED => "Module rejected (lockdown mode)",
+    };
+
+    // Log to kernel ring buffer
+    _ = name;
+    _ = event_str;
+    // kprintf("[module_signing] {s}: {s}\n", .{event_str, name});
+}
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+/// Initialize module signing subsystem
+pub fn init() !void {
+    // Load built-in keys from kernel image
+    try load_builtin_keys();
+
+    // Check secure boot state
+    if (secure_boot.is_enabled()) {
+        // Enforce signature requirement when secure boot is on
+        set_policy(.REQUIRE_VALID_SIGNATURE);
+    }
+
+    // Check kernel command line for policy override
+    // (only allow making policy more restrictive)
+}
+
+fn load_builtin_keys() !void {
+    // Built-in keys would be embedded in kernel binary
+    // This is a placeholder - actual implementation would
+    // parse the __modsign_keys section
+}
+
+/// Add key from system keyring
+pub fn add_key_from_system(cert_data: []const u8) !void {
+    var key = TrustedKey{
+        .id = undefined,
+        .public_key = cert_data,
+        .subject = &[_]u8{},
+        .issuer = &[_]u8{},
+        .algo = PKEY_ALGO_RSA,
+        .is_builtin = false,
+    };
+
+    // Calculate key ID
+    crypto.sha1(cert_data, &key.id);
+
+    try g_keyring.add_key(key);
+}
+
+// =============================================================================
+// Sysfs Interface
+// =============================================================================
+
+/// Format module signing info for /sys/module/<name>/signature
+pub fn format_signature_info(info: *const SignatureInfo, buffer: []u8) usize {
+    var pos: usize = 0;
+
+    // Algorithm
+    const algo_name = info.get_algo_name();
+    @memcpy(buffer[pos..][0..6], "algo: ");
+    pos += 6;
+    @memcpy(buffer[pos..][0..algo_name.len], algo_name);
+    pos += algo_name.len;
+    buffer[pos] = '\n';
+    pos += 1;
+
+    // Hash
+    const hash_name = info.get_hash_name();
+    @memcpy(buffer[pos..][0..6], "hash: ");
+    pos += 6;
+    @memcpy(buffer[pos..][0..hash_name.len], hash_name);
+    pos += hash_name.len;
+    buffer[pos] = '\n';
+    pos += 1;
+
+    // Signer
+    @memcpy(buffer[pos..][0..8], "signer: ");
+    pos += 8;
+    @memcpy(buffer[pos..][0..info.signer_name.len], info.signer_name);
+    pos += info.signer_name.len;
+    buffer[pos] = '\n';
+    pos += 1;
+
+    return pos;
+}

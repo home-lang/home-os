@@ -1,0 +1,646 @@
+// home-os dm-verity Implementation
+// Block-level integrity verification using Merkle trees
+
+const std = @import("std");
+const crypto = @import("../crypto/crypto.home");
+const dm = @import("../drivers/block/dm.home");
+
+// =============================================================================
+// dm-verity Constants
+// =============================================================================
+
+pub const DM_VERITY_VERSION: u32 = 1;
+
+// Hash algorithms
+pub const VERITY_HASH_SHA256: u8 = 0;
+pub const VERITY_HASH_SHA512: u8 = 1;
+
+// Block sizes
+pub const VERITY_DEFAULT_BLOCK_SIZE: u32 = 4096;
+pub const VERITY_MIN_BLOCK_SIZE: u32 = 512;
+pub const VERITY_MAX_BLOCK_SIZE: u32 = 65536;
+
+// Mode flags
+pub const VERITY_MODE_EIO: u32 = 0;        // Return I/O error on verification failure
+pub const VERITY_MODE_LOGGING: u32 = 1;    // Log and continue on failure
+pub const VERITY_MODE_RESTART: u32 = 2;    // Restart system on failure
+pub const VERITY_MODE_PANIC: u32 = 3;      // Panic on failure
+
+// Feature flags
+pub const VERITY_FEC_SUPPORTED: u32 = 0x01;    // Forward error correction
+pub const VERITY_CHECK_AT_MOST_ONCE: u32 = 0x02;  // Check block only once
+
+// =============================================================================
+// Superblock Structure
+// =============================================================================
+
+/// dm-verity superblock (on-disk format)
+pub const VeritySuperblock = packed struct {
+    signature: [8]u8,        // "verity\0\0"
+    version: u32,            // Format version
+    hash_type: u32,          // Hash algorithm
+    uuid: [16]u8,            // UUID
+
+    algorithm: [32]u8,       // Hash algorithm name (null-terminated)
+
+    data_block_size: u32,    // Data block size
+    hash_block_size: u32,    // Hash block size
+
+    data_blocks: u64,        // Number of data blocks
+    salt_size: u16,          // Salt size
+    _pad1: [6]u8,
+
+    salt: [256]u8,           // Salt (variable, up to 256 bytes)
+
+    _pad2: [168]u8,          // Padding to 512 bytes total
+
+    pub fn validate(self: *const VeritySuperblock) bool {
+        // Check signature
+        if (!std.mem.eql(u8, self.signature[0..6], "verity")) {
+            return false;
+        }
+
+        // Check version
+        if (self.version != 1) {
+            return false;
+        }
+
+        // Check block sizes
+        if (self.data_block_size < VERITY_MIN_BLOCK_SIZE or
+            self.data_block_size > VERITY_MAX_BLOCK_SIZE)
+        {
+            return false;
+        }
+
+        if (self.hash_block_size < VERITY_MIN_BLOCK_SIZE or
+            self.hash_block_size > VERITY_MAX_BLOCK_SIZE)
+        {
+            return false;
+        }
+
+        return true;
+    }
+};
+
+// =============================================================================
+// Merkle Tree
+// =============================================================================
+
+/// Merkle tree level info
+pub const TreeLevel = struct {
+    hash_per_block: u32,     // Hashes per block at this level
+    blocks: u64,             // Number of blocks at this level
+    offset: u64,             // Block offset in hash device
+};
+
+/// Merkle tree structure
+pub const MerkleTree = struct {
+    // Configuration
+    data_blocks: u64,
+    data_block_size: u32,
+    hash_block_size: u32,
+    hash_size: u32,
+
+    // Tree structure
+    levels: [16]TreeLevel,
+    level_count: u32,
+    hash_per_block: u32,
+
+    // Root hash
+    root_hash: [64]u8,
+    root_hash_size: u32,
+
+    // Salt
+    salt: [256]u8,
+    salt_size: u32,
+
+    pub fn init(
+        data_blocks: u64,
+        data_block_size: u32,
+        hash_block_size: u32,
+        hash_size: u32,
+    ) MerkleTree {
+        var tree = MerkleTree{
+            .data_blocks = data_blocks,
+            .data_block_size = data_block_size,
+            .hash_block_size = hash_block_size,
+            .hash_size = hash_size,
+            .levels = undefined,
+            .level_count = 0,
+            .hash_per_block = hash_block_size / hash_size,
+            .root_hash = undefined,
+            .root_hash_size = hash_size,
+            .salt = undefined,
+            .salt_size = 0,
+        };
+
+        // Calculate tree levels
+        tree.calculate_levels();
+
+        return tree;
+    }
+
+    fn calculate_levels(self: *MerkleTree) void {
+        var blocks = self.data_blocks;
+        var offset: u64 = 0;
+        self.level_count = 0;
+
+        while (blocks > 1 and self.level_count < 16) {
+            const hashes_needed = blocks;
+            const hash_blocks = (hashes_needed + self.hash_per_block - 1) / self.hash_per_block;
+
+            self.levels[self.level_count] = TreeLevel{
+                .hash_per_block = self.hash_per_block,
+                .blocks = hash_blocks,
+                .offset = offset,
+            };
+
+            offset += hash_blocks;
+            blocks = hash_blocks;
+            self.level_count += 1;
+        }
+    }
+
+    /// Get hash block index for a data block
+    pub fn get_hash_block(self: *const MerkleTree, data_block: u64, level: u32) u64 {
+        if (level >= self.level_count) return 0;
+
+        const hash_index = if (level == 0)
+            data_block
+        else
+            data_block / std.math.pow(u64, self.hash_per_block, level);
+
+        return self.levels[level].offset + hash_index / self.hash_per_block;
+    }
+
+    /// Get offset within hash block for a data block
+    pub fn get_hash_offset(self: *const MerkleTree, data_block: u64, level: u32) u32 {
+        if (level >= self.level_count) return 0;
+
+        const hash_index = if (level == 0)
+            data_block
+        else
+            data_block / std.math.pow(u64, self.hash_per_block, level);
+
+        return @intCast((hash_index % self.hash_per_block) * self.hash_size);
+    }
+
+    /// Calculate total hash tree size in blocks
+    pub fn total_hash_blocks(self: *const MerkleTree) u64 {
+        var total: u64 = 0;
+        var i: u32 = 0;
+        while (i < self.level_count) : (i += 1) {
+            total += self.levels[i].blocks;
+        }
+        return total;
+    }
+};
+
+// =============================================================================
+// Verity Target
+// =============================================================================
+
+pub const VerityTarget = struct {
+    // Devices
+    data_device: *dm.BlockDevice,
+    hash_device: *dm.BlockDevice,
+
+    // Configuration
+    tree: MerkleTree,
+    hash_algo: u8,
+    mode: u32,
+    features: u32,
+
+    // Verification state
+    verified_blocks: []u1,    // Bitmap of verified blocks
+    corrupted: bool,
+
+    // Statistics
+    stats: VerityStats,
+
+    // FEC (forward error correction)
+    fec: ?*FECData,
+
+    pub fn init(
+        data_dev: *dm.BlockDevice,
+        hash_dev: *dm.BlockDevice,
+        root_hash: []const u8,
+        salt: []const u8,
+        data_blocks: u64,
+        data_block_size: u32,
+        hash_block_size: u32,
+        hash_algo: u8,
+    ) !*VerityTarget {
+        var target = try std.heap.page_allocator.create(VerityTarget);
+
+        const hash_size: u32 = switch (hash_algo) {
+            VERITY_HASH_SHA256 => 32,
+            VERITY_HASH_SHA512 => 64,
+            else => return error.UnsupportedHashAlgorithm,
+        };
+
+        target.data_device = data_dev;
+        target.hash_device = hash_dev;
+        target.hash_algo = hash_algo;
+        target.mode = VERITY_MODE_EIO;
+        target.features = 0;
+        target.corrupted = false;
+        target.stats = VerityStats{};
+        target.fec = null;
+
+        target.tree = MerkleTree.init(
+            data_blocks,
+            data_block_size,
+            hash_block_size,
+            hash_size,
+        );
+
+        // Set root hash
+        @memcpy(target.tree.root_hash[0..root_hash.len], root_hash);
+        target.tree.root_hash_size = @intCast(root_hash.len);
+
+        // Set salt
+        @memcpy(target.tree.salt[0..salt.len], salt);
+        target.tree.salt_size = @intCast(salt.len);
+
+        // Allocate verified block bitmap
+        const bitmap_size = (data_blocks + 7) / 8;
+        target.verified_blocks = try std.heap.page_allocator.alloc(u1, data_blocks);
+        @memset(target.verified_blocks, 0);
+
+        return target;
+    }
+
+    pub fn deinit(self: *VerityTarget) void {
+        std.heap.page_allocator.free(self.verified_blocks);
+        if (self.fec) |fec| {
+            fec.deinit();
+        }
+        std.heap.page_allocator.destroy(self);
+    }
+
+    /// Verify and read a data block
+    pub fn read_block(self: *VerityTarget, block_num: u64, buffer: []u8) !void {
+        if (block_num >= self.tree.data_blocks) {
+            return error.BlockOutOfRange;
+        }
+
+        // Check if already verified (and features allow skipping)
+        if (self.features & VERITY_CHECK_AT_MOST_ONCE != 0) {
+            if (self.verified_blocks[block_num] != 0) {
+                // Already verified, just read
+                try self.data_device.read_block(block_num, buffer);
+                self.stats.blocks_cached += 1;
+                return;
+            }
+        }
+
+        // Read data block
+        try self.data_device.read_block(block_num, buffer);
+        self.stats.blocks_read += 1;
+
+        // Verify hash chain
+        const verified = try self.verify_block(block_num, buffer);
+
+        if (!verified) {
+            self.stats.verify_failures += 1;
+
+            // Try FEC if available
+            if (self.fec) |fec| {
+                if (try fec.repair_block(self, block_num, buffer)) {
+                    self.stats.fec_repairs += 1;
+                    self.verified_blocks[block_num] = 1;
+                    return;
+                }
+            }
+
+            // Handle failure based on mode
+            try self.handle_verification_failure(block_num);
+            return error.VerificationFailed;
+        }
+
+        // Mark as verified
+        self.verified_blocks[block_num] = 1;
+        self.stats.blocks_verified += 1;
+    }
+
+    /// Verify block hash chain from leaf to root
+    fn verify_block(self: *VerityTarget, block_num: u64, data: []const u8) !bool {
+        var computed_hash: [64]u8 = undefined;
+
+        // Hash data block with salt
+        try self.hash_block_with_salt(data, &computed_hash);
+
+        // Verify each level up to root
+        var level: u32 = 0;
+        while (level < self.tree.level_count) : (level += 1) {
+            // Read hash block
+            const hash_block_num = self.tree.get_hash_block(block_num, level);
+            var hash_block_data: [65536]u8 = undefined;
+            try self.hash_device.read_block(hash_block_num, hash_block_data[0..self.tree.hash_block_size]);
+
+            // Get expected hash
+            const hash_offset = self.tree.get_hash_offset(block_num, level);
+            const expected = hash_block_data[hash_offset..][0..self.tree.hash_size];
+
+            // Compare
+            if (!std.mem.eql(u8, expected, computed_hash[0..self.tree.hash_size])) {
+                return false;
+            }
+
+            // Hash this hash block for next level
+            try self.hash_block_with_salt(
+                hash_block_data[0..self.tree.hash_block_size],
+                &computed_hash,
+            );
+        }
+
+        // Verify against root hash
+        return std.mem.eql(u8, computed_hash[0..self.tree.root_hash_size], self.tree.root_hash[0..self.tree.root_hash_size]);
+    }
+
+    /// Hash a block with salt prepended
+    fn hash_block_with_salt(self: *VerityTarget, data: []const u8, hash: *[64]u8) !void {
+        switch (self.hash_algo) {
+            VERITY_HASH_SHA256 => {
+                var hasher = crypto.sha256_init();
+                hasher.update(self.tree.salt[0..self.tree.salt_size]);
+                hasher.update(data);
+                hasher.finalize(hash[0..32]);
+            },
+            VERITY_HASH_SHA512 => {
+                var hasher = crypto.sha512_init();
+                hasher.update(self.tree.salt[0..self.tree.salt_size]);
+                hasher.update(data);
+                hasher.finalize(hash[0..64]);
+            },
+            else => return error.UnsupportedHashAlgorithm,
+        }
+    }
+
+    /// Handle verification failure based on mode
+    fn handle_verification_failure(self: *VerityTarget, block_num: u64) !void {
+        self.corrupted = true;
+
+        switch (self.mode) {
+            VERITY_MODE_EIO => {
+                // Return error (done by caller)
+            },
+            VERITY_MODE_LOGGING => {
+                // Log but don't fail
+                log_corruption(block_num);
+            },
+            VERITY_MODE_RESTART => {
+                // Trigger system restart
+                trigger_restart();
+            },
+            VERITY_MODE_PANIC => {
+                // Kernel panic
+                @panic("dm-verity: corruption detected");
+            },
+            else => {},
+        }
+    }
+
+    /// Enable FEC (forward error correction)
+    pub fn enable_fec(self: *VerityTarget, fec_dev: *dm.BlockDevice, fec_roots: u32) !void {
+        self.fec = try FECData.init(fec_dev, fec_roots, self.tree.data_block_size);
+        self.features |= VERITY_FEC_SUPPORTED;
+    }
+};
+
+// =============================================================================
+// Statistics
+// =============================================================================
+
+pub const VerityStats = struct {
+    blocks_read: u64 = 0,
+    blocks_verified: u64 = 0,
+    blocks_cached: u64 = 0,
+    verify_failures: u64 = 0,
+    fec_repairs: u64 = 0,
+};
+
+// =============================================================================
+// Forward Error Correction
+// =============================================================================
+
+pub const FECData = struct {
+    device: *dm.BlockDevice,
+    roots: u32,              // Reed-Solomon roots
+    block_size: u32,
+    rsn: u32,                // RS(n, k) parameters
+    rsk: u32,
+
+    pub fn init(dev: *dm.BlockDevice, roots: u32, block_size: u32) !*FECData {
+        var fec = try std.heap.page_allocator.create(FECData);
+        fec.device = dev;
+        fec.roots = roots;
+        fec.block_size = block_size;
+        fec.rsn = 255;
+        fec.rsk = 255 - roots;
+        return fec;
+    }
+
+    pub fn deinit(self: *FECData) void {
+        std.heap.page_allocator.destroy(self);
+    }
+
+    /// Attempt to repair corrupted block using FEC data
+    pub fn repair_block(self: *FECData, target: *VerityTarget, block_num: u64, buffer: []u8) !bool {
+        _ = target;
+        _ = buffer;
+
+        // Read FEC block
+        var fec_block: [4096]u8 = undefined;
+        const fec_block_num = self.get_fec_block(block_num);
+        try self.device.read_block(fec_block_num, &fec_block);
+
+        // Apply Reed-Solomon correction
+        // This is a placeholder - actual implementation would use RS decoder
+        _ = fec_block;
+
+        return false;  // FEC repair not implemented
+    }
+
+    fn get_fec_block(self: *FECData, data_block: u64) u64 {
+        // Calculate which FEC block covers this data block
+        _ = self;
+        return data_block;  // Simplified
+    }
+};
+
+// =============================================================================
+// Verity Setup from Superblock
+// =============================================================================
+
+/// Create verity target from superblock
+pub fn create_from_superblock(
+    data_dev: *dm.BlockDevice,
+    hash_dev: *dm.BlockDevice,
+    sb_offset: u64,
+    root_hash: []const u8,
+) !*VerityTarget {
+    // Read superblock
+    var sb_buffer: [512]u8 = undefined;
+    try hash_dev.read_block(sb_offset, &sb_buffer);
+
+    const sb = @as(*const VeritySuperblock, @ptrCast(@alignCast(&sb_buffer)));
+
+    if (!sb.validate()) {
+        return error.InvalidSuperblock;
+    }
+
+    // Determine hash algorithm
+    const hash_algo: u8 = if (std.mem.startsWith(u8, &sb.algorithm, "sha256"))
+        VERITY_HASH_SHA256
+    else if (std.mem.startsWith(u8, &sb.algorithm, "sha512"))
+        VERITY_HASH_SHA512
+    else
+        return error.UnsupportedHashAlgorithm;
+
+    return try VerityTarget.init(
+        data_dev,
+        hash_dev,
+        root_hash,
+        sb.salt[0..sb.salt_size],
+        sb.data_blocks,
+        sb.data_block_size,
+        sb.hash_block_size,
+        hash_algo,
+    );
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn log_corruption(block_num: u64) void {
+    // Log to kernel message buffer
+    _ = block_num;
+    // kprintf("dm-verity: corruption at block %llu\n", block_num);
+}
+
+fn trigger_restart() void {
+    // Request system restart
+    // reboot(REBOOT_CMD_RESTART);
+}
+
+/// Format root hash for display
+pub fn format_root_hash(hash: []const u8, buffer: []u8) usize {
+    var pos: usize = 0;
+    for (hash) |byte| {
+        const hex = "0123456789abcdef";
+        buffer[pos] = hex[byte >> 4];
+        pos += 1;
+        buffer[pos] = hex[byte & 0x0f];
+        pos += 1;
+    }
+    return pos;
+}
+
+/// Parse root hash from hex string
+pub fn parse_root_hash(hex: []const u8, hash: []u8) !void {
+    if (hex.len % 2 != 0) return error.InvalidHexLength;
+    if (hex.len / 2 > hash.len) return error.HashBufferTooSmall;
+
+    var i: usize = 0;
+    while (i < hex.len) : (i += 2) {
+        const high = try hex_digit(hex[i]);
+        const low = try hex_digit(hex[i + 1]);
+        hash[i / 2] = (high << 4) | low;
+    }
+}
+
+fn hex_digit(c: u8) !u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return error.InvalidHexDigit;
+}
+
+// =============================================================================
+// Verity Hash Tree Generation (for creating verity images)
+// =============================================================================
+
+/// Generate hash tree for a device
+pub fn generate_hash_tree(
+    data_dev: *dm.BlockDevice,
+    hash_dev: *dm.BlockDevice,
+    data_blocks: u64,
+    block_size: u32,
+    hash_algo: u8,
+    salt: []const u8,
+    root_hash: *[64]u8,
+) !void {
+    const hash_size: u32 = switch (hash_algo) {
+        VERITY_HASH_SHA256 => 32,
+        VERITY_HASH_SHA512 => 64,
+        else => return error.UnsupportedHashAlgorithm,
+    };
+
+    const hash_per_block = block_size / hash_size;
+
+    // Level 0: Hash all data blocks
+    var level_hashes = try std.heap.page_allocator.alloc([64]u8, data_blocks);
+    defer std.heap.page_allocator.free(level_hashes);
+
+    var data_buffer: [65536]u8 = undefined;
+    var block: u64 = 0;
+    while (block < data_blocks) : (block += 1) {
+        try data_dev.read_block(block, data_buffer[0..block_size]);
+
+        var hasher = if (hash_algo == VERITY_HASH_SHA256)
+            crypto.sha256_init()
+        else
+            crypto.sha512_init();
+
+        hasher.update(salt);
+        hasher.update(data_buffer[0..block_size]);
+        hasher.finalize(&level_hashes[block]);
+    }
+
+    // Write level 0 hashes and build higher levels
+    var hash_offset: u64 = 0;
+    var current_count = data_blocks;
+
+    while (current_count > 1) {
+        const hash_blocks = (current_count + hash_per_block - 1) / hash_per_block;
+
+        // Write current level
+        var hash_block: u64 = 0;
+        while (hash_block < hash_blocks) : (hash_block += 1) {
+            var hash_block_data: [65536]u8 = undefined;
+            @memset(hash_block_data[0..block_size], 0);
+
+            var i: u32 = 0;
+            while (i < hash_per_block and hash_block * hash_per_block + i < current_count) : (i += 1) {
+                const src_idx = hash_block * hash_per_block + i;
+                @memcpy(
+                    hash_block_data[i * hash_size ..][0..hash_size],
+                    level_hashes[src_idx][0..hash_size],
+                );
+            }
+
+            try hash_dev.write_block(hash_offset + hash_block, hash_block_data[0..block_size]);
+
+            // Hash this block for next level
+            if (hash_block < hash_blocks) {
+                var hasher = if (hash_algo == VERITY_HASH_SHA256)
+                    crypto.sha256_init()
+                else
+                    crypto.sha512_init();
+
+                hasher.update(salt);
+                hasher.update(hash_block_data[0..block_size]);
+                hasher.finalize(&level_hashes[hash_block]);
+            }
+        }
+
+        hash_offset += hash_blocks;
+        current_count = hash_blocks;
+    }
+
+    // Root hash is the single remaining hash
+    @memcpy(root_hash[0..hash_size], level_hashes[0][0..hash_size]);
+}

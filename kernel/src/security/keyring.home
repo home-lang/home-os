@@ -1,0 +1,841 @@
+// home-os Key Management System
+// Secure keyring and key lifecycle management
+
+const std = @import("std");
+const crypto = @import("../crypto/crypto.home");
+const process = @import("../proc/process.home");
+
+// =============================================================================
+// Key Types
+// =============================================================================
+
+pub const KeyType = enum(u8) {
+    USER = 0,               // User-defined key
+    KEYRING = 1,            // Keyring (holds other keys)
+    LOGON = 2,              // Logon key (not readable)
+    ENCRYPTED = 3,          // Encrypted key
+    TRUSTED = 4,            // TPM-sealed key
+    ASYMMETRIC = 5,         // Public/private key pair
+    DNS_RESOLVER = 6,       // DNS resolver key
+    BIG_KEY = 7,            // Large key (file-backed)
+    BLACKLIST = 8,          // Blacklisted key
+    FSCRYPT = 9,            // Filesystem encryption key
+    DM_CRYPT = 10,          // dm-crypt encryption key
+};
+
+pub const KeyPermission = packed struct {
+    // Possessor permissions
+    possess_view: bool,
+    possess_read: bool,
+    possess_write: bool,
+    possess_search: bool,
+    possess_link: bool,
+    possess_setattr: bool,
+    possess_all: bool,
+    _pad1: bool,
+
+    // User permissions
+    user_view: bool,
+    user_read: bool,
+    user_write: bool,
+    user_search: bool,
+    user_link: bool,
+    user_setattr: bool,
+    user_all: bool,
+    _pad2: bool,
+
+    // Group permissions
+    group_view: bool,
+    group_read: bool,
+    group_write: bool,
+    group_search: bool,
+    group_link: bool,
+    group_setattr: bool,
+    group_all: bool,
+    _pad3: bool,
+
+    // Other permissions
+    other_view: bool,
+    other_read: bool,
+    other_write: bool,
+    other_search: bool,
+    other_link: bool,
+    other_setattr: bool,
+    other_all: bool,
+    _pad4: bool,
+
+    pub fn default_user() KeyPermission {
+        return KeyPermission{
+            .possess_view = true,
+            .possess_read = true,
+            .possess_write = true,
+            .possess_search = true,
+            .possess_link = true,
+            .possess_setattr = true,
+            .possess_all = false,
+            ._pad1 = false,
+            .user_view = true,
+            .user_read = true,
+            .user_write = false,
+            .user_search = false,
+            .user_link = false,
+            .user_setattr = false,
+            .user_all = false,
+            ._pad2 = false,
+            .group_view = false,
+            .group_read = false,
+            .group_write = false,
+            .group_search = false,
+            .group_link = false,
+            .group_setattr = false,
+            .group_all = false,
+            ._pad3 = false,
+            .other_view = false,
+            .other_read = false,
+            .other_write = false,
+            .other_search = false,
+            .other_link = false,
+            .other_setattr = false,
+            .other_all = false,
+            ._pad4 = false,
+        };
+    }
+
+    pub fn all_access() KeyPermission {
+        return KeyPermission{
+            .possess_view = true,
+            .possess_read = true,
+            .possess_write = true,
+            .possess_search = true,
+            .possess_link = true,
+            .possess_setattr = true,
+            .possess_all = true,
+            ._pad1 = false,
+            .user_view = true,
+            .user_read = true,
+            .user_write = true,
+            .user_search = true,
+            .user_link = true,
+            .user_setattr = true,
+            .user_all = true,
+            ._pad2 = false,
+            .group_view = true,
+            .group_read = true,
+            .group_write = true,
+            .group_search = true,
+            .group_link = true,
+            .group_setattr = true,
+            .group_all = true,
+            ._pad3 = false,
+            .other_view = true,
+            .other_read = true,
+            .other_write = true,
+            .other_search = true,
+            .other_link = true,
+            .other_setattr = true,
+            .other_all = true,
+            ._pad4 = false,
+        };
+    }
+};
+
+// =============================================================================
+// Key Structure
+// =============================================================================
+
+pub const Key = struct {
+    // Identity
+    serial: i32,             // Unique serial number
+    key_type: KeyType,
+    description: [256]u8,
+    description_len: u16,
+
+    // Ownership
+    uid: u32,
+    gid: u32,
+    permissions: KeyPermission,
+
+    // State
+    flags: u32,
+    state: KeyState,
+    usage_count: u32,
+
+    // Expiration
+    expiry: i64,             // Unix timestamp, 0 = no expiry
+
+    // Data
+    payload: [4096]u8,
+    payload_len: u32,
+
+    // Linkage
+    linked_keyrings: [16]i32,  // Serial numbers of keyrings containing this key
+    link_count: u32,
+
+    pub fn init(serial: i32, key_type: KeyType, description: []const u8) Key {
+        var key = Key{
+            .serial = serial,
+            .key_type = key_type,
+            .description = undefined,
+            .description_len = @intCast(@min(description.len, 255)),
+            .uid = 0,
+            .gid = 0,
+            .permissions = KeyPermission.default_user(),
+            .flags = 0,
+            .state = .VALID,
+            .usage_count = 1,
+            .expiry = 0,
+            .payload = undefined,
+            .payload_len = 0,
+            .linked_keyrings = [_]i32{0} ** 16,
+            .link_count = 0,
+        };
+
+        @memset(&key.description, 0);
+        @memcpy(key.description[0..key.description_len], description[0..key.description_len]);
+        @memset(&key.payload, 0);
+
+        return key;
+    }
+
+    pub fn set_payload(self: *Key, data: []const u8) !void {
+        if (data.len > self.payload.len) {
+            return error.PayloadTooLarge;
+        }
+        @memcpy(self.payload[0..data.len], data);
+        self.payload_len = @intCast(data.len);
+    }
+
+    pub fn get_payload(self: *const Key) []const u8 {
+        return self.payload[0..self.payload_len];
+    }
+
+    pub fn is_expired(self: *const Key) bool {
+        if (self.expiry == 0) return false;
+        return get_current_time() > self.expiry;
+    }
+
+    pub fn revoke(self: *Key) void {
+        self.state = .REVOKED;
+    }
+
+    pub fn invalidate(self: *Key) void {
+        self.state = .DEAD;
+        crypto.secure_zero(&self.payload);
+        self.payload_len = 0;
+    }
+};
+
+pub const KeyState = enum(u8) {
+    VALID = 0,
+    REVOKED = 1,
+    DEAD = 2,
+    EXPIRED = 3,
+    NEGATIVE = 4,
+};
+
+// Key flags
+pub const KEY_FLAG_INSTANTIATED: u32 = 0x0001;
+pub const KEY_FLAG_DEAD: u32 = 0x0002;
+pub const KEY_FLAG_REVOKED: u32 = 0x0004;
+pub const KEY_FLAG_IN_QUOTA: u32 = 0x0008;
+pub const KEY_FLAG_USER_CONSTRUCT: u32 = 0x0010;
+pub const KEY_FLAG_ROOT_CAN_CLEAR: u32 = 0x0020;
+pub const KEY_FLAG_INVALIDATED: u32 = 0x0040;
+pub const KEY_FLAG_BUILTIN: u32 = 0x0080;
+pub const KEY_FLAG_ROOT_CAN_INVAL: u32 = 0x0100;
+pub const KEY_FLAG_KEEP: u32 = 0x0200;
+pub const KEY_FLAG_UID_KEYRING: u32 = 0x0400;
+
+// =============================================================================
+// Keyring (Container for Keys)
+// =============================================================================
+
+pub const Keyring = struct {
+    key: Key,                // Keyring is itself a key
+    children: [256]i32,      // Serial numbers of contained keys
+    child_count: u32,
+    max_children: u32,
+
+    pub fn init(serial: i32, description: []const u8) Keyring {
+        return Keyring{
+            .key = Key.init(serial, .KEYRING, description),
+            .children = [_]i32{0} ** 256,
+            .child_count = 0,
+            .max_children = 256,
+        };
+    }
+
+    pub fn link_key(self: *Keyring, key_serial: i32) !void {
+        if (self.child_count >= self.max_children) {
+            return error.KeyringFull;
+        }
+
+        // Check for duplicates
+        var i: u32 = 0;
+        while (i < self.child_count) : (i += 1) {
+            if (self.children[i] == key_serial) {
+                return error.KeyAlreadyLinked;
+            }
+        }
+
+        self.children[self.child_count] = key_serial;
+        self.child_count += 1;
+    }
+
+    pub fn unlink_key(self: *Keyring, key_serial: i32) bool {
+        var i: u32 = 0;
+        while (i < self.child_count) : (i += 1) {
+            if (self.children[i] == key_serial) {
+                // Shift remaining
+                var j = i;
+                while (j < self.child_count - 1) : (j += 1) {
+                    self.children[j] = self.children[j + 1];
+                }
+                self.child_count -= 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn contains(self: *const Keyring, key_serial: i32) bool {
+        var i: u32 = 0;
+        while (i < self.child_count) : (i += 1) {
+            if (self.children[i] == key_serial) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn clear(self: *Keyring) void {
+        self.child_count = 0;
+        @memset(&self.children, 0);
+    }
+};
+
+// =============================================================================
+// Key Management System
+// =============================================================================
+
+pub const KeyManager = struct {
+    // All keys in system
+    keys: [4096]Key,
+    key_count: u32,
+
+    // All keyrings
+    keyrings: [256]Keyring,
+    keyring_count: u32,
+
+    // Serial number counter
+    next_serial: i32,
+
+    // Special keyrings
+    system_keyring: i32,          // @.system_keyring
+    builtin_keyring: i32,         // Built-in keys (module signing, etc.)
+    platform_keyring: i32,        // Platform/firmware keys
+    secondary_keyring: i32,       // Secondary trusted keys
+    blacklist_keyring: i32,       // Blacklisted key hashes
+
+    // Per-user quota tracking
+    user_quotas: [256]UserQuota,
+
+    pub fn init() KeyManager {
+        var km = KeyManager{
+            .keys = undefined,
+            .key_count = 0,
+            .keyrings = undefined,
+            .keyring_count = 0,
+            .next_serial = 1,
+            .system_keyring = 0,
+            .builtin_keyring = 0,
+            .platform_keyring = 0,
+            .secondary_keyring = 0,
+            .blacklist_keyring = 0,
+            .user_quotas = undefined,
+        };
+
+        // Initialize quotas
+        for (&km.user_quotas) |*q| {
+            q.* = UserQuota.init();
+        }
+
+        return km;
+    }
+
+    /// Create system keyrings at boot
+    pub fn create_system_keyrings(self: *KeyManager) !void {
+        // System keyring
+        self.system_keyring = try self.create_keyring(0, 0, ".system_keyring");
+
+        // Built-in keyring
+        self.builtin_keyring = try self.create_keyring(0, 0, ".builtin_trusted_keys");
+
+        // Platform keyring
+        self.platform_keyring = try self.create_keyring(0, 0, ".platform");
+
+        // Secondary keyring
+        self.secondary_keyring = try self.create_keyring(0, 0, ".secondary_trusted_keys");
+
+        // Blacklist keyring
+        self.blacklist_keyring = try self.create_keyring(0, 0, ".blacklist");
+
+        // Link secondary and platform to system
+        var sys_kr = self.get_keyring(self.system_keyring) orelse return error.SystemError;
+        try sys_kr.link_key(self.builtin_keyring);
+        try sys_kr.link_key(self.platform_keyring);
+        try sys_kr.link_key(self.secondary_keyring);
+    }
+
+    /// Allocate new key
+    pub fn alloc_key(self: *KeyManager, key_type: KeyType, description: []const u8, uid: u32, gid: u32) !*Key {
+        if (self.key_count >= 4096) {
+            return error.KeyQuotaExceeded;
+        }
+
+        // Check user quota
+        if (!self.check_quota(uid, 1, 0)) {
+            return error.UserQuotaExceeded;
+        }
+
+        const serial = self.next_serial;
+        self.next_serial += 1;
+
+        self.keys[self.key_count] = Key.init(serial, key_type, description);
+        self.keys[self.key_count].uid = uid;
+        self.keys[self.key_count].gid = gid;
+
+        const key = &self.keys[self.key_count];
+        self.key_count += 1;
+
+        // Update quota
+        self.update_quota(uid, 1, 0);
+
+        return key;
+    }
+
+    /// Create a keyring
+    pub fn create_keyring(self: *KeyManager, uid: u32, gid: u32, description: []const u8) !i32 {
+        if (self.keyring_count >= 256) {
+            return error.TooManyKeyrings;
+        }
+
+        const serial = self.next_serial;
+        self.next_serial += 1;
+
+        self.keyrings[self.keyring_count] = Keyring.init(serial, description);
+        self.keyrings[self.keyring_count].key.uid = uid;
+        self.keyrings[self.keyring_count].key.gid = gid;
+
+        self.keyring_count += 1;
+
+        return serial;
+    }
+
+    /// Find key by serial
+    pub fn get_key(self: *KeyManager, serial: i32) ?*Key {
+        var i: u32 = 0;
+        while (i < self.key_count) : (i += 1) {
+            if (self.keys[i].serial == serial) {
+                return &self.keys[i];
+            }
+        }
+        return null;
+    }
+
+    /// Find keyring by serial
+    pub fn get_keyring(self: *KeyManager, serial: i32) ?*Keyring {
+        var i: u32 = 0;
+        while (i < self.keyring_count) : (i += 1) {
+            if (self.keyrings[i].key.serial == serial) {
+                return &self.keyrings[i];
+            }
+        }
+        return null;
+    }
+
+    /// Search for key by description
+    pub fn search_key(self: *KeyManager, keyring_serial: i32, description: []const u8) ?*Key {
+        const keyring = self.get_keyring(keyring_serial) orelse return null;
+
+        // Search direct children
+        var i: u32 = 0;
+        while (i < keyring.child_count) : (i += 1) {
+            const key = self.get_key(keyring.children[i]) orelse continue;
+            if (std.mem.eql(u8, key.description[0..key.description_len], description)) {
+                return key;
+            }
+        }
+
+        // Recursive search in child keyrings
+        i = 0;
+        while (i < keyring.child_count) : (i += 1) {
+            const child = self.get_key(keyring.children[i]) orelse continue;
+            if (child.key_type == .KEYRING) {
+                if (self.search_key(child.serial, description)) |found| {
+                    return found;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// Add key to keyring
+    pub fn add_key(
+        self: *KeyManager,
+        key_type: KeyType,
+        description: []const u8,
+        payload: []const u8,
+        keyring_serial: i32,
+        uid: u32,
+        gid: u32,
+    ) !i32 {
+        // Allocate key
+        var key = try self.alloc_key(key_type, description, uid, gid);
+        try key.set_payload(payload);
+        key.flags |= KEY_FLAG_INSTANTIATED;
+
+        // Link to keyring
+        var keyring = self.get_keyring(keyring_serial) orelse return error.KeyringNotFound;
+
+        // Check permissions
+        if (!self.check_keyring_permission(keyring, uid, gid, .link)) {
+            return error.PermissionDenied;
+        }
+
+        try keyring.link_key(key.serial);
+
+        return key.serial;
+    }
+
+    /// Revoke a key
+    pub fn revoke_key(self: *KeyManager, serial: i32, uid: u32, gid: u32) !void {
+        var key = self.get_key(serial) orelse return error.KeyNotFound;
+
+        // Check permissions
+        if (!self.check_key_permission(key, uid, gid, .setattr)) {
+            return error.PermissionDenied;
+        }
+
+        key.revoke();
+    }
+
+    /// Invalidate a key (remove completely)
+    pub fn invalidate_key(self: *KeyManager, serial: i32, uid: u32, gid: u32) !void {
+        var key = self.get_key(serial) orelse return error.KeyNotFound;
+
+        // Check permissions
+        if (!self.check_key_permission(key, uid, gid, .setattr)) {
+            // Root can invalidate if flag set
+            if (uid != 0 or (key.flags & KEY_FLAG_ROOT_CAN_INVAL) == 0) {
+                return error.PermissionDenied;
+            }
+        }
+
+        key.invalidate();
+    }
+
+    /// Read key payload
+    pub fn read_key(self: *KeyManager, serial: i32, uid: u32, gid: u32) ![]const u8 {
+        const key = self.get_key(serial) orelse return error.KeyNotFound;
+
+        // Check state
+        if (key.state != .VALID) {
+            return error.KeyInvalid;
+        }
+
+        // Check expiry
+        if (key.is_expired()) {
+            return error.KeyExpired;
+        }
+
+        // Logon keys cannot be read
+        if (key.key_type == .LOGON) {
+            return error.KeyNotReadable;
+        }
+
+        // Check permissions
+        if (!self.check_key_permission(key, uid, gid, .read)) {
+            return error.PermissionDenied;
+        }
+
+        return key.get_payload();
+    }
+
+    /// Update key payload
+    pub fn update_key(self: *KeyManager, serial: i32, payload: []const u8, uid: u32, gid: u32) !void {
+        var key = self.get_key(serial) orelse return error.KeyNotFound;
+
+        // Check permissions
+        if (!self.check_key_permission(key, uid, gid, .write)) {
+            return error.PermissionDenied;
+        }
+
+        try key.set_payload(payload);
+    }
+
+    // Permission checking
+    const PermissionType = enum { view, read, write, search, link, setattr };
+
+    fn check_key_permission(self: *KeyManager, key: *const Key, uid: u32, gid: u32, perm: PermissionType) bool {
+        _ = self;
+        if (uid == 0) return true;  // Root can do anything
+
+        const p = key.permissions;
+
+        if (uid == key.uid) {
+            return switch (perm) {
+                .view => p.user_view,
+                .read => p.user_read,
+                .write => p.user_write,
+                .search => p.user_search,
+                .link => p.user_link,
+                .setattr => p.user_setattr,
+            };
+        }
+
+        if (gid == key.gid) {
+            return switch (perm) {
+                .view => p.group_view,
+                .read => p.group_read,
+                .write => p.group_write,
+                .search => p.group_search,
+                .link => p.group_link,
+                .setattr => p.group_setattr,
+            };
+        }
+
+        return switch (perm) {
+            .view => p.other_view,
+            .read => p.other_read,
+            .write => p.other_write,
+            .search => p.other_search,
+            .link => p.other_link,
+            .setattr => p.other_setattr,
+        };
+    }
+
+    fn check_keyring_permission(self: *KeyManager, keyring: *const Keyring, uid: u32, gid: u32, perm: PermissionType) bool {
+        return self.check_key_permission(&keyring.key, uid, gid, perm);
+    }
+
+    // Quota management
+    fn check_quota(self: *KeyManager, uid: u32, keys: u32, bytes: u32) bool {
+        const idx = uid % 256;
+        const quota = &self.user_quotas[idx];
+        return (quota.keys + keys <= quota.max_keys and
+            quota.bytes + bytes <= quota.max_bytes);
+    }
+
+    fn update_quota(self: *KeyManager, uid: u32, keys: i32, bytes: i32) void {
+        const idx = uid % 256;
+        var quota = &self.user_quotas[idx];
+
+        if (keys > 0) {
+            quota.keys += @intCast(keys);
+        } else if (keys < 0) {
+            quota.keys -= @intCast(-keys);
+        }
+
+        if (bytes > 0) {
+            quota.bytes += @intCast(bytes);
+        } else if (bytes < 0) {
+            quota.bytes -= @intCast(-bytes);
+        }
+    }
+};
+
+const UserQuota = struct {
+    keys: u32,
+    bytes: u32,
+    max_keys: u32,
+    max_bytes: u32,
+
+    pub fn init() UserQuota {
+        return UserQuota{
+            .keys = 0,
+            .bytes = 0,
+            .max_keys = 200,
+            .max_bytes = 20000,
+        };
+    }
+};
+
+// =============================================================================
+// Per-Process Keyrings
+// =============================================================================
+
+pub const ProcessKeyrings = struct {
+    session_keyring: i32,     // Session keyring
+    process_keyring: i32,     // Process keyring
+    thread_keyring: i32,      // Thread keyring
+    user_keyring: i32,        // User keyring
+    user_session_keyring: i32, // User default session keyring
+
+    pub fn init() ProcessKeyrings {
+        return ProcessKeyrings{
+            .session_keyring = 0,
+            .process_keyring = 0,
+            .thread_keyring = 0,
+            .user_keyring = 0,
+            .user_session_keyring = 0,
+        };
+    }
+};
+
+// =============================================================================
+// Global State
+// =============================================================================
+
+var g_key_manager: KeyManager = KeyManager.init();
+
+pub fn get_manager() *KeyManager {
+    return &g_key_manager;
+}
+
+pub fn init() !void {
+    try g_key_manager.create_system_keyrings();
+}
+
+// =============================================================================
+// System Call Interface
+// =============================================================================
+
+/// add_key syscall
+pub fn sys_add_key(
+    key_type: []const u8,
+    description: []const u8,
+    payload: []const u8,
+    keyring_serial: i32,
+) !i32 {
+    const proc = process.current() orelse return error.NoProcess;
+    const uid = proc.uid;
+    const gid = proc.gid;
+
+    const ktype = parse_key_type(key_type) orelse return error.InvalidKeyType;
+
+    return try g_key_manager.add_key(
+        ktype,
+        description,
+        payload,
+        keyring_serial,
+        uid,
+        gid,
+    );
+}
+
+/// request_key syscall
+pub fn sys_request_key(
+    key_type: []const u8,
+    description: []const u8,
+    dest_keyring: i32,
+) !i32 {
+    _ = key_type;
+    const proc = process.current() orelse return error.NoProcess;
+
+    // Search process keyrings
+    const keyrings = &proc.keyrings;
+
+    // Search thread, process, session keyrings in order
+    const search_order = [_]i32{
+        keyrings.thread_keyring,
+        keyrings.process_keyring,
+        keyrings.session_keyring,
+        keyrings.user_keyring,
+    };
+
+    for (search_order) |kr| {
+        if (kr != 0) {
+            if (g_key_manager.search_key(kr, description)) |key| {
+                // Link to dest keyring if specified
+                if (dest_keyring != 0) {
+                    var dest = g_key_manager.get_keyring(dest_keyring) orelse return error.KeyringNotFound;
+                    try dest.link_key(key.serial);
+                }
+                return key.serial;
+            }
+        }
+    }
+
+    return error.KeyNotFound;
+}
+
+/// keyctl syscall
+pub fn sys_keyctl(cmd: u32, arg2: usize, arg3: usize, arg4: usize, arg5: usize) !isize {
+    const proc = process.current() orelse return error.NoProcess;
+    const uid = proc.uid;
+    const gid = proc.gid;
+
+    switch (cmd) {
+        KEYCTL_GET_KEYRING_ID => {
+            const serial: i32 = @intCast(arg2);
+            return serial;
+        },
+        KEYCTL_REVOKE => {
+            const serial: i32 = @intCast(arg2);
+            try g_key_manager.revoke_key(serial, uid, gid);
+            return 0;
+        },
+        KEYCTL_READ => {
+            const serial: i32 = @intCast(arg2);
+            const buffer = @as([*]u8, @ptrFromInt(arg3));
+            const buflen: usize = arg4;
+
+            const payload = try g_key_manager.read_key(serial, uid, gid);
+            const copy_len = @min(payload.len, buflen);
+            @memcpy(buffer[0..copy_len], payload[0..copy_len]);
+            return @intCast(payload.len);
+        },
+        KEYCTL_UPDATE => {
+            const serial: i32 = @intCast(arg2);
+            const payload = @as([*]const u8, @ptrFromInt(arg3));
+            const plen: usize = arg4;
+
+            try g_key_manager.update_key(serial, payload[0..plen], uid, gid);
+            return 0;
+        },
+        KEYCTL_INVALIDATE => {
+            const serial: i32 = @intCast(arg2);
+            try g_key_manager.invalidate_key(serial, uid, gid);
+            return 0;
+        },
+        else => return error.InvalidCommand,
+    }
+
+    _ = arg5;
+}
+
+// keyctl commands
+const KEYCTL_GET_KEYRING_ID: u32 = 0;
+const KEYCTL_JOIN_SESSION_KEYRING: u32 = 1;
+const KEYCTL_UPDATE: u32 = 2;
+const KEYCTL_REVOKE: u32 = 3;
+const KEYCTL_CHOWN: u32 = 4;
+const KEYCTL_SETPERM: u32 = 5;
+const KEYCTL_DESCRIBE: u32 = 6;
+const KEYCTL_CLEAR: u32 = 7;
+const KEYCTL_LINK: u32 = 8;
+const KEYCTL_UNLINK: u32 = 9;
+const KEYCTL_SEARCH: u32 = 10;
+const KEYCTL_READ: u32 = 11;
+const KEYCTL_INSTANTIATE: u32 = 12;
+const KEYCTL_NEGATE: u32 = 13;
+const KEYCTL_SET_TIMEOUT: u32 = 15;
+const KEYCTL_INVALIDATE: u32 = 21;
+
+fn parse_key_type(name: []const u8) ?KeyType {
+    if (std.mem.eql(u8, name, "user")) return .USER;
+    if (std.mem.eql(u8, name, "keyring")) return .KEYRING;
+    if (std.mem.eql(u8, name, "logon")) return .LOGON;
+    if (std.mem.eql(u8, name, "encrypted")) return .ENCRYPTED;
+    if (std.mem.eql(u8, name, "trusted")) return .TRUSTED;
+    if (std.mem.eql(u8, name, "asymmetric")) return .ASYMMETRIC;
+    if (std.mem.eql(u8, name, "fscrypt")) return .FSCRYPT;
+    if (std.mem.eql(u8, name, "dm-crypt")) return .DM_CRYPT;
+    return null;
+}
+
+fn get_current_time() i64 {
+    return 0;  // Would return current Unix timestamp
+}
