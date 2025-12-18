@@ -1,0 +1,673 @@
+// home-os Tree-Based RCU Implementation
+// Hierarchical RCU for scalable multi-core systems
+
+const std = @import("std");
+const atomic = @import("../sync/atomic.home");
+
+// =============================================================================
+// RCU Configuration
+// =============================================================================
+
+pub const RCU_FANOUT: u32 = 32;           // Children per internal node
+pub const RCU_FANOUT_LEAF: u32 = 16;      // CPUs per leaf node
+pub const MAX_RCU_LEVELS: u32 = 4;        // Maximum tree depth
+pub const RCU_BATCH_SIZE: u32 = 64;       // Callbacks per batch
+
+// Grace period states
+pub const GP_IDLE: u32 = 0;
+pub const GP_WAIT: u32 = 1;
+pub const GP_CLEANUP: u32 = 2;
+
+// RCU flavors
+pub const RCU_FLAVOR_NORMAL: u8 = 0;      // Normal RCU
+pub const RCU_FLAVOR_BH: u8 = 1;          // RCU-bh (bottom half)
+pub const RCU_FLAVOR_SCHED: u8 = 2;       // RCU-sched
+
+// =============================================================================
+// RCU Node Structure (Tree Hierarchy)
+// =============================================================================
+
+/// RCU tree node - used for hierarchical quiescent state propagation
+pub const RcuNode = struct {
+    // Quiescent state tracking
+    qsmask: atomic.AtomicU64,         // CPUs/children that haven't reported
+    qsmask_init: u64,                  // Initial qsmask for new GP
+    completed: atomic.AtomicU64,       // Last completed grace period
+
+    // Tree structure
+    parent: ?*RcuNode,
+    level: u8,
+    grplo: u16,                        // Low CPU number for this group
+    grphi: u16,                        // High CPU number for this group
+    grpnum: u8,                        // This node's position in parent
+
+    // Children (for internal nodes)
+    children: [RCU_FANOUT]?*RcuNode,
+    child_count: u32,
+
+    // Lock for updates
+    lock: atomic.SpinLock,
+
+    // Statistics
+    qlen: atomic.AtomicU64,            // Callbacks queued
+    qlen_last_gp: u64,                 // Callbacks at last GP end
+
+    pub fn init(level: u8, grplo: u16, grphi: u16) RcuNode {
+        return RcuNode{
+            .qsmask = atomic.AtomicU64.init(0),
+            .qsmask_init = 0,
+            .completed = atomic.AtomicU64.init(0),
+            .parent = null,
+            .level = level,
+            .grplo = grplo,
+            .grphi = grphi,
+            .grpnum = 0,
+            .children = [_]?*RcuNode{null} ** RCU_FANOUT,
+            .child_count = 0,
+            .lock = atomic.SpinLock.init(),
+            .qlen = atomic.AtomicU64.init(0),
+            .qlen_last_gp = 0,
+        };
+    }
+};
+
+// =============================================================================
+// Per-CPU RCU Data
+// =============================================================================
+
+/// RCU callback entry
+pub const RcuCallback = struct {
+    func: *const fn (*anyopaque) void,
+    arg: *anyopaque,
+    next: ?*RcuCallback,
+};
+
+/// Callback segment (for batching)
+pub const RcuCbSegment = struct {
+    head: ?*RcuCallback,
+    tail: ?*?*RcuCallback,
+    len: u64,
+    gp_seq: u64,                       // GP sequence when segment completes
+};
+
+/// Per-CPU RCU data
+pub const RcuData = struct {
+    // CPU identification
+    cpu: u32,
+    grpmask: u64,                      // Mask for this CPU in leaf node
+
+    // Callback lists (segmented by grace period)
+    cb_segments: [4]RcuCbSegment,      // DONE, WAIT, NEXT_READY, NEXT
+    cb_total: u64,
+
+    // Quiescent state tracking
+    passed_quiesce: bool,              // Passed quiescent state this GP?
+    qs_pending: bool,                  // Quiescent state report pending?
+    gp_seq: u64,                       // Current grace period sequence
+
+    // Associated node
+    my_node: ?*RcuNode,
+
+    // Dynticks tracking (for idle detection)
+    dynticks: atomic.AtomicU64,
+    dynticks_snap: u64,
+
+    // Statistics
+    qs_count: u64,                     // Quiescent states reported
+    cb_invoked: u64,                   // Callbacks invoked
+
+    pub fn init(cpu: u32) RcuData {
+        var data = RcuData{
+            .cpu = cpu,
+            .grpmask = @as(u64, 1) << @intCast(cpu % RCU_FANOUT_LEAF),
+            .cb_segments = undefined,
+            .cb_total = 0,
+            .passed_quiesce = false,
+            .qs_pending = false,
+            .gp_seq = 0,
+            .my_node = null,
+            .dynticks = atomic.AtomicU64.init(1),  // Odd = not idle
+            .dynticks_snap = 0,
+            .qs_count = 0,
+            .cb_invoked = 0,
+        };
+
+        // Initialize callback segments
+        for (&data.cb_segments) |*seg| {
+            seg.head = null;
+            seg.tail = &seg.head;
+            seg.len = 0;
+            seg.gp_seq = 0;
+        }
+
+        return data;
+    }
+
+    /// Queue a callback
+    pub fn queue_callback(self: *RcuData, cb: *RcuCallback) void {
+        cb.next = null;
+        self.cb_segments[3].tail.?.* = cb;
+        self.cb_segments[3].tail = &cb.next;
+        self.cb_segments[3].len += 1;
+        self.cb_total += 1;
+    }
+
+    /// Report quiescent state
+    pub fn report_qs(self: *RcuData, state: *RcuState) void {
+        if (self.passed_quiesce) return;
+
+        self.passed_quiesce = true;
+        self.qs_count += 1;
+
+        // Report to parent node
+        if (self.my_node) |node| {
+            state.report_qs_to_node(node, self.grpmask);
+        }
+    }
+
+    /// Advance callbacks after grace period
+    pub fn advance_callbacks(self: *RcuData, gp_seq: u64) void {
+        // Move segments forward
+        // DONE <- WAIT <- NEXT_READY <- NEXT
+        if (self.cb_segments[1].gp_seq <= gp_seq) {
+            // WAIT segment is done
+            // Merge into DONE
+            if (self.cb_segments[1].head != null) {
+                self.cb_segments[0].tail.?.* = self.cb_segments[1].head;
+                self.cb_segments[0].tail = self.cb_segments[1].tail;
+                self.cb_segments[0].len += self.cb_segments[1].len;
+            }
+
+            // Shift remaining segments
+            self.cb_segments[1] = self.cb_segments[2];
+            self.cb_segments[2] = self.cb_segments[3];
+            self.cb_segments[3] = RcuCbSegment{
+                .head = null,
+                .tail = &self.cb_segments[3].head,
+                .len = 0,
+                .gp_seq = 0,
+            };
+        }
+    }
+
+    /// Invoke ready callbacks
+    pub fn invoke_callbacks(self: *RcuData) u64 {
+        var invoked: u64 = 0;
+
+        while (self.cb_segments[0].head) |cb| {
+            self.cb_segments[0].head = cb.next;
+            self.cb_segments[0].len -= 1;
+            self.cb_total -= 1;
+
+            // Invoke callback
+            cb.func(cb.arg);
+            invoked += 1;
+
+            // Limit batch size
+            if (invoked >= RCU_BATCH_SIZE) break;
+        }
+
+        if (self.cb_segments[0].head == null) {
+            self.cb_segments[0].tail = &self.cb_segments[0].head;
+        }
+
+        self.cb_invoked += invoked;
+        return invoked;
+    }
+};
+
+// =============================================================================
+// RCU State
+// =============================================================================
+
+pub const RcuState = struct {
+    // Tree structure
+    root: *RcuNode,
+    nodes: [128]RcuNode,              // Pre-allocated nodes
+    node_count: u32,
+    level_offsets: [MAX_RCU_LEVELS]u32,
+    num_levels: u32,
+
+    // Grace period state
+    gp_seq: atomic.AtomicU64,         // Current GP sequence
+    gp_state: atomic.AtomicU32,       // GP_IDLE, GP_WAIT, GP_CLEANUP
+    gp_start: u64,                    // GP start timestamp
+
+    // Configuration
+    flavor: u8,
+    num_cpus: u32,
+
+    // Per-CPU data pointers
+    per_cpu: [256]*RcuData,
+
+    // Statistics
+    gp_count: u64,
+    gp_total_time: u64,
+
+    pub fn init(num_cpus: u32, flavor: u8) !*RcuState {
+        var state = try std.heap.page_allocator.create(RcuState);
+
+        state.flavor = flavor;
+        state.num_cpus = num_cpus;
+        state.node_count = 0;
+        state.gp_seq = atomic.AtomicU64.init(0);
+        state.gp_state = atomic.AtomicU32.init(GP_IDLE);
+        state.gp_start = 0;
+        state.gp_count = 0;
+        state.gp_total_time = 0;
+
+        // Build tree
+        try state.build_tree();
+
+        return state;
+    }
+
+    fn build_tree(self: *RcuState) !void {
+        // Calculate tree structure
+        var cpus_per_node: u32 = RCU_FANOUT_LEAF;
+        var nodes_at_level: u32 = (self.num_cpus + RCU_FANOUT_LEAF - 1) / RCU_FANOUT_LEAF;
+        var level: u32 = 0;
+
+        self.level_offsets[0] = 0;
+
+        while (nodes_at_level > 1 and level < MAX_RCU_LEVELS - 1) {
+            level += 1;
+            self.level_offsets[level] = self.node_count;
+
+            var i: u32 = 0;
+            while (i < nodes_at_level) : (i += 1) {
+                if (self.node_count >= 128) break;
+
+                const grplo = i * cpus_per_node;
+                const grphi = @min((i + 1) * cpus_per_node - 1, self.num_cpus - 1);
+
+                self.nodes[self.node_count] = RcuNode.init(
+                    @intCast(level),
+                    @intCast(grplo),
+                    @intCast(grphi),
+                );
+                self.node_count += 1;
+            }
+
+            cpus_per_node *= RCU_FANOUT;
+            nodes_at_level = (nodes_at_level + RCU_FANOUT - 1) / RCU_FANOUT;
+        }
+
+        self.num_levels = level + 1;
+        self.root = &self.nodes[self.level_offsets[level]];
+
+        // Link tree
+        try self.link_tree();
+    }
+
+    fn link_tree(self: *RcuState) !void {
+        // Link children to parents
+        var level: u32 = 0;
+        while (level < self.num_levels - 1) : (level += 1) {
+            const parent_level = level + 1;
+            const start = self.level_offsets[level];
+            const end = if (level + 1 < self.num_levels)
+                self.level_offsets[level + 1]
+            else
+                self.node_count;
+
+            var i: u32 = start;
+            while (i < end) : (i += 1) {
+                const parent_idx = self.level_offsets[parent_level] + (i - start) / RCU_FANOUT;
+                if (parent_idx < self.node_count) {
+                    self.nodes[i].parent = &self.nodes[parent_idx];
+                    self.nodes[i].grpnum = @intCast((i - start) % RCU_FANOUT);
+
+                    // Add to parent's children
+                    const child_idx = (i - start) % RCU_FANOUT;
+                    self.nodes[parent_idx].children[child_idx] = &self.nodes[i];
+                    self.nodes[parent_idx].child_count += 1;
+                }
+            }
+        }
+    }
+
+    /// Start a new grace period
+    pub fn start_gp(self: *RcuState) void {
+        if (self.gp_state.load(.Acquire) != GP_IDLE) return;
+
+        self.gp_state.store(GP_WAIT, .Release);
+        _ = self.gp_seq.fetchAdd(1, .AcqRel);
+        self.gp_start = get_timestamp();
+
+        // Initialize quiescent state masks
+        self.init_qs_masks(self.root);
+
+        // Mark all CPUs as needing to report quiescent state
+        var cpu: u32 = 0;
+        while (cpu < self.num_cpus) : (cpu += 1) {
+            self.per_cpu[cpu].passed_quiesce = false;
+            self.per_cpu[cpu].qs_pending = true;
+        }
+    }
+
+    fn init_qs_masks(self: *RcuState, node: *RcuNode) void {
+        node.qsmask.store(node.qsmask_init, .Release);
+
+        var i: u32 = 0;
+        while (i < node.child_count) : (i += 1) {
+            if (node.children[i]) |child| {
+                self.init_qs_masks(child);
+            }
+        }
+    }
+
+    /// Report quiescent state to a node
+    pub fn report_qs_to_node(self: *RcuState, node: *RcuNode, mask: u64) void {
+        node.lock.lock();
+        defer node.lock.unlock();
+
+        const old_mask = node.qsmask.fetchAnd(~mask, .AcqRel);
+        const new_mask = old_mask & ~mask;
+
+        if (new_mask == 0) {
+            // All children have reported
+            node.completed.store(self.gp_seq.load(.Acquire), .Release);
+
+            // Propagate to parent
+            if (node.parent) |parent| {
+                const parent_mask = @as(u64, 1) << node.grpnum;
+                self.report_qs_to_node(parent, parent_mask);
+            } else {
+                // Root node - GP complete
+                self.end_gp();
+            }
+        }
+    }
+
+    /// End grace period
+    fn end_gp(self: *RcuState) void {
+        self.gp_state.store(GP_CLEANUP, .Release);
+
+        const gp_seq = self.gp_seq.load(.Acquire);
+        const elapsed = get_timestamp() - self.gp_start;
+
+        self.gp_count += 1;
+        self.gp_total_time += elapsed;
+
+        // Advance callbacks on all CPUs
+        var cpu: u32 = 0;
+        while (cpu < self.num_cpus) : (cpu += 1) {
+            self.per_cpu[cpu].advance_callbacks(gp_seq);
+        }
+
+        self.gp_state.store(GP_IDLE, .Release);
+    }
+
+    /// Check if grace period needed
+    pub fn gp_needed(self: *RcuState) bool {
+        var cpu: u32 = 0;
+        while (cpu < self.num_cpus) : (cpu += 1) {
+            if (self.per_cpu[cpu].cb_total > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Force synchronize (blocking)
+    pub fn synchronize(self: *RcuState) void {
+        // Start GP if not already running
+        if (self.gp_state.load(.Acquire) == GP_IDLE) {
+            self.start_gp();
+        }
+
+        // Wait for GP to complete
+        while (self.gp_state.load(.Acquire) != GP_IDLE) {
+            cpu_relax();
+        }
+    }
+};
+
+// =============================================================================
+// RCU API
+// =============================================================================
+
+var global_rcu_state: ?*RcuState = null;
+var global_rcu_bh: ?*RcuState = null;
+var global_rcu_sched: ?*RcuState = null;
+
+/// Initialize RCU subsystem
+pub fn rcu_init(num_cpus: u32) !void {
+    global_rcu_state = try RcuState.init(num_cpus, RCU_FLAVOR_NORMAL);
+    global_rcu_bh = try RcuState.init(num_cpus, RCU_FLAVOR_BH);
+    global_rcu_sched = try RcuState.init(num_cpus, RCU_FLAVOR_SCHED);
+}
+
+/// Initialize per-CPU RCU data
+pub fn rcu_cpu_init(cpu: u32) !*RcuData {
+    var data = try std.heap.page_allocator.create(RcuData);
+    data.* = RcuData.init(cpu);
+
+    if (global_rcu_state) |state| {
+        state.per_cpu[cpu] = data;
+
+        // Assign to leaf node
+        const leaf_idx = cpu / RCU_FANOUT_LEAF;
+        if (leaf_idx < state.node_count) {
+            data.my_node = &state.nodes[leaf_idx];
+        }
+    }
+
+    return data;
+}
+
+/// Enter RCU read-side critical section
+pub inline fn rcu_read_lock() void {
+    preempt_disable();
+}
+
+/// Exit RCU read-side critical section
+pub inline fn rcu_read_unlock() void {
+    preempt_enable();
+}
+
+/// RCU-bh read lock
+pub inline fn rcu_read_lock_bh() void {
+    local_bh_disable();
+}
+
+/// RCU-bh read unlock
+pub inline fn rcu_read_unlock_bh() void {
+    local_bh_enable();
+}
+
+/// RCU-sched read lock
+pub inline fn rcu_read_lock_sched() void {
+    preempt_disable();
+}
+
+/// RCU-sched read unlock
+pub inline fn rcu_read_unlock_sched() void {
+    preempt_enable();
+}
+
+/// Dereference RCU-protected pointer
+pub inline fn rcu_dereference(comptime T: type, ptr: *const ?*T) ?*T {
+    atomic.compiler_barrier();
+    return @atomicLoad(?*T, ptr, .Acquire);
+}
+
+/// Assign RCU-protected pointer
+pub inline fn rcu_assign_pointer(comptime T: type, ptr: *?*T, value: ?*T) void {
+    atomic.compiler_barrier();
+    @atomicStore(?*T, ptr, value, .Release);
+}
+
+/// Queue callback for after grace period
+pub fn call_rcu(cb: *RcuCallback, func: *const fn (*anyopaque) void, arg: *anyopaque) void {
+    cb.func = func;
+    cb.arg = arg;
+    cb.next = null;
+
+    const cpu = get_cpu();
+    if (global_rcu_state) |state| {
+        state.per_cpu[cpu].queue_callback(cb);
+    }
+}
+
+/// Synchronous grace period wait
+pub fn synchronize_rcu() void {
+    if (global_rcu_state) |state| {
+        state.synchronize();
+    }
+}
+
+/// RCU-bh synchronize
+pub fn synchronize_rcu_bh() void {
+    if (global_rcu_bh) |state| {
+        state.synchronize();
+    }
+}
+
+/// RCU-sched synchronize
+pub fn synchronize_rcu_sched() void {
+    if (global_rcu_sched) |state| {
+        state.synchronize();
+    }
+}
+
+/// Report quiescent state (called at context switch, etc.)
+pub fn rcu_note_context_switch() void {
+    const cpu = get_cpu();
+    if (global_rcu_state) |state| {
+        state.per_cpu[cpu].report_qs(state);
+    }
+}
+
+/// RCU barrier - wait for all callbacks to complete
+pub fn rcu_barrier() void {
+    synchronize_rcu();
+    synchronize_rcu();  // Two GPs ensure all callbacks done
+}
+
+/// Process callbacks (called from softirq)
+pub fn rcu_process_callbacks() void {
+    const cpu = get_cpu();
+
+    if (global_rcu_state) |state| {
+        // Report quiescent state
+        state.per_cpu[cpu].report_qs(state);
+
+        // Invoke ready callbacks
+        _ = state.per_cpu[cpu].invoke_callbacks();
+
+        // Start new GP if needed
+        if (state.gp_state.load(.Acquire) == GP_IDLE and state.gp_needed()) {
+            state.start_gp();
+        }
+    }
+}
+
+// =============================================================================
+// SRCU (Sleepable RCU)
+// =============================================================================
+
+pub const SrcuStruct = struct {
+    per_cpu_ref: [256]SrcuPerCpu,
+    num_cpus: u32,
+    completed: atomic.AtomicU64,
+    lock: atomic.SpinLock,
+
+    pub fn init(num_cpus: u32) SrcuStruct {
+        var srcu = SrcuStruct{
+            .per_cpu_ref = undefined,
+            .num_cpus = num_cpus,
+            .completed = atomic.AtomicU64.init(0),
+            .lock = atomic.SpinLock.init(),
+        };
+
+        var cpu: u32 = 0;
+        while (cpu < num_cpus) : (cpu += 1) {
+            srcu.per_cpu_ref[cpu] = SrcuPerCpu.init();
+        }
+
+        return srcu;
+    }
+
+    pub fn read_lock(self: *SrcuStruct) u32 {
+        const cpu = get_cpu();
+        const idx = self.completed.load(.Acquire) & 1;
+
+        _ = self.per_cpu_ref[cpu].count[idx].fetchAdd(1, .AcqRel);
+
+        atomic.compiler_barrier();
+        return @intCast(idx);
+    }
+
+    pub fn read_unlock(self: *SrcuStruct, idx: u32) void {
+        const cpu = get_cpu();
+        atomic.compiler_barrier();
+        _ = self.per_cpu_ref[cpu].count[idx].fetchSub(1, .AcqRel);
+    }
+
+    pub fn synchronize(self: *SrcuStruct) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        // Flip completed index
+        const idx = self.completed.load(.Acquire) & 1;
+        _ = self.completed.fetchAdd(1, .AcqRel);
+
+        // Wait for all readers with old index
+        var cpu: u32 = 0;
+        while (cpu < self.num_cpus) : (cpu += 1) {
+            while (self.per_cpu_ref[cpu].count[idx].load(.Acquire) > 0) {
+                cpu_relax();
+            }
+        }
+    }
+};
+
+const SrcuPerCpu = struct {
+    count: [2]atomic.AtomicU64,
+
+    pub fn init() SrcuPerCpu {
+        return SrcuPerCpu{
+            .count = [_]atomic.AtomicU64{
+                atomic.AtomicU64.init(0),
+                atomic.AtomicU64.init(0),
+            },
+        };
+    }
+};
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+fn get_timestamp() u64 {
+    // Would use RDTSC or similar
+    return 0;
+}
+
+fn get_cpu() u32 {
+    // Would read from per-CPU data
+    return 0;
+}
+
+fn cpu_relax() void {
+    // Spin-loop hint
+    asm volatile ("pause" ::: "memory");
+}
+
+fn preempt_disable() void {
+    // Disable preemption
+}
+
+fn preempt_enable() void {
+    // Enable preemption
+}
+
+fn local_bh_disable() void {
+    // Disable bottom halves
+}
+
+fn local_bh_enable() void {
+    // Enable bottom halves
+}

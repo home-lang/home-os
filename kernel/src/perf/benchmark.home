@@ -1,11 +1,34 @@
-// home-os Kernel - Benchmark Suite
-// Comprehensive performance testing
+// home-os Kernel - Comprehensive Benchmark Suite
+// Full system performance testing framework
+// Includes: CPU, Memory, I/O, Network, Scheduler, Lock, RCU benchmarks
 
 import "../core/foundation.home" as foundation
-import "../core/memory.home" as memory
+import "../mm/memory.home" as memory
 import "../core/process.home" as process
 import "../core/filesystem.home" as filesystem
-import "../network/network.home" as network
+import "../net/network.home" as network
+import "./lockfree.home" as lockfree
+import "./rcu_tree.home" as rcu
+import "./io_uring.home" as io_uring
+import "../mm/ksm.home" as ksm
+
+// =============================================================================
+// Benchmark Configuration
+// =============================================================================
+
+const BENCHMARK_WARMUP_ITERATIONS: u32 = 100
+const BENCHMARK_MIN_ITERATIONS: u32 = 1000
+const BENCHMARK_MAX_ITERATIONS: u32 = 1000000
+const BENCHMARK_TARGET_TIME_MS: u32 = 1000    // Target benchmark duration
+
+// Result flags
+const BENCH_FLAG_COMPLETED: u32 = 1 << 0
+const BENCH_FLAG_FAILED: u32 = 1 << 1
+const BENCH_FLAG_SKIPPED: u32 = 1 << 2
+
+// =============================================================================
+// Data Structures
+// =============================================================================
 
 struct BenchmarkResult {
   name: [u8; 64],
@@ -13,46 +36,306 @@ struct BenchmarkResult {
   total_time: u64,
   min_time: u64,
   max_time: u64,
-  avg_time: u64
+  avg_time: u64,
+  stddev: u64,
+  ops_per_sec: u64,
+  throughput_mbps: u64,
+  flags: u32,
+  _pad: u32
 }
+
+struct BenchmarkHistogram {
+  buckets: [u64; 64],
+  bucket_count: u32,
+  min_bucket: u64,
+  bucket_size: u64
+}
+
+struct BenchmarkSuite {
+  name: [u8; 64],
+  results: [BenchmarkResult; 64],
+  result_count: u32,
+  total_time: u64,
+  start_tsc: u64,
+  cpu_freq_mhz: u64
+}
+
+// =============================================================================
+// Global State
+// =============================================================================
 
 var benchmark_results: [BenchmarkResult; 32]
 var result_count: u32 = 0
+var suite: BenchmarkSuite = undefined
+var benchmark_initialized: u32 = 0
+
+// Scratch buffers for benchmarks
+var bench_buffer1: [u8; 65536] = undefined
+var bench_buffer2: [u8; 65536] = undefined
+
+// =============================================================================
+// Initialization
+// =============================================================================
 
 export fn benchmark_init() {
   result_count = 0
+  suite.result_count = 0
+  suite.total_time = 0
+  suite.start_tsc = foundation.rdtsc()
+  suite.cpu_freq_mhz = calibrate_cpu_frequency()
+  benchmark_initialized = 1
+
   foundation.serial_write_string("[Benchmark] Suite initialized\n")
+  foundation.serial_write_string("  CPU frequency: ")
+  foundation.serial_write_hex(suite.cpu_freq_mhz)
+  foundation.serial_write_string(" MHz\n")
 }
+
+fn calibrate_cpu_frequency(): u64 {
+  // Calibrate using timer ticks
+  var start_tsc: u64 = foundation.rdtsc()
+  var start_tick: u64 = foundation.timer_get_ticks()
+
+  // Busy wait for some ticks
+  while foundation.timer_get_ticks() - start_tick < 100 {
+    foundation.cpu_pause()
+  }
+
+  var end_tsc: u64 = foundation.rdtsc()
+  var end_tick: u64 = foundation.timer_get_ticks()
+
+  var tsc_diff: u64 = end_tsc - start_tsc
+  var tick_diff: u64 = end_tick - start_tick
+
+  // Assuming 1000 ticks = 1 second
+  return (tsc_diff * 1000) / (tick_diff * 1000000)
+}
+
+fn tsc_to_ns(tsc_diff: u64): u64 {
+  if suite.cpu_freq_mhz == 0 {
+    return tsc_diff  // Fallback
+  }
+  return (tsc_diff * 1000) / suite.cpu_freq_mhz
+}
+
+// =============================================================================
+// Core Benchmark Functions
+// =============================================================================
+
+fn run_benchmark(name: u64, func: fn() -> u64, warmup: u32, iterations: u32): BenchmarkResult {
+  var result: BenchmarkResult = undefined
+
+  // Copy name
+  var i: u32 = 0
+  while i < 64 && @intToPtr(name + @zext(i, u64), u8) != 0 {
+    result.name[i] = @intToPtr(name + @zext(i, u64), u8)
+    i = i + 1
+  }
+  if i < 64 {
+    result.name[i] = 0
+  }
+
+  result.iterations = iterations
+  result.flags = 0
+
+  // Warmup phase
+  i = 0
+  while i < warmup {
+    func()
+    i = i + 1
+  }
+
+  // Measurement phase
+  var total: u64 = 0
+  var min: u64 = 0xFFFFFFFFFFFFFFFF
+  var max: u64 = 0
+  var sum_sq: u64 = 0
+
+  i = 0
+  while i < iterations {
+    var start: u64 = foundation.rdtsc()
+    func()
+    var end: u64 = foundation.rdtsc()
+
+    var elapsed: u64 = end - start
+    total = total + elapsed
+
+    if elapsed < min { min = elapsed }
+    if elapsed > max { max = elapsed }
+
+    sum_sq = sum_sq + (elapsed * elapsed)
+    i = i + 1
+  }
+
+  result.total_time = tsc_to_ns(total)
+  result.min_time = tsc_to_ns(min)
+  result.max_time = tsc_to_ns(max)
+  result.avg_time = tsc_to_ns(total / @zext(iterations, u64))
+
+  // Calculate standard deviation
+  var mean: u64 = total / @zext(iterations, u64)
+  var variance: u64 = (sum_sq / @zext(iterations, u64)) - (mean * mean)
+  result.stddev = tsc_to_ns(isqrt(variance))
+
+  // Operations per second
+  if result.avg_time > 0 {
+    result.ops_per_sec = 1000000000 / result.avg_time
+  }
+
+  result.flags = BENCH_FLAG_COMPLETED
+
+  return result
+}
+
+fn isqrt(n: u64): u64 {
+  if n == 0 { return 0 }
+
+  var x: u64 = n
+  var y: u64 = (x + 1) / 2
+
+  while y < x {
+    x = y
+    y = (x + n / x) / 2
+  }
+
+  return x
+}
+
+fn store_result(result: BenchmarkResult) {
+  if suite.result_count < 64 {
+    suite.results[suite.result_count] = result
+    suite.result_count = suite.result_count + 1
+  }
+}
+
+fn print_result(result: BenchmarkResult) {
+  foundation.serial_write_string("  ")
+
+  var i: u32 = 0
+  while i < 64 && result.name[i] != 0 {
+    foundation.serial_write_char(result.name[i])
+    i = i + 1
+  }
+
+  foundation.serial_write_string(": avg=")
+  foundation.serial_write_hex(result.avg_time)
+  foundation.serial_write_string("ns min=")
+  foundation.serial_write_hex(result.min_time)
+  foundation.serial_write_string("ns max=")
+  foundation.serial_write_hex(result.max_time)
+  foundation.serial_write_string("ns ops/s=")
+  foundation.serial_write_hex(result.ops_per_sec)
+  foundation.serial_write_string("\n")
+}
+
+// =============================================================================
+// CPU Benchmarks
+// =============================================================================
 
 export fn benchmark_syscall_latency(): u64 {
   foundation.serial_write_string("[Benchmark] Testing syscall latency...\n")
-  
+
   var iterations: u32 = 100000
-  var start: u64 = foundation.timer_get_ticks()
-  
+  var start: u64 = foundation.rdtsc()
+
   var i: u32 = 0
   while i < iterations {
     foundation.getpid()
     i = i + 1
   }
-  
-  var end: u64 = foundation.timer_get_ticks()
+
+  var end: u64 = foundation.rdtsc()
   var total: u64 = end - start
-  var avg: u64 = (total * 1000) / iterations  // nanoseconds
-  
+  var avg: u64 = tsc_to_ns(total / @zext(iterations, u64))
+
   foundation.serial_write_string("  Average: ")
-  foundation.serial_write_hex(@truncate(avg, u32))
+  foundation.serial_write_hex(avg)
   foundation.serial_write_string(" ns\n")
-  
+
   return avg
 }
 
+export fn benchmark_rdtsc_overhead(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing RDTSC overhead...\n")
+
+  var iterations: u32 = 1000000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    var t: u64 = foundation.rdtsc()
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
+  foundation.serial_write_string("  Overhead: ")
+  foundation.serial_write_hex(avg)
+  foundation.serial_write_string(" ns\n")
+
+  return avg
+}
+
+export fn benchmark_atomic_increment(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing atomic increment...\n")
+
+  var counter: u64 = 0
+  var iterations: u32 = 1000000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    foundation.atomic_add_u64(@ptrToInt(&counter), 1)
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
+  foundation.serial_write_string("  Average: ")
+  foundation.serial_write_hex(avg)
+  foundation.serial_write_string(" ns\n")
+
+  return avg
+}
+
+export fn benchmark_cas(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing CAS...\n")
+
+  var counter: u64 = 0
+  var iterations: u32 = 1000000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    var old: u64 = counter
+    while foundation.atomic_cas_u64(@ptrToInt(&counter), old, old + 1) != 1 {
+      old = counter
+    }
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
+  foundation.serial_write_string("  Average: ")
+  foundation.serial_write_hex(avg)
+  foundation.serial_write_string(" ns\n")
+
+  return avg
+}
+
+// =============================================================================
+// Process Benchmarks
+// =============================================================================
+
 export fn benchmark_process_creation(): u64 {
   foundation.serial_write_string("[Benchmark] Testing process creation...\n")
-  
+
   var iterations: u32 = 1000
-  var start: u64 = foundation.timer_get_ticks()
-  
+  var start: u64 = foundation.rdtsc()
+
   var i: u32 = 0
   while i < iterations {
     var pid: u32 = process.process_fork()
@@ -63,137 +346,505 @@ export fn benchmark_process_creation(): u64 {
     }
     i = i + 1
   }
-  
-  var end: u64 = foundation.timer_get_ticks()
-  var total: u64 = end - start
-  var avg: u64 = (total * 1000) / iterations  // microseconds
-  
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64)) / 1000  // us
+
   foundation.serial_write_string("  Average: ")
-  foundation.serial_write_hex(@truncate(avg, u32))
+  foundation.serial_write_hex(avg)
   foundation.serial_write_string(" us\n")
-  
+
   return avg
-}
-
-export fn benchmark_memory_allocation(): u64 {
-  foundation.serial_write_string("[Benchmark] Testing memory allocation...\n")
-  
-  var iterations: u32 = 10000
-  var size: u32 = 4096
-  var start: u64 = foundation.timer_get_ticks()
-  
-  var i: u32 = 0
-  while i < iterations {
-    var ptr: u64 = memory.memory_alloc(size)
-    memory.memory_free(ptr, size)
-    i = i + 1
-  }
-  
-  var end: u64 = foundation.timer_get_ticks()
-  var total: u64 = end - start
-  var avg: u64 = (total * 1000) / iterations  // nanoseconds
-  
-  foundation.serial_write_string("  Average: ")
-  foundation.serial_write_hex(@truncate(avg, u32))
-  foundation.serial_write_string(" ns\n")
-  
-  return avg
-}
-
-export fn benchmark_file_io(): u64 {
-  foundation.serial_write_string("[Benchmark] Testing file I/O...\n")
-  
-  var iterations: u32 = 1000
-  var size: u32 = 4096
-  var buffer: [u8; 4096]
-  
-  // Create test file
-  var fd: u32 = filesystem.vfs_open(@ptrFromInt("/tmp/bench"), 0x0242, 0x1B6)
-  if fd == 0xFFFFFFFF {
-    foundation.serial_write_string("  Failed to create test file\n")
-    return 0
-  }
-  
-  var start: u64 = foundation.timer_get_ticks()
-  
-  var i: u32 = 0
-  while i < iterations {
-    filesystem.vfs_write(fd, @ptrFromInt(buffer), size)
-    i = i + 1
-  }
-  
-  var end: u64 = foundation.timer_get_ticks()
-  filesystem.vfs_close(fd)
-  filesystem.vfs_unlink(@ptrFromInt("/tmp/bench"))
-  
-  var total: u64 = end - start
-  var throughput: u64 = (iterations * size * 1000) / total  // MB/s
-  
-  foundation.serial_write_string("  Throughput: ")
-  foundation.serial_write_hex(@truncate(throughput, u32))
-  foundation.serial_write_string(" MB/s\n")
-  
-  return throughput
-}
-
-export fn benchmark_network_throughput(): u64 {
-  foundation.serial_write_string("[Benchmark] Testing network throughput...\n")
-  
-  var iterations: u32 = 1000
-  var size: u32 = 1500  // MTU
-  var buffer: [u8; 1500]
-  
-  var start: u64 = foundation.timer_get_ticks()
-  
-  var i: u32 = 0
-  while i < iterations {
-    network.net_send_raw(@ptrFromInt(buffer), size)
-    i = i + 1
-  }
-  
-  var end: u64 = foundation.timer_get_ticks()
-  var total: u64 = end - start
-  var throughput: u64 = (iterations * size * 1000) / total  // MB/s
-  
-  foundation.serial_write_string("  Throughput: ")
-  foundation.serial_write_hex(@truncate(throughput, u32))
-  foundation.serial_write_string(" MB/s\n")
-  
-  return throughput
 }
 
 export fn benchmark_context_switch(): u64 {
   foundation.serial_write_string("[Benchmark] Testing context switch...\n")
-  
+
   var iterations: u32 = 10000
-  var start: u64 = foundation.timer_get_ticks()
-  
+  var start: u64 = foundation.rdtsc()
+
   var i: u32 = 0
   while i < iterations {
     foundation.yield_cpu()
     i = i + 1
   }
-  
-  var end: u64 = foundation.timer_get_ticks()
-  var total: u64 = end - start
-  var avg: u64 = (total * 1000) / iterations  // nanoseconds
-  
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
   foundation.serial_write_string("  Average: ")
-  foundation.serial_write_hex(@truncate(avg, u32))
+  foundation.serial_write_hex(avg)
   foundation.serial_write_string(" ns\n")
-  
+
   return avg
 }
 
+// =============================================================================
+// Memory Benchmarks
+// =============================================================================
+
+export fn benchmark_memory_allocation(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing memory allocation...\n")
+
+  var iterations: u32 = 10000
+  var size: u32 = 4096
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    var ptr: u64 = memory.kmalloc(@zext(size, u64), 0)
+    memory.kfree(ptr)
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
+  foundation.serial_write_string("  Average: ")
+  foundation.serial_write_hex(avg)
+  foundation.serial_write_string(" ns\n")
+
+  return avg
+}
+
+export fn benchmark_page_allocation(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing page allocation...\n")
+
+  var iterations: u32 = 10000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    var page: u64 = memory.alloc_page()
+    memory.free_page(page)
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
+  foundation.serial_write_string("  Average: ")
+  foundation.serial_write_hex(avg)
+  foundation.serial_write_string(" ns\n")
+
+  return avg
+}
+
+export fn benchmark_memcpy(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing memcpy (4KB)...\n")
+
+  var iterations: u32 = 100000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    memory.memcpy(@ptrToInt(&bench_buffer2), @ptrToInt(&bench_buffer1), 4096)
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var total_ns: u64 = tsc_to_ns(end - start)
+  var throughput: u64 = (@zext(iterations, u64) * 4096 * 1000) / total_ns  // MB/s
+
+  foundation.serial_write_string("  Throughput: ")
+  foundation.serial_write_hex(throughput)
+  foundation.serial_write_string(" MB/s\n")
+
+  return throughput
+}
+
+export fn benchmark_memset(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing memset (4KB)...\n")
+
+  var iterations: u32 = 100000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    memory.memset(@ptrToInt(&bench_buffer1), 0xAA, 4096)
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var total_ns: u64 = tsc_to_ns(end - start)
+  var throughput: u64 = (@zext(iterations, u64) * 4096 * 1000) / total_ns
+
+  foundation.serial_write_string("  Throughput: ")
+  foundation.serial_write_hex(throughput)
+  foundation.serial_write_string(" MB/s\n")
+
+  return throughput
+}
+
+// =============================================================================
+// I/O Benchmarks
+// =============================================================================
+
+export fn benchmark_file_io(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing file I/O...\n")
+
+  var iterations: u32 = 1000
+  var size: u32 = 4096
+
+  var fd: u32 = filesystem.vfs_open(@ptrToInt("/tmp/bench"), 0x0242, 0x1B6)
+  if fd == 0xFFFFFFFF {
+    foundation.serial_write_string("  Failed to create test file\n")
+    return 0
+  }
+
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    filesystem.vfs_write(fd, @ptrToInt(&bench_buffer1), size)
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  filesystem.vfs_close(fd)
+  filesystem.vfs_unlink(@ptrToInt("/tmp/bench"))
+
+  var total_ns: u64 = tsc_to_ns(end - start)
+  var throughput: u64 = (@zext(iterations, u64) * @zext(size, u64) * 1000) / total_ns
+
+  foundation.serial_write_string("  Write throughput: ")
+  foundation.serial_write_hex(throughput)
+  foundation.serial_write_string(" MB/s\n")
+
+  return throughput
+}
+
+export fn benchmark_io_uring(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing io_uring submission...\n")
+
+  // Create ring
+  var ring_id: i32 = io_uring.io_uring_setup(128, 0)
+  if ring_id < 0 {
+    foundation.serial_write_string("  Failed to create io_uring\n")
+    return 0
+  }
+
+  var iterations: u32 = 10000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    // Submit NOP operations
+    io_uring.io_uring_enter(@bitCast(ring_id, u32), 1, 0, 0)
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  io_uring.io_uring_destroy(@bitCast(ring_id, u32))
+
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
+  foundation.serial_write_string("  Average submission: ")
+  foundation.serial_write_hex(avg)
+  foundation.serial_write_string(" ns\n")
+
+  return avg
+}
+
+// =============================================================================
+// Network Benchmarks
+// =============================================================================
+
+export fn benchmark_network_throughput(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing network throughput...\n")
+
+  var iterations: u32 = 1000
+  var size: u32 = 1500  // MTU
+
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    network.net_send_raw(@ptrToInt(&bench_buffer1), size)
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var total_ns: u64 = tsc_to_ns(end - start)
+  var throughput: u64 = (@zext(iterations, u64) * @zext(size, u64) * 1000) / total_ns
+
+  foundation.serial_write_string("  Throughput: ")
+  foundation.serial_write_hex(throughput)
+  foundation.serial_write_string(" MB/s\n")
+
+  return throughput
+}
+
+// =============================================================================
+// Lock-Free Data Structure Benchmarks
+// =============================================================================
+
+export fn benchmark_lockfree_stack(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing lock-free stack...\n")
+
+  var stack_mem: [u8; 256] = undefined
+  lockfree.treiber_stack_init(@ptrToInt(&stack_mem))
+
+  var node_mem: [u8; 32768] = undefined  // Space for nodes
+  var iterations: u32 = 100000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    var node: u64 = @ptrToInt(&node_mem) + @zext((i % 1024) * 32, u64)
+    lockfree.treiber_stack_push(@ptrToInt(&stack_mem), node)
+    lockfree.treiber_stack_pop(@ptrToInt(&stack_mem))
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
+  foundation.serial_write_string("  Average push+pop: ")
+  foundation.serial_write_hex(avg)
+  foundation.serial_write_string(" ns\n")
+
+  return avg
+}
+
+export fn benchmark_spsc_ringbuf(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing SPSC ring buffer...\n")
+
+  var rb_mem: [u8; 256] = undefined
+  var data_mem: [u64; 1024] = undefined
+  lockfree.spsc_init(@ptrToInt(&rb_mem), @ptrToInt(&data_mem), 1024)
+
+  var iterations: u32 = 1000000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    lockfree.spsc_push(@ptrToInt(&rb_mem), @zext(i, u64))
+    lockfree.spsc_pop(@ptrToInt(&rb_mem))
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
+  foundation.serial_write_string("  Average push+pop: ")
+  foundation.serial_write_hex(avg)
+  foundation.serial_write_string(" ns\n")
+
+  return avg
+}
+
+export fn benchmark_seqlock(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing sequence lock...\n")
+
+  var lock_mem: [u8; 128] = undefined
+  lockfree.seqlock_init(@ptrToInt(&lock_mem))
+
+  var iterations: u32 = 1000000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    // Read side (optimistic)
+    var seq: u64 = lockfree.seqlock_read_begin(@ptrToInt(&lock_mem))
+    // Read some data
+    var retry: u32 = lockfree.seqlock_read_retry(@ptrToInt(&lock_mem), seq)
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
+  foundation.serial_write_string("  Average read: ")
+  foundation.serial_write_hex(avg)
+  foundation.serial_write_string(" ns\n")
+
+  return avg
+}
+
+// =============================================================================
+// RCU Benchmarks
+// =============================================================================
+
+export fn benchmark_rcu_read(): u64 {
+  foundation.serial_write_string("[Benchmark] Testing RCU read-side...\n")
+
+  var iterations: u32 = 1000000
+  var start: u64 = foundation.rdtsc()
+
+  var i: u32 = 0
+  while i < iterations {
+    rcu.rcu_read_lock()
+    // Critical section
+    rcu.rcu_read_unlock()
+    i = i + 1
+  }
+
+  var end: u64 = foundation.rdtsc()
+  var avg: u64 = tsc_to_ns((end - start) / @zext(iterations, u64))
+
+  foundation.serial_write_string("  Average lock/unlock: ")
+  foundation.serial_write_hex(avg)
+  foundation.serial_write_string(" ns\n")
+
+  return avg
+}
+
+// =============================================================================
+// Comprehensive Run Functions
+// =============================================================================
+
 export fn benchmark_run_all() {
-  foundation.serial_write_string("\n=== Running Full Benchmark Suite ===\n\n")
-  
+  if benchmark_initialized == 0 {
+    benchmark_init()
+  }
+
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("╔════════════════════════════════════════════════════════════════╗\n")
+  foundation.serial_write_string("║         home-os Comprehensive Benchmark Suite                  ║\n")
+  foundation.serial_write_string("╚════════════════════════════════════════════════════════════════╝\n\n")
+
+  var start: u64 = foundation.rdtsc()
+
+  // CPU benchmarks
+  foundation.serial_write_string("=== CPU Benchmarks ===\n")
+  benchmark_rdtsc_overhead()
   benchmark_syscall_latency()
-  benchmark_process_creation()
-  benchmark_memory_allocation()
-  benchmark_file_io()
-  benchmark_network_throughput()
+  benchmark_atomic_increment()
+  benchmark_cas()
+
+  // Process benchmarks
+  foundation.serial_write_string("\n=== Process Benchmarks ===\n")
   benchmark_context_switch()
-  
-  foundation.serial_write_string("\n=== Benchmark Complete ===\n")
+  benchmark_process_creation()
+
+  // Memory benchmarks
+  foundation.serial_write_string("\n=== Memory Benchmarks ===\n")
+  benchmark_memory_allocation()
+  benchmark_page_allocation()
+  benchmark_memcpy()
+  benchmark_memset()
+
+  // I/O benchmarks
+  foundation.serial_write_string("\n=== I/O Benchmarks ===\n")
+  benchmark_file_io()
+  benchmark_io_uring()
+
+  // Network benchmarks
+  foundation.serial_write_string("\n=== Network Benchmarks ===\n")
+  benchmark_network_throughput()
+
+  // Lock-free data structures
+  foundation.serial_write_string("\n=== Lock-Free Data Structure Benchmarks ===\n")
+  benchmark_lockfree_stack()
+  benchmark_spsc_ringbuf()
+  benchmark_seqlock()
+
+  // RCU benchmarks
+  foundation.serial_write_string("\n=== RCU Benchmarks ===\n")
+  benchmark_rcu_read()
+
+  var end: u64 = foundation.rdtsc()
+  var total_time: u64 = tsc_to_ns(end - start) / 1000000  // ms
+
+  foundation.serial_write_string("\n╔════════════════════════════════════════════════════════════════╗\n")
+  foundation.serial_write_string("║                     Benchmark Complete                         ║\n")
+  foundation.serial_write_string("╚════════════════════════════════════════════════════════════════╝\n")
+  foundation.serial_write_string("Total time: ")
+  foundation.serial_write_hex(total_time)
+  foundation.serial_write_string(" ms\n\n")
+}
+
+export fn benchmark_run_quick() {
+  if benchmark_initialized == 0 {
+    benchmark_init()
+  }
+
+  foundation.serial_write_string("\n=== Quick Benchmark Suite ===\n\n")
+
+  benchmark_rdtsc_overhead()
+  benchmark_syscall_latency()
+  benchmark_memory_allocation()
+  benchmark_context_switch()
+  benchmark_memcpy()
+  benchmark_lockfree_stack()
+
+  foundation.serial_write_string("\n=== Quick Benchmark Complete ===\n")
+}
+
+export fn benchmark_run_memory() {
+  if benchmark_initialized == 0 {
+    benchmark_init()
+  }
+
+  foundation.serial_write_string("\n=== Memory Benchmark Suite ===\n\n")
+
+  benchmark_memory_allocation()
+  benchmark_page_allocation()
+  benchmark_memcpy()
+  benchmark_memset()
+
+  foundation.serial_write_string("\n=== Memory Benchmark Complete ===\n")
+}
+
+export fn benchmark_run_io() {
+  if benchmark_initialized == 0 {
+    benchmark_init()
+  }
+
+  foundation.serial_write_string("\n=== I/O Benchmark Suite ===\n\n")
+
+  benchmark_file_io()
+  benchmark_io_uring()
+  benchmark_network_throughput()
+
+  foundation.serial_write_string("\n=== I/O Benchmark Complete ===\n")
+}
+
+export fn benchmark_run_lockfree() {
+  if benchmark_initialized == 0 {
+    benchmark_init()
+  }
+
+  foundation.serial_write_string("\n=== Lock-Free Benchmark Suite ===\n\n")
+
+  benchmark_atomic_increment()
+  benchmark_cas()
+  benchmark_lockfree_stack()
+  benchmark_spsc_ringbuf()
+  benchmark_seqlock()
+  benchmark_rcu_read()
+
+  foundation.serial_write_string("\n=== Lock-Free Benchmark Complete ===\n")
+}
+
+// =============================================================================
+// Result Export
+// =============================================================================
+
+export fn benchmark_get_result_count(): u32 {
+  return suite.result_count
+}
+
+export fn benchmark_get_result(index: u32, result_ptr: u64): i32 {
+  if index >= suite.result_count {
+    return -1
+  }
+
+  memory.memcpy(result_ptr, @ptrToInt(&suite.results[index]), @sizeOf(BenchmarkResult))
+  return 0
+}
+
+export fn benchmark_print_summary() {
+  foundation.serial_write_string("\n=== Benchmark Summary ===\n\n")
+
+  var i: u32 = 0
+  while i < suite.result_count {
+    print_result(suite.results[i])
+    i = i + 1
+  }
+
+  foundation.serial_write_string("\nTotal benchmarks: ")
+  foundation.serial_write_hex(@zext(suite.result_count, u64))
+  foundation.serial_write_string("\n")
 }

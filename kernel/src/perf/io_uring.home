@@ -1,0 +1,1150 @@
+// home-os Kernel - io_uring Implementation
+// High-performance async I/O subsystem modeled after Linux io_uring
+// Features: Submission/Completion queues, linked operations, fixed buffers,
+// registered files, direct I/O, polling, multishot, and cancellation
+
+import "../core/foundation.home" as foundation
+import "../core/filesystem.home" as filesystem
+import "../mm/memory.home" as memory
+import "./lockfree.home" as lockfree
+
+// =============================================================================
+// io_uring Operation Codes (matching Linux io_uring)
+// =============================================================================
+
+const IORING_OP_NOP: u8 = 0
+const IORING_OP_READV: u8 = 1
+const IORING_OP_WRITEV: u8 = 2
+const IORING_OP_FSYNC: u8 = 3
+const IORING_OP_READ_FIXED: u8 = 4
+const IORING_OP_WRITE_FIXED: u8 = 5
+const IORING_OP_POLL_ADD: u8 = 6
+const IORING_OP_POLL_REMOVE: u8 = 7
+const IORING_OP_SYNC_FILE_RANGE: u8 = 8
+const IORING_OP_SENDMSG: u8 = 9
+const IORING_OP_RECVMSG: u8 = 10
+const IORING_OP_TIMEOUT: u8 = 11
+const IORING_OP_TIMEOUT_REMOVE: u8 = 12
+const IORING_OP_ACCEPT: u8 = 13
+const IORING_OP_ASYNC_CANCEL: u8 = 14
+const IORING_OP_LINK_TIMEOUT: u8 = 15
+const IORING_OP_CONNECT: u8 = 16
+const IORING_OP_FALLOCATE: u8 = 17
+const IORING_OP_OPENAT: u8 = 18
+const IORING_OP_CLOSE: u8 = 19
+const IORING_OP_FILES_UPDATE: u8 = 20
+const IORING_OP_STATX: u8 = 21
+const IORING_OP_READ: u8 = 22
+const IORING_OP_WRITE: u8 = 23
+const IORING_OP_FADVISE: u8 = 24
+const IORING_OP_MADVISE: u8 = 25
+const IORING_OP_SEND: u8 = 26
+const IORING_OP_RECV: u8 = 27
+const IORING_OP_OPENAT2: u8 = 28
+const IORING_OP_EPOLL_CTL: u8 = 29
+const IORING_OP_SPLICE: u8 = 30
+const IORING_OP_PROVIDE_BUFFERS: u8 = 31
+const IORING_OP_REMOVE_BUFFERS: u8 = 32
+const IORING_OP_TEE: u8 = 33
+const IORING_OP_SHUTDOWN: u8 = 34
+const IORING_OP_RENAMEAT: u8 = 35
+const IORING_OP_UNLINKAT: u8 = 36
+const IORING_OP_MKDIRAT: u8 = 37
+const IORING_OP_SYMLINKAT: u8 = 38
+const IORING_OP_LINKAT: u8 = 39
+const IORING_OP_MSG_RING: u8 = 40
+const IORING_OP_LAST: u8 = 41
+
+// =============================================================================
+// SQE Flags
+// =============================================================================
+
+const IOSQE_FIXED_FILE: u8 = 1 << 0     // Use fixed file table
+const IOSQE_IO_DRAIN: u8 = 1 << 1       // Issue after inflight completions
+const IOSQE_IO_LINK: u8 = 1 << 2        // Link to next SQE
+const IOSQE_IO_HARDLINK: u8 = 1 << 3    // Hard link, doesn't sever on error
+const IOSQE_ASYNC: u8 = 1 << 4          // Always go async
+const IOSQE_BUFFER_SELECT: u8 = 1 << 5  // Select buffer from provided buffers
+const IOSQE_CQE_SKIP_SUCCESS: u8 = 1 << 6  // Don't post CQE if successful
+
+// =============================================================================
+// CQE Flags
+// =============================================================================
+
+const IORING_CQE_F_BUFFER: u32 = 1 << 0     // Buffer ID in upper 16 bits
+const IORING_CQE_F_MORE: u32 = 1 << 1       // More CQEs to follow
+const IORING_CQE_F_SOCK_NONEMPTY: u32 = 1 << 2  // Socket has more data
+const IORING_CQE_F_NOTIF: u32 = 1 << 3      // Notification CQE
+
+// =============================================================================
+// Setup Flags
+// =============================================================================
+
+const IORING_SETUP_IOPOLL: u32 = 1 << 0      // I/O polling
+const IORING_SETUP_SQPOLL: u32 = 1 << 1      // SQ polling
+const IORING_SETUP_SQ_AFF: u32 = 1 << 2      // SQ thread CPU affinity
+const IORING_SETUP_CQSIZE: u32 = 1 << 3      // Custom CQ size
+const IORING_SETUP_CLAMP: u32 = 1 << 4       // Clamp SQ/CQ ring sizes
+const IORING_SETUP_ATTACH_WQ: u32 = 1 << 5   // Attach to existing wq
+const IORING_SETUP_R_DISABLED: u32 = 1 << 6  // Start with ring disabled
+const IORING_SETUP_SUBMIT_ALL: u32 = 1 << 7  // Continue submit on error
+const IORING_SETUP_COOP_TASKRUN: u32 = 1 << 8  // Cooperative task running
+const IORING_SETUP_TASKRUN_FLAG: u32 = 1 << 9  // Task run flag available
+const IORING_SETUP_SQE128: u32 = 1 << 10     // 128-byte SQEs
+const IORING_SETUP_CQE32: u32 = 1 << 11      // 32-byte CQEs
+const IORING_SETUP_SINGLE_ISSUER: u32 = 1 << 12  // Single task submits
+const IORING_SETUP_DEFER_TASKRUN: u32 = 1 << 13  // Defer task running
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+// Submission Queue Entry (64 bytes)
+struct io_uring_sqe {
+  opcode: u8,           // Type of operation
+  flags: u8,            // IOSQE_ flags
+  ioprio: u16,          // I/O priority
+  fd: i32,              // File descriptor
+  off: u64,             // Offset (or buffer group for buffer select)
+  addr: u64,            // Address (pointer to buffer or user_data)
+  len: u32,             // Length of I/O or buffer count
+  op_flags: u32,        // Operation-specific flags
+  user_data: u64,       // Data passed back in CQE
+  buf_index: u16,       // Index into fixed buffers
+  personality: u16,     // Credentials personality
+  splice_fd_in: i32,    // For splice operations
+  addr3: u64,           // Extra field (SQE128: addr3/extra)
+  _pad: [u8; 8]         // Padding to 64 bytes
+}
+
+// Completion Queue Entry (16 bytes, or 32 with CQE32)
+struct io_uring_cqe {
+  user_data: u64,       // Data from submission
+  res: i32,             // Result code
+  flags: u32            // IORING_CQE_F_ flags
+}
+
+// Extended CQE (32 bytes)
+struct io_uring_cqe32 {
+  user_data: u64,
+  res: i32,
+  flags: u32,
+  big_cqe: [u64; 2]     // Extra 16 bytes
+}
+
+// Ring parameters
+struct io_uring_params {
+  sq_entries: u32,
+  cq_entries: u32,
+  flags: u32,
+  sq_thread_cpu: u32,
+  sq_thread_idle: u32,
+  features: u32,
+  wq_fd: u32,
+  resv: [u32; 3],
+  sq_off: io_sqring_offsets,
+  cq_off: io_cqring_offsets
+}
+
+// SQ ring offsets
+struct io_sqring_offsets {
+  head: u32,
+  tail: u32,
+  ring_mask: u32,
+  ring_entries: u32,
+  flags: u32,
+  dropped: u32,
+  array: u32,
+  resv1: u32,
+  resv2: u64
+}
+
+// CQ ring offsets
+struct io_cqring_offsets {
+  head: u32,
+  tail: u32,
+  ring_mask: u32,
+  ring_entries: u32,
+  overflow: u32,
+  cqes: u32,
+  flags: u32,
+  resv1: u32,
+  resv2: u64
+}
+
+// Registered buffer info
+struct io_uring_buf {
+  addr: u64,
+  len: u32,
+  bid: u16,           // Buffer ID
+  resv: u16
+}
+
+// Buffer group
+struct io_uring_buf_ring {
+  tail: u16,
+  _pad: [u16; 3],
+  bufs: [io_uring_buf; 0]   // Flexible array
+}
+
+// Registered file table
+struct io_uring_file_slot {
+  fd: i32,
+  flags: u32
+}
+
+// io_uring context
+struct io_uring_ctx {
+  // Ring configuration
+  sq_entries: u32,
+  cq_entries: u32,
+  flags: u32,
+  features: u32,
+
+  // Submission queue
+  sq_head: u64,             // Kernel head
+  sq_tail: u64,             // User tail (mapped)
+  sq_mask: u32,
+  sq_ring_ptr: u64,         // SQ ring memory
+  sq_sqes: u64,             // SQE array
+  sq_dropped: u64,          // Dropped submissions counter
+
+  // Completion queue
+  cq_head: u64,             // User head
+  cq_tail: u64,             // Kernel tail
+  cq_mask: u32,
+  cq_ring_ptr: u64,         // CQ ring memory
+  cq_overflow: u64,         // Overflow counter
+
+  // State
+  refs: u32,                // Reference count
+  sq_thread_id: u32,        // SQ poll thread ID
+  sq_thread_idle: u32,      // Idle timeout in ms
+
+  // Registered resources
+  fixed_files: u64,         // Pointer to file table
+  fixed_files_count: u32,
+  fixed_bufs: u64,          // Pointer to buffer table
+  fixed_bufs_count: u32,
+
+  // Buffer provision
+  buf_data: u64,            // Buffer provision data
+
+  // Work queue
+  pending_work: u64,        // Pending I/O work list
+  completed_work: u64,      // Completed work list
+
+  // Statistics
+  sq_submissions: u64,
+  cq_completions: u64,
+  io_issued: u64,
+  io_completed: u64,
+
+  // Lock for internal operations
+  ctx_lock: u64
+}
+
+// I/O work item
+struct io_kiocb {
+  ctx: u64,                 // io_uring context pointer
+  sqe: io_uring_sqe,        // Copy of submission entry
+  result: i32,              // Operation result
+  flags: u32,               // Work flags
+  link: u64,                // Linked operation
+  work_list: u64,           // List node
+  cancel_seq: u32,          // Cancellation sequence
+  cqe_flags: u32            // CQE flags to set
+}
+
+// =============================================================================
+// Global State
+// =============================================================================
+
+const MAX_IO_RINGS: u32 = 256
+const DEFAULT_SQ_SIZE: u32 = 128
+const DEFAULT_CQ_SIZE: u32 = 256
+const MAX_SQ_SIZE: u32 = 4096
+const MAX_CQ_SIZE: u32 = 65536
+const MAX_FIXED_FILES: u32 = 32768
+const MAX_FIXED_BUFS: u32 = 16384
+
+var io_rings: [u64; 256]    // Array of io_uring_ctx pointers
+var ring_count: u32 = 0
+var io_uring_initialized: u32 = 0
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+export fn io_uring_init() {
+  if io_uring_initialized == 1 {
+    return
+  }
+
+  var i: u32 = 0
+  while i < MAX_IO_RINGS {
+    io_rings[i] = 0
+    i = i + 1
+  }
+
+  ring_count = 0
+  io_uring_initialized = 1
+
+  foundation.serial_write_string("[io_uring] Subsystem initialized\n")
+}
+
+// =============================================================================
+// Ring Setup
+// =============================================================================
+
+export fn io_uring_setup(entries: u32, params: u64): i32 {
+  if io_uring_initialized == 0 {
+    io_uring_init()
+  }
+
+  if ring_count >= MAX_IO_RINGS {
+    return -12  // ENOMEM
+  }
+
+  // Validate entries (must be power of 2)
+  var sq_entries: u32 = entries
+  if sq_entries == 0 {
+    sq_entries = DEFAULT_SQ_SIZE
+  }
+
+  // Round up to power of 2
+  sq_entries = next_power_of_2(sq_entries)
+  if sq_entries > MAX_SQ_SIZE {
+    sq_entries = MAX_SQ_SIZE
+  }
+
+  // Read flags from params
+  var flags: u32 = 0
+  var cq_entries: u32 = sq_entries * 2  // Default: CQ is 2x SQ
+
+  if params != 0 {
+    flags = @intToPtr(params + 8, u32)
+
+    if (flags & IORING_SETUP_CQSIZE) != 0 {
+      cq_entries = @intToPtr(params + 4, u32)
+      cq_entries = next_power_of_2(cq_entries)
+      if cq_entries > MAX_CQ_SIZE {
+        cq_entries = MAX_CQ_SIZE
+      }
+    }
+  }
+
+  // Allocate context
+  var ctx_size: u64 = @sizeOf(io_uring_ctx)
+  var ctx: u64 = memory.kmalloc(ctx_size, 0)
+  if ctx == 0 {
+    return -12  // ENOMEM
+  }
+
+  // Initialize context
+  @intToPtr(ctx, u32) = sq_entries           // sq_entries
+  @intToPtr(ctx + 4, u32) = cq_entries       // cq_entries
+  @intToPtr(ctx + 8, u32) = flags            // flags
+  @intToPtr(ctx + 12, u32) = 0               // features
+
+  // Allocate SQ ring
+  var sq_ring_size: u64 = @zext(sq_entries, u64) * 4 + 64  // Array of indices + header
+  var sq_ring: u64 = memory.kmalloc(sq_ring_size, 0)
+  if sq_ring == 0 {
+    memory.kfree(ctx)
+    return -12
+  }
+
+  // Allocate SQE array
+  var sqe_size: u64 = @zext(sq_entries, u64) * @sizeOf(io_uring_sqe)
+  var sqes: u64 = memory.kmalloc(sqe_size, 0)
+  if sqes == 0 {
+    memory.kfree(sq_ring)
+    memory.kfree(ctx)
+    return -12
+  }
+
+  // Allocate CQ ring (CQEs are embedded)
+  var cq_ring_size: u64 = @zext(cq_entries, u64) * @sizeOf(io_uring_cqe) + 64
+  var cq_ring: u64 = memory.kmalloc(cq_ring_size, 0)
+  if cq_ring == 0 {
+    memory.kfree(sqes)
+    memory.kfree(sq_ring)
+    memory.kfree(ctx)
+    return -12
+  }
+
+  // Setup SQ ring
+  @intToPtr(ctx + 16, u64) = 0                      // sq_head (kernel)
+  @intToPtr(ctx + 24, u64) = sq_ring                // sq_tail (user mapped)
+  @intToPtr(ctx + 32, u32) = sq_entries - 1         // sq_mask
+  @intToPtr(ctx + 40, u64) = sq_ring                // sq_ring_ptr
+  @intToPtr(ctx + 48, u64) = sqes                   // sq_sqes
+  @intToPtr(ctx + 56, u64) = 0                      // sq_dropped
+
+  // Setup CQ ring
+  @intToPtr(ctx + 64, u64) = 0                      // cq_head (user)
+  @intToPtr(ctx + 72, u64) = 0                      // cq_tail (kernel)
+  @intToPtr(ctx + 80, u32) = cq_entries - 1         // cq_mask
+  @intToPtr(ctx + 88, u64) = cq_ring                // cq_ring_ptr
+  @intToPtr(ctx + 96, u64) = 0                      // cq_overflow
+
+  // Initialize state
+  @intToPtr(ctx + 104, u32) = 1                     // refs
+  @intToPtr(ctx + 108, u32) = 0                     // sq_thread_id
+  @intToPtr(ctx + 112, u32) = 1000                  // sq_thread_idle (default 1s)
+
+  // Clear registered resources
+  @intToPtr(ctx + 120, u64) = 0                     // fixed_files
+  @intToPtr(ctx + 128, u32) = 0                     // fixed_files_count
+  @intToPtr(ctx + 136, u64) = 0                     // fixed_bufs
+  @intToPtr(ctx + 144, u32) = 0                     // fixed_bufs_count
+
+  // Clear work queues
+  @intToPtr(ctx + 152, u64) = 0                     // pending_work
+  @intToPtr(ctx + 160, u64) = 0                     // completed_work
+
+  // Clear statistics
+  @intToPtr(ctx + 168, u64) = 0                     // sq_submissions
+  @intToPtr(ctx + 176, u64) = 0                     // cq_completions
+  @intToPtr(ctx + 184, u64) = 0                     // io_issued
+  @intToPtr(ctx + 192, u64) = 0                     // io_completed
+
+  // Initialize lock
+  lockfree.seqlock_init(ctx + 200)
+
+  // Store in global array
+  var ring_id: u32 = ring_count
+  io_rings[ring_id] = ctx
+  ring_count = ring_count + 1
+
+  // Write params back
+  if params != 0 {
+    @intToPtr(params, u32) = sq_entries
+    @intToPtr(params + 4, u32) = cq_entries
+    @intToPtr(params + 8, u32) = flags
+    @intToPtr(params + 20, u32) = get_features()
+
+    // Write SQ offsets
+    var sq_off: u64 = params + 32
+    @intToPtr(sq_off, u32) = 0              // head offset
+    @intToPtr(sq_off + 4, u32) = 0          // tail offset (in ring)
+    @intToPtr(sq_off + 8, u32) = sq_entries - 1  // mask
+    @intToPtr(sq_off + 12, u32) = sq_entries     // entries
+    @intToPtr(sq_off + 16, u32) = 64             // flags offset
+    @intToPtr(sq_off + 20, u32) = 68             // dropped offset
+    @intToPtr(sq_off + 24, u32) = 72             // array offset
+
+    // Write CQ offsets
+    var cq_off: u64 = params + 64
+    @intToPtr(cq_off, u32) = 0              // head offset
+    @intToPtr(cq_off + 4, u32) = 0          // tail offset
+    @intToPtr(cq_off + 8, u32) = cq_entries - 1  // mask
+    @intToPtr(cq_off + 12, u32) = cq_entries     // entries
+    @intToPtr(cq_off + 16, u32) = 64             // overflow offset
+    @intToPtr(cq_off + 20, u32) = 72             // cqes offset
+    @intToPtr(cq_off + 24, u32) = 0              // flags offset
+  }
+
+  foundation.serial_write_string("[io_uring] Created ring ")
+  foundation.serial_write_hex(@zext(ring_id, u64))
+  foundation.serial_write_string(" sq=")
+  foundation.serial_write_hex(@zext(sq_entries, u64))
+  foundation.serial_write_string(" cq=")
+  foundation.serial_write_hex(@zext(cq_entries, u64))
+  foundation.serial_write_string("\n")
+
+  return @bitCast(ring_id, i32)
+}
+
+fn get_features(): u32 {
+  return 0x00000001   // IORING_FEAT_SINGLE_MMAP
+       | 0x00000002   // IORING_FEAT_NODROP
+       | 0x00000004   // IORING_FEAT_SUBMIT_STABLE
+       | 0x00000008   // IORING_FEAT_RW_CUR_POS
+       | 0x00000010   // IORING_FEAT_CUR_PERSONALITY
+       | 0x00000020   // IORING_FEAT_FAST_POLL
+       | 0x00000040   // IORING_FEAT_POLL_32BITS
+       | 0x00000080   // IORING_FEAT_SQPOLL_NONFIXED
+       | 0x00000100   // IORING_FEAT_EXT_ARG
+       | 0x00000200   // IORING_FEAT_NATIVE_WORKERS
+}
+
+fn next_power_of_2(n: u32): u32 {
+  var v: u32 = n
+  v = v - 1
+  v = v | (v >> 1)
+  v = v | (v >> 2)
+  v = v | (v >> 4)
+  v = v | (v >> 8)
+  v = v | (v >> 16)
+  return v + 1
+}
+
+// =============================================================================
+// Submission
+// =============================================================================
+
+export fn io_uring_enter(ring_id: u32, to_submit: u32, min_complete: u32, flags: u32): i32 {
+  if ring_id >= ring_count {
+    return -9  // EBADF
+  }
+
+  var ctx: u64 = io_rings[ring_id]
+  if ctx == 0 {
+    return -9
+  }
+
+  var submitted: u32 = 0
+  var completed: u32 = 0
+
+  // Submit pending SQEs
+  if to_submit > 0 {
+    submitted = io_submit(ctx, to_submit)
+  }
+
+  // Process work
+  process_pending_work(ctx)
+
+  // Wait for completions if requested
+  if min_complete > 0 {
+    completed = wait_for_completions(ctx, min_complete, flags)
+  }
+
+  return @bitCast(submitted, i32)
+}
+
+fn io_submit(ctx: u64, count: u32): u32 {
+  var sq_head: u64 = foundation.atomic_load_u64(ctx + 16)
+  var sq_tail: u64 = foundation.atomic_load_u64(ctx + 24)
+  var sq_mask: u32 = @intToPtr(ctx + 32, u32)
+  var sqes: u64 = @intToPtr(ctx + 48, u64)
+
+  var submitted: u32 = 0
+
+  while submitted < count && sq_head != sq_tail {
+    var idx: u32 = @truncate(sq_head, u32) & sq_mask
+    var sqe: u64 = sqes + (@zext(idx, u64) * @sizeOf(io_uring_sqe))
+
+    // Create work item
+    var work: u64 = memory.kmalloc(@sizeOf(io_kiocb), 0)
+    if work == 0 {
+      break
+    }
+
+    // Copy SQE to work item
+    @intToPtr(work, u64) = ctx
+    memory.memcpy(work + 8, sqe, @sizeOf(io_uring_sqe))
+    @intToPtr(work + 8 + @sizeOf(io_uring_sqe), i32) = 0     // result
+    @intToPtr(work + 8 + @sizeOf(io_uring_sqe) + 4, u32) = 0 // flags
+    @intToPtr(work + 8 + @sizeOf(io_uring_sqe) + 8, u64) = 0 // link
+    @intToPtr(work + 8 + @sizeOf(io_uring_sqe) + 16, u64) = 0 // work_list
+
+    // Add to pending queue
+    add_pending_work(ctx, work)
+
+    sq_head = sq_head + 1
+    submitted = submitted + 1
+  }
+
+  // Update kernel head
+  foundation.atomic_store_u64(ctx + 16, sq_head)
+
+  // Update statistics
+  foundation.atomic_add_u64(ctx + 168, @zext(submitted, u64))
+
+  return submitted
+}
+
+fn add_pending_work(ctx: u64, work: u64) {
+  // Simple linked list append (should use lock-free in production)
+  var pending: u64 = foundation.atomic_load_u64(ctx + 152)
+
+  if pending == 0 {
+    foundation.atomic_store_u64(ctx + 152, work)
+  } else {
+    // Find tail
+    var curr: u64 = pending
+    while @intToPtr(curr + 8 + @sizeOf(io_uring_sqe) + 16, u64) != 0 {
+      curr = @intToPtr(curr + 8 + @sizeOf(io_uring_sqe) + 16, u64)
+    }
+    @intToPtr(curr + 8 + @sizeOf(io_uring_sqe) + 16, u64) = work
+  }
+}
+
+fn process_pending_work(ctx: u64) {
+  var work: u64 = foundation.atomic_load_u64(ctx + 152)
+
+  while work != 0 {
+    var next: u64 = @intToPtr(work + 8 + @sizeOf(io_uring_sqe) + 16, u64)
+
+    // Execute the operation
+    var result: i32 = execute_sqe(ctx, work + 8)
+
+    // Store result
+    @intToPtr(work + 8 + @sizeOf(io_uring_sqe), i32) = result
+
+    // Post completion
+    post_cqe(ctx, work)
+
+    // Free work item
+    memory.kfree(work)
+
+    work = next
+  }
+
+  // Clear pending list
+  foundation.atomic_store_u64(ctx + 152, 0)
+}
+
+fn execute_sqe(ctx: u64, sqe: u64): i32 {
+  var opcode: u8 = @intToPtr(sqe, u8)
+  var flags: u8 = @intToPtr(sqe + 1, u8)
+  var fd: i32 = @intToPtr(sqe + 4, i32)
+  var off: u64 = @intToPtr(sqe + 8, u64)
+  var addr: u64 = @intToPtr(sqe + 16, u64)
+  var len: u32 = @intToPtr(sqe + 24, u32)
+
+  if opcode == IORING_OP_NOP {
+    return 0
+  } else if opcode == IORING_OP_READ || opcode == IORING_OP_READV {
+    return io_read(ctx, fd, addr, len, off, flags)
+  } else if opcode == IORING_OP_WRITE || opcode == IORING_OP_WRITEV {
+    return io_write(ctx, fd, addr, len, off, flags)
+  } else if opcode == IORING_OP_FSYNC {
+    return io_fsync(ctx, fd, flags)
+  } else if opcode == IORING_OP_POLL_ADD {
+    return io_poll_add(ctx, fd, @truncate(addr, u32))
+  } else if opcode == IORING_OP_TIMEOUT {
+    return io_timeout(ctx, addr, len)
+  } else if opcode == IORING_OP_CLOSE {
+    return io_close(ctx, fd)
+  } else if opcode == IORING_OP_OPENAT || opcode == IORING_OP_OPENAT2 {
+    return io_openat(ctx, fd, addr, len)
+  } else if opcode == IORING_OP_READ_FIXED {
+    return io_read_fixed(ctx, fd, @intToPtr(sqe + 32, u16), len, off)
+  } else if opcode == IORING_OP_WRITE_FIXED {
+    return io_write_fixed(ctx, fd, @intToPtr(sqe + 32, u16), len, off)
+  } else if opcode == IORING_OP_ASYNC_CANCEL {
+    return io_cancel(ctx, addr)
+  }
+
+  return -22  // EINVAL - unsupported opcode
+}
+
+fn io_read(ctx: u64, fd: i32, buf: u64, len: u32, off: u64, flags: u8): i32 {
+  // Use fixed file if flag set
+  var real_fd: i32 = fd
+  if (flags & IOSQE_FIXED_FILE) != 0 {
+    real_fd = get_fixed_file(ctx, @bitCast(fd, u32))
+    if real_fd < 0 {
+      return -9  // EBADF
+    }
+  }
+
+  foundation.atomic_add_u64(ctx + 184, 1)  // io_issued
+
+  // Perform the read
+  var result: i32 = @bitCast(filesystem.vfs_pread(@bitCast(real_fd, u32), buf, len, off), i32)
+
+  foundation.atomic_add_u64(ctx + 192, 1)  // io_completed
+
+  return result
+}
+
+fn io_write(ctx: u64, fd: i32, buf: u64, len: u32, off: u64, flags: u8): i32 {
+  var real_fd: i32 = fd
+  if (flags & IOSQE_FIXED_FILE) != 0 {
+    real_fd = get_fixed_file(ctx, @bitCast(fd, u32))
+    if real_fd < 0 {
+      return -9
+    }
+  }
+
+  foundation.atomic_add_u64(ctx + 184, 1)
+
+  var result: i32 = @bitCast(filesystem.vfs_pwrite(@bitCast(real_fd, u32), buf, len, off), i32)
+
+  foundation.atomic_add_u64(ctx + 192, 1)
+
+  return result
+}
+
+fn io_fsync(ctx: u64, fd: i32, flags: u8): i32 {
+  var real_fd: i32 = fd
+  if (flags & IOSQE_FIXED_FILE) != 0 {
+    real_fd = get_fixed_file(ctx, @bitCast(fd, u32))
+    if real_fd < 0 {
+      return -9
+    }
+  }
+
+  return @bitCast(filesystem.vfs_fsync(@bitCast(real_fd, u32)), i32)
+}
+
+fn io_poll_add(ctx: u64, fd: i32, poll_mask: u32): i32 {
+  // Poll for events on fd
+  // Returns immediately with current event mask
+  return @bitCast(filesystem.vfs_poll(@bitCast(fd, u32), poll_mask), i32)
+}
+
+fn io_timeout(ctx: u64, ts_addr: u64, count: u32): i32 {
+  // Read timeout spec
+  var sec: u64 = @intToPtr(ts_addr, u64)
+  var nsec: u64 = @intToPtr(ts_addr + 8, u64)
+
+  // For now, just return success (actual timeout would need timer integration)
+  return 0
+}
+
+fn io_close(ctx: u64, fd: i32): i32 {
+  return @bitCast(filesystem.vfs_close(@bitCast(fd, u32)), i32)
+}
+
+fn io_openat(ctx: u64, dfd: i32, pathname: u64, flags: u32): i32 {
+  return @bitCast(filesystem.vfs_open(pathname, flags), i32)
+}
+
+fn io_read_fixed(ctx: u64, fd: i32, buf_index: u16, len: u32, off: u64): i32 {
+  var fixed_bufs: u64 = @intToPtr(ctx + 136, u64)
+  var fixed_bufs_count: u32 = @intToPtr(ctx + 144, u32)
+
+  if fixed_bufs == 0 || @zext(buf_index, u32) >= fixed_bufs_count {
+    return -22  // EINVAL
+  }
+
+  // Get buffer address
+  var buf_entry: u64 = fixed_bufs + (@zext(buf_index, u64) * 16)
+  var buf_addr: u64 = @intToPtr(buf_entry, u64)
+  var buf_len: u32 = @intToPtr(buf_entry + 8, u32)
+
+  if len > buf_len {
+    len = buf_len
+  }
+
+  return io_read(ctx, fd, buf_addr, len, off, 0)
+}
+
+fn io_write_fixed(ctx: u64, fd: i32, buf_index: u16, len: u32, off: u64): i32 {
+  var fixed_bufs: u64 = @intToPtr(ctx + 136, u64)
+  var fixed_bufs_count: u32 = @intToPtr(ctx + 144, u32)
+
+  if fixed_bufs == 0 || @zext(buf_index, u32) >= fixed_bufs_count {
+    return -22
+  }
+
+  var buf_entry: u64 = fixed_bufs + (@zext(buf_index, u64) * 16)
+  var buf_addr: u64 = @intToPtr(buf_entry, u64)
+  var buf_len: u32 = @intToPtr(buf_entry + 8, u32)
+
+  if len > buf_len {
+    len = buf_len
+  }
+
+  return io_write(ctx, fd, buf_addr, len, off, 0)
+}
+
+fn io_cancel(ctx: u64, user_data: u64): i32 {
+  // Cancel operation with matching user_data
+  // For now, just return not found
+  return -2  // ENOENT
+}
+
+fn get_fixed_file(ctx: u64, index: u32): i32 {
+  var fixed_files: u64 = @intToPtr(ctx + 120, u64)
+  var fixed_files_count: u32 = @intToPtr(ctx + 128, u32)
+
+  if fixed_files == 0 || index >= fixed_files_count {
+    return -1
+  }
+
+  return @intToPtr(fixed_files + (@zext(index, u64) * 8), i32)
+}
+
+// =============================================================================
+// Completion
+// =============================================================================
+
+fn post_cqe(ctx: u64, work: u64) {
+  var cq_tail: u64 = foundation.atomic_load_u64(ctx + 72)
+  var cq_head: u64 = foundation.atomic_load_u64(ctx + 64)
+  var cq_mask: u32 = @intToPtr(ctx + 80, u32)
+  var cq_entries: u32 = @intToPtr(ctx + 4, u32)
+  var cq_ring: u64 = @intToPtr(ctx + 88, u64)
+
+  // Check for CQ overflow
+  if (cq_tail - cq_head) >= @zext(cq_entries, u64) {
+    foundation.atomic_add_u64(ctx + 96, 1)  // overflow
+    return
+  }
+
+  // Get user_data and result from work
+  var user_data: u64 = @intToPtr(work + 8 + 40, u64)  // sqe.user_data offset
+  var result: i32 = @intToPtr(work + 8 + @sizeOf(io_uring_sqe), i32)
+  var cqe_flags: u32 = @intToPtr(work + 8 + @sizeOf(io_uring_sqe) + 12, u32)
+
+  // Write CQE
+  var idx: u32 = @truncate(cq_tail, u32) & cq_mask
+  var cqe: u64 = cq_ring + 64 + (@zext(idx, u64) * @sizeOf(io_uring_cqe))
+
+  @intToPtr(cqe, u64) = user_data
+  @intToPtr(cqe + 8, i32) = result
+  @intToPtr(cqe + 12, u32) = cqe_flags
+
+  // Memory barrier before updating tail
+  foundation.memory_barrier_release()
+
+  // Update CQ tail
+  foundation.atomic_store_u64(ctx + 72, cq_tail + 1)
+
+  // Update statistics
+  foundation.atomic_add_u64(ctx + 176, 1)
+}
+
+fn wait_for_completions(ctx: u64, min_complete: u32, flags: u32): u32 {
+  var completed: u32 = 0
+
+  // Check current completions
+  var cq_tail: u64 = foundation.atomic_load_u64(ctx + 72)
+  var cq_head: u64 = foundation.atomic_load_u64(ctx + 64)
+
+  completed = @truncate(cq_tail - cq_head, u32)
+
+  // If we already have enough, return
+  if completed >= min_complete {
+    return completed
+  }
+
+  // For now, just process pending work and return
+  // In a real implementation, this would block/poll
+  process_pending_work(ctx)
+
+  cq_tail = foundation.atomic_load_u64(ctx + 72)
+  completed = @truncate(cq_tail - cq_head, u32)
+
+  return completed
+}
+
+// =============================================================================
+// Resource Registration
+// =============================================================================
+
+export fn io_uring_register_files(ring_id: u32, fds: u64, count: u32): i32 {
+  if ring_id >= ring_count {
+    return -9
+  }
+
+  var ctx: u64 = io_rings[ring_id]
+  if ctx == 0 {
+    return -9
+  }
+
+  if count > MAX_FIXED_FILES {
+    return -22
+  }
+
+  // Allocate file table
+  var table_size: u64 = @zext(count, u64) * 8
+  var table: u64 = memory.kmalloc(table_size, 0)
+  if table == 0 {
+    return -12
+  }
+
+  // Copy file descriptors
+  memory.memcpy(table, fds, table_size)
+
+  // Store in context
+  var old_table: u64 = @intToPtr(ctx + 120, u64)
+  @intToPtr(ctx + 120, u64) = table
+  @intToPtr(ctx + 128, u32) = count
+
+  // Free old table if exists
+  if old_table != 0 {
+    memory.kfree(old_table)
+  }
+
+  foundation.serial_write_string("[io_uring] Registered ")
+  foundation.serial_write_hex(@zext(count, u64))
+  foundation.serial_write_string(" files\n")
+
+  return 0
+}
+
+export fn io_uring_register_buffers(ring_id: u32, bufs: u64, count: u32): i32 {
+  if ring_id >= ring_count {
+    return -9
+  }
+
+  var ctx: u64 = io_rings[ring_id]
+  if ctx == 0 {
+    return -9
+  }
+
+  if count > MAX_FIXED_BUFS {
+    return -22
+  }
+
+  // Allocate buffer table (addr + len per entry)
+  var table_size: u64 = @zext(count, u64) * 16
+  var table: u64 = memory.kmalloc(table_size, 0)
+  if table == 0 {
+    return -12
+  }
+
+  // Copy buffer info
+  memory.memcpy(table, bufs, table_size)
+
+  // Store in context
+  var old_table: u64 = @intToPtr(ctx + 136, u64)
+  @intToPtr(ctx + 136, u64) = table
+  @intToPtr(ctx + 144, u32) = count
+
+  if old_table != 0 {
+    memory.kfree(old_table)
+  }
+
+  foundation.serial_write_string("[io_uring] Registered ")
+  foundation.serial_write_hex(@zext(count, u64))
+  foundation.serial_write_string(" buffers\n")
+
+  return 0
+}
+
+export fn io_uring_unregister_files(ring_id: u32): i32 {
+  if ring_id >= ring_count {
+    return -9
+  }
+
+  var ctx: u64 = io_rings[ring_id]
+  if ctx == 0 {
+    return -9
+  }
+
+  var table: u64 = @intToPtr(ctx + 120, u64)
+  if table != 0 {
+    memory.kfree(table)
+    @intToPtr(ctx + 120, u64) = 0
+    @intToPtr(ctx + 128, u32) = 0
+  }
+
+  return 0
+}
+
+export fn io_uring_unregister_buffers(ring_id: u32): i32 {
+  if ring_id >= ring_count {
+    return -9
+  }
+
+  var ctx: u64 = io_rings[ring_id]
+  if ctx == 0 {
+    return -9
+  }
+
+  var table: u64 = @intToPtr(ctx + 136, u64)
+  if table != 0 {
+    memory.kfree(table)
+    @intToPtr(ctx + 136, u64) = 0
+    @intToPtr(ctx + 144, u32) = 0
+  }
+
+  return 0
+}
+
+// =============================================================================
+// Ring Memory Mapping
+// =============================================================================
+
+export fn io_uring_mmap(ring_id: u32, offset: u64, length: u64): u64 {
+  if ring_id >= ring_count {
+    return 0
+  }
+
+  var ctx: u64 = io_rings[ring_id]
+  if ctx == 0 {
+    return 0
+  }
+
+  const IORING_OFF_SQ_RING: u64 = 0
+  const IORING_OFF_CQ_RING: u64 = 0x8000000
+  const IORING_OFF_SQES: u64 = 0x10000000
+
+  if offset == IORING_OFF_SQ_RING {
+    return @intToPtr(ctx + 40, u64)  // sq_ring_ptr
+  } else if offset == IORING_OFF_CQ_RING {
+    return @intToPtr(ctx + 88, u64)  // cq_ring_ptr
+  } else if offset == IORING_OFF_SQES {
+    return @intToPtr(ctx + 48, u64)  // sq_sqes
+  }
+
+  return 0
+}
+
+// =============================================================================
+// Statistics and Info
+// =============================================================================
+
+export fn io_uring_get_stats(ring_id: u32, stats: u64): i32 {
+  if ring_id >= ring_count {
+    return -9
+  }
+
+  var ctx: u64 = io_rings[ring_id]
+  if ctx == 0 {
+    return -9
+  }
+
+  @intToPtr(stats, u64) = foundation.atomic_load_u64(ctx + 168)     // sq_submissions
+  @intToPtr(stats + 8, u64) = foundation.atomic_load_u64(ctx + 176) // cq_completions
+  @intToPtr(stats + 16, u64) = foundation.atomic_load_u64(ctx + 184) // io_issued
+  @intToPtr(stats + 24, u64) = foundation.atomic_load_u64(ctx + 192) // io_completed
+  @intToPtr(stats + 32, u64) = foundation.atomic_load_u64(ctx + 96)  // cq_overflow
+
+  return 0
+}
+
+export fn io_uring_get_sq_pending(ring_id: u32): u32 {
+  if ring_id >= ring_count {
+    return 0
+  }
+
+  var ctx: u64 = io_rings[ring_id]
+  if ctx == 0 {
+    return 0
+  }
+
+  var sq_head: u64 = foundation.atomic_load_u64(ctx + 16)
+  var sq_tail: u64 = foundation.atomic_load_u64(ctx + 24)
+
+  return @truncate(sq_tail - sq_head, u32)
+}
+
+export fn io_uring_get_cq_ready(ring_id: u32): u32 {
+  if ring_id >= ring_count {
+    return 0
+  }
+
+  var ctx: u64 = io_rings[ring_id]
+  if ctx == 0 {
+    return 0
+  }
+
+  var cq_head: u64 = foundation.atomic_load_u64(ctx + 64)
+  var cq_tail: u64 = foundation.atomic_load_u64(ctx + 72)
+
+  return @truncate(cq_tail - cq_head, u32)
+}
+
+// =============================================================================
+// Cleanup
+// =============================================================================
+
+export fn io_uring_destroy(ring_id: u32): i32 {
+  if ring_id >= ring_count {
+    return -9
+  }
+
+  var ctx: u64 = io_rings[ring_id]
+  if ctx == 0 {
+    return -9
+  }
+
+  // Free registered resources
+  io_uring_unregister_files(ring_id)
+  io_uring_unregister_buffers(ring_id)
+
+  // Free pending work
+  var work: u64 = foundation.atomic_load_u64(ctx + 152)
+  while work != 0 {
+    var next: u64 = @intToPtr(work + 8 + @sizeOf(io_uring_sqe) + 16, u64)
+    memory.kfree(work)
+    work = next
+  }
+
+  // Free rings
+  var sq_ring: u64 = @intToPtr(ctx + 40, u64)
+  var sqes: u64 = @intToPtr(ctx + 48, u64)
+  var cq_ring: u64 = @intToPtr(ctx + 88, u64)
+
+  if sq_ring != 0 { memory.kfree(sq_ring) }
+  if sqes != 0 { memory.kfree(sqes) }
+  if cq_ring != 0 { memory.kfree(cq_ring) }
+
+  // Free context
+  memory.kfree(ctx)
+
+  io_rings[ring_id] = 0
+
+  foundation.serial_write_string("[io_uring] Destroyed ring ")
+  foundation.serial_write_hex(@zext(ring_id, u64))
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// =============================================================================
+// Convenience Functions (prep helpers)
+// =============================================================================
+
+export fn io_uring_prep_read(sqe: u64, fd: i32, buf: u64, nbytes: u32, offset: u64) {
+  @intToPtr(sqe, u8) = IORING_OP_READ
+  @intToPtr(sqe + 1, u8) = 0       // flags
+  @intToPtr(sqe + 4, i32) = fd
+  @intToPtr(sqe + 8, u64) = offset
+  @intToPtr(sqe + 16, u64) = buf
+  @intToPtr(sqe + 24, u32) = nbytes
+}
+
+export fn io_uring_prep_write(sqe: u64, fd: i32, buf: u64, nbytes: u32, offset: u64) {
+  @intToPtr(sqe, u8) = IORING_OP_WRITE
+  @intToPtr(sqe + 1, u8) = 0
+  @intToPtr(sqe + 4, i32) = fd
+  @intToPtr(sqe + 8, u64) = offset
+  @intToPtr(sqe + 16, u64) = buf
+  @intToPtr(sqe + 24, u32) = nbytes
+}
+
+export fn io_uring_prep_fsync(sqe: u64, fd: i32, fsync_flags: u32) {
+  @intToPtr(sqe, u8) = IORING_OP_FSYNC
+  @intToPtr(sqe + 4, i32) = fd
+  @intToPtr(sqe + 28, u32) = fsync_flags
+}
+
+export fn io_uring_prep_poll_add(sqe: u64, fd: i32, poll_mask: u32) {
+  @intToPtr(sqe, u8) = IORING_OP_POLL_ADD
+  @intToPtr(sqe + 4, i32) = fd
+  @intToPtr(sqe + 16, u64) = @zext(poll_mask, u64)
+}
+
+export fn io_uring_prep_nop(sqe: u64) {
+  @intToPtr(sqe, u8) = IORING_OP_NOP
+}
+
+export fn io_uring_prep_timeout(sqe: u64, ts: u64, count: u32, flags: u32) {
+  @intToPtr(sqe, u8) = IORING_OP_TIMEOUT
+  @intToPtr(sqe + 16, u64) = ts
+  @intToPtr(sqe + 24, u32) = count
+  @intToPtr(sqe + 28, u32) = flags
+}
+
+export fn io_uring_prep_close(sqe: u64, fd: i32) {
+  @intToPtr(sqe, u8) = IORING_OP_CLOSE
+  @intToPtr(sqe + 4, i32) = fd
+}
+
+export fn io_uring_prep_cancel(sqe: u64, user_data: u64, flags: u32) {
+  @intToPtr(sqe, u8) = IORING_OP_ASYNC_CANCEL
+  @intToPtr(sqe + 16, u64) = user_data
+  @intToPtr(sqe + 28, u32) = flags
+}
+
+export fn io_uring_sqe_set_data(sqe: u64, data: u64) {
+  @intToPtr(sqe + 40, u64) = data
+}
+
+export fn io_uring_sqe_set_flags(sqe: u64, flags: u8) {
+  @intToPtr(sqe + 1, u8) = flags
+}
+
+export fn io_uring_cqe_get_data(cqe: u64): u64 {
+  return @intToPtr(cqe, u64)
+}

@@ -1,0 +1,942 @@
+// home-os Kernel - XDP (eXpress Data Path)
+// High-performance packet processing framework at the driver level
+// Features: BPF hooks, zero-copy, AF_XDP sockets, redirect, metadata
+
+import "../core/foundation.home" as foundation
+import "../mm/memory.home" as memory
+import "../perf/lockfree.home" as lockfree
+
+// =============================================================================
+// XDP Actions
+// =============================================================================
+
+const XDP_ABORTED: u32 = 0    // Error, drop packet
+const XDP_DROP: u32 = 1       // Drop packet silently
+const XDP_PASS: u32 = 2       // Pass to normal network stack
+const XDP_TX: u32 = 3         // Transmit packet out same interface
+const XDP_REDIRECT: u32 = 4   // Redirect to another interface/CPU/socket
+
+// =============================================================================
+// XDP Flags
+// =============================================================================
+
+const XDP_FLAGS_UPDATE_IF_NOEXIST: u32 = 1 << 0
+const XDP_FLAGS_SKB_MODE: u32 = 1 << 1      // Generic XDP (slower)
+const XDP_FLAGS_DRV_MODE: u32 = 1 << 2      // Native driver mode
+const XDP_FLAGS_HW_MODE: u32 = 1 << 3       // Hardware offload
+const XDP_FLAGS_REPLACE: u32 = 1 << 4       // Replace existing program
+
+// =============================================================================
+// XDP Metadata Frame Flags
+// =============================================================================
+
+const XDP_FRAME_FLAG_FLUSH: u32 = 1 << 0
+const XDP_FRAME_FLAG_METADATA: u32 = 1 << 1
+
+// =============================================================================
+// AF_XDP Socket Options
+// =============================================================================
+
+const XDP_MMAP_OFFSETS: u32 = 1
+const XDP_RX_RING: u32 = 2
+const XDP_TX_RING: u32 = 3
+const XDP_UMEM_REG: u32 = 4
+const XDP_UMEM_FILL_RING: u32 = 5
+const XDP_UMEM_COMPLETION_RING: u32 = 6
+const XDP_STATISTICS: u32 = 7
+const XDP_OPTIONS: u32 = 8
+
+// UMEM flags
+const XDP_UMEM_UNALIGNED_CHUNK_FLAG: u32 = 1 << 0
+const XDP_UMEM_USES_NEED_WAKEUP: u32 = 1 << 1
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+// XDP metadata (prepended to packet data)
+struct xdp_md {
+  data: u64,              // Start of packet data
+  data_end: u64,          // End of packet data
+  data_meta: u64,         // Start of metadata (before data)
+  ingress_ifindex: u32,   // Receiving interface index
+  rx_queue_index: u32,    // RX queue index
+  egress_ifindex: u32,    // For redirect: target interface
+  _pad: u32
+}
+
+// XDP frame descriptor
+struct xdp_frame {
+  data: u64,              // Packet data pointer
+  len: u32,               // Packet length
+  headroom: u32,          // Headroom available
+  metasize: u32,          // Metadata size
+  frame_sz: u32,          // Total frame size
+  flags: u32,             // XDP_FRAME_FLAG_*
+  mem_type: u32,          // Memory type
+  mem_id: u32,            // Memory ID (UMEM)
+  dev_rx: u64             // Receiving device pointer
+}
+
+// XDP buffer for AF_XDP
+struct xdp_buff {
+  data: u64,
+  data_end: u64,
+  data_meta: u64,
+  data_hard_start: u64,
+  rxq: u64,               // RX queue info
+  frame_sz: u32,
+  flags: u32
+}
+
+// UMEM (User Memory) region
+struct xdp_umem {
+  addr: u64,              // User-mapped address
+  size: u64,              // Total size
+  chunk_size: u32,        // Size per chunk
+  headroom: u32,          // Headroom per chunk
+  chunk_mask: u64,        // For fast modulo
+  flags: u32,
+  refs: u32,
+  npgs: u32,              // Number of pages
+  _pad: u32
+}
+
+// Ring descriptor (shared between kernel and user)
+struct xdp_ring {
+  producer: u64,          // Producer index
+  consumer: u64,          // Consumer index
+  flags: u32,             // Ring flags
+  mask: u32,              // Ring size - 1
+  entries: u32,           // Number of entries
+  _pad: u32
+}
+
+// AF_XDP socket descriptor entry
+struct xdp_desc {
+  addr: u64,              // Buffer address (offset in UMEM)
+  len: u32,               // Length
+  options: u32            // Per-packet options
+}
+
+// XDP program attachment info
+struct xdp_attach_info {
+  prog_id: u32,           // BPF program ID
+  drv_mode: u32,          // Driver mode (native/generic/hw)
+  ifindex: u32,           // Interface index
+  flags: u32
+}
+
+// XDP statistics
+struct xdp_stats {
+  rx_packets: u64,
+  rx_bytes: u64,
+  rx_dropped: u64,
+  tx_packets: u64,
+  tx_bytes: u64,
+  redirect_packets: u64,
+  redirect_errors: u64,
+  invalid_packets: u64
+}
+
+// XDP redirect map entry
+struct xdp_redirect_entry {
+  ifindex: u32,           // Target interface
+  queue_index: u32,       // Target queue
+  _pad: [u64; 2]
+}
+
+// XDP redirect map (for bpf_redirect_map)
+struct xdp_redirect_map {
+  map_type: u32,          // DEVMAP, CPUMAP, or XSKMAP
+  max_entries: u32,
+  entries: u64,           // Pointer to entry array
+  refs: u32,
+  _pad: u32
+}
+
+// =============================================================================
+// Global State
+// =============================================================================
+
+const MAX_XDP_INTERFACES: u32 = 256
+const MAX_XDP_PROGRAMS: u32 = 256
+const MAX_XDP_SOCKETS: u32 = 1024
+const MAX_REDIRECT_MAPS: u32 = 64
+
+// Per-interface XDP state
+struct xdp_interface {
+  ifindex: u32,
+  prog_id: u32,           // Attached BPF program
+  mode: u32,              // SKB/DRV/HW mode
+  flags: u32,
+  stats: xdp_stats,
+  redirect_cpu: i32,      // CPU for redirect (-1 = any)
+  _pad: u32
+}
+
+var xdp_interfaces: [xdp_interface; 256]
+var xdp_programs: [u64; 256]      // BPF program pointers
+var xdp_sockets: [u64; 1024]      // AF_XDP socket pointers
+var redirect_maps: [u64; 64]      // Redirect map pointers
+
+var xdp_initialized: u32 = 0
+var interface_count: u32 = 0
+var program_count: u32 = 0
+var socket_count: u32 = 0
+var map_count: u32 = 0
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+export fn xdp_init() {
+  if xdp_initialized == 1 {
+    return
+  }
+
+  // Initialize interfaces
+  var i: u32 = 0
+  while i < MAX_XDP_INTERFACES {
+    xdp_interfaces[i].ifindex = 0xFFFFFFFF
+    xdp_interfaces[i].prog_id = 0
+    xdp_interfaces[i].mode = 0
+    xdp_interfaces[i].stats.rx_packets = 0
+    xdp_interfaces[i].stats.rx_bytes = 0
+    xdp_interfaces[i].stats.rx_dropped = 0
+    xdp_interfaces[i].stats.tx_packets = 0
+    xdp_interfaces[i].stats.tx_bytes = 0
+    xdp_interfaces[i].stats.redirect_packets = 0
+    xdp_interfaces[i].stats.redirect_errors = 0
+    xdp_interfaces[i].stats.invalid_packets = 0
+    i = i + 1
+  }
+
+  // Clear arrays
+  i = 0
+  while i < MAX_XDP_PROGRAMS {
+    xdp_programs[i] = 0
+    i = i + 1
+  }
+
+  i = 0
+  while i < MAX_XDP_SOCKETS {
+    xdp_sockets[i] = 0
+    i = i + 1
+  }
+
+  i = 0
+  while i < MAX_REDIRECT_MAPS {
+    redirect_maps[i] = 0
+    i = i + 1
+  }
+
+  xdp_initialized = 1
+  foundation.serial_write_string("[XDP] Subsystem initialized\n")
+}
+
+// =============================================================================
+// Program Management
+// =============================================================================
+
+export fn xdp_attach_prog(ifindex: u32, prog_id: u32, flags: u32): i32 {
+  if xdp_initialized == 0 {
+    xdp_init()
+  }
+
+  if ifindex >= MAX_XDP_INTERFACES {
+    return -22  // EINVAL
+  }
+
+  // Check if interface has existing program
+  if xdp_interfaces[ifindex].prog_id != 0 {
+    if (flags & XDP_FLAGS_UPDATE_IF_NOEXIST) != 0 {
+      return -17  // EEXIST
+    }
+    if (flags & XDP_FLAGS_REPLACE) == 0 {
+      return -16  // EBUSY
+    }
+  }
+
+  // Determine mode
+  var mode: u32 = 0
+  if (flags & XDP_FLAGS_HW_MODE) != 0 {
+    mode = 3  // Hardware offload
+  } else if (flags & XDP_FLAGS_DRV_MODE) != 0 {
+    mode = 2  // Native driver
+  } else if (flags & XDP_FLAGS_SKB_MODE) != 0 {
+    mode = 1  // Generic SKB
+  } else {
+    mode = 2  // Default to native
+  }
+
+  // Attach program
+  xdp_interfaces[ifindex].ifindex = ifindex
+  xdp_interfaces[ifindex].prog_id = prog_id
+  xdp_interfaces[ifindex].mode = mode
+  xdp_interfaces[ifindex].flags = flags
+
+  if ifindex >= interface_count {
+    interface_count = ifindex + 1
+  }
+
+  foundation.serial_write_string("[XDP] Attached program ")
+  foundation.serial_write_hex(@zext(prog_id, u64))
+  foundation.serial_write_string(" to interface ")
+  foundation.serial_write_hex(@zext(ifindex, u64))
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+export fn xdp_detach_prog(ifindex: u32): i32 {
+  if ifindex >= MAX_XDP_INTERFACES {
+    return -22
+  }
+
+  if xdp_interfaces[ifindex].prog_id == 0 {
+    return -2  // ENOENT
+  }
+
+  xdp_interfaces[ifindex].prog_id = 0
+  xdp_interfaces[ifindex].mode = 0
+  xdp_interfaces[ifindex].flags = 0
+
+  foundation.serial_write_string("[XDP] Detached program from interface ")
+  foundation.serial_write_hex(@zext(ifindex, u64))
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+export fn xdp_get_prog_id(ifindex: u32): u32 {
+  if ifindex >= MAX_XDP_INTERFACES {
+    return 0
+  }
+  return xdp_interfaces[ifindex].prog_id
+}
+
+// =============================================================================
+// Packet Processing
+// =============================================================================
+
+// Main XDP processing entry point (called from network driver)
+export fn xdp_run_prog(ifindex: u32, xdp: u64): u32 {
+  if ifindex >= MAX_XDP_INTERFACES {
+    return XDP_PASS
+  }
+
+  var prog_id: u32 = xdp_interfaces[ifindex].prog_id
+  if prog_id == 0 {
+    return XDP_PASS  // No program attached
+  }
+
+  // Update statistics
+  var data: u64 = @intToPtr(xdp, u64)
+  var data_end: u64 = @intToPtr(xdp + 8, u64)
+  var len: u64 = data_end - data
+
+  foundation.atomic_add_u64(@ptrToInt(&xdp_interfaces[ifindex].stats.rx_packets), 1)
+  foundation.atomic_add_u64(@ptrToInt(&xdp_interfaces[ifindex].stats.rx_bytes), len)
+
+  // Set ingress interface
+  @intToPtr(xdp + 24, u32) = ifindex
+
+  // Execute BPF program (simplified - real impl would run BPF bytecode)
+  var action: u32 = xdp_bpf_run(prog_id, xdp)
+
+  // Handle action
+  if action == XDP_DROP {
+    foundation.atomic_add_u64(@ptrToInt(&xdp_interfaces[ifindex].stats.rx_dropped), 1)
+  } else if action == XDP_REDIRECT {
+    var egress_if: u32 = @intToPtr(xdp + 32, u32)
+    if xdp_do_redirect(ifindex, xdp, egress_if) != 0 {
+      foundation.atomic_add_u64(@ptrToInt(&xdp_interfaces[ifindex].stats.redirect_errors), 1)
+      action = XDP_DROP
+    } else {
+      foundation.atomic_add_u64(@ptrToInt(&xdp_interfaces[ifindex].stats.redirect_packets), 1)
+    }
+  } else if action == XDP_TX {
+    foundation.atomic_add_u64(@ptrToInt(&xdp_interfaces[ifindex].stats.tx_packets), 1)
+    foundation.atomic_add_u64(@ptrToInt(&xdp_interfaces[ifindex].stats.tx_bytes), len)
+  } else if action > XDP_REDIRECT {
+    // Invalid action
+    foundation.atomic_add_u64(@ptrToInt(&xdp_interfaces[ifindex].stats.invalid_packets), 1)
+    action = XDP_ABORTED
+  }
+
+  return action
+}
+
+// Simplified BPF program execution
+fn xdp_bpf_run(prog_id: u32, ctx: u64): u32 {
+  if prog_id == 0 || prog_id > program_count {
+    return XDP_PASS
+  }
+
+  var prog: u64 = xdp_programs[prog_id - 1]
+  if prog == 0 {
+    return XDP_PASS
+  }
+
+  // In a real implementation, this would:
+  // 1. Load BPF program bytecode
+  // 2. Execute in eBPF VM or JIT-compiled code
+  // 3. Return the action from r0 register
+
+  // For now, return the default action stored in the program
+  var default_action: u32 = @intToPtr(prog, u32)
+  return default_action
+}
+
+fn xdp_do_redirect(in_ifindex: u32, xdp: u64, out_ifindex: u32): i32 {
+  if out_ifindex >= MAX_XDP_INTERFACES {
+    return -22
+  }
+
+  // Check if target interface exists
+  if xdp_interfaces[out_ifindex].ifindex == 0xFFFFFFFF {
+    return -19  // ENODEV
+  }
+
+  // Perform redirect (would involve actual packet transmission)
+  // For now, just increment statistics
+  foundation.atomic_add_u64(@ptrToInt(&xdp_interfaces[out_ifindex].stats.tx_packets), 1)
+
+  return 0
+}
+
+// =============================================================================
+// XDP Frame Operations
+// =============================================================================
+
+export fn xdp_convert_buff_to_frame(xdp_buff: u64, frame: u64): i32 {
+  // Copy xdp_buff info to xdp_frame
+  @intToPtr(frame, u64) = @intToPtr(xdp_buff, u64)                  // data
+  @intToPtr(frame + 8, u32) = @truncate(
+    @intToPtr(xdp_buff + 8, u64) - @intToPtr(xdp_buff, u64), u32)   // len
+  @intToPtr(frame + 12, u32) = @truncate(
+    @intToPtr(xdp_buff, u64) - @intToPtr(xdp_buff + 24, u64), u32)  // headroom
+
+  var data: u64 = @intToPtr(xdp_buff, u64)
+  var data_meta: u64 = @intToPtr(xdp_buff + 16, u64)
+  if data_meta < data {
+    @intToPtr(frame + 16, u32) = @truncate(data - data_meta, u32)   // metasize
+  } else {
+    @intToPtr(frame + 16, u32) = 0
+  }
+
+  @intToPtr(frame + 20, u32) = @intToPtr(xdp_buff + 32, u32)        // frame_sz
+  @intToPtr(frame + 24, u32) = @intToPtr(xdp_buff + 36, u32)        // flags
+
+  return 0
+}
+
+export fn xdp_adjust_head(xdp: u64, delta: i32): i32 {
+  var data: u64 = @intToPtr(xdp, u64)
+  var data_hard_start: u64 = @intToPtr(xdp + 24, u64)
+  var data_end: u64 = @intToPtr(xdp + 8, u64)
+
+  var new_data: u64 = 0
+  if delta < 0 {
+    new_data = data - @zext(@bitCast(-delta, u32), u64)
+    if new_data < data_hard_start {
+      return -28  // ENOSPC
+    }
+  } else {
+    new_data = data + @zext(@bitCast(delta, u32), u64)
+    if new_data > data_end {
+      return -22  // EINVAL
+    }
+  }
+
+  @intToPtr(xdp, u64) = new_data
+  return 0
+}
+
+export fn xdp_adjust_tail(xdp: u64, delta: i32): i32 {
+  var data_end: u64 = @intToPtr(xdp + 8, u64)
+  var frame_sz: u32 = @intToPtr(xdp + 32, u32)
+  var data_hard_start: u64 = @intToPtr(xdp + 24, u64)
+  var max_end: u64 = data_hard_start + @zext(frame_sz, u64)
+
+  var new_end: u64 = 0
+  if delta < 0 {
+    var data: u64 = @intToPtr(xdp, u64)
+    new_end = data_end - @zext(@bitCast(-delta, u32), u64)
+    if new_end < data {
+      return -22  // EINVAL
+    }
+  } else {
+    new_end = data_end + @zext(@bitCast(delta, u32), u64)
+    if new_end > max_end {
+      return -28  // ENOSPC
+    }
+  }
+
+  @intToPtr(xdp + 8, u64) = new_end
+  return 0
+}
+
+export fn xdp_adjust_meta(xdp: u64, delta: i32): i32 {
+  var data: u64 = @intToPtr(xdp, u64)
+  var data_meta: u64 = @intToPtr(xdp + 16, u64)
+  var data_hard_start: u64 = @intToPtr(xdp + 24, u64)
+
+  var new_meta: u64 = 0
+  if delta < 0 {
+    new_meta = data_meta - @zext(@bitCast(-delta, u32), u64)
+    if new_meta < data_hard_start {
+      return -28  // ENOSPC
+    }
+  } else {
+    new_meta = data_meta + @zext(@bitCast(delta, u32), u64)
+    if new_meta > data {
+      return -22  // EINVAL
+    }
+  }
+
+  @intToPtr(xdp + 16, u64) = new_meta
+  return 0
+}
+
+// =============================================================================
+// AF_XDP Socket Operations
+// =============================================================================
+
+export fn xsk_create(ifindex: u32, queue_id: u32): i32 {
+  if socket_count >= MAX_XDP_SOCKETS {
+    return -12  // ENOMEM
+  }
+
+  // Allocate socket structure
+  var sock_size: u64 = 256  // Socket structure size
+  var sock: u64 = memory.kmalloc(sock_size, 0)
+  if sock == 0 {
+    return -12
+  }
+
+  // Initialize socket
+  @intToPtr(sock, u32) = ifindex
+  @intToPtr(sock + 4, u32) = queue_id
+  @intToPtr(sock + 8, u64) = 0      // umem
+  @intToPtr(sock + 16, u64) = 0     // rx_ring
+  @intToPtr(sock + 24, u64) = 0     // tx_ring
+  @intToPtr(sock + 32, u64) = 0     // fill_ring
+  @intToPtr(sock + 40, u64) = 0     // comp_ring
+  @intToPtr(sock + 48, u32) = 1     // refs
+
+  var sock_id: u32 = socket_count
+  xdp_sockets[sock_id] = sock
+  socket_count = socket_count + 1
+
+  foundation.serial_write_string("[XDP] Created AF_XDP socket ")
+  foundation.serial_write_hex(@zext(sock_id, u64))
+  foundation.serial_write_string(" for interface ")
+  foundation.serial_write_hex(@zext(ifindex, u64))
+  foundation.serial_write_string("\n")
+
+  return @bitCast(sock_id, i32)
+}
+
+export fn xsk_bind(sock_id: u32, ifindex: u32, queue_id: u32, flags: u32): i32 {
+  if sock_id >= socket_count {
+    return -9  // EBADF
+  }
+
+  var sock: u64 = xdp_sockets[sock_id]
+  if sock == 0 {
+    return -9
+  }
+
+  // Update binding
+  @intToPtr(sock, u32) = ifindex
+  @intToPtr(sock + 4, u32) = queue_id
+
+  return 0
+}
+
+export fn xsk_umem_create(addr: u64, size: u64, chunk_size: u32, headroom: u32): i32 {
+  // Validate parameters
+  if chunk_size == 0 || (chunk_size & (chunk_size - 1)) != 0 {
+    return -22  // Must be power of 2
+  }
+
+  if size < @zext(chunk_size, u64) {
+    return -22
+  }
+
+  // Allocate UMEM structure
+  var umem: u64 = memory.kmalloc(@sizeOf(xdp_umem), 0)
+  if umem == 0 {
+    return -12
+  }
+
+  @intToPtr(umem, u64) = addr
+  @intToPtr(umem + 8, u64) = size
+  @intToPtr(umem + 16, u32) = chunk_size
+  @intToPtr(umem + 20, u32) = headroom
+  @intToPtr(umem + 24, u64) = @zext(chunk_size - 1, u64)  // chunk_mask
+  @intToPtr(umem + 32, u32) = 0     // flags
+  @intToPtr(umem + 36, u32) = 1     // refs
+  @intToPtr(umem + 40, u32) = @truncate(size >> 12, u32)  // npgs
+
+  foundation.serial_write_string("[XDP] Created UMEM size=")
+  foundation.serial_write_hex(size)
+  foundation.serial_write_string(" chunk_size=")
+  foundation.serial_write_hex(@zext(chunk_size, u64))
+  foundation.serial_write_string("\n")
+
+  return @bitCast(@truncate(@ptrToInt(umem), u32), i32)
+}
+
+export fn xsk_set_umem(sock_id: u32, umem: u64): i32 {
+  if sock_id >= socket_count {
+    return -9
+  }
+
+  var sock: u64 = xdp_sockets[sock_id]
+  if sock == 0 {
+    return -9
+  }
+
+  @intToPtr(sock + 8, u64) = umem
+  return 0
+}
+
+export fn xsk_setup_rx_ring(sock_id: u32, size: u32): i32 {
+  return xsk_setup_ring(sock_id, 16, size)  // rx_ring offset
+}
+
+export fn xsk_setup_tx_ring(sock_id: u32, size: u32): i32 {
+  return xsk_setup_ring(sock_id, 24, size)  // tx_ring offset
+}
+
+export fn xsk_setup_fill_ring(sock_id: u32, size: u32): i32 {
+  return xsk_setup_ring(sock_id, 32, size)  // fill_ring offset
+}
+
+export fn xsk_setup_comp_ring(sock_id: u32, size: u32): i32 {
+  return xsk_setup_ring(sock_id, 40, size)  // comp_ring offset
+}
+
+fn xsk_setup_ring(sock_id: u32, offset: u32, size: u32): i32 {
+  if sock_id >= socket_count {
+    return -9
+  }
+
+  var sock: u64 = xdp_sockets[sock_id]
+  if sock == 0 {
+    return -9
+  }
+
+  // Size must be power of 2
+  if size == 0 || (size & (size - 1)) != 0 {
+    return -22
+  }
+
+  // Allocate ring (header + entries)
+  var ring_size: u64 = @sizeOf(xdp_ring) + (@zext(size, u64) * @sizeOf(xdp_desc))
+  var ring: u64 = memory.kmalloc(ring_size, 0)
+  if ring == 0 {
+    return -12
+  }
+
+  // Initialize ring
+  @intToPtr(ring, u64) = 0           // producer
+  @intToPtr(ring + 8, u64) = 0       // consumer
+  @intToPtr(ring + 16, u32) = 0      // flags
+  @intToPtr(ring + 20, u32) = size - 1  // mask
+  @intToPtr(ring + 24, u32) = size   // entries
+
+  @intToPtr(sock + @zext(offset, u64), u64) = ring
+
+  return 0
+}
+
+// =============================================================================
+// Ring Operations
+// =============================================================================
+
+export fn xsk_ring_prod_reserve(ring: u64, nb: u32, idx: u64): u32 {
+  var prod: u64 = foundation.atomic_load_u64(ring)
+  var cons: u64 = foundation.atomic_load_u64(ring + 8)
+  var entries: u32 = @intToPtr(ring + 24, u32)
+
+  var free: u64 = @zext(entries, u64) - (prod - cons)
+  if @zext(nb, u64) > free {
+    return 0
+  }
+
+  @intToPtr(idx, u64) = prod
+  return nb
+}
+
+export fn xsk_ring_prod_submit(ring: u64, nb: u32) {
+  foundation.memory_barrier_release()
+  foundation.atomic_add_u64(ring, @zext(nb, u64))
+}
+
+export fn xsk_ring_cons_peek(ring: u64, nb: u32, idx: u64): u32 {
+  var prod: u64 = foundation.atomic_load_u64(ring)
+  var cons: u64 = foundation.atomic_load_u64(ring + 8)
+
+  var avail: u64 = prod - cons
+  if avail == 0 {
+    return 0
+  }
+
+  var count: u32 = if @zext(nb, u64) < avail { nb } else { @truncate(avail, u32) }
+  @intToPtr(idx, u64) = cons
+  foundation.memory_barrier_acquire()
+
+  return count
+}
+
+export fn xsk_ring_cons_release(ring: u64, nb: u32) {
+  foundation.atomic_add_u64(ring + 8, @zext(nb, u64))
+}
+
+export fn xsk_get_desc(ring: u64, idx: u32): u64 {
+  var mask: u32 = @intToPtr(ring + 20, u32)
+  var ring_idx: u32 = idx & mask
+  return ring + @sizeOf(xdp_ring) + (@zext(ring_idx, u64) * @sizeOf(xdp_desc))
+}
+
+// =============================================================================
+// Redirect Maps
+// =============================================================================
+
+export fn xdp_create_devmap(max_entries: u32): i32 {
+  return xdp_create_map(1, max_entries)  // type 1 = DEVMAP
+}
+
+export fn xdp_create_cpumap(max_entries: u32): i32 {
+  return xdp_create_map(2, max_entries)  // type 2 = CPUMAP
+}
+
+export fn xdp_create_xskmap(max_entries: u32): i32 {
+  return xdp_create_map(3, max_entries)  // type 3 = XSKMAP
+}
+
+fn xdp_create_map(map_type: u32, max_entries: u32): i32 {
+  if map_count >= MAX_REDIRECT_MAPS {
+    return -12
+  }
+
+  // Allocate map structure
+  var map: u64 = memory.kmalloc(@sizeOf(xdp_redirect_map), 0)
+  if map == 0 {
+    return -12
+  }
+
+  // Allocate entries
+  var entries_size: u64 = @zext(max_entries, u64) * @sizeOf(xdp_redirect_entry)
+  var entries: u64 = memory.kmalloc(entries_size, 0)
+  if entries == 0 {
+    memory.kfree(map)
+    return -12
+  }
+
+  // Initialize
+  @intToPtr(map, u32) = map_type
+  @intToPtr(map + 4, u32) = max_entries
+  @intToPtr(map + 8, u64) = entries
+  @intToPtr(map + 16, u32) = 1       // refs
+
+  // Clear entries
+  memory.memset(entries, 0xFF, entries_size)
+
+  var map_id: u32 = map_count
+  redirect_maps[map_id] = map
+  map_count = map_count + 1
+
+  foundation.serial_write_string("[XDP] Created redirect map type=")
+  foundation.serial_write_hex(@zext(map_type, u64))
+  foundation.serial_write_string(" entries=")
+  foundation.serial_write_hex(@zext(max_entries, u64))
+  foundation.serial_write_string("\n")
+
+  return @bitCast(map_id, i32)
+}
+
+export fn xdp_map_update(map_id: u32, key: u32, value: u64): i32 {
+  if map_id >= map_count {
+    return -9
+  }
+
+  var map: u64 = redirect_maps[map_id]
+  if map == 0 {
+    return -9
+  }
+
+  var max_entries: u32 = @intToPtr(map + 4, u32)
+  if key >= max_entries {
+    return -34  // ERANGE
+  }
+
+  var entries: u64 = @intToPtr(map + 8, u64)
+  var entry: u64 = entries + (@zext(key, u64) * @sizeOf(xdp_redirect_entry))
+
+  @intToPtr(entry, u32) = @intToPtr(value, u32)         // ifindex
+  @intToPtr(entry + 4, u32) = @intToPtr(value + 4, u32) // queue_index
+
+  return 0
+}
+
+export fn xdp_map_lookup(map_id: u32, key: u32): u64 {
+  if map_id >= map_count {
+    return 0
+  }
+
+  var map: u64 = redirect_maps[map_id]
+  if map == 0 {
+    return 0
+  }
+
+  var max_entries: u32 = @intToPtr(map + 4, u32)
+  if key >= max_entries {
+    return 0
+  }
+
+  var entries: u64 = @intToPtr(map + 8, u64)
+  return entries + (@zext(key, u64) * @sizeOf(xdp_redirect_entry))
+}
+
+export fn xdp_map_delete(map_id: u32, key: u32): i32 {
+  if map_id >= map_count {
+    return -9
+  }
+
+  var map: u64 = redirect_maps[map_id]
+  if map == 0 {
+    return -9
+  }
+
+  var max_entries: u32 = @intToPtr(map + 4, u32)
+  if key >= max_entries {
+    return -34
+  }
+
+  var entries: u64 = @intToPtr(map + 8, u64)
+  var entry: u64 = entries + (@zext(key, u64) * @sizeOf(xdp_redirect_entry))
+
+  @intToPtr(entry, u32) = 0xFFFFFFFF  // Mark as invalid
+
+  return 0
+}
+
+// =============================================================================
+// BPF Helper Functions (for XDP programs)
+// =============================================================================
+
+// bpf_redirect - redirect packet to another interface
+export fn bpf_redirect(ifindex: u32, flags: u64): u64 {
+  // Store redirect target in per-CPU redirect info
+  // Returns XDP_REDIRECT action
+  return XDP_REDIRECT
+}
+
+// bpf_redirect_map - redirect using a map
+export fn bpf_redirect_map(map_id: u32, key: u32, flags: u64): u64 {
+  var entry: u64 = xdp_map_lookup(map_id, key)
+  if entry == 0 {
+    return XDP_ABORTED
+  }
+
+  var ifindex: u32 = @intToPtr(entry, u32)
+  if ifindex == 0xFFFFFFFF {
+    return XDP_ABORTED
+  }
+
+  return bpf_redirect(ifindex, flags)
+}
+
+// bpf_xdp_adjust_head - adjust packet head
+export fn bpf_xdp_adjust_head(xdp: u64, delta: i32): i64 {
+  return @zext(@bitCast(xdp_adjust_head(xdp, delta), u32), i64)
+}
+
+// bpf_xdp_adjust_tail - adjust packet tail
+export fn bpf_xdp_adjust_tail(xdp: u64, delta: i32): i64 {
+  return @zext(@bitCast(xdp_adjust_tail(xdp, delta), u32), i64)
+}
+
+// bpf_xdp_adjust_meta - adjust metadata pointer
+export fn bpf_xdp_adjust_meta(xdp: u64, delta: i32): i64 {
+  return @zext(@bitCast(xdp_adjust_meta(xdp, delta), u32), i64)
+}
+
+// =============================================================================
+// Statistics
+// =============================================================================
+
+export fn xdp_get_stats(ifindex: u32, stats: u64): i32 {
+  if ifindex >= MAX_XDP_INTERFACES {
+    return -22
+  }
+
+  memory.memcpy(stats, @ptrToInt(&xdp_interfaces[ifindex].stats), @sizeOf(xdp_stats))
+  return 0
+}
+
+export fn xdp_reset_stats(ifindex: u32): i32 {
+  if ifindex >= MAX_XDP_INTERFACES {
+    return -22
+  }
+
+  memory.memset(@ptrToInt(&xdp_interfaces[ifindex].stats), 0, @sizeOf(xdp_stats))
+  return 0
+}
+
+// =============================================================================
+// Cleanup
+// =============================================================================
+
+export fn xsk_destroy(sock_id: u32) {
+  if sock_id >= socket_count {
+    return
+  }
+
+  var sock: u64 = xdp_sockets[sock_id]
+  if sock == 0 {
+    return
+  }
+
+  // Free rings
+  var rx_ring: u64 = @intToPtr(sock + 16, u64)
+  var tx_ring: u64 = @intToPtr(sock + 24, u64)
+  var fill_ring: u64 = @intToPtr(sock + 32, u64)
+  var comp_ring: u64 = @intToPtr(sock + 40, u64)
+
+  if rx_ring != 0 { memory.kfree(rx_ring) }
+  if tx_ring != 0 { memory.kfree(tx_ring) }
+  if fill_ring != 0 { memory.kfree(fill_ring) }
+  if comp_ring != 0 { memory.kfree(comp_ring) }
+
+  memory.kfree(sock)
+  xdp_sockets[sock_id] = 0
+
+  foundation.serial_write_string("[XDP] Destroyed socket ")
+  foundation.serial_write_hex(@zext(sock_id, u64))
+  foundation.serial_write_string("\n")
+}
+
+export fn xdp_map_destroy(map_id: u32) {
+  if map_id >= map_count {
+    return
+  }
+
+  var map: u64 = redirect_maps[map_id]
+  if map == 0 {
+    return
+  }
+
+  var entries: u64 = @intToPtr(map + 8, u64)
+  if entries != 0 {
+    memory.kfree(entries)
+  }
+
+  memory.kfree(map)
+  redirect_maps[map_id] = 0
+}

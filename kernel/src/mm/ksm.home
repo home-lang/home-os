@@ -1,0 +1,1052 @@
+// home-os Kernel - KSM (Kernel Samepage Merging)
+// Memory deduplication subsystem for identical page consolidation
+// Features: Stable/unstable trees, COW handling, per-process control
+
+import "../core/foundation.home" as foundation
+import "./memory.home" as memory
+import "./vmm.home" as vmm
+import "../perf/lockfree.home" as lockfree
+
+// =============================================================================
+// KSM Configuration
+// =============================================================================
+
+const KSM_RUN_STOP: u32 = 0       // KSM disabled
+const KSM_RUN_MERGE: u32 = 1      // Merging pages
+const KSM_RUN_UNMERGE: u32 = 2    // Unmerging pages
+
+// Page flags for KSM
+const PAGE_KSM: u32 = 1 << 0           // Page is managed by KSM
+const PAGE_KSM_CANDIDATE: u32 = 1 << 1 // Page is a merge candidate
+const PAGE_KSM_MERGED: u32 = 1 << 2    // Page has been merged
+
+// Default configuration values
+const DEFAULT_SLEEP_MS: u32 = 20            // Sleep between scans
+const DEFAULT_PAGES_TO_SCAN: u32 = 100      // Pages per scan
+const DEFAULT_MAX_PAGE_SHARING: u32 = 256   // Max processes sharing a page
+
+const PAGE_SIZE: u64 = 4096
+const PAGE_SHIFT: u32 = 12
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+// KSM page tracking
+struct ksm_rmap_item {
+  mm: u64,                    // Process mm_struct pointer
+  address: u64,               // Virtual address in process
+  oldchecksum: u32,           // Previous checksum
+  age: u32,                   // Scan age
+  node: ksm_tree_node,        // Tree node linkage
+  next: u64,                  // Next rmap item (linked list)
+  flags: u32,
+  _pad: u32
+}
+
+// Red-black tree node for stable/unstable trees
+struct ksm_tree_node {
+  parent: u64,
+  left: u64,
+  right: u64,
+  color: u32,                 // 0 = red, 1 = black
+  _pad: u32
+}
+
+// Stable page (fully merged, read-only)
+struct stable_node {
+  kpfn: u64,                  // Kernel page frame number
+  rmap_head: u64,             // Head of rmap_item list
+  rmap_count: u32,            // Number of mappings
+  nid: u32,                   // NUMA node ID
+  tree_node: ksm_tree_node,   // Tree linkage
+  checksum: u32,              // Page checksum
+  flags: u32
+}
+
+// Unstable page (candidate for merging)
+struct unstable_node {
+  rmap_item: u64,             // Rmap item pointer
+  tree_node: ksm_tree_node,   // Tree linkage
+  checksum: u32,
+  _pad: u32
+}
+
+// Per-mm KSM tracking
+struct mm_slot {
+  mm: u64,                    // Process mm_struct
+  slot_list: u64,             // Next mm_slot (linked list)
+  rmap_list: u64,             // List of rmap_items for this mm
+  flags: u32,
+  _pad: u32
+}
+
+// KSM scan cursor
+struct ksm_scan {
+  mm_slot: u64,               // Current mm being scanned
+  address: u64,               // Current address being scanned
+  rmap_list: u64,             // Current rmap list position
+  seqnr: u64                  // Sequence number (increments on full scan)
+}
+
+// KSM statistics
+struct ksm_stats {
+  full_scans: u64,            // Number of complete scans
+  pages_scanned: u64,         // Total pages scanned
+  pages_sharing: u64,         // Pages currently being shared
+  pages_shared: u64,          // Unique pages being shared
+  pages_unshared: u64,        // Pages not yet merged
+  pages_volatile: u64,        // Pages changing too fast
+  stable_node_chains: u64,    // Length of stable tree chains
+  stable_node_dups: u64,      // Duplicate stable nodes
+  cow_breaks: u64,            // Copy-on-write breaks
+  merge_across_nodes: u64     // Cross-NUMA merges
+}
+
+// =============================================================================
+// Global State
+// =============================================================================
+
+const MAX_MM_SLOTS: u32 = 4096
+const STABLE_TREE_SIZE: u32 = 65536
+const UNSTABLE_TREE_SIZE: u32 = 65536
+
+var ksm_run: u32 = KSM_RUN_STOP
+var ksm_sleep_ms: u32 = DEFAULT_SLEEP_MS
+var ksm_pages_to_scan: u32 = DEFAULT_PAGES_TO_SCAN
+var ksm_max_page_sharing: u32 = DEFAULT_MAX_PAGE_SHARING
+var ksm_merge_across_nodes: u32 = 1   // Allow cross-NUMA merging
+
+// Trees and lists
+var stable_tree_root: u64 = 0
+var unstable_tree_root: u64 = 0
+var mm_slots_hash: [u64; 256]         // Hash table of mm_slots
+var mm_slot_list_head: u64 = 0        // Linked list of active mm_slots
+
+// Scan state
+var ksm_scan_state: ksm_scan = undefined
+
+// Statistics
+var ksm_stats_data: ksm_stats = undefined
+
+// Initialization flag
+var ksm_initialized: u32 = 0
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+export fn ksm_init() {
+  if ksm_initialized == 1 {
+    return
+  }
+
+  // Initialize hash table
+  var i: u32 = 0
+  while i < 256 {
+    mm_slots_hash[i] = 0
+    i = i + 1
+  }
+
+  // Initialize scan state
+  ksm_scan_state.mm_slot = 0
+  ksm_scan_state.address = 0
+  ksm_scan_state.rmap_list = 0
+  ksm_scan_state.seqnr = 0
+
+  // Initialize statistics
+  ksm_stats_data.full_scans = 0
+  ksm_stats_data.pages_scanned = 0
+  ksm_stats_data.pages_sharing = 0
+  ksm_stats_data.pages_shared = 0
+  ksm_stats_data.pages_unshared = 0
+  ksm_stats_data.pages_volatile = 0
+  ksm_stats_data.stable_node_chains = 0
+  ksm_stats_data.stable_node_dups = 0
+  ksm_stats_data.cow_breaks = 0
+  ksm_stats_data.merge_across_nodes = 0
+
+  // Clear trees
+  stable_tree_root = 0
+  unstable_tree_root = 0
+  mm_slot_list_head = 0
+
+  ksm_initialized = 1
+  foundation.serial_write_string("[KSM] Subsystem initialized\n")
+}
+
+// =============================================================================
+// Control Interface
+// =============================================================================
+
+export fn ksm_enable(run_mode: u32): i32 {
+  if ksm_initialized == 0 {
+    ksm_init()
+  }
+
+  if run_mode > KSM_RUN_UNMERGE {
+    return -22  // EINVAL
+  }
+
+  var old_mode: u32 = ksm_run
+  ksm_run = run_mode
+
+  if run_mode == KSM_RUN_MERGE && old_mode != KSM_RUN_MERGE {
+    foundation.serial_write_string("[KSM] Merging enabled\n")
+  } else if run_mode == KSM_RUN_UNMERGE {
+    // Start unmerging all pages
+    ksm_unmerge_all()
+  } else if run_mode == KSM_RUN_STOP {
+    foundation.serial_write_string("[KSM] Stopped\n")
+  }
+
+  return 0
+}
+
+export fn ksm_set_pages_to_scan(pages: u32): i32 {
+  if pages == 0 {
+    return -22
+  }
+  ksm_pages_to_scan = pages
+  return 0
+}
+
+export fn ksm_set_sleep_ms(ms: u32): i32 {
+  ksm_sleep_ms = ms
+  return 0
+}
+
+export fn ksm_set_max_page_sharing(max: u32): i32 {
+  if max == 0 {
+    return -22
+  }
+  ksm_max_page_sharing = max
+  return 0
+}
+
+export fn ksm_set_merge_across_nodes(enable: u32): i32 {
+  ksm_merge_across_nodes = if enable != 0 { 1 } else { 0 }
+  return 0
+}
+
+// =============================================================================
+// Process Registration
+// =============================================================================
+
+// Register a memory region for KSM scanning
+export fn ksm_madvise_merge(mm: u64, start: u64, end: u64): i32 {
+  if ksm_initialized == 0 {
+    ksm_init()
+  }
+
+  if start >= end || (start & (PAGE_SIZE - 1)) != 0 {
+    return -22
+  }
+
+  // Find or create mm_slot
+  var slot: u64 = find_mm_slot(mm)
+  if slot == 0 {
+    slot = create_mm_slot(mm)
+    if slot == 0 {
+      return -12  // ENOMEM
+    }
+  }
+
+  // Create rmap_items for each page in the range
+  var addr: u64 = start
+  while addr < end {
+    var rmap: u64 = create_rmap_item(mm, addr)
+    if rmap == 0 {
+      // Out of memory, partial success
+      break
+    }
+
+    // Add to mm_slot's rmap list
+    add_rmap_to_slot(slot, rmap)
+
+    addr = addr + PAGE_SIZE
+  }
+
+  return 0
+}
+
+// Unregister a memory region from KSM
+export fn ksm_madvise_unmerge(mm: u64, start: u64, end: u64): i32 {
+  var slot: u64 = find_mm_slot(mm)
+  if slot == 0 {
+    return 0  // Not registered
+  }
+
+  // Unmerge and remove rmap_items in range
+  var addr: u64 = start
+  while addr < end {
+    var rmap: u64 = find_rmap_item(slot, addr)
+    if rmap != 0 {
+      // Unmerge if merged
+      if (@intToPtr(rmap + 48, u32) & PAGE_KSM_MERGED) != 0 {
+        unmerge_rmap_item(rmap)
+      }
+      remove_rmap_from_slot(slot, rmap)
+      free_rmap_item(rmap)
+    }
+    addr = addr + PAGE_SIZE
+  }
+
+  return 0
+}
+
+// =============================================================================
+// MM Slot Management
+// =============================================================================
+
+fn hash_mm(mm: u64): u32 {
+  // Simple hash function
+  var h: u64 = mm >> PAGE_SHIFT
+  h = h ^ (h >> 16)
+  h = h * 0x85ebca6b
+  return @truncate(h & 0xFF, u32)
+}
+
+fn find_mm_slot(mm: u64): u64 {
+  var hash: u32 = hash_mm(mm)
+  var slot: u64 = mm_slots_hash[hash]
+
+  while slot != 0 {
+    if @intToPtr(slot, u64) == mm {
+      return slot
+    }
+    slot = @intToPtr(slot + 8, u64)
+  }
+
+  return 0
+}
+
+fn create_mm_slot(mm: u64): u64 {
+  var slot: u64 = memory.kmalloc(@sizeOf(mm_slot), 0)
+  if slot == 0 {
+    return 0
+  }
+
+  @intToPtr(slot, u64) = mm              // mm
+  @intToPtr(slot + 8, u64) = 0           // slot_list (next)
+  @intToPtr(slot + 16, u64) = 0          // rmap_list
+  @intToPtr(slot + 24, u32) = 0          // flags
+
+  // Add to hash table
+  var hash: u32 = hash_mm(mm)
+  @intToPtr(slot + 8, u64) = mm_slots_hash[hash]
+  mm_slots_hash[hash] = slot
+
+  // Add to global list
+  if mm_slot_list_head != 0 {
+    // Insert at head
+    @intToPtr(slot + 8, u64) = mm_slot_list_head
+  }
+  mm_slot_list_head = slot
+
+  return slot
+}
+
+fn remove_mm_slot(slot: u64) {
+  var mm: u64 = @intToPtr(slot, u64)
+  var hash: u32 = hash_mm(mm)
+
+  // Remove from hash table
+  var prev: u64 = 0
+  var curr: u64 = mm_slots_hash[hash]
+
+  while curr != 0 {
+    if curr == slot {
+      if prev == 0 {
+        mm_slots_hash[hash] = @intToPtr(curr + 8, u64)
+      } else {
+        @intToPtr(prev + 8, u64) = @intToPtr(curr + 8, u64)
+      }
+      break
+    }
+    prev = curr
+    curr = @intToPtr(curr + 8, u64)
+  }
+
+  memory.kfree(slot)
+}
+
+// =============================================================================
+// Rmap Item Management
+// =============================================================================
+
+fn create_rmap_item(mm: u64, address: u64): u64 {
+  var rmap: u64 = memory.kmalloc(@sizeOf(ksm_rmap_item), 0)
+  if rmap == 0 {
+    return 0
+  }
+
+  @intToPtr(rmap, u64) = mm                    // mm
+  @intToPtr(rmap + 8, u64) = address           // address
+  @intToPtr(rmap + 16, u32) = 0                // oldchecksum
+  @intToPtr(rmap + 20, u32) = 0                // age
+  // Clear tree_node
+  @intToPtr(rmap + 24, u64) = 0                // parent
+  @intToPtr(rmap + 32, u64) = 0                // left
+  @intToPtr(rmap + 40, u64) = 0                // right
+  @intToPtr(rmap + 48, u32) = 0                // color
+  @intToPtr(rmap + 56, u64) = 0                // next
+  @intToPtr(rmap + 64, u32) = PAGE_KSM_CANDIDATE  // flags
+
+  return rmap
+}
+
+fn free_rmap_item(rmap: u64) {
+  memory.kfree(rmap)
+}
+
+fn add_rmap_to_slot(slot: u64, rmap: u64) {
+  var head: u64 = @intToPtr(slot + 16, u64)
+  @intToPtr(rmap + 56, u64) = head
+  @intToPtr(slot + 16, u64) = rmap
+}
+
+fn remove_rmap_from_slot(slot: u64, rmap: u64) {
+  var prev: u64 = 0
+  var curr: u64 = @intToPtr(slot + 16, u64)
+
+  while curr != 0 {
+    if curr == rmap {
+      if prev == 0 {
+        @intToPtr(slot + 16, u64) = @intToPtr(curr + 56, u64)
+      } else {
+        @intToPtr(prev + 56, u64) = @intToPtr(curr + 56, u64)
+      }
+      return
+    }
+    prev = curr
+    curr = @intToPtr(curr + 56, u64)
+  }
+}
+
+fn find_rmap_item(slot: u64, address: u64): u64 {
+  var rmap: u64 = @intToPtr(slot + 16, u64)
+
+  while rmap != 0 {
+    if @intToPtr(rmap + 8, u64) == address {
+      return rmap
+    }
+    rmap = @intToPtr(rmap + 56, u64)
+  }
+
+  return 0
+}
+
+// =============================================================================
+// Page Scanning
+// =============================================================================
+
+// Main scanning function (called periodically)
+export fn ksm_scan() {
+  if ksm_run != KSM_RUN_MERGE {
+    return
+  }
+
+  var pages_scanned: u32 = 0
+
+  while pages_scanned < ksm_pages_to_scan {
+    var rmap: u64 = get_next_rmap_item()
+    if rmap == 0 {
+      // End of scan cycle
+      ksm_scan_state.seqnr = ksm_scan_state.seqnr + 1
+      ksm_stats_data.full_scans = ksm_stats_data.full_scans + 1
+
+      // Clear unstable tree for new cycle
+      clear_unstable_tree()
+
+      break
+    }
+
+    // Scan this page
+    scan_rmap_item(rmap)
+    pages_scanned = pages_scanned + 1
+    ksm_stats_data.pages_scanned = ksm_stats_data.pages_scanned + 1
+  }
+}
+
+fn get_next_rmap_item(): u64 {
+  var slot: u64 = ksm_scan_state.mm_slot
+
+  // If no current slot, start from beginning
+  if slot == 0 {
+    slot = mm_slot_list_head
+    if slot == 0 {
+      return 0  // No registered processes
+    }
+    ksm_scan_state.mm_slot = slot
+    ksm_scan_state.rmap_list = @intToPtr(slot + 16, u64)
+  }
+
+  // Get next rmap from current slot
+  var rmap: u64 = ksm_scan_state.rmap_list
+  if rmap != 0 {
+    ksm_scan_state.rmap_list = @intToPtr(rmap + 56, u64)
+    return rmap
+  }
+
+  // Move to next slot
+  slot = @intToPtr(slot + 8, u64)
+  while slot != 0 {
+    ksm_scan_state.mm_slot = slot
+    rmap = @intToPtr(slot + 16, u64)
+    if rmap != 0 {
+      ksm_scan_state.rmap_list = @intToPtr(rmap + 56, u64)
+      return rmap
+    }
+    slot = @intToPtr(slot + 8, u64)
+  }
+
+  // Wrapped around
+  ksm_scan_state.mm_slot = 0
+  ksm_scan_state.rmap_list = 0
+  return 0
+}
+
+fn scan_rmap_item(rmap: u64) {
+  var mm: u64 = @intToPtr(rmap, u64)
+  var address: u64 = @intToPtr(rmap + 8, u64)
+  var flags: u32 = @intToPtr(rmap + 64, u32)
+
+  // Get physical page for this virtual address
+  var page: u64 = get_page_for_address(mm, address)
+  if page == 0 {
+    return  // Page not present
+  }
+
+  // Calculate checksum
+  var checksum: u32 = calc_page_checksum(page)
+  var old_checksum: u32 = @intToPtr(rmap + 16, u32)
+
+  // Check for page changes
+  if (flags & PAGE_KSM_MERGED) != 0 {
+    // Already merged - check if still valid
+    if checksum != old_checksum {
+      // Page was modified - COW occurred
+      ksm_stats_data.cow_breaks = ksm_stats_data.cow_breaks + 1
+      handle_cow_break(rmap)
+    }
+    return
+  }
+
+  // Check if page is stable (content unchanged)
+  if checksum == old_checksum {
+    // Increment age
+    var age: u32 = @intToPtr(rmap + 20, u32)
+    @intToPtr(rmap + 20, u32) = age + 1
+
+    if age >= 2 {
+      // Page is stable enough, try to merge
+      try_to_merge_page(rmap, page, checksum)
+    }
+  } else {
+    // Content changed, reset age
+    @intToPtr(rmap + 16, u32) = checksum
+    @intToPtr(rmap + 20, u32) = 0
+    ksm_stats_data.pages_volatile = ksm_stats_data.pages_volatile + 1
+  }
+}
+
+// =============================================================================
+// Page Merging
+// =============================================================================
+
+fn try_to_merge_page(rmap: u64, page: u64, checksum: u32) {
+  // First, search stable tree for identical page
+  var stable: u64 = stable_tree_search(checksum, page)
+
+  if stable != 0 {
+    // Found identical page in stable tree
+    if try_to_merge_with_stable(rmap, stable) == 0 {
+      // Success!
+      ksm_stats_data.pages_sharing = ksm_stats_data.pages_sharing + 1
+      return
+    }
+  }
+
+  // Search unstable tree for candidate
+  var unstable: u64 = unstable_tree_search(checksum, page)
+
+  if unstable != 0 {
+    // Found matching candidate
+    var other_rmap: u64 = @intToPtr(unstable, u64)
+
+    // Try to merge both pages
+    if try_to_merge_two_pages(rmap, other_rmap) == 0 {
+      // Success - create stable node
+      var new_stable: u64 = create_stable_node(page, checksum)
+      if new_stable != 0 {
+        add_to_stable_node(new_stable, rmap)
+        add_to_stable_node(new_stable, other_rmap)
+        stable_tree_insert(new_stable)
+
+        // Remove from unstable tree
+        unstable_tree_remove(unstable)
+        memory.kfree(unstable)
+
+        ksm_stats_data.pages_shared = ksm_stats_data.pages_shared + 1
+        ksm_stats_data.pages_sharing = ksm_stats_data.pages_sharing + 2
+      }
+      return
+    }
+  }
+
+  // No match found - add to unstable tree
+  var node: u64 = memory.kmalloc(@sizeOf(unstable_node), 0)
+  if node != 0 {
+    @intToPtr(node, u64) = rmap
+    @intToPtr(node + 8, u64) = 0    // parent
+    @intToPtr(node + 16, u64) = 0   // left
+    @intToPtr(node + 24, u64) = 0   // right
+    @intToPtr(node + 32, u32) = 0   // color (red)
+    @intToPtr(node + 40, u32) = checksum
+
+    unstable_tree_insert(node)
+    ksm_stats_data.pages_unshared = ksm_stats_data.pages_unshared + 1
+  }
+}
+
+fn try_to_merge_with_stable(rmap: u64, stable: u64): i32 {
+  var rmap_count: u32 = @intToPtr(stable + 16, u32)
+
+  // Check if we've hit the sharing limit
+  if rmap_count >= ksm_max_page_sharing {
+    return -28  // ENOSPC
+  }
+
+  var mm: u64 = @intToPtr(rmap, u64)
+  var address: u64 = @intToPtr(rmap + 8, u64)
+  var stable_page: u64 = @intToPtr(stable, u64) << PAGE_SHIFT
+
+  // Remap virtual address to stable page (COW)
+  if remap_page_to_ksm(mm, address, stable_page) != 0 {
+    return -1
+  }
+
+  // Add to stable node's rmap list
+  add_to_stable_node(stable, rmap)
+
+  // Mark rmap as merged
+  @intToPtr(rmap + 64, u32) = @intToPtr(rmap + 64, u32) | PAGE_KSM_MERGED
+
+  return 0
+}
+
+fn try_to_merge_two_pages(rmap1: u64, rmap2: u64): i32 {
+  var mm1: u64 = @intToPtr(rmap1, u64)
+  var addr1: u64 = @intToPtr(rmap1 + 8, u64)
+  var mm2: u64 = @intToPtr(rmap2, u64)
+  var addr2: u64 = @intToPtr(rmap2 + 8, u64)
+
+  var page1: u64 = get_page_for_address(mm1, addr1)
+  var page2: u64 = get_page_for_address(mm2, addr2)
+
+  if page1 == 0 || page2 == 0 {
+    return -1
+  }
+
+  // Final verification that pages are identical
+  if !pages_identical(page1, page2) {
+    return -1
+  }
+
+  return 0
+}
+
+fn add_to_stable_node(stable: u64, rmap: u64) {
+  // Add rmap to stable node's list
+  var head: u64 = @intToPtr(stable + 8, u64)
+  @intToPtr(rmap + 56, u64) = head
+  @intToPtr(stable + 8, u64) = rmap
+
+  // Increment count
+  var count: u32 = @intToPtr(stable + 16, u32)
+  @intToPtr(stable + 16, u32) = count + 1
+}
+
+fn create_stable_node(page: u64, checksum: u32): u64 {
+  var node: u64 = memory.kmalloc(@sizeOf(stable_node), 0)
+  if node == 0 {
+    return 0
+  }
+
+  @intToPtr(node, u64) = page >> PAGE_SHIFT    // kpfn
+  @intToPtr(node + 8, u64) = 0                  // rmap_head
+  @intToPtr(node + 16, u32) = 0                 // rmap_count
+  @intToPtr(node + 20, u32) = 0                 // nid
+  // Clear tree_node
+  @intToPtr(node + 24, u64) = 0                 // parent
+  @intToPtr(node + 32, u64) = 0                 // left
+  @intToPtr(node + 40, u64) = 0                 // right
+  @intToPtr(node + 48, u32) = 0                 // color
+  @intToPtr(node + 56, u32) = checksum          // checksum
+  @intToPtr(node + 60, u32) = 0                 // flags
+
+  return node
+}
+
+// =============================================================================
+// Tree Operations (Red-Black Tree)
+// =============================================================================
+
+fn stable_tree_search(checksum: u32, page: u64): u64 {
+  var node: u64 = stable_tree_root
+
+  while node != 0 {
+    var node_checksum: u32 = @intToPtr(node + 56, u32)
+
+    if checksum < node_checksum {
+      node = @intToPtr(node + 32, u64)  // left
+    } else if checksum > node_checksum {
+      node = @intToPtr(node + 40, u64)  // right
+    } else {
+      // Checksum matches - verify page content
+      var kpfn: u64 = @intToPtr(node, u64)
+      var stable_page: u64 = kpfn << PAGE_SHIFT
+
+      if pages_identical(page, stable_page) {
+        return node
+      }
+
+      // Hash collision - search right subtree
+      node = @intToPtr(node + 40, u64)
+    }
+  }
+
+  return 0
+}
+
+fn stable_tree_insert(node: u64) {
+  var checksum: u32 = @intToPtr(node + 56, u32)
+
+  if stable_tree_root == 0 {
+    stable_tree_root = node
+    @intToPtr(node + 48, u32) = 1  // Black
+    return
+  }
+
+  // BST insert
+  var parent: u64 = 0
+  var curr: u64 = stable_tree_root
+
+  while curr != 0 {
+    parent = curr
+    var curr_checksum: u32 = @intToPtr(curr + 56, u32)
+
+    if checksum < curr_checksum {
+      curr = @intToPtr(curr + 32, u64)  // left
+    } else {
+      curr = @intToPtr(curr + 40, u64)  // right
+    }
+  }
+
+  @intToPtr(node + 24, u64) = parent  // parent
+  @intToPtr(node + 48, u32) = 0       // Red
+
+  var parent_checksum: u32 = @intToPtr(parent + 56, u32)
+  if checksum < parent_checksum {
+    @intToPtr(parent + 32, u64) = node
+  } else {
+    @intToPtr(parent + 40, u64) = node
+  }
+
+  // Fix RB tree violations
+  rb_insert_fixup_stable(node)
+}
+
+fn rb_insert_fixup_stable(node: u64) {
+  // Simplified RB fixup - just ensure root is black
+  @intToPtr(stable_tree_root + 48, u32) = 1
+}
+
+fn unstable_tree_search(checksum: u32, page: u64): u64 {
+  var node: u64 = unstable_tree_root
+
+  while node != 0 {
+    var node_checksum: u32 = @intToPtr(node + 40, u32)
+
+    if checksum < node_checksum {
+      node = @intToPtr(node + 16, u64)  // left
+    } else if checksum > node_checksum {
+      node = @intToPtr(node + 24, u64)  // right
+    } else {
+      // Checksum matches - verify page content
+      var rmap: u64 = @intToPtr(node, u64)
+      var mm: u64 = @intToPtr(rmap, u64)
+      var address: u64 = @intToPtr(rmap + 8, u64)
+      var other_page: u64 = get_page_for_address(mm, address)
+
+      if other_page != 0 && pages_identical(page, other_page) {
+        return node
+      }
+
+      node = @intToPtr(node + 24, u64)  // right
+    }
+  }
+
+  return 0
+}
+
+fn unstable_tree_insert(node: u64) {
+  var checksum: u32 = @intToPtr(node + 40, u32)
+
+  if unstable_tree_root == 0 {
+    unstable_tree_root = node
+    @intToPtr(node + 32, u32) = 1  // Black
+    return
+  }
+
+  // BST insert
+  var parent: u64 = 0
+  var curr: u64 = unstable_tree_root
+
+  while curr != 0 {
+    parent = curr
+    var curr_checksum: u32 = @intToPtr(curr + 40, u32)
+
+    if checksum < curr_checksum {
+      curr = @intToPtr(curr + 16, u64)
+    } else {
+      curr = @intToPtr(curr + 24, u64)
+    }
+  }
+
+  @intToPtr(node + 8, u64) = parent
+  @intToPtr(node + 32, u32) = 0  // Red
+
+  var parent_checksum: u32 = @intToPtr(parent + 40, u32)
+  if checksum < parent_checksum {
+    @intToPtr(parent + 16, u64) = node
+  } else {
+    @intToPtr(parent + 24, u64) = node
+  }
+}
+
+fn unstable_tree_remove(node: u64) {
+  // Simple removal - just unlink
+  var parent: u64 = @intToPtr(node + 8, u64)
+  var left: u64 = @intToPtr(node + 16, u64)
+  var right: u64 = @intToPtr(node + 24, u64)
+
+  var replacement: u64 = 0
+  if left != 0 {
+    replacement = left
+    if right != 0 {
+      // Find rightmost in left subtree
+      var rm: u64 = left
+      while @intToPtr(rm + 24, u64) != 0 {
+        rm = @intToPtr(rm + 24, u64)
+      }
+      @intToPtr(rm + 24, u64) = right
+      @intToPtr(right + 8, u64) = rm
+    }
+  } else {
+    replacement = right
+  }
+
+  if parent == 0 {
+    unstable_tree_root = replacement
+  } else if @intToPtr(parent + 16, u64) == node {
+    @intToPtr(parent + 16, u64) = replacement
+  } else {
+    @intToPtr(parent + 24, u64) = replacement
+  }
+
+  if replacement != 0 {
+    @intToPtr(replacement + 8, u64) = parent
+  }
+}
+
+fn clear_unstable_tree() {
+  // Free all nodes in unstable tree
+  clear_unstable_subtree(unstable_tree_root)
+  unstable_tree_root = 0
+}
+
+fn clear_unstable_subtree(node: u64) {
+  if node == 0 {
+    return
+  }
+
+  clear_unstable_subtree(@intToPtr(node + 16, u64))  // left
+  clear_unstable_subtree(@intToPtr(node + 24, u64))  // right
+
+  memory.kfree(node)
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+fn get_page_for_address(mm: u64, address: u64): u64 {
+  // Translate virtual address to physical page
+  // This would interact with the page table implementation
+  return vmm.virt_to_phys(mm, address) & ~(PAGE_SIZE - 1)
+}
+
+fn calc_page_checksum(page: u64): u32 {
+  // Calculate checksum of page content
+  // Using simple addition with rotation
+  var checksum: u32 = 0
+  var ptr: u64 = page
+  var end: u64 = page + PAGE_SIZE
+
+  while ptr < end {
+    var val: u32 = @intToPtr(ptr, u32)
+    checksum = checksum + val
+    checksum = (checksum << 7) | (checksum >> 25)
+    ptr = ptr + 4
+  }
+
+  return checksum
+}
+
+fn pages_identical(page1: u64, page2: u64): bool {
+  // Compare two pages byte by byte
+  return memory.memcmp(page1, page2, PAGE_SIZE) == 0
+}
+
+fn remap_page_to_ksm(mm: u64, address: u64, ksm_page: u64): i32 {
+  // Update page table entry to point to KSM page with COW
+  return vmm.remap_page_read_only(mm, address, ksm_page)
+}
+
+// =============================================================================
+// Unmerging
+// =============================================================================
+
+fn unmerge_rmap_item(rmap: u64) {
+  var mm: u64 = @intToPtr(rmap, u64)
+  var address: u64 = @intToPtr(rmap + 8, u64)
+
+  // Allocate new page
+  var new_page: u64 = memory.alloc_page()
+  if new_page == 0 {
+    return
+  }
+
+  // Copy content from KSM page
+  var old_page: u64 = get_page_for_address(mm, address)
+  if old_page != 0 {
+    memory.memcpy(new_page, old_page, PAGE_SIZE)
+  }
+
+  // Remap to new page
+  vmm.remap_page(mm, address, new_page)
+
+  // Clear merged flag
+  @intToPtr(rmap + 64, u32) = @intToPtr(rmap + 64, u32) & ~PAGE_KSM_MERGED
+
+  ksm_stats_data.pages_sharing = ksm_stats_data.pages_sharing - 1
+}
+
+fn handle_cow_break(rmap: u64) {
+  // A COW break occurred - the page was written to
+  // The kernel already created a copy, just update our tracking
+
+  @intToPtr(rmap + 64, u32) = @intToPtr(rmap + 64, u32) & ~PAGE_KSM_MERGED
+  @intToPtr(rmap + 20, u32) = 0  // Reset age
+
+  ksm_stats_data.pages_sharing = ksm_stats_data.pages_sharing - 1
+}
+
+fn ksm_unmerge_all() {
+  foundation.serial_write_string("[KSM] Unmerging all pages...\n")
+
+  var slot: u64 = mm_slot_list_head
+
+  while slot != 0 {
+    var rmap: u64 = @intToPtr(slot + 16, u64)
+
+    while rmap != 0 {
+      var flags: u32 = @intToPtr(rmap + 64, u32)
+      if (flags & PAGE_KSM_MERGED) != 0 {
+        unmerge_rmap_item(rmap)
+      }
+      rmap = @intToPtr(rmap + 56, u64)
+    }
+
+    slot = @intToPtr(slot + 8, u64)
+  }
+
+  // Clear stable tree
+  clear_stable_tree()
+
+  ksm_stats_data.pages_shared = 0
+  ksm_stats_data.pages_sharing = 0
+
+  foundation.serial_write_string("[KSM] Unmerge complete\n")
+}
+
+fn clear_stable_tree() {
+  clear_stable_subtree(stable_tree_root)
+  stable_tree_root = 0
+}
+
+fn clear_stable_subtree(node: u64) {
+  if node == 0 {
+    return
+  }
+
+  clear_stable_subtree(@intToPtr(node + 32, u64))  // left
+  clear_stable_subtree(@intToPtr(node + 40, u64))  // right
+
+  // Free the stable page if no longer needed
+  var kpfn: u64 = @intToPtr(node, u64)
+  // Note: Don't free page here as it may still be mapped
+
+  memory.kfree(node)
+}
+
+// =============================================================================
+// Statistics
+// =============================================================================
+
+export fn ksm_get_stats(stats: u64): i32 {
+  memory.memcpy(stats, @ptrToInt(&ksm_stats_data), @sizeOf(ksm_stats))
+  return 0
+}
+
+export fn ksm_get_pages_sharing(): u64 {
+  return ksm_stats_data.pages_sharing
+}
+
+export fn ksm_get_pages_shared(): u64 {
+  return ksm_stats_data.pages_shared
+}
+
+export fn ksm_get_full_scans(): u64 {
+  return ksm_stats_data.full_scans
+}
+
+export fn ksm_get_pages_scanned(): u64 {
+  return ksm_stats_data.pages_scanned
+}
+
+// =============================================================================
+// Sysfs-like Interface
+// =============================================================================
+
+export fn ksm_read_run(): u32 {
+  return ksm_run
+}
+
+export fn ksm_read_sleep_ms(): u32 {
+  return ksm_sleep_ms
+}
+
+export fn ksm_read_pages_to_scan(): u32 {
+  return ksm_pages_to_scan
+}
+
+export fn ksm_read_max_page_sharing(): u32 {
+  return ksm_max_page_sharing
+}
+
+export fn ksm_read_merge_across_nodes(): u32 {
+  return ksm_merge_across_nodes
+}

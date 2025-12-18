@@ -1,11 +1,953 @@
 // home-os Kernel - Lock-Free Data Structures
-// Lock-free queue, stack, and hash table implementations
+// High-performance concurrent data structures without traditional locking
+// Implements: Treiber Stack, Michael-Scott Queue, SPSC/MPMC Ring Buffers,
+// Skip List, Hazard Pointers, Epoch-Based Reclamation, Wait-Free Counter
 
 import "../core/foundation.home" as foundation
+import "../mm/memory.home" as memory
 
-// Lock-free queue
+// =============================================================================
+// Constants and Configuration
+// =============================================================================
+
 const QUEUE_SIZE: u32 = 1024
+const STACK_SIZE: u32 = 1024
+const HASH_TABLE_SIZE: u32 = 256
+const MAX_HAZARD_POINTERS: u32 = 128
+const MAX_SKIP_LEVEL: u32 = 32
+const CACHE_LINE_SIZE: u32 = 64
+const NUM_EPOCHS: u32 = 3
 
+// Memory ordering constants
+const MEMORY_ORDER_RELAXED: u32 = 0
+const MEMORY_ORDER_ACQUIRE: u32 = 1
+const MEMORY_ORDER_RELEASE: u32 = 2
+const MEMORY_ORDER_ACQ_REL: u32 = 3
+const MEMORY_ORDER_SEQ_CST: u32 = 4
+
+// =============================================================================
+// Treiber Lock-Free Stack
+// =============================================================================
+// Classic lock-free stack using compare-and-swap for thread-safe push/pop
+
+struct TreiberStackNode {
+  data: u64,
+  next: u64,      // Pointer to next node
+  version: u64    // ABA counter
+}
+
+struct TreiberStack {
+  head: u64,        // Pointer to top node (with ABA counter embedded)
+  size: u64,        // Approximate size (relaxed)
+  _pad: [u8; 48]    // Padding to cache line
+}
+
+export fn treiber_stack_init(stack: u64) {
+  // Initialize head to null with version 0
+  foundation.atomic_store_u64(stack, 0)
+  foundation.atomic_store_u64(stack + 8, 0)
+}
+
+export fn treiber_stack_push(stack: u64, node: u64): u32 {
+  // Load current head
+  var current_head: u64 = foundation.atomic_load_u64(stack)
+
+  loop {
+    // Set node's next to current head
+    @intToPtr(node + 8, u64) = current_head
+
+    // Try to CAS head to point to new node
+    // Use 128-bit CAS with version counter to prevent ABA
+    var version: u64 = foundation.atomic_load_u64(stack + 8)
+    var new_version: u64 = version + 1
+
+    if foundation.atomic_cas_u64(stack, current_head, node) == 1 {
+      // Success - increment version and size
+      foundation.atomic_store_u64(stack + 8, new_version)
+      foundation.atomic_add_u64(stack + 16, 1)
+      return 1
+    }
+
+    // CAS failed, reload head and retry
+    current_head = foundation.atomic_load_u64(stack)
+    foundation.cpu_pause()
+  }
+}
+
+export fn treiber_stack_pop(stack: u64): u64 {
+  loop {
+    var head: u64 = foundation.atomic_load_u64(stack)
+
+    if head == 0 {
+      return 0  // Stack empty
+    }
+
+    var next: u64 = @intToPtr(head + 8, u64)
+    var version: u64 = foundation.atomic_load_u64(stack + 8)
+
+    // Try to CAS head to next node
+    if foundation.atomic_cas_u64(stack, head, next) == 1 {
+      foundation.atomic_store_u64(stack + 8, version + 1)
+      foundation.atomic_sub_u64(stack + 16, 1)
+      // Clear next pointer for safety
+      @intToPtr(head + 8, u64) = 0
+      return head
+    }
+
+    foundation.cpu_pause()
+  }
+}
+
+export fn treiber_stack_is_empty(stack: u64): u32 {
+  return if foundation.atomic_load_u64(stack) == 0 { 1 } else { 0 }
+}
+
+export fn treiber_stack_size(stack: u64): u64 {
+  return foundation.atomic_load_u64(stack + 16)
+}
+
+// =============================================================================
+// Michael-Scott Lock-Free Queue (MPMC)
+// =============================================================================
+// FIFO queue with separate head and tail pointers
+
+struct MSQueueNode {
+  data: u64,
+  next: u64,      // Atomic pointer to next node
+  _pad: [u8; 48]  // Cache line padding
+}
+
+struct MSQueue {
+  head: u64,        // Pointer to sentinel/first node
+  _pad1: [u8; 56],  // Cache line separation
+  tail: u64,        // Pointer to last node
+  _pad2: [u8; 56],  // Cache line separation
+  size: u64,
+  sentinel: u64     // Sentinel node pointer
+}
+
+export fn msqueue_init(queue: u64, sentinel_node: u64) {
+  // Initialize sentinel node
+  @intToPtr(sentinel_node, u64) = 0        // data (unused)
+  @intToPtr(sentinel_node + 8, u64) = 0    // next = null
+
+  // Both head and tail point to sentinel
+  foundation.atomic_store_u64(queue, sentinel_node)          // head
+  foundation.atomic_store_u64(queue + 64, sentinel_node)     // tail
+  foundation.atomic_store_u64(queue + 128, 0)                // size
+  @intToPtr(queue + 136, u64) = sentinel_node                // sentinel ref
+}
+
+export fn msqueue_enqueue(queue: u64, node: u64, data: u64) {
+  // Initialize node
+  @intToPtr(node, u64) = data
+  foundation.atomic_store_u64(node + 8, 0)  // next = null
+
+  loop {
+    var tail: u64 = foundation.atomic_load_u64(queue + 64)
+    var next: u64 = foundation.atomic_load_u64(tail + 8)
+
+    // Check if tail is still valid
+    if tail == foundation.atomic_load_u64(queue + 64) {
+      if next == 0 {
+        // Tail is at end, try to link new node
+        if foundation.atomic_cas_u64(tail + 8, 0, node) == 1 {
+          // Success - try to advance tail (okay if fails)
+          foundation.atomic_cas_u64(queue + 64, tail, node)
+          foundation.atomic_add_u64(queue + 128, 1)
+          return
+        }
+      } else {
+        // Tail is lagging, try to advance it
+        foundation.atomic_cas_u64(queue + 64, tail, next)
+      }
+    }
+
+    foundation.cpu_pause()
+  }
+}
+
+export fn msqueue_dequeue(queue: u64): u64 {
+  loop {
+    var head: u64 = foundation.atomic_load_u64(queue)
+    var tail: u64 = foundation.atomic_load_u64(queue + 64)
+    var next: u64 = foundation.atomic_load_u64(head + 8)
+
+    // Check consistency
+    if head == foundation.atomic_load_u64(queue) {
+      if head == tail {
+        if next == 0 {
+          return 0  // Queue empty
+        }
+        // Tail lagging, advance it
+        foundation.atomic_cas_u64(queue + 64, tail, next)
+      } else {
+        if next != 0 {
+          // Read data before CAS
+          var data: u64 = @intToPtr(next, u64)
+
+          // Try to advance head
+          if foundation.atomic_cas_u64(queue, head, next) == 1 {
+            foundation.atomic_sub_u64(queue + 128, 1)
+            // Return the data, not the node
+            return data
+          }
+        }
+      }
+    }
+
+    foundation.cpu_pause()
+  }
+}
+
+export fn msqueue_is_empty(queue: u64): u32 {
+  var head: u64 = foundation.atomic_load_u64(queue)
+  var tail: u64 = foundation.atomic_load_u64(queue + 64)
+  var next: u64 = foundation.atomic_load_u64(head + 8)
+  return if head == tail && next == 0 { 1 } else { 0 }
+}
+
+// =============================================================================
+// SPSC Ring Buffer (Single Producer Single Consumer)
+// =============================================================================
+// Optimized for exactly one producer and one consumer
+
+struct SPSCRingBuffer {
+  buffer: u64,              // Pointer to data array
+  capacity: u32,            // Buffer capacity
+  mask: u32,                // capacity - 1 (for fast modulo)
+  _pad1: [u8; 52],          // Cache line padding
+  head: u64,                // Producer index
+  _pad2: [u8; 56],          // Cache line padding
+  tail: u64                 // Consumer index
+}
+
+export fn spsc_init(rb: u64, buffer: u64, capacity: u32) {
+  @intToPtr(rb, u64) = buffer
+  @intToPtr(rb + 8, u32) = capacity
+  @intToPtr(rb + 12, u32) = capacity - 1  // mask (assumes power of 2)
+  foundation.atomic_store_u64(rb + 64, 0)   // head
+  foundation.atomic_store_u64(rb + 128, 0)  // tail
+}
+
+export fn spsc_push(rb: u64, item: u64): u32 {
+  var head: u64 = foundation.atomic_load_u64(rb + 64)
+  var mask: u32 = @intToPtr(rb + 12, u32)
+  var next_head: u64 = (head + 1) & @zext(mask, u64)
+
+  // Check if full (next_head would equal tail)
+  if next_head == foundation.atomic_load_u64(rb + 128) {
+    return 0  // Full
+  }
+
+  // Write data
+  var buffer: u64 = @intToPtr(rb, u64)
+  var index: u64 = head & @zext(mask, u64)
+  @intToPtr(buffer + (index * 8), u64) = item
+
+  // Release store to make data visible to consumer
+  foundation.memory_barrier_release()
+  foundation.atomic_store_u64(rb + 64, next_head)
+
+  return 1
+}
+
+export fn spsc_pop(rb: u64): u64 {
+  var tail: u64 = foundation.atomic_load_u64(rb + 128)
+
+  // Check if empty (tail equals head)
+  var head: u64 = foundation.atomic_load_u64(rb + 64)
+  if tail == head {
+    return 0xFFFFFFFFFFFFFFFF  // Empty (use sentinel value)
+  }
+
+  // Acquire barrier to see producer's writes
+  foundation.memory_barrier_acquire()
+
+  // Read data
+  var buffer: u64 = @intToPtr(rb, u64)
+  var mask: u32 = @intToPtr(rb + 12, u32)
+  var index: u64 = tail & @zext(mask, u64)
+  var item: u64 = @intToPtr(buffer + (index * 8), u64)
+
+  // Advance tail
+  foundation.atomic_store_u64(rb + 128, (tail + 1) & @zext(mask, u64))
+
+  return item
+}
+
+export fn spsc_size(rb: u64): u64 {
+  var head: u64 = foundation.atomic_load_u64(rb + 64)
+  var tail: u64 = foundation.atomic_load_u64(rb + 128)
+  var mask: u32 = @intToPtr(rb + 12, u32)
+  return (head - tail) & @zext(mask, u64)
+}
+
+// =============================================================================
+// MPMC Ring Buffer (Multi Producer Multi Consumer)
+// =============================================================================
+// Thread-safe ring buffer for multiple producers and consumers
+
+const SLOT_EMPTY: u32 = 0
+const SLOT_WRITING: u32 = 1
+const SLOT_FULL: u32 = 2
+const SLOT_READING: u32 = 3
+
+struct MPMCSlot {
+  data: u64,
+  state: u32,
+  _pad: u32
+}
+
+struct MPMCRingBuffer {
+  buffer: u64,              // Pointer to slot array
+  capacity: u32,
+  mask: u32,
+  _pad1: [u8; 48],
+  head: u64,                // Producer position
+  _pad2: [u8; 56],
+  tail: u64                 // Consumer position
+}
+
+export fn mpmc_init(rb: u64, buffer: u64, capacity: u32) {
+  @intToPtr(rb, u64) = buffer
+  @intToPtr(rb + 8, u32) = capacity
+  @intToPtr(rb + 12, u32) = capacity - 1
+  foundation.atomic_store_u64(rb + 64, 0)
+  foundation.atomic_store_u64(rb + 128, 0)
+
+  // Initialize all slots as empty
+  var i: u32 = 0
+  while i < capacity {
+    var slot: u64 = buffer + (@zext(i, u64) * 16)
+    @intToPtr(slot + 8, u32) = SLOT_EMPTY
+    i = i + 1
+  }
+}
+
+export fn mpmc_push(rb: u64, item: u64): u32 {
+  var mask: u32 = @intToPtr(rb + 12, u32)
+  var capacity: u32 = @intToPtr(rb + 8, u32)
+  var buffer: u64 = @intToPtr(rb, u64)
+
+  loop {
+    var head: u64 = foundation.atomic_load_u64(rb + 64)
+    var index: u64 = head & @zext(mask, u64)
+    var slot: u64 = buffer + (index * 16)
+    var state: u32 = foundation.atomic_load_u32(slot + 8)
+
+    if state == SLOT_EMPTY {
+      // Try to claim slot for writing
+      if foundation.atomic_cas_u32(slot + 8, SLOT_EMPTY, SLOT_WRITING) == 1 {
+        // Try to advance head
+        if foundation.atomic_cas_u64(rb + 64, head, head + 1) == 1 {
+          // Write data and mark full
+          @intToPtr(slot, u64) = item
+          foundation.memory_barrier_release()
+          foundation.atomic_store_u32(slot + 8, SLOT_FULL)
+          return 1
+        } else {
+          // Another producer advanced, release slot
+          foundation.atomic_store_u32(slot + 8, SLOT_EMPTY)
+        }
+      }
+    } else if state == SLOT_FULL {
+      // Check if buffer is full
+      var tail: u64 = foundation.atomic_load_u64(rb + 128)
+      if head - tail >= @zext(capacity, u64) {
+        return 0  // Full
+      }
+    }
+
+    foundation.cpu_pause()
+  }
+}
+
+export fn mpmc_pop(rb: u64): u64 {
+  var mask: u32 = @intToPtr(rb + 12, u32)
+  var buffer: u64 = @intToPtr(rb, u64)
+
+  loop {
+    var tail: u64 = foundation.atomic_load_u64(rb + 128)
+    var head: u64 = foundation.atomic_load_u64(rb + 64)
+
+    if tail >= head {
+      return 0xFFFFFFFFFFFFFFFF  // Empty
+    }
+
+    var index: u64 = tail & @zext(mask, u64)
+    var slot: u64 = buffer + (index * 16)
+    var state: u32 = foundation.atomic_load_u32(slot + 8)
+
+    if state == SLOT_FULL {
+      // Try to claim slot for reading
+      if foundation.atomic_cas_u32(slot + 8, SLOT_FULL, SLOT_READING) == 1 {
+        // Try to advance tail
+        if foundation.atomic_cas_u64(rb + 128, tail, tail + 1) == 1 {
+          // Read data and mark empty
+          foundation.memory_barrier_acquire()
+          var item: u64 = @intToPtr(slot, u64)
+          foundation.atomic_store_u32(slot + 8, SLOT_EMPTY)
+          return item
+        } else {
+          // Another consumer advanced, release slot
+          foundation.atomic_store_u32(slot + 8, SLOT_FULL)
+        }
+      }
+    }
+
+    foundation.cpu_pause()
+  }
+}
+
+// =============================================================================
+// Lock-Free Skip List
+// =============================================================================
+// Probabilistic data structure for O(log n) concurrent sorted map
+
+struct SkipListNode {
+  key: u64,
+  value: u64,
+  level: u32,
+  marked: u32,                    // Logical deletion flag
+  forward: [u64; 32]              // Array of next pointers (MAX_SKIP_LEVEL)
+}
+
+struct SkipList {
+  head: u64,                      // Pointer to sentinel head
+  level: u32,                     // Current max level
+  size: u64,
+  random_seed: u64
+}
+
+export fn skiplist_init(list: u64, head_node: u64) {
+  // Initialize head sentinel with max level
+  @intToPtr(head_node, u64) = 0                   // key (min)
+  @intToPtr(head_node + 8, u64) = 0               // value
+  @intToPtr(head_node + 16, u32) = MAX_SKIP_LEVEL - 1
+  @intToPtr(head_node + 20, u32) = 0              // not marked
+
+  // Initialize all forward pointers to null
+  var i: u32 = 0
+  while i < MAX_SKIP_LEVEL {
+    @intToPtr(head_node + 24 + (@zext(i, u64) * 8), u64) = 0
+    i = i + 1
+  }
+
+  @intToPtr(list, u64) = head_node
+  foundation.atomic_store_u32(list + 8, 0)
+  foundation.atomic_store_u64(list + 16, 0)
+  @intToPtr(list + 24, u64) = foundation.rdtsc()  // random seed
+}
+
+fn skiplist_random_level(list: u64): u32 {
+  var seed: u64 = @intToPtr(list + 24, u64)
+  var level: u32 = 0
+
+  // XorShift PRNG
+  seed = seed ^ (seed << 13)
+  seed = seed ^ (seed >> 7)
+  seed = seed ^ (seed << 17)
+  @intToPtr(list + 24, u64) = seed
+
+  // Geometric distribution - ~50% chance to increase level
+  while level < MAX_SKIP_LEVEL - 1 {
+    seed = seed ^ (seed << 13)
+    seed = seed ^ (seed >> 7)
+    seed = seed ^ (seed << 17)
+    @intToPtr(list + 24, u64) = seed
+
+    if (seed & 1) == 0 {
+      break
+    }
+    level = level + 1
+  }
+
+  return level
+}
+
+export fn skiplist_find(list: u64, key: u64, preds: u64, succs: u64): u32 {
+  var found: u32 = 0
+
+  retry:
+  var pred: u64 = @intToPtr(list, u64)  // head
+  var level: i32 = @intCast(foundation.atomic_load_u32(list + 8), i32)
+
+  while level >= 0 {
+    var forward_offset: u64 = 24 + (@zext(@intCast(level, u32), u64) * 8)
+    var curr: u64 = foundation.atomic_load_u64(pred + forward_offset)
+
+    while curr != 0 {
+      var curr_marked: u32 = @intToPtr(curr + 20, u32)
+      var succ: u64 = foundation.atomic_load_u64(curr + forward_offset)
+
+      // Skip marked nodes (logically deleted)
+      while curr_marked != 0 {
+        // Try to physically remove
+        if foundation.atomic_cas_u64(pred + forward_offset, curr, succ) != 1 {
+          goto retry
+        }
+        curr = succ
+        if curr != 0 {
+          curr_marked = @intToPtr(curr + 20, u32)
+          succ = foundation.atomic_load_u64(curr + forward_offset)
+        } else {
+          break
+        }
+      }
+
+      if curr != 0 {
+        var curr_key: u64 = @intToPtr(curr, u64)
+        if curr_key < key {
+          pred = curr
+          curr = foundation.atomic_load_u64(curr + forward_offset)
+          continue
+        }
+      }
+      break
+    }
+
+    // Store predecessor and successor at this level
+    @intToPtr(preds + (@zext(@intCast(level, u32), u64) * 8), u64) = pred
+    @intToPtr(succs + (@zext(@intCast(level, u32), u64) * 8), u64) = curr
+
+    if level == 0 && curr != 0 {
+      var curr_key: u64 = @intToPtr(curr, u64)
+      if curr_key == key {
+        found = 1
+      }
+    }
+
+    level = level - 1
+  }
+
+  return found
+}
+
+export fn skiplist_insert(list: u64, node: u64, key: u64, value: u64): u32 {
+  var level: u32 = skiplist_random_level(list)
+
+  // Initialize node
+  @intToPtr(node, u64) = key
+  @intToPtr(node + 8, u64) = value
+  @intToPtr(node + 16, u32) = level
+  @intToPtr(node + 20, u32) = 0  // not marked
+
+  // Allocate space for preds and succs on stack (conceptually)
+  var preds: [u64; 32] = undefined
+  var succs: [u64; 32] = undefined
+
+  loop {
+    if skiplist_find(list, key, @ptrToInt(&preds), @ptrToInt(&succs)) == 1 {
+      // Key already exists
+      return 0
+    }
+
+    // Initialize forward pointers
+    var i: u32 = 0
+    while i <= level {
+      @intToPtr(node + 24 + (@zext(i, u64) * 8), u64) = succs[i]
+      i = i + 1
+    }
+
+    // Try to insert at level 0 first
+    var pred: u64 = preds[0]
+    var succ: u64 = succs[0]
+    if foundation.atomic_cas_u64(pred + 24, succ, node) != 1 {
+      continue  // Retry
+    }
+
+    // Link at higher levels
+    i = 1
+    while i <= level {
+      loop {
+        pred = preds[i]
+        succ = succs[i]
+        if foundation.atomic_cas_u64(pred + 24 + (@zext(i, u64) * 8), succ, node) == 1 {
+          break
+        }
+        // Re-find if failed
+        skiplist_find(list, key, @ptrToInt(&preds), @ptrToInt(&succs))
+      }
+      i = i + 1
+    }
+
+    // Update max level if needed
+    var curr_level: u32 = foundation.atomic_load_u32(list + 8)
+    while level > curr_level {
+      if foundation.atomic_cas_u32(list + 8, curr_level, level) == 1 {
+        break
+      }
+      curr_level = foundation.atomic_load_u32(list + 8)
+    }
+
+    foundation.atomic_add_u64(list + 16, 1)
+    return 1
+  }
+}
+
+export fn skiplist_get(list: u64, key: u64): u64 {
+  var pred: u64 = @intToPtr(list, u64)
+  var level: i32 = @intCast(foundation.atomic_load_u32(list + 8), i32)
+
+  while level >= 0 {
+    var forward_offset: u64 = 24 + (@zext(@intCast(level, u32), u64) * 8)
+    var curr: u64 = foundation.atomic_load_u64(pred + forward_offset)
+
+    while curr != 0 {
+      var curr_marked: u32 = @intToPtr(curr + 20, u32)
+      if curr_marked != 0 {
+        curr = foundation.atomic_load_u64(curr + forward_offset)
+        continue
+      }
+
+      var curr_key: u64 = @intToPtr(curr, u64)
+      if curr_key < key {
+        pred = curr
+        curr = foundation.atomic_load_u64(curr + forward_offset)
+      } else if curr_key == key {
+        return @intToPtr(curr + 8, u64)  // Return value
+      } else {
+        break
+      }
+    }
+    level = level - 1
+  }
+
+  return 0  // Not found
+}
+
+export fn skiplist_remove(list: u64, key: u64): u32 {
+  var preds: [u64; 32] = undefined
+  var succs: [u64; 32] = undefined
+
+  if skiplist_find(list, key, @ptrToInt(&preds), @ptrToInt(&succs)) == 0 {
+    return 0  // Not found
+  }
+
+  var node: u64 = succs[0]
+  if node != 0 {
+    // Mark for logical deletion
+    var old_marked: u32 = foundation.atomic_swap_u32(node + 20, 1)
+    if old_marked == 0 {
+      foundation.atomic_sub_u64(list + 16, 1)
+      return 1
+    }
+  }
+
+  return 0
+}
+
+// =============================================================================
+// Hazard Pointers (Safe Memory Reclamation)
+// =============================================================================
+
+struct HazardPointer {
+  ptr: u64,           // Protected pointer
+  active: u32,        // Whether slot is in use
+  _pad: u32
+}
+
+struct HazardPointerDomain {
+  hazard_pointers: [HazardPointer; 128],
+  hp_count: u32
+}
+
+export fn hp_domain_init(domain: u64) {
+  var i: u32 = 0
+  while i < MAX_HAZARD_POINTERS {
+    var hp: u64 = domain + (@zext(i, u64) * 16)
+    foundation.atomic_store_u64(hp, 0)
+    foundation.atomic_store_u32(hp + 8, 0)
+    i = i + 1
+  }
+  foundation.atomic_store_u32(domain + (@zext(MAX_HAZARD_POINTERS, u64) * 16), 0)
+}
+
+export fn hp_acquire(domain: u64): u64 {
+  var i: u32 = 0
+  while i < MAX_HAZARD_POINTERS {
+    var hp: u64 = domain + (@zext(i, u64) * 16)
+    var active: u32 = foundation.atomic_load_u32(hp + 8)
+
+    if active == 0 {
+      if foundation.atomic_cas_u32(hp + 8, 0, 1) == 1 {
+        return hp
+      }
+    }
+    i = i + 1
+  }
+  return 0  // No available slot
+}
+
+export fn hp_release(domain: u64, hp: u64) {
+  foundation.atomic_store_u64(hp, 0)
+  foundation.atomic_store_u32(hp + 8, 0)
+}
+
+export fn hp_protect(hp: u64, ptr: u64) {
+  foundation.atomic_store_u64(hp, ptr)
+  foundation.memory_barrier_seq_cst()
+}
+
+export fn hp_is_protected(domain: u64, ptr: u64): u32 {
+  var i: u32 = 0
+  while i < MAX_HAZARD_POINTERS {
+    var hp: u64 = domain + (@zext(i, u64) * 16)
+    var active: u32 = foundation.atomic_load_u32(hp + 8)
+
+    if active != 0 {
+      if foundation.atomic_load_u64(hp) == ptr {
+        return 1
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// =============================================================================
+// Epoch-Based Reclamation (EBR)
+// =============================================================================
+
+struct EpochThread {
+  local_epoch: u64,
+  active: u32,
+  _pad: u32
+}
+
+struct EpochReclamation {
+  global_epoch: u64,
+  _pad: [u8; 56],
+  threads: [u64; 256],    // Pointers to EpochThread
+  thread_count: u32
+}
+
+export fn ebr_init(ebr: u64) {
+  foundation.atomic_store_u64(ebr, 0)  // global_epoch
+  foundation.atomic_store_u32(ebr + 64 + 2048, 0)  // thread_count
+}
+
+export fn ebr_register_thread(ebr: u64, thread: u64) {
+  @intToPtr(thread, u64) = 0       // local_epoch
+  @intToPtr(thread + 8, u32) = 0   // active
+
+  var idx: u32 = foundation.atomic_fetch_add_u32(ebr + 64 + 2048, 1)
+  @intToPtr(ebr + 64 + (@zext(idx, u64) * 8), u64) = thread
+}
+
+export fn ebr_enter(ebr: u64, thread: u64) {
+  // Mark thread as active
+  foundation.atomic_store_u32(thread + 8, 1)
+  foundation.memory_barrier_seq_cst()
+
+  // Copy global epoch to local
+  var global: u64 = foundation.atomic_load_u64(ebr)
+  foundation.atomic_store_u64(thread, global)
+}
+
+export fn ebr_exit(thread: u64) {
+  foundation.atomic_store_u32(thread + 8, 0)
+}
+
+export fn ebr_try_advance(ebr: u64): u32 {
+  var current: u64 = foundation.atomic_load_u64(ebr)
+  var count: u32 = foundation.atomic_load_u32(ebr + 64 + 2048)
+
+  // Check all threads are in current epoch or inactive
+  var i: u32 = 0
+  while i < count {
+    var thread: u64 = @intToPtr(ebr + 64 + (@zext(i, u64) * 8), u64)
+    if thread != 0 {
+      var active: u32 = foundation.atomic_load_u32(thread + 8)
+      if active != 0 {
+        var local: u64 = foundation.atomic_load_u64(thread)
+        if local != current {
+          return 0  // Thread in old epoch
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  // Advance epoch
+  foundation.atomic_cas_u64(ebr, current, current + 1)
+  return 1
+}
+
+export fn ebr_current_epoch(ebr: u64): u64 {
+  return foundation.atomic_load_u64(ebr)
+}
+
+// =============================================================================
+// Wait-Free Distributed Counter
+// =============================================================================
+
+struct WaitFreeCounter {
+  per_cpu: [u64; 256],    // Per-CPU counters (cache-aligned)
+  cpu_count: u32
+}
+
+export fn wf_counter_init(counter: u64, ncpus: u32) {
+  var i: u32 = 0
+  while i < ncpus {
+    foundation.atomic_store_u64(counter + (@zext(i, u64) * 64), 0)
+    i = i + 1
+  }
+  @intToPtr(counter + 256 * 64, u32) = ncpus
+}
+
+export fn wf_counter_increment(counter: u64, cpu_id: u32) {
+  var ncpus: u32 = @intToPtr(counter + 256 * 64, u32)
+  var idx: u32 = cpu_id % ncpus
+  foundation.atomic_add_u64(counter + (@zext(idx, u64) * 64), 1)
+}
+
+export fn wf_counter_decrement(counter: u64, cpu_id: u32) {
+  var ncpus: u32 = @intToPtr(counter + 256 * 64, u32)
+  var idx: u32 = cpu_id % ncpus
+  foundation.atomic_sub_u64(counter + (@zext(idx, u64) * 64), 1)
+}
+
+export fn wf_counter_add(counter: u64, cpu_id: u32, value: i64) {
+  var ncpus: u32 = @intToPtr(counter + 256 * 64, u32)
+  var idx: u32 = cpu_id % ncpus
+  foundation.atomic_add_u64(counter + (@zext(idx, u64) * 64), @bitcast(value, u64))
+}
+
+export fn wf_counter_read(counter: u64): i64 {
+  var total: i64 = 0
+  var ncpus: u32 = @intToPtr(counter + 256 * 64, u32)
+
+  var i: u32 = 0
+  while i < ncpus {
+    total = total + @bitcast(foundation.atomic_load_u64(counter + (@zext(i, u64) * 64)), i64)
+    i = i + 1
+  }
+
+  return total
+}
+
+export fn wf_counter_reset(counter: u64) {
+  var ncpus: u32 = @intToPtr(counter + 256 * 64, u32)
+  var i: u32 = 0
+  while i < ncpus {
+    foundation.atomic_store_u64(counter + (@zext(i, u64) * 64), 0)
+    i = i + 1
+  }
+}
+
+// =============================================================================
+// Sequence Lock (SeqLock)
+// =============================================================================
+// Readers use optimistic retry, writers use traditional locking
+
+struct SeqLock {
+  sequence: u64,          // Even = no writer, Odd = writer active
+  _pad: [u8; 56],
+  write_lock: u32         // Spinlock for writers
+}
+
+export fn seqlock_init(lock: u64) {
+  foundation.atomic_store_u64(lock, 0)
+  foundation.atomic_store_u32(lock + 64, 0)
+}
+
+export fn seqlock_read_begin(lock: u64): u64 {
+  loop {
+    var seq: u64 = foundation.atomic_load_u64(lock)
+
+    // Wait if writer is active (odd sequence)
+    if (seq & 1) != 0 {
+      foundation.cpu_pause()
+      continue
+    }
+
+    foundation.memory_barrier_acquire()
+    return seq
+  }
+}
+
+export fn seqlock_read_retry(lock: u64, seq: u64): u32 {
+  foundation.memory_barrier_acquire()
+  var current: u64 = foundation.atomic_load_u64(lock)
+  return if current != seq { 1 } else { 0 }
+}
+
+export fn seqlock_write_lock(lock: u64) {
+  // Acquire spinlock
+  while foundation.atomic_swap_u32(lock + 64, 1) != 0 {
+    while foundation.atomic_load_u32(lock + 64) != 0 {
+      foundation.cpu_pause()
+    }
+  }
+
+  // Increment sequence to odd (write in progress)
+  foundation.atomic_add_u64(lock, 1)
+  foundation.memory_barrier_release()
+}
+
+export fn seqlock_write_unlock(lock: u64) {
+  foundation.memory_barrier_release()
+  // Increment sequence to even (write complete)
+  foundation.atomic_add_u64(lock, 1)
+  // Release spinlock
+  foundation.atomic_store_u32(lock + 64, 0)
+}
+
+// =============================================================================
+// Lock-Free Pool Allocator
+// =============================================================================
+
+struct LockFreePool {
+  free_stack: u64,        // Treiber stack of free nodes
+  capacity: u32,
+  allocated: u32,
+  node_size: u32
+}
+
+export fn lf_pool_init(pool: u64, buffer: u64, node_size: u32, count: u32) {
+  // Initialize free stack (Treiber stack header)
+  treiber_stack_init(pool)
+  @intToPtr(pool + 24, u32) = count
+  @intToPtr(pool + 28, u32) = 0
+  @intToPtr(pool + 32, u32) = node_size
+
+  // Add all nodes to free stack
+  var i: u32 = 0
+  while i < count {
+    var node: u64 = buffer + (@zext(i, u64) * @zext(node_size, u64))
+    treiber_stack_push(pool, node)
+    i = i + 1
+  }
+}
+
+export fn lf_pool_alloc(pool: u64): u64 {
+  var node: u64 = treiber_stack_pop(pool)
+  if node != 0 {
+    foundation.atomic_add_u32(pool + 28, 1)
+  }
+  return node
+}
+
+export fn lf_pool_free(pool: u64, node: u64) {
+  treiber_stack_push(pool, node)
+  foundation.atomic_sub_u32(pool + 28, 1)
+}
+
+export fn lf_pool_allocated(pool: u64): u32 {
+  return foundation.atomic_load_u32(pool + 28)
+}
+
+export fn lf_pool_available(pool: u64): u64 {
+  return treiber_stack_size(pool)
+}
+
+// =============================================================================
+// Legacy API Compatibility
+// =============================================================================
+
+// Lock-free queue (simple ring buffer implementation for backwards compatibility)
 struct LockFreeQueue {
   data: [u64; 1024],
   head: u32,
@@ -21,43 +963,41 @@ export fn lockfree_queue_enqueue(queue: u64, value: u64): u32 {
   var tail: u32 = @intToPtr(queue + 4, u32)
   var next_tail: u32 = (tail + 1) % QUEUE_SIZE
   var head: u32 = @intToPtr(queue, u32)
-  
+
   if next_tail == head {
     return 0  // Queue full
   }
-  
+
   var data_ptr: u64 = queue + 8 + (tail * 8)
   @intToPtr(data_ptr, u64) = value
-  
+
   // Atomic update of tail
   foundation.atomic_store_u32(queue + 4, next_tail)
-  
+
   return 1
 }
 
 export fn lockfree_queue_dequeue(queue: u64, value_out: u64): u32 {
   var head: u32 = @intToPtr(queue, u32)
   var tail: u32 = @intToPtr(queue + 4, u32)
-  
+
   if head == tail {
     return 0  // Queue empty
   }
-  
+
   var data_ptr: u64 = queue + 8 + (head * 8)
   @intToPtr(value_out, u64) = @intToPtr(data_ptr, u64)
-  
+
   var next_head: u32 = (head + 1) % QUEUE_SIZE
-  
+
   // Atomic update of head
   foundation.atomic_store_u32(queue, next_head)
-  
+
   return 1
 }
 
-// Lock-free stack
-const STACK_SIZE: u32 = 1024
-
-struct LockFreeStack {
+// Lock-free stack (legacy simple implementation)
+struct LegacyLockFreeStack {
   data: [u64; 1024],
   top: u32
 }
@@ -68,39 +1008,37 @@ export fn lockfree_stack_init(stack: u64) {
 
 export fn lockfree_stack_push(stack: u64, value: u64): u32 {
   var top: u32 = @intToPtr(stack, u32)
-  
+
   if top >= STACK_SIZE {
     return 0  // Stack full
   }
-  
-  var data_ptr: u64 = stack + 4 + (top * 8)
+
+  var data_ptr: u64 = stack + 4 + (@zext(top, u64) * 8)
   @intToPtr(data_ptr, u64) = value
-  
+
   // Atomic increment of top
   foundation.atomic_add_u32(stack, 1)
-  
+
   return 1
 }
 
 export fn lockfree_stack_pop(stack: u64, value_out: u64): u32 {
   var top: u32 = @intToPtr(stack, u32)
-  
+
   if top == 0 {
     return 0  // Stack empty
   }
-  
+
   // Atomic decrement of top
   var new_top: u32 = foundation.atomic_sub_u32(stack, 1)
-  
-  var data_ptr: u64 = stack + 4 + (new_top * 8)
+
+  var data_ptr: u64 = stack + 4 + (@zext(new_top, u64) * 8)
   @intToPtr(value_out, u64) = @intToPtr(data_ptr, u64)
-  
+
   return 1
 }
 
 // Lock-free hash table (simplified)
-const HASH_TABLE_SIZE: u32 = 256
-
 struct HashEntry {
   key: u64,
   value: u64,
@@ -110,63 +1048,63 @@ struct HashEntry {
 export fn lockfree_hash_init(table: u64) {
   var i: u32 = 0
   while i < HASH_TABLE_SIZE {
-    @intToPtr(table + (i * 4), u32) = 0xFFFFFFFF
+    @intToPtr(table + (@zext(i, u64) * 4), u32) = 0xFFFFFFFF
     i = i + 1
   }
 }
 
 fn lockfree_hash_function(key: u64): u32 {
-  return @truncate(key % HASH_TABLE_SIZE, u32)
+  return @truncate(key % @zext(HASH_TABLE_SIZE, u64), u32)
 }
 
 export fn lockfree_hash_insert(table: u64, entries: u64, key: u64, value: u64): u32 {
   var hash: u32 = lockfree_hash_function(key)
-  var bucket_ptr: u64 = table + (hash * 4)
-  
+  var bucket_ptr: u64 = table + (@zext(hash, u64) * 4)
+
   // Find free entry
   var entry_idx: u32 = 0
   while entry_idx < 1000 {
-    var entry_ptr: u64 = entries + (entry_idx * 24)
+    var entry_ptr: u64 = entries + (@zext(entry_idx, u64) * 24)
     var entry_key: u64 = @intToPtr(entry_ptr, u64)
-    
+
     if entry_key == 0 {
       // Free entry found
       @intToPtr(entry_ptr, u64) = key
       @intToPtr(entry_ptr + 8, u64) = value
-      
+
       var old_head: u32 = @intToPtr(bucket_ptr, u32)
       @intToPtr(entry_ptr + 16, u32) = old_head
-      
+
       // Atomic update of bucket head
       foundation.atomic_store_u32(bucket_ptr, entry_idx)
-      
+
       return 1
     }
-    
+
     entry_idx = entry_idx + 1
   }
-  
+
   return 0
 }
 
 export fn lockfree_hash_lookup(table: u64, entries: u64, key: u64, value_out: u64): u32 {
   var hash: u32 = lockfree_hash_function(key)
-  var bucket_ptr: u64 = table + (hash * 4)
-  
+  var bucket_ptr: u64 = table + (@zext(hash, u64) * 4)
+
   var entry_idx: u32 = @intToPtr(bucket_ptr, u32)
-  
+
   while entry_idx != 0xFFFFFFFF {
-    var entry_ptr: u64 = entries + (entry_idx * 24)
+    var entry_ptr: u64 = entries + (@zext(entry_idx, u64) * 24)
     var entry_key: u64 = @intToPtr(entry_ptr, u64)
-    
+
     if entry_key == key {
       @intToPtr(value_out, u64) = @intToPtr(entry_ptr + 8, u64)
       return 1
     }
-    
+
     entry_idx = @intToPtr(entry_ptr + 16, u32)
   }
-  
+
   return 0
 }
 
