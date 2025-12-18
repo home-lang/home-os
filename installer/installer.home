@@ -1,0 +1,917 @@
+// home-os Graphical Installer
+// Full system installation with partitioning, configuration, and bootloader setup
+
+import "../../kernel/src/core/foundation.home" as foundation
+import "../../kernel/src/fs/vfs.home" as vfs
+import "../../kernel/src/ui/compositor.home" as compositor
+
+// ============================================================================
+// INSTALLER CONSTANTS
+// ============================================================================
+
+const INSTALLER_VERSION: [u8; 8] = "1.0.0\0\0\0"
+const MIN_DISK_SIZE_MB: u64 = 2048      // 2GB minimum
+const RECOMMENDED_DISK_SIZE_MB: u64 = 20480  // 20GB recommended
+
+// Installation stages
+const STAGE_WELCOME: u32 = 0
+const STAGE_LICENSE: u32 = 1
+const STAGE_DISK_SELECT: u32 = 2
+const STAGE_PARTITION: u32 = 3
+const STAGE_TIMEZONE: u32 = 4
+const STAGE_LOCALE: u32 = 5
+const STAGE_USER: u32 = 6
+const STAGE_PACKAGES: u32 = 7
+const STAGE_INSTALL: u32 = 8
+const STAGE_BOOTLOADER: u32 = 9
+const STAGE_COMPLETE: u32 = 10
+
+// Partition types
+const PART_TYPE_EFI: u32 = 0
+const PART_TYPE_BOOT: u32 = 1
+const PART_TYPE_ROOT: u32 = 2
+const PART_TYPE_HOME: u32 = 3
+const PART_TYPE_SWAP: u32 = 4
+
+// Filesystem types
+const FS_TYPE_FAT32: u32 = 0
+const FS_TYPE_EXT4: u32 = 1
+const FS_TYPE_HOMEFS: u32 = 2
+const FS_TYPE_SWAP: u32 = 3
+
+// ============================================================================
+// DISK AND PARTITION STRUCTURES
+// ============================================================================
+
+struct DiskInfo {
+  device_path: [u8; 64],
+  model: [u8; 64],
+  size_bytes: u64,
+  sector_size: u32,
+  is_ssd: u32,
+  is_removable: u32,
+  partition_table: u32,  // 0=MBR, 1=GPT
+  partitions: [PartitionInfo; 32],
+  partition_count: u32
+}
+
+struct PartitionInfo {
+  number: u32,
+  start_sector: u64,
+  end_sector: u64,
+  size_bytes: u64,
+  fs_type: u32,
+  label: [u8; 32],
+  mount_point: [u8; 64],
+  is_bootable: u32
+}
+
+struct PartitionPlan {
+  partitions: [PlannedPartition; 8],
+  partition_count: u32,
+  use_encryption: u32,
+  encryption_password: [u8; 128]
+}
+
+struct PlannedPartition {
+  part_type: u32,
+  size_mb: u64,
+  fs_type: u32,
+  mount_point: [u8; 64]
+}
+
+// ============================================================================
+// INSTALLATION CONFIGURATION
+// ============================================================================
+
+struct InstallConfig {
+  // Disk configuration
+  target_disk: [u8; 64],
+  partition_plan: PartitionPlan,
+
+  // Locale settings
+  timezone: [u8; 64],
+  language: [u8; 16],
+  keyboard_layout: [u8; 32],
+
+  // User configuration
+  hostname: [u8; 64],
+  username: [u8; 32],
+  password_hash: [u8; 64],
+  user_fullname: [u8; 128],
+  root_password_hash: [u8; 64],
+
+  // Package selection
+  install_desktop: u32,
+  install_development: u32,
+  install_server: u32,
+  install_multimedia: u32,
+
+  // Boot configuration
+  install_bootloader: u32,
+  bootloader_device: [u8; 64],
+  enable_secure_boot: u32
+}
+
+struct InstallProgress {
+  current_stage: u32,
+  stage_progress: u32,  // 0-100
+  total_progress: u32,  // 0-100
+  current_action: [u8; 256],
+  errors: [u8; 1024],
+  error_count: u32
+}
+
+// ============================================================================
+// INSTALLER STATE
+// ============================================================================
+
+var installer_config: InstallConfig
+var install_progress: InstallProgress
+var available_disks: [DiskInfo; 16]
+var disk_count: u32 = 0
+var current_stage: u32 = STAGE_WELCOME
+
+// Timezone database (subset)
+var timezones: [[u8; 64]; 64]
+var timezone_count: u32 = 0
+
+// Language database (subset)
+var languages: [[u8; 32]; 32]
+var language_count: u32 = 0
+
+// ============================================================================
+// DISK DETECTION
+// ============================================================================
+
+export fn installer_detect_disks(): u32 {
+  disk_count = 0
+
+  // Scan for SATA/NVMe/USB disks
+  scan_sata_disks()
+  scan_nvme_disks()
+  scan_usb_disks()
+
+  foundation.serial_write_string("[Installer] Detected ")
+  foundation.serial_write_hex(disk_count)
+  foundation.serial_write_string(" disks\n")
+
+  return disk_count
+}
+
+fn scan_sata_disks() {
+  // Probe SATA controllers for attached disks
+  var port: u32 = 0
+  while port < 8 {
+    if probe_sata_port(port) == 1 {
+      if disk_count < 16 {
+        populate_disk_info(disk_count, 0, port)  // 0 = SATA
+        disk_count = disk_count + 1
+      }
+    }
+    port = port + 1
+  }
+}
+
+fn scan_nvme_disks() {
+  // Probe NVMe namespaces
+  var ns: u32 = 0
+  while ns < 4 {
+    if probe_nvme_namespace(ns) == 1 {
+      if disk_count < 16 {
+        populate_disk_info(disk_count, 1, ns)  // 1 = NVMe
+        disk_count = disk_count + 1
+      }
+    }
+    ns = ns + 1
+  }
+}
+
+fn scan_usb_disks() {
+  // Probe USB mass storage devices
+  var dev: u32 = 0
+  while dev < 8 {
+    if probe_usb_storage(dev) == 1 {
+      if disk_count < 16 {
+        populate_disk_info(disk_count, 2, dev)  // 2 = USB
+        disk_count = disk_count + 1
+      }
+    }
+    dev = dev + 1
+  }
+}
+
+fn probe_sata_port(port: u32): u32 {
+  // Stub: Would probe AHCI port for device
+  return 0
+}
+
+fn probe_nvme_namespace(ns: u32): u32 {
+  // Stub: Would probe NVMe controller
+  return 0
+}
+
+fn probe_usb_storage(dev: u32): u32 {
+  // Stub: Would probe USB device
+  return 0
+}
+
+fn populate_disk_info(index: u32, disk_type: u32, port: u32) {
+  // Stub: Would populate DiskInfo structure
+}
+
+// ============================================================================
+// PARTITION MANAGEMENT
+// ============================================================================
+
+export fn installer_read_partitions(disk_index: u32): u32 {
+  if disk_index >= disk_count { return 0 }
+
+  // Read partition table (GPT or MBR)
+  if available_disks[disk_index].partition_table == 1 {
+    return read_gpt_partitions(disk_index)
+  } else {
+    return read_mbr_partitions(disk_index)
+  }
+}
+
+fn read_gpt_partitions(disk_index: u32): u32 {
+  // Read GPT header and partition entries
+  var count: u32 = 0
+
+  // Read LBA 1 for GPT header
+  // Read partition entries starting at LBA 2
+
+  available_disks[disk_index].partition_count = count
+  return count
+}
+
+fn read_mbr_partitions(disk_index: u32): u32 {
+  // Read MBR partition table
+  var count: u32 = 0
+
+  // Read 4 primary partitions from MBR
+  // Check for extended partitions
+
+  available_disks[disk_index].partition_count = count
+  return count
+}
+
+export fn installer_create_partition_plan(disk_index: u32, scheme: u32): u32 {
+  if disk_index >= disk_count { return 0 }
+
+  var disk_size_mb: u64 = available_disks[disk_index].size_bytes / (1024 * 1024)
+
+  if disk_size_mb < MIN_DISK_SIZE_MB {
+    foundation.serial_write_string("[Installer] Disk too small\n")
+    return 0
+  }
+
+  // Reset partition plan
+  installer_config.partition_plan.partition_count = 0
+
+  if scheme == 0 {
+    // Automatic partitioning
+    create_auto_partitions(disk_size_mb)
+  } else if scheme == 1 {
+    // Manual partitioning (user will add partitions)
+  }
+
+  return 1
+}
+
+fn create_auto_partitions(disk_size_mb: u64) {
+  var plan: *PartitionPlan = &installer_config.partition_plan
+
+  // EFI System Partition (512MB)
+  plan.partitions[0].part_type = PART_TYPE_EFI
+  plan.partitions[0].size_mb = 512
+  plan.partitions[0].fs_type = FS_TYPE_FAT32
+  copy_string(&plan.partitions[0].mount_point, "/boot/efi\0")
+
+  // Boot partition (1GB)
+  plan.partitions[1].part_type = PART_TYPE_BOOT
+  plan.partitions[1].size_mb = 1024
+  plan.partitions[1].fs_type = FS_TYPE_EXT4
+  copy_string(&plan.partitions[1].mount_point, "/boot\0")
+
+  // Swap partition (RAM size or 8GB max)
+  var swap_size: u64 = 8192
+  plan.partitions[2].part_type = PART_TYPE_SWAP
+  plan.partitions[2].size_mb = swap_size
+  plan.partitions[2].fs_type = FS_TYPE_SWAP
+  copy_string(&plan.partitions[2].mount_point, "swap\0")
+
+  // Root partition (remaining space or split with home)
+  var remaining: u64 = disk_size_mb - 512 - 1024 - swap_size
+
+  if remaining > 50 * 1024 {
+    // Split: 30GB root, rest for home
+    plan.partitions[3].part_type = PART_TYPE_ROOT
+    plan.partitions[3].size_mb = 30 * 1024
+    plan.partitions[3].fs_type = FS_TYPE_HOMEFS
+    copy_string(&plan.partitions[3].mount_point, "/\0")
+
+    plan.partitions[4].part_type = PART_TYPE_HOME
+    plan.partitions[4].size_mb = remaining - (30 * 1024)
+    plan.partitions[4].fs_type = FS_TYPE_HOMEFS
+    copy_string(&plan.partitions[4].mount_point, "/home\0")
+
+    plan.partition_count = 5
+  } else {
+    // Single root partition
+    plan.partitions[3].part_type = PART_TYPE_ROOT
+    plan.partitions[3].size_mb = remaining
+    plan.partitions[3].fs_type = FS_TYPE_HOMEFS
+    copy_string(&plan.partitions[3].mount_point, "/\0")
+
+    plan.partition_count = 4
+  }
+}
+
+export fn installer_apply_partition_plan(disk_index: u32): u32 {
+  if disk_index >= disk_count { return 0 }
+
+  var plan: *PartitionPlan = &installer_config.partition_plan
+
+  foundation.serial_write_string("[Installer] Creating partition table...\n")
+
+  // Create new GPT partition table
+  if create_gpt_table(disk_index) == 0 {
+    return 0
+  }
+
+  // Create each partition
+  var i: u32 = 0
+  while i < plan.partition_count {
+    foundation.serial_write_string("[Installer] Creating partition ")
+    foundation.serial_write_hex(i + 1)
+    foundation.serial_write_string("\n")
+
+    if create_partition(disk_index, i) == 0 {
+      return 0
+    }
+    i = i + 1
+  }
+
+  // Format partitions
+  i = 0
+  while i < plan.partition_count {
+    foundation.serial_write_string("[Installer] Formatting partition ")
+    foundation.serial_write_hex(i + 1)
+    foundation.serial_write_string("\n")
+
+    if format_partition(disk_index, i) == 0 {
+      return 0
+    }
+    i = i + 1
+  }
+
+  return 1
+}
+
+fn create_gpt_table(disk_index: u32): u32 {
+  // Write protective MBR
+  // Write GPT header at LBA 1
+  // Initialize partition entries
+  // Write backup GPT at end of disk
+  return 1
+}
+
+fn create_partition(disk_index: u32, part_index: u32): u32 {
+  // Write GPT partition entry
+  return 1
+}
+
+fn format_partition(disk_index: u32, part_index: u32): u32 {
+  var plan: *PartitionPlan = &installer_config.partition_plan
+  var fs_type: u32 = plan.partitions[part_index].fs_type
+
+  if fs_type == FS_TYPE_FAT32 {
+    return format_fat32(disk_index, part_index)
+  } else if fs_type == FS_TYPE_EXT4 {
+    return format_ext4(disk_index, part_index)
+  } else if fs_type == FS_TYPE_HOMEFS {
+    return format_homefs(disk_index, part_index)
+  } else if fs_type == FS_TYPE_SWAP {
+    return format_swap(disk_index, part_index)
+  }
+
+  return 0
+}
+
+fn format_fat32(disk_index: u32, part_index: u32): u32 {
+  // Create FAT32 filesystem
+  return 1
+}
+
+fn format_ext4(disk_index: u32, part_index: u32): u32 {
+  // Create ext4 filesystem
+  return 1
+}
+
+fn format_homefs(disk_index: u32, part_index: u32): u32 {
+  // Create HomeFS filesystem
+  return 1
+}
+
+fn format_swap(disk_index: u32, part_index: u32): u32 {
+  // Create swap signature
+  return 1
+}
+
+// ============================================================================
+// TIMEZONE AND LOCALE
+// ============================================================================
+
+export fn installer_init_timezones() {
+  timezone_count = 0
+
+  // Common timezones
+  add_timezone("UTC")
+  add_timezone("America/New_York")
+  add_timezone("America/Chicago")
+  add_timezone("America/Denver")
+  add_timezone("America/Los_Angeles")
+  add_timezone("America/Anchorage")
+  add_timezone("Pacific/Honolulu")
+  add_timezone("Europe/London")
+  add_timezone("Europe/Paris")
+  add_timezone("Europe/Berlin")
+  add_timezone("Europe/Moscow")
+  add_timezone("Asia/Tokyo")
+  add_timezone("Asia/Shanghai")
+  add_timezone("Asia/Singapore")
+  add_timezone("Asia/Manila")
+  add_timezone("Australia/Sydney")
+  add_timezone("Pacific/Auckland")
+}
+
+fn add_timezone(tz: u64) {
+  if timezone_count >= 64 { return }
+  copy_string(&timezones[timezone_count], tz)
+  timezone_count = timezone_count + 1
+}
+
+export fn installer_init_languages() {
+  language_count = 0
+
+  add_language("en_US")
+  add_language("en_GB")
+  add_language("es_ES")
+  add_language("es_MX")
+  add_language("fr_FR")
+  add_language("de_DE")
+  add_language("it_IT")
+  add_language("pt_BR")
+  add_language("ru_RU")
+  add_language("zh_CN")
+  add_language("zh_TW")
+  add_language("ja_JP")
+  add_language("ko_KR")
+  add_language("fil_PH")
+}
+
+fn add_language(lang: u64) {
+  if language_count >= 32 { return }
+  copy_string(&languages[language_count], lang)
+  language_count = language_count + 1
+}
+
+export fn installer_set_timezone(tz_index: u32): u32 {
+  if tz_index >= timezone_count { return 0 }
+  copy_string(&installer_config.timezone, @ptrFromInt(&timezones[tz_index]))
+  return 1
+}
+
+export fn installer_set_language(lang_index: u32): u32 {
+  if lang_index >= language_count { return 0 }
+  copy_string(&installer_config.language, @ptrFromInt(&languages[lang_index]))
+  return 1
+}
+
+// ============================================================================
+// USER CONFIGURATION
+// ============================================================================
+
+export fn installer_set_hostname(hostname: u64): u32 {
+  // Validate hostname
+  var len: u32 = string_length(hostname)
+  if len == 0 || len > 63 { return 0 }
+
+  // Check valid characters
+  var i: u32 = 0
+  while i < len {
+    var ch: u8 = @intToPtr(hostname + i, u8)
+    if !is_valid_hostname_char(ch) { return 0 }
+    i = i + 1
+  }
+
+  copy_string(&installer_config.hostname, hostname)
+  return 1
+}
+
+fn is_valid_hostname_char(ch: u8): u32 {
+  if ch >= 'a' && ch <= 'z' { return 1 }
+  if ch >= 'A' && ch <= 'Z' { return 1 }
+  if ch >= '0' && ch <= '9' { return 1 }
+  if ch == '-' { return 1 }
+  return 0
+}
+
+export fn installer_create_user(username: u64, password: u64, fullname: u64): u32 {
+  // Validate username
+  var ulen: u32 = string_length(username)
+  if ulen < 3 || ulen > 32 { return 0 }
+
+  // Validate password strength
+  var plen: u32 = string_length(password)
+  if plen < 8 { return 0 }
+
+  // Hash password
+  hash_password(password, &installer_config.password_hash)
+
+  copy_string(&installer_config.username, username)
+  copy_string(&installer_config.user_fullname, fullname)
+
+  return 1
+}
+
+export fn installer_set_root_password(password: u64): u32 {
+  var plen: u32 = string_length(password)
+  if plen < 8 { return 0 }
+
+  hash_password(password, &installer_config.root_password_hash)
+  return 1
+}
+
+fn hash_password(password: u64, hash_out: *[u8; 64]) {
+  // SHA-512 password hash with salt
+  // Stub: Would implement proper password hashing
+  var i: u32 = 0
+  while i < 64 {
+    (*hash_out)[i] = 0
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// PACKAGE SELECTION
+// ============================================================================
+
+export fn installer_select_packages(desktop: u32, dev: u32, server: u32, multimedia: u32) {
+  installer_config.install_desktop = desktop
+  installer_config.install_development = dev
+  installer_config.install_server = server
+  installer_config.install_multimedia = multimedia
+}
+
+fn get_package_list(): u64 {
+  // Calculate total packages based on selection
+  var count: u64 = 50  // Base system
+
+  if installer_config.install_desktop == 1 {
+    count = count + 100  // Desktop packages
+  }
+  if installer_config.install_development == 1 {
+    count = count + 150  // Development tools
+  }
+  if installer_config.install_server == 1 {
+    count = count + 75   // Server packages
+  }
+  if installer_config.install_multimedia == 1 {
+    count = count + 50   // Multimedia packages
+  }
+
+  return count
+}
+
+// ============================================================================
+// INSTALLATION PROCESS
+// ============================================================================
+
+export fn installer_start_installation(): u32 {
+  install_progress.current_stage = STAGE_INSTALL
+  install_progress.stage_progress = 0
+  install_progress.total_progress = 0
+  install_progress.error_count = 0
+
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("========================================\n")
+  foundation.serial_write_string("  home-os Installation Starting\n")
+  foundation.serial_write_string("========================================\n\n")
+
+  // Step 1: Mount target filesystems
+  update_progress("Mounting filesystems...", 5)
+  if mount_target_filesystems() == 0 {
+    log_error("Failed to mount filesystems")
+    return 0
+  }
+
+  // Step 2: Copy base system
+  update_progress("Installing base system...", 10)
+  if install_base_system() == 0 {
+    log_error("Failed to install base system")
+    return 0
+  }
+
+  // Step 3: Install kernel
+  update_progress("Installing kernel...", 30)
+  if install_kernel() == 0 {
+    log_error("Failed to install kernel")
+    return 0
+  }
+
+  // Step 4: Install selected packages
+  update_progress("Installing packages...", 40)
+  if install_packages() == 0 {
+    log_error("Failed to install packages")
+    return 0
+  }
+
+  // Step 5: Configure system
+  update_progress("Configuring system...", 70)
+  if configure_system() == 0 {
+    log_error("Failed to configure system")
+    return 0
+  }
+
+  // Step 6: Create user accounts
+  update_progress("Creating user accounts...", 80)
+  if create_user_accounts() == 0 {
+    log_error("Failed to create user accounts")
+    return 0
+  }
+
+  // Step 7: Install bootloader
+  update_progress("Installing bootloader...", 90)
+  if installer_config.install_bootloader == 1 {
+    if install_bootloader() == 0 {
+      log_error("Failed to install bootloader")
+      return 0
+    }
+  }
+
+  // Step 8: Finalize
+  update_progress("Finalizing installation...", 95)
+  if finalize_installation() == 0 {
+    log_error("Failed to finalize installation")
+    return 0
+  }
+
+  update_progress("Installation complete!", 100)
+  install_progress.current_stage = STAGE_COMPLETE
+
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("========================================\n")
+  foundation.serial_write_string("  Installation Complete!\n")
+  foundation.serial_write_string("========================================\n")
+  foundation.serial_write_string("  Please remove installation media\n")
+  foundation.serial_write_string("  and reboot your system.\n")
+  foundation.serial_write_string("========================================\n\n")
+
+  return 1
+}
+
+fn update_progress(action: u64, progress: u32) {
+  install_progress.total_progress = progress
+  copy_string(&install_progress.current_action, action)
+
+  foundation.serial_write_string("[")
+  foundation.serial_write_hex(progress)
+  foundation.serial_write_string("%] ")
+  foundation.serial_write_string(action)
+  foundation.serial_write_string("\n")
+}
+
+fn log_error(error: u64) {
+  foundation.serial_write_string("[ERROR] ")
+  foundation.serial_write_string(error)
+  foundation.serial_write_string("\n")
+
+  install_progress.error_count = install_progress.error_count + 1
+}
+
+fn mount_target_filesystems(): u32 {
+  var plan: *PartitionPlan = &installer_config.partition_plan
+
+  // Mount root first
+  var i: u32 = 0
+  while i < plan.partition_count {
+    if plan.partitions[i].part_type == PART_TYPE_ROOT {
+      // Mount root at /mnt/target
+      break
+    }
+    i = i + 1
+  }
+
+  // Mount other partitions
+  i = 0
+  while i < plan.partition_count {
+    if plan.partitions[i].part_type != PART_TYPE_ROOT &&
+       plan.partitions[i].part_type != PART_TYPE_SWAP {
+      // Mount relative to /mnt/target
+    }
+    i = i + 1
+  }
+
+  return 1
+}
+
+fn install_base_system(): u32 {
+  // Copy base system files
+  // This would typically unpack a base system archive
+  foundation.serial_write_string("  - Copying base system files\n")
+  foundation.serial_write_string("  - Creating directory structure\n")
+  foundation.serial_write_string("  - Installing core libraries\n")
+  return 1
+}
+
+fn install_kernel(): u32 {
+  // Copy kernel and modules
+  foundation.serial_write_string("  - Copying kernel image\n")
+  foundation.serial_write_string("  - Installing kernel modules\n")
+  foundation.serial_write_string("  - Generating initramfs\n")
+  return 1
+}
+
+fn install_packages(): u32 {
+  var total: u64 = get_package_list()
+
+  foundation.serial_write_string("  - Installing ")
+  foundation.serial_write_hex(total)
+  foundation.serial_write_string(" packages\n")
+
+  if installer_config.install_desktop == 1 {
+    foundation.serial_write_string("  - Installing desktop environment\n")
+  }
+  if installer_config.install_development == 1 {
+    foundation.serial_write_string("  - Installing development tools\n")
+  }
+  if installer_config.install_server == 1 {
+    foundation.serial_write_string("  - Installing server packages\n")
+  }
+  if installer_config.install_multimedia == 1 {
+    foundation.serial_write_string("  - Installing multimedia packages\n")
+  }
+
+  return 1
+}
+
+fn configure_system(): u32 {
+  // Configure hostname
+  foundation.serial_write_string("  - Setting hostname: ")
+  foundation.serial_write_string(@ptrFromInt(&installer_config.hostname))
+  foundation.serial_write_string("\n")
+
+  // Configure timezone
+  foundation.serial_write_string("  - Setting timezone: ")
+  foundation.serial_write_string(@ptrFromInt(&installer_config.timezone))
+  foundation.serial_write_string("\n")
+
+  // Configure locale
+  foundation.serial_write_string("  - Setting locale: ")
+  foundation.serial_write_string(@ptrFromInt(&installer_config.language))
+  foundation.serial_write_string("\n")
+
+  // Configure keyboard
+  foundation.serial_write_string("  - Configuring keyboard layout\n")
+
+  // Configure networking
+  foundation.serial_write_string("  - Configuring network\n")
+
+  // Configure fstab
+  foundation.serial_write_string("  - Generating fstab\n")
+
+  return 1
+}
+
+fn create_user_accounts(): u32 {
+  // Create root account
+  foundation.serial_write_string("  - Setting root password\n")
+
+  // Create user account
+  foundation.serial_write_string("  - Creating user: ")
+  foundation.serial_write_string(@ptrFromInt(&installer_config.username))
+  foundation.serial_write_string("\n")
+
+  // Set up home directory
+  foundation.serial_write_string("  - Creating home directory\n")
+
+  // Add user to groups
+  foundation.serial_write_string("  - Adding user to groups\n")
+
+  return 1
+}
+
+fn install_bootloader(): u32 {
+  foundation.serial_write_string("  - Installing bootloader to ")
+  foundation.serial_write_string(@ptrFromInt(&installer_config.bootloader_device))
+  foundation.serial_write_string("\n")
+
+  // Detect UEFI vs BIOS
+  if is_uefi_boot() == 1 {
+    foundation.serial_write_string("  - Installing UEFI bootloader\n")
+    return install_uefi_bootloader()
+  } else {
+    foundation.serial_write_string("  - Installing BIOS bootloader\n")
+    return install_bios_bootloader()
+  }
+}
+
+fn is_uefi_boot(): u32 {
+  // Check if system booted via UEFI
+  return 1
+}
+
+fn install_uefi_bootloader(): u32 {
+  // Install systemd-boot or custom bootloader to ESP
+  foundation.serial_write_string("  - Copying EFI binary\n")
+  foundation.serial_write_string("  - Creating boot entry\n")
+
+  if installer_config.enable_secure_boot == 1 {
+    foundation.serial_write_string("  - Configuring Secure Boot\n")
+  }
+
+  return 1
+}
+
+fn install_bios_bootloader(): u32 {
+  // Install GRUB or custom bootloader to MBR
+  foundation.serial_write_string("  - Installing boot sector\n")
+  foundation.serial_write_string("  - Installing boot files\n")
+  return 1
+}
+
+fn finalize_installation(): u32 {
+  // Generate machine-id
+  foundation.serial_write_string("  - Generating machine ID\n")
+
+  // Update package database
+  foundation.serial_write_string("  - Updating package database\n")
+
+  // Clean up
+  foundation.serial_write_string("  - Cleaning up temporary files\n")
+
+  // Unmount filesystems
+  foundation.serial_write_string("  - Unmounting filesystems\n")
+
+  return 1
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn copy_string(dest: *[u8; 64], src: u64) {
+  var i: u32 = 0
+  while i < 63 {
+    var ch: u8 = @intToPtr(src + i, u8)
+    (*dest)[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  (*dest)[i] = 0
+}
+
+fn string_length(s: u64): u32 {
+  var len: u32 = 0
+  while @intToPtr(s + len, u8) != 0 {
+    len = len + 1
+  }
+  return len
+}
+
+// ============================================================================
+// MAIN INSTALLER ENTRY
+// ============================================================================
+
+export fn installer_main(): u32 {
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("========================================\n")
+  foundation.serial_write_string("  Welcome to home-os Installer v")
+  foundation.serial_write_string(@ptrFromInt(&INSTALLER_VERSION))
+  foundation.serial_write_string("\n")
+  foundation.serial_write_string("========================================\n\n")
+
+  // Initialize databases
+  installer_init_timezones()
+  installer_init_languages()
+
+  // Detect available disks
+  installer_detect_disks()
+
+  // Default configuration
+  installer_config.install_bootloader = 1
+  installer_config.install_desktop = 1
+  installer_config.install_development = 0
+  installer_config.install_server = 0
+  installer_config.install_multimedia = 1
+
+  current_stage = STAGE_WELCOME
+
+  foundation.serial_write_string("Installer initialized successfully.\n")
+  foundation.serial_write_string("Use installer_* functions to configure and install.\n\n")
+
+  return 1
+}

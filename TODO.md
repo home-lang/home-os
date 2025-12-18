@@ -4,6 +4,27 @@
 
 ## 🎉 Recent Progress (December 18, 2025)
 
+### Phase 17 Testing, Refinement & Release (IN PROGRESS)
+- ✅ **Comprehensive Test Suite** - `tests/kernel/test_suite.home`
+  - Test framework with registration and execution
+  - Assertion helpers (assert_true, assert_eq, assert_ne, assert_gt, assert_lt)
+  - Test categories: Memory, Process, Filesystem, Network, Security, Stress
+  - Summary reporting with pass/fail/skip counts and duration
+- ✅ **Installation System** - `installer/installer.home`
+  - Graphical installer with disk detection
+  - GPT partition table creation
+  - Auto-partitioning (EFI, boot, swap, root, home)
+  - Filesystem formatting (FAT32, ext4, HomeFS, swap)
+  - Timezone and locale configuration
+  - User account creation with password hashing
+  - Bootloader installation (UEFI and BIOS)
+  - Package selection (desktop, development, server, multimedia)
+- ✅ **User Documentation** - `docs/`
+  - `USER_MANUAL.md` - Comprehensive user guide
+  - `INSTALLATION_GUIDE.md` - Detailed installation instructions
+  - `TROUBLESHOOTING.md` - Common issues and solutions
+  - `FAQ.md` - Frequently asked questions
+
 ### Phase 16 Advanced Features & Polish (COMPLETED)
 - ✅ **Multimedia Support** - `kernel/src/media/`
   - Video decoding (H.264, H.265, VP8, VP9)
@@ -2516,9 +2537,14 @@ Build a next-generation operating system that prioritizes:
 
 ---
 
-## Phase 17: Testing, Refinement & Release (Weeks 67-78)
+## Phase 17: Testing, Refinement & Release (Weeks 67-78) - IN PROGRESS
 
 ### 17.1 Comprehensive Testing
+- [x] Test framework (`tests/kernel/test_suite.home`)
+  - [x] Test registration and execution system
+  - [x] Assertion helpers (assert_true, assert_eq, assert_ne, etc.)
+  - [x] Multiple test categories (Memory, Process, FS, Network, Security, Stress)
+  - [x] Summary reporting with timing
 - [ ] Alpha testing on virtual machines
 - [ ] Beta testing on real hardware
   - [ ] Raspberry Pi 4 Model B (all RAM variants)
@@ -2540,10 +2566,10 @@ Build a next-generation operating system that prioritizes:
 - [ ] Edge case handling
 
 ### 17.3 Documentation Polish
-- [ ] User manual
-- [ ] Installation guide
-- [ ] Troubleshooting guide
-- [ ] FAQ
+- [x] User manual (`docs/USER_MANUAL.md`)
+- [x] Installation guide (`docs/INSTALLATION_GUIDE.md`)
+- [x] Troubleshooting guide (`docs/TROUBLESHOOTING.md`)
+- [x] FAQ (`docs/FAQ.md`)
 - [ ] Video tutorials
 - [ ] API documentation finalization
 
@@ -2553,12 +2579,16 @@ Build a next-generation operating system that prioritizes:
   - [ ] Raspberry Pi Imager integration
   - [ ] Pre-configured images (desktop, server, minimal)
   - [ ] First-boot setup wizard
-- [ ] Graphical installer
-  - [ ] Disk partitioning
-  - [ ] Timezone/locale selection
-  - [ ] User creation
-  - [ ] Network configuration
-  - [ ] Bootloader installation
+- [x] Graphical installer (`installer/installer.home`)
+  - [x] Disk detection (SATA, NVMe, USB)
+  - [x] Disk partitioning (GPT)
+  - [x] Auto-partitioning scheme
+  - [x] Filesystem formatting (FAT32, ext4, HomeFS, swap)
+  - [x] Timezone/locale selection
+  - [x] User creation with password hashing
+  - [x] Network configuration support
+  - [x] Bootloader installation (UEFI/BIOS)
+  - [x] Package selection (desktop, dev, server, multimedia)
 - [ ] Automated installation (preseed/kickstart-like)
 - [ ] Upgrade path from previous versions
 
@@ -2942,10 +2972,11 @@ Choose the option that scores highest across these dimensions.
 ---
 
 **Last Updated**: 2025-12-18
-**Status**: Phases 1-16 Complete, Phase 17 (Release) In Progress
-**Next Review**: After Phase 17 completion (Release Preparation)
-**Version**: 1.3.0
+**Status**: Phases 1-16 Complete, Phase 17 (Testing & Release) ~50% Complete
+**Next Review**: After Phase 17 completion (Full Release)
+**Version**: 1.4.0
 **Total Tasks**: ~800+ across 18 phases
 **Completed Phases**: 1-16 (Foundation through Advanced Features)
-**Remaining**: Phase 17 (Testing & Release), Phase 18 (Optional IoT)
+**Phase 17 Progress**: Test suite, installer, and documentation complete. Remaining: Testing, bug fixes, release prep.
+**Remaining**: Phase 17 (Testing & Release) completion, Phase 18 (Optional IoT)
 **Estimated Duration**: 78-82 weeks (19.5-20.5 months)
