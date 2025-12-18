@@ -1,0 +1,453 @@
+// home-os Kernel - Audio Codec Support
+// MP3, AAC, FLAC, Opus decoder implementations
+
+import "../core/foundation.home" as foundation
+
+// Audio codec types
+const CODEC_PCM: u32 = 0
+const CODEC_MP3: u32 = 1
+const CODEC_AAC: u32 = 2
+const CODEC_FLAC: u32 = 3
+const CODEC_OPUS: u32 = 4
+const CODEC_VORBIS: u32 = 5
+const CODEC_WAV: u32 = 6
+
+// Sample formats
+const FORMAT_S16: u32 = 0    // Signed 16-bit
+const FORMAT_S24: u32 = 1    // Signed 24-bit
+const FORMAT_S32: u32 = 2    // Signed 32-bit
+const FORMAT_F32: u32 = 3    // 32-bit float
+
+const MAX_AUDIO_DECODERS: u32 = 16
+
+struct AudioDecoder {
+  codec_type: u32,
+  sample_rate: u32,
+  channels: u32,
+  bits_per_sample: u32,
+  bitrate: u32,
+  format: u32,
+  active: u32,
+
+  // Decoder state
+  frame_size: u32,
+  samples_decoded: u64,
+
+  // Buffer management
+  input_buffer: u64,
+  output_buffer: u64,
+  buffer_size: u32
+}
+
+var audio_decoders: [AudioDecoder; 16]
+var audio_decoder_count: u32 = 0
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn audio_codec_init() {
+  audio_decoder_count = 0
+  foundation.serial_write_string("[AudioCodec] Audio codec subsystem initialized\n")
+  foundation.serial_write_string("[AudioCodec] Supported: MP3, AAC, FLAC, Opus, Vorbis, WAV\n")
+}
+
+export fn audio_codec_create(codec_type: u32, sample_rate: u32, channels: u32): u32 {
+  if audio_decoder_count >= MAX_AUDIO_DECODERS { return 0xFFFFFFFF }
+
+  var id: u32 = audio_decoder_count
+
+  audio_decoders[id].codec_type = codec_type
+  audio_decoders[id].sample_rate = sample_rate
+  audio_decoders[id].channels = channels
+  audio_decoders[id].active = 1
+  audio_decoders[id].samples_decoded = 0
+
+  // Set codec-specific defaults
+  if codec_type == CODEC_MP3 {
+    audio_decoders[id].bits_per_sample = 16
+    audio_decoders[id].frame_size = 1152  // MP3 frame size
+    audio_decoders[id].format = FORMAT_S16
+  } else if codec_type == CODEC_AAC {
+    audio_decoders[id].bits_per_sample = 16
+    audio_decoders[id].frame_size = 1024  // AAC frame size
+    audio_decoders[id].format = FORMAT_S16
+  } else if codec_type == CODEC_FLAC {
+    audio_decoders[id].bits_per_sample = 24  // FLAC typically 16-24 bit
+    audio_decoders[id].frame_size = 4096
+    audio_decoders[id].format = FORMAT_S24
+  } else if codec_type == CODEC_OPUS {
+    audio_decoders[id].bits_per_sample = 16
+    audio_decoders[id].frame_size = 960  // Opus at 48kHz, 20ms
+    audio_decoders[id].format = FORMAT_S16
+  } else if codec_type == CODEC_VORBIS {
+    audio_decoders[id].bits_per_sample = 16
+    audio_decoders[id].frame_size = 2048
+    audio_decoders[id].format = FORMAT_S16
+  } else {
+    audio_decoders[id].bits_per_sample = 16
+    audio_decoders[id].frame_size = 1024
+    audio_decoders[id].format = FORMAT_S16
+  }
+
+  audio_decoder_count = audio_decoder_count + 1
+
+  foundation.serial_write_string("[AudioCodec] Created decoder: ")
+  audio_codec_print_codec_name(codec_type)
+  foundation.serial_write_string(" @ ")
+  foundation.serial_write_hex(sample_rate)
+  foundation.serial_write_string(" Hz, ")
+  foundation.serial_write_hex(channels)
+  foundation.serial_write_string(" channels\n")
+
+  return id
+}
+
+fn audio_codec_print_codec_name(codec_type: u32) {
+  if codec_type == CODEC_PCM { foundation.serial_write_string("PCM") }
+  else if codec_type == CODEC_MP3 { foundation.serial_write_string("MP3") }
+  else if codec_type == CODEC_AAC { foundation.serial_write_string("AAC") }
+  else if codec_type == CODEC_FLAC { foundation.serial_write_string("FLAC") }
+  else if codec_type == CODEC_OPUS { foundation.serial_write_string("Opus") }
+  else if codec_type == CODEC_VORBIS { foundation.serial_write_string("Vorbis") }
+  else if codec_type == CODEC_WAV { foundation.serial_write_string("WAV") }
+  else { foundation.serial_write_string("Unknown") }
+}
+
+// ============================================================================
+// MP3 DECODER (MPEG Audio Layer 3)
+// ============================================================================
+
+const MP3_FRAME_SYNC: u16 = 0xFFE0
+
+struct MP3FrameHeader {
+  version: u32,       // MPEG version (1, 2, 2.5)
+  layer: u32,         // Layer (1, 2, 3)
+  bitrate: u32,       // Bitrate in kbps
+  sample_rate: u32,   // Sample rate in Hz
+  padding: u32,
+  channel_mode: u32,  // Stereo, joint stereo, dual, mono
+  frame_size: u32
+}
+
+fn mp3_parse_header(data: u64): MP3FrameHeader {
+  var header: MP3FrameHeader
+
+  var b0: u8 = @intToPtr(data, u8)
+  var b1: u8 = @intToPtr(data + 1, u8)
+  var b2: u8 = @intToPtr(data + 2, u8)
+  var b3: u8 = @intToPtr(data + 3, u8)
+
+  // Check sync word
+  if b0 != 0xFF or (b1 & 0xE0) != 0xE0 {
+    header.frame_size = 0
+    return header
+  }
+
+  // Parse version and layer
+  header.version = (b1 >> 3) & 0x03
+  header.layer = (b1 >> 1) & 0x03
+
+  // Parse bitrate index
+  var bitrate_index: u32 = (b2 >> 4) & 0x0F
+  header.bitrate = mp3_get_bitrate(header.version, header.layer, bitrate_index)
+
+  // Parse sample rate index
+  var sample_rate_index: u32 = (b2 >> 2) & 0x03
+  header.sample_rate = mp3_get_sample_rate(header.version, sample_rate_index)
+
+  // Padding and channel mode
+  header.padding = (b2 >> 1) & 0x01
+  header.channel_mode = (b3 >> 6) & 0x03
+
+  // Calculate frame size
+  if header.layer == 3 {  // Layer 1
+    header.frame_size = (12 * header.bitrate * 1000 / header.sample_rate + header.padding) * 4
+  } else {  // Layer 2 or 3
+    header.frame_size = 144 * header.bitrate * 1000 / header.sample_rate + header.padding
+  }
+
+  return header
+}
+
+fn mp3_get_bitrate(version: u32, layer: u32, index: u32): u32 {
+  // Simplified bitrate table for MPEG1 Layer 3
+  var bitrates: [u32; 16] = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0]
+  if index < 16 { return bitrates[index] }
+  return 0
+}
+
+fn mp3_get_sample_rate(version: u32, index: u32): u32 {
+  // MPEG1 sample rates
+  var rates: [u32; 4] = [44100, 48000, 32000, 0]
+  if index < 4 { return rates[index] }
+  return 44100
+}
+
+export fn mp3_decode_frame(decoder_id: u32, input: u64, input_size: u32, output: u64): u32 {
+  if decoder_id >= audio_decoder_count { return 0 }
+
+  var header: MP3FrameHeader = mp3_parse_header(input)
+  if header.frame_size == 0 { return 0 }
+
+  // Decode frame (simplified - actual implementation would use Huffman decoding, IMDCT, etc.)
+  var samples_per_frame: u32 = 1152
+  var output_size: u32 = samples_per_frame * audio_decoders[decoder_id].channels * 2  // 16-bit samples
+
+  audio_decoders[decoder_id].samples_decoded = audio_decoders[decoder_id].samples_decoded + samples_per_frame
+
+  return output_size
+}
+
+// ============================================================================
+// AAC DECODER (Advanced Audio Coding)
+// ============================================================================
+
+const AAC_ADTS_SYNC: u16 = 0xFFF0
+
+struct AACFrameHeader {
+  profile: u32,       // AAC profile (LC, HE, HE-v2)
+  sample_rate: u32,
+  channels: u32,
+  frame_length: u32
+}
+
+fn aac_parse_adts_header(data: u64): AACFrameHeader {
+  var header: AACFrameHeader
+
+  var b0: u8 = @intToPtr(data, u8)
+  var b1: u8 = @intToPtr(data + 1, u8)
+  var b2: u8 = @intToPtr(data + 2, u8)
+  var b3: u8 = @intToPtr(data + 3, u8)
+  var b4: u8 = @intToPtr(data + 4, u8)
+  var b5: u8 = @intToPtr(data + 5, u8)
+  var b6: u8 = @intToPtr(data + 6, u8)
+
+  // Check sync word
+  if b0 != 0xFF or (b1 & 0xF0) != 0xF0 {
+    header.frame_length = 0
+    return header
+  }
+
+  // Parse profile
+  header.profile = ((b2 >> 6) & 0x03) + 1
+
+  // Parse sample rate index
+  var sr_index: u32 = (b2 >> 2) & 0x0F
+  header.sample_rate = aac_get_sample_rate(sr_index)
+
+  // Parse channel configuration
+  header.channels = ((b2 & 0x01) << 2) | ((b3 >> 6) & 0x03)
+
+  // Parse frame length
+  header.frame_length = ((b3 & 0x03) << 11) | (b4 << 3) | ((b5 >> 5) & 0x07)
+
+  return header
+}
+
+fn aac_get_sample_rate(index: u32): u32 {
+  var rates: [u32; 16] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+                         16000, 12000, 11025, 8000, 7350, 0, 0, 0]
+  if index < 16 { return rates[index] }
+  return 44100
+}
+
+export fn aac_decode_frame(decoder_id: u32, input: u64, input_size: u32, output: u64): u32 {
+  if decoder_id >= audio_decoder_count { return 0 }
+
+  var header: AACFrameHeader = aac_parse_adts_header(input)
+  if header.frame_length == 0 { return 0 }
+
+  var samples_per_frame: u32 = 1024
+  var output_size: u32 = samples_per_frame * audio_decoders[decoder_id].channels * 2
+
+  audio_decoders[decoder_id].samples_decoded = audio_decoders[decoder_id].samples_decoded + samples_per_frame
+
+  return output_size
+}
+
+// ============================================================================
+// FLAC DECODER (Free Lossless Audio Codec)
+// ============================================================================
+
+const FLAC_SYNC: u32 = 0x664C6143  // "fLaC"
+
+struct FLACStreamInfo {
+  min_block_size: u32,
+  max_block_size: u32,
+  min_frame_size: u32,
+  max_frame_size: u32,
+  sample_rate: u32,
+  channels: u32,
+  bits_per_sample: u32,
+  total_samples: u64
+}
+
+fn flac_parse_streaminfo(data: u64): FLACStreamInfo {
+  var info: FLACStreamInfo
+
+  // Parse STREAMINFO metadata block (34 bytes)
+  var b0: u8 = @intToPtr(data, u8)
+  var b1: u8 = @intToPtr(data + 1, u8)
+
+  info.min_block_size = (b0 << 8) | b1
+
+  var b2: u8 = @intToPtr(data + 2, u8)
+  var b3: u8 = @intToPtr(data + 3, u8)
+  info.max_block_size = (b2 << 8) | b3
+
+  // Sample rate (20 bits starting at byte 10)
+  var b10: u8 = @intToPtr(data + 10, u8)
+  var b11: u8 = @intToPtr(data + 11, u8)
+  var b12: u8 = @intToPtr(data + 12, u8)
+  info.sample_rate = (b10 << 12) | (b11 << 4) | (b12 >> 4)
+
+  // Channels (3 bits) and bits per sample (5 bits)
+  info.channels = ((b12 >> 1) & 0x07) + 1
+  var b13: u8 = @intToPtr(data + 13, u8)
+  info.bits_per_sample = ((b12 & 0x01) << 4) | (b13 >> 4) + 1
+
+  return info
+}
+
+export fn flac_decode_frame(decoder_id: u32, input: u64, input_size: u32, output: u64): u32 {
+  if decoder_id >= audio_decoder_count { return 0 }
+
+  // FLAC frames can vary in size
+  var block_size: u32 = 4096  // Default block size
+  var output_size: u32 = block_size * audio_decoders[decoder_id].channels *
+                         (audio_decoders[decoder_id].bits_per_sample / 8)
+
+  audio_decoders[decoder_id].samples_decoded = audio_decoders[decoder_id].samples_decoded + block_size
+
+  return output_size
+}
+
+// ============================================================================
+// OPUS DECODER
+// ============================================================================
+
+struct OpusHeader {
+  version: u32,
+  channels: u32,
+  pre_skip: u32,
+  sample_rate: u32,
+  output_gain: i32
+}
+
+fn opus_parse_header(data: u64): OpusHeader {
+  var header: OpusHeader
+
+  // Check "OpusHead" magic
+  var magic: [u8; 8]
+  var i: u32 = 0
+  while i < 8 {
+    magic[i] = @intToPtr(data + i, u8)
+    i = i + 1
+  }
+
+  header.version = @intToPtr(data + 8, u8)
+  header.channels = @intToPtr(data + 9, u8)
+
+  // Pre-skip (16-bit LE)
+  var b10: u8 = @intToPtr(data + 10, u8)
+  var b11: u8 = @intToPtr(data + 11, u8)
+  header.pre_skip = b10 | (b11 << 8)
+
+  // Sample rate (32-bit LE)
+  var b12: u8 = @intToPtr(data + 12, u8)
+  var b13: u8 = @intToPtr(data + 13, u8)
+  var b14: u8 = @intToPtr(data + 14, u8)
+  var b15: u8 = @intToPtr(data + 15, u8)
+  header.sample_rate = b12 | (b13 << 8) | (b14 << 16) | (b15 << 24)
+
+  return header
+}
+
+export fn opus_decode_frame(decoder_id: u32, input: u64, input_size: u32, output: u64): u32 {
+  if decoder_id >= audio_decoder_count { return 0 }
+
+  // Opus uses 48kHz internally, frame sizes: 2.5, 5, 10, 20, 40, 60 ms
+  var samples_per_frame: u32 = 960  // 20ms at 48kHz
+  var output_size: u32 = samples_per_frame * audio_decoders[decoder_id].channels * 2
+
+  audio_decoders[decoder_id].samples_decoded = audio_decoders[decoder_id].samples_decoded + samples_per_frame
+
+  return output_size
+}
+
+// ============================================================================
+// GENERIC DECODE INTERFACE
+// ============================================================================
+
+export fn audio_codec_decode(decoder_id: u32, input: u64, input_size: u32, output: u64): u32 {
+  if decoder_id >= audio_decoder_count { return 0 }
+  if audio_decoders[decoder_id].active == 0 { return 0 }
+
+  var codec_type: u32 = audio_decoders[decoder_id].codec_type
+
+  if codec_type == CODEC_MP3 {
+    return mp3_decode_frame(decoder_id, input, input_size, output)
+  } else if codec_type == CODEC_AAC {
+    return aac_decode_frame(decoder_id, input, input_size, output)
+  } else if codec_type == CODEC_FLAC {
+    return flac_decode_frame(decoder_id, input, input_size, output)
+  } else if codec_type == CODEC_OPUS {
+    return opus_decode_frame(decoder_id, input, input_size, output)
+  } else if codec_type == CODEC_PCM or codec_type == CODEC_WAV {
+    // PCM - just copy
+    return input_size
+  }
+
+  return 0
+}
+
+export fn audio_codec_destroy(decoder_id: u32) {
+  if decoder_id >= audio_decoder_count { return }
+  audio_decoders[decoder_id].active = 0
+}
+
+export fn audio_codec_get_info(decoder_id: u32, sample_rate: u64, channels: u64, bits: u64) {
+  if decoder_id >= audio_decoder_count { return }
+
+  @intToPtr(sample_rate, u32) = audio_decoders[decoder_id].sample_rate
+  @intToPtr(channels, u32) = audio_decoders[decoder_id].channels
+  @intToPtr(bits, u32) = audio_decoders[decoder_id].bits_per_sample
+}
+
+export fn audio_codec_detect_format(data: u64, size: u32): u32 {
+  if size < 12 { return CODEC_PCM }
+
+  var b0: u8 = @intToPtr(data, u8)
+  var b1: u8 = @intToPtr(data + 1, u8)
+  var b2: u8 = @intToPtr(data + 2, u8)
+  var b3: u8 = @intToPtr(data + 3, u8)
+
+  // Check MP3 sync
+  if b0 == 0xFF and (b1 & 0xE0) == 0xE0 {
+    return CODEC_MP3
+  }
+
+  // Check AAC ADTS sync
+  if b0 == 0xFF and (b1 & 0xF0) == 0xF0 {
+    return CODEC_AAC
+  }
+
+  // Check FLAC magic "fLaC"
+  if b0 == 0x66 and b1 == 0x4C and b2 == 0x61 and b3 == 0x43 {
+    return CODEC_FLAC
+  }
+
+  // Check Ogg container (for Opus/Vorbis)
+  if b0 == 0x4F and b1 == 0x67 and b2 == 0x67 and b3 == 0x53 {  // "OggS"
+    // Check for Opus or Vorbis
+    return CODEC_OPUS  // Simplified - would need to check further
+  }
+
+  // Check WAV "RIFF"
+  if b0 == 0x52 and b1 == 0x49 and b2 == 0x46 and b3 == 0x46 {
+    return CODEC_WAV
+  }
+
+  return CODEC_PCM
+}

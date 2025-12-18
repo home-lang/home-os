@@ -1,0 +1,710 @@
+// home-os Kernel - SSH (Secure Shell) Protocol
+// SSH server and client implementation
+
+import "../core/foundation.home" as foundation
+import "../crypto/aes.home" as aes
+import "../crypto/sha256.home" as sha256
+import "tcp.home" as tcp
+
+// SSH Protocol Constants
+const SSH_PORT: u16 = 22
+const SSH_VERSION: u64 = @ptrFromInt("SSH-2.0-HomeOS_1.0")
+
+// SSH Message Types
+const SSH_MSG_DISCONNECT: u8 = 1
+const SSH_MSG_IGNORE: u8 = 2
+const SSH_MSG_UNIMPLEMENTED: u8 = 3
+const SSH_MSG_DEBUG: u8 = 4
+const SSH_MSG_SERVICE_REQUEST: u8 = 5
+const SSH_MSG_SERVICE_ACCEPT: u8 = 6
+const SSH_MSG_KEXINIT: u8 = 20
+const SSH_MSG_NEWKEYS: u8 = 21
+const SSH_MSG_KEXDH_INIT: u8 = 30
+const SSH_MSG_KEXDH_REPLY: u8 = 31
+const SSH_MSG_USERAUTH_REQUEST: u8 = 50
+const SSH_MSG_USERAUTH_FAILURE: u8 = 51
+const SSH_MSG_USERAUTH_SUCCESS: u8 = 52
+const SSH_MSG_CHANNEL_OPEN: u8 = 90
+const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91
+const SSH_MSG_CHANNEL_OPEN_FAILURE: u8 = 92
+const SSH_MSG_CHANNEL_WINDOW_ADJUST: u8 = 93
+const SSH_MSG_CHANNEL_DATA: u8 = 94
+const SSH_MSG_CHANNEL_EOF: u8 = 96
+const SSH_MSG_CHANNEL_CLOSE: u8 = 97
+const SSH_MSG_CHANNEL_REQUEST: u8 = 98
+const SSH_MSG_CHANNEL_SUCCESS: u8 = 99
+const SSH_MSG_CHANNEL_FAILURE: u8 = 100
+
+// SSH Disconnect Reasons
+const SSH_DISCONNECT_HOST_NOT_ALLOWED: u32 = 1
+const SSH_DISCONNECT_PROTOCOL_ERROR: u32 = 2
+const SSH_DISCONNECT_KEY_EXCHANGE_FAILED: u32 = 3
+const SSH_DISCONNECT_AUTH_CANCELLED: u32 = 13
+
+// Maximum connections
+const MAX_SSH_CONNECTIONS: u32 = 16
+const MAX_SSH_CHANNELS: u32 = 64
+
+// Connection states
+const SSH_STATE_INIT: u32 = 0
+const SSH_STATE_VERSION_EXCHANGE: u32 = 1
+const SSH_STATE_KEX: u32 = 2
+const SSH_STATE_AUTH: u32 = 3
+const SSH_STATE_ESTABLISHED: u32 = 4
+const SSH_STATE_CLOSED: u32 = 5
+
+struct SSHChannel {
+  local_id: u32,
+  remote_id: u32,
+  local_window: u32,
+  remote_window: u32,
+  max_packet: u32,
+  channel_type: u32,  // 0=session, 1=forwarded-tcpip, etc.
+  active: u32
+}
+
+struct SSHConnection {
+  socket_fd: u32,
+  state: u32,
+  is_server: u32,
+
+  // Peer info
+  peer_version: [u8; 256],
+  peer_ip: u32,
+  peer_port: u16,
+
+  // Session keys
+  session_id: [u8; 32],
+  encryption_key_c2s: [u8; 32],
+  encryption_key_s2c: [u8; 32],
+  mac_key_c2s: [u8; 32],
+  mac_key_s2c: [u8; 32],
+
+  // Sequence numbers
+  seq_num_c2s: u32,
+  seq_num_s2c: u32,
+
+  // Channels
+  channels: [SSHChannel; 8],
+  channel_count: u32,
+
+  // Authentication
+  username: [u8; 64],
+  authenticated: u32,
+
+  active: u32
+}
+
+var ssh_connections: [SSHConnection; 16]
+var ssh_connection_count: u32 = 0
+var ssh_server_socket: u32 = 0xFFFFFFFF
+var ssh_server_running: u32 = 0
+
+// Host keys
+var ssh_host_rsa_key: [u8; 4096]
+var ssh_host_ed25519_key: [u8; 64]
+var ssh_host_key_loaded: u32 = 0
+
+// ============================================================================
+// SERVER FUNCTIONS
+// ============================================================================
+
+export fn ssh_server_init(): u32 {
+  if ssh_server_running == 1 { return 1 }
+
+  // Create server socket
+  ssh_server_socket = tcp.tcp_socket_create()
+  if ssh_server_socket == 0xFFFFFFFF { return 0 }
+
+  // Bind to SSH port
+  if tcp.tcp_socket_bind(ssh_server_socket, 0, SSH_PORT) != 0 {
+    tcp.tcp_socket_close(ssh_server_socket)
+    return 0
+  }
+
+  // Listen for connections
+  if tcp.tcp_socket_listen(ssh_server_socket, 5) != 0 {
+    tcp.tcp_socket_close(ssh_server_socket)
+    return 0
+  }
+
+  ssh_server_running = 1
+  foundation.serial_write_string("[SSH] Server started on port 22\n")
+
+  return 1
+}
+
+export fn ssh_server_stop() {
+  if ssh_server_running == 0 { return }
+
+  // Close all connections
+  var i: u32 = 0
+  while i < ssh_connection_count {
+    if ssh_connections[i].active == 1 {
+      ssh_disconnect(i, SSH_DISCONNECT_HOST_NOT_ALLOWED, "Server shutting down")
+    }
+    i = i + 1
+  }
+
+  tcp.tcp_socket_close(ssh_server_socket)
+  ssh_server_socket = 0xFFFFFFFF
+  ssh_server_running = 0
+
+  foundation.serial_write_string("[SSH] Server stopped\n")
+}
+
+export fn ssh_server_accept(): u32 {
+  if ssh_server_running == 0 { return 0xFFFFFFFF }
+  if ssh_connection_count >= MAX_SSH_CONNECTIONS { return 0xFFFFFFFF }
+
+  var client_socket: u32 = tcp.tcp_socket_accept(ssh_server_socket)
+  if client_socket == 0xFFFFFFFF { return 0xFFFFFFFF }
+
+  // Initialize connection
+  var conn_id: u32 = ssh_connection_count
+  ssh_connections[conn_id].socket_fd = client_socket
+  ssh_connections[conn_id].state = SSH_STATE_INIT
+  ssh_connections[conn_id].is_server = 1
+  ssh_connections[conn_id].seq_num_c2s = 0
+  ssh_connections[conn_id].seq_num_s2c = 0
+  ssh_connections[conn_id].channel_count = 0
+  ssh_connections[conn_id].authenticated = 0
+  ssh_connections[conn_id].active = 1
+
+  ssh_connection_count = ssh_connection_count + 1
+
+  // Send version string
+  ssh_send_version(conn_id)
+
+  foundation.serial_write_string("[SSH] Client connected, conn_id=")
+  foundation.serial_write_hex(conn_id)
+  foundation.serial_write_string("\n")
+
+  return conn_id
+}
+
+fn ssh_send_version(conn_id: u32) {
+  var version_string: [u8; 64]
+  var pos: u32 = 0
+
+  // "SSH-2.0-HomeOS_1.0\r\n"
+  version_string[0] = 'S'
+  version_string[1] = 'S'
+  version_string[2] = 'H'
+  version_string[3] = '-'
+  version_string[4] = '2'
+  version_string[5] = '.'
+  version_string[6] = '0'
+  version_string[7] = '-'
+  version_string[8] = 'H'
+  version_string[9] = 'o'
+  version_string[10] = 'm'
+  version_string[11] = 'e'
+  version_string[12] = 'O'
+  version_string[13] = 'S'
+  version_string[14] = '_'
+  version_string[15] = '1'
+  version_string[16] = '.'
+  version_string[17] = '0'
+  version_string[18] = '\r'
+  version_string[19] = '\n'
+  version_string[20] = 0
+
+  tcp.tcp_socket_send(ssh_connections[conn_id].socket_fd, @ptrFromInt(version_string), 20)
+  ssh_connections[conn_id].state = SSH_STATE_VERSION_EXCHANGE
+}
+
+// ============================================================================
+// CLIENT FUNCTIONS
+// ============================================================================
+
+export fn ssh_connect(host: u64, port: u16, username: u64, password: u64): u32 {
+  if ssh_connection_count >= MAX_SSH_CONNECTIONS { return 0xFFFFFFFF }
+
+  // Create socket and connect
+  var socket_fd: u32 = tcp.tcp_socket_create()
+  if socket_fd == 0xFFFFFFFF { return 0xFFFFFFFF }
+
+  // Parse host (simplified - just use IP for now)
+  var ip: u32 = ssh_parse_ip(host)
+  if tcp.tcp_socket_connect(socket_fd, ip, port) != 0 {
+    tcp.tcp_socket_close(socket_fd)
+    return 0xFFFFFFFF
+  }
+
+  // Initialize connection
+  var conn_id: u32 = ssh_connection_count
+  ssh_connections[conn_id].socket_fd = socket_fd
+  ssh_connections[conn_id].state = SSH_STATE_INIT
+  ssh_connections[conn_id].is_server = 0
+  ssh_connections[conn_id].seq_num_c2s = 0
+  ssh_connections[conn_id].seq_num_s2c = 0
+  ssh_connections[conn_id].channel_count = 0
+  ssh_connections[conn_id].authenticated = 0
+  ssh_connections[conn_id].active = 1
+
+  // Copy username
+  ssh_copy_string(@ptrFromInt(ssh_connections[conn_id].username), username, 64)
+
+  ssh_connection_count = ssh_connection_count + 1
+
+  // Receive server version
+  var buffer: [u8; 256]
+  var received: u32 = tcp.tcp_socket_recv(socket_fd, @ptrFromInt(buffer), 256)
+  if received > 0 {
+    ssh_copy_string(@ptrFromInt(ssh_connections[conn_id].peer_version), @ptrFromInt(buffer), 256)
+  }
+
+  // Send our version
+  ssh_send_version(conn_id)
+
+  // Start key exchange
+  ssh_start_kex(conn_id)
+
+  // Authenticate
+  if ssh_authenticate_password(conn_id, password) == 0 {
+    ssh_disconnect(conn_id, SSH_DISCONNECT_AUTH_CANCELLED, "Authentication failed")
+    return 0xFFFFFFFF
+  }
+
+  foundation.serial_write_string("[SSH] Connected to host\n")
+  return conn_id
+}
+
+fn ssh_parse_ip(host: u64): u32 {
+  // Simple IP parser (a.b.c.d format)
+  var ip: u32 = 0
+  var octet: u32 = 0
+  var pos: u32 = 0
+  var shift: u32 = 24
+
+  loop {
+    var ch: u8 = @intToPtr(host + pos, u8)
+    if ch == 0 { break }
+
+    if ch >= '0' and ch <= '9' {
+      octet = octet * 10 + (ch - '0')
+    } else if ch == '.' {
+      ip = ip | (octet << shift)
+      octet = 0
+      shift = shift - 8
+    }
+    pos = pos + 1
+  }
+
+  ip = ip | octet  // Last octet
+  return ip
+}
+
+// ============================================================================
+// KEY EXCHANGE
+// ============================================================================
+
+fn ssh_start_kex(conn_id: u32) {
+  ssh_connections[conn_id].state = SSH_STATE_KEX
+
+  // Send SSH_MSG_KEXINIT
+  var kexinit: [u8; 512]
+  var pos: u32 = 0
+
+  kexinit[pos] = SSH_MSG_KEXINIT
+  pos = pos + 1
+
+  // Cookie (16 random bytes)
+  var i: u32 = 0
+  while i < 16 {
+    kexinit[pos] = foundation.random_byte()
+    pos = pos + 1
+    i = i + 1
+  }
+
+  // Key exchange algorithms
+  pos = ssh_write_name_list(@ptrFromInt(kexinit) + pos, "curve25519-sha256,diffie-hellman-group14-sha256")
+
+  // Host key algorithms
+  pos = pos + ssh_write_name_list(@ptrFromInt(kexinit) + pos, "ssh-ed25519,ssh-rsa")
+
+  // Encryption algorithms (client to server)
+  pos = pos + ssh_write_name_list(@ptrFromInt(kexinit) + pos, "aes256-ctr,aes128-ctr,chacha20-poly1305@openssh.com")
+
+  // Encryption algorithms (server to client)
+  pos = pos + ssh_write_name_list(@ptrFromInt(kexinit) + pos, "aes256-ctr,aes128-ctr,chacha20-poly1305@openssh.com")
+
+  // MAC algorithms
+  pos = pos + ssh_write_name_list(@ptrFromInt(kexinit) + pos, "hmac-sha2-256,hmac-sha2-512")
+  pos = pos + ssh_write_name_list(@ptrFromInt(kexinit) + pos, "hmac-sha2-256,hmac-sha2-512")
+
+  // Compression algorithms
+  pos = pos + ssh_write_name_list(@ptrFromInt(kexinit) + pos, "none")
+  pos = pos + ssh_write_name_list(@ptrFromInt(kexinit) + pos, "none")
+
+  // Languages
+  pos = pos + ssh_write_name_list(@ptrFromInt(kexinit) + pos, "")
+  pos = pos + ssh_write_name_list(@ptrFromInt(kexinit) + pos, "")
+
+  // First KEX packet follows
+  kexinit[pos] = 0
+  pos = pos + 1
+
+  // Reserved
+  kexinit[pos] = 0
+  kexinit[pos + 1] = 0
+  kexinit[pos + 2] = 0
+  kexinit[pos + 3] = 0
+  pos = pos + 4
+
+  ssh_send_packet(conn_id, @ptrFromInt(kexinit), pos)
+}
+
+fn ssh_write_name_list(output: u64, names: u64): u32 {
+  // Write length-prefixed name list
+  var len: u32 = 0
+  var i: u32 = 0
+  while @intToPtr(names + i, u8) != 0 {
+    len = len + 1
+    i = i + 1
+  }
+
+  // Write length (big-endian 32-bit)
+  @intToPtr(output, u8) = (len >> 24) & 0xFF
+  @intToPtr(output + 1, u8) = (len >> 16) & 0xFF
+  @intToPtr(output + 2, u8) = (len >> 8) & 0xFF
+  @intToPtr(output + 3, u8) = len & 0xFF
+
+  // Write names
+  i = 0
+  while i < len {
+    @intToPtr(output + 4 + i, u8) = @intToPtr(names + i, u8)
+    i = i + 1
+  }
+
+  return 4 + len
+}
+
+// ============================================================================
+// AUTHENTICATION
+// ============================================================================
+
+fn ssh_authenticate_password(conn_id: u32, password: u64): u32 {
+  ssh_connections[conn_id].state = SSH_STATE_AUTH
+
+  // Send SSH_MSG_USERAUTH_REQUEST
+  var request: [u8; 512]
+  var pos: u32 = 0
+
+  request[pos] = SSH_MSG_USERAUTH_REQUEST
+  pos = pos + 1
+
+  // Username
+  pos = pos + ssh_write_string(@ptrFromInt(request) + pos, @ptrFromInt(ssh_connections[conn_id].username))
+
+  // Service name
+  pos = pos + ssh_write_string(@ptrFromInt(request) + pos, @ptrFromInt("ssh-connection"))
+
+  // Method name
+  pos = pos + ssh_write_string(@ptrFromInt(request) + pos, @ptrFromInt("password"))
+
+  // Boolean FALSE (no password change)
+  request[pos] = 0
+  pos = pos + 1
+
+  // Password
+  pos = pos + ssh_write_string(@ptrFromInt(request) + pos, password)
+
+  ssh_send_packet(conn_id, @ptrFromInt(request), pos)
+
+  // Wait for response
+  var response: [u8; 256]
+  var response_len: u32 = ssh_recv_packet(conn_id, @ptrFromInt(response), 256)
+
+  if response_len > 0 and response[0] == SSH_MSG_USERAUTH_SUCCESS {
+    ssh_connections[conn_id].authenticated = 1
+    ssh_connections[conn_id].state = SSH_STATE_ESTABLISHED
+    return 1
+  }
+
+  return 0
+}
+
+fn ssh_write_string(output: u64, str: u64): u32 {
+  var len: u32 = 0
+  while @intToPtr(str + len, u8) != 0 {
+    len = len + 1
+  }
+
+  // Write length (big-endian 32-bit)
+  @intToPtr(output, u8) = (len >> 24) & 0xFF
+  @intToPtr(output + 1, u8) = (len >> 16) & 0xFF
+  @intToPtr(output + 2, u8) = (len >> 8) & 0xFF
+  @intToPtr(output + 3, u8) = len & 0xFF
+
+  // Write string
+  var i: u32 = 0
+  while i < len {
+    @intToPtr(output + 4 + i, u8) = @intToPtr(str + i, u8)
+    i = i + 1
+  }
+
+  return 4 + len
+}
+
+// ============================================================================
+// CHANNEL OPERATIONS
+// ============================================================================
+
+export fn ssh_open_channel(conn_id: u32, channel_type: u64): u32 {
+  if conn_id >= ssh_connection_count { return 0xFFFFFFFF }
+  if ssh_connections[conn_id].authenticated == 0 { return 0xFFFFFFFF }
+  if ssh_connections[conn_id].channel_count >= 8 { return 0xFFFFFFFF }
+
+  var channel_id: u32 = ssh_connections[conn_id].channel_count
+
+  ssh_connections[conn_id].channels[channel_id].local_id = channel_id
+  ssh_connections[conn_id].channels[channel_id].local_window = 1048576  // 1MB
+  ssh_connections[conn_id].channels[channel_id].max_packet = 32768
+  ssh_connections[conn_id].channels[channel_id].active = 1
+
+  // Send SSH_MSG_CHANNEL_OPEN
+  var request: [u8; 256]
+  var pos: u32 = 0
+
+  request[pos] = SSH_MSG_CHANNEL_OPEN
+  pos = pos + 1
+
+  pos = pos + ssh_write_string(@ptrFromInt(request) + pos, channel_type)
+
+  // Sender channel
+  request[pos] = (channel_id >> 24) & 0xFF
+  request[pos + 1] = (channel_id >> 16) & 0xFF
+  request[pos + 2] = (channel_id >> 8) & 0xFF
+  request[pos + 3] = channel_id & 0xFF
+  pos = pos + 4
+
+  // Initial window size
+  var window: u32 = 1048576
+  request[pos] = (window >> 24) & 0xFF
+  request[pos + 1] = (window >> 16) & 0xFF
+  request[pos + 2] = (window >> 8) & 0xFF
+  request[pos + 3] = window & 0xFF
+  pos = pos + 4
+
+  // Maximum packet size
+  var max_pkt: u32 = 32768
+  request[pos] = (max_pkt >> 24) & 0xFF
+  request[pos + 1] = (max_pkt >> 16) & 0xFF
+  request[pos + 2] = (max_pkt >> 8) & 0xFF
+  request[pos + 3] = max_pkt & 0xFF
+  pos = pos + 4
+
+  ssh_send_packet(conn_id, @ptrFromInt(request), pos)
+
+  ssh_connections[conn_id].channel_count = ssh_connections[conn_id].channel_count + 1
+
+  return channel_id
+}
+
+export fn ssh_channel_send(conn_id: u32, channel_id: u32, data: u64, length: u32): u32 {
+  if conn_id >= ssh_connection_count { return 0 }
+  if channel_id >= ssh_connections[conn_id].channel_count { return 0 }
+
+  // Send SSH_MSG_CHANNEL_DATA
+  var packet: [u8; 65536]
+  var pos: u32 = 0
+
+  packet[pos] = SSH_MSG_CHANNEL_DATA
+  pos = pos + 1
+
+  // Recipient channel
+  var remote_id: u32 = ssh_connections[conn_id].channels[channel_id].remote_id
+  packet[pos] = (remote_id >> 24) & 0xFF
+  packet[pos + 1] = (remote_id >> 16) & 0xFF
+  packet[pos + 2] = (remote_id >> 8) & 0xFF
+  packet[pos + 3] = remote_id & 0xFF
+  pos = pos + 4
+
+  // Data length
+  packet[pos] = (length >> 24) & 0xFF
+  packet[pos + 1] = (length >> 16) & 0xFF
+  packet[pos + 2] = (length >> 8) & 0xFF
+  packet[pos + 3] = length & 0xFF
+  pos = pos + 4
+
+  // Copy data
+  var i: u32 = 0
+  while i < length {
+    packet[pos + i] = @intToPtr(data + i, u8)
+    i = i + 1
+  }
+  pos = pos + length
+
+  ssh_send_packet(conn_id, @ptrFromInt(packet), pos)
+
+  return length
+}
+
+export fn ssh_channel_recv(conn_id: u32, channel_id: u32, buffer: u64, max_len: u32): u32 {
+  if conn_id >= ssh_connection_count { return 0 }
+  if channel_id >= ssh_connections[conn_id].channel_count { return 0 }
+
+  // Receive packet
+  var packet: [u8; 65536]
+  var len: u32 = ssh_recv_packet(conn_id, @ptrFromInt(packet), 65536)
+
+  if len == 0 { return 0 }
+  if packet[0] != SSH_MSG_CHANNEL_DATA { return 0 }
+
+  // Extract data length
+  var data_len: u32 = (packet[5] << 24) | (packet[6] << 16) | (packet[7] << 8) | packet[8]
+  if data_len > max_len { data_len = max_len }
+
+  // Copy data
+  var i: u32 = 0
+  while i < data_len {
+    @intToPtr(buffer + i, u8) = packet[9 + i]
+    i = i + 1
+  }
+
+  return data_len
+}
+
+export fn ssh_channel_close(conn_id: u32, channel_id: u32) {
+  if conn_id >= ssh_connection_count { return }
+  if channel_id >= ssh_connections[conn_id].channel_count { return }
+
+  // Send SSH_MSG_CHANNEL_CLOSE
+  var packet: [u8; 16]
+  packet[0] = SSH_MSG_CHANNEL_CLOSE
+  var remote_id: u32 = ssh_connections[conn_id].channels[channel_id].remote_id
+  packet[1] = (remote_id >> 24) & 0xFF
+  packet[2] = (remote_id >> 16) & 0xFF
+  packet[3] = (remote_id >> 8) & 0xFF
+  packet[4] = remote_id & 0xFF
+
+  ssh_send_packet(conn_id, @ptrFromInt(packet), 5)
+
+  ssh_connections[conn_id].channels[channel_id].active = 0
+}
+
+// ============================================================================
+// PACKET I/O
+// ============================================================================
+
+fn ssh_send_packet(conn_id: u32, payload: u64, payload_len: u32) {
+  var packet: [u8; 65536]
+  var pos: u32 = 0
+
+  // Calculate padding
+  var block_size: u32 = 16  // AES block size
+  var padding_len: u32 = block_size - ((4 + 1 + payload_len) % block_size)
+  if padding_len < 4 { padding_len = padding_len + block_size }
+
+  var packet_len: u32 = 1 + payload_len + padding_len
+
+  // Packet length (big-endian)
+  packet[0] = (packet_len >> 24) & 0xFF
+  packet[1] = (packet_len >> 16) & 0xFF
+  packet[2] = (packet_len >> 8) & 0xFF
+  packet[3] = packet_len & 0xFF
+  pos = 4
+
+  // Padding length
+  packet[pos] = padding_len
+  pos = pos + 1
+
+  // Payload
+  var i: u32 = 0
+  while i < payload_len {
+    packet[pos + i] = @intToPtr(payload + i, u8)
+    i = i + 1
+  }
+  pos = pos + payload_len
+
+  // Random padding
+  i = 0
+  while i < padding_len {
+    packet[pos + i] = foundation.random_byte()
+    i = i + 1
+  }
+  pos = pos + padding_len
+
+  // TODO: Encrypt packet if keys established
+  // TODO: Add MAC
+
+  tcp.tcp_socket_send(ssh_connections[conn_id].socket_fd, @ptrFromInt(packet), pos)
+  ssh_connections[conn_id].seq_num_c2s = ssh_connections[conn_id].seq_num_c2s + 1
+}
+
+fn ssh_recv_packet(conn_id: u32, buffer: u64, max_len: u32): u32 {
+  // Read packet length
+  var header: [u8; 4]
+  var received: u32 = tcp.tcp_socket_recv(ssh_connections[conn_id].socket_fd, @ptrFromInt(header), 4)
+  if received < 4 { return 0 }
+
+  var packet_len: u32 = (header[0] << 24) | (header[1] << 16) | (header[2] << 8) | header[3]
+  if packet_len > max_len { return 0 }
+
+  // Read rest of packet
+  received = tcp.tcp_socket_recv(ssh_connections[conn_id].socket_fd, buffer, packet_len)
+
+  // TODO: Decrypt if keys established
+  // TODO: Verify MAC
+
+  ssh_connections[conn_id].seq_num_s2c = ssh_connections[conn_id].seq_num_s2c + 1
+
+  // Skip padding length byte, return payload
+  var padding_len: u32 = @intToPtr(buffer, u8)
+  return packet_len - 1 - padding_len
+}
+
+// ============================================================================
+// DISCONNECT
+// ============================================================================
+
+export fn ssh_disconnect(conn_id: u32, reason: u32, description: u64) {
+  if conn_id >= ssh_connection_count { return }
+  if ssh_connections[conn_id].active == 0 { return }
+
+  // Send SSH_MSG_DISCONNECT
+  var packet: [u8; 512]
+  var pos: u32 = 0
+
+  packet[pos] = SSH_MSG_DISCONNECT
+  pos = pos + 1
+
+  // Reason code
+  packet[pos] = (reason >> 24) & 0xFF
+  packet[pos + 1] = (reason >> 16) & 0xFF
+  packet[pos + 2] = (reason >> 8) & 0xFF
+  packet[pos + 3] = reason & 0xFF
+  pos = pos + 4
+
+  // Description
+  pos = pos + ssh_write_string(@ptrFromInt(packet) + pos, description)
+
+  // Language tag (empty)
+  pos = pos + ssh_write_string(@ptrFromInt(packet) + pos, @ptrFromInt(""))
+
+  ssh_send_packet(conn_id, @ptrFromInt(packet), pos)
+
+  tcp.tcp_socket_close(ssh_connections[conn_id].socket_fd)
+  ssh_connections[conn_id].active = 0
+
+  foundation.serial_write_string("[SSH] Disconnected, conn_id=")
+  foundation.serial_write_hex(conn_id)
+  foundation.serial_write_string("\n")
+}
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+fn ssh_copy_string(dest: u64, src: u64, max_len: u32) {
+  var i: u32 = 0
+  while i < max_len - 1 {
+    var ch: u8 = @intToPtr(src + i, u8)
+    @intToPtr(dest + i, u8) = ch
+    if ch == 0 { return }
+    i = i + 1
+  }
+  @intToPtr(dest + i, u8) = 0
+}

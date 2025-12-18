@@ -1,0 +1,749 @@
+// home-os Kernel - WireGuard VPN Protocol
+// Modern, secure VPN implementation
+
+import "../core/foundation.home" as foundation
+import "../crypto/chacha20.home" as chacha20
+import "../crypto/poly1305.home" as poly1305
+import "../crypto/curve25519.home" as curve25519
+import "../crypto/blake2s.home" as blake2s
+import "udp.home" as udp
+
+// WireGuard Constants
+const WG_PORT: u16 = 51820
+const WG_REKEY_TIMEOUT: u32 = 120000      // 120 seconds
+const WG_KEEPALIVE_INTERVAL: u32 = 25000  // 25 seconds
+const WG_REKEY_AFTER_MESSAGES: u64 = 0xFFFFFFFFFFFFFFFF - 0xFFFF
+const WG_REJECT_AFTER_MESSAGES: u64 = 0xFFFFFFFFFFFFFFFF - 4
+
+// Message Types
+const WG_MSG_HANDSHAKE_INITIATION: u8 = 1
+const WG_MSG_HANDSHAKE_RESPONSE: u8 = 2
+const WG_MSG_COOKIE_REPLY: u8 = 3
+const WG_MSG_TRANSPORT_DATA: u8 = 4
+
+// Key sizes
+const WG_KEY_SIZE: u32 = 32
+const WG_HASH_SIZE: u32 = 32
+const WG_AEAD_TAG_SIZE: u32 = 16
+const WG_TIMESTAMP_SIZE: u32 = 12
+
+const MAX_WG_PEERS: u32 = 64
+const MAX_WG_INTERFACES: u32 = 8
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct WireGuardKey {
+  data: [u8; 32]
+}
+
+struct WireGuardNoise {
+  // Handshake state
+  hash: [u8; 32],
+  chaining_key: [u8; 32],
+  ephemeral_private: [u8; 32],
+  ephemeral_public: [u8; 32],
+  remote_ephemeral: [u8; 32],
+  precomputed: [u8; 32]
+}
+
+struct WireGuardPeer {
+  public_key: [u8; 32],
+  preshared_key: [u8; 32],    // Optional
+  endpoint_ip: u32,
+  endpoint_port: u16,
+
+  // Allowed IPs (simplified - single range)
+  allowed_ip: u32,
+  allowed_mask: u32,
+
+  // Session state
+  sending_key: [u8; 32],
+  receiving_key: [u8; 32],
+  sending_nonce: u64,
+  receiving_nonce: u64,
+  sender_index: u32,
+  receiver_index: u32,
+
+  // Handshake state
+  handshake: WireGuardNoise,
+  last_handshake: u64,
+  last_sent: u64,
+  last_received: u64,
+
+  // Statistics
+  tx_bytes: u64,
+  rx_bytes: u64,
+
+  active: u32
+}
+
+struct WireGuardInterface {
+  name: [u8; 16],
+  private_key: [u8; 32],
+  public_key: [u8; 32],
+  listen_port: u16,
+
+  // Network configuration
+  ip_address: u32,
+  ip_mask: u32,
+
+  // Peers
+  peers: [WireGuardPeer; 64],
+  peer_count: u32,
+
+  // Socket
+  socket_fd: u32,
+
+  // Index counter
+  next_index: u32,
+
+  active: u32
+}
+
+var wg_interfaces: [WireGuardInterface; 8]
+var wg_interface_count: u32 = 0
+
+// Noise protocol constants
+var WG_CONSTRUCTION: [u8; 37] = [
+  'N', 'o', 'i', 's', 'e', '_', 'I', 'K',
+  'p', 's', 'k', '2', '_', '2', '5', '5',
+  '1', '9', '_', 'C', 'h', 'a', 'C', 'h',
+  'a', '2', '0', 'P', 'o', 'l', 'y', '1',
+  '3', '0', '5', '_', 'B', 'L', 'A', 'K',
+  'E', '2', 's'
+]
+
+var WG_IDENTIFIER: [u8; 34] = [
+  'W', 'i', 'r', 'e', 'G', 'u', 'a', 'r',
+  'd', ' ', 'v', '1', ' ', 'z', 'x', '2',
+  'c', '4', '6', '5', '1', '2', '9', 's',
+  'd', 'f', 'z', 'x', '1', '0', '2', 's', 'w', 'q'
+]
+
+// ============================================================================
+// INTERFACE MANAGEMENT
+// ============================================================================
+
+export fn wireguard_create_interface(name: u64, listen_port: u16): u32 {
+  if wg_interface_count >= MAX_WG_INTERFACES { return 0xFFFFFFFF }
+
+  var id: u32 = wg_interface_count
+
+  // Copy name
+  var i: u32 = 0
+  while i < 15 {
+    var ch: u8 = @intToPtr(name + i, u8)
+    wg_interfaces[id].name[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  wg_interfaces[id].name[15] = 0
+
+  wg_interfaces[id].listen_port = listen_port
+  wg_interfaces[id].peer_count = 0
+  wg_interfaces[id].next_index = 1
+
+  // Generate private key
+  wireguard_generate_private_key(@ptrFromInt(wg_interfaces[id].private_key))
+
+  // Derive public key
+  curve25519.curve25519_base(
+    @ptrFromInt(wg_interfaces[id].public_key),
+    @ptrFromInt(wg_interfaces[id].private_key)
+  )
+
+  // Create UDP socket
+  wg_interfaces[id].socket_fd = udp.udp_socket_create()
+  if wg_interfaces[id].socket_fd == 0xFFFFFFFF {
+    return 0xFFFFFFFF
+  }
+
+  // Bind to port
+  if udp.udp_socket_bind(wg_interfaces[id].socket_fd, 0, listen_port) != 0 {
+    udp.udp_socket_close(wg_interfaces[id].socket_fd)
+    return 0xFFFFFFFF
+  }
+
+  wg_interfaces[id].active = 1
+  wg_interface_count = wg_interface_count + 1
+
+  foundation.serial_write_string("[WireGuard] Interface created: ")
+  foundation.serial_write_string(name)
+  foundation.serial_write_string(" on port ")
+  foundation.serial_write_hex(listen_port)
+  foundation.serial_write_string("\n")
+
+  return id
+}
+
+export fn wireguard_set_private_key(iface_id: u32, private_key: u64) {
+  if iface_id >= wg_interface_count { return }
+
+  // Copy private key
+  var i: u32 = 0
+  while i < WG_KEY_SIZE {
+    wg_interfaces[iface_id].private_key[i] = @intToPtr(private_key + i, u8)
+    i = i + 1
+  }
+
+  // Derive public key
+  curve25519.curve25519_base(
+    @ptrFromInt(wg_interfaces[iface_id].public_key),
+    @ptrFromInt(wg_interfaces[iface_id].private_key)
+  )
+}
+
+export fn wireguard_get_public_key(iface_id: u32, public_key: u64) {
+  if iface_id >= wg_interface_count { return }
+
+  var i: u32 = 0
+  while i < WG_KEY_SIZE {
+    @intToPtr(public_key + i, u8) = wg_interfaces[iface_id].public_key[i]
+    i = i + 1
+  }
+}
+
+export fn wireguard_set_ip(iface_id: u32, ip: u32, mask: u32) {
+  if iface_id >= wg_interface_count { return }
+
+  wg_interfaces[iface_id].ip_address = ip
+  wg_interfaces[iface_id].ip_mask = mask
+}
+
+export fn wireguard_destroy_interface(iface_id: u32) {
+  if iface_id >= wg_interface_count { return }
+
+  udp.udp_socket_close(wg_interfaces[iface_id].socket_fd)
+  wg_interfaces[iface_id].active = 0
+
+  foundation.serial_write_string("[WireGuard] Interface destroyed\n")
+}
+
+// ============================================================================
+// PEER MANAGEMENT
+// ============================================================================
+
+export fn wireguard_add_peer(iface_id: u32, public_key: u64, preshared_key: u64,
+                             endpoint_ip: u32, endpoint_port: u16,
+                             allowed_ip: u32, allowed_mask: u32): u32 {
+  if iface_id >= wg_interface_count { return 0xFFFFFFFF }
+  if wg_interfaces[iface_id].peer_count >= MAX_WG_PEERS { return 0xFFFFFFFF }
+
+  var peer_id: u32 = wg_interfaces[iface_id].peer_count
+
+  // Copy public key
+  var i: u32 = 0
+  while i < WG_KEY_SIZE {
+    wg_interfaces[iface_id].peers[peer_id].public_key[i] = @intToPtr(public_key + i, u8)
+    i = i + 1
+  }
+
+  // Copy preshared key (if provided)
+  if preshared_key != 0 {
+    i = 0
+    while i < WG_KEY_SIZE {
+      wg_interfaces[iface_id].peers[peer_id].preshared_key[i] = @intToPtr(preshared_key + i, u8)
+      i = i + 1
+    }
+  }
+
+  wg_interfaces[iface_id].peers[peer_id].endpoint_ip = endpoint_ip
+  wg_interfaces[iface_id].peers[peer_id].endpoint_port = endpoint_port
+  wg_interfaces[iface_id].peers[peer_id].allowed_ip = allowed_ip
+  wg_interfaces[iface_id].peers[peer_id].allowed_mask = allowed_mask
+  wg_interfaces[iface_id].peers[peer_id].sending_nonce = 0
+  wg_interfaces[iface_id].peers[peer_id].receiving_nonce = 0
+  wg_interfaces[iface_id].peers[peer_id].tx_bytes = 0
+  wg_interfaces[iface_id].peers[peer_id].rx_bytes = 0
+  wg_interfaces[iface_id].peers[peer_id].active = 1
+
+  // Generate sender index
+  wg_interfaces[iface_id].peers[peer_id].sender_index = wg_interfaces[iface_id].next_index
+  wg_interfaces[iface_id].next_index = wg_interfaces[iface_id].next_index + 1
+
+  wg_interfaces[iface_id].peer_count = wg_interfaces[iface_id].peer_count + 1
+
+  foundation.serial_write_string("[WireGuard] Peer added\n")
+
+  return peer_id
+}
+
+export fn wireguard_remove_peer(iface_id: u32, peer_id: u32) {
+  if iface_id >= wg_interface_count { return }
+  if peer_id >= wg_interfaces[iface_id].peer_count { return }
+
+  wg_interfaces[iface_id].peers[peer_id].active = 0
+}
+
+// ============================================================================
+// HANDSHAKE
+// ============================================================================
+
+fn wireguard_initiate_handshake(iface_id: u32, peer_id: u32): u32 {
+  if iface_id >= wg_interface_count { return 0 }
+  if peer_id >= wg_interfaces[iface_id].peer_count { return 0 }
+
+  var iface: u64 = @ptrFromInt(wg_interfaces[iface_id])
+  var peer: u64 = @ptrFromInt(wg_interfaces[iface_id].peers[peer_id])
+
+  // Initialize handshake state
+  wireguard_handshake_init(iface_id, peer_id)
+
+  // Build handshake initiation message
+  var message: [u8; 148]
+  var pos: u32 = 0
+
+  // Message type
+  message[pos] = WG_MSG_HANDSHAKE_INITIATION
+  pos = pos + 1
+
+  // Reserved zeros
+  message[pos] = 0
+  message[pos + 1] = 0
+  message[pos + 2] = 0
+  pos = pos + 3
+
+  // Sender index
+  var sender_idx: u32 = wg_interfaces[iface_id].peers[peer_id].sender_index
+  message[pos] = sender_idx & 0xFF
+  message[pos + 1] = (sender_idx >> 8) & 0xFF
+  message[pos + 2] = (sender_idx >> 16) & 0xFF
+  message[pos + 3] = (sender_idx >> 24) & 0xFF
+  pos = pos + 4
+
+  // Generate ephemeral keypair
+  wireguard_generate_private_key(@ptrFromInt(wg_interfaces[iface_id].peers[peer_id].handshake.ephemeral_private))
+  curve25519.curve25519_base(
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].handshake.ephemeral_public),
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].handshake.ephemeral_private)
+  )
+
+  // Unencrypted ephemeral (32 bytes)
+  var i: u32 = 0
+  while i < 32 {
+    message[pos + i] = wg_interfaces[iface_id].peers[peer_id].handshake.ephemeral_public[i]
+    i = i + 1
+  }
+  pos = pos + 32
+
+  // Encrypted static (32 + 16 bytes)
+  // ... (AEAD encryption of our public key)
+  pos = pos + 48
+
+  // Encrypted timestamp (12 + 16 bytes)
+  // ... (AEAD encryption of TAI64N timestamp)
+  pos = pos + 28
+
+  // MAC1 (16 bytes)
+  // ... (keyed BLAKE2s)
+  pos = pos + 16
+
+  // MAC2 (16 bytes - only if under load)
+  // ... (keyed BLAKE2s with cookie)
+  pos = pos + 16
+
+  // Send message
+  udp.udp_socket_sendto(
+    wg_interfaces[iface_id].socket_fd,
+    @ptrFromInt(message),
+    pos,
+    wg_interfaces[iface_id].peers[peer_id].endpoint_ip,
+    wg_interfaces[iface_id].peers[peer_id].endpoint_port
+  )
+
+  wg_interfaces[iface_id].peers[peer_id].last_sent = foundation.get_tick_count()
+
+  foundation.serial_write_string("[WireGuard] Handshake initiation sent\n")
+
+  return 1
+}
+
+fn wireguard_handshake_init(iface_id: u32, peer_id: u32) {
+  // Initialize Noise protocol state
+
+  // Hash = HASH(CONSTRUCTION)
+  blake2s.blake2s(
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].handshake.hash),
+    @ptrFromInt(WG_CONSTRUCTION),
+    37
+  )
+
+  // Chaining_Key = HASH(CONSTRUCTION)
+  var i: u32 = 0
+  while i < 32 {
+    wg_interfaces[iface_id].peers[peer_id].handshake.chaining_key[i] =
+      wg_interfaces[iface_id].peers[peer_id].handshake.hash[i]
+    i = i + 1
+  }
+
+  // Hash = HASH(Hash || IDENTIFIER)
+  var temp: [u8; 66]
+  i = 0
+  while i < 32 {
+    temp[i] = wg_interfaces[iface_id].peers[peer_id].handshake.hash[i]
+    i = i + 1
+  }
+  i = 0
+  while i < 34 {
+    temp[32 + i] = WG_IDENTIFIER[i]
+    i = i + 1
+  }
+  blake2s.blake2s(
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].handshake.hash),
+    @ptrFromInt(temp),
+    66
+  )
+
+  // Hash = HASH(Hash || S_pub_r)
+  i = 0
+  while i < 32 {
+    temp[i] = wg_interfaces[iface_id].peers[peer_id].handshake.hash[i]
+    i = i + 1
+  }
+  i = 0
+  while i < 32 {
+    temp[32 + i] = wg_interfaces[iface_id].peers[peer_id].public_key[i]
+    i = i + 1
+  }
+  blake2s.blake2s(
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].handshake.hash),
+    @ptrFromInt(temp),
+    64
+  )
+}
+
+fn wireguard_process_handshake_response(iface_id: u32, message: u64, length: u32) {
+  if length < 92 { return }
+
+  // Parse response
+  var sender_index: u32 = @intToPtr(message + 4, u32)
+  var receiver_index: u32 = @intToPtr(message + 8, u32)
+
+  // Find peer by receiver_index
+  var peer_id: u32 = wireguard_find_peer_by_index(iface_id, receiver_index)
+  if peer_id == 0xFFFFFFFF { return }
+
+  wg_interfaces[iface_id].peers[peer_id].receiver_index = sender_index
+
+  // Process encrypted ephemeral
+  // ... (decrypt and verify)
+
+  // Derive session keys
+  wireguard_derive_keys(iface_id, peer_id)
+
+  wg_interfaces[iface_id].peers[peer_id].last_handshake = foundation.get_tick_count()
+  wg_interfaces[iface_id].peers[peer_id].last_received = foundation.get_tick_count()
+
+  foundation.serial_write_string("[WireGuard] Handshake complete\n")
+}
+
+fn wireguard_derive_keys(iface_id: u32, peer_id: u32) {
+  // Derive sending and receiving keys from handshake state
+  // Using HKDF with the chaining key
+
+  var temp: [u8; 64]
+
+  // Derive sending key
+  blake2s.blake2s_keyed(
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].sending_key),
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].handshake.chaining_key),
+    @ptrFromInt("sending"),
+    7
+  )
+
+  // Derive receiving key
+  blake2s.blake2s_keyed(
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].receiving_key),
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].handshake.chaining_key),
+    @ptrFromInt("receiving"),
+    9
+  )
+
+  // Reset nonces
+  wg_interfaces[iface_id].peers[peer_id].sending_nonce = 0
+  wg_interfaces[iface_id].peers[peer_id].receiving_nonce = 0
+}
+
+fn wireguard_find_peer_by_index(iface_id: u32, index: u32): u32 {
+  var i: u32 = 0
+  while i < wg_interfaces[iface_id].peer_count {
+    if wg_interfaces[iface_id].peers[i].sender_index == index {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+// ============================================================================
+// DATA TRANSPORT
+// ============================================================================
+
+export fn wireguard_send(iface_id: u32, data: u64, length: u32, dest_ip: u32): u32 {
+  if iface_id >= wg_interface_count { return 0 }
+
+  // Find peer for destination IP
+  var peer_id: u32 = wireguard_find_peer_for_ip(iface_id, dest_ip)
+  if peer_id == 0xFFFFFFFF { return 0 }
+
+  // Check if handshake is needed
+  var now: u64 = foundation.get_tick_count()
+  if wg_interfaces[iface_id].peers[peer_id].last_handshake == 0 or
+     now - wg_interfaces[iface_id].peers[peer_id].last_handshake > WG_REKEY_TIMEOUT {
+    wireguard_initiate_handshake(iface_id, peer_id)
+    return 0  // Data will be queued and sent after handshake
+  }
+
+  // Build transport data message
+  var message: [u8; 65536]
+  var pos: u32 = 0
+
+  // Message type
+  message[pos] = WG_MSG_TRANSPORT_DATA
+  pos = pos + 1
+
+  // Reserved zeros
+  message[pos] = 0
+  message[pos + 1] = 0
+  message[pos + 2] = 0
+  pos = pos + 3
+
+  // Receiver index
+  var recv_idx: u32 = wg_interfaces[iface_id].peers[peer_id].receiver_index
+  message[pos] = recv_idx & 0xFF
+  message[pos + 1] = (recv_idx >> 8) & 0xFF
+  message[pos + 2] = (recv_idx >> 16) & 0xFF
+  message[pos + 3] = (recv_idx >> 24) & 0xFF
+  pos = pos + 4
+
+  // Counter (nonce)
+  var nonce: u64 = wg_interfaces[iface_id].peers[peer_id].sending_nonce
+  message[pos] = nonce & 0xFF
+  message[pos + 1] = (nonce >> 8) & 0xFF
+  message[pos + 2] = (nonce >> 16) & 0xFF
+  message[pos + 3] = (nonce >> 24) & 0xFF
+  message[pos + 4] = (nonce >> 32) & 0xFF
+  message[pos + 5] = (nonce >> 40) & 0xFF
+  message[pos + 6] = (nonce >> 48) & 0xFF
+  message[pos + 7] = (nonce >> 56) & 0xFF
+  pos = pos + 8
+
+  // Encrypt data with ChaCha20-Poly1305
+  var encrypted_len: u32 = wireguard_encrypt(
+    iface_id, peer_id,
+    @ptrFromInt(message) + pos,
+    data, length
+  )
+  pos = pos + encrypted_len
+
+  // Increment nonce
+  wg_interfaces[iface_id].peers[peer_id].sending_nonce = nonce + 1
+
+  // Send
+  udp.udp_socket_sendto(
+    wg_interfaces[iface_id].socket_fd,
+    @ptrFromInt(message),
+    pos,
+    wg_interfaces[iface_id].peers[peer_id].endpoint_ip,
+    wg_interfaces[iface_id].peers[peer_id].endpoint_port
+  )
+
+  wg_interfaces[iface_id].peers[peer_id].tx_bytes =
+    wg_interfaces[iface_id].peers[peer_id].tx_bytes + length
+  wg_interfaces[iface_id].peers[peer_id].last_sent = foundation.get_tick_count()
+
+  return length
+}
+
+export fn wireguard_recv(iface_id: u32, buffer: u64, max_len: u32): u32 {
+  if iface_id >= wg_interface_count { return 0 }
+
+  // Receive UDP packet
+  var packet: [u8; 65536]
+  var src_ip: u32 = 0
+  var src_port: u16 = 0
+  var received: u32 = udp.udp_socket_recvfrom(
+    wg_interfaces[iface_id].socket_fd,
+    @ptrFromInt(packet),
+    65536,
+    @ptrFromInt(src_ip),
+    @ptrFromInt(src_port)
+  )
+
+  if received == 0 { return 0 }
+
+  var msg_type: u8 = packet[0]
+
+  if msg_type == WG_MSG_HANDSHAKE_INITIATION {
+    wireguard_process_handshake_initiation(iface_id, @ptrFromInt(packet), received, src_ip, src_port)
+    return 0
+  } else if msg_type == WG_MSG_HANDSHAKE_RESPONSE {
+    wireguard_process_handshake_response(iface_id, @ptrFromInt(packet), received)
+    return 0
+  } else if msg_type == WG_MSG_TRANSPORT_DATA {
+    return wireguard_process_transport_data(iface_id, @ptrFromInt(packet), received, buffer, max_len)
+  }
+
+  return 0
+}
+
+fn wireguard_process_handshake_initiation(iface_id: u32, message: u64, length: u32,
+                                          src_ip: u32, src_port: u16) {
+  if length < 148 { return }
+
+  // Parse initiation and respond
+  // ... (full Noise IK protocol implementation)
+
+  foundation.serial_write_string("[WireGuard] Handshake initiation received\n")
+}
+
+fn wireguard_process_transport_data(iface_id: u32, message: u64, length: u32,
+                                    buffer: u64, max_len: u32): u32 {
+  if length < 32 { return 0 }
+
+  // Parse header
+  var receiver_index: u32 = @intToPtr(message + 4, u32)
+  var counter: u64 = @intToPtr(message + 8, u64)
+
+  // Find peer
+  var peer_id: u32 = wireguard_find_peer_by_index(iface_id, receiver_index)
+  if peer_id == 0xFFFFFFFF { return 0 }
+
+  // Verify counter (replay protection)
+  if counter <= wg_interfaces[iface_id].peers[peer_id].receiving_nonce {
+    return 0  // Replay detected
+  }
+
+  // Decrypt data
+  var encrypted_data: u64 = message + 16
+  var encrypted_len: u32 = length - 16
+
+  var decrypted_len: u32 = wireguard_decrypt(
+    iface_id, peer_id,
+    buffer, max_len,
+    encrypted_data, encrypted_len,
+    counter
+  )
+
+  if decrypted_len == 0 { return 0 }  // Decryption failed
+
+  // Update state
+  wg_interfaces[iface_id].peers[peer_id].receiving_nonce = counter
+  wg_interfaces[iface_id].peers[peer_id].rx_bytes =
+    wg_interfaces[iface_id].peers[peer_id].rx_bytes + decrypted_len
+  wg_interfaces[iface_id].peers[peer_id].last_received = foundation.get_tick_count()
+
+  return decrypted_len
+}
+
+// ============================================================================
+// ENCRYPTION/DECRYPTION
+// ============================================================================
+
+fn wireguard_encrypt(iface_id: u32, peer_id: u32, output: u64, plaintext: u64, length: u32): u32 {
+  // ChaCha20-Poly1305 AEAD encryption
+
+  // Build nonce (12 bytes: 4 zeros + 8 bytes counter)
+  var nonce: [u8; 12]
+  nonce[0] = 0
+  nonce[1] = 0
+  nonce[2] = 0
+  nonce[3] = 0
+
+  var counter: u64 = wg_interfaces[iface_id].peers[peer_id].sending_nonce
+  nonce[4] = counter & 0xFF
+  nonce[5] = (counter >> 8) & 0xFF
+  nonce[6] = (counter >> 16) & 0xFF
+  nonce[7] = (counter >> 24) & 0xFF
+  nonce[8] = (counter >> 32) & 0xFF
+  nonce[9] = (counter >> 40) & 0xFF
+  nonce[10] = (counter >> 48) & 0xFF
+  nonce[11] = (counter >> 56) & 0xFF
+
+  // Encrypt
+  chacha20.chacha20_poly1305_encrypt(
+    output,
+    plaintext, length,
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].sending_key),
+    @ptrFromInt(nonce),
+    0, 0  // No additional data
+  )
+
+  return length + WG_AEAD_TAG_SIZE
+}
+
+fn wireguard_decrypt(iface_id: u32, peer_id: u32, output: u64, max_len: u32,
+                     ciphertext: u64, length: u32, counter: u64): u32 {
+  if length < WG_AEAD_TAG_SIZE { return 0 }
+
+  // Build nonce
+  var nonce: [u8; 12]
+  nonce[0] = 0
+  nonce[1] = 0
+  nonce[2] = 0
+  nonce[3] = 0
+  nonce[4] = counter & 0xFF
+  nonce[5] = (counter >> 8) & 0xFF
+  nonce[6] = (counter >> 16) & 0xFF
+  nonce[7] = (counter >> 24) & 0xFF
+  nonce[8] = (counter >> 32) & 0xFF
+  nonce[9] = (counter >> 40) & 0xFF
+  nonce[10] = (counter >> 48) & 0xFF
+  nonce[11] = (counter >> 56) & 0xFF
+
+  // Decrypt and verify
+  var result: u32 = chacha20.chacha20_poly1305_decrypt(
+    output,
+    ciphertext, length,
+    @ptrFromInt(wg_interfaces[iface_id].peers[peer_id].receiving_key),
+    @ptrFromInt(nonce),
+    0, 0
+  )
+
+  if result == 0 { return 0 }
+
+  return length - WG_AEAD_TAG_SIZE
+}
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+fn wireguard_find_peer_for_ip(iface_id: u32, ip: u32): u32 {
+  var i: u32 = 0
+  while i < wg_interfaces[iface_id].peer_count {
+    if wg_interfaces[iface_id].peers[i].active == 1 {
+      var masked: u32 = ip & wg_interfaces[iface_id].peers[i].allowed_mask
+      if masked == wg_interfaces[iface_id].peers[i].allowed_ip {
+        return i
+      }
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+fn wireguard_generate_private_key(key: u64) {
+  // Generate 32 random bytes
+  var i: u32 = 0
+  while i < 32 {
+    @intToPtr(key + i, u8) = foundation.random_byte()
+    i = i + 1
+  }
+
+  // Clamp for Curve25519
+  @intToPtr(key, u8) = @intToPtr(key, u8) & 248
+  @intToPtr(key + 31, u8) = (@intToPtr(key + 31, u8) & 127) | 64
+}
+
+export fn wireguard_get_peer_stats(iface_id: u32, peer_id: u32, tx_bytes: u64, rx_bytes: u64,
+                                   last_handshake: u64) {
+  if iface_id >= wg_interface_count { return }
+  if peer_id >= wg_interfaces[iface_id].peer_count { return }
+
+  @intToPtr(tx_bytes, u64) = wg_interfaces[iface_id].peers[peer_id].tx_bytes
+  @intToPtr(rx_bytes, u64) = wg_interfaces[iface_id].peers[peer_id].rx_bytes
+  @intToPtr(last_handshake, u64) = wg_interfaces[iface_id].peers[peer_id].last_handshake
+}

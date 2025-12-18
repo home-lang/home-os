@@ -1,0 +1,567 @@
+// home-os Kernel - Accessibility Services
+// Screen reader, TTS, magnifier, high contrast themes
+
+import "../core/foundation.home" as foundation
+import "../drivers/audio.home" as audio
+
+// ============================================================================
+// ACCESSIBILITY CONFIGURATION
+// ============================================================================
+
+const A11Y_SCREEN_READER: u32 = 0x01
+const A11Y_MAGNIFIER: u32 = 0x02
+const A11Y_HIGH_CONTRAST: u32 = 0x04
+const A11Y_KEYBOARD_ONLY: u32 = 0x08
+const A11Y_STICKY_KEYS: u32 = 0x10
+const A11Y_SLOW_KEYS: u32 = 0x20
+const A11Y_BOUNCE_KEYS: u32 = 0x40
+const A11Y_MOUSE_KEYS: u32 = 0x80
+const A11Y_CARET_BROWSING: u32 = 0x100
+const A11Y_REDUCED_MOTION: u32 = 0x200
+const A11Y_LARGE_TEXT: u32 = 0x400
+
+struct AccessibilityConfig {
+  enabled_features: u32,
+
+  // Screen reader settings
+  speech_rate: u32,         // Words per minute (100-400)
+  speech_pitch: u32,        // 50-200 (100 = normal)
+  speech_volume: u32,       // 0-100
+  verbosity_level: u32,     // 0=minimal, 1=normal, 2=verbose
+
+  // Magnifier settings
+  zoom_level: u32,          // 100-1000 (100 = 1x, 200 = 2x)
+  magnifier_follows: u32,   // 0=mouse, 1=focus, 2=caret
+  smooth_scrolling: u32,
+
+  // High contrast settings
+  contrast_theme: u32,      // 0=dark, 1=light, 2=yellow-on-black, 3=custom
+  invert_colors: u32,
+
+  // Keyboard settings
+  sticky_keys_modifier: u32,
+  slow_keys_delay: u32,     // ms
+  bounce_keys_delay: u32,   // ms
+
+  // Mouse keys settings
+  mouse_keys_speed: u32,
+  mouse_keys_accel: u32,
+
+  // Display settings
+  text_scale: u32,          // 100-300 (percentage)
+  cursor_size: u32          // 1=small, 2=medium, 3=large, 4=extra-large
+}
+
+var a11y_config: AccessibilityConfig
+var a11y_initialized: u32 = 0
+var screen_reader_active: u32 = 0
+var magnifier_active: u32 = 0
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn accessibility_init() {
+  if a11y_initialized == 1 { return }
+
+  // Default configuration
+  a11y_config.enabled_features = 0
+  a11y_config.speech_rate = 180
+  a11y_config.speech_pitch = 100
+  a11y_config.speech_volume = 80
+  a11y_config.verbosity_level = 1
+  a11y_config.zoom_level = 100
+  a11y_config.magnifier_follows = 1
+  a11y_config.smooth_scrolling = 1
+  a11y_config.contrast_theme = 0
+  a11y_config.invert_colors = 0
+  a11y_config.sticky_keys_modifier = 0
+  a11y_config.slow_keys_delay = 300
+  a11y_config.bounce_keys_delay = 300
+  a11y_config.mouse_keys_speed = 10
+  a11y_config.mouse_keys_accel = 2
+  a11y_config.text_scale = 100
+  a11y_config.cursor_size = 2
+
+  a11y_initialized = 1
+  foundation.serial_write_string("[A11Y] Accessibility services initialized\n")
+}
+
+export fn accessibility_enable(feature: u32) {
+  a11y_config.enabled_features = a11y_config.enabled_features | feature
+
+  if feature == A11Y_SCREEN_READER {
+    screen_reader_init()
+  } else if feature == A11Y_MAGNIFIER {
+    magnifier_init()
+  } else if feature == A11Y_HIGH_CONTRAST {
+    high_contrast_apply(a11y_config.contrast_theme)
+  }
+
+  foundation.serial_write_string("[A11Y] Feature enabled: ")
+  foundation.serial_write_hex(feature)
+  foundation.serial_write_string("\n")
+}
+
+export fn accessibility_disable(feature: u32) {
+  a11y_config.enabled_features = a11y_config.enabled_features & (~feature)
+
+  if feature == A11Y_SCREEN_READER {
+    screen_reader_stop()
+  } else if feature == A11Y_MAGNIFIER {
+    magnifier_stop()
+  } else if feature == A11Y_HIGH_CONTRAST {
+    high_contrast_reset()
+  }
+}
+
+export fn accessibility_is_enabled(feature: u32): u32 {
+  return (a11y_config.enabled_features & feature) != 0
+}
+
+// ============================================================================
+// SCREEN READER (Text-to-Speech)
+// ============================================================================
+
+const TTS_MAX_QUEUE: u32 = 64
+const TTS_MAX_TEXT: u32 = 1024
+
+struct TTSQueueEntry {
+  text: [u8; 1024],
+  text_len: u32,
+  priority: u32,      // 0=low, 1=normal, 2=high, 3=critical
+  interrupt: u32      // 1=interrupt current speech
+}
+
+var tts_queue: [TTSQueueEntry; 64]
+var tts_queue_head: u32 = 0
+var tts_queue_tail: u32 = 0
+var tts_speaking: u32 = 0
+var tts_current_pos: u32 = 0
+
+fn screen_reader_init() {
+  screen_reader_active = 1
+  tts_queue_head = 0
+  tts_queue_tail = 0
+  tts_speaking = 0
+
+  // Announce screen reader activation
+  screen_reader_speak("Screen reader enabled", 3, 1)
+
+  foundation.serial_write_string("[A11Y] Screen reader initialized\n")
+}
+
+fn screen_reader_stop() {
+  screen_reader_active = 0
+  tts_speaking = 0
+  foundation.serial_write_string("[A11Y] Screen reader stopped\n")
+}
+
+export fn screen_reader_speak(text: u64, priority: u32, interrupt: u32) {
+  if screen_reader_active == 0 { return }
+
+  // Check if queue is full
+  var next_tail: u32 = (tts_queue_tail + 1) % TTS_MAX_QUEUE
+  if next_tail == tts_queue_head { return }  // Queue full
+
+  // Copy text to queue
+  var i: u32 = 0
+  while i < TTS_MAX_TEXT - 1 {
+    var ch: u8 = @intToPtr(text + i, u8)
+    tts_queue[tts_queue_tail].text[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  tts_queue[tts_queue_tail].text[i] = 0
+  tts_queue[tts_queue_tail].text_len = i
+  tts_queue[tts_queue_tail].priority = priority
+  tts_queue[tts_queue_tail].interrupt = interrupt
+
+  // Handle interrupt
+  if interrupt == 1 and tts_speaking == 1 {
+    tts_speaking = 0
+    tts_current_pos = 0
+  }
+
+  tts_queue_tail = next_tail
+
+  // Start speaking if not already
+  if tts_speaking == 0 {
+    screen_reader_process_queue()
+  }
+}
+
+fn screen_reader_process_queue() {
+  if tts_queue_head == tts_queue_tail { return }  // Queue empty
+
+  tts_speaking = 1
+
+  // Get next entry
+  var entry: u64 = @ptrFromInt(tts_queue[tts_queue_head])
+
+  // Synthesize speech (simplified - real implementation would use TTS engine)
+  tts_synthesize(@ptrFromInt(tts_queue[tts_queue_head].text), tts_queue[tts_queue_head].text_len)
+
+  // Move to next entry
+  tts_queue_head = (tts_queue_head + 1) % TTS_MAX_QUEUE
+  tts_speaking = 0
+
+  // Process next entry if available
+  if tts_queue_head != tts_queue_tail {
+    screen_reader_process_queue()
+  }
+}
+
+fn tts_synthesize(text: u64, length: u32) {
+  // Text-to-speech synthesis
+  // This would interface with an actual TTS engine
+  // For now, output to serial for debugging
+  foundation.serial_write_string("[TTS] Speaking: ")
+  foundation.serial_write_string(text)
+  foundation.serial_write_string("\n")
+
+  // Generate audio samples based on phonemes
+  // (Real implementation would use formant synthesis, concatenative synthesis, or neural TTS)
+}
+
+export fn screen_reader_announce_focus(element_type: u64, element_name: u64, element_value: u64) {
+  if screen_reader_active == 0 { return }
+
+  // Build announcement string
+  var announcement: [u8; 512]
+  var pos: u32 = 0
+
+  // Add element type
+  var i: u32 = 0
+  while i < 100 {
+    var ch: u8 = @intToPtr(element_type + i, u8)
+    if ch == 0 { break }
+    announcement[pos] = ch
+    pos = pos + 1
+    i = i + 1
+  }
+
+  announcement[pos] = ' '
+  pos = pos + 1
+
+  // Add element name
+  i = 0
+  while i < 200 {
+    var ch: u8 = @intToPtr(element_name + i, u8)
+    if ch == 0 { break }
+    announcement[pos] = ch
+    pos = pos + 1
+    i = i + 1
+  }
+
+  announcement[pos] = 0
+
+  screen_reader_speak(@ptrFromInt(announcement), 1, 0)
+}
+
+// ============================================================================
+// MAGNIFIER
+// ============================================================================
+
+struct MagnifierState {
+  center_x: u32,
+  center_y: u32,
+  viewport_width: u32,
+  viewport_height: u32,
+  zoom_factor: u32,
+  lens_mode: u32       // 0=full screen, 1=lens, 2=docked
+}
+
+var magnifier_state: MagnifierState
+
+fn magnifier_init() {
+  magnifier_active = 1
+  magnifier_state.center_x = 512
+  magnifier_state.center_y = 384
+  magnifier_state.viewport_width = 1024
+  magnifier_state.viewport_height = 768
+  magnifier_state.zoom_factor = a11y_config.zoom_level
+  magnifier_state.lens_mode = 0
+
+  foundation.serial_write_string("[A11Y] Magnifier initialized at ")
+  foundation.serial_write_hex(magnifier_state.zoom_factor)
+  foundation.serial_write_string("% zoom\n")
+}
+
+fn magnifier_stop() {
+  magnifier_active = 0
+}
+
+export fn magnifier_set_zoom(zoom_percent: u32) {
+  if zoom_percent < 100 { zoom_percent = 100 }
+  if zoom_percent > 1000 { zoom_percent = 1000 }
+
+  magnifier_state.zoom_factor = zoom_percent
+  a11y_config.zoom_level = zoom_percent
+
+  if magnifier_active == 1 {
+    magnifier_update_viewport()
+  }
+}
+
+export fn magnifier_zoom_in() {
+  var new_zoom: u32 = magnifier_state.zoom_factor + 25
+  magnifier_set_zoom(new_zoom)
+}
+
+export fn magnifier_zoom_out() {
+  var new_zoom: u32 = magnifier_state.zoom_factor - 25
+  magnifier_set_zoom(new_zoom)
+}
+
+export fn magnifier_move_to(x: u32, y: u32) {
+  magnifier_state.center_x = x
+  magnifier_state.center_y = y
+
+  if magnifier_active == 1 {
+    magnifier_update_viewport()
+  }
+}
+
+fn magnifier_update_viewport() {
+  // Calculate the visible region based on zoom level
+  var visible_width: u32 = (magnifier_state.viewport_width * 100) / magnifier_state.zoom_factor
+  var visible_height: u32 = (magnifier_state.viewport_height * 100) / magnifier_state.zoom_factor
+
+  // Calculate bounds
+  var left: u32 = magnifier_state.center_x - (visible_width / 2)
+  var top: u32 = magnifier_state.center_y - (visible_height / 2)
+
+  // Render magnified view
+  // (Real implementation would use GPU scaling or software interpolation)
+}
+
+export fn magnifier_set_mode(mode: u32) {
+  magnifier_state.lens_mode = mode
+  // 0 = Full screen magnification
+  // 1 = Lens mode (magnified area follows cursor)
+  // 2 = Docked mode (magnified area in fixed position)
+}
+
+// ============================================================================
+// HIGH CONTRAST THEMES
+// ============================================================================
+
+struct ColorTheme {
+  background: u32,
+  foreground: u32,
+  accent: u32,
+  link: u32,
+  visited_link: u32,
+  button_bg: u32,
+  button_fg: u32,
+  input_bg: u32,
+  input_fg: u32,
+  selection_bg: u32,
+  selection_fg: u32,
+  error: u32,
+  warning: u32,
+  success: u32
+}
+
+var current_theme: ColorTheme
+var default_theme: ColorTheme
+
+fn high_contrast_apply(theme_id: u32) {
+  if theme_id == 0 {
+    // High contrast dark (white on black)
+    current_theme.background = 0x000000
+    current_theme.foreground = 0xFFFFFF
+    current_theme.accent = 0x00FFFF
+    current_theme.link = 0x00FF00
+    current_theme.button_bg = 0x000000
+    current_theme.button_fg = 0xFFFFFF
+    current_theme.selection_bg = 0xFFFFFF
+    current_theme.selection_fg = 0x000000
+  } else if theme_id == 1 {
+    // High contrast light (black on white)
+    current_theme.background = 0xFFFFFF
+    current_theme.foreground = 0x000000
+    current_theme.accent = 0x0000FF
+    current_theme.link = 0x0000FF
+    current_theme.button_bg = 0xFFFFFF
+    current_theme.button_fg = 0x000000
+    current_theme.selection_bg = 0x000000
+    current_theme.selection_fg = 0xFFFFFF
+  } else if theme_id == 2 {
+    // Yellow on black (good for some visual impairments)
+    current_theme.background = 0x000000
+    current_theme.foreground = 0xFFFF00
+    current_theme.accent = 0x00FFFF
+    current_theme.link = 0x00FF00
+    current_theme.button_bg = 0x000000
+    current_theme.button_fg = 0xFFFF00
+    current_theme.selection_bg = 0xFFFF00
+    current_theme.selection_fg = 0x000000
+  } else if theme_id == 3 {
+    // Green on black (terminal-style)
+    current_theme.background = 0x000000
+    current_theme.foreground = 0x00FF00
+    current_theme.accent = 0x00FFFF
+    current_theme.link = 0xFFFF00
+    current_theme.button_bg = 0x000000
+    current_theme.button_fg = 0x00FF00
+    current_theme.selection_bg = 0x00FF00
+    current_theme.selection_fg = 0x000000
+  }
+
+  foundation.serial_write_string("[A11Y] Applied high contrast theme ")
+  foundation.serial_write_hex(theme_id)
+  foundation.serial_write_string("\n")
+}
+
+fn high_contrast_reset() {
+  current_theme = default_theme
+  foundation.serial_write_string("[A11Y] Reset to default theme\n")
+}
+
+export fn accessibility_get_color(color_type: u32): u32 {
+  if color_type == 0 { return current_theme.background }
+  else if color_type == 1 { return current_theme.foreground }
+  else if color_type == 2 { return current_theme.accent }
+  else if color_type == 3 { return current_theme.link }
+  else if color_type == 4 { return current_theme.button_bg }
+  else if color_type == 5 { return current_theme.button_fg }
+  else if color_type == 6 { return current_theme.selection_bg }
+  else if color_type == 7 { return current_theme.selection_fg }
+  return 0x000000
+}
+
+// ============================================================================
+// KEYBOARD ACCESSIBILITY
+// ============================================================================
+
+var sticky_keys_state: u32 = 0      // Bitmask of locked modifiers
+var sticky_keys_pending: u32 = 0    // Bitmask of pending modifiers
+var slow_keys_timer: u32 = 0
+var bounce_keys_last: u32 = 0
+
+export fn keyboard_accessibility_process(scancode: u32, pressed: u32): u32 {
+  // Sticky Keys: Hold modifier without holding the physical key
+  if (a11y_config.enabled_features & A11Y_STICKY_KEYS) != 0 {
+    if keyboard_is_modifier(scancode) {
+      if pressed == 1 {
+        // Single tap = activate once, double tap = lock
+        if (sticky_keys_pending & scancode) != 0 {
+          sticky_keys_state = sticky_keys_state | scancode  // Lock
+          sticky_keys_pending = sticky_keys_pending & (~scancode)
+        } else {
+          sticky_keys_pending = sticky_keys_pending | scancode
+        }
+        return scancode | sticky_keys_state
+      }
+    } else {
+      // Non-modifier key pressed, apply pending modifiers
+      var result: u32 = scancode | sticky_keys_pending | sticky_keys_state
+      sticky_keys_pending = 0  // Clear pending after use
+      return result
+    }
+  }
+
+  // Slow Keys: Require key to be held for a minimum time
+  if (a11y_config.enabled_features & A11Y_SLOW_KEYS) != 0 {
+    if pressed == 1 {
+      // Start timer
+      slow_keys_timer = foundation.get_tick_count()
+      return 0  // Don't register yet
+    } else {
+      var held_time: u32 = foundation.get_tick_count() - slow_keys_timer
+      if held_time < a11y_config.slow_keys_delay {
+        return 0  // Key wasn't held long enough
+      }
+    }
+  }
+
+  // Bounce Keys: Ignore rapid repeated keypresses
+  if (a11y_config.enabled_features & A11Y_BOUNCE_KEYS) != 0 {
+    var current_time: u32 = foundation.get_tick_count()
+    if current_time - bounce_keys_last < a11y_config.bounce_keys_delay {
+      return 0  // Too soon after last keypress
+    }
+    bounce_keys_last = current_time
+  }
+
+  return scancode
+}
+
+fn keyboard_is_modifier(scancode: u32): u32 {
+  // Check if scancode is a modifier key (Ctrl, Alt, Shift, Super)
+  if scancode == 0x1D or scancode == 0x9D { return 1 }  // Ctrl
+  if scancode == 0x38 or scancode == 0xB8 { return 1 }  // Alt
+  if scancode == 0x2A or scancode == 0x36 { return 1 }  // Shift
+  if scancode == 0x5B or scancode == 0x5C { return 1 }  // Super/Win
+  return 0
+}
+
+// ============================================================================
+// MOUSE KEYS (Use numpad as mouse)
+// ============================================================================
+
+var mouse_keys_x: i32 = 0
+var mouse_keys_y: i32 = 0
+var mouse_keys_button: u32 = 0  // 0=none, 1=left, 2=right, 3=middle
+
+export fn mouse_keys_process(scancode: u32): u32 {
+  if (a11y_config.enabled_features & A11Y_MOUSE_KEYS) == 0 { return 0 }
+
+  var speed: i32 = a11y_config.mouse_keys_speed
+
+  // Numpad movement
+  if scancode == 0x4B { mouse_keys_x = mouse_keys_x - speed; return 1 }  // 4 = Left
+  if scancode == 0x4D { mouse_keys_x = mouse_keys_x + speed; return 1 }  // 6 = Right
+  if scancode == 0x48 { mouse_keys_y = mouse_keys_y - speed; return 1 }  // 8 = Up
+  if scancode == 0x50 { mouse_keys_y = mouse_keys_y + speed; return 1 }  // 2 = Down
+  if scancode == 0x47 { mouse_keys_x = mouse_keys_x - speed; mouse_keys_y = mouse_keys_y - speed; return 1 }  // 7 = Up-Left
+  if scancode == 0x49 { mouse_keys_x = mouse_keys_x + speed; mouse_keys_y = mouse_keys_y - speed; return 1 }  // 9 = Up-Right
+  if scancode == 0x4F { mouse_keys_x = mouse_keys_x - speed; mouse_keys_y = mouse_keys_y + speed; return 1 }  // 1 = Down-Left
+  if scancode == 0x51 { mouse_keys_x = mouse_keys_x + speed; mouse_keys_y = mouse_keys_y + speed; return 1 }  // 3 = Down-Right
+
+  // Button selection
+  if scancode == 0x35 { mouse_keys_button = 1; return 1 }  // / = Left button
+  if scancode == 0x37 { mouse_keys_button = 2; return 1 }  // * = Right button
+  if scancode == 0x4A { mouse_keys_button = 3; return 1 }  // - = Middle button
+
+  // Click
+  if scancode == 0x4C { return 2 }  // 5 = Click (return special code)
+  if scancode == 0x4E { return 3 }  // + = Double click
+
+  return 0
+}
+
+export fn mouse_keys_get_position(x: u64, y: u64) {
+  @intToPtr(x, i32) = mouse_keys_x
+  @intToPtr(y, i32) = mouse_keys_y
+}
+
+// ============================================================================
+// ACCESSIBILITY EVENTS
+// ============================================================================
+
+export fn accessibility_notify_focus_change(element_type: u64, element_name: u64) {
+  if (a11y_config.enabled_features & A11Y_SCREEN_READER) != 0 {
+    screen_reader_announce_focus(element_type, element_name, 0)
+  }
+
+  if (a11y_config.enabled_features & A11Y_MAGNIFIER) != 0 {
+    if a11y_config.magnifier_follows == 1 {
+      // Move magnifier to focused element (would need element coordinates)
+    }
+  }
+}
+
+export fn accessibility_notify_text_change(text: u64) {
+  if (a11y_config.enabled_features & A11Y_SCREEN_READER) != 0 {
+    screen_reader_speak(text, 0, 0)
+  }
+}
+
+export fn accessibility_notify_alert(message: u64, severity: u32) {
+  if (a11y_config.enabled_features & A11Y_SCREEN_READER) != 0 {
+    screen_reader_speak(message, 2, 1)  // High priority, interrupt
+  }
+}
