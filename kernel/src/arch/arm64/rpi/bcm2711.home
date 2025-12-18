@@ -1,0 +1,731 @@
+// home-os Kernel - BCM2711 SoC Support (Raspberry Pi 4)
+// Broadcom BCM2711 SoC initialization and hardware abstraction
+// ARM Cortex-A72 quad-core @ 1.5GHz, VideoCore VI GPU
+
+import "../../core/foundation.home" as foundation
+import "../arm64.home" as arm64
+
+// =============================================================================
+// BCM2711 Memory Map
+// =============================================================================
+
+// The BCM2711 has different MMIO bases depending on address translation:
+// - ARM Physical: 0xFE000000 (used by kernel)
+// - VideoCore Bus: 0x7E000000 (legacy, for GPU)
+// - ARM Low Peripheral: 0xFF800000 (GIC, local peripherals)
+
+const MMIO_BASE: u64 = 0xFE000000           // ARM physical MMIO base
+const VC_MMIO_BASE: u64 = 0x7E000000        // VideoCore bus address
+
+// Peripheral offsets from MMIO_BASE
+const GPIO_OFFSET: u64 = 0x200000           // GPIO controller
+const UART0_OFFSET: u64 = 0x201000          // PL011 UART
+const UART2_OFFSET: u64 = 0x201400          // Mini UART (primary)
+const UART3_OFFSET: u64 = 0x201600          // Additional UART
+const UART4_OFFSET: u64 = 0x201800          // Additional UART
+const UART5_OFFSET: u64 = 0x201A00          // Additional UART
+const SPI0_OFFSET: u64 = 0x204000           // SPI0 controller
+const SPI3_OFFSET: u64 = 0x204600           // SPI3 controller
+const SPI4_OFFSET: u64 = 0x204800           // SPI4 controller
+const SPI5_OFFSET: u64 = 0x204A00           // SPI5 controller
+const SPI6_OFFSET: u64 = 0x204C00           // SPI6 controller
+const BSC0_OFFSET: u64 = 0x205000           // I2C0 (BSC0)
+const BSC1_OFFSET: u64 = 0x804000           // I2C1 (BSC1)
+const BSC3_OFFSET: u64 = 0x205600           // I2C3 (BSC3)
+const BSC4_OFFSET: u64 = 0x205800           // I2C4 (BSC4)
+const BSC5_OFFSET: u64 = 0x205A00           // I2C5 (BSC5)
+const BSC6_OFFSET: u64 = 0x205C00           // I2C6 (BSC6)
+const AUX_OFFSET: u64 = 0x215000            // Auxiliary peripherals (Mini UART, SPI1/2)
+const EMMC2_OFFSET: u64 = 0x340000          // EMMC2 (SD card)
+const MAILBOX_OFFSET: u64 = 0xB880          // Mailbox interface
+const PM_OFFSET: u64 = 0x100000             // Power Management
+const RNG_OFFSET: u64 = 0x104000            // Hardware RNG
+const THERMAL_OFFSET: u64 = 0x5D2200        // Thermal sensor
+const USB_OFFSET: u64 = 0x980000            // USB controller (DWC_OTG)
+const DMA_OFFSET: u64 = 0x7000              // DMA controller
+const DMA15_OFFSET: u64 = 0xE05000          // DMA channel 15
+const IRQ_OFFSET: u64 = 0xB200              // Legacy interrupt controller
+const TIMER_OFFSET: u64 = 0x3000            // System timer
+const PCM_OFFSET: u64 = 0x203000            // PCM/I2S audio
+const PWM0_OFFSET: u64 = 0x20C000           // PWM0 controller
+const PWM1_OFFSET: u64 = 0x20C800           // PWM1 controller
+
+// ARM Local peripherals (different base)
+const ARM_LOCAL_BASE: u64 = 0xFF800000
+const GIC_DIST_OFFSET: u64 = 0x41000        // GIC-400 distributor
+const GIC_CPU_OFFSET: u64 = 0x42000         // GIC-400 CPU interface
+const ARM_TIMER_OFFSET: u64 = 0x40000       // ARM local timer
+
+// Memory regions
+const SDRAM_BASE: u64 = 0x00000000
+const SDRAM_SIZE_1GB: u64 = 0x40000000
+const SDRAM_SIZE_2GB: u64 = 0x80000000
+const SDRAM_SIZE_4GB: u64 = 0x100000000
+const SDRAM_SIZE_8GB: u64 = 0x200000000
+
+// VideoCore memory (GPU)
+const VC_MEM_BASE: u64 = 0xC0000000         // Cached
+const VC_MEM_UNCACHED: u64 = 0x80000000     // Uncached
+
+// =============================================================================
+// BCM2711 Clock IDs
+// =============================================================================
+
+const CLOCK_ID_RESERVED: u32 = 0
+const CLOCK_ID_EMMC: u32 = 1
+const CLOCK_ID_UART: u32 = 2
+const CLOCK_ID_ARM: u32 = 3
+const CLOCK_ID_CORE: u32 = 4
+const CLOCK_ID_V3D: u32 = 5
+const CLOCK_ID_H264: u32 = 6
+const CLOCK_ID_ISP: u32 = 7
+const CLOCK_ID_SDRAM: u32 = 8
+const CLOCK_ID_PIXEL: u32 = 9
+const CLOCK_ID_PWM: u32 = 10
+const CLOCK_ID_HEVC: u32 = 11
+const CLOCK_ID_EMMC2: u32 = 12
+const CLOCK_ID_M2MC: u32 = 13
+const CLOCK_ID_PIXEL_BVB: u32 = 14
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+struct BCM2711State {
+  mmio_base: u64,
+  arm_local_base: u64,
+  sdram_size: u64,
+  gpu_mem_size: u64,
+  arm_mem_size: u64,
+  board_revision: u32,
+  board_serial: u64,
+  cpu_freq: u32,
+  core_freq: u32,
+  sdram_freq: u32,
+  initialized: u32
+}
+
+struct BCM2711ClockInfo {
+  clock_id: u32,
+  rate: u32,
+  min_rate: u32,
+  max_rate: u32,
+  turbo: u32
+}
+
+struct BCM2711ThermalInfo {
+  temperature: i32,          // Temperature in millidegrees C
+  max_temp: i32,
+  throttle_temp: i32,
+  throttled: u32
+}
+
+// =============================================================================
+// Global State
+// =============================================================================
+
+var bcm2711_state: BCM2711State = undefined
+var bcm2711_initialized: u32 = 0
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+export fn bcm2711_init(): i32 {
+  if bcm2711_initialized == 1 {
+    return 0
+  }
+
+  foundation.serial_write_string("[BCM2711] Initializing Raspberry Pi 4 SoC...\n")
+
+  // Set up MMIO bases
+  bcm2711_state.mmio_base = MMIO_BASE
+  bcm2711_state.arm_local_base = ARM_LOCAL_BASE
+  bcm2711_state.initialized = 0
+
+  // Query memory size from mailbox
+  var mem_size: u64 = query_arm_memory()
+  bcm2711_state.arm_mem_size = mem_size
+  bcm2711_state.sdram_size = mem_size
+
+  foundation.serial_write_string("  ARM memory: ")
+  foundation.serial_write_hex(mem_size >> 20)
+  foundation.serial_write_string(" MB\n")
+
+  // Query GPU memory
+  bcm2711_state.gpu_mem_size = query_vc_memory()
+  foundation.serial_write_string("  GPU memory: ")
+  foundation.serial_write_hex(bcm2711_state.gpu_mem_size >> 20)
+  foundation.serial_write_string(" MB\n")
+
+  // Query board info
+  bcm2711_state.board_revision = query_board_revision()
+  bcm2711_state.board_serial = query_board_serial()
+
+  foundation.serial_write_string("  Board revision: 0x")
+  foundation.serial_write_hex(@zext(bcm2711_state.board_revision, u64))
+  foundation.serial_write_string("\n")
+
+  // Query clock rates
+  bcm2711_state.cpu_freq = query_clock_rate(CLOCK_ID_ARM)
+  bcm2711_state.core_freq = query_clock_rate(CLOCK_ID_CORE)
+  bcm2711_state.sdram_freq = query_clock_rate(CLOCK_ID_SDRAM)
+
+  foundation.serial_write_string("  CPU freq: ")
+  foundation.serial_write_hex(@zext(bcm2711_state.cpu_freq / 1000000, u64))
+  foundation.serial_write_string(" MHz\n")
+
+  // Initialize subsystems
+  bcm2711_gpio_init()
+  bcm2711_timer_init()
+
+  bcm2711_state.initialized = 1
+  bcm2711_initialized = 1
+
+  foundation.serial_write_string("[BCM2711] Initialization complete\n")
+
+  return 0
+}
+
+// =============================================================================
+// Memory-Mapped I/O Helpers
+// =============================================================================
+
+export fn bcm2711_read32(offset: u64): u32 {
+  var addr: u64 = bcm2711_state.mmio_base + offset
+  return arm64.mmio_read32(addr)
+}
+
+export fn bcm2711_write32(offset: u64, value: u32) {
+  var addr: u64 = bcm2711_state.mmio_base + offset
+  arm64.mmio_write32(addr, value)
+}
+
+export fn bcm2711_read32_local(offset: u64): u32 {
+  var addr: u64 = bcm2711_state.arm_local_base + offset
+  return arm64.mmio_read32(addr)
+}
+
+export fn bcm2711_write32_local(offset: u64, value: u32) {
+  var addr: u64 = bcm2711_state.arm_local_base + offset
+  arm64.mmio_write32(addr, value)
+}
+
+// Set/clear bits atomically
+export fn bcm2711_set_bits(offset: u64, bits: u32) {
+  var val: u32 = bcm2711_read32(offset)
+  bcm2711_write32(offset, val | bits)
+}
+
+export fn bcm2711_clear_bits(offset: u64, bits: u32) {
+  var val: u32 = bcm2711_read32(offset)
+  bcm2711_write32(offset, val & ~bits)
+}
+
+// =============================================================================
+// Mailbox Interface (for GPU communication)
+// =============================================================================
+
+const MBOX_READ: u64 = 0x00
+const MBOX_POLL: u64 = 0x10
+const MBOX_SENDER: u64 = 0x14
+const MBOX_STATUS: u64 = 0x18
+const MBOX_CONFIG: u64 = 0x1C
+const MBOX_WRITE: u64 = 0x20
+
+const MBOX_FULL: u32 = 0x80000000
+const MBOX_EMPTY: u32 = 0x40000000
+
+const MBOX_CHANNEL_POWER: u32 = 0
+const MBOX_CHANNEL_FB: u32 = 1
+const MBOX_CHANNEL_VUART: u32 = 2
+const MBOX_CHANNEL_VCHIQ: u32 = 3
+const MBOX_CHANNEL_LED: u32 = 4
+const MBOX_CHANNEL_BUTTON: u32 = 5
+const MBOX_CHANNEL_TOUCH: u32 = 6
+const MBOX_CHANNEL_COUNT: u32 = 7
+const MBOX_CHANNEL_PROPERTY: u32 = 8
+
+// Property tags
+const MBOX_TAG_END: u32 = 0
+const MBOX_TAG_GET_BOARD_REV: u32 = 0x00010002
+const MBOX_TAG_GET_BOARD_SERIAL: u32 = 0x00010004
+const MBOX_TAG_GET_ARM_MEMORY: u32 = 0x00010005
+const MBOX_TAG_GET_VC_MEMORY: u32 = 0x00010006
+const MBOX_TAG_GET_CLOCK_RATE: u32 = 0x00030002
+const MBOX_TAG_SET_CLOCK_RATE: u32 = 0x00038002
+const MBOX_TAG_GET_MAX_CLOCK: u32 = 0x00030004
+const MBOX_TAG_GET_MIN_CLOCK: u32 = 0x00030007
+const MBOX_TAG_GET_TEMPERATURE: u32 = 0x00030006
+const MBOX_TAG_GET_MAX_TEMPERATURE: u32 = 0x0003000A
+const MBOX_TAG_ALLOCATE_BUFFER: u32 = 0x00040001
+const MBOX_TAG_RELEASE_BUFFER: u32 = 0x00048001
+const MBOX_TAG_SET_PHYSICAL_SIZE: u32 = 0x00048003
+const MBOX_TAG_SET_VIRTUAL_SIZE: u32 = 0x00048004
+const MBOX_TAG_SET_DEPTH: u32 = 0x00048005
+const MBOX_TAG_SET_PIXEL_ORDER: u32 = 0x00048006
+const MBOX_TAG_GET_PITCH: u32 = 0x00040008
+const MBOX_TAG_SET_VIRTUAL_OFFSET: u32 = 0x00048009
+
+// Mailbox buffer (16-byte aligned)
+var mbox_buffer: [u32; 64] align(16) = undefined
+
+fn mailbox_call(channel: u32): u32 {
+  var addr: u64 = @ptrToInt(&mbox_buffer) | @zext(channel, u64)
+
+  // Convert to GPU bus address (uncached)
+  var gpu_addr: u32 = @truncate(addr, u32) | 0xC0000000
+
+  // Wait for mailbox to be ready
+  while (bcm2711_read32(MAILBOX_OFFSET + MBOX_STATUS) & MBOX_FULL) != 0 {
+    arm64.nop()
+  }
+
+  // Write address to mailbox
+  bcm2711_write32(MAILBOX_OFFSET + MBOX_WRITE, gpu_addr)
+
+  // Wait for response
+  loop {
+    while (bcm2711_read32(MAILBOX_OFFSET + MBOX_STATUS) & MBOX_EMPTY) != 0 {
+      arm64.nop()
+    }
+
+    var response: u32 = bcm2711_read32(MAILBOX_OFFSET + MBOX_READ)
+    if (response & 0xF) == channel {
+      return mbox_buffer[1]  // Return code is at index 1
+    }
+  }
+}
+
+fn query_arm_memory(): u64 {
+  mbox_buffer[0] = 8 * 4                    // Buffer size
+  mbox_buffer[1] = 0                         // Request code
+  mbox_buffer[2] = MBOX_TAG_GET_ARM_MEMORY  // Tag
+  mbox_buffer[3] = 8                         // Value buffer size
+  mbox_buffer[4] = 0                         // Request/response indicator
+  mbox_buffer[5] = 0                         // Base address (response)
+  mbox_buffer[6] = 0                         // Size (response)
+  mbox_buffer[7] = MBOX_TAG_END             // End tag
+
+  if mailbox_call(MBOX_CHANNEL_PROPERTY) == 0x80000000 {
+    return @zext(mbox_buffer[6], u64)
+  }
+  return 0
+}
+
+fn query_vc_memory(): u64 {
+  mbox_buffer[0] = 8 * 4
+  mbox_buffer[1] = 0
+  mbox_buffer[2] = MBOX_TAG_GET_VC_MEMORY
+  mbox_buffer[3] = 8
+  mbox_buffer[4] = 0
+  mbox_buffer[5] = 0
+  mbox_buffer[6] = 0
+  mbox_buffer[7] = MBOX_TAG_END
+
+  if mailbox_call(MBOX_CHANNEL_PROPERTY) == 0x80000000 {
+    return @zext(mbox_buffer[6], u64)
+  }
+  return 0
+}
+
+fn query_board_revision(): u32 {
+  mbox_buffer[0] = 7 * 4
+  mbox_buffer[1] = 0
+  mbox_buffer[2] = MBOX_TAG_GET_BOARD_REV
+  mbox_buffer[3] = 4
+  mbox_buffer[4] = 0
+  mbox_buffer[5] = 0
+  mbox_buffer[6] = MBOX_TAG_END
+
+  if mailbox_call(MBOX_CHANNEL_PROPERTY) == 0x80000000 {
+    return mbox_buffer[5]
+  }
+  return 0
+}
+
+fn query_board_serial(): u64 {
+  mbox_buffer[0] = 8 * 4
+  mbox_buffer[1] = 0
+  mbox_buffer[2] = MBOX_TAG_GET_BOARD_SERIAL
+  mbox_buffer[3] = 8
+  mbox_buffer[4] = 0
+  mbox_buffer[5] = 0
+  mbox_buffer[6] = 0
+  mbox_buffer[7] = MBOX_TAG_END
+
+  if mailbox_call(MBOX_CHANNEL_PROPERTY) == 0x80000000 {
+    return (@zext(mbox_buffer[6], u64) << 32) | @zext(mbox_buffer[5], u64)
+  }
+  return 0
+}
+
+fn query_clock_rate(clock_id: u32): u32 {
+  mbox_buffer[0] = 8 * 4
+  mbox_buffer[1] = 0
+  mbox_buffer[2] = MBOX_TAG_GET_CLOCK_RATE
+  mbox_buffer[3] = 8
+  mbox_buffer[4] = 0
+  mbox_buffer[5] = clock_id
+  mbox_buffer[6] = 0
+  mbox_buffer[7] = MBOX_TAG_END
+
+  if mailbox_call(MBOX_CHANNEL_PROPERTY) == 0x80000000 {
+    return mbox_buffer[6]
+  }
+  return 0
+}
+
+export fn bcm2711_set_clock_rate(clock_id: u32, rate: u32, skip_turbo: u32): i32 {
+  mbox_buffer[0] = 9 * 4
+  mbox_buffer[1] = 0
+  mbox_buffer[2] = MBOX_TAG_SET_CLOCK_RATE
+  mbox_buffer[3] = 12
+  mbox_buffer[4] = 0
+  mbox_buffer[5] = clock_id
+  mbox_buffer[6] = rate
+  mbox_buffer[7] = skip_turbo
+  mbox_buffer[8] = MBOX_TAG_END
+
+  if mailbox_call(MBOX_CHANNEL_PROPERTY) == 0x80000000 {
+    return 0
+  }
+  return -1
+}
+
+// =============================================================================
+// GPIO Initialization
+// =============================================================================
+
+fn bcm2711_gpio_init() {
+  // GPIO is initialized separately in gpio.home
+  // Here we just ensure the base registers are accessible
+  foundation.serial_write_string("  GPIO controller at 0x")
+  foundation.serial_write_hex(bcm2711_state.mmio_base + GPIO_OFFSET)
+  foundation.serial_write_string("\n")
+}
+
+// =============================================================================
+// Timer Initialization
+// =============================================================================
+
+fn bcm2711_timer_init() {
+  // System timer initialization
+  // The BCM2711 has a 1MHz system timer
+  foundation.serial_write_string("  System timer at 0x")
+  foundation.serial_write_hex(bcm2711_state.mmio_base + TIMER_OFFSET)
+  foundation.serial_write_string("\n")
+}
+
+// =============================================================================
+// Temperature Monitoring
+// =============================================================================
+
+export fn bcm2711_get_temperature(): i32 {
+  mbox_buffer[0] = 8 * 4
+  mbox_buffer[1] = 0
+  mbox_buffer[2] = MBOX_TAG_GET_TEMPERATURE
+  mbox_buffer[3] = 8
+  mbox_buffer[4] = 0
+  mbox_buffer[5] = 0                         // Temperature ID (0 = SoC)
+  mbox_buffer[6] = 0
+  mbox_buffer[7] = MBOX_TAG_END
+
+  if mailbox_call(MBOX_CHANNEL_PROPERTY) == 0x80000000 {
+    return @bitCast(mbox_buffer[6], i32)    // Temperature in millidegrees C
+  }
+  return -1
+}
+
+export fn bcm2711_get_max_temperature(): i32 {
+  mbox_buffer[0] = 8 * 4
+  mbox_buffer[1] = 0
+  mbox_buffer[2] = MBOX_TAG_GET_MAX_TEMPERATURE
+  mbox_buffer[3] = 8
+  mbox_buffer[4] = 0
+  mbox_buffer[5] = 0
+  mbox_buffer[6] = 0
+  mbox_buffer[7] = MBOX_TAG_END
+
+  if mailbox_call(MBOX_CHANNEL_PROPERTY) == 0x80000000 {
+    return @bitCast(mbox_buffer[6], i32)
+  }
+  return -1
+}
+
+// =============================================================================
+// Power Management
+// =============================================================================
+
+const PM_RSTC: u64 = 0x1C
+const PM_RSTS: u64 = 0x20
+const PM_WDOG: u64 = 0x24
+const PM_PASSWORD: u32 = 0x5A000000
+
+export fn bcm2711_reboot() {
+  // Use the watchdog timer to trigger a reboot
+  var pm_base: u64 = bcm2711_state.mmio_base + PM_OFFSET
+
+  // Clear reset flags
+  var rsts: u32 = arm64.mmio_read32(pm_base + PM_RSTS)
+  rsts = rsts & ~0xFFFFFAAA
+  arm64.mmio_write32(pm_base + PM_RSTS, PM_PASSWORD | rsts)
+
+  // Set watchdog timeout to minimum
+  arm64.mmio_write32(pm_base + PM_WDOG, PM_PASSWORD | 1)
+
+  // Trigger watchdog reset
+  var rstc: u32 = arm64.mmio_read32(pm_base + PM_RSTC)
+  rstc = (rstc & ~0x30) | 0x20  // Full reset
+  arm64.mmio_write32(pm_base + PM_RSTC, PM_PASSWORD | rstc)
+
+  // Wait for reboot
+  loop {
+    arm64.wfe()
+  }
+}
+
+export fn bcm2711_poweroff() {
+  // Power off via mailbox
+  mbox_buffer[0] = 8 * 4
+  mbox_buffer[1] = 0
+  mbox_buffer[2] = 0x00028001  // SET_POWER_STATE
+  mbox_buffer[3] = 8
+  mbox_buffer[4] = 8
+  mbox_buffer[5] = 0           // Device ID 0
+  mbox_buffer[6] = 0           // Power off
+  mbox_buffer[7] = MBOX_TAG_END
+
+  mailbox_call(MBOX_CHANNEL_PROPERTY)
+
+  // Halt CPU
+  loop {
+    arm64.wfi()
+  }
+}
+
+// =============================================================================
+// DMA Controller
+// =============================================================================
+
+const DMA_CS: u64 = 0x00           // Control and Status
+const DMA_CONBLK_AD: u64 = 0x04    // Control Block Address
+const DMA_TI: u64 = 0x08           // Transfer Information
+const DMA_SOURCE_AD: u64 = 0x0C    // Source Address
+const DMA_DEST_AD: u64 = 0x10      // Destination Address
+const DMA_TXFR_LEN: u64 = 0x14     // Transfer Length
+const DMA_STRIDE: u64 = 0x18       // 2D Stride
+const DMA_NEXTCONBK: u64 = 0x1C    // Next Control Block Address
+const DMA_DEBUG: u64 = 0x20        // Debug
+
+const DMA_CHANNEL_SIZE: u64 = 0x100
+
+// DMA Control Block structure
+struct DMAControlBlock {
+  ti: u32,              // Transfer Information
+  source_ad: u32,       // Source Address
+  dest_ad: u32,         // Destination Address
+  txfr_len: u32,        // Transfer Length
+  stride: u32,          // 2D Mode Stride
+  nextconbk: u32,       // Next Control Block Address
+  reserved: [u32; 2]    // Reserved (set to 0)
+}
+
+export fn bcm2711_dma_enable(channel: u32) {
+  if channel > 14 {
+    return
+  }
+
+  // Enable DMA channel in global enable register
+  var enable_reg: u64 = bcm2711_state.mmio_base + DMA_OFFSET + 0xFF0
+  var enable: u32 = arm64.mmio_read32(enable_reg)
+  arm64.mmio_write32(enable_reg, enable | (1 << channel))
+}
+
+export fn bcm2711_dma_reset(channel: u32) {
+  if channel > 14 {
+    return
+  }
+
+  var base: u64 = bcm2711_state.mmio_base + DMA_OFFSET + (@zext(channel, u64) * DMA_CHANNEL_SIZE)
+  arm64.mmio_write32(base + DMA_CS, 1 << 31)  // Reset bit
+}
+
+// =============================================================================
+// Hardware Random Number Generator
+// =============================================================================
+
+const RNG_CTRL: u64 = 0x00
+const RNG_STATUS: u64 = 0x04
+const RNG_DATA: u64 = 0x08
+
+export fn bcm2711_rng_init() {
+  var base: u64 = bcm2711_state.mmio_base + RNG_OFFSET
+
+  // Enable RNG with fastest mode
+  arm64.mmio_write32(base + RNG_STATUS, 0x40000)  // Warm-up count
+  arm64.mmio_write32(base + RNG_CTRL, 1)          // Enable
+}
+
+export fn bcm2711_rng_get(): u32 {
+  var base: u64 = bcm2711_state.mmio_base + RNG_OFFSET
+
+  // Wait for data available
+  while (arm64.mmio_read32(base + RNG_STATUS) >> 24) == 0 {
+    arm64.nop()
+  }
+
+  return arm64.mmio_read32(base + RNG_DATA)
+}
+
+// =============================================================================
+// Framebuffer Allocation
+// =============================================================================
+
+struct FramebufferInfo {
+  width: u32,
+  height: u32,
+  virtual_width: u32,
+  virtual_height: u32,
+  pitch: u32,
+  depth: u32,
+  x_offset: u32,
+  y_offset: u32,
+  pointer: u64,
+  size: u32
+}
+
+export fn bcm2711_fb_alloc(width: u32, height: u32, depth: u32, fb_info: u64): i32 {
+  // Build framebuffer allocation request
+  mbox_buffer[0] = 35 * 4
+  mbox_buffer[1] = 0
+
+  // Set physical size
+  mbox_buffer[2] = MBOX_TAG_SET_PHYSICAL_SIZE
+  mbox_buffer[3] = 8
+  mbox_buffer[4] = 8
+  mbox_buffer[5] = width
+  mbox_buffer[6] = height
+
+  // Set virtual size
+  mbox_buffer[7] = MBOX_TAG_SET_VIRTUAL_SIZE
+  mbox_buffer[8] = 8
+  mbox_buffer[9] = 8
+  mbox_buffer[10] = width
+  mbox_buffer[11] = height
+
+  // Set depth
+  mbox_buffer[12] = MBOX_TAG_SET_DEPTH
+  mbox_buffer[13] = 4
+  mbox_buffer[14] = 4
+  mbox_buffer[15] = depth
+
+  // Set pixel order (RGB)
+  mbox_buffer[16] = MBOX_TAG_SET_PIXEL_ORDER
+  mbox_buffer[17] = 4
+  mbox_buffer[18] = 4
+  mbox_buffer[19] = 1           // RGB
+
+  // Set virtual offset
+  mbox_buffer[20] = MBOX_TAG_SET_VIRTUAL_OFFSET
+  mbox_buffer[21] = 8
+  mbox_buffer[22] = 8
+  mbox_buffer[23] = 0
+  mbox_buffer[24] = 0
+
+  // Allocate buffer
+  mbox_buffer[25] = MBOX_TAG_ALLOCATE_BUFFER
+  mbox_buffer[26] = 8
+  mbox_buffer[27] = 8
+  mbox_buffer[28] = 4096        // Alignment
+  mbox_buffer[29] = 0           // Size (response)
+
+  // Get pitch
+  mbox_buffer[30] = MBOX_TAG_GET_PITCH
+  mbox_buffer[31] = 4
+  mbox_buffer[32] = 4
+  mbox_buffer[33] = 0
+
+  mbox_buffer[34] = MBOX_TAG_END
+
+  if mailbox_call(MBOX_CHANNEL_PROPERTY) != 0x80000000 {
+    return -1
+  }
+
+  if mbox_buffer[28] == 0 {
+    return -1
+  }
+
+  // Fill framebuffer info
+  @intToPtr(fb_info, u32) = mbox_buffer[5]           // width
+  @intToPtr(fb_info + 4, u32) = mbox_buffer[6]       // height
+  @intToPtr(fb_info + 8, u32) = mbox_buffer[10]      // virtual_width
+  @intToPtr(fb_info + 12, u32) = mbox_buffer[11]     // virtual_height
+  @intToPtr(fb_info + 16, u32) = mbox_buffer[33]     // pitch
+  @intToPtr(fb_info + 20, u32) = mbox_buffer[15]     // depth
+  @intToPtr(fb_info + 24, u32) = 0                   // x_offset
+  @intToPtr(fb_info + 28, u32) = 0                   // y_offset
+  // Convert GPU address to ARM address
+  @intToPtr(fb_info + 32, u64) = @zext(mbox_buffer[28] & 0x3FFFFFFF, u64)  // pointer
+  @intToPtr(fb_info + 40, u32) = mbox_buffer[29]     // size
+
+  foundation.serial_write_string("[BCM2711] Framebuffer allocated: ")
+  foundation.serial_write_hex(@zext(width, u64))
+  foundation.serial_write_string("x")
+  foundation.serial_write_hex(@zext(height, u64))
+  foundation.serial_write_string("@")
+  foundation.serial_write_hex(@zext(depth, u64))
+  foundation.serial_write_string("\n")
+
+  return 0
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+export fn bcm2711_get_mmio_base(): u64 {
+  return bcm2711_state.mmio_base
+}
+
+export fn bcm2711_get_arm_local_base(): u64 {
+  return bcm2711_state.arm_local_base
+}
+
+export fn bcm2711_get_sdram_size(): u64 {
+  return bcm2711_state.sdram_size
+}
+
+export fn bcm2711_get_cpu_freq(): u32 {
+  return bcm2711_state.cpu_freq
+}
+
+export fn bcm2711_get_board_revision(): u32 {
+  return bcm2711_state.board_revision
+}
+
+export fn bcm2711_get_board_serial(): u64 {
+  return bcm2711_state.board_serial
+}
+
+// Delay in microseconds using system timer
+export fn bcm2711_delay_us(us: u32) {
+  var timer_base: u64 = bcm2711_state.mmio_base + TIMER_OFFSET
+  var start: u64 = @zext(arm64.mmio_read32(timer_base + 4), u64)  // Timer low
+  start = start | (@zext(arm64.mmio_read32(timer_base + 8), u64) << 32)  // Timer high
+
+  var target: u64 = start + @zext(us, u64)
+
+  while true {
+    var now: u64 = @zext(arm64.mmio_read32(timer_base + 4), u64)
+    now = now | (@zext(arm64.mmio_read32(timer_base + 8), u64) << 32)
+
+    if now >= target {
+      break
+    }
+  }
+}
+
+export fn bcm2711_delay_ms(ms: u32) {
+  bcm2711_delay_us(ms * 1000)
+}

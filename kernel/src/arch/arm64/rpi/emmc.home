@@ -1,0 +1,943 @@
+// home-os Raspberry Pi EMMC/SD Controller
+// BCM2711 EMMC2 and legacy SDHCI support
+
+import "../../../core/types"
+import "../../../sync/spinlock"
+
+// =============================================================================
+// EMMC Base Addresses
+// =============================================================================
+
+// BCM2711 has two EMMC controllers
+const EMMC_BASE_PI3: u64 = 0x3F300000      // BCM2837 SDHCI
+const EMMC_BASE_PI4: u64 = 0xFE300000      // BCM2711 SDHCI (EMMC)
+const EMMC2_BASE_PI4: u64 = 0xFE340000     // BCM2711 EMMC2 (SD card)
+
+// =============================================================================
+// SDHCI Register Offsets
+// =============================================================================
+
+const SDHCI_DMA_ADDRESS: u64 = 0x00
+const SDHCI_BLOCK_SIZE: u64 = 0x04
+const SDHCI_BLOCK_COUNT: u64 = 0x06
+const SDHCI_ARGUMENT: u64 = 0x08
+const SDHCI_TRANSFER_MODE: u64 = 0x0C
+const SDHCI_COMMAND: u64 = 0x0E
+const SDHCI_RESPONSE0: u64 = 0x10
+const SDHCI_RESPONSE1: u64 = 0x14
+const SDHCI_RESPONSE2: u64 = 0x18
+const SDHCI_RESPONSE3: u64 = 0x1C
+const SDHCI_BUFFER_DATA_PORT: u64 = 0x20
+const SDHCI_PRESENT_STATE: u64 = 0x24
+const SDHCI_HOST_CONTROL: u64 = 0x28
+const SDHCI_POWER_CONTROL: u64 = 0x29
+const SDHCI_BLOCK_GAP_CONTROL: u64 = 0x2A
+const SDHCI_WAKE_UP_CONTROL: u64 = 0x2B
+const SDHCI_CLOCK_CONTROL: u64 = 0x2C
+const SDHCI_TIMEOUT_CONTROL: u64 = 0x2E
+const SDHCI_SOFTWARE_RESET: u64 = 0x2F
+const SDHCI_INT_STATUS: u64 = 0x30
+const SDHCI_INT_STATUS_ENABLE: u64 = 0x34
+const SDHCI_INT_SIGNAL_ENABLE: u64 = 0x38
+const SDHCI_AUTO_CMD_STATUS: u64 = 0x3C
+const SDHCI_HOST_CONTROL2: u64 = 0x3E
+const SDHCI_CAPABILITIES: u64 = 0x40
+const SDHCI_CAPABILITIES_1: u64 = 0x44
+const SDHCI_MAX_CURRENT: u64 = 0x48
+const SDHCI_FORCE_EVENT_AUTO_CMD: u64 = 0x50
+const SDHCI_FORCE_EVENT_ERR_INT: u64 = 0x52
+const SDHCI_ADMA_ERROR: u64 = 0x54
+const SDHCI_ADMA_ADDRESS: u64 = 0x58
+const SDHCI_ADMA_ADDRESS_HI: u64 = 0x5C
+const SDHCI_PRESET_VALUES: u64 = 0x60
+const SDHCI_SLOT_INT_STATUS: u64 = 0xFC
+const SDHCI_HOST_VERSION: u64 = 0xFE
+
+// =============================================================================
+// Command Types
+// =============================================================================
+
+// Response types
+const CMD_RESP_NONE: u16 = 0x00
+const CMD_RESP_136: u16 = 0x01      // R2
+const CMD_RESP_48: u16 = 0x02       // R1, R3, R6, R7
+const CMD_RESP_48_BUSY: u16 = 0x03  // R1b
+
+// Command flags
+const CMD_CRC_CHECK: u16 = 1 << 3
+const CMD_INDEX_CHECK: u16 = 1 << 4
+const CMD_DATA_PRESENT: u16 = 1 << 5
+const CMD_TYPE_NORMAL: u16 = 0 << 6
+const CMD_TYPE_SUSPEND: u16 = 1 << 6
+const CMD_TYPE_RESUME: u16 = 2 << 6
+const CMD_TYPE_ABORT: u16 = 3 << 6
+
+// Transfer mode flags
+const TM_DMA_ENABLE: u16 = 1 << 0
+const TM_BLOCK_COUNT_ENABLE: u16 = 1 << 1
+const TM_AUTO_CMD12: u16 = 1 << 2
+const TM_AUTO_CMD23: u16 = 2 << 2
+const TM_READ: u16 = 1 << 4
+const TM_MULTI_BLOCK: u16 = 1 << 5
+
+// =============================================================================
+// Present State Register
+// =============================================================================
+
+const STATE_CMD_INHIBIT: u32 = 1 << 0
+const STATE_DAT_INHIBIT: u32 = 1 << 1
+const STATE_DAT_ACTIVE: u32 = 1 << 2
+const STATE_RETUNING_REQUEST: u32 = 1 << 3
+const STATE_WRITE_TRANSFER: u32 = 1 << 8
+const STATE_READ_TRANSFER: u32 = 1 << 9
+const STATE_BUFFER_WRITE_ENABLE: u32 = 1 << 10
+const STATE_BUFFER_READ_ENABLE: u32 = 1 << 11
+const STATE_CARD_INSERTED: u32 = 1 << 16
+const STATE_CARD_STABLE: u32 = 1 << 17
+const STATE_CARD_DETECT_PIN: u32 = 1 << 18
+const STATE_WRITE_PROTECT: u32 = 1 << 19
+const STATE_DAT0_LEVEL: u32 = 1 << 20
+const STATE_DAT1_LEVEL: u32 = 1 << 21
+const STATE_DAT2_LEVEL: u32 = 1 << 22
+const STATE_DAT3_LEVEL: u32 = 1 << 23
+const STATE_CMD_LEVEL: u32 = 1 << 24
+
+// =============================================================================
+// Interrupt Status
+// =============================================================================
+
+const INT_CMD_COMPLETE: u32 = 1 << 0
+const INT_TRANSFER_COMPLETE: u32 = 1 << 1
+const INT_BLOCK_GAP: u32 = 1 << 2
+const INT_DMA_INTERRUPT: u32 = 1 << 3
+const INT_BUFFER_WRITE_READY: u32 = 1 << 4
+const INT_BUFFER_READ_READY: u32 = 1 << 5
+const INT_CARD_INSERTION: u32 = 1 << 6
+const INT_CARD_REMOVAL: u32 = 1 << 7
+const INT_CARD_INTERRUPT: u32 = 1 << 8
+const INT_RETUNE: u32 = 1 << 12
+const INT_ERROR: u32 = 1 << 15
+const INT_CMD_TIMEOUT: u32 = 1 << 16
+const INT_CMD_CRC: u32 = 1 << 17
+const INT_CMD_END_BIT: u32 = 1 << 18
+const INT_CMD_INDEX: u32 = 1 << 19
+const INT_DATA_TIMEOUT: u32 = 1 << 20
+const INT_DATA_CRC: u32 = 1 << 21
+const INT_DATA_END_BIT: u32 = 1 << 22
+const INT_CURRENT_LIMIT: u32 = 1 << 23
+const INT_AUTO_CMD_ERROR: u32 = 1 << 24
+const INT_ADMA_ERROR: u32 = 1 << 25
+const INT_TUNING_ERROR: u32 = 1 << 26
+
+const INT_ERROR_MASK: u32 = 0xFFFF0000
+const INT_ALL_MASK: u32 = 0x1FFF00FF
+
+// =============================================================================
+// Clock Control
+// =============================================================================
+
+const CLOCK_INTERNAL_ENABLE: u16 = 1 << 0
+const CLOCK_INTERNAL_STABLE: u16 = 1 << 1
+const CLOCK_CARD_ENABLE: u16 = 1 << 2
+const CLOCK_PROGRAMMABLE: u16 = 1 << 5
+const CLOCK_GENERATOR_SELECT: u16 = 1 << 5
+const CLOCK_DIVIDER_SHIFT: u32 = 8
+const CLOCK_DIVIDER_HI_SHIFT: u32 = 6
+const CLOCK_DIVIDER_MASK: u16 = 0xFF << 8
+
+// =============================================================================
+// Host Control
+// =============================================================================
+
+const HOST_LED_ON: u8 = 1 << 0
+const HOST_4BIT_MODE: u8 = 1 << 1
+const HOST_HIGH_SPEED: u8 = 1 << 2
+const HOST_DMA_SELECT_SDMA: u8 = 0 << 3
+const HOST_DMA_SELECT_ADMA32: u8 = 2 << 3
+const HOST_DMA_SELECT_ADMA64: u8 = 3 << 3
+const HOST_8BIT_MODE: u8 = 1 << 5
+const HOST_CARD_DETECT_TEST: u8 = 1 << 6
+const HOST_CARD_DETECT_SIGNAL: u8 = 1 << 7
+
+// Host Control 2
+const HOST2_UHS_SDR12: u16 = 0
+const HOST2_UHS_SDR25: u16 = 1
+const HOST2_UHS_SDR50: u16 = 2
+const HOST2_UHS_SDR104: u16 = 3
+const HOST2_UHS_DDR50: u16 = 4
+const HOST2_1_8V_SIGNALING: u16 = 1 << 3
+const HOST2_DRIVER_STRENGTH_B: u16 = 0 << 4
+const HOST2_DRIVER_STRENGTH_A: u16 = 1 << 4
+const HOST2_DRIVER_STRENGTH_C: u16 = 2 << 4
+const HOST2_DRIVER_STRENGTH_D: u16 = 3 << 4
+const HOST2_EXECUTE_TUNING: u16 = 1 << 6
+const HOST2_SAMPLING_CLOCK: u16 = 1 << 7
+const HOST2_ASYNC_INT_ENABLE: u16 = 1 << 14
+const HOST2_PRESET_VALUE_ENABLE: u16 = 1 << 15
+
+// =============================================================================
+// Power Control
+// =============================================================================
+
+const POWER_ON: u8 = 1 << 0
+const POWER_1_8V: u8 = 5 << 1
+const POWER_3_0V: u8 = 6 << 1
+const POWER_3_3V: u8 = 7 << 1
+
+// =============================================================================
+// Software Reset
+// =============================================================================
+
+const RESET_ALL: u8 = 1 << 0
+const RESET_CMD: u8 = 1 << 1
+const RESET_DATA: u8 = 1 << 2
+
+// =============================================================================
+// SD Commands
+// =============================================================================
+
+const CMD0_GO_IDLE_STATE: u8 = 0
+const CMD1_SEND_OP_COND: u8 = 1
+const CMD2_ALL_SEND_CID: u8 = 2
+const CMD3_SEND_RELATIVE_ADDR: u8 = 3
+const CMD4_SET_DSR: u8 = 4
+const CMD5_IO_SEND_OP_COND: u8 = 5
+const CMD6_SWITCH_FUNC: u8 = 6
+const CMD7_SELECT_CARD: u8 = 7
+const CMD8_SEND_IF_COND: u8 = 8
+const CMD9_SEND_CSD: u8 = 9
+const CMD10_SEND_CID: u8 = 10
+const CMD11_VOLTAGE_SWITCH: u8 = 11
+const CMD12_STOP_TRANSMISSION: u8 = 12
+const CMD13_SEND_STATUS: u8 = 13
+const CMD15_GO_INACTIVE_STATE: u8 = 15
+const CMD16_SET_BLOCKLEN: u8 = 16
+const CMD17_READ_SINGLE_BLOCK: u8 = 17
+const CMD18_READ_MULTIPLE_BLOCK: u8 = 18
+const CMD19_SEND_TUNING_BLOCK: u8 = 19
+const CMD23_SET_BLOCK_COUNT: u8 = 23
+const CMD24_WRITE_BLOCK: u8 = 24
+const CMD25_WRITE_MULTIPLE_BLOCK: u8 = 25
+const CMD32_ERASE_WR_BLK_START: u8 = 32
+const CMD33_ERASE_WR_BLK_END: u8 = 33
+const CMD38_ERASE: u8 = 38
+const CMD55_APP_CMD: u8 = 55
+const CMD56_GEN_CMD: u8 = 56
+
+// Application commands (after CMD55)
+const ACMD6_SET_BUS_WIDTH: u8 = 6
+const ACMD13_SD_STATUS: u8 = 13
+const ACMD22_SEND_NUM_WR_BLOCKS: u8 = 22
+const ACMD23_SET_WR_BLK_ERASE_COUNT: u8 = 23
+const ACMD41_SD_SEND_OP_COND: u8 = 41
+const ACMD42_SET_CLR_CARD_DETECT: u8 = 42
+const ACMD51_SEND_SCR: u8 = 51
+
+// =============================================================================
+// SD Card Structures
+// =============================================================================
+
+struct SDCard {
+    rca: u16,               // Relative Card Address
+    version: u8,            // SD version (1, 2, 3)
+    high_capacity: bool,    // SDHC/SDXC
+    block_size: u32,
+    block_count: u64,
+    capacity: u64,          // Total bytes
+    cid: [u32; 4],          // Card ID
+    csd: [u32; 4],          // Card Specific Data
+    scr: [u32; 2],          // SD Configuration Register
+    ocr: u32,               // Operating Conditions Register
+    bus_width: u8,          // 1 or 4 bit
+    speed_class: u8,
+    uhs_mode: u8,
+}
+
+struct EMMCController {
+    base: u64,
+    lock: Spinlock,
+    card: Option<SDCard>,
+    base_clock: u32,        // Base clock frequency
+    max_clock: u32,         // Max supported clock
+    current_clock: u32,     // Current clock frequency
+    version: u16,           // SDHCI version
+    timeout_clks: u32,      // Timeout in clock cycles
+}
+
+static mut EMMC: EMMCController = EMMCController {
+    base: EMMC2_BASE_PI4,
+    lock: Spinlock::new(),
+    card: None,
+    base_clock: 200000000,  // 200MHz on Pi 4
+    max_clock: 50000000,    // 50MHz for SD
+    current_clock: 0,
+    version: 0,
+    timeout_clks: 0,
+}
+
+// =============================================================================
+// Register Access
+// =============================================================================
+
+fn emmc_read32(offset: u64): u32 {
+    unsafe {
+        let addr = EMMC.base + offset
+        let value: u32
+        asm!("ldr {0:w}, [{1}]", out(reg) value, in(reg) addr)
+        return value
+    }
+}
+
+fn emmc_write32(offset: u64, value: u32) {
+    unsafe {
+        let addr = EMMC.base + offset
+        asm!("str {0:w}, [{1}]", in(reg) value, in(reg) addr)
+    }
+}
+
+fn emmc_read16(offset: u64): u16 {
+    unsafe {
+        let addr = EMMC.base + offset
+        let value: u16
+        asm!("ldrh {0:w}, [{1}]", out(reg) value, in(reg) addr)
+        return value
+    }
+}
+
+fn emmc_write16(offset: u64, value: u16) {
+    unsafe {
+        let addr = EMMC.base + offset
+        asm!("strh {0:w}, [{1}]", in(reg) value, in(reg) addr)
+    }
+}
+
+fn emmc_read8(offset: u64): u8 {
+    unsafe {
+        let addr = EMMC.base + offset
+        let value: u8
+        asm!("ldrb {0:w}, [{1}]", out(reg) value, in(reg) addr)
+        return value
+    }
+}
+
+fn emmc_write8(offset: u64, value: u8) {
+    unsafe {
+        let addr = EMMC.base + offset
+        asm!("strb {0:w}, [{1}]", in(reg) value, in(reg) addr)
+    }
+}
+
+fn delay_us(us: u32) {
+    // Simple delay loop (should use timer)
+    for _ in 0..us * 100 {
+        asm!("nop")
+    }
+}
+
+// =============================================================================
+// EMMC Controller Functions
+// =============================================================================
+
+// Initialize EMMC controller
+export fn emmc_init(base: u64, base_clock: u32): i32 {
+    unsafe {
+        EMMC.base = base
+        EMMC.base_clock = base_clock
+        EMMC.lock.init()
+    }
+
+    // Read host version
+    let version = emmc_read16(SDHCI_HOST_VERSION)
+    unsafe {
+        EMMC.version = version
+    }
+
+    // Reset controller
+    if emmc_reset(RESET_ALL) != 0 {
+        return -1
+    }
+
+    // Read capabilities
+    let caps = emmc_read32(SDHCI_CAPABILITIES)
+    let caps1 = emmc_read32(SDHCI_CAPABILITIES_1)
+
+    // Set base clock from capabilities if available
+    let base_clk_freq = ((caps >> 8) & 0xFF) as u32
+    if base_clk_freq > 0 {
+        unsafe {
+            EMMC.base_clock = base_clk_freq * 1000000
+        }
+    }
+
+    // Enable all interrupts
+    emmc_write32(SDHCI_INT_STATUS_ENABLE, INT_ALL_MASK)
+    emmc_write32(SDHCI_INT_SIGNAL_ENABLE, 0)  // Polling mode
+
+    // Set timeout
+    emmc_write8(SDHCI_TIMEOUT_CONTROL, 0x0E)  // Max timeout
+
+    // Power on with 3.3V
+    emmc_set_power(true, 3300)
+
+    // Set initial clock (400kHz for identification)
+    emmc_set_clock(400000)
+
+    return 0
+}
+
+// Reset EMMC controller
+fn emmc_reset(mask: u8): i32 {
+    emmc_write8(SDHCI_SOFTWARE_RESET, mask)
+
+    // Wait for reset to complete
+    let mut timeout = 100
+    while (emmc_read8(SDHCI_SOFTWARE_RESET) & mask) != 0 {
+        if timeout == 0 {
+            return -1  // Timeout
+        }
+        timeout -= 1
+        delay_us(1000)
+    }
+
+    return 0
+}
+
+// Set power
+fn emmc_set_power(on: bool, voltage_mv: u32): i32 {
+    let mut power: u8 = 0
+
+    if on {
+        power = POWER_ON
+        if voltage_mv >= 3300 {
+            power |= POWER_3_3V
+        } else if voltage_mv >= 3000 {
+            power |= POWER_3_0V
+        } else {
+            power |= POWER_1_8V
+        }
+    }
+
+    emmc_write8(SDHCI_POWER_CONTROL, 0)  // Power off first
+    if on {
+        delay_us(1000)
+        emmc_write8(SDHCI_POWER_CONTROL, power)
+        delay_us(1000)
+    }
+
+    return 0
+}
+
+// Set clock frequency
+fn emmc_set_clock(freq: u32): i32 {
+    // Disable clock
+    emmc_write16(SDHCI_CLOCK_CONTROL, 0)
+
+    if freq == 0 {
+        return 0
+    }
+
+    unsafe {
+        // Calculate divider
+        let mut divider = EMMC.base_clock / freq
+        if EMMC.base_clock % freq != 0 {
+            divider += 1
+        }
+
+        // Round up to nearest power of 2 for version < 3.0
+        if EMMC.version < 0x300 {
+            let mut pwr = 1u32
+            while pwr < divider && pwr < 256 {
+                pwr *= 2
+            }
+            divider = pwr
+        }
+
+        // Divider must be even and <= 2046
+        if divider > 2046 {
+            divider = 2046
+        }
+        if divider > 1 {
+            divider = (divider + 1) & !1
+        }
+
+        let div_lo = ((divider >> 1) & 0xFF) as u16
+        let div_hi = (((divider >> 1) >> 8) & 0x03) as u16
+
+        let clock = CLOCK_INTERNAL_ENABLE |
+                    (div_lo << 8) |
+                    (div_hi << 6)
+
+        emmc_write16(SDHCI_CLOCK_CONTROL, clock)
+
+        // Wait for internal clock stable
+        let mut timeout = 20
+        while (emmc_read16(SDHCI_CLOCK_CONTROL) & CLOCK_INTERNAL_STABLE) == 0 {
+            if timeout == 0 {
+                return -1
+            }
+            timeout -= 1
+            delay_us(1000)
+        }
+
+        // Enable card clock
+        emmc_write16(SDHCI_CLOCK_CONTROL, clock | CLOCK_CARD_ENABLE)
+
+        EMMC.current_clock = EMMC.base_clock / divider
+    }
+
+    delay_us(1000)
+    return 0
+}
+
+// =============================================================================
+// Command Execution
+// =============================================================================
+
+fn emmc_wait_cmd(): i32 {
+    let mut timeout = 1000000
+    while (emmc_read32(SDHCI_PRESENT_STATE) & STATE_CMD_INHIBIT) != 0 {
+        if timeout == 0 {
+            return -1
+        }
+        timeout -= 1
+    }
+    return 0
+}
+
+fn emmc_wait_data(): i32 {
+    let mut timeout = 1000000
+    while (emmc_read32(SDHCI_PRESENT_STATE) & STATE_DAT_INHIBIT) != 0 {
+        if timeout == 0 {
+            return -1
+        }
+        timeout -= 1
+    }
+    return 0
+}
+
+fn emmc_send_cmd(cmd: u8, arg: u32, resp_type: u16, flags: u16): i32 {
+    // Wait for command line to be free
+    if emmc_wait_cmd() != 0 {
+        return -1
+    }
+
+    // Clear interrupt status
+    emmc_write32(SDHCI_INT_STATUS, INT_ALL_MASK)
+
+    // Set argument
+    emmc_write32(SDHCI_ARGUMENT, arg)
+
+    // Build and send command
+    let command = ((cmd as u16) << 8) | resp_type | flags
+    emmc_write16(SDHCI_COMMAND, command)
+
+    // Wait for command complete
+    let mut timeout = 1000000
+    loop {
+        let status = emmc_read32(SDHCI_INT_STATUS)
+
+        if (status & INT_ERROR_MASK) != 0 {
+            // Clear status and return error
+            emmc_write32(SDHCI_INT_STATUS, status)
+            return -1
+        }
+
+        if (status & INT_CMD_COMPLETE) != 0 {
+            emmc_write32(SDHCI_INT_STATUS, INT_CMD_COMPLETE)
+            break
+        }
+
+        if timeout == 0 {
+            return -1
+        }
+        timeout -= 1
+    }
+
+    return 0
+}
+
+fn emmc_send_app_cmd(cmd: u8, arg: u32, resp_type: u16, flags: u16): i32 {
+    unsafe {
+        let rca = match &EMMC.card {
+            Some(card) => card.rca,
+            None => 0,
+        }
+
+        // Send CMD55 first
+        if emmc_send_cmd(CMD55_APP_CMD, (rca as u32) << 16, CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0) != 0 {
+            return -1
+        }
+
+        // Send the actual application command
+        return emmc_send_cmd(cmd, arg, resp_type, flags)
+    }
+}
+
+fn emmc_get_response(): [u32; 4] {
+    let mut resp: [u32; 4] = [0u32; 4]
+    resp[0] = emmc_read32(SDHCI_RESPONSE0)
+    resp[1] = emmc_read32(SDHCI_RESPONSE1)
+    resp[2] = emmc_read32(SDHCI_RESPONSE2)
+    resp[3] = emmc_read32(SDHCI_RESPONSE3)
+    return resp
+}
+
+// =============================================================================
+// Card Detection and Initialization
+// =============================================================================
+
+// Check if card is present
+export fn emmc_card_present(): bool {
+    return (emmc_read32(SDHCI_PRESENT_STATE) & STATE_CARD_INSERTED) != 0
+}
+
+// Initialize SD card
+export fn emmc_init_card(): i32 {
+    if !emmc_card_present() {
+        return -1  // No card
+    }
+
+    // CMD0 - Go idle state
+    emmc_send_cmd(CMD0_GO_IDLE_STATE, 0, CMD_RESP_NONE, 0)
+    delay_us(2000)
+
+    // CMD8 - Send interface condition (for SD 2.0+)
+    let mut sd_version: u8 = 1
+    let cmd8_arg: u32 = 0x1AA  // 2.7-3.6V, check pattern 0xAA
+    if emmc_send_cmd(CMD8_SEND_IF_COND, cmd8_arg, CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0) == 0 {
+        let resp = emmc_get_response()
+        if (resp[0] & 0xFFF) == cmd8_arg {
+            sd_version = 2
+        }
+    }
+
+    // ACMD41 - SD_SEND_OP_COND
+    let mut ocr: u32 = 0
+    let mut high_capacity = false
+    let acmd41_arg: u32 = 0x40FF8000  // HCS + voltage range
+
+    for _ in 0..100 {
+        if emmc_send_app_cmd(ACMD41_SD_SEND_OP_COND, acmd41_arg, CMD_RESP_48, 0) != 0 {
+            return -1
+        }
+
+        let resp = emmc_get_response()
+        ocr = resp[0]
+
+        if (ocr & (1 << 31)) != 0 {
+            // Card is ready
+            high_capacity = (ocr & (1 << 30)) != 0
+            break
+        }
+
+        delay_us(10000)
+    }
+
+    if (ocr & (1 << 31)) == 0 {
+        return -1  // Card never became ready
+    }
+
+    // CMD2 - All send CID
+    if emmc_send_cmd(CMD2_ALL_SEND_CID, 0, CMD_RESP_136 | CMD_CRC_CHECK, 0) != 0 {
+        return -1
+    }
+    let cid = emmc_get_response()
+
+    // CMD3 - Send relative address
+    if emmc_send_cmd(CMD3_SEND_RELATIVE_ADDR, 0, CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0) != 0 {
+        return -1
+    }
+    let resp = emmc_get_response()
+    let rca = ((resp[0] >> 16) & 0xFFFF) as u16
+
+    // CMD9 - Send CSD
+    if emmc_send_cmd(CMD9_SEND_CSD, (rca as u32) << 16, CMD_RESP_136 | CMD_CRC_CHECK, 0) != 0 {
+        return -1
+    }
+    let csd = emmc_get_response()
+
+    // Calculate capacity
+    let block_size: u32 = 512
+    let block_count: u64
+    let capacity: u64
+
+    if high_capacity {
+        // CSD v2: C_SIZE is 22 bits at bits 48-69
+        let c_size = ((csd[1] & 0x3F) << 16) | (csd[2] >> 16)
+        block_count = (c_size as u64 + 1) * 1024
+    } else {
+        // CSD v1
+        let c_size = ((csd[1] & 0x3FF) << 2) | (csd[2] >> 30)
+        let c_size_mult = (csd[2] >> 15) & 0x7
+        let read_bl_len = (csd[1] >> 16) & 0xF
+        block_count = (c_size as u64 + 1) << (c_size_mult + 2) << (read_bl_len - 9)
+    }
+    capacity = block_count * block_size as u64
+
+    // CMD7 - Select card
+    if emmc_send_cmd(CMD7_SELECT_CARD, (rca as u32) << 16, CMD_RESP_48_BUSY | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0) != 0 {
+        return -1
+    }
+
+    // Set block length to 512
+    if emmc_send_cmd(CMD16_SET_BLOCKLEN, 512, CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0) != 0 {
+        return -1
+    }
+
+    // Try to switch to 4-bit mode
+    let mut bus_width: u8 = 1
+    if emmc_send_app_cmd(ACMD6_SET_BUS_WIDTH, 2, CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK, 0) == 0 {
+        let host_ctrl = emmc_read8(SDHCI_HOST_CONTROL)
+        emmc_write8(SDHCI_HOST_CONTROL, host_ctrl | HOST_4BIT_MODE)
+        bus_width = 4
+    }
+
+    // Increase clock for data transfer
+    emmc_set_clock(25000000)  // 25MHz
+
+    // Store card info
+    unsafe {
+        EMMC.card = Some(SDCard {
+            rca: rca,
+            version: sd_version,
+            high_capacity: high_capacity,
+            block_size: block_size,
+            block_count: block_count,
+            capacity: capacity,
+            cid: cid,
+            csd: csd,
+            scr: [0, 0],
+            ocr: ocr,
+            bus_width: bus_width,
+            speed_class: 0,
+            uhs_mode: 0,
+        })
+    }
+
+    return 0
+}
+
+// =============================================================================
+// Data Transfer
+// =============================================================================
+
+// Read blocks
+export fn emmc_read_blocks(start_block: u64, count: u32, buffer: *mut u8): i32 {
+    unsafe {
+        let card = match &EMMC.card {
+            Some(c) => c,
+            None => return -1,
+        }
+
+        if count == 0 {
+            return 0
+        }
+
+        // Wait for data line
+        if emmc_wait_data() != 0 {
+            return -1
+        }
+
+        // Calculate address
+        let addr = if card.high_capacity {
+            start_block as u32
+        } else {
+            (start_block * card.block_size as u64) as u32
+        }
+
+        // Set block size and count
+        emmc_write16(SDHCI_BLOCK_SIZE, card.block_size as u16)
+        emmc_write16(SDHCI_BLOCK_COUNT, count as u16)
+
+        // Set transfer mode
+        let transfer_mode = TM_READ | TM_BLOCK_COUNT_ENABLE |
+                           if count > 1 { TM_MULTI_BLOCK | TM_AUTO_CMD12 } else { 0 }
+        emmc_write16(SDHCI_TRANSFER_MODE, transfer_mode)
+
+        // Send read command
+        let cmd = if count > 1 { CMD18_READ_MULTIPLE_BLOCK } else { CMD17_READ_SINGLE_BLOCK }
+        if emmc_send_cmd(cmd, addr, CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK, CMD_DATA_PRESENT) != 0 {
+            return -1
+        }
+
+        // Read data
+        let mut buf_offset: usize = 0
+        for _ in 0..count {
+            // Wait for buffer read ready
+            let mut timeout = 1000000
+            loop {
+                let status = emmc_read32(SDHCI_INT_STATUS)
+                if (status & INT_ERROR_MASK) != 0 {
+                    emmc_write32(SDHCI_INT_STATUS, status)
+                    return -1
+                }
+                if (status & INT_BUFFER_READ_READY) != 0 {
+                    emmc_write32(SDHCI_INT_STATUS, INT_BUFFER_READ_READY)
+                    break
+                }
+                if timeout == 0 {
+                    return -1
+                }
+                timeout -= 1
+            }
+
+            // Read block (512 bytes = 128 words)
+            for _ in 0..128 {
+                let word = emmc_read32(SDHCI_BUFFER_DATA_PORT)
+                let ptr = buffer.add(buf_offset) as *mut u32
+                *ptr = word
+                buf_offset += 4
+            }
+        }
+
+        // Wait for transfer complete
+        let mut timeout = 1000000
+        loop {
+            let status = emmc_read32(SDHCI_INT_STATUS)
+            if (status & INT_TRANSFER_COMPLETE) != 0 {
+                emmc_write32(SDHCI_INT_STATUS, INT_TRANSFER_COMPLETE)
+                break
+            }
+            if (status & INT_ERROR_MASK) != 0 {
+                emmc_write32(SDHCI_INT_STATUS, status)
+                return -1
+            }
+            if timeout == 0 {
+                return -1
+            }
+            timeout -= 1
+        }
+    }
+
+    return 0
+}
+
+// Write blocks
+export fn emmc_write_blocks(start_block: u64, count: u32, buffer: *const u8): i32 {
+    unsafe {
+        let card = match &EMMC.card {
+            Some(c) => c,
+            None => return -1,
+        }
+
+        if count == 0 {
+            return 0
+        }
+
+        // Wait for data line
+        if emmc_wait_data() != 0 {
+            return -1
+        }
+
+        // Calculate address
+        let addr = if card.high_capacity {
+            start_block as u32
+        } else {
+            (start_block * card.block_size as u64) as u32
+        }
+
+        // Set block size and count
+        emmc_write16(SDHCI_BLOCK_SIZE, card.block_size as u16)
+        emmc_write16(SDHCI_BLOCK_COUNT, count as u16)
+
+        // Set transfer mode (no TM_READ for write)
+        let transfer_mode = TM_BLOCK_COUNT_ENABLE |
+                           if count > 1 { TM_MULTI_BLOCK | TM_AUTO_CMD12 } else { 0 }
+        emmc_write16(SDHCI_TRANSFER_MODE, transfer_mode)
+
+        // Send write command
+        let cmd = if count > 1 { CMD25_WRITE_MULTIPLE_BLOCK } else { CMD24_WRITE_BLOCK }
+        if emmc_send_cmd(cmd, addr, CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK, CMD_DATA_PRESENT) != 0 {
+            return -1
+        }
+
+        // Write data
+        let mut buf_offset: usize = 0
+        for _ in 0..count {
+            // Wait for buffer write ready
+            let mut timeout = 1000000
+            loop {
+                let status = emmc_read32(SDHCI_INT_STATUS)
+                if (status & INT_ERROR_MASK) != 0 {
+                    emmc_write32(SDHCI_INT_STATUS, status)
+                    return -1
+                }
+                if (status & INT_BUFFER_WRITE_READY) != 0 {
+                    emmc_write32(SDHCI_INT_STATUS, INT_BUFFER_WRITE_READY)
+                    break
+                }
+                if timeout == 0 {
+                    return -1
+                }
+                timeout -= 1
+            }
+
+            // Write block
+            for _ in 0..128 {
+                let ptr = buffer.add(buf_offset) as *const u32
+                emmc_write32(SDHCI_BUFFER_DATA_PORT, *ptr)
+                buf_offset += 4
+            }
+        }
+
+        // Wait for transfer complete
+        let mut timeout = 1000000
+        loop {
+            let status = emmc_read32(SDHCI_INT_STATUS)
+            if (status & INT_TRANSFER_COMPLETE) != 0 {
+                emmc_write32(SDHCI_INT_STATUS, INT_TRANSFER_COMPLETE)
+                break
+            }
+            if (status & INT_ERROR_MASK) != 0 {
+                emmc_write32(SDHCI_INT_STATUS, status)
+                return -1
+            }
+            if timeout == 0 {
+                return -1
+            }
+            timeout -= 1
+        }
+    }
+
+    return 0
+}
+
+// =============================================================================
+// Card Information
+// =============================================================================
+
+export fn emmc_get_capacity(): u64 {
+    unsafe {
+        match &EMMC.card {
+            Some(card) => card.capacity,
+            None => 0,
+        }
+    }
+}
+
+export fn emmc_get_block_count(): u64 {
+    unsafe {
+        match &EMMC.card {
+            Some(card) => card.block_count,
+            None => 0,
+        }
+    }
+}
+
+export fn emmc_get_block_size(): u32 {
+    unsafe {
+        match &EMMC.card {
+            Some(card) => card.block_size,
+            None => 0,
+        }
+    }
+}
+
+export fn emmc_is_high_capacity(): bool {
+    unsafe {
+        match &EMMC.card {
+            Some(card) => card.high_capacity,
+            None => false,
+        }
+    }
+}

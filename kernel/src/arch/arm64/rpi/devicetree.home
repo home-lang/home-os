@@ -1,0 +1,909 @@
+// home-os Device Tree Parser
+// Flattened Device Tree (FDT) / Device Tree Blob (DTB) support
+
+import "../../../core/types"
+import "../../../mm/memory"
+
+// =============================================================================
+// FDT Constants
+// =============================================================================
+
+const FDT_MAGIC: u32 = 0xD00DFEED
+const FDT_VERSION: u32 = 17
+
+// FDT structure tokens
+const FDT_BEGIN_NODE: u32 = 0x00000001
+const FDT_END_NODE: u32 = 0x00000002
+const FDT_PROP: u32 = 0x00000003
+const FDT_NOP: u32 = 0x00000004
+const FDT_END: u32 = 0x00000009
+
+// =============================================================================
+// FDT Header
+// =============================================================================
+
+#[repr(C)]
+struct FdtHeader {
+    magic: u32,
+    totalsize: u32,
+    off_dt_struct: u32,
+    off_dt_strings: u32,
+    off_mem_rsvmap: u32,
+    version: u32,
+    last_comp_version: u32,
+    boot_cpuid_phys: u32,
+    size_dt_strings: u32,
+    size_dt_struct: u32,
+}
+
+// Memory reservation entry
+#[repr(C)]
+struct FdtReserveEntry {
+    address: u64,
+    size: u64,
+}
+
+// Property header
+#[repr(C)]
+struct FdtProperty {
+    len: u32,
+    nameoff: u32,
+}
+
+// =============================================================================
+// Device Tree Node
+// =============================================================================
+
+const MAX_NODE_NAME: usize = 128
+const MAX_PROPERTY_NAME: usize = 64
+const MAX_PROPERTIES: usize = 64
+const MAX_CHILDREN: usize = 32
+const MAX_NODES: usize = 256
+
+struct DtProperty {
+    name: [u8; MAX_PROPERTY_NAME],
+    name_len: usize,
+    data: *const u8,
+    data_len: usize,
+}
+
+struct DtNode {
+    name: [u8; MAX_NODE_NAME],
+    name_len: usize,
+    unit_address: u64,
+    has_unit_address: bool,
+    parent: Option<usize>,
+    properties: [Option<DtProperty>; MAX_PROPERTIES],
+    property_count: usize,
+    children: [Option<usize>; MAX_CHILDREN],
+    child_count: usize,
+    phandle: u32,
+    depth: u32,
+}
+
+// =============================================================================
+// Device Tree State
+// =============================================================================
+
+struct DeviceTree {
+    fdt_addr: u64,
+    fdt_size: u32,
+    valid: bool,
+    root_node: usize,
+    nodes: [Option<DtNode>; MAX_NODES],
+    node_count: usize,
+    // Commonly accessed values
+    memory_base: u64,
+    memory_size: u64,
+    cmdline: [u8; 512],
+    cmdline_len: usize,
+    model: [u8; 128],
+    model_len: usize,
+    compatible: [u8; 256],
+    compatible_len: usize,
+    serial_stdout: [u8; 64],
+    serial_stdout_len: usize,
+}
+
+static mut DT: DeviceTree = DeviceTree {
+    fdt_addr: 0,
+    fdt_size: 0,
+    valid: false,
+    root_node: 0,
+    nodes: [None; MAX_NODES],
+    node_count: 0,
+    memory_base: 0,
+    memory_size: 0,
+    cmdline: [0u8; 512],
+    cmdline_len: 0,
+    model: [0u8; 128],
+    model_len: 0,
+    compatible: [0u8; 256],
+    compatible_len: 0,
+    serial_stdout: [0u8; 64],
+    serial_stdout_len: 0,
+}
+
+// =============================================================================
+// Byte Order Conversion (Big-endian to CPU)
+// =============================================================================
+
+fn be32_to_cpu(val: u32): u32 {
+    return ((val & 0xFF) << 24) |
+           ((val & 0xFF00) << 8) |
+           ((val & 0xFF0000) >> 8) |
+           ((val & 0xFF000000) >> 24)
+}
+
+fn be64_to_cpu(val: u64): u64 {
+    let hi = be32_to_cpu((val >> 32) as u32) as u64
+    let lo = be32_to_cpu(val as u32) as u64
+    return (lo << 32) | hi
+}
+
+fn cpu_to_be32(val: u32): u32 {
+    return be32_to_cpu(val)  // Same operation
+}
+
+// =============================================================================
+// FDT Reading Utilities
+// =============================================================================
+
+fn read_u32(addr: u64): u32 {
+    unsafe {
+        let ptr = addr as *const u32
+        return be32_to_cpu(*ptr)
+    }
+}
+
+fn read_u64(addr: u64): u64 {
+    unsafe {
+        let ptr = addr as *const u64
+        return be64_to_cpu(*ptr)
+    }
+}
+
+fn read_u8(addr: u64): u8 {
+    unsafe {
+        let ptr = addr as *const u8
+        return *ptr
+    }
+}
+
+// Read null-terminated string
+fn read_string(addr: u64, max_len: usize): (usize, [u8; MAX_NODE_NAME]) {
+    let mut buf: [u8; MAX_NODE_NAME] = [0u8; MAX_NODE_NAME]
+    let mut len = 0
+
+    while len < max_len {
+        let c = read_u8(addr + len as u64)
+        if c == 0 {
+            break
+        }
+        buf[len] = c
+        len += 1
+    }
+
+    return (len, buf)
+}
+
+// Align to 4-byte boundary
+fn align4(offset: u64): u64 {
+    return (offset + 3) & !3
+}
+
+// =============================================================================
+// FDT Parsing
+// =============================================================================
+
+// Initialize device tree from FDT blob
+export fn dt_init(fdt_addr: u64): i32 {
+    // Validate magic number
+    let magic = read_u32(fdt_addr)
+    if magic != FDT_MAGIC {
+        return -1  // Invalid FDT
+    }
+
+    let totalsize = read_u32(fdt_addr + 4)
+    let version = read_u32(fdt_addr + 20)
+
+    if version < 16 {
+        return -2  // Version too old
+    }
+
+    unsafe {
+        DT.fdt_addr = fdt_addr
+        DT.fdt_size = totalsize
+        DT.valid = true
+        DT.node_count = 0
+    }
+
+    // Parse the structure block
+    let off_dt_struct = read_u32(fdt_addr + 8)
+    let off_dt_strings = read_u32(fdt_addr + 12)
+
+    parse_structure_block(fdt_addr + off_dt_struct as u64, fdt_addr + off_dt_strings as u64)
+
+    // Extract commonly needed values
+    extract_memory_info()
+    extract_cmdline()
+    extract_model_info()
+    extract_stdout_path()
+
+    return 0
+}
+
+// Parse the FDT structure block
+fn parse_structure_block(struct_addr: u64, strings_addr: u64) {
+    let mut offset: u64 = 0
+    let mut current_node: Option<usize> = None
+    let mut depth: u32 = 0
+    let mut node_stack: [Option<usize>; 32] = [None; 32]
+
+    loop {
+        let token = read_u32(struct_addr + offset)
+        offset += 4
+
+        match token {
+            FDT_BEGIN_NODE => {
+                // Read node name
+                let (name_len, name) = read_string(struct_addr + offset, MAX_NODE_NAME)
+                offset = align4(offset + name_len as u64 + 1)
+
+                // Parse unit address if present
+                let mut unit_address: u64 = 0
+                let mut has_unit_address = false
+                for i in 0..name_len {
+                    if name[i] == '@' as u8 {
+                        // Parse hex address after @
+                        unit_address = parse_hex_address(&name[i+1..name_len])
+                        has_unit_address = true
+                        break
+                    }
+                }
+
+                // Create node
+                let node_idx = unsafe { DT.node_count }
+                if node_idx >= MAX_NODES {
+                    break
+                }
+
+                let parent = if depth > 0 {
+                    node_stack[(depth - 1) as usize]
+                } else {
+                    None
+                }
+
+                unsafe {
+                    DT.nodes[node_idx] = Some(DtNode {
+                        name: name,
+                        name_len: name_len,
+                        unit_address: unit_address,
+                        has_unit_address: has_unit_address,
+                        parent: parent,
+                        properties: [None; MAX_PROPERTIES],
+                        property_count: 0,
+                        children: [None; MAX_CHILDREN],
+                        child_count: 0,
+                        phandle: 0,
+                        depth: depth,
+                    })
+                    DT.node_count += 1
+
+                    // Add as child of parent
+                    if let Some(parent_idx) = parent {
+                        if let Some(ref mut parent_node) = DT.nodes[parent_idx] {
+                            if parent_node.child_count < MAX_CHILDREN {
+                                parent_node.children[parent_node.child_count] = Some(node_idx)
+                                parent_node.child_count += 1
+                            }
+                        }
+                    }
+                }
+
+                current_node = Some(node_idx)
+                node_stack[depth as usize] = Some(node_idx)
+                depth += 1
+            },
+
+            FDT_END_NODE => {
+                depth -= 1
+                current_node = if depth > 0 {
+                    node_stack[(depth - 1) as usize]
+                } else {
+                    None
+                }
+            },
+
+            FDT_PROP => {
+                let len = read_u32(struct_addr + offset)
+                let nameoff = read_u32(struct_addr + offset + 4)
+                offset += 8
+
+                // Read property name from strings block
+                let (prop_name_len, prop_name) = read_string(strings_addr + nameoff as u64, MAX_PROPERTY_NAME)
+
+                // Property data
+                let data_ptr = (struct_addr + offset) as *const u8
+                offset = align4(offset + len as u64)
+
+                // Add property to current node
+                if let Some(node_idx) = current_node {
+                    unsafe {
+                        if let Some(ref mut node) = DT.nodes[node_idx] {
+                            if node.property_count < MAX_PROPERTIES {
+                                let mut prop_name_arr: [u8; MAX_PROPERTY_NAME] = [0u8; MAX_PROPERTY_NAME]
+                                for i in 0..prop_name_len.min(MAX_PROPERTY_NAME) {
+                                    prop_name_arr[i] = prop_name[i]
+                                }
+
+                                node.properties[node.property_count] = Some(DtProperty {
+                                    name: prop_name_arr,
+                                    name_len: prop_name_len,
+                                    data: data_ptr,
+                                    data_len: len as usize,
+                                })
+                                node.property_count += 1
+
+                                // Check for phandle
+                                if str_eq(&prop_name_arr, prop_name_len, "phandle") {
+                                    node.phandle = read_u32(data_ptr as u64)
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+
+            FDT_NOP => {
+                // Skip
+            },
+
+            FDT_END => {
+                break
+            },
+
+            _ => {
+                // Unknown token, stop parsing
+                break
+            }
+        }
+    }
+}
+
+fn parse_hex_address(s: &[u8]): u64 {
+    let mut result: u64 = 0
+    for c in s {
+        result <<= 4
+        match *c {
+            b'0'..=b'9' => result |= (*c - b'0') as u64,
+            b'a'..=b'f' => result |= (*c - b'a' + 10) as u64,
+            b'A'..=b'F' => result |= (*c - b'A' + 10) as u64,
+            _ => break,
+        }
+    }
+    return result
+}
+
+fn str_eq(a: &[u8], a_len: usize, b: &str): bool {
+    let b_bytes = b.as_bytes()
+    if a_len != b_bytes.len() {
+        return false
+    }
+    for i in 0..a_len {
+        if a[i] != b_bytes[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// =============================================================================
+// Information Extraction
+// =============================================================================
+
+fn extract_memory_info() {
+    // Find /memory node
+    if let Some(node) = find_node_by_name("memory") {
+        // Look for "reg" property
+        if let Some(prop) = get_property(node, "reg") {
+            // Assuming #address-cells = 2, #size-cells = 1 or 2
+            // Common format: <base_hi base_lo size_hi size_lo>
+            if prop.data_len >= 8 {
+                let base = read_u64(prop.data as u64)
+                let size = if prop.data_len >= 16 {
+                    read_u64(prop.data as u64 + 8)
+                } else {
+                    read_u32(prop.data as u64 + 8) as u64
+                }
+                unsafe {
+                    DT.memory_base = base
+                    DT.memory_size = size
+                }
+            }
+        }
+    }
+}
+
+fn extract_cmdline() {
+    // Find /chosen node
+    if let Some(node) = find_node_by_name("chosen") {
+        // Look for "bootargs" property
+        if let Some(prop) = get_property(node, "bootargs") {
+            let len = prop.data_len.min(511)
+            unsafe {
+                for i in 0..len {
+                    DT.cmdline[i] = *(prop.data.add(i))
+                }
+                DT.cmdline[len] = 0
+                DT.cmdline_len = len
+            }
+        }
+    }
+}
+
+fn extract_model_info() {
+    // Find root node
+    if let Some(node) = find_node_by_path("/") {
+        // Look for "model" property
+        if let Some(prop) = get_property(node, "model") {
+            let len = prop.data_len.min(127)
+            unsafe {
+                for i in 0..len {
+                    DT.model[i] = *(prop.data.add(i))
+                }
+                DT.model[len] = 0
+                DT.model_len = len
+            }
+        }
+
+        // Look for "compatible" property
+        if let Some(prop) = get_property(node, "compatible") {
+            let len = prop.data_len.min(255)
+            unsafe {
+                for i in 0..len {
+                    DT.compatible[i] = *(prop.data.add(i))
+                }
+                DT.compatible[len] = 0
+                DT.compatible_len = len
+            }
+        }
+    }
+}
+
+fn extract_stdout_path() {
+    // Find /chosen node
+    if let Some(node) = find_node_by_name("chosen") {
+        // Look for "stdout-path" property
+        if let Some(prop) = get_property(node, "stdout-path") {
+            let len = prop.data_len.min(63)
+            unsafe {
+                for i in 0..len {
+                    DT.serial_stdout[i] = *(prop.data.add(i))
+                }
+                DT.serial_stdout[len] = 0
+                DT.serial_stdout_len = len
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Node Finding
+// =============================================================================
+
+fn find_node_by_name(name: &str): Option<&'static DtNode> {
+    let name_bytes = name.as_bytes()
+    unsafe {
+        for i in 0..DT.node_count {
+            if let Some(ref node) = DT.nodes[i] {
+                // Compare just the name part (before @)
+                let mut node_name_len = node.name_len
+                for j in 0..node.name_len {
+                    if node.name[j] == '@' as u8 {
+                        node_name_len = j
+                        break
+                    }
+                }
+                if node_name_len == name_bytes.len() {
+                    let mut match_ok = true
+                    for j in 0..node_name_len {
+                        if node.name[j] != name_bytes[j] {
+                            match_ok = false
+                            break
+                        }
+                    }
+                    if match_ok {
+                        return Some(node)
+                    }
+                }
+            }
+        }
+    }
+    return None
+}
+
+fn find_node_by_path(path: &str): Option<&'static DtNode> {
+    if path == "/" {
+        // Return root node
+        unsafe {
+            if DT.node_count > 0 {
+                if let Some(ref node) = DT.nodes[0] {
+                    return Some(node)
+                }
+            }
+        }
+        return None
+    }
+
+    // Parse path and traverse
+    let path_bytes = path.as_bytes()
+    let mut current_node: Option<&'static DtNode> = None
+
+    // Start from root
+    unsafe {
+        if DT.node_count > 0 {
+            current_node = DT.nodes[0].as_ref()
+        }
+    }
+
+    // TODO: Implement full path traversal
+    // For now, just search all nodes
+    return find_node_by_name(&path[1..])  // Skip leading /
+}
+
+fn find_node_by_phandle(phandle: u32): Option<&'static DtNode> {
+    unsafe {
+        for i in 0..DT.node_count {
+            if let Some(ref node) = DT.nodes[i] {
+                if node.phandle == phandle {
+                    return Some(node)
+                }
+            }
+        }
+    }
+    return None
+}
+
+fn get_property(node: &DtNode, name: &str): Option<&DtProperty> {
+    let name_bytes = name.as_bytes()
+    for i in 0..node.property_count {
+        if let Some(ref prop) = node.properties[i] {
+            if prop.name_len == name_bytes.len() {
+                let mut match_ok = true
+                for j in 0..prop.name_len {
+                    if prop.name[j] != name_bytes[j] {
+                        match_ok = false
+                        break
+                    }
+                }
+                if match_ok {
+                    return Some(prop)
+                }
+            }
+        }
+    }
+    return None
+}
+
+// =============================================================================
+// Property Reading Utilities
+// =============================================================================
+
+// Read u32 property
+export fn dt_read_u32(node: &DtNode, name: &str): Option<u32> {
+    if let Some(prop) = get_property(node, name) {
+        if prop.data_len >= 4 {
+            return Some(read_u32(prop.data as u64))
+        }
+    }
+    return None
+}
+
+// Read u64 property
+export fn dt_read_u64(node: &DtNode, name: &str): Option<u64> {
+    if let Some(prop) = get_property(node, name) {
+        if prop.data_len >= 8 {
+            return Some(read_u64(prop.data as u64))
+        }
+    }
+    return None
+}
+
+// Read string property
+export fn dt_read_string(node: &DtNode, name: &str, buf: &mut [u8]): usize {
+    if let Some(prop) = get_property(node, name) {
+        let len = prop.data_len.min(buf.len())
+        unsafe {
+            for i in 0..len {
+                buf[i] = *(prop.data.add(i))
+            }
+        }
+        return len
+    }
+    return 0
+}
+
+// Read reg property (address, size pairs)
+export fn dt_read_reg(node: &DtNode, addr_cells: u32, size_cells: u32): Vec<(u64, u64)> {
+    let mut result: Vec<(u64, u64)> = Vec::new()
+
+    if let Some(prop) = get_property(node, "reg") {
+        let entry_size = ((addr_cells + size_cells) * 4) as usize
+        let num_entries = prop.data_len / entry_size
+
+        for i in 0..num_entries {
+            let offset = (i * entry_size) as u64
+            let addr_ptr = prop.data as u64 + offset
+            let size_ptr = addr_ptr + (addr_cells * 4) as u64
+
+            let addr = if addr_cells == 2 {
+                read_u64(addr_ptr)
+            } else {
+                read_u32(addr_ptr) as u64
+            }
+
+            let size = if size_cells == 2 {
+                read_u64(size_ptr)
+            } else if size_cells == 1 {
+                read_u32(size_ptr) as u64
+            } else {
+                0
+            }
+
+            result.push((addr, size))
+        }
+    }
+
+    return result
+}
+
+// Check if node is compatible with given string
+export fn dt_is_compatible(node: &DtNode, compat: &str): bool {
+    if let Some(prop) = get_property(node, "compatible") {
+        let compat_bytes = compat.as_bytes()
+        let mut i = 0
+
+        // Compatible property is a list of null-terminated strings
+        while i < prop.data_len {
+            let mut j = i
+            unsafe {
+                while j < prop.data_len && *(prop.data.add(j)) != 0 {
+                    j += 1
+                }
+            }
+
+            let entry_len = j - i
+            if entry_len == compat_bytes.len() {
+                let mut match_ok = true
+                for k in 0..entry_len {
+                    unsafe {
+                        if *(prop.data.add(i + k)) != compat_bytes[k] {
+                            match_ok = false
+                            break
+                        }
+                    }
+                }
+                if match_ok {
+                    return true
+                }
+            }
+
+            i = j + 1
+        }
+    }
+    return false
+}
+
+// =============================================================================
+// Public API
+// =============================================================================
+
+// Get memory information
+export fn dt_get_memory(): (u64, u64) {
+    unsafe {
+        return (DT.memory_base, DT.memory_size)
+    }
+}
+
+// Get command line
+export fn dt_get_cmdline(buf: &mut [u8]): usize {
+    unsafe {
+        let len = DT.cmdline_len.min(buf.len())
+        for i in 0..len {
+            buf[i] = DT.cmdline[i]
+        }
+        return len
+    }
+}
+
+// Get model string
+export fn dt_get_model(buf: &mut [u8]): usize {
+    unsafe {
+        let len = DT.model_len.min(buf.len())
+        for i in 0..len {
+            buf[i] = DT.model[i]
+        }
+        return len
+    }
+}
+
+// Get compatible strings
+export fn dt_get_compatible(buf: &mut [u8]): usize {
+    unsafe {
+        let len = DT.compatible_len.min(buf.len())
+        for i in 0..len {
+            buf[i] = DT.compatible[i]
+        }
+        return len
+    }
+}
+
+// Get stdout path
+export fn dt_get_stdout_path(buf: &mut [u8]): usize {
+    unsafe {
+        let len = DT.serial_stdout_len.min(buf.len())
+        for i in 0..len {
+            buf[i] = DT.serial_stdout[i]
+        }
+        return len
+    }
+}
+
+// Find node by compatible string
+export fn dt_find_compatible(compat: &str): Option<&'static DtNode> {
+    unsafe {
+        for i in 0..DT.node_count {
+            if let Some(ref node) = DT.nodes[i] {
+                if dt_is_compatible(node, compat) {
+                    return Some(node)
+                }
+            }
+        }
+    }
+    return None
+}
+
+// Iterate over all nodes with a callback
+export fn dt_foreach_node(callback: fn(&DtNode)) {
+    unsafe {
+        for i in 0..DT.node_count {
+            if let Some(ref node) = DT.nodes[i] {
+                callback(node)
+            }
+        }
+    }
+}
+
+// Check if device tree is valid
+export fn dt_is_valid(): bool {
+    unsafe {
+        return DT.valid
+    }
+}
+
+// Get FDT address
+export fn dt_get_fdt_addr(): u64 {
+    unsafe {
+        return DT.fdt_addr
+    }
+}
+
+// Get FDT size
+export fn dt_get_fdt_size(): u32 {
+    unsafe {
+        return DT.fdt_size
+    }
+}
+
+// Get node count
+export fn dt_get_node_count(): usize {
+    unsafe {
+        return DT.node_count
+    }
+}
+
+// =============================================================================
+// Device Discovery
+// =============================================================================
+
+struct DeviceInfo {
+    node: *const DtNode,
+    base_addr: u64,
+    size: u64,
+    irq: u32,
+    compatible: [u8; 64],
+    compatible_len: usize,
+}
+
+// Find all devices of a certain type
+export fn dt_find_devices(compat_pattern: &str): Vec<DeviceInfo> {
+    let mut devices: Vec<DeviceInfo> = Vec::new()
+
+    unsafe {
+        for i in 0..DT.node_count {
+            if let Some(ref node) = DT.nodes[i] {
+                if dt_is_compatible(node, compat_pattern) {
+                    let mut info = DeviceInfo {
+                        node: node as *const DtNode,
+                        base_addr: 0,
+                        size: 0,
+                        irq: 0,
+                        compatible: [0u8; 64],
+                        compatible_len: 0,
+                    }
+
+                    // Get reg property
+                    let regs = dt_read_reg(node, 2, 2)  // Assume default cells
+                    if regs.len() > 0 {
+                        info.base_addr = regs[0].0
+                        info.size = regs[0].1
+                    }
+
+                    // Get interrupts property
+                    if let Some(irq) = dt_read_u32(node, "interrupts") {
+                        info.irq = irq
+                    }
+
+                    // Copy compatible string
+                    if let Some(prop) = get_property(node, "compatible") {
+                        let len = prop.data_len.min(63)
+                        for j in 0..len {
+                            info.compatible[j] = *(prop.data.add(j))
+                        }
+                        info.compatible_len = len
+                    }
+
+                    devices.push(info)
+                }
+            }
+        }
+    }
+
+    return devices
+}
+
+// Simple Vec implementation for device tree (since we can't use std)
+struct Vec<T> {
+    data: [T; 64],
+    len: usize,
+}
+
+impl<T: Copy + Default> Vec<T> {
+    fn new(): Vec<T> {
+        return Vec {
+            data: [T::default(); 64],
+            len: 0,
+        }
+    }
+
+    fn push(self: &mut Self, item: T) {
+        if self.len < 64 {
+            self.data[self.len] = item
+            self.len += 1
+        }
+    }
+
+    fn len(self: &Self): usize {
+        return self.len
+    }
+}
+
+impl Default for (u64, u64) {
+    fn default(): (u64, u64) {
+        return (0, 0)
+    }
+}
+
+impl Default for DeviceInfo {
+    fn default(): DeviceInfo {
+        return DeviceInfo {
+            node: 0 as *const DtNode,
+            base_addr: 0,
+            size: 0,
+            irq: 0,
+            compatible: [0u8; 64],
+            compatible_len: 0,
+        }
+    }
+}

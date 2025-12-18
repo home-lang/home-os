@@ -1,0 +1,765 @@
+// home-os Raspberry Pi GPIO Controller
+// BCM2835/2837/2711/2712 GPIO support
+
+import "../../../core/types"
+import "../../../sync/spinlock"
+
+// =============================================================================
+// GPIO Base Addresses
+// =============================================================================
+
+const GPIO_BASE_PI3: u64 = 0x3F200000    // BCM2837
+const GPIO_BASE_PI4: u64 = 0xFE200000    // BCM2711
+const GPIO_BASE_PI5: u64 = 0x107D508500  // BCM2712 (RP1 GPIO)
+
+// =============================================================================
+// GPIO Register Offsets (BCM2711)
+// =============================================================================
+
+// Function Select registers (3 bits per GPIO, 10 GPIOs per register)
+const GPFSEL0: u64 = 0x00   // GPIO 0-9
+const GPFSEL1: u64 = 0x04   // GPIO 10-19
+const GPFSEL2: u64 = 0x08   // GPIO 20-29
+const GPFSEL3: u64 = 0x0C   // GPIO 30-39
+const GPFSEL4: u64 = 0x10   // GPIO 40-49
+const GPFSEL5: u64 = 0x14   // GPIO 50-57
+
+// Pin Output Set registers
+const GPSET0: u64 = 0x1C    // GPIO 0-31
+const GPSET1: u64 = 0x20    // GPIO 32-57
+
+// Pin Output Clear registers
+const GPCLR0: u64 = 0x28    // GPIO 0-31
+const GPCLR1: u64 = 0x2C    // GPIO 32-57
+
+// Pin Level registers
+const GPLEV0: u64 = 0x34    // GPIO 0-31
+const GPLEV1: u64 = 0x38    // GPIO 32-57
+
+// Pin Event Detect Status registers
+const GPEDS0: u64 = 0x40    // GPIO 0-31
+const GPEDS1: u64 = 0x44    // GPIO 32-57
+
+// Pin Rising Edge Detect Enable registers
+const GPREN0: u64 = 0x4C    // GPIO 0-31
+const GPREN1: u64 = 0x50    // GPIO 32-57
+
+// Pin Falling Edge Detect Enable registers
+const GPFEN0: u64 = 0x58    // GPIO 0-31
+const GPFEN1: u64 = 0x5C    // GPIO 32-57
+
+// Pin High Detect Enable registers
+const GPHEN0: u64 = 0x64    // GPIO 0-31
+const GPHEN1: u64 = 0x68    // GPIO 32-57
+
+// Pin Low Detect Enable registers
+const GPLEN0: u64 = 0x70    // GPIO 0-31
+const GPLEN1: u64 = 0x74    // GPIO 32-57
+
+// Pin Async Rising Edge Detect registers
+const GPAREN0: u64 = 0x7C   // GPIO 0-31
+const GPAREN1: u64 = 0x80   // GPIO 32-57
+
+// Pin Async Falling Edge Detect registers
+const GPAFEN0: u64 = 0x88   // GPIO 0-31
+const GPAFEN1: u64 = 0x8C   // GPIO 32-57
+
+// BCM2711 specific: Pull-up/down control (replaces GPPUD/GPPUDCLK)
+const GPIO_PUP_PDN_CNTRL_REG0: u64 = 0xE4  // GPIO 0-15
+const GPIO_PUP_PDN_CNTRL_REG1: u64 = 0xE8  // GPIO 16-31
+const GPIO_PUP_PDN_CNTRL_REG2: u64 = 0xEC  // GPIO 32-47
+const GPIO_PUP_PDN_CNTRL_REG3: u64 = 0xF0  // GPIO 48-57
+
+// Legacy Pull-up/down registers (BCM2835/2837)
+const GPPUD: u64 = 0x94
+const GPPUDCLK0: u64 = 0x98
+const GPPUDCLK1: u64 = 0x9C
+
+// =============================================================================
+// GPIO Function Modes
+// =============================================================================
+
+enum GpioFunction {
+    Input = 0b000,
+    Output = 0b001,
+    Alt0 = 0b100,
+    Alt1 = 0b101,
+    Alt2 = 0b110,
+    Alt3 = 0b111,
+    Alt4 = 0b011,
+    Alt5 = 0b010,
+}
+
+// =============================================================================
+// Pull-up/Pull-down Configuration
+// =============================================================================
+
+enum GpioPull {
+    None = 0b00,
+    PullUp = 0b01,
+    PullDown = 0b10,
+    Reserved = 0b11,
+}
+
+// =============================================================================
+// Edge Detection Types
+// =============================================================================
+
+enum EdgeType {
+    None,
+    Rising,
+    Falling,
+    Both,
+    HighLevel,
+    LowLevel,
+    AsyncRising,
+    AsyncFalling,
+}
+
+// =============================================================================
+// GPIO Interrupt Configuration
+// =============================================================================
+
+struct GpioIrqConfig {
+    pin: u8,
+    edge: EdgeType,
+    enabled: bool,
+    handler: fn(u8),
+}
+
+// =============================================================================
+// GPIO Pin Configuration
+// =============================================================================
+
+struct GpioPinConfig {
+    pin: u8,
+    function: GpioFunction,
+    pull: GpioPull,
+    irq: Option<GpioIrqConfig>,
+}
+
+// =============================================================================
+// GPIO Controller State
+// =============================================================================
+
+const MAX_GPIO_PINS: usize = 58
+
+struct GpioController {
+    base: u64,
+    lock: Spinlock,
+    is_bcm2711: bool,              // BCM2711 has different pull registers
+    pin_configs: [GpioPinConfig; MAX_GPIO_PINS],
+    irq_handlers: [Option<fn(u8)>; MAX_GPIO_PINS],
+    irq_enabled: [bool; MAX_GPIO_PINS],
+}
+
+static mut GPIO: GpioController = GpioController {
+    base: GPIO_BASE_PI4,
+    lock: Spinlock::new(),
+    is_bcm2711: true,
+    pin_configs: [GpioPinConfig {
+        pin: 0,
+        function: GpioFunction::Input,
+        pull: GpioPull::None,
+        irq: None,
+    }; MAX_GPIO_PINS],
+    irq_handlers: [None; MAX_GPIO_PINS],
+    irq_enabled: [false; MAX_GPIO_PINS],
+}
+
+// =============================================================================
+// Low-level Register Access
+// =============================================================================
+
+fn gpio_read(offset: u64): u32 {
+    unsafe {
+        let addr = GPIO.base + offset
+        let value: u32
+        asm!("ldr {0:w}, [{1}]", out(reg) value, in(reg) addr)
+        return value
+    }
+}
+
+fn gpio_write(offset: u64, value: u32) {
+    unsafe {
+        let addr = GPIO.base + offset
+        asm!("str {0:w}, [{1}]", in(reg) value, in(reg) addr)
+    }
+}
+
+fn delay_cycles(count: u32) {
+    for _ in 0..count {
+        asm!("nop")
+    }
+}
+
+// =============================================================================
+// GPIO Controller Initialization
+// =============================================================================
+
+export fn gpio_init(base: u64, is_bcm2711: bool): i32 {
+    unsafe {
+        GPIO.base = base
+        GPIO.is_bcm2711 = is_bcm2711
+        GPIO.lock.init()
+
+        // Initialize all pins as inputs with no pull
+        for i in 0..MAX_GPIO_PINS {
+            GPIO.pin_configs[i] = GpioPinConfig {
+                pin: i as u8,
+                function: GpioFunction::Input,
+                pull: GpioPull::None,
+                irq: None,
+            }
+            GPIO.irq_handlers[i] = None
+            GPIO.irq_enabled[i] = false
+        }
+    }
+
+    return 0
+}
+
+// =============================================================================
+// GPIO Function Selection
+// =============================================================================
+
+// Set GPIO function
+export fn gpio_set_function(pin: u8, func: GpioFunction): i32 {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return -1  // EINVAL
+    }
+
+    // Calculate register and bit offset
+    // Each GPFSEL register handles 10 GPIOs, 3 bits each
+    let reg_offset = (pin / 10) as u64 * 4
+    let bit_offset = ((pin % 10) * 3) as u32
+
+    unsafe {
+        GPIO.lock.lock()
+
+        let reg = gpio_read(reg_offset)
+        let mask = 0b111 << bit_offset
+        let value = (func as u32) << bit_offset
+        gpio_write(reg_offset, (reg & !mask) | value)
+
+        GPIO.pin_configs[pin as usize].function = func
+
+        GPIO.lock.unlock()
+    }
+
+    return 0
+}
+
+// Get GPIO function
+export fn gpio_get_function(pin: u8): GpioFunction {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return GpioFunction::Input
+    }
+
+    let reg_offset = (pin / 10) as u64 * 4
+    let bit_offset = ((pin % 10) * 3) as u32
+
+    let reg = gpio_read(reg_offset)
+    let func = (reg >> bit_offset) & 0b111
+
+    match func {
+        0b000 => GpioFunction::Input,
+        0b001 => GpioFunction::Output,
+        0b100 => GpioFunction::Alt0,
+        0b101 => GpioFunction::Alt1,
+        0b110 => GpioFunction::Alt2,
+        0b111 => GpioFunction::Alt3,
+        0b011 => GpioFunction::Alt4,
+        0b010 => GpioFunction::Alt5,
+        _ => GpioFunction::Input,
+    }
+}
+
+// =============================================================================
+// GPIO Output Control
+// =============================================================================
+
+// Set GPIO output high
+export fn gpio_set(pin: u8) {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return
+    }
+
+    let reg_offset = if pin < 32 { GPSET0 } else { GPSET1 }
+    let bit = 1u32 << (pin % 32)
+    gpio_write(reg_offset, bit)
+}
+
+// Set GPIO output low
+export fn gpio_clear(pin: u8) {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return
+    }
+
+    let reg_offset = if pin < 32 { GPCLR0 } else { GPCLR1 }
+    let bit = 1u32 << (pin % 32)
+    gpio_write(reg_offset, bit)
+}
+
+// Write GPIO output value
+export fn gpio_write_pin(pin: u8, value: bool) {
+    if value {
+        gpio_set(pin)
+    } else {
+        gpio_clear(pin)
+    }
+}
+
+// Toggle GPIO output
+export fn gpio_toggle(pin: u8) {
+    if gpio_read_pin(pin) {
+        gpio_clear(pin)
+    } else {
+        gpio_set(pin)
+    }
+}
+
+// =============================================================================
+// GPIO Input Reading
+// =============================================================================
+
+// Read GPIO level
+export fn gpio_read_pin(pin: u8): bool {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return false
+    }
+
+    let reg_offset = if pin < 32 { GPLEV0 } else { GPLEV1 }
+    let bit = 1u32 << (pin % 32)
+    return (gpio_read(reg_offset) & bit) != 0
+}
+
+// Read all GPIO levels (0-31)
+export fn gpio_read_all_low(): u32 {
+    return gpio_read(GPLEV0)
+}
+
+// Read all GPIO levels (32-57)
+export fn gpio_read_all_high(): u32 {
+    return gpio_read(GPLEV1)
+}
+
+// =============================================================================
+// Pull-up/Pull-down Configuration
+// =============================================================================
+
+// Set pull-up/pull-down for BCM2711
+fn gpio_set_pull_bcm2711(pin: u8, pull: GpioPull) {
+    // BCM2711 has 2 bits per GPIO in GPIO_PUP_PDN_CNTRL registers
+    let reg_offset = match pin / 16 {
+        0 => GPIO_PUP_PDN_CNTRL_REG0,
+        1 => GPIO_PUP_PDN_CNTRL_REG1,
+        2 => GPIO_PUP_PDN_CNTRL_REG2,
+        _ => GPIO_PUP_PDN_CNTRL_REG3,
+    }
+    let bit_offset = ((pin % 16) * 2) as u32
+
+    let reg = gpio_read(reg_offset)
+    let mask = 0b11 << bit_offset
+    let value = (pull as u32) << bit_offset
+    gpio_write(reg_offset, (reg & !mask) | value)
+}
+
+// Set pull-up/pull-down for BCM2835/2837
+fn gpio_set_pull_legacy(pin: u8, pull: GpioPull) {
+    // Legacy sequence: write to GPPUD, wait, write to GPPUDCLKx, wait, clear both
+
+    // Convert pull to legacy format
+    let pud: u32 = match pull {
+        GpioPull::None => 0b00,
+        GpioPull::PullDown => 0b01,
+        GpioPull::PullUp => 0b10,
+        GpioPull::Reserved => 0b00,
+    }
+
+    // Write to GPPUD
+    gpio_write(GPPUD, pud)
+
+    // Wait 150 cycles
+    delay_cycles(150)
+
+    // Write to GPPUDCLK
+    let clk_reg = if pin < 32 { GPPUDCLK0 } else { GPPUDCLK1 }
+    let bit = 1u32 << (pin % 32)
+    gpio_write(clk_reg, bit)
+
+    // Wait 150 cycles
+    delay_cycles(150)
+
+    // Clear GPPUD and GPPUDCLK
+    gpio_write(GPPUD, 0)
+    gpio_write(clk_reg, 0)
+}
+
+// Set pull-up/pull-down (public API)
+export fn gpio_set_pull(pin: u8, pull: GpioPull): i32 {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return -1
+    }
+
+    unsafe {
+        GPIO.lock.lock()
+
+        if GPIO.is_bcm2711 {
+            gpio_set_pull_bcm2711(pin, pull)
+        } else {
+            gpio_set_pull_legacy(pin, pull)
+        }
+
+        GPIO.pin_configs[pin as usize].pull = pull
+
+        GPIO.lock.unlock()
+    }
+
+    return 0
+}
+
+// Get pull configuration (BCM2711 only)
+export fn gpio_get_pull(pin: u8): GpioPull {
+    unsafe {
+        if !GPIO.is_bcm2711 {
+            // Can't read pull state on legacy SoC
+            return GPIO.pin_configs[pin as usize].pull
+        }
+    }
+
+    let reg_offset = match pin / 16 {
+        0 => GPIO_PUP_PDN_CNTRL_REG0,
+        1 => GPIO_PUP_PDN_CNTRL_REG1,
+        2 => GPIO_PUP_PDN_CNTRL_REG2,
+        _ => GPIO_PUP_PDN_CNTRL_REG3,
+    }
+    let bit_offset = ((pin % 16) * 2) as u32
+
+    let reg = gpio_read(reg_offset)
+    let pull = (reg >> bit_offset) & 0b11
+
+    match pull {
+        0b00 => GpioPull::None,
+        0b01 => GpioPull::PullUp,
+        0b10 => GpioPull::PullDown,
+        _ => GpioPull::Reserved,
+    }
+}
+
+// =============================================================================
+// Edge Detection / Interrupt Configuration
+// =============================================================================
+
+// Configure edge detection
+export fn gpio_set_edge_detect(pin: u8, edge: EdgeType): i32 {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return -1
+    }
+
+    let reg0_offset: u64
+    let reg1_offset: u64 = 4  // All pairs are 4 bytes apart
+
+    // Determine which detect register to use
+    let base_offset = match edge {
+        EdgeType::Rising => GPREN0,
+        EdgeType::Falling => GPFEN0,
+        EdgeType::HighLevel => GPHEN0,
+        EdgeType::LowLevel => GPLEN0,
+        EdgeType::AsyncRising => GPAREN0,
+        EdgeType::AsyncFalling => GPAFEN0,
+        EdgeType::None | EdgeType::Both => {
+            // Clear all detection for this pin
+            gpio_clear_edge_detect(pin)
+            if edge == EdgeType::Both {
+                // Set both rising and falling
+                let r0 = if pin < 32 { GPREN0 } else { GPREN0 + 4 }
+                let f0 = if pin < 32 { GPFEN0 } else { GPFEN0 + 4 }
+                let bit = 1u32 << (pin % 32)
+                gpio_write(r0, gpio_read(r0) | bit)
+                gpio_write(f0, gpio_read(f0) | bit)
+            }
+            return 0
+        }
+    }
+
+    let reg_offset = if pin < 32 { base_offset } else { base_offset + 4 }
+    let bit = 1u32 << (pin % 32)
+
+    gpio_write(reg_offset, gpio_read(reg_offset) | bit)
+
+    return 0
+}
+
+// Clear all edge detection for a pin
+export fn gpio_clear_edge_detect(pin: u8) {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return
+    }
+
+    let offset = if pin < 32 { 0u64 } else { 4u64 }
+    let bit = 1u32 << (pin % 32)
+    let mask = !bit
+
+    gpio_write(GPREN0 + offset, gpio_read(GPREN0 + offset) & mask)
+    gpio_write(GPFEN0 + offset, gpio_read(GPFEN0 + offset) & mask)
+    gpio_write(GPHEN0 + offset, gpio_read(GPHEN0 + offset) & mask)
+    gpio_write(GPLEN0 + offset, gpio_read(GPLEN0 + offset) & mask)
+    gpio_write(GPAREN0 + offset, gpio_read(GPAREN0 + offset) & mask)
+    gpio_write(GPAFEN0 + offset, gpio_read(GPAFEN0 + offset) & mask)
+}
+
+// Check if event detected on pin
+export fn gpio_event_detected(pin: u8): bool {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return false
+    }
+
+    let reg_offset = if pin < 32 { GPEDS0 } else { GPEDS1 }
+    let bit = 1u32 << (pin % 32)
+    return (gpio_read(reg_offset) & bit) != 0
+}
+
+// Clear event status
+export fn gpio_clear_event(pin: u8) {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return
+    }
+
+    let reg_offset = if pin < 32 { GPEDS0 } else { GPEDS1 }
+    let bit = 1u32 << (pin % 32)
+    gpio_write(reg_offset, bit)  // Write 1 to clear
+}
+
+// Get all event status (0-31)
+export fn gpio_get_events_low(): u32 {
+    return gpio_read(GPEDS0)
+}
+
+// Get all event status (32-57)
+export fn gpio_get_events_high(): u32 {
+    return gpio_read(GPEDS1)
+}
+
+// Clear all events
+export fn gpio_clear_all_events() {
+    gpio_write(GPEDS0, 0xFFFFFFFF)
+    gpio_write(GPEDS1, 0xFFFFFFFF)
+}
+
+// =============================================================================
+// GPIO Interrupt Handlers
+// =============================================================================
+
+// Register interrupt handler
+export fn gpio_register_irq(pin: u8, edge: EdgeType, handler: fn(u8)): i32 {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return -1
+    }
+
+    unsafe {
+        GPIO.lock.lock()
+
+        GPIO.irq_handlers[pin as usize] = Some(handler)
+        GPIO.irq_enabled[pin as usize] = true
+
+        GPIO.lock.unlock()
+    }
+
+    // Configure edge detection
+    gpio_set_edge_detect(pin, edge)
+
+    return 0
+}
+
+// Unregister interrupt handler
+export fn gpio_unregister_irq(pin: u8) {
+    if pin >= MAX_GPIO_PINS as u8 {
+        return
+    }
+
+    gpio_clear_edge_detect(pin)
+
+    unsafe {
+        GPIO.lock.lock()
+        GPIO.irq_handlers[pin as usize] = None
+        GPIO.irq_enabled[pin as usize] = false
+        GPIO.lock.unlock()
+    }
+}
+
+// GPIO interrupt handler (called from GIC)
+export fn gpio_irq_handler() {
+    // Check events for GPIO 0-31
+    let events0 = gpio_read(GPEDS0)
+    if events0 != 0 {
+        for pin in 0..32 {
+            if (events0 & (1 << pin)) != 0 {
+                gpio_write(GPEDS0, 1 << pin)  // Clear event
+                unsafe {
+                    if let Some(handler) = GPIO.irq_handlers[pin] {
+                        if GPIO.irq_enabled[pin] {
+                            handler(pin as u8)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check events for GPIO 32-57
+    let events1 = gpio_read(GPEDS1)
+    if events1 != 0 {
+        for pin in 0..26 {
+            if (events1 & (1 << pin)) != 0 {
+                gpio_write(GPEDS1, 1 << pin)  // Clear event
+                unsafe {
+                    let idx = 32 + pin
+                    if let Some(handler) = GPIO.irq_handlers[idx] {
+                        if GPIO.irq_enabled[idx] {
+                            handler(idx as u8)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Pin Mode Helper Functions
+// =============================================================================
+
+// Configure pin as input with optional pull
+export fn gpio_input(pin: u8, pull: GpioPull): i32 {
+    let ret = gpio_set_function(pin, GpioFunction::Input)
+    if ret != 0 {
+        return ret
+    }
+    return gpio_set_pull(pin, pull)
+}
+
+// Configure pin as output
+export fn gpio_output(pin: u8): i32 {
+    return gpio_set_function(pin, GpioFunction::Output)
+}
+
+// Configure pin for alternate function
+export fn gpio_alt_function(pin: u8, alt: u8): i32 {
+    let func = match alt {
+        0 => GpioFunction::Alt0,
+        1 => GpioFunction::Alt1,
+        2 => GpioFunction::Alt2,
+        3 => GpioFunction::Alt3,
+        4 => GpioFunction::Alt4,
+        5 => GpioFunction::Alt5,
+        _ => return -1,
+    }
+    return gpio_set_function(pin, func)
+}
+
+// =============================================================================
+// Common Pin Configurations
+// =============================================================================
+
+// Configure UART0 pins (GPIO 14/15, ALT0)
+export fn gpio_setup_uart0(): i32 {
+    gpio_set_function(14, GpioFunction::Alt0)  // TXD0
+    gpio_set_function(15, GpioFunction::Alt0)  // RXD0
+    gpio_set_pull(14, GpioPull::None)
+    gpio_set_pull(15, GpioPull::PullUp)
+    return 0
+}
+
+// Configure Mini UART pins (GPIO 14/15, ALT5)
+export fn gpio_setup_mini_uart(): i32 {
+    gpio_set_function(14, GpioFunction::Alt5)  // TXD1
+    gpio_set_function(15, GpioFunction::Alt5)  // RXD1
+    gpio_set_pull(14, GpioPull::None)
+    gpio_set_pull(15, GpioPull::PullUp)
+    return 0
+}
+
+// Configure I2C1 pins (GPIO 2/3, ALT0)
+export fn gpio_setup_i2c1(): i32 {
+    gpio_set_function(2, GpioFunction::Alt0)   // SDA1
+    gpio_set_function(3, GpioFunction::Alt0)   // SCL1
+    gpio_set_pull(2, GpioPull::PullUp)
+    gpio_set_pull(3, GpioPull::PullUp)
+    return 0
+}
+
+// Configure SPI0 pins (GPIO 7-11, ALT0)
+export fn gpio_setup_spi0(): i32 {
+    gpio_set_function(7, GpioFunction::Alt0)   // CE1
+    gpio_set_function(8, GpioFunction::Alt0)   // CE0
+    gpio_set_function(9, GpioFunction::Alt0)   // MISO
+    gpio_set_function(10, GpioFunction::Alt0)  // MOSI
+    gpio_set_function(11, GpioFunction::Alt0)  // SCLK
+    for pin in 7..12 {
+        gpio_set_pull(pin, GpioPull::None)
+    }
+    return 0
+}
+
+// Configure PWM0 pins (GPIO 12/13, ALT0)
+export fn gpio_setup_pwm0(): i32 {
+    gpio_set_function(12, GpioFunction::Alt0)  // PWM0
+    gpio_set_function(13, GpioFunction::Alt0)  // PWM1
+    return 0
+}
+
+// Configure PCM/I2S pins (GPIO 18-21, ALT0)
+export fn gpio_setup_pcm(): i32 {
+    gpio_set_function(18, GpioFunction::Alt0)  // PCM_CLK
+    gpio_set_function(19, GpioFunction::Alt0)  // PCM_FS
+    gpio_set_function(20, GpioFunction::Alt0)  // PCM_DIN
+    gpio_set_function(21, GpioFunction::Alt0)  // PCM_DOUT
+    return 0
+}
+
+// Configure SD card pins (GPIO 34-39, ALT3 on Pi 4)
+export fn gpio_setup_sdcard(): i32 {
+    // On BCM2711, SD card uses dedicated pins via EMMC2
+    // GPIO 34-39 are directly connected
+    for pin in 34..40 {
+        gpio_set_function(pin, GpioFunction::Alt3)
+        gpio_set_pull(pin, GpioPull::PullUp)
+    }
+    return 0
+}
+
+// =============================================================================
+// Activity LED Control
+// =============================================================================
+
+// Activity LED on Pi 4 is GPIO 42
+const ACTIVITY_LED_PIN: u8 = 42
+
+export fn gpio_led_init() {
+    gpio_set_function(ACTIVITY_LED_PIN, GpioFunction::Output)
+}
+
+export fn gpio_led_on() {
+    gpio_set(ACTIVITY_LED_PIN)
+}
+
+export fn gpio_led_off() {
+    gpio_clear(ACTIVITY_LED_PIN)
+}
+
+export fn gpio_led_toggle() {
+    gpio_toggle(ACTIVITY_LED_PIN)
+}
+
+// =============================================================================
+// Debugging
+// =============================================================================
+
+export fn gpio_dump_state(pin: u8) {
+    // Would print GPIO state - requires console
+}
+
+export fn gpio_dump_all() {
+    // Dump all GPIO configurations
+}

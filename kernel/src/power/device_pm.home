@@ -1,0 +1,710 @@
+// home-os Device Power Management
+// Runtime PM, suspend/resume, and device power states
+
+import "../core/types"
+import "../sync/spinlock"
+
+// =============================================================================
+// Device Power States (D-states)
+// =============================================================================
+
+enum DevicePowerState {
+    D0,         // Fully on, operational
+    D1,         // Light sleep (device-specific)
+    D2,         // Deep sleep (device-specific)
+    D3hot,      // Off but accessible (Vcc maintained)
+    D3cold,     // Off completely (Vcc removed)
+}
+
+// =============================================================================
+// System Power States (S-states)
+// =============================================================================
+
+enum SystemPowerState {
+    S0,         // Working
+    S1,         // Sleeping with processor context maintained
+    S2,         // Sleeping with processor context lost
+    S3,         // Suspend to RAM
+    S4,         // Suspend to Disk (Hibernate)
+    S5,         // Soft Off
+}
+
+// =============================================================================
+// Runtime PM States
+// =============================================================================
+
+enum RuntimePMState {
+    Active,
+    Suspending,
+    Suspended,
+    Resuming,
+    Error,
+}
+
+// =============================================================================
+// Wake Capabilities
+// =============================================================================
+
+const WAKE_CAPABLE: u32 = 1 << 0
+const WAKE_ENABLED: u32 = 1 << 1
+const WAKE_FROM_D0: u32 = 1 << 2
+const WAKE_FROM_D1: u32 = 1 << 3
+const WAKE_FROM_D2: u32 = 1 << 4
+const WAKE_FROM_D3HOT: u32 = 1 << 5
+const WAKE_FROM_D3COLD: u32 = 1 << 6
+
+// =============================================================================
+// Device PM Callbacks
+// =============================================================================
+
+struct DevicePMOps {
+    // Runtime PM
+    runtime_suspend: Option<fn(dev: *mut DevicePM) -> i32>,
+    runtime_resume: Option<fn(dev: *mut DevicePM) -> i32>,
+    runtime_idle: Option<fn(dev: *mut DevicePM) -> i32>,
+
+    // System PM
+    prepare: Option<fn(dev: *mut DevicePM) -> i32>,
+    complete: Option<fn(dev: *mut DevicePM)>,
+    suspend: Option<fn(dev: *mut DevicePM) -> i32>,
+    resume: Option<fn(dev: *mut DevicePM) -> i32>,
+    freeze: Option<fn(dev: *mut DevicePM) -> i32>,
+    thaw: Option<fn(dev: *mut DevicePM) -> i32>,
+    poweroff: Option<fn(dev: *mut DevicePM) -> i32>,
+    restore: Option<fn(dev: *mut DevicePM) -> i32>,
+
+    // Late/Early callbacks (after/before children)
+    suspend_late: Option<fn(dev: *mut DevicePM) -> i32>,
+    resume_early: Option<fn(dev: *mut DevicePM) -> i32>,
+
+    // Noirq callbacks (with IRQs disabled)
+    suspend_noirq: Option<fn(dev: *mut DevicePM) -> i32>,
+    resume_noirq: Option<fn(dev: *mut DevicePM) -> i32>,
+}
+
+// =============================================================================
+// Device PM Structure
+// =============================================================================
+
+const MAX_DEVICES: usize = 256
+const DEVICE_NAME_LEN: usize = 64
+
+struct DevicePM {
+    // Identification
+    id: u32,
+    name: [u8; DEVICE_NAME_LEN],
+    name_len: usize,
+    device_type: DeviceType,
+
+    // Hierarchy
+    parent: Option<u32>,
+    children: [Option<u32>; 16],
+    child_count: usize,
+
+    // Power state
+    power_state: DevicePowerState,
+    runtime_state: RuntimePMState,
+    target_state: DevicePowerState,
+
+    // Runtime PM
+    runtime_enabled: bool,
+    runtime_auto: bool,         // Auto-suspend enabled
+    auto_suspend_delay: u32,    // Milliseconds
+    last_busy_time: u64,        // Timestamp
+    usage_count: i32,           // Reference count
+    child_count_active: u32,    // Active children
+
+    // Wake
+    wake_flags: u32,
+    wake_irq: Option<u32>,
+
+    // Statistics
+    suspend_count: u64,
+    resume_count: u64,
+    runtime_suspend_count: u64,
+    runtime_resume_count: u64,
+    total_suspend_time: u64,    // Microseconds
+    last_suspend_time: u64,
+
+    // Callbacks
+    ops: DevicePMOps,
+
+    // Driver data
+    driver_data: u64,
+}
+
+enum DeviceType {
+    PCI,
+    USB,
+    Platform,
+    ACPI,
+    I2C,
+    SPI,
+    GPIO,
+    Other,
+}
+
+// =============================================================================
+// Device PM State
+// =============================================================================
+
+struct DevicePMState {
+    devices: [Option<DevicePM>; MAX_DEVICES],
+    device_count: usize,
+
+    // System state
+    system_state: SystemPowerState,
+    target_system_state: SystemPowerState,
+    suspend_in_progress: bool,
+    resume_in_progress: bool,
+
+    // Runtime PM global settings
+    runtime_pm_enabled: bool,
+    auto_suspend_enabled: bool,
+    default_auto_suspend_delay: u32,
+
+    // Wake sources
+    wake_sources: [Option<u32>; 32],
+    wake_source_count: usize,
+    last_wake_source: Option<u32>,
+
+    // Statistics
+    suspend_success_count: u64,
+    suspend_fail_count: u64,
+    resume_count: u64,
+    total_suspend_time: u64,
+
+    lock: Spinlock,
+}
+
+static mut DEVICE_PM: DevicePMState = DevicePMState {
+    devices: [None; MAX_DEVICES],
+    device_count: 0,
+    system_state: SystemPowerState::S0,
+    target_system_state: SystemPowerState::S0,
+    suspend_in_progress: false,
+    resume_in_progress: false,
+    runtime_pm_enabled: true,
+    auto_suspend_enabled: true,
+    default_auto_suspend_delay: 2000,
+    wake_sources: [None; 32],
+    wake_source_count: 0,
+    last_wake_source: None,
+    suspend_success_count: 0,
+    suspend_fail_count: 0,
+    resume_count: 0,
+    total_suspend_time: 0,
+    lock: Spinlock::new(),
+}
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+export fn device_pm_init(): i32 {
+    unsafe { DEVICE_PM.lock.init() }
+    return 0
+}
+
+// =============================================================================
+// Device Registration
+// =============================================================================
+
+export fn device_pm_register(
+    name: &str,
+    device_type: DeviceType,
+    parent: Option<u32>,
+    ops: DevicePMOps
+): i32 {
+    unsafe {
+        DEVICE_PM.lock.lock()
+
+        if DEVICE_PM.device_count >= MAX_DEVICES {
+            DEVICE_PM.lock.unlock()
+            return -1
+        }
+
+        let id = DEVICE_PM.device_count as u32
+
+        let mut name_arr = [0u8; DEVICE_NAME_LEN]
+        let name_bytes = name.as_bytes()
+        let len = name_bytes.len().min(DEVICE_NAME_LEN - 1)
+        for i in 0..len {
+            name_arr[i] = name_bytes[i]
+        }
+
+        DEVICE_PM.devices[DEVICE_PM.device_count] = Some(DevicePM {
+            id: id,
+            name: name_arr,
+            name_len: len,
+            device_type: device_type,
+            parent: parent,
+            children: [None; 16],
+            child_count: 0,
+            power_state: DevicePowerState::D0,
+            runtime_state: RuntimePMState::Active,
+            target_state: DevicePowerState::D0,
+            runtime_enabled: false,
+            runtime_auto: false,
+            auto_suspend_delay: DEVICE_PM.default_auto_suspend_delay,
+            last_busy_time: 0,
+            usage_count: 0,
+            child_count_active: 0,
+            wake_flags: 0,
+            wake_irq: None,
+            suspend_count: 0,
+            resume_count: 0,
+            runtime_suspend_count: 0,
+            runtime_resume_count: 0,
+            total_suspend_time: 0,
+            last_suspend_time: 0,
+            ops: ops,
+            driver_data: 0,
+        })
+
+        // Add as child to parent
+        if let Some(parent_id) = parent {
+            if let Some(ref mut parent_dev) = DEVICE_PM.devices[parent_id as usize] {
+                if parent_dev.child_count < 16 {
+                    parent_dev.children[parent_dev.child_count] = Some(id)
+                    parent_dev.child_count += 1
+                }
+            }
+        }
+
+        DEVICE_PM.device_count += 1
+        DEVICE_PM.lock.unlock()
+
+        return id as i32
+    }
+}
+
+export fn device_pm_unregister(id: u32): i32 {
+    unsafe {
+        DEVICE_PM.lock.lock()
+
+        if id as usize >= DEVICE_PM.device_count {
+            DEVICE_PM.lock.unlock()
+            return -1
+        }
+
+        // Remove from parent's children list
+        if let Some(ref dev) = DEVICE_PM.devices[id as usize] {
+            if let Some(parent_id) = dev.parent {
+                if let Some(ref mut parent) = DEVICE_PM.devices[parent_id as usize] {
+                    for i in 0..parent.child_count {
+                        if parent.children[i] == Some(id) {
+                            // Shift remaining children
+                            for j in i..parent.child_count - 1 {
+                                parent.children[j] = parent.children[j + 1]
+                            }
+                            parent.children[parent.child_count - 1] = None
+                            parent.child_count -= 1
+                            break
+                        }
+                    }
+                }
+            }
+        }
+
+        DEVICE_PM.devices[id as usize] = None
+        DEVICE_PM.lock.unlock()
+        return 0
+    }
+}
+
+// =============================================================================
+// Runtime PM
+// =============================================================================
+
+export fn pm_runtime_enable(id: u32): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            dev.runtime_enabled = true
+            return 0
+        }
+        return -1
+    }
+}
+
+export fn pm_runtime_disable(id: u32): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            dev.runtime_enabled = false
+            // Resume if currently suspended
+            if dev.runtime_state == RuntimePMState::Suspended {
+                pm_runtime_resume(id)
+            }
+            return 0
+        }
+        return -1
+    }
+}
+
+export fn pm_runtime_get(id: u32): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            dev.usage_count += 1
+            if dev.runtime_state == RuntimePMState::Suspended {
+                return pm_runtime_resume(id)
+            }
+            return 0
+        }
+        return -1
+    }
+}
+
+export fn pm_runtime_put(id: u32): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            if dev.usage_count > 0 {
+                dev.usage_count -= 1
+            }
+            if dev.usage_count == 0 && dev.runtime_enabled && dev.runtime_auto {
+                // Schedule auto-suspend
+                dev.last_busy_time = get_time_us()
+            }
+            return 0
+        }
+        return -1
+    }
+}
+
+export fn pm_runtime_suspend(id: u32): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            if !dev.runtime_enabled || dev.usage_count > 0 {
+                return -1
+            }
+
+            if dev.runtime_state == RuntimePMState::Suspended {
+                return 0  // Already suspended
+            }
+
+            dev.runtime_state = RuntimePMState::Suspending
+
+            // Call callback
+            if let Some(suspend) = dev.ops.runtime_suspend {
+                let result = suspend(dev as *mut DevicePM)
+                if result != 0 {
+                    dev.runtime_state = RuntimePMState::Error
+                    return result
+                }
+            }
+
+            dev.runtime_state = RuntimePMState::Suspended
+            dev.power_state = DevicePowerState::D3hot
+            dev.runtime_suspend_count += 1
+            dev.last_suspend_time = get_time_us()
+
+            return 0
+        }
+        return -1
+    }
+}
+
+export fn pm_runtime_resume(id: u32): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            if dev.runtime_state == RuntimePMState::Active {
+                return 0  // Already active
+            }
+
+            // Resume parent first
+            if let Some(parent_id) = dev.parent {
+                pm_runtime_resume(parent_id)
+            }
+
+            dev.runtime_state = RuntimePMState::Resuming
+
+            // Call callback
+            if let Some(resume) = dev.ops.runtime_resume {
+                let result = resume(dev as *mut DevicePM)
+                if result != 0 {
+                    dev.runtime_state = RuntimePMState::Error
+                    return result
+                }
+            }
+
+            dev.runtime_state = RuntimePMState::Active
+            dev.power_state = DevicePowerState::D0
+            dev.runtime_resume_count += 1
+
+            if dev.last_suspend_time > 0 {
+                dev.total_suspend_time += get_time_us() - dev.last_suspend_time
+            }
+
+            return 0
+        }
+        return -1
+    }
+}
+
+export fn pm_runtime_set_autosuspend_delay(id: u32, delay_ms: u32): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            dev.auto_suspend_delay = delay_ms
+            return 0
+        }
+        return -1
+    }
+}
+
+export fn pm_runtime_use_autosuspend(id: u32, enable: bool): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            dev.runtime_auto = enable
+            return 0
+        }
+        return -1
+    }
+}
+
+// =============================================================================
+// System PM
+// =============================================================================
+
+export fn device_pm_suspend_all(): i32 {
+    unsafe {
+        DEVICE_PM.lock.lock()
+        DEVICE_PM.suspend_in_progress = true
+
+        // Suspend devices in reverse order (children before parents)
+        for i in (0..DEVICE_PM.device_count).rev() {
+            if let Some(ref mut dev) = DEVICE_PM.devices[i] {
+                if dev.power_state == DevicePowerState::D0 {
+                    let result = suspend_device(dev)
+                    if result != 0 {
+                        // Resume already suspended devices on failure
+                        for j in i + 1..DEVICE_PM.device_count {
+                            if let Some(ref mut dev2) = DEVICE_PM.devices[j] {
+                                resume_device(dev2)
+                            }
+                        }
+                        DEVICE_PM.suspend_in_progress = false
+                        DEVICE_PM.suspend_fail_count += 1
+                        DEVICE_PM.lock.unlock()
+                        return result
+                    }
+                }
+            }
+        }
+
+        DEVICE_PM.suspend_in_progress = false
+        DEVICE_PM.suspend_success_count += 1
+        DEVICE_PM.lock.unlock()
+        return 0
+    }
+}
+
+export fn device_pm_resume_all(): i32 {
+    unsafe {
+        DEVICE_PM.lock.lock()
+        DEVICE_PM.resume_in_progress = true
+
+        // Resume devices in order (parents before children)
+        for i in 0..DEVICE_PM.device_count {
+            if let Some(ref mut dev) = DEVICE_PM.devices[i] {
+                if dev.power_state != DevicePowerState::D0 {
+                    resume_device(dev)
+                }
+            }
+        }
+
+        DEVICE_PM.resume_in_progress = false
+        DEVICE_PM.resume_count += 1
+        DEVICE_PM.lock.unlock()
+        return 0
+    }
+}
+
+fn suspend_device(dev: &mut DevicePM): i32 {
+    // Prepare
+    if let Some(prepare) = dev.ops.prepare {
+        let result = prepare(dev as *mut DevicePM)
+        if result != 0 { return result }
+    }
+
+    // Suspend
+    if let Some(suspend) = dev.ops.suspend {
+        let result = suspend(dev as *mut DevicePM)
+        if result != 0 { return result }
+    }
+
+    // Late suspend
+    if let Some(suspend_late) = dev.ops.suspend_late {
+        let result = suspend_late(dev as *mut DevicePM)
+        if result != 0 { return result }
+    }
+
+    // Noirq suspend
+    if let Some(suspend_noirq) = dev.ops.suspend_noirq {
+        let result = suspend_noirq(dev as *mut DevicePM)
+        if result != 0 { return result }
+    }
+
+    dev.power_state = DevicePowerState::D3hot
+    dev.suspend_count += 1
+    dev.last_suspend_time = get_time_us()
+
+    return 0
+}
+
+fn resume_device(dev: &mut DevicePM): i32 {
+    // Noirq resume
+    if let Some(resume_noirq) = dev.ops.resume_noirq {
+        let result = resume_noirq(dev as *mut DevicePM)
+        if result != 0 { return result }
+    }
+
+    // Early resume
+    if let Some(resume_early) = dev.ops.resume_early {
+        let result = resume_early(dev as *mut DevicePM)
+        if result != 0 { return result }
+    }
+
+    // Resume
+    if let Some(resume) = dev.ops.resume {
+        let result = resume(dev as *mut DevicePM)
+        if result != 0 { return result }
+    }
+
+    // Complete
+    if let Some(complete) = dev.ops.complete {
+        complete(dev as *mut DevicePM)
+    }
+
+    dev.power_state = DevicePowerState::D0
+    dev.resume_count += 1
+
+    if dev.last_suspend_time > 0 {
+        dev.total_suspend_time += get_time_us() - dev.last_suspend_time
+    }
+
+    return 0
+}
+
+// =============================================================================
+// Wake Source Management
+// =============================================================================
+
+export fn device_pm_set_wakeup(id: u32, capable: bool): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            if capable {
+                dev.wake_flags |= WAKE_CAPABLE
+            } else {
+                dev.wake_flags &= !WAKE_CAPABLE
+            }
+            return 0
+        }
+        return -1
+    }
+}
+
+export fn device_pm_enable_wakeup(id: u32, enable: bool): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            if (dev.wake_flags & WAKE_CAPABLE) == 0 {
+                return -1  // Not capable
+            }
+            if enable {
+                dev.wake_flags |= WAKE_ENABLED
+                // Add to wake sources
+                if DEVICE_PM.wake_source_count < 32 {
+                    DEVICE_PM.wake_sources[DEVICE_PM.wake_source_count] = Some(id)
+                    DEVICE_PM.wake_source_count += 1
+                }
+            } else {
+                dev.wake_flags &= !WAKE_ENABLED
+                // Remove from wake sources
+                for i in 0..DEVICE_PM.wake_source_count {
+                    if DEVICE_PM.wake_sources[i] == Some(id) {
+                        for j in i..DEVICE_PM.wake_source_count - 1 {
+                            DEVICE_PM.wake_sources[j] = DEVICE_PM.wake_sources[j + 1]
+                        }
+                        DEVICE_PM.wake_sources[DEVICE_PM.wake_source_count - 1] = None
+                        DEVICE_PM.wake_source_count -= 1
+                        break
+                    }
+                }
+            }
+            return 0
+        }
+        return -1
+    }
+}
+
+export fn device_pm_set_wake_irq(id: u32, irq: u32): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return -1 }
+        if let Some(ref mut dev) = DEVICE_PM.devices[id as usize] {
+            dev.wake_irq = Some(irq)
+            return 0
+        }
+        return -1
+    }
+}
+
+// =============================================================================
+// Query Functions
+// =============================================================================
+
+export fn device_pm_get_state(id: u32): DevicePowerState {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return DevicePowerState::D0 }
+        match &DEVICE_PM.devices[id as usize] {
+            Some(dev) => dev.power_state,
+            None => DevicePowerState::D0,
+        }
+    }
+}
+
+export fn device_pm_get_runtime_state(id: u32): RuntimePMState {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return RuntimePMState::Active }
+        match &DEVICE_PM.devices[id as usize] {
+            Some(dev) => dev.runtime_state,
+            None => RuntimePMState::Active,
+        }
+    }
+}
+
+export fn device_pm_get_usage_count(id: u32): i32 {
+    unsafe {
+        if id as usize >= DEVICE_PM.device_count { return 0 }
+        match &DEVICE_PM.devices[id as usize] {
+            Some(dev) => dev.usage_count,
+            None => 0,
+        }
+    }
+}
+
+export fn device_pm_is_suspended(): bool {
+    unsafe { DEVICE_PM.system_state != SystemPowerState::S0 }
+}
+
+export fn device_pm_get_last_wake_source(): Option<u32> {
+    unsafe { DEVICE_PM.last_wake_source }
+}
+
+// =============================================================================
+// Helper
+// =============================================================================
+
+fn get_time_us(): u64 {
+    // Would use TSC or HPET
+    let tsc: u64
+    asm!("rdtsc", out("eax") _, out("edx") _, lateout("rax") tsc)
+    return tsc / 1000  // Approximate
+}

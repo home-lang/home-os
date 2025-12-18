@@ -1,0 +1,938 @@
+// home-os Raspberry Pi UART Drivers
+// Mini UART (AUX) and PL011 UART support
+
+import "../../../core/types"
+import "../../../sync/spinlock"
+
+// =============================================================================
+// UART Type Selection
+// =============================================================================
+
+enum UartType {
+    MiniUart,   // BCM2835 auxiliary mini UART
+    PL011,      // ARM PrimeCell PL011
+}
+
+// =============================================================================
+// Mini UART (Auxiliary UART) - BCM2835/2837/2711
+// =============================================================================
+
+// Mini UART base addresses per SoC
+const MINI_UART_BASE_PI3: u64 = 0x3F215000    // BCM2837
+const MINI_UART_BASE_PI4: u64 = 0xFE215000    // BCM2711
+const MINI_UART_BASE_PI5: u64 = 0x107D00D000  // BCM2712 (tentative)
+
+// Mini UART registers (offsets from AUX base)
+const AUX_IRQ: u64 = 0x00         // Auxiliary Interrupt status
+const AUX_ENABLES: u64 = 0x04     // Auxiliary enables
+const AUX_MU_IO_REG: u64 = 0x40   // Mini UART I/O Data
+const AUX_MU_IER_REG: u64 = 0x44  // Mini UART Interrupt Enable
+const AUX_MU_IIR_REG: u64 = 0x48  // Mini UART Interrupt Identify
+const AUX_MU_LCR_REG: u64 = 0x4C  // Mini UART Line Control
+const AUX_MU_MCR_REG: u64 = 0x50  // Mini UART Modem Control
+const AUX_MU_LSR_REG: u64 = 0x54  // Mini UART Line Status
+const AUX_MU_MSR_REG: u64 = 0x58  // Mini UART Modem Status
+const AUX_MU_SCRATCH: u64 = 0x5C  // Mini UART Scratch
+const AUX_MU_CNTL_REG: u64 = 0x60 // Mini UART Extra Control
+const AUX_MU_STAT_REG: u64 = 0x64 // Mini UART Extra Status
+const AUX_MU_BAUD_REG: u64 = 0x68 // Mini UART Baudrate
+
+// AUX_ENABLES bits
+const AUX_ENABLE_MU: u32 = 1 << 0   // Mini UART enable
+const AUX_ENABLE_SPI1: u32 = 1 << 1 // SPI 1 enable
+const AUX_ENABLE_SPI2: u32 = 1 << 2 // SPI 2 enable
+
+// AUX_MU_IER bits
+const MU_IER_TX_IRQ: u32 = 1 << 1   // Enable transmit interrupts
+const MU_IER_RX_IRQ: u32 = 1 << 0   // Enable receive interrupts
+
+// AUX_MU_IIR bits
+const MU_IIR_RX_IRQ: u32 = 1 << 2   // Receive interrupt pending
+const MU_IIR_TX_IRQ: u32 = 1 << 1   // Transmit interrupt pending
+const MU_IIR_PENDING: u32 = 1 << 0  // Interrupt pending (active low)
+const MU_IIR_FIFO_CLR: u32 = 0xC6   // Clear both FIFOs
+
+// AUX_MU_LCR bits
+const MU_LCR_DLAB: u32 = 1 << 7     // DLAB access
+const MU_LCR_BREAK: u32 = 1 << 6    // Break
+const MU_LCR_8BIT: u32 = 3          // 8-bit mode
+
+// AUX_MU_MCR bits
+const MU_MCR_RTS: u32 = 1 << 1      // RTS signal
+
+// AUX_MU_LSR bits
+const MU_LSR_TX_EMPTY: u32 = 1 << 5 // Transmitter empty
+const MU_LSR_TX_IDLE: u32 = 1 << 6  // Transmitter idle
+const MU_LSR_RX_READY: u32 = 1 << 0 // Receiver ready
+const MU_LSR_RX_OVERRUN: u32 = 1 << 1 // Receiver overrun
+
+// AUX_MU_CNTL bits
+const MU_CNTL_RX_ENABLE: u32 = 1 << 0 // Receiver enable
+const MU_CNTL_TX_ENABLE: u32 = 1 << 1 // Transmitter enable
+const MU_CNTL_RTS_FLOW: u32 = 1 << 2  // RTS flow control
+const MU_CNTL_CTS_FLOW: u32 = 1 << 3  // CTS flow control
+const MU_CNTL_RTS_LEVEL: u32 = 3 << 4 // RTS auto-flow level
+const MU_CNTL_CTS_ASSERT: u32 = 1 << 7 // CTS assert level
+
+// AUX_MU_STAT bits
+const MU_STAT_TX_DONE: u32 = 1 << 9   // Transmitter done
+const MU_STAT_TX_EMPTY: u32 = 1 << 8  // TX FIFO empty
+const MU_STAT_CTS: u32 = 1 << 7       // CTS status
+const MU_STAT_RTS: u32 = 1 << 6       // RTS status
+const MU_STAT_TX_FULL: u32 = 1 << 5   // TX FIFO full
+const MU_STAT_RX_OVERRUN: u32 = 1 << 4 // RX overrun
+const MU_STAT_TX_IDLE: u32 = 1 << 3   // Transmitter idle
+const MU_STAT_RX_IDLE: u32 = 1 << 2   // Receiver idle
+const MU_STAT_TX_AVAIL: u32 = 1 << 1  // Space available in TX FIFO
+const MU_STAT_RX_AVAIL: u32 = 1 << 0  // Data available in RX FIFO
+
+// =============================================================================
+// PL011 UART - ARM PrimeCell
+// =============================================================================
+
+// PL011 base addresses
+const PL011_BASE_PI3: u64 = 0x3F201000    // BCM2837
+const PL011_BASE_PI4: u64 = 0xFE201000    // BCM2711
+const PL011_BASE_PI5: u64 = 0x107D001000  // BCM2712 (tentative)
+
+// PL011 registers (offsets)
+const UART_DR: u64 = 0x00       // Data Register
+const UART_RSR: u64 = 0x04      // Receive Status Register
+const UART_FR: u64 = 0x18       // Flag Register
+const UART_ILPR: u64 = 0x20     // IrDA Low-Power Counter
+const UART_IBRD: u64 = 0x24     // Integer Baud Rate Divisor
+const UART_FBRD: u64 = 0x28     // Fractional Baud Rate Divisor
+const UART_LCRH: u64 = 0x2C     // Line Control Register
+const UART_CR: u64 = 0x30       // Control Register
+const UART_IFLS: u64 = 0x34     // Interrupt FIFO Level Select
+const UART_IMSC: u64 = 0x38     // Interrupt Mask Set/Clear
+const UART_RIS: u64 = 0x3C      // Raw Interrupt Status
+const UART_MIS: u64 = 0x40      // Masked Interrupt Status
+const UART_ICR: u64 = 0x44      // Interrupt Clear Register
+const UART_DMACR: u64 = 0x48    // DMA Control Register
+const UART_PERIPHID: u64 = 0xFE0 // Peripheral ID registers
+const UART_CELLID: u64 = 0xFF0  // PrimeCell ID registers
+
+// UART_FR bits
+const FR_RI: u32 = 1 << 8    // Ring indicator
+const FR_TXFE: u32 = 1 << 7  // Transmit FIFO empty
+const FR_RXFF: u32 = 1 << 6  // Receive FIFO full
+const FR_TXFF: u32 = 1 << 5  // Transmit FIFO full
+const FR_RXFE: u32 = 1 << 4  // Receive FIFO empty
+const FR_BUSY: u32 = 1 << 3  // UART busy
+const FR_DCD: u32 = 1 << 2   // Data carrier detect
+const FR_DSR: u32 = 1 << 1   // Data set ready
+const FR_CTS: u32 = 1 << 0   // Clear to send
+
+// UART_RSR bits
+const RSR_OE: u32 = 1 << 3   // Overrun error
+const RSR_BE: u32 = 1 << 2   // Break error
+const RSR_PE: u32 = 1 << 1   // Parity error
+const RSR_FE: u32 = 1 << 0   // Framing error
+
+// UART_LCRH bits
+const LCRH_SPS: u32 = 1 << 7    // Stick parity select
+const LCRH_WLEN_8: u32 = 3 << 5 // 8-bit word length
+const LCRH_WLEN_7: u32 = 2 << 5 // 7-bit word length
+const LCRH_WLEN_6: u32 = 1 << 5 // 6-bit word length
+const LCRH_WLEN_5: u32 = 0 << 5 // 5-bit word length
+const LCRH_FEN: u32 = 1 << 4    // FIFO enable
+const LCRH_STP2: u32 = 1 << 3   // Two stop bits
+const LCRH_EPS: u32 = 1 << 2    // Even parity select
+const LCRH_PEN: u32 = 1 << 1    // Parity enable
+const LCRH_BRK: u32 = 1 << 0    // Send break
+
+// UART_CR bits
+const CR_CTSEN: u32 = 1 << 15  // CTS hardware flow control
+const CR_RTSEN: u32 = 1 << 14  // RTS hardware flow control
+const CR_OUT2: u32 = 1 << 13   // OUT2
+const CR_OUT1: u32 = 1 << 12   // OUT1
+const CR_RTS: u32 = 1 << 11    // Request to send
+const CR_DTR: u32 = 1 << 10    // Data terminal ready
+const CR_RXE: u32 = 1 << 9     // Receive enable
+const CR_TXE: u32 = 1 << 8     // Transmit enable
+const CR_LBE: u32 = 1 << 7     // Loopback enable
+const CR_SIRLP: u32 = 1 << 2   // IrDA SIR low power mode
+const CR_SIREN: u32 = 1 << 1   // SIR enable
+const CR_UARTEN: u32 = 1 << 0  // UART enable
+
+// UART_IFLS bits (FIFO level select)
+const IFLS_RXIFLSEL_1_8: u32 = 0 << 3
+const IFLS_RXIFLSEL_1_4: u32 = 1 << 3
+const IFLS_RXIFLSEL_1_2: u32 = 2 << 3
+const IFLS_RXIFLSEL_3_4: u32 = 3 << 3
+const IFLS_RXIFLSEL_7_8: u32 = 4 << 3
+const IFLS_TXIFLSEL_1_8: u32 = 0 << 0
+const IFLS_TXIFLSEL_1_4: u32 = 1 << 0
+const IFLS_TXIFLSEL_1_2: u32 = 2 << 0
+const IFLS_TXIFLSEL_3_4: u32 = 3 << 0
+const IFLS_TXIFLSEL_7_8: u32 = 4 << 0
+
+// UART interrupt bits (for IMSC, RIS, MIS, ICR)
+const INT_OE: u32 = 1 << 10    // Overrun error
+const INT_BE: u32 = 1 << 9     // Break error
+const INT_PE: u32 = 1 << 8     // Parity error
+const INT_FE: u32 = 1 << 7     // Framing error
+const INT_RT: u32 = 1 << 6     // Receive timeout
+const INT_TX: u32 = 1 << 5     // Transmit
+const INT_RX: u32 = 1 << 4     // Receive
+const INT_DSR: u32 = 1 << 3    // DSR modem
+const INT_DCD: u32 = 1 << 2    // DCD modem
+const INT_CTS: u32 = 1 << 1    // CTS modem
+const INT_RI: u32 = 1 << 0     // RI modem
+
+// =============================================================================
+// UART Configuration
+// =============================================================================
+
+struct UartConfig {
+    baud_rate: u32,
+    data_bits: u8,
+    stop_bits: u8,
+    parity: Parity,
+    flow_control: FlowControl,
+}
+
+enum Parity {
+    None,
+    Odd,
+    Even,
+}
+
+enum FlowControl {
+    None,
+    RtsCts,
+}
+
+impl UartConfig {
+    fn default(): UartConfig {
+        return UartConfig {
+            baud_rate: 115200,
+            data_bits: 8,
+            stop_bits: 1,
+            parity: Parity::None,
+            flow_control: FlowControl::None,
+        }
+    }
+}
+
+// =============================================================================
+// UART Statistics
+// =============================================================================
+
+struct UartStats {
+    rx_bytes: u64,
+    tx_bytes: u64,
+    rx_errors: u64,
+    tx_errors: u64,
+    overrun_errors: u64,
+    framing_errors: u64,
+    parity_errors: u64,
+    break_errors: u64,
+}
+
+// =============================================================================
+// Ring Buffer for UART I/O
+// =============================================================================
+
+const UART_BUFFER_SIZE: usize = 4096
+
+struct RingBuffer {
+    buffer: [u8; UART_BUFFER_SIZE],
+    head: usize,
+    tail: usize,
+    count: usize,
+}
+
+impl RingBuffer {
+    fn new(): RingBuffer {
+        return RingBuffer {
+            buffer: [0u8; UART_BUFFER_SIZE],
+            head: 0,
+            tail: 0,
+            count: 0,
+        }
+    }
+
+    fn is_empty(self: &Self): bool {
+        return self.count == 0
+    }
+
+    fn is_full(self: &Self): bool {
+        return self.count >= UART_BUFFER_SIZE
+    }
+
+    fn available(self: &Self): usize {
+        return self.count
+    }
+
+    fn free_space(self: &Self): usize {
+        return UART_BUFFER_SIZE - self.count
+    }
+
+    fn push(self: &mut Self, byte: u8): bool {
+        if self.is_full() {
+            return false
+        }
+        self.buffer[self.head] = byte
+        self.head = (self.head + 1) % UART_BUFFER_SIZE
+        self.count += 1
+        return true
+    }
+
+    fn pop(self: &mut Self): Option<u8> {
+        if self.is_empty() {
+            return None
+        }
+        let byte = self.buffer[self.tail]
+        self.tail = (self.tail + 1) % UART_BUFFER_SIZE
+        self.count -= 1
+        return Some(byte)
+    }
+
+    fn peek(self: &Self): Option<u8> {
+        if self.is_empty() {
+            return None
+        }
+        return Some(self.buffer[self.tail])
+    }
+}
+
+// =============================================================================
+// Mini UART Driver
+// =============================================================================
+
+struct MiniUart {
+    base: u64,
+    config: UartConfig,
+    lock: Spinlock,
+    rx_buffer: RingBuffer,
+    tx_buffer: RingBuffer,
+    stats: UartStats,
+    irq_enabled: bool,
+}
+
+static mut MINI_UART: MiniUart = MiniUart {
+    base: MINI_UART_BASE_PI4,
+    config: UartConfig {
+        baud_rate: 115200,
+        data_bits: 8,
+        stop_bits: 1,
+        parity: Parity::None,
+        flow_control: FlowControl::None,
+    },
+    lock: Spinlock::new(),
+    rx_buffer: RingBuffer::new(),
+    tx_buffer: RingBuffer::new(),
+    stats: UartStats {
+        rx_bytes: 0,
+        tx_bytes: 0,
+        rx_errors: 0,
+        tx_errors: 0,
+        overrun_errors: 0,
+        framing_errors: 0,
+        parity_errors: 0,
+        break_errors: 0,
+    },
+    irq_enabled: false,
+}
+
+fn mu_read(offset: u64): u32 {
+    unsafe {
+        let addr = MINI_UART.base + offset
+        let value: u32
+        asm!("ldr {0:w}, [{1}]", out(reg) value, in(reg) addr)
+        return value
+    }
+}
+
+fn mu_write(offset: u64, value: u32) {
+    unsafe {
+        let addr = MINI_UART.base + offset
+        asm!("str {0:w}, [{1}]", in(reg) value, in(reg) addr)
+    }
+}
+
+// Initialize mini UART
+export fn mini_uart_init(base: u64, system_clock: u32): i32 {
+    unsafe {
+        MINI_UART.base = base
+        MINI_UART.lock.init()
+        MINI_UART.rx_buffer = RingBuffer::new()
+        MINI_UART.tx_buffer = RingBuffer::new()
+    }
+
+    // Enable mini UART
+    mu_write(AUX_ENABLES, mu_read(AUX_ENABLES) | AUX_ENABLE_MU)
+
+    // Disable TX/RX during configuration
+    mu_write(AUX_MU_CNTL_REG, 0)
+
+    // 8-bit mode
+    mu_write(AUX_MU_LCR_REG, MU_LCR_8BIT)
+
+    // RTS high
+    mu_write(AUX_MU_MCR_REG, 0)
+
+    // Disable interrupts initially
+    mu_write(AUX_MU_IER_REG, 0)
+
+    // Clear FIFOs
+    mu_write(AUX_MU_IIR_REG, MU_IIR_FIFO_CLR)
+
+    // Set baud rate
+    // baudrate = system_clock / (8 * (baud_reg + 1))
+    // baud_reg = system_clock / (8 * baudrate) - 1
+    let baud_reg = system_clock / (8 * 115200) - 1
+    mu_write(AUX_MU_BAUD_REG, baud_reg)
+
+    // Enable TX and RX
+    mu_write(AUX_MU_CNTL_REG, MU_CNTL_RX_ENABLE | MU_CNTL_TX_ENABLE)
+
+    return 0
+}
+
+// Configure mini UART baud rate
+export fn mini_uart_set_baud(system_clock: u32, baud_rate: u32): i32 {
+    let baud_reg = system_clock / (8 * baud_rate) - 1
+    mu_write(AUX_MU_BAUD_REG, baud_reg)
+    unsafe {
+        MINI_UART.config.baud_rate = baud_rate
+    }
+    return 0
+}
+
+// Enable/disable mini UART interrupts
+export fn mini_uart_enable_irq(rx: bool, tx: bool) {
+    let mut ier: u32 = 0
+    if rx {
+        ier |= MU_IER_RX_IRQ
+    }
+    if tx {
+        ier |= MU_IER_TX_IRQ
+    }
+    mu_write(AUX_MU_IER_REG, ier)
+    unsafe {
+        MINI_UART.irq_enabled = rx || tx
+    }
+}
+
+// Check if data available
+export fn mini_uart_rx_ready(): bool {
+    return (mu_read(AUX_MU_LSR_REG) & MU_LSR_RX_READY) != 0
+}
+
+// Check if transmitter ready
+export fn mini_uart_tx_ready(): bool {
+    return (mu_read(AUX_MU_LSR_REG) & MU_LSR_TX_EMPTY) != 0
+}
+
+// Read single byte (blocking)
+export fn mini_uart_getc(): u8 {
+    while !mini_uart_rx_ready() {}
+    let byte = (mu_read(AUX_MU_IO_REG) & 0xFF) as u8
+    unsafe {
+        MINI_UART.stats.rx_bytes += 1
+    }
+    return byte
+}
+
+// Write single byte (blocking)
+export fn mini_uart_putc(c: u8) {
+    while !mini_uart_tx_ready() {}
+    mu_write(AUX_MU_IO_REG, c as u32)
+    unsafe {
+        MINI_UART.stats.tx_bytes += 1
+    }
+}
+
+// Read byte non-blocking
+export fn mini_uart_try_getc(): Option<u8> {
+    if mini_uart_rx_ready() {
+        let byte = (mu_read(AUX_MU_IO_REG) & 0xFF) as u8
+        unsafe {
+            MINI_UART.stats.rx_bytes += 1
+        }
+        return Some(byte)
+    }
+    return None
+}
+
+// Write byte non-blocking
+export fn mini_uart_try_putc(c: u8): bool {
+    if mini_uart_tx_ready() {
+        mu_write(AUX_MU_IO_REG, c as u32)
+        unsafe {
+            MINI_UART.stats.tx_bytes += 1
+        }
+        return true
+    }
+    return false
+}
+
+// Write string
+export fn mini_uart_puts(s: &str) {
+    for c in s.bytes() {
+        if c == '\n' as u8 {
+            mini_uart_putc('\r' as u8)
+        }
+        mini_uart_putc(c)
+    }
+}
+
+// Write hex value
+export fn mini_uart_hex(value: u64) {
+    mini_uart_puts("0x")
+    let hex_chars = "0123456789ABCDEF"
+    for i in (0..16).rev() {
+        let nibble = ((value >> (i * 4)) & 0xF) as usize
+        mini_uart_putc(hex_chars.as_bytes()[nibble])
+    }
+}
+
+// Write decimal value
+export fn mini_uart_dec(value: u64) {
+    if value == 0 {
+        mini_uart_putc('0' as u8)
+        return
+    }
+
+    let mut buf: [u8; 20] = [0u8; 20]
+    let mut i = 0
+    let mut v = value
+
+    while v > 0 {
+        buf[i] = ('0' as u8) + (v % 10) as u8
+        v /= 10
+        i += 1
+    }
+
+    while i > 0 {
+        i -= 1
+        mini_uart_putc(buf[i])
+    }
+}
+
+// Read line into buffer
+export fn mini_uart_gets(buffer: &mut [u8], max_len: usize): usize {
+    let mut i = 0
+    while i < max_len - 1 {
+        let c = mini_uart_getc()
+        if c == '\r' as u8 || c == '\n' as u8 {
+            break
+        }
+        if c == 0x7F || c == '\b' as u8 {  // Backspace
+            if i > 0 {
+                i -= 1
+                mini_uart_puts("\b \b")
+            }
+            continue
+        }
+        buffer[i] = c
+        mini_uart_putc(c)  // Echo
+        i += 1
+    }
+    buffer[i] = 0
+    mini_uart_puts("\r\n")
+    return i
+}
+
+// Mini UART interrupt handler
+export fn mini_uart_irq_handler() {
+    let iir = mu_read(AUX_MU_IIR_REG)
+
+    // Check if interrupt pending (active low)
+    if (iir & MU_IIR_PENDING) != 0 {
+        return
+    }
+
+    unsafe {
+        // RX interrupt
+        if (iir & MU_IIR_RX_IRQ) != 0 {
+            while mini_uart_rx_ready() {
+                let byte = (mu_read(AUX_MU_IO_REG) & 0xFF) as u8
+                if !MINI_UART.rx_buffer.push(byte) {
+                    MINI_UART.stats.overrun_errors += 1
+                } else {
+                    MINI_UART.stats.rx_bytes += 1
+                }
+            }
+        }
+
+        // TX interrupt
+        if (iir & MU_IIR_TX_IRQ) != 0 {
+            while mini_uart_tx_ready() {
+                match MINI_UART.tx_buffer.pop() {
+                    Some(byte) => {
+                        mu_write(AUX_MU_IO_REG, byte as u32)
+                        MINI_UART.stats.tx_bytes += 1
+                    },
+                    None => {
+                        // Disable TX interrupt when buffer empty
+                        mu_write(AUX_MU_IER_REG, mu_read(AUX_MU_IER_REG) & !MU_IER_TX_IRQ)
+                        break
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// PL011 UART Driver
+// =============================================================================
+
+struct PL011Uart {
+    base: u64,
+    config: UartConfig,
+    lock: Spinlock,
+    rx_buffer: RingBuffer,
+    tx_buffer: RingBuffer,
+    stats: UartStats,
+    irq_enabled: bool,
+    clock_freq: u32,
+}
+
+static mut PL011: PL011Uart = PL011Uart {
+    base: PL011_BASE_PI4,
+    config: UartConfig {
+        baud_rate: 115200,
+        data_bits: 8,
+        stop_bits: 1,
+        parity: Parity::None,
+        flow_control: FlowControl::None,
+    },
+    lock: Spinlock::new(),
+    rx_buffer: RingBuffer::new(),
+    tx_buffer: RingBuffer::new(),
+    stats: UartStats {
+        rx_bytes: 0,
+        tx_bytes: 0,
+        rx_errors: 0,
+        tx_errors: 0,
+        overrun_errors: 0,
+        framing_errors: 0,
+        parity_errors: 0,
+        break_errors: 0,
+    },
+    irq_enabled: false,
+    clock_freq: 48000000,  // 48MHz default on Pi 4
+}
+
+fn pl011_read(offset: u64): u32 {
+    unsafe {
+        let addr = PL011.base + offset
+        let value: u32
+        asm!("ldr {0:w}, [{1}]", out(reg) value, in(reg) addr)
+        return value
+    }
+}
+
+fn pl011_write(offset: u64, value: u32) {
+    unsafe {
+        let addr = PL011.base + offset
+        asm!("str {0:w}, [{1}]", in(reg) value, in(reg) addr)
+    }
+}
+
+// Initialize PL011 UART
+export fn pl011_init(base: u64, clock_freq: u32): i32 {
+    unsafe {
+        PL011.base = base
+        PL011.clock_freq = clock_freq
+        PL011.lock.init()
+        PL011.rx_buffer = RingBuffer::new()
+        PL011.tx_buffer = RingBuffer::new()
+    }
+
+    // Disable UART
+    pl011_write(UART_CR, 0)
+
+    // Wait for current TX to complete
+    while (pl011_read(UART_FR) & FR_BUSY) != 0 {}
+
+    // Disable FIFOs
+    pl011_write(UART_LCRH, pl011_read(UART_LCRH) & !LCRH_FEN)
+
+    // Clear all interrupts
+    pl011_write(UART_ICR, 0x7FF)
+
+    // Set baud rate (115200 at 48MHz)
+    pl011_set_baud(clock_freq, 115200)
+
+    // Set line control: 8-bit, no parity, 1 stop bit, FIFOs enabled
+    pl011_write(UART_LCRH, LCRH_WLEN_8 | LCRH_FEN)
+
+    // Mask all interrupts
+    pl011_write(UART_IMSC, 0)
+
+    // Enable UART, TX, RX
+    pl011_write(UART_CR, CR_UARTEN | CR_TXE | CR_RXE)
+
+    return 0
+}
+
+// Set PL011 baud rate
+export fn pl011_set_baud(clock_freq: u32, baud_rate: u32): i32 {
+    // BAUDDIV = clock_freq / (16 * baud_rate)
+    // IBRD = integer part
+    // FBRD = fractional part * 64 + 0.5
+
+    let bauddiv = (clock_freq * 4) / baud_rate  // Scaled by 64
+    let ibrd = bauddiv / 64
+    let fbrd = bauddiv % 64
+
+    pl011_write(UART_IBRD, ibrd)
+    pl011_write(UART_FBRD, fbrd)
+
+    // Line control must be written to latch baud rate
+    let lcrh = pl011_read(UART_LCRH)
+    pl011_write(UART_LCRH, lcrh)
+
+    unsafe {
+        PL011.config.baud_rate = baud_rate
+    }
+    return 0
+}
+
+// Enable PL011 interrupts
+export fn pl011_enable_irq(mask: u32) {
+    pl011_write(UART_IMSC, mask)
+    unsafe {
+        PL011.irq_enabled = mask != 0
+    }
+}
+
+// Check if RX ready
+export fn pl011_rx_ready(): bool {
+    return (pl011_read(UART_FR) & FR_RXFE) == 0
+}
+
+// Check if TX ready
+export fn pl011_tx_ready(): bool {
+    return (pl011_read(UART_FR) & FR_TXFF) == 0
+}
+
+// Read single byte (blocking)
+export fn pl011_getc(): u8 {
+    while !pl011_rx_ready() {}
+
+    let dr = pl011_read(UART_DR)
+
+    // Check for errors
+    unsafe {
+        if (dr & (RSR_OE << 8)) != 0 {
+            PL011.stats.overrun_errors += 1
+        }
+        if (dr & (RSR_BE << 8)) != 0 {
+            PL011.stats.break_errors += 1
+        }
+        if (dr & (RSR_PE << 8)) != 0 {
+            PL011.stats.parity_errors += 1
+        }
+        if (dr & (RSR_FE << 8)) != 0 {
+            PL011.stats.framing_errors += 1
+        }
+        PL011.stats.rx_bytes += 1
+    }
+
+    return (dr & 0xFF) as u8
+}
+
+// Write single byte (blocking)
+export fn pl011_putc(c: u8) {
+    while !pl011_tx_ready() {}
+    pl011_write(UART_DR, c as u32)
+    unsafe {
+        PL011.stats.tx_bytes += 1
+    }
+}
+
+// Write string
+export fn pl011_puts(s: &str) {
+    for c in s.bytes() {
+        if c == '\n' as u8 {
+            pl011_putc('\r' as u8)
+        }
+        pl011_putc(c)
+    }
+}
+
+// Non-blocking read
+export fn pl011_try_getc(): Option<u8> {
+    if pl011_rx_ready() {
+        return Some(pl011_getc())
+    }
+    return None
+}
+
+// Non-blocking write
+export fn pl011_try_putc(c: u8): bool {
+    if pl011_tx_ready() {
+        pl011_write(UART_DR, c as u32)
+        unsafe {
+            PL011.stats.tx_bytes += 1
+        }
+        return true
+    }
+    return false
+}
+
+// PL011 interrupt handler
+export fn pl011_irq_handler() {
+    let mis = pl011_read(UART_MIS)
+
+    // RX interrupt or RX timeout
+    if (mis & (INT_RX | INT_RT)) != 0 {
+        unsafe {
+            while pl011_rx_ready() {
+                let byte = pl011_getc()
+                if !PL011.rx_buffer.push(byte) {
+                    PL011.stats.overrun_errors += 1
+                }
+            }
+        }
+        pl011_write(UART_ICR, INT_RX | INT_RT)
+    }
+
+    // TX interrupt
+    if (mis & INT_TX) != 0 {
+        unsafe {
+            while pl011_tx_ready() {
+                match PL011.tx_buffer.pop() {
+                    Some(byte) => {
+                        pl011_write(UART_DR, byte as u32)
+                    },
+                    None => {
+                        // Disable TX interrupt when buffer empty
+                        pl011_write(UART_IMSC, pl011_read(UART_IMSC) & !INT_TX)
+                        break
+                    }
+                }
+            }
+        }
+        pl011_write(UART_ICR, INT_TX)
+    }
+
+    // Error interrupts
+    if (mis & (INT_OE | INT_BE | INT_PE | INT_FE)) != 0 {
+        unsafe {
+            if (mis & INT_OE) != 0 { PL011.stats.overrun_errors += 1 }
+            if (mis & INT_BE) != 0 { PL011.stats.break_errors += 1 }
+            if (mis & INT_PE) != 0 { PL011.stats.parity_errors += 1 }
+            if (mis & INT_FE) != 0 { PL011.stats.framing_errors += 1 }
+        }
+        pl011_write(UART_ICR, INT_OE | INT_BE | INT_PE | INT_FE)
+    }
+}
+
+// =============================================================================
+// Console Interface
+// =============================================================================
+
+enum ConsoleType {
+    MiniUart,
+    PL011,
+}
+
+static mut CONSOLE_TYPE: ConsoleType = ConsoleType::MiniUart
+
+// Initialize console
+export fn console_init(uart_type: ConsoleType, base: u64, clock: u32): i32 {
+    unsafe {
+        CONSOLE_TYPE = uart_type
+    }
+
+    match uart_type {
+        ConsoleType::MiniUart => mini_uart_init(base, clock),
+        ConsoleType::PL011 => pl011_init(base, clock),
+    }
+}
+
+// Console write
+export fn console_putc(c: u8) {
+    unsafe {
+        match CONSOLE_TYPE {
+            ConsoleType::MiniUart => mini_uart_putc(c),
+            ConsoleType::PL011 => pl011_putc(c),
+        }
+    }
+}
+
+export fn console_puts(s: &str) {
+    unsafe {
+        match CONSOLE_TYPE {
+            ConsoleType::MiniUart => mini_uart_puts(s),
+            ConsoleType::PL011 => pl011_puts(s),
+        }
+    }
+}
+
+// Console read
+export fn console_getc(): u8 {
+    unsafe {
+        match CONSOLE_TYPE {
+            ConsoleType::MiniUart => mini_uart_getc(),
+            ConsoleType::PL011 => pl011_getc(),
+        }
+    }
+}
+
+// Get UART statistics
+export fn uart_get_stats(uart_type: ConsoleType): UartStats {
+    unsafe {
+        match uart_type {
+            ConsoleType::MiniUart => MINI_UART.stats,
+            ConsoleType::PL011 => PL011.stats,
+        }
+    }
+}
+
+// =============================================================================
+// Printf-style output
+// =============================================================================
+
+export fn kprintf(fmt: &str, args: ...) {
+    // Simple printf implementation
+    let mut i = 0
+    let bytes = fmt.as_bytes()
+    let mut arg_idx = 0
+
+    while i < bytes.len() {
+        if bytes[i] == '%' as u8 && i + 1 < bytes.len() {
+            i += 1
+            match bytes[i] {
+                'd' as u8 => {
+                    // Decimal - would need proper varargs
+                    console_puts("<int>")
+                    arg_idx += 1
+                },
+                'x' as u8 => {
+                    console_puts("<hex>")
+                    arg_idx += 1
+                },
+                's' as u8 => {
+                    console_puts("<str>")
+                    arg_idx += 1
+                },
+                'c' as u8 => {
+                    console_puts("<char>")
+                    arg_idx += 1
+                },
+                '%' as u8 => {
+                    console_putc('%' as u8)
+                },
+                _ => {
+                    console_putc('%' as u8)
+                    console_putc(bytes[i])
+                }
+            }
+        } else {
+            if bytes[i] == '\n' as u8 {
+                console_putc('\r' as u8)
+            }
+            console_putc(bytes[i])
+        }
+        i += 1
+    }
+}

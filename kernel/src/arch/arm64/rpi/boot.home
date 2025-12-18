@@ -1,0 +1,837 @@
+// home-os Raspberry Pi Bootloader
+// ARM64 boot sequence for Pi 3/4/5
+
+import "../../../mm/memory"
+import "../../../core/types"
+
+// =============================================================================
+// Boot Configuration
+// =============================================================================
+
+// Kernel load address (configurable via config.txt)
+const KERNEL_LOAD_ADDR: u64 = 0x80000
+
+// DTB load address
+const DTB_LOAD_ADDR: u64 = 0x100
+
+// Stack configuration
+const BOOT_STACK_SIZE: usize = 16384
+const BOOT_STACK_ADDR: u64 = 0x80000 - BOOT_STACK_SIZE
+
+// ARM CPU IDs
+const CPU_ID_MASK: u64 = 0xFF
+
+// Exception levels
+const EL3: u32 = 3
+const EL2: u32 = 2
+const EL1: u32 = 1
+const EL0: u32 = 0
+
+// SPSR register bits
+const SPSR_EL1h: u64 = 0x5        // EL1 with SP_EL1
+const SPSR_D: u64 = 1 << 9       // Debug mask
+const SPSR_A: u64 = 1 << 8       // SError mask
+const SPSR_I: u64 = 1 << 7       // IRQ mask
+const SPSR_F: u64 = 1 << 6       // FIQ mask
+
+// HCR_EL2 bits
+const HCR_RW: u64 = 1 << 31      // EL1 is AArch64
+const HCR_HCD: u64 = 1 << 29     // Disable HVC
+const HCR_SWIO: u64 = 1 << 1     // Set/Way Invalidation Override
+
+// SCR_EL3 bits
+const SCR_RW: u64 = 1 << 10      // EL2 is AArch64
+const SCR_HCE: u64 = 1 << 8      // HVC enable
+const SCR_SMD: u64 = 1 << 7      // SMC disable
+const SCR_NS: u64 = 1 << 0       // Non-secure
+
+// SCTLR bits
+const SCTLR_EE: u64 = 1 << 25    // Exception endianness (0 = little)
+const SCTLR_E0E: u64 = 1 << 24   // EL0 endianness (0 = little)
+const SCTLR_I: u64 = 1 << 12     // Instruction cache enable
+const SCTLR_SA: u64 = 1 << 3     // Stack alignment check
+const SCTLR_C: u64 = 1 << 2      // Data cache enable
+const SCTLR_A: u64 = 1 << 1      // Alignment check
+const SCTLR_M: u64 = 1 << 0      // MMU enable
+
+// CPACR_EL1 bits
+const CPACR_FPEN: u64 = 3 << 20  // Enable FP/SIMD
+
+// =============================================================================
+// Boot Data Structures
+// =============================================================================
+
+struct BootInfo {
+    dtb_addr: u64,
+    kernel_addr: u64,
+    kernel_size: u64,
+    mem_start: u64,
+    mem_size: u64,
+    cmdline: [u8; 512],
+    cmdline_len: usize,
+    board_revision: u32,
+    serial: u64,
+    cpu_count: u32,
+}
+
+struct ArmBootTable {
+    magic: u32,
+    version: u32,
+    mem_size: u64,
+    kernel_entry: u64,
+    dtb_addr: u64,
+    reserved: [u64; 4],
+}
+
+const ARM_BOOT_TABLE_MAGIC: u32 = 0x544F4F42  // "BOOT"
+
+// Per-CPU boot state
+struct CpuBootState {
+    stack_ptr: u64,
+    entry_point: u64,
+    cpu_id: u32,
+    ready: u32,
+}
+
+static mut BOOT_INFO: BootInfo = BootInfo {
+    dtb_addr: 0,
+    kernel_addr: 0,
+    kernel_size: 0,
+    mem_start: 0,
+    mem_size: 0,
+    cmdline: [0u8; 512],
+    cmdline_len: 0,
+    board_revision: 0,
+    serial: 0,
+    cpu_count: 0,
+}
+
+static mut CPU_BOOT_STATES: [CpuBootState; 4] = [
+    CpuBootState { stack_ptr: 0, entry_point: 0, cpu_id: 0, ready: 0 },
+    CpuBootState { stack_ptr: 0, entry_point: 0, cpu_id: 1, ready: 0 },
+    CpuBootState { stack_ptr: 0, entry_point: 0, cpu_id: 2, ready: 0 },
+    CpuBootState { stack_ptr: 0, entry_point: 0, cpu_id: 3, ready: 0 },
+]
+
+// =============================================================================
+// Assembly Boot Entry (Primary CPU)
+// =============================================================================
+
+// This is the entry point - linked at 0x80000
+// GPU bootloader passes: x0 = DTB address, x1-x3 = reserved
+#[naked]
+#[no_mangle]
+#[link_section = ".text.boot"]
+export fn _start() {
+    asm!(
+        // Disable interrupts
+        "msr daifset, #0xf",
+
+        // Read CPU ID from MPIDR_EL1
+        "mrs x4, mpidr_el1",
+        "and x4, x4, #0xFF",
+
+        // If not CPU 0, go to secondary boot
+        "cbnz x4, secondary_boot",
+
+        // Save DTB address
+        "adr x5, {dtb_save}",
+        "str x0, [x5]",
+
+        // Set up boot stack for CPU 0
+        "ldr x4, ={stack_top}",
+        "mov sp, x4",
+
+        // Clear BSS section
+        "adr x4, __bss_start",
+        "adr x5, __bss_end",
+        "1:",
+        "cmp x4, x5",
+        "b.ge 2f",
+        "stp xzr, xzr, [x4], #16",
+        "b 1b",
+        "2:",
+
+        // Jump to primary boot in Rust
+        "bl primary_boot",
+
+        // Should not return, but halt if it does
+        "b halt",
+
+        dtb_save = sym SAVED_DTB_ADDR,
+        stack_top = const BOOT_STACK_ADDR + BOOT_STACK_SIZE as u64,
+    )
+}
+
+#[naked]
+fn secondary_boot() {
+    asm!(
+        // x4 contains CPU ID
+        // Calculate stack address: base - (cpu_id * stack_size)
+        "ldr x5, ={stack_base}",
+        "ldr x6, ={stack_size}",
+        "mul x6, x4, x6",
+        "sub x5, x5, x6",
+        "mov sp, x5",
+
+        // Wait for primary CPU to set up secondary boot
+        "adr x5, {cpu_states}",
+        "lsl x6, x4, #5",          // Each CpuBootState is 32 bytes
+        "add x5, x5, x6",
+
+        // Spin until ready flag is set
+        "1:",
+        "ldr w6, [x5, #12]",        // ready offset
+        "cbz w6, 1b",
+
+        // Load entry point
+        "ldr x6, [x5, #8]",         // entry_point offset
+
+        // Jump to kernel entry with CPU ID
+        "mov x0, x4",
+        "br x6",
+
+        stack_base = const BOOT_STACK_ADDR,
+        stack_size = const BOOT_STACK_SIZE,
+        cpu_states = sym CPU_BOOT_STATES,
+    )
+}
+
+#[naked]
+fn halt() {
+    asm!(
+        "1:",
+        "wfe",
+        "b 1b",
+    )
+}
+
+static mut SAVED_DTB_ADDR: u64 = 0
+
+// =============================================================================
+// Primary Boot Sequence
+// =============================================================================
+
+#[no_mangle]
+fn primary_boot() {
+    // Get current exception level
+    let current_el = get_current_el()
+
+    // Configure and drop from EL3 if needed
+    if current_el == EL3 {
+        setup_el3()
+        drop_to_el2()
+    }
+
+    // Configure and drop from EL2 if needed
+    if current_el >= EL2 {
+        setup_el2()
+        drop_to_el1()
+    }
+
+    // Now in EL1 - continue boot
+    boot_el1()
+}
+
+fn get_current_el(): u32 {
+    let el: u64
+    asm!("mrs {}, CurrentEL", out(reg) el)
+    return ((el >> 2) & 0x3) as u32
+}
+
+fn setup_el3() {
+    // Configure SCR_EL3 for dropping to EL2
+    let scr = SCR_RW | SCR_HCE | SCR_NS
+    asm!("msr scr_el3, {}", in(reg) scr)
+
+    // Set up SPSR for EL2
+    let spsr = SPSR_EL1h | SPSR_D | SPSR_A | SPSR_I | SPSR_F
+    asm!("msr spsr_el3, {}", in(reg) spsr)
+
+    // Counter frequency (usually set by firmware)
+    asm!("msr cntfrq_el0, {}", in(reg) 54000000u64)  // 54MHz on Pi 4
+}
+
+fn drop_to_el2() {
+    asm!(
+        "adr x0, 1f",
+        "msr elr_el3, x0",
+        "eret",
+        "1:",
+    )
+}
+
+fn setup_el2() {
+    // Configure HCR_EL2
+    let hcr = HCR_RW  // EL1 is AArch64
+    asm!("msr hcr_el2, {}", in(reg) hcr)
+
+    // Disable EL2 MMU
+    asm!("msr sctlr_el2, xzr")
+
+    // Set up SPSR for EL1
+    let spsr = SPSR_EL1h | SPSR_D | SPSR_A | SPSR_I | SPSR_F
+    asm!("msr spsr_el2, {}", in(reg) spsr)
+
+    // Enable timer access from EL1
+    asm!("msr cnthctl_el2, {}", in(reg) 0x3u64)
+    asm!("msr cntvoff_el2, xzr")
+
+    // Enable AArch64 for EL1
+    asm!("msr hcr_el2, {}", in(reg) HCR_RW)
+}
+
+fn drop_to_el1() {
+    asm!(
+        "adr x0, 1f",
+        "msr elr_el2, x0",
+        "eret",
+        "1:",
+    )
+}
+
+fn boot_el1() {
+    // Configure SCTLR_EL1 (caches off, MMU off for now)
+    let sctlr: u64 = 0
+    asm!("msr sctlr_el1, {}", in(reg) sctlr)
+
+    // Enable FP/SIMD
+    asm!("msr cpacr_el1, {}", in(reg) CPACR_FPEN)
+
+    // Set up exception vectors (will be configured later)
+    // asm!("msr vbar_el1, {}", in(reg) exception_vectors)
+
+    // Initialize boot info
+    unsafe {
+        BOOT_INFO.dtb_addr = SAVED_DTB_ADDR
+        BOOT_INFO.kernel_addr = KERNEL_LOAD_ADDR
+    }
+
+    // Initialize early console
+    early_uart_init()
+
+    // Parse DTB for memory info
+    parse_dtb()
+
+    // Query hardware via mailbox
+    query_hardware_info()
+
+    // Print boot banner
+    print_boot_banner()
+
+    // Set up page tables
+    setup_page_tables()
+
+    // Enable MMU and caches
+    enable_mmu()
+
+    // Jump to kernel main
+    jump_to_kernel()
+}
+
+// =============================================================================
+// Early UART (Mini UART on GPIO 14/15)
+// =============================================================================
+
+const AUX_BASE: u64 = 0xFE215000
+const AUX_MU_IO_REG: u64 = AUX_BASE + 0x40
+const AUX_MU_LSR_REG: u64 = AUX_BASE + 0x54
+const AUX_ENABLES: u64 = AUX_BASE + 0x04
+const AUX_MU_CNTL_REG: u64 = AUX_BASE + 0x60
+const AUX_MU_LCR_REG: u64 = AUX_BASE + 0x4C
+const AUX_MU_MCR_REG: u64 = AUX_BASE + 0x50
+const AUX_MU_IER_REG: u64 = AUX_BASE + 0x44
+const AUX_MU_IIR_REG: u64 = AUX_BASE + 0x48
+const AUX_MU_BAUD_REG: u64 = AUX_BASE + 0x68
+
+const GPIO_BASE: u64 = 0xFE200000
+const GPFSEL1: u64 = GPIO_BASE + 0x04
+const GPPUD: u64 = GPIO_BASE + 0x94
+const GPPUDCLK0: u64 = GPIO_BASE + 0x98
+const GPIO_PUP_PDN_CNTRL_REG0: u64 = GPIO_BASE + 0xE4
+
+fn early_uart_init() {
+    // Enable mini UART
+    mmio_write(AUX_ENABLES, 1)
+
+    // Disable TX/RX during configuration
+    mmio_write(AUX_MU_CNTL_REG, 0)
+
+    // 8-bit mode
+    mmio_write(AUX_MU_LCR_REG, 3)
+
+    // RTS line high
+    mmio_write(AUX_MU_MCR_REG, 0)
+
+    // Disable interrupts
+    mmio_write(AUX_MU_IER_REG, 0)
+
+    // Clear FIFOs
+    mmio_write(AUX_MU_IIR_REG, 0xC6)
+
+    // Set baud rate: 115200 at 500MHz VPU clock
+    // baudrate = system_clock / (8 * (baud_reg + 1))
+    // 115200 = 500000000 / (8 * (baud_reg + 1))
+    // baud_reg = 500000000 / (8 * 115200) - 1 = 541
+    mmio_write(AUX_MU_BAUD_REG, 541)
+
+    // Set GPIO 14/15 to ALT5 (Mini UART)
+    let mut gpfsel1 = mmio_read(GPFSEL1)
+    gpfsel1 &= ~((7 << 12) | (7 << 15))  // Clear GPIO 14 and 15
+    gpfsel1 |= (2 << 12) | (2 << 15)     // ALT5
+    mmio_write(GPFSEL1, gpfsel1)
+
+    // Disable pull-up/down for GPIO 14/15 (BCM2711 style)
+    let mut pup_pdn = mmio_read(GPIO_PUP_PDN_CNTRL_REG0)
+    pup_pdn &= ~(0xF << 28)  // Clear bits for GPIO 14/15
+    mmio_write(GPIO_PUP_PDN_CNTRL_REG0, pup_pdn)
+
+    // Enable TX/RX
+    mmio_write(AUX_MU_CNTL_REG, 3)
+}
+
+fn uart_putc(c: u8) {
+    // Wait for TX FIFO to have space
+    while (mmio_read(AUX_MU_LSR_REG) & 0x20) == 0 {}
+    mmio_write(AUX_MU_IO_REG, c as u32)
+}
+
+fn uart_puts(s: &str) {
+    for c in s.bytes() {
+        if c == '\n' as u8 {
+            uart_putc('\r' as u8)
+        }
+        uart_putc(c)
+    }
+}
+
+fn uart_hex(value: u64) {
+    uart_puts("0x")
+    let hex_chars = "0123456789ABCDEF"
+    for i in (0..16).rev() {
+        let nibble = ((value >> (i * 4)) & 0xF) as usize
+        uart_putc(hex_chars.as_bytes()[nibble])
+    }
+}
+
+fn mmio_read(addr: u64): u32 {
+    let value: u32
+    asm!(
+        "ldr {0:w}, [{1}]",
+        out(reg) value,
+        in(reg) addr,
+    )
+    return value
+}
+
+fn mmio_write(addr: u64, value: u32) {
+    asm!(
+        "str {0:w}, [{1}]",
+        in(reg) value,
+        in(reg) addr,
+    )
+}
+
+// =============================================================================
+// Device Tree Parsing (Minimal for boot)
+// =============================================================================
+
+const FDT_MAGIC: u32 = 0xD00DFEED
+const FDT_BEGIN_NODE: u32 = 1
+const FDT_END_NODE: u32 = 2
+const FDT_PROP: u32 = 3
+const FDT_NOP: u32 = 4
+const FDT_END: u32 = 9
+
+struct FdtHeader {
+    magic: u32,
+    totalsize: u32,
+    off_dt_struct: u32,
+    off_dt_strings: u32,
+    off_mem_rsvmap: u32,
+    version: u32,
+    last_comp_version: u32,
+    boot_cpuid_phys: u32,
+    size_dt_strings: u32,
+    size_dt_struct: u32,
+}
+
+fn be32_to_cpu(val: u32): u32 {
+    return ((val & 0xFF) << 24) |
+           ((val & 0xFF00) << 8) |
+           ((val & 0xFF0000) >> 8) |
+           ((val & 0xFF000000) >> 24)
+}
+
+fn parse_dtb() {
+    unsafe {
+        let dtb_addr = BOOT_INFO.dtb_addr
+        if dtb_addr == 0 {
+            uart_puts("Warning: No DTB address\n")
+            return
+        }
+
+        let header = dtb_addr as *const FdtHeader
+        let magic = be32_to_cpu((*header).magic)
+
+        if magic != FDT_MAGIC {
+            uart_puts("Warning: Invalid DTB magic: ")
+            uart_hex(magic as u64)
+            uart_puts("\n")
+            return
+        }
+
+        uart_puts("DTB found at ")
+        uart_hex(dtb_addr)
+        uart_puts(", size: ")
+        uart_hex(be32_to_cpu((*header).totalsize) as u64)
+        uart_puts("\n")
+
+        // Parse memory node to get RAM size
+        // For simplicity, we'll query via mailbox instead
+    }
+}
+
+// =============================================================================
+// Hardware Query via Mailbox
+// =============================================================================
+
+const MBOX_BASE: u64 = 0xFE00B880
+const MBOX_READ: u64 = MBOX_BASE + 0x00
+const MBOX_STATUS: u64 = MBOX_BASE + 0x18
+const MBOX_WRITE: u64 = MBOX_BASE + 0x20
+
+const MBOX_FULL: u32 = 0x80000000
+const MBOX_EMPTY: u32 = 0x40000000
+
+const MBOX_CH_PROP: u32 = 8
+
+// Property tags
+const TAG_GET_ARM_MEMORY: u32 = 0x00010005
+const TAG_GET_BOARD_REVISION: u32 = 0x00010002
+const TAG_GET_BOARD_SERIAL: u32 = 0x00010004
+const TAG_END: u32 = 0
+
+#[repr(C, align(16))]
+struct PropertyBuffer {
+    size: u32,
+    code: u32,
+    tags: [u32; 32],
+}
+
+static mut PROP_BUFFER: PropertyBuffer = PropertyBuffer {
+    size: 0,
+    code: 0,
+    tags: [0u32; 32],
+}
+
+fn mailbox_call(channel: u32): bool {
+    unsafe {
+        let addr = &PROP_BUFFER as *const _ as u64
+        let value = ((addr as u32) & !0xF) | (channel & 0xF)
+
+        // Wait for mailbox to be not full
+        while (mmio_read(MBOX_STATUS) & MBOX_FULL) != 0 {}
+
+        // Write address
+        mmio_write(MBOX_WRITE, value)
+
+        // Wait for response
+        loop {
+            while (mmio_read(MBOX_STATUS) & MBOX_EMPTY) != 0 {}
+            let response = mmio_read(MBOX_READ)
+            if (response & 0xF) == channel {
+                return PROP_BUFFER.code == 0x80000000
+            }
+        }
+    }
+}
+
+fn query_hardware_info() {
+    unsafe {
+        // Query ARM memory
+        PROP_BUFFER.size = 32
+        PROP_BUFFER.code = 0
+        PROP_BUFFER.tags[0] = TAG_GET_ARM_MEMORY
+        PROP_BUFFER.tags[1] = 8   // Buffer size
+        PROP_BUFFER.tags[2] = 0   // Request code
+        PROP_BUFFER.tags[3] = 0   // Base (response)
+        PROP_BUFFER.tags[4] = 0   // Size (response)
+        PROP_BUFFER.tags[5] = TAG_END
+
+        if mailbox_call(MBOX_CH_PROP) {
+            BOOT_INFO.mem_start = PROP_BUFFER.tags[3] as u64
+            BOOT_INFO.mem_size = PROP_BUFFER.tags[4] as u64
+            uart_puts("Memory: ")
+            uart_hex(BOOT_INFO.mem_start)
+            uart_puts(" - ")
+            uart_hex(BOOT_INFO.mem_start + BOOT_INFO.mem_size)
+            uart_puts("\n")
+        }
+
+        // Query board revision
+        PROP_BUFFER.size = 32
+        PROP_BUFFER.code = 0
+        PROP_BUFFER.tags[0] = TAG_GET_BOARD_REVISION
+        PROP_BUFFER.tags[1] = 4
+        PROP_BUFFER.tags[2] = 0
+        PROP_BUFFER.tags[3] = 0
+        PROP_BUFFER.tags[4] = TAG_END
+
+        if mailbox_call(MBOX_CH_PROP) {
+            BOOT_INFO.board_revision = PROP_BUFFER.tags[3]
+            uart_puts("Board revision: ")
+            uart_hex(BOOT_INFO.board_revision as u64)
+            uart_puts("\n")
+        }
+
+        // Query serial number
+        PROP_BUFFER.size = 32
+        PROP_BUFFER.code = 0
+        PROP_BUFFER.tags[0] = TAG_GET_BOARD_SERIAL
+        PROP_BUFFER.tags[1] = 8
+        PROP_BUFFER.tags[2] = 0
+        PROP_BUFFER.tags[3] = 0
+        PROP_BUFFER.tags[4] = 0
+        PROP_BUFFER.tags[5] = TAG_END
+
+        if mailbox_call(MBOX_CH_PROP) {
+            BOOT_INFO.serial = (PROP_BUFFER.tags[4] as u64) << 32 | PROP_BUFFER.tags[3] as u64
+            uart_puts("Serial: ")
+            uart_hex(BOOT_INFO.serial)
+            uart_puts("\n")
+        }
+
+        // Detect number of CPUs based on board revision
+        BOOT_INFO.cpu_count = 4  // Pi 3/4/5 all have 4 cores
+    }
+}
+
+fn print_boot_banner() {
+    uart_puts("\n")
+    uart_puts("╔════════════════════════════════════════╗\n")
+    uart_puts("║     home-os Raspberry Pi Bootloader    ║\n")
+    uart_puts("╠════════════════════════════════════════╣\n")
+    uart_puts("║  ARM64 AArch64 - Cortex-A72/A76        ║\n")
+    uart_puts("╚════════════════════════════════════════╝\n")
+    uart_puts("\n")
+}
+
+// =============================================================================
+// Page Table Setup
+// =============================================================================
+
+const PAGE_SIZE: u64 = 4096
+const PAGE_SHIFT: u32 = 12
+
+// Page table entry flags
+const PTE_VALID: u64 = 1 << 0
+const PTE_TABLE: u64 = 1 << 1
+const PTE_BLOCK: u64 = 0 << 1
+const PTE_AF: u64 = 1 << 10      // Access flag
+const PTE_SH_INNER: u64 = 3 << 8 // Inner shareable
+const PTE_AP_RW: u64 = 0 << 6    // Read-write
+const PTE_AP_RO: u64 = 2 << 6    // Read-only
+const PTE_UXN: u64 = 1 << 54     // User execute never
+const PTE_PXN: u64 = 1 << 53     // Privileged execute never
+
+// Memory attribute indices
+const MT_DEVICE_nGnRnE: u64 = 0
+const MT_NORMAL: u64 = 1
+const MT_NORMAL_NC: u64 = 2
+
+const PTE_ATTR_DEVICE: u64 = (MT_DEVICE_nGnRnE << 2) | PTE_UXN | PTE_PXN
+const PTE_ATTR_NORMAL: u64 = (MT_NORMAL << 2)
+const PTE_ATTR_NORMAL_NC: u64 = (MT_NORMAL_NC << 2) | PTE_UXN | PTE_PXN
+
+// MAIR attribute definitions
+const MAIR_ATTR_DEVICE_nGnRnE: u64 = 0x00
+const MAIR_ATTR_NORMAL_NC: u64 = 0x44
+const MAIR_ATTR_NORMAL: u64 = 0xFF
+
+// Identity-mapped page tables (4KB pages, 4-level)
+#[repr(C, align(4096))]
+struct PageTable {
+    entries: [u64; 512],
+}
+
+static mut PGD: PageTable = PageTable { entries: [0u64; 512] }
+static mut PUD: PageTable = PageTable { entries: [0u64; 512] }
+static mut PMD: [PageTable; 4] = [
+    PageTable { entries: [0u64; 512] },
+    PageTable { entries: [0u64; 512] },
+    PageTable { entries: [0u64; 512] },
+    PageTable { entries: [0u64; 512] },
+]
+
+fn setup_page_tables() {
+    uart_puts("Setting up page tables...\n")
+
+    unsafe {
+        // Clear page tables
+        for i in 0..512 {
+            PGD.entries[i] = 0
+            PUD.entries[i] = 0
+        }
+        for tbl in 0..4 {
+            for i in 0..512 {
+                PMD[tbl].entries[i] = 0
+            }
+        }
+
+        // PGD[0] -> PUD
+        let pud_addr = &PUD as *const _ as u64
+        PGD.entries[0] = pud_addr | PTE_VALID | PTE_TABLE
+
+        // PUD[0..3] -> PMD[0..3] (covers 0 - 4GB)
+        for i in 0..4 {
+            let pmd_addr = &PMD[i] as *const _ as u64
+            PUD.entries[i] = pmd_addr | PTE_VALID | PTE_TABLE
+        }
+
+        // Map first 2GB as normal memory (2MB blocks)
+        // PMD entries for 0x00000000 - 0x7FFFFFFF
+        for pmd_idx in 0..2 {
+            for i in 0..512 {
+                let phys_addr = ((pmd_idx * 512 + i) as u64) << 21  // 2MB blocks
+                if phys_addr < BOOT_INFO.mem_start + BOOT_INFO.mem_size {
+                    PMD[pmd_idx].entries[i] = phys_addr |
+                        PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER | PTE_ATTR_NORMAL
+                }
+            }
+        }
+
+        // Map device memory (0xFC000000 - 0xFFFFFFFF as device)
+        // This is in PMD[3] (covers 0xC0000000 - 0xFFFFFFFF)
+        for i in 480..512 {  // 0xFC000000 / 2MB = 2016, 2016 - 1536 = 480
+            let phys_addr = (3 * 512 + i) as u64 << 21
+            PMD[3].entries[i] = phys_addr |
+                PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER | PTE_ATTR_DEVICE | PTE_UXN | PTE_PXN
+        }
+    }
+
+    uart_puts("Page tables configured\n")
+}
+
+fn enable_mmu() {
+    uart_puts("Enabling MMU...\n")
+
+    unsafe {
+        // Set MAIR_EL1
+        let mair = MAIR_ATTR_DEVICE_nGnRnE << (8 * MT_DEVICE_nGnRnE) |
+                   MAIR_ATTR_NORMAL << (8 * MT_NORMAL) |
+                   MAIR_ATTR_NORMAL_NC << (8 * MT_NORMAL_NC)
+        asm!("msr mair_el1, {}", in(reg) mair)
+
+        // Set TCR_EL1
+        // T0SZ = 25 (39-bit VA), 512GB address space
+        // TG0 = 0b00 (4KB granule)
+        // SH0 = 0b11 (inner shareable)
+        // ORGN0 = 0b01 (write-back)
+        // IRGN0 = 0b01 (write-back)
+        let tcr: u64 = (25 << 0) |   // T0SZ
+                       (0b00 << 14) | // TG0
+                       (0b11 << 12) | // SH0
+                       (0b01 << 10) | // ORGN0
+                       (0b01 << 8)    // IRGN0
+        asm!("msr tcr_el1, {}", in(reg) tcr)
+
+        // Set TTBR0_EL1 to PGD
+        let pgd_addr = &PGD as *const _ as u64
+        asm!("msr ttbr0_el1, {}", in(reg) pgd_addr)
+
+        // Invalidate TLB
+        asm!("tlbi vmalle1")
+        asm!("dsb sy")
+        asm!("isb")
+
+        // Enable MMU and caches
+        let sctlr = SCTLR_M | SCTLR_C | SCTLR_I
+        asm!("msr sctlr_el1, {}", in(reg) sctlr)
+        asm!("isb")
+    }
+
+    uart_puts("MMU enabled\n")
+}
+
+// =============================================================================
+// Secondary CPU Boot
+// =============================================================================
+
+export fn boot_secondary_cpus(entry_point: u64) {
+    uart_puts("Booting secondary CPUs...\n")
+
+    unsafe {
+        for cpu in 1..BOOT_INFO.cpu_count {
+            // Set up stack for this CPU
+            let stack_top = BOOT_STACK_ADDR - (cpu as u64 * BOOT_STACK_SIZE as u64)
+
+            CPU_BOOT_STATES[cpu as usize].stack_ptr = stack_top
+            CPU_BOOT_STATES[cpu as usize].entry_point = entry_point
+            CPU_BOOT_STATES[cpu as usize].cpu_id = cpu
+
+            // Memory barrier before setting ready flag
+            asm!("dmb sy")
+
+            // Set ready flag to wake secondary CPU
+            CPU_BOOT_STATES[cpu as usize].ready = 1
+
+            // Send event to wake CPUs from WFE
+            asm!("sev")
+
+            uart_puts("  CPU ")
+            uart_putc('0' as u8 + cpu as u8)
+            uart_puts(" started\n")
+        }
+    }
+}
+
+// =============================================================================
+// Jump to Kernel
+// =============================================================================
+
+fn jump_to_kernel() {
+    uart_puts("\nJumping to kernel...\n\n")
+
+    unsafe {
+        // Kernel entry point: kernel_main(dtb_addr, boot_info)
+        let kernel_entry: extern "C" fn(u64, *const BootInfo) =
+            core::mem::transmute(KERNEL_LOAD_ADDR)
+
+        kernel_entry(BOOT_INFO.dtb_addr, &BOOT_INFO)
+    }
+
+    // Should never reach here
+    uart_puts("Error: Kernel returned!\n")
+    loop {
+        asm!("wfe")
+    }
+}
+
+// =============================================================================
+// Boot Info Access
+// =============================================================================
+
+export fn get_boot_info(): *const BootInfo {
+    unsafe { return &BOOT_INFO }
+}
+
+export fn get_dtb_addr(): u64 {
+    unsafe { return BOOT_INFO.dtb_addr }
+}
+
+export fn get_memory_info(): (u64, u64) {
+    unsafe { return (BOOT_INFO.mem_start, BOOT_INFO.mem_size) }
+}
+
+export fn get_board_revision(): u32 {
+    unsafe { return BOOT_INFO.board_revision }
+}
+
+export fn get_serial(): u64 {
+    unsafe { return BOOT_INFO.serial }
+}
+
+export fn get_cpu_count(): u32 {
+    unsafe { return BOOT_INFO.cpu_count }
+}

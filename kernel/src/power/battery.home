@@ -1,0 +1,705 @@
+// home-os Battery Management
+// ACPI battery monitoring and power management
+
+import "../core/types"
+import "../sync/spinlock"
+
+// =============================================================================
+// Battery Constants
+// =============================================================================
+
+const MAX_BATTERIES: usize = 4
+const BATTERY_NAME_LEN: usize = 32
+const BATTERY_SERIAL_LEN: usize = 32
+const BATTERY_MODEL_LEN: usize = 32
+const BATTERY_TYPE_LEN: usize = 16
+
+// =============================================================================
+// Battery Status Flags
+// =============================================================================
+
+const BATTERY_STATE_DISCHARGING: u32 = 1 << 0
+const BATTERY_STATE_CHARGING: u32 = 1 << 1
+const BATTERY_STATE_CRITICAL: u32 = 1 << 2
+const BATTERY_STATE_CHARGE_LIMITING: u32 = 1 << 3
+
+// =============================================================================
+// Power Source Types
+// =============================================================================
+
+enum PowerSource {
+    Battery,
+    AC,
+    USB,
+    Wireless,
+    Unknown,
+}
+
+// =============================================================================
+// Battery Health Status
+// =============================================================================
+
+enum BatteryHealth {
+    Good,
+    Fair,
+    Poor,
+    Critical,
+    Unknown,
+}
+
+// =============================================================================
+// Charging Status
+// =============================================================================
+
+enum ChargeStatus {
+    NotCharging,
+    Charging,
+    Discharging,
+    Full,
+    Unknown,
+}
+
+// =============================================================================
+// Battery Information Structures
+// =============================================================================
+
+struct BatteryInfo {
+    // Identification
+    present: bool,
+    name: [u8; BATTERY_NAME_LEN],
+    name_len: usize,
+    serial: [u8; BATTERY_SERIAL_LEN],
+    serial_len: usize,
+    model: [u8; BATTERY_MODEL_LEN],
+    model_len: usize,
+    battery_type: [u8; BATTERY_TYPE_LEN],  // Li-ion, NiMH, etc.
+    type_len: usize,
+
+    // Design specifications
+    design_capacity: u32,          // mWh or mAh
+    design_voltage: u32,           // mV
+    design_capacity_warning: u32,  // Low battery threshold
+    design_capacity_low: u32,      // Critical battery threshold
+
+    // Current state
+    full_charge_capacity: u32,     // Current max capacity (degrades over time)
+    remaining_capacity: u32,       // Current charge level
+    present_rate: i32,             // Charge/discharge rate (negative = discharging)
+    present_voltage: u32,          // Current voltage
+
+    // Calculated values
+    percentage: u8,                // 0-100%
+    time_to_empty: u32,            // Minutes (0 if charging)
+    time_to_full: u32,             // Minutes (0 if discharging)
+
+    // Status
+    state: u32,                    // BATTERY_STATE_* flags
+    charge_status: ChargeStatus,
+    health: BatteryHealth,
+    temperature: i32,              // Celsius * 10 (0.1°C resolution)
+
+    // Cycle count
+    cycle_count: u32,
+
+    // Statistics
+    charge_cycles_total: u64,
+    discharge_cycles_total: u64,
+    time_on_battery: u64,          // Seconds
+}
+
+struct ACAdapterInfo {
+    present: bool,
+    online: bool,
+    power_source: PowerSource,
+    max_power: u32,                // mW
+    current_power: u32,            // mW
+}
+
+// =============================================================================
+// Battery Thresholds
+// =============================================================================
+
+struct BatteryThresholds {
+    warning_level: u8,             // Default: 20%
+    critical_level: u8,            // Default: 5%
+    low_level: u8,                 // Default: 10%
+    charge_start: u8,              // Start charging below this (for battery health)
+    charge_stop: u8,               // Stop charging above this
+}
+
+// =============================================================================
+// Power Events
+// =============================================================================
+
+enum PowerEvent {
+    ACPlugged,
+    ACUnplugged,
+    BatteryLow,
+    BatteryCritical,
+    BatteryFull,
+    BatteryInserted,
+    BatteryRemoved,
+    ThermalWarning,
+    PowerButtonPressed,
+    LidClosed,
+    LidOpened,
+}
+
+type PowerEventHandler = fn(event: PowerEvent, data: u64)
+
+// =============================================================================
+// Battery State
+// =============================================================================
+
+struct BatteryState {
+    batteries: [Option<BatteryInfo>; MAX_BATTERIES],
+    battery_count: usize,
+
+    ac_adapter: ACAdapterInfo,
+
+    thresholds: BatteryThresholds,
+
+    // Event handlers
+    event_handlers: [Option<PowerEventHandler>; 16],
+    handler_count: usize,
+
+    // Power statistics
+    total_time_on_battery: u64,    // Seconds
+    total_time_on_ac: u64,         // Seconds
+    last_full_charge_time: u64,    // Unix timestamp
+    last_state_change: u64,        // Unix timestamp
+
+    lock: Spinlock,
+}
+
+static mut BATTERY: BatteryState = BatteryState {
+    batteries: [None; MAX_BATTERIES],
+    battery_count: 0,
+    ac_adapter: ACAdapterInfo {
+        present: false,
+        online: false,
+        power_source: PowerSource::Unknown,
+        max_power: 0,
+        current_power: 0,
+    },
+    thresholds: BatteryThresholds {
+        warning_level: 20,
+        critical_level: 5,
+        low_level: 10,
+        charge_start: 75,
+        charge_stop: 80,
+    },
+    event_handlers: [None; 16],
+    handler_count: 0,
+    total_time_on_battery: 0,
+    total_time_on_ac: 0,
+    last_full_charge_time: 0,
+    last_state_change: 0,
+    lock: Spinlock::new(),
+}
+
+// =============================================================================
+// ACPI EC (Embedded Controller) Access
+// =============================================================================
+
+// EC ports
+const EC_DATA: u16 = 0x62
+const EC_CMD: u16 = 0x66
+
+// EC commands
+const EC_READ_CMD: u8 = 0x80
+const EC_WRITE_CMD: u8 = 0x81
+const EC_BURST_ENABLE: u8 = 0x82
+const EC_BURST_DISABLE: u8 = 0x83
+const EC_QUERY: u8 = 0x84
+
+// EC status bits
+const EC_OBF: u8 = 1 << 0    // Output buffer full
+const EC_IBF: u8 = 1 << 1    // Input buffer full
+const EC_BURST: u8 = 1 << 4  // Burst mode active
+const EC_SCI_EVT: u8 = 1 << 5 // SCI event pending
+
+fn inb(port: u16): u8 {
+    let val: u8
+    asm!("inb %dx, %al", out("al") val, in("dx") port)
+    return val
+}
+
+fn outb(port: u16, val: u8) {
+    asm!("outb %al, %dx", in("al") val, in("dx") port)
+}
+
+fn ec_wait_read(): bool {
+    for _ in 0..1000 {
+        if (inb(EC_CMD) & EC_OBF) != 0 {
+            return true
+        }
+        // Small delay
+        for _ in 0..100 { asm!("pause") }
+    }
+    return false
+}
+
+fn ec_wait_write(): bool {
+    for _ in 0..1000 {
+        if (inb(EC_CMD) & EC_IBF) == 0 {
+            return true
+        }
+        for _ in 0..100 { asm!("pause") }
+    }
+    return false
+}
+
+fn ec_read(addr: u8): Option<u8> {
+    if !ec_wait_write() { return None }
+    outb(EC_CMD, EC_READ_CMD)
+    if !ec_wait_write() { return None }
+    outb(EC_DATA, addr)
+    if !ec_wait_read() { return None }
+    return Some(inb(EC_DATA))
+}
+
+fn ec_write(addr: u8, val: u8): bool {
+    if !ec_wait_write() { return false }
+    outb(EC_CMD, EC_WRITE_CMD)
+    if !ec_wait_write() { return false }
+    outb(EC_DATA, addr)
+    if !ec_wait_write() { return false }
+    outb(EC_DATA, val)
+    return true
+}
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+export fn battery_init(): i32 {
+    unsafe { BATTERY.lock.init() }
+
+    // Detect AC adapter
+    detect_ac_adapter()
+
+    // Detect batteries
+    detect_batteries()
+
+    // Initial update
+    battery_update()
+
+    return 0
+}
+
+fn detect_ac_adapter() {
+    // This would normally use ACPI _PSR method
+    // For now, assume AC adapter is present
+    unsafe {
+        BATTERY.ac_adapter.present = true
+        BATTERY.ac_adapter.power_source = PowerSource::AC
+    }
+}
+
+fn detect_batteries() {
+    // This would normally enumerate ACPI battery devices
+    // Create a default battery for demonstration
+    unsafe {
+        BATTERY.batteries[0] = Some(BatteryInfo {
+            present: true,
+            name: [0u8; BATTERY_NAME_LEN],
+            name_len: 0,
+            serial: [0u8; BATTERY_SERIAL_LEN],
+            serial_len: 0,
+            model: [0u8; BATTERY_MODEL_LEN],
+            model_len: 0,
+            battery_type: [0u8; BATTERY_TYPE_LEN],
+            type_len: 0,
+            design_capacity: 50000,        // 50 Wh
+            design_voltage: 11100,         // 11.1V
+            design_capacity_warning: 10000,
+            design_capacity_low: 5000,
+            full_charge_capacity: 45000,   // Degraded to 45 Wh
+            remaining_capacity: 0,
+            present_rate: 0,
+            present_voltage: 0,
+            percentage: 0,
+            time_to_empty: 0,
+            time_to_full: 0,
+            state: 0,
+            charge_status: ChargeStatus::Unknown,
+            health: BatteryHealth::Good,
+            temperature: 250,              // 25.0°C
+            cycle_count: 0,
+            charge_cycles_total: 0,
+            discharge_cycles_total: 0,
+            time_on_battery: 0,
+        })
+        BATTERY.battery_count = 1
+    }
+}
+
+// =============================================================================
+// Battery Update
+// =============================================================================
+
+export fn battery_update(): i32 {
+    unsafe {
+        BATTERY.lock.lock()
+
+        // Update AC adapter status
+        update_ac_status()
+
+        // Update each battery
+        for i in 0..BATTERY.battery_count {
+            if let Some(ref mut bat) = BATTERY.batteries[i] {
+                if bat.present {
+                    update_battery(bat)
+                }
+            }
+        }
+
+        BATTERY.lock.unlock()
+    }
+
+    return 0
+}
+
+fn update_ac_status() {
+    // Would read from ACPI _PSR method
+    // For now, check EC or use default
+
+    unsafe {
+        let was_online = BATTERY.ac_adapter.online
+
+        // Try to read from EC (vendor-specific)
+        // Example: Some laptops use EC address 0x10 for AC status
+        if let Some(status) = ec_read(0x10) {
+            BATTERY.ac_adapter.online = (status & 0x01) != 0
+        }
+
+        // Fire events on state change
+        if was_online != BATTERY.ac_adapter.online {
+            let event = if BATTERY.ac_adapter.online {
+                PowerEvent::ACPlugged
+            } else {
+                PowerEvent::ACUnplugged
+            }
+            fire_power_event(event, 0)
+        }
+    }
+}
+
+fn update_battery(bat: &mut BatteryInfo) {
+    // Would read from ACPI _BST (Battery Status) and _BIF/_BIX methods
+
+    // Read battery status from EC (vendor-specific addresses)
+    // Example addresses - actual values vary by laptop model
+
+    // Remaining capacity (2 bytes)
+    if let (Some(lo), Some(hi)) = (ec_read(0x20), ec_read(0x21)) {
+        bat.remaining_capacity = (lo as u32) | ((hi as u32) << 8)
+    }
+
+    // Present rate (2 bytes, signed)
+    if let (Some(lo), Some(hi)) = (ec_read(0x22), ec_read(0x23)) {
+        bat.present_rate = ((lo as i32) | ((hi as i32) << 8)) as i16 as i32
+    }
+
+    // Present voltage (2 bytes)
+    if let (Some(lo), Some(hi)) = (ec_read(0x24), ec_read(0x25)) {
+        bat.present_voltage = (lo as u32) | ((hi as u32) << 8)
+    }
+
+    // Battery state flags
+    if let Some(state) = ec_read(0x26) {
+        bat.state = state as u32
+    }
+
+    // Temperature (2 bytes, in 0.1K)
+    if let (Some(lo), Some(hi)) = (ec_read(0x28), ec_read(0x29)) {
+        let temp_dk = (lo as i32) | ((hi as i32) << 8)  // Deci-Kelvin
+        bat.temperature = temp_dk - 2732  // Convert to deci-Celsius
+    }
+
+    // Calculate percentage
+    if bat.full_charge_capacity > 0 {
+        bat.percentage = ((bat.remaining_capacity * 100) / bat.full_charge_capacity) as u8
+        bat.percentage = bat.percentage.min(100)
+    }
+
+    // Determine charge status
+    let old_status = bat.charge_status
+    if (bat.state & BATTERY_STATE_CHARGING) != 0 {
+        bat.charge_status = ChargeStatus::Charging
+    } else if (bat.state & BATTERY_STATE_DISCHARGING) != 0 {
+        bat.charge_status = ChargeStatus::Discharging
+    } else if bat.percentage >= 98 {
+        bat.charge_status = ChargeStatus::Full
+    } else {
+        bat.charge_status = ChargeStatus::NotCharging
+    }
+
+    // Calculate time remaining
+    if bat.present_rate != 0 {
+        if bat.present_rate < 0 {
+            // Discharging - time to empty
+            let rate = (-bat.present_rate) as u32
+            if rate > 0 {
+                bat.time_to_empty = (bat.remaining_capacity * 60) / rate
+            }
+            bat.time_to_full = 0
+        } else {
+            // Charging - time to full
+            let rate = bat.present_rate as u32
+            let remaining_to_full = bat.full_charge_capacity - bat.remaining_capacity
+            if rate > 0 {
+                bat.time_to_full = (remaining_to_full * 60) / rate
+            }
+            bat.time_to_empty = 0
+        }
+    }
+
+    // Determine health based on capacity degradation
+    if bat.design_capacity > 0 {
+        let health_pct = (bat.full_charge_capacity * 100) / bat.design_capacity
+        bat.health = if health_pct >= 80 {
+            BatteryHealth::Good
+        } else if health_pct >= 60 {
+            BatteryHealth::Fair
+        } else if health_pct >= 40 {
+            BatteryHealth::Poor
+        } else {
+            BatteryHealth::Critical
+        }
+    }
+
+    // Check for events
+    unsafe {
+        if bat.percentage <= BATTERY.thresholds.critical_level {
+            if (bat.state & BATTERY_STATE_CRITICAL) == 0 {
+                bat.state |= BATTERY_STATE_CRITICAL
+                fire_power_event(PowerEvent::BatteryCritical, bat.percentage as u64)
+            }
+        } else if bat.percentage <= BATTERY.thresholds.warning_level {
+            fire_power_event(PowerEvent::BatteryLow, bat.percentage as u64)
+        }
+
+        if old_status != ChargeStatus::Full && bat.charge_status == ChargeStatus::Full {
+            fire_power_event(PowerEvent::BatteryFull, 0)
+        }
+    }
+}
+
+// =============================================================================
+// Event Handling
+// =============================================================================
+
+export fn battery_register_event_handler(handler: PowerEventHandler): i32 {
+    unsafe {
+        if BATTERY.handler_count >= 16 {
+            return -1
+        }
+        BATTERY.event_handlers[BATTERY.handler_count] = Some(handler)
+        BATTERY.handler_count += 1
+        return 0
+    }
+}
+
+fn fire_power_event(event: PowerEvent, data: u64) {
+    unsafe {
+        for i in 0..BATTERY.handler_count {
+            if let Some(handler) = BATTERY.event_handlers[i] {
+                handler(event, data)
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Query Functions
+// =============================================================================
+
+export fn battery_get_count(): usize {
+    unsafe { BATTERY.battery_count }
+}
+
+export fn battery_get_percentage(index: usize): u8 {
+    unsafe {
+        if index >= BATTERY.battery_count { return 0 }
+        match &BATTERY.batteries[index] {
+            Some(b) => b.percentage,
+            None => 0,
+        }
+    }
+}
+
+export fn battery_get_status(index: usize): ChargeStatus {
+    unsafe {
+        if index >= BATTERY.battery_count { return ChargeStatus::Unknown }
+        match &BATTERY.batteries[index] {
+            Some(b) => b.charge_status,
+            None => ChargeStatus::Unknown,
+        }
+    }
+}
+
+export fn battery_get_time_remaining(index: usize): u32 {
+    unsafe {
+        if index >= BATTERY.battery_count { return 0 }
+        match &BATTERY.batteries[index] {
+            Some(b) => {
+                if b.charge_status == ChargeStatus::Discharging {
+                    b.time_to_empty
+                } else if b.charge_status == ChargeStatus::Charging {
+                    b.time_to_full
+                } else {
+                    0
+                }
+            },
+            None => 0,
+        }
+    }
+}
+
+export fn battery_get_health(index: usize): BatteryHealth {
+    unsafe {
+        if index >= BATTERY.battery_count { return BatteryHealth::Unknown }
+        match &BATTERY.batteries[index] {
+            Some(b) => b.health,
+            None => BatteryHealth::Unknown,
+        }
+    }
+}
+
+export fn battery_get_temperature(index: usize): i32 {
+    unsafe {
+        if index >= BATTERY.battery_count { return 0 }
+        match &BATTERY.batteries[index] {
+            Some(b) => b.temperature,
+            None => 0,
+        }
+    }
+}
+
+export fn battery_get_capacity(index: usize): (u32, u32, u32) {
+    // Returns (remaining, full_charge, design)
+    unsafe {
+        if index >= BATTERY.battery_count { return (0, 0, 0) }
+        match &BATTERY.batteries[index] {
+            Some(b) => (b.remaining_capacity, b.full_charge_capacity, b.design_capacity),
+            None => (0, 0, 0),
+        }
+    }
+}
+
+export fn battery_get_voltage(index: usize): (u32, u32) {
+    // Returns (current, design)
+    unsafe {
+        if index >= BATTERY.battery_count { return (0, 0) }
+        match &BATTERY.batteries[index] {
+            Some(b) => (b.present_voltage, b.design_voltage),
+            None => (0, 0),
+        }
+    }
+}
+
+export fn battery_get_rate(index: usize): i32 {
+    unsafe {
+        if index >= BATTERY.battery_count { return 0 }
+        match &BATTERY.batteries[index] {
+            Some(b) => b.present_rate,
+            None => 0,
+        }
+    }
+}
+
+export fn battery_get_cycle_count(index: usize): u32 {
+    unsafe {
+        if index >= BATTERY.battery_count { return 0 }
+        match &BATTERY.batteries[index] {
+            Some(b) => b.cycle_count,
+            None => 0,
+        }
+    }
+}
+
+export fn battery_is_ac_online(): bool {
+    unsafe { BATTERY.ac_adapter.online }
+}
+
+export fn battery_get_power_source(): PowerSource {
+    unsafe {
+        if BATTERY.ac_adapter.online {
+            BATTERY.ac_adapter.power_source
+        } else {
+            PowerSource::Battery
+        }
+    }
+}
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+export fn battery_set_thresholds(warning: u8, critical: u8, low: u8) {
+    unsafe {
+        BATTERY.thresholds.warning_level = warning
+        BATTERY.thresholds.critical_level = critical
+        BATTERY.thresholds.low_level = low
+    }
+}
+
+export fn battery_set_charge_thresholds(start: u8, stop: u8) {
+    unsafe {
+        BATTERY.thresholds.charge_start = start
+        BATTERY.thresholds.charge_stop = stop
+    }
+
+    // Write to EC to configure charge thresholds (vendor-specific)
+    ec_write(0x30, start)
+    ec_write(0x31, stop)
+}
+
+// =============================================================================
+// Total Battery Statistics
+// =============================================================================
+
+export fn battery_get_combined_percentage(): u8 {
+    unsafe {
+        let mut total_remaining: u64 = 0
+        let mut total_full: u64 = 0
+
+        for i in 0..BATTERY.battery_count {
+            if let Some(ref b) = BATTERY.batteries[i] {
+                if b.present {
+                    total_remaining += b.remaining_capacity as u64
+                    total_full += b.full_charge_capacity as u64
+                }
+            }
+        }
+
+        if total_full > 0 {
+            ((total_remaining * 100) / total_full) as u8
+        } else {
+            0
+        }
+    }
+}
+
+export fn battery_get_combined_time_remaining(): u32 {
+    unsafe {
+        let mut total_minutes: u32 = 0
+
+        for i in 0..BATTERY.battery_count {
+            if let Some(ref b) = BATTERY.batteries[i] {
+                if b.present {
+                    if b.charge_status == ChargeStatus::Discharging {
+                        total_minutes += b.time_to_empty
+                    } else if b.charge_status == ChargeStatus::Charging {
+                        // For charging, take the max (slowest to fill)
+                        total_minutes = total_minutes.max(b.time_to_full)
+                    }
+                }
+            }
+        }
+
+        total_minutes
+    }
+}

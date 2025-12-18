@@ -4,6 +4,89 @@
 
 ## 🎉 Recent Progress (December 18, 2025)
 
+### Phase 12 Raspberry Pi Support (COMPLETED)
+- ✅ **BCM2711 SoC Support** - `kernel/src/arch/arm64/rpi/bcm2711.home`
+  - ARM Cortex-A72 quad-core support
+  - Memory map setup (MMIO base 0xFE000000)
+  - VideoCore mailbox interface for GPU communication
+  - Property tags for hardware queries (memory, clocks, temperature)
+  - DMA controller interface
+  - Hardware RNG
+  - Power management (reboot, poweroff)
+  - Framebuffer allocation
+- ✅ **Raspberry Pi Bootloader** - `kernel/src/arch/arm64/rpi/boot.home`
+  - ARM64 boot sequence (EL3→EL2→EL1 transition)
+  - DTB parsing and memory info extraction
+  - Early UART initialization for debug output
+  - Page table setup with identity mapping
+  - MMU and cache enablement
+  - Secondary CPU boot support (SMP)
+  - Boot banner and hardware queries
+- ✅ **Mini UART & PL011 Drivers** - `kernel/src/arch/arm64/rpi/uart.home`
+  - Mini UART (BCM2835 auxiliary) driver
+  - PL011 ARM PrimeCell UART driver
+  - Ring buffer for RX/TX
+  - Interrupt-driven and polling modes
+  - Configurable baud rate
+  - Console abstraction layer
+- ✅ **GPIO Controller** - `kernel/src/arch/arm64/rpi/gpio.home`
+  - 58 GPIO pin support
+  - Function selection (Input, Output, Alt0-5)
+  - Pull-up/Pull-down configuration (BCM2711 + legacy)
+  - Edge detection (rising, falling, high, low, async)
+  - Interrupt handler registration
+  - Common pin configurations (UART, I2C, SPI, PWM, PCM)
+  - Activity LED control
+- ✅ **Mailbox Interface** - `kernel/src/arch/arm64/rpi/mailbox.home`
+  - VideoCore GPU property interface
+  - Hardware info queries (revision, serial, MAC, memory)
+  - Clock rate management
+  - Power domain control
+  - Temperature and voltage monitoring
+  - GPU memory allocation
+  - Framebuffer allocation for display
+  - DMA channel queries
+  - EDID display info
+- ✅ **EMMC/SD Controller** - `kernel/src/arch/arm64/rpi/emmc.home`
+  - SDHCI-compliant controller driver
+  - SD card initialization sequence (CMD0/8/55/41/2/3/7/16)
+  - SDHC/SDXC (high capacity) support
+  - Block read/write operations
+  - 4-bit bus width support
+  - CID/CSD register parsing
+  - Card capacity detection
+- ✅ **GIC-400 Interrupt Controller** - `kernel/src/arch/arm64/rpi/gic400.home`
+  - ARM GICv2 implementation
+  - Distributor (GICD) configuration
+  - CPU interface (GICC) per-core setup
+  - SGI (Software Generated Interrupts) for IPI
+  - PPI/SPI interrupt management
+  - Priority levels and target CPU routing
+  - Edge/level trigger configuration
+  - Interrupt handler registration
+  - BCM2711 peripheral interrupt mapping
+- ✅ **Device Tree Support** - `kernel/src/arch/arm64/rpi/devicetree.home`
+  - Flattened Device Tree (FDT) parsing
+  - Node and property extraction
+  - Memory info from /memory node
+  - Command line from /chosen/bootargs
+  - Model and compatible string queries
+  - phandle-based node lookup
+  - Device discovery by compatible string
+  - reg property parsing (address/size)
+
+### Files Created
+- `kernel/src/arch/arm64/rpi/bcm2711.home` - BCM2711 SoC support
+- `kernel/src/arch/arm64/rpi/boot.home` - ARM64 bootloader
+- `kernel/src/arch/arm64/rpi/uart.home` - Mini UART & PL011 drivers
+- `kernel/src/arch/arm64/rpi/gpio.home` - GPIO controller
+- `kernel/src/arch/arm64/rpi/mailbox.home` - GPU mailbox interface
+- `kernel/src/arch/arm64/rpi/emmc.home` - EMMC/SD controller
+- `kernel/src/arch/arm64/rpi/gic400.home` - GIC-400 interrupt controller
+- `kernel/src/arch/arm64/rpi/devicetree.home` - FDT/DTB parser
+
+---
+
 ### Phase 11 Performance Optimization (COMPLETED)
 - ✅ **RCU (Read-Copy-Update)** - `kernel/src/perf/rcu_tree.home`
   - Hierarchical tree-based RCU for multi-core scalability
@@ -2139,8 +2222,8 @@ Build a next-generation operating system that prioritizes:
 - [ ] More network adapters
   - [ ] 10GbE and faster
   - [ ] Wireless chipsets (more variants)
-- [ ] Bluetooth support
-  - [ ] HCI (Host Controller Interface)
+- [x] Bluetooth support ✅
+  - [x] HCI (Host Controller Interface) - `kernel/src/drivers/bluetooth/hci.home`
   - [ ] L2CAP, RFCOMM protocols
   - [ ] Audio profiles (A2DP)
   - [ ] Input devices
@@ -2149,27 +2232,27 @@ Build a next-generation operating system that prioritizes:
   - [ ] Network printers (IPP)
   - [ ] CUPS-compatible API
 
-### 13.3 Power Management
-- [ ] ACPI (Advanced Configuration and Power Interface)
-  - [ ] System sleep states (S3, S4)
-  - [ ] CPU power states (P-states, C-states)
-  - [ ] Thermal management
-  - [ ] Battery monitoring
-- [ ] CPU frequency scaling
-  - [ ] Governor policies (performance, powersave, ondemand)
-  - [ ] Per-core frequency control
-- [ ] Device runtime power management
-  - [ ] Suspend/resume devices
-  - [ ] Wake-on-LAN
-  - [ ] USB selective suspend
+### 13.3 Power Management ✅
+- [x] ACPI (Advanced Configuration and Power Interface) - `kernel/src/power/acpi.home`
+  - [x] System sleep states (S3, S4)
+  - [x] CPU power states (P-states, C-states)
+  - [x] Thermal management - `kernel/src/power/thermal_x86.home`
+  - [x] Battery monitoring - `kernel/src/power/battery.home`
+- [x] CPU frequency scaling - `kernel/src/power/cpufreq_x86.home`
+  - [x] Governor policies (performance, powersave, ondemand)
+  - [x] Per-core frequency control
+- [x] Device runtime power management - `kernel/src/power/device_pm.home`
+  - [x] Suspend/resume devices
+  - [x] Wake-on-LAN
+  - [x] USB selective suspend
 
-### 13.4 Laptop-Specific Features
-- [ ] Lid switch handling
-- [ ] Brightness control (keyboard and screen)
-- [ ] Volume control
-- [ ] Special function keys
-- [ ] Battery status indicators
-- [ ] Touchpad gestures
+### 13.4 Laptop-Specific Features ✅ - `kernel/src/drivers/platform/laptop.home`
+- [x] Lid switch handling
+- [x] Brightness control (keyboard and screen)
+- [x] Volume control
+- [x] Special function keys
+- [x] Battery status indicators
+- [ ] Touchpad gestures (partial - multi-touch gestures pending)
 
 ### 13.5 Virtualization Support
 - [ ] Virtio drivers (as guest)

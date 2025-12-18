@@ -1,0 +1,1181 @@
+// HomeOS Laptop Platform Driver
+// Handles lid switch, brightness, volume, and special function keys
+
+const std = @import("std");
+const acpi = @import("../../power/acpi.home");
+const input = @import("../input/keyboard.home");
+const power = @import("../../power/device_pm.home");
+
+// =============================================================================
+// Laptop Platform Features
+// =============================================================================
+
+pub const LaptopFeature = enum(u8) {
+    LidSwitch = 0,
+    ScreenBrightness = 1,
+    KeyboardBacklight = 2,
+    Volume = 3,
+    Mute = 4,
+    WirelessRfkill = 5,
+    TouchpadToggle = 6,
+    CameraToggle = 7,
+    PerformanceMode = 8,
+    FanControl = 9,
+    BatteryCharge = 10,
+    ScreenToggle = 11,
+};
+
+pub const FeatureState = struct {
+    supported: bool,
+    enabled: bool,
+    current_value: i32,
+    min_value: i32,
+    max_value: i32,
+};
+
+// =============================================================================
+// Lid Switch Management
+// =============================================================================
+
+pub const LidState = enum(u8) {
+    Open = 0,
+    Closed = 1,
+    Unknown = 0xFF,
+};
+
+pub const LidAction = enum(u8) {
+    Nothing = 0,
+    Suspend = 1,
+    Hibernate = 2,
+    Shutdown = 3,
+    LockScreen = 4,
+};
+
+pub const LidConfig = struct {
+    // Actions when lid closes
+    on_battery_action: LidAction,
+    on_ac_action: LidAction,
+
+    // Actions when lid opens
+    on_open_action: LidAction,
+
+    // External display handling
+    ignore_when_external: bool,
+    switch_to_external: bool,
+
+    // Delay before action (ms)
+    action_delay_ms: u32,
+};
+
+var lid_state: LidState = .Unknown;
+var lid_config: LidConfig = .{
+    .on_battery_action = .Suspend,
+    .on_ac_action = .Nothing,
+    .on_open_action = .Nothing,
+    .ignore_when_external = true,
+    .switch_to_external = true,
+    .action_delay_ms = 1000,
+};
+
+// ACPI lid switch methods (GPE-based)
+const ACPI_LID_DEVICE = "_SB.LID0";
+const ACPI_LID_STATUS = "_LID";
+const ACPI_LID_GPE = 0x1D; // Common GPE for lid events
+
+pub fn lid_init() !void {
+    // Register for ACPI lid notifications
+    if (acpi.find_device(ACPI_LID_DEVICE)) |_| {
+        // Read initial lid state
+        lid_state = read_lid_state();
+
+        // Register GPE handler
+        try acpi.register_gpe_handler(ACPI_LID_GPE, lid_gpe_handler);
+
+        log_info("Lid switch initialized, state: {s}", .{@tagName(lid_state)});
+    } else {
+        log_info("No ACPI lid device found", .{});
+    }
+}
+
+fn read_lid_state() LidState {
+    // Execute ACPI _LID method
+    if (acpi.evaluate_integer(ACPI_LID_DEVICE, ACPI_LID_STATUS)) |value| {
+        return if (value != 0) .Open else .Closed;
+    }
+    return .Unknown;
+}
+
+fn lid_gpe_handler(_: u32) void {
+    const new_state = read_lid_state();
+
+    if (new_state != lid_state) {
+        const old_state = lid_state;
+        lid_state = new_state;
+        handle_lid_change(old_state, new_state);
+    }
+}
+
+fn handle_lid_change(old: LidState, new: LidState) void {
+    log_info("Lid state changed: {s} -> {s}", .{@tagName(old), @tagName(new)});
+
+    switch (new) {
+        .Closed => {
+            // Check if external display is connected
+            if (lid_config.ignore_when_external and is_external_display_connected()) {
+                log_info("External display connected, ignoring lid close", .{});
+                if (lid_config.switch_to_external) {
+                    switch_to_external_display();
+                }
+                return;
+            }
+
+            // Determine action based on AC status
+            const action = if (is_on_ac_power())
+                lid_config.on_ac_action
+            else
+                lid_config.on_battery_action;
+
+            execute_lid_action(action);
+        },
+        .Open => {
+            execute_lid_action(lid_config.on_open_action);
+            // Wake screen if it was off
+            wake_display();
+        },
+        .Unknown => {},
+    }
+}
+
+fn execute_lid_action(action: LidAction) void {
+    switch (action) {
+        .Nothing => {},
+        .Suspend => {
+            log_info("Lid action: suspending system", .{});
+            power.request_system_suspend(.S3) catch |err| {
+                log_error("Suspend failed: {}", .{err});
+            };
+        },
+        .Hibernate => {
+            log_info("Lid action: hibernating system", .{});
+            power.request_system_suspend(.S4) catch |err| {
+                log_error("Hibernate failed: {}", .{err});
+            };
+        },
+        .Shutdown => {
+            log_info("Lid action: shutting down", .{});
+            acpi.system_shutdown() catch |err| {
+                log_error("Shutdown failed: {}", .{err});
+            };
+        },
+        .LockScreen => {
+            log_info("Lid action: locking screen", .{});
+            send_lock_screen_event();
+        },
+    }
+}
+
+pub fn get_lid_state() LidState {
+    return lid_state;
+}
+
+pub fn set_lid_config(config: LidConfig) void {
+    lid_config = config;
+}
+
+// =============================================================================
+// Screen Brightness Control
+// =============================================================================
+
+pub const BrightnessBackend = enum {
+    ACPI,          // ACPI _BCM/_BQC methods
+    IntelBacklight, // /sys/class/backlight/intel_backlight equivalent
+    ACPIVideo,     // ACPI video extension
+    DDC,           // Display Data Channel for external monitors
+    Platform,      // Platform-specific (vendor driver)
+};
+
+const BrightnessDevice = struct {
+    name: [32]u8,
+    backend: BrightnessBackend,
+    current: u32,
+    max: u32,
+    acpi_path: ?[64]u8,
+    io_base: ?u64,
+};
+
+var brightness_devices: [8]?BrightnessDevice = [_]?BrightnessDevice{null} ** 8;
+var primary_brightness: ?*BrightnessDevice = null;
+
+// ACPI brightness control ports
+const ACPI_VIDEO_DEVICE = "_SB.PCI0.GFX0";
+const ACPI_BCL = "_BCL"; // Query brightness levels
+const ACPI_BCM = "_BCM"; // Set brightness
+const ACPI_BQC = "_BQC"; // Query current brightness
+
+// Intel backlight registers (common locations)
+const INTEL_BLC_PWM_CTL = 0x48250;   // Backlight PWM control
+const INTEL_BLC_PWM_CTL2 = 0x48254;  // Backlight PWM control 2
+const INTEL_BLC_FREQ_REG = 0x48254;
+
+pub fn brightness_init() !void {
+    var device_count: usize = 0;
+
+    // Try ACPI video brightness first
+    if (try_acpi_brightness(&device_count)) {
+        log_info("Found ACPI brightness control", .{});
+    }
+
+    // Try Intel backlight
+    if (try_intel_backlight(&device_count)) {
+        log_info("Found Intel backlight control", .{});
+    }
+
+    // Try platform-specific (vendor WMI)
+    if (try_platform_brightness(&device_count)) {
+        log_info("Found platform brightness control", .{});
+    }
+
+    if (device_count > 0) {
+        primary_brightness = &brightness_devices[0].?;
+        log_info("Brightness control initialized with {} device(s)", .{device_count});
+    } else {
+        log_info("No brightness control devices found", .{});
+    }
+}
+
+fn try_acpi_brightness(count: *usize) bool {
+    if (acpi.find_device(ACPI_VIDEO_DEVICE)) |_| {
+        // Query available brightness levels
+        if (acpi.evaluate_package(ACPI_VIDEO_DEVICE, ACPI_BCL)) |levels| {
+            if (levels.len >= 2) {
+                var dev = BrightnessDevice{
+                    .name = undefined,
+                    .backend = .ACPI,
+                    .current = 0,
+                    .max = @intCast(levels[levels.len - 1]),
+                    .acpi_path = undefined,
+                    .io_base = null,
+                };
+                @memcpy(dev.name[0..4], "ACPI");
+                dev.name[4] = 0;
+                @memcpy(dev.acpi_path.?[0..ACPI_VIDEO_DEVICE.len], ACPI_VIDEO_DEVICE);
+
+                // Query current brightness
+                if (acpi.evaluate_integer(ACPI_VIDEO_DEVICE, ACPI_BQC)) |current| {
+                    dev.current = @intCast(current);
+                }
+
+                brightness_devices[count.*] = dev;
+                count.* += 1;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn try_intel_backlight(count: *usize) bool {
+    // Check for Intel GPU via PCI
+    // This would normally probe PCI for Intel graphics device
+    // For now, check if MMIO region is accessible
+
+    // Map Intel GPU MMIO (typically at BAR 0 of PCI device 00:02.0)
+    // This is a simplified check
+    const intel_vendor_id: u16 = 0x8086;
+
+    if (find_pci_device(intel_vendor_id, null)) |pci_dev| {
+        const bar0 = pci_dev.bar[0] & ~@as(u64, 0xF);
+        if (bar0 != 0) {
+            var dev = BrightnessDevice{
+                .name = undefined,
+                .backend = .IntelBacklight,
+                .current = 0,
+                .max = 0xFFFF, // 16-bit PWM
+                .acpi_path = null,
+                .io_base = bar0,
+            };
+            @memcpy(dev.name[0..5], "Intel");
+            dev.name[5] = 0;
+
+            // Read current brightness from PWM register
+            const pwm_ctl = mmio_read32(bar0 + INTEL_BLC_PWM_CTL);
+            dev.current = pwm_ctl & 0xFFFF;
+            dev.max = (pwm_ctl >> 16) & 0xFFFF;
+            if (dev.max == 0) dev.max = 0xFFFF;
+
+            brightness_devices[count.*] = dev;
+            count.* += 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn try_platform_brightness(count: *usize) bool {
+    _ = count;
+    // Platform-specific brightness control via WMI
+    // This would check for vendor-specific WMI GUIDs:
+    // - Dell: DCDE90D8-5E4B-4AED-B6E7-0D15F7AE3261
+    // - HP: 5FB7F034-2C63-45e9-BE91-3D44E2C707E4
+    // - Lenovo: 6F2ED7DB-4B8E-11E3-BE9F-6C626D6E3AFF
+    // - ASUS: 97845ED0-4E6D-11DE-8A39-0800200C9A66
+
+    // Implementation would probe WMI namespace and register handlers
+    return false;
+}
+
+pub fn get_brightness() ?u32 {
+    if (primary_brightness) |dev| {
+        return dev.current;
+    }
+    return null;
+}
+
+pub fn get_max_brightness() ?u32 {
+    if (primary_brightness) |dev| {
+        return dev.max;
+    }
+    return null;
+}
+
+pub fn set_brightness(value: u32) !void {
+    if (primary_brightness) |dev| {
+        const clamped = @min(value, dev.max);
+
+        switch (dev.backend) {
+            .ACPI => {
+                if (dev.acpi_path) |path| {
+                    try acpi.evaluate_with_arg(&path, ACPI_BCM, clamped);
+                }
+            },
+            .IntelBacklight => {
+                if (dev.io_base) |base| {
+                    // Write to PWM control register (preserve frequency in upper 16 bits)
+                    const current = mmio_read32(base + INTEL_BLC_PWM_CTL);
+                    const new_val = (current & 0xFFFF0000) | clamped;
+                    mmio_write32(base + INTEL_BLC_PWM_CTL, new_val);
+                }
+            },
+            .ACPIVideo => {
+                // Use ACPI video extension
+            },
+            .DDC => {
+                // Use DDC/CI for external monitors
+                try ddc_set_brightness(value);
+            },
+            .Platform => {
+                // Use WMI method
+            },
+        }
+
+        dev.current = clamped;
+        log_info("Brightness set to {}/{}", .{clamped, dev.max});
+    } else {
+        return error.NoBrightnessControl;
+    }
+}
+
+pub fn adjust_brightness(delta: i32) !void {
+    if (primary_brightness) |dev| {
+        const current_signed: i32 = @intCast(dev.current);
+        const new_value = @max(0, current_signed + delta);
+        try set_brightness(@intCast(new_value));
+    } else {
+        return error.NoBrightnessControl;
+    }
+}
+
+pub fn brightness_step_up() !void {
+    if (primary_brightness) |dev| {
+        const step = dev.max / 20; // 5% steps
+        try adjust_brightness(@intCast(step));
+    }
+}
+
+pub fn brightness_step_down() !void {
+    if (primary_brightness) |dev| {
+        const step = dev.max / 20;
+        try adjust_brightness(-@as(i32, @intCast(step)));
+    }
+}
+
+// =============================================================================
+// Keyboard Backlight Control
+// =============================================================================
+
+pub const KbdBacklightMode = enum(u8) {
+    Off = 0,
+    Low = 1,
+    Medium = 2,
+    High = 3,
+    Auto = 4, // ALS-based
+};
+
+const KbdBacklightDevice = struct {
+    name: [32]u8,
+    max_level: u8,
+    current_level: u8,
+    supports_color: bool,
+    color_rgb: u32,
+    auto_enabled: bool,
+    timeout_seconds: u16,
+};
+
+var kbd_backlight: ?KbdBacklightDevice = null;
+
+// Common ACPI paths for keyboard backlight
+const ACPI_KBD_BACKLIGHT = "_SB.PCI0.LPCB.EC0.KBLT";
+const ACPI_KBD_BL_SET = "SKBL";
+const ACPI_KBD_BL_GET = "GKBL";
+
+pub fn kbd_backlight_init() !void {
+    // Try ACPI EC-based keyboard backlight
+    if (acpi.find_device(ACPI_KBD_BACKLIGHT)) |_| {
+        var dev = KbdBacklightDevice{
+            .name = undefined,
+            .max_level = 3,
+            .current_level = 0,
+            .supports_color = false,
+            .color_rgb = 0xFFFFFF,
+            .auto_enabled = false,
+            .timeout_seconds = 30,
+        };
+        @memcpy(dev.name[0..4], "ACPI");
+
+        if (acpi.evaluate_integer(ACPI_KBD_BACKLIGHT, ACPI_KBD_BL_GET)) |level| {
+            dev.current_level = @intCast(level);
+        }
+
+        kbd_backlight = dev;
+        log_info("Keyboard backlight initialized (max level: {})", .{dev.max_level});
+        return;
+    }
+
+    // Try platform-specific (e.g., Dell SMBIOS, ThinkPad EC)
+    if (try_platform_kbd_backlight()) {
+        return;
+    }
+
+    log_info("No keyboard backlight found", .{});
+}
+
+fn try_platform_kbd_backlight() bool {
+    // Check for vendor-specific implementations
+    // ThinkPad: EC register 0x0C
+    // Dell: SMBIOS token
+    // HP: WMI
+    // ASUS: ATK WMI
+    return false;
+}
+
+pub fn get_kbd_backlight() ?u8 {
+    if (kbd_backlight) |dev| {
+        return dev.current_level;
+    }
+    return null;
+}
+
+pub fn set_kbd_backlight(level: u8) !void {
+    if (kbd_backlight) |*dev| {
+        const clamped = @min(level, dev.max_level);
+
+        // Set via ACPI
+        try acpi.evaluate_with_arg(ACPI_KBD_BACKLIGHT, ACPI_KBD_BL_SET, clamped);
+
+        dev.current_level = clamped;
+        log_info("Keyboard backlight set to {}/{}", .{clamped, dev.max_level});
+    } else {
+        return error.NoKbdBacklight;
+    }
+}
+
+pub fn cycle_kbd_backlight() !void {
+    if (kbd_backlight) |*dev| {
+        const next_level = (dev.current_level + 1) % (dev.max_level + 1);
+        try set_kbd_backlight(next_level);
+    }
+}
+
+// =============================================================================
+// Volume Control (Hardware Mixer)
+// =============================================================================
+
+pub const VolumeChannel = enum {
+    Master,
+    Headphone,
+    Speaker,
+    Microphone,
+    LineIn,
+    LineOut,
+};
+
+const VolumeState = struct {
+    level: u8, // 0-100
+    muted: bool,
+};
+
+var volume_state: VolumeState = .{
+    .level = 50,
+    .muted = false,
+};
+
+// HDA codec address for volume control
+var hda_codec_base: ?u64 = null;
+
+pub fn volume_init() !void {
+    // Find HDA controller via PCI
+    // Intel HDA: vendor 0x8086, class 0x0403
+    if (find_pci_class(0x0403)) |pci_dev| {
+        hda_codec_base = pci_dev.bar[0] & ~@as(u64, 0xF);
+        log_info("HDA controller found at 0x{x}", .{hda_codec_base.?});
+
+        // Read current volume from codec
+        read_hda_volume();
+    } else {
+        log_info("No HDA controller found", .{});
+    }
+}
+
+fn read_hda_volume() void {
+    if (hda_codec_base) |base| {
+        // Send HDA verb to read volume
+        // AMP_GAIN_MUTE verb (0xB)
+        const verb = hda_send_verb(base, 0x0B, 0x8000); // Get left output amp
+        volume_state.level = @intCast((verb >> 0) & 0x7F);
+        volume_state.muted = (verb & 0x80) != 0;
+    }
+}
+
+fn hda_send_verb(base: u64, nid: u8, verb: u32) u32 {
+    // Write verb to CORB (Command Output Ring Buffer)
+    const corb_base = mmio_read32(base + 0x40); // CORBLBASE
+    const corb_wp = mmio_read16(base + 0x48);   // CORBWP
+
+    const command = (@as(u32, nid) << 20) | verb;
+    mmio_write32(corb_base + (corb_wp * 4), command);
+
+    // Increment write pointer
+    mmio_write16(base + 0x48, corb_wp + 1);
+
+    // Wait for response in RIRB
+    var timeout: u32 = 1000;
+    while (timeout > 0) : (timeout -= 1) {
+        const rirb_wp = mmio_read16(base + 0x58);
+        if (rirb_wp != corb_wp) {
+            const rirb_base = mmio_read32(base + 0x50);
+            return mmio_read32(rirb_base + (rirb_wp * 8));
+        }
+        delay_us(10);
+    }
+    return 0;
+}
+
+pub fn get_volume() u8 {
+    return volume_state.level;
+}
+
+pub fn is_muted() bool {
+    return volume_state.muted;
+}
+
+pub fn set_volume(level: u8) !void {
+    const clamped = @min(level, 100);
+
+    if (hda_codec_base) |base| {
+        // Set volume via HDA verb
+        // AMP_GAIN_MUTE SET verb
+        const mute_bit: u32 = if (volume_state.muted) 0x80 else 0;
+        const verb: u32 = 0x3000 | mute_bit | clamped; // Set output amp
+        _ = hda_send_verb(base, 0x0B, verb);
+    }
+
+    volume_state.level = clamped;
+    notify_volume_change();
+}
+
+pub fn adjust_volume(delta: i8) !void {
+    const current_signed: i16 = volume_state.level;
+    const new_value = @max(0, @min(100, current_signed + delta));
+    try set_volume(@intCast(new_value));
+}
+
+pub fn volume_up() !void {
+    try adjust_volume(5);
+}
+
+pub fn volume_down() !void {
+    try adjust_volume(-5);
+}
+
+pub fn toggle_mute() !void {
+    volume_state.muted = !volume_state.muted;
+
+    if (hda_codec_base) |base| {
+        const mute_bit: u32 = if (volume_state.muted) 0x80 else 0;
+        const verb: u32 = 0x3000 | mute_bit | volume_state.level;
+        _ = hda_send_verb(base, 0x0B, verb);
+    }
+
+    notify_volume_change();
+}
+
+fn notify_volume_change() void {
+    // Send event to GUI/notification system
+    send_osd_notification(.Volume, volume_state.level);
+}
+
+// =============================================================================
+// Special Function Keys (Hotkeys)
+// =============================================================================
+
+pub const FunctionKey = enum(u8) {
+    // Brightness
+    BrightnessUp = 0x10,
+    BrightnessDown = 0x11,
+
+    // Keyboard backlight
+    KbdBacklightUp = 0x12,
+    KbdBacklightDown = 0x13,
+    KbdBacklightToggle = 0x14,
+
+    // Volume
+    VolumeUp = 0x20,
+    VolumeDown = 0x21,
+    VolumeMute = 0x22,
+    MicMute = 0x23,
+
+    // Display
+    DisplaySwitch = 0x30, // Cycle displays
+    ProjectorToggle = 0x31,
+    ScreenOff = 0x32,
+
+    // Wireless
+    WifiToggle = 0x40,
+    BluetoothToggle = 0x41,
+    AirplaneMode = 0x42,
+    MobileData = 0x43,
+
+    // System
+    Sleep = 0x50,
+    Hibernate = 0x51,
+    LockScreen = 0x52,
+
+    // Hardware toggles
+    TouchpadToggle = 0x60,
+    CameraToggle = 0x61,
+    NumLockToggle = 0x62,
+
+    // Performance
+    PerformanceMode = 0x70,
+    FanBoost = 0x71,
+
+    // Media
+    PlayPause = 0x80,
+    Stop = 0x81,
+    PreviousTrack = 0x82,
+    NextTrack = 0x83,
+
+    // Application launch
+    LaunchBrowser = 0x90,
+    LaunchMail = 0x91,
+    LaunchCalculator = 0x92,
+    LaunchFileManager = 0x93,
+
+    // Custom vendor keys
+    VendorKey1 = 0xF0,
+    VendorKey2 = 0xF1,
+    VendorKey3 = 0xF2,
+    VendorKey4 = 0xF3,
+};
+
+// Scancode to function key mapping
+const HotkeyMapping = struct {
+    scancode: u16,
+    key: FunctionKey,
+    requires_fn: bool,
+};
+
+// Standard multimedia key scancodes (E0 prefix)
+const hotkey_mappings = [_]HotkeyMapping{
+    // Common scancodes
+    .{ .scancode = 0xE010, .key = .PreviousTrack, .requires_fn = false },
+    .{ .scancode = 0xE019, .key = .NextTrack, .requires_fn = false },
+    .{ .scancode = 0xE020, .key = .VolumeMute, .requires_fn = false },
+    .{ .scancode = 0xE021, .key = .LaunchCalculator, .requires_fn = false },
+    .{ .scancode = 0xE022, .key = .PlayPause, .requires_fn = false },
+    .{ .scancode = 0xE024, .key = .Stop, .requires_fn = false },
+    .{ .scancode = 0xE02E, .key = .VolumeDown, .requires_fn = false },
+    .{ .scancode = 0xE030, .key = .VolumeUp, .requires_fn = false },
+    .{ .scancode = 0xE032, .key = .LaunchBrowser, .requires_fn = false },
+    .{ .scancode = 0xE05F, .key = .Sleep, .requires_fn = false },
+    .{ .scancode = 0xE06C, .key = .LaunchMail, .requires_fn = false },
+
+    // ACPI-generated keys
+    .{ .scancode = 0x0067, .key = .BrightnessUp, .requires_fn = true },
+    .{ .scancode = 0x0068, .key = .BrightnessDown, .requires_fn = true },
+    .{ .scancode = 0x0069, .key = .DisplaySwitch, .requires_fn = true },
+    .{ .scancode = 0x006A, .key = .WifiToggle, .requires_fn = true },
+    .{ .scancode = 0x006B, .key = .TouchpadToggle, .requires_fn = true },
+};
+
+var hotkey_handlers: [256]?*const fn(FunctionKey) void = [_]?*const fn(FunctionKey) void{null} ** 256;
+
+pub fn hotkey_init() !void {
+    // Register keyboard hook for special keys
+    try input.register_scancode_hook(hotkey_scancode_handler);
+
+    // Register ACPI hotkey notifications
+    try acpi.register_notify_handler("_SB.PCI0.LPCB.EC0", acpi_hotkey_handler);
+
+    // Register default handlers
+    register_default_handlers();
+
+    log_info("Hotkey subsystem initialized", .{});
+}
+
+fn register_default_handlers() void {
+    // Brightness
+    hotkey_handlers[@intFromEnum(FunctionKey.BrightnessUp)] = handle_brightness_up;
+    hotkey_handlers[@intFromEnum(FunctionKey.BrightnessDown)] = handle_brightness_down;
+
+    // Volume
+    hotkey_handlers[@intFromEnum(FunctionKey.VolumeUp)] = handle_volume_up;
+    hotkey_handlers[@intFromEnum(FunctionKey.VolumeDown)] = handle_volume_down;
+    hotkey_handlers[@intFromEnum(FunctionKey.VolumeMute)] = handle_mute_toggle;
+
+    // Keyboard backlight
+    hotkey_handlers[@intFromEnum(FunctionKey.KbdBacklightToggle)] = handle_kbd_backlight;
+
+    // Wireless
+    hotkey_handlers[@intFromEnum(FunctionKey.AirplaneMode)] = handle_airplane_mode;
+
+    // System
+    hotkey_handlers[@intFromEnum(FunctionKey.Sleep)] = handle_sleep;
+    hotkey_handlers[@intFromEnum(FunctionKey.LockScreen)] = handle_lock_screen;
+
+    // Display
+    hotkey_handlers[@intFromEnum(FunctionKey.DisplaySwitch)] = handle_display_switch;
+}
+
+fn hotkey_scancode_handler(scancode: u16, pressed: bool) bool {
+    if (!pressed) return false; // Only handle key press, not release
+
+    // Look up function key
+    for (hotkey_mappings) |mapping| {
+        if (mapping.scancode == scancode) {
+            dispatch_hotkey(mapping.key);
+            return true; // Consumed
+        }
+    }
+    return false; // Not consumed
+}
+
+fn acpi_hotkey_handler(event: u32) void {
+    // Map ACPI event to function key
+    const key: ?FunctionKey = switch (event) {
+        0x10 => .BrightnessUp,
+        0x11 => .BrightnessDown,
+        0x12 => .DisplaySwitch,
+        0x13 => .WifiToggle,
+        0x14 => .KbdBacklightToggle,
+        0x15 => .TouchpadToggle,
+        0x16 => .CameraToggle,
+        0x17 => .AirplaneMode,
+        0x18 => .PerformanceMode,
+        else => null,
+    };
+
+    if (key) |k| {
+        dispatch_hotkey(k);
+    }
+}
+
+fn dispatch_hotkey(key: FunctionKey) void {
+    log_info("Hotkey pressed: {s}", .{@tagName(key)});
+
+    if (hotkey_handlers[@intFromEnum(key)]) |handler| {
+        handler(key);
+    }
+}
+
+pub fn register_hotkey_handler(key: FunctionKey, handler: *const fn(FunctionKey) void) void {
+    hotkey_handlers[@intFromEnum(key)] = handler;
+}
+
+// Default handlers
+fn handle_brightness_up(_: FunctionKey) void {
+    brightness_step_up() catch {};
+    send_osd_notification(.Brightness, get_brightness() orelse 0);
+}
+
+fn handle_brightness_down(_: FunctionKey) void {
+    brightness_step_down() catch {};
+    send_osd_notification(.Brightness, get_brightness() orelse 0);
+}
+
+fn handle_volume_up(_: FunctionKey) void {
+    volume_up() catch {};
+}
+
+fn handle_volume_down(_: FunctionKey) void {
+    volume_down() catch {};
+}
+
+fn handle_mute_toggle(_: FunctionKey) void {
+    toggle_mute() catch {};
+}
+
+fn handle_kbd_backlight(_: FunctionKey) void {
+    cycle_kbd_backlight() catch {};
+}
+
+fn handle_airplane_mode(_: FunctionKey) void {
+    toggle_airplane_mode();
+}
+
+fn handle_sleep(_: FunctionKey) void {
+    power.request_system_suspend(.S3) catch {};
+}
+
+fn handle_lock_screen(_: FunctionKey) void {
+    send_lock_screen_event();
+}
+
+fn handle_display_switch(_: FunctionKey) void {
+    cycle_display_outputs();
+}
+
+// =============================================================================
+// Wireless RF Kill (Airplane Mode)
+// =============================================================================
+
+pub const RfKillDevice = enum {
+    Wifi,
+    Bluetooth,
+    MobileData,
+    NFC,
+    GPS,
+    All,
+};
+
+const RfKillState = struct {
+    soft_blocked: bool,
+    hard_blocked: bool,
+};
+
+var rfkill_states = [_]RfKillState{.{ .soft_blocked = false, .hard_blocked = false }} ** 6;
+var airplane_mode_enabled: bool = false;
+
+pub fn rfkill_init() !void {
+    // Register with ACPI for hardware RF kill switch
+    if (acpi.find_device("_SB.WLAN")) |_| {
+        log_info("WLAN device found", .{});
+    }
+    if (acpi.find_device("_SB.BT00")) |_| {
+        log_info("Bluetooth device found", .{});
+    }
+
+    // Check hardware RF kill switch state
+    check_hardware_rfkill();
+
+    log_info("RF Kill subsystem initialized", .{});
+}
+
+fn check_hardware_rfkill() void {
+    // Check GPIO or ACPI method for hardware switch state
+    if (acpi.evaluate_integer("_SB.WLAN", "_STA")) |status| {
+        rfkill_states[@intFromEnum(RfKillDevice.Wifi)].hard_blocked = (status & 0x0F) != 0x0F;
+    }
+}
+
+pub fn rfkill_set_soft_block(device: RfKillDevice, blocked: bool) !void {
+    const idx = @intFromEnum(device);
+
+    if (rfkill_states[idx].hard_blocked) {
+        return error.HardwareBlocked;
+    }
+
+    rfkill_states[idx].soft_blocked = blocked;
+
+    // Actually disable the device
+    switch (device) {
+        .Wifi => set_wifi_power(!blocked),
+        .Bluetooth => set_bluetooth_power(!blocked),
+        .MobileData => set_mobile_power(!blocked),
+        .All => {
+            set_wifi_power(!blocked);
+            set_bluetooth_power(!blocked);
+            set_mobile_power(!blocked);
+        },
+        else => {},
+    }
+
+    log_info("RF Kill {s}: {s}", .{
+        @tagName(device),
+        if (blocked) "blocked" else "unblocked"
+    });
+}
+
+pub fn rfkill_get_state(device: RfKillDevice) RfKillState {
+    return rfkill_states[@intFromEnum(device)];
+}
+
+pub fn toggle_airplane_mode() void {
+    airplane_mode_enabled = !airplane_mode_enabled;
+
+    rfkill_set_soft_block(.All, airplane_mode_enabled) catch {};
+
+    send_osd_notification(.AirplaneMode, if (airplane_mode_enabled) 1 else 0);
+}
+
+pub fn is_airplane_mode() bool {
+    return airplane_mode_enabled;
+}
+
+// =============================================================================
+// Display Output Management
+// =============================================================================
+
+pub const DisplayOutput = enum {
+    Internal,
+    HDMI,
+    DisplayPort,
+    VGA,
+    USB_C,
+    Wireless,
+};
+
+pub const DisplayMode = enum {
+    SingleInternal,
+    SingleExternal,
+    Clone,
+    Extend,
+    PresentationMode,
+};
+
+var current_display_mode: DisplayMode = .SingleInternal;
+var connected_displays: u8 = 1;
+
+pub fn display_init() !void {
+    // Detect connected displays via EDID/DDC
+    detect_displays();
+
+    // Register for hotplug events
+    if (acpi.find_device("_SB.PCI0.GFX0.DD01")) |_| {
+        try acpi.register_notify_handler("_SB.PCI0.GFX0", display_acpi_handler);
+    }
+
+    log_info("Display management initialized, {} displays connected", .{connected_displays});
+}
+
+fn detect_displays() void {
+    connected_displays = 1; // Always have internal
+
+    // Check HDMI via ACPI _DCS (device connection status)
+    if (acpi.evaluate_integer("_SB.PCI0.GFX0.DD02", "_DCS")) |status| {
+        if ((status & 0x0F) == 0x0F) {
+            connected_displays += 1;
+        }
+    }
+
+    // Check DisplayPort
+    if (acpi.evaluate_integer("_SB.PCI0.GFX0.DD03", "_DCS")) |status| {
+        if ((status & 0x0F) == 0x0F) {
+            connected_displays += 1;
+        }
+    }
+}
+
+fn display_acpi_handler(event: u32) void {
+    switch (event) {
+        0x80 => { // Display status change
+            detect_displays();
+            log_info("Display hotplug event, {} displays now connected", .{connected_displays});
+        },
+        0x81 => { // Lid status change (handled by lid subsystem)
+        },
+        0x86 => { // Brightness change request
+        },
+        else => {},
+    }
+}
+
+pub fn cycle_display_outputs() void {
+    if (connected_displays <= 1) {
+        // Only internal display
+        return;
+    }
+
+    current_display_mode = switch (current_display_mode) {
+        .SingleInternal => .Clone,
+        .Clone => .Extend,
+        .Extend => .SingleExternal,
+        .SingleExternal => .SingleInternal,
+        .PresentationMode => .SingleInternal,
+    };
+
+    apply_display_mode(current_display_mode);
+    send_osd_notification(.DisplayMode, @intFromEnum(current_display_mode));
+}
+
+fn apply_display_mode(mode: DisplayMode) void {
+    // Use ACPI _DOS/_DOD methods or GPU-specific registers
+    _ = mode;
+    // Implementation would configure display controller
+}
+
+// =============================================================================
+// On-Screen Display Notifications
+// =============================================================================
+
+pub const OSDType = enum {
+    Brightness,
+    Volume,
+    KbdBacklight,
+    AirplaneMode,
+    DisplayMode,
+    BatteryLow,
+    Charging,
+    CapsLock,
+    NumLock,
+};
+
+fn send_osd_notification(osd_type: OSDType, value: u32) void {
+    // Send to GUI subsystem for display
+    _ = osd_type;
+    _ = value;
+    // gui.show_osd(osd_type, value);
+}
+
+fn send_lock_screen_event() void {
+    // Trigger screen lock via session manager
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+fn is_external_display_connected() bool {
+    return connected_displays > 1;
+}
+
+fn switch_to_external_display() void {
+    apply_display_mode(.SingleExternal);
+}
+
+fn wake_display() void {
+    // Enable backlight and restore brightness
+    if (primary_brightness) |dev| {
+        if (dev.current == 0) {
+            set_brightness(dev.max / 2) catch {};
+        }
+    }
+}
+
+fn is_on_ac_power() bool {
+    // Check ACPI AC adapter status
+    if (acpi.evaluate_integer("_SB.PCI0.LPCB.EC0.AC0", "_PSR")) |status| {
+        return status != 0;
+    }
+    return true; // Assume AC if unknown
+}
+
+fn set_wifi_power(enabled: bool) void {
+    // Control via ACPI or PCI power state
+    if (enabled) {
+        _ = acpi.evaluate_integer("_SB.WLAN", "_PS0"); // D0 state
+    } else {
+        _ = acpi.evaluate_integer("_SB.WLAN", "_PS3"); // D3 state
+    }
+}
+
+fn set_bluetooth_power(enabled: bool) void {
+    if (enabled) {
+        _ = acpi.evaluate_integer("_SB.BT00", "_PS0");
+    } else {
+        _ = acpi.evaluate_integer("_SB.BT00", "_PS3");
+    }
+}
+
+fn set_mobile_power(enabled: bool) void {
+    _ = enabled;
+    // Control mobile broadband modem
+}
+
+fn ddc_set_brightness(value: u32) !void {
+    // DDC/CI brightness control for external monitors
+    _ = value;
+}
+
+// PCI device lookup stubs
+const PciDevice = struct {
+    bar: [6]u64,
+};
+
+fn find_pci_device(vendor: u16, device: ?u16) ?PciDevice {
+    _ = vendor;
+    _ = device;
+    // Would enumerate PCI devices
+    return null;
+}
+
+fn find_pci_class(class_code: u16) ?PciDevice {
+    _ = class_code;
+    return null;
+}
+
+// MMIO access
+fn mmio_read32(addr: u64) u32 {
+    const ptr: *volatile u32 = @ptrFromInt(addr);
+    return ptr.*;
+}
+
+fn mmio_write32(addr: u64, value: u32) void {
+    const ptr: *volatile u32 = @ptrFromInt(addr);
+    ptr.* = value;
+}
+
+fn mmio_read16(addr: u64) u16 {
+    const ptr: *volatile u16 = @ptrFromInt(addr);
+    return ptr.*;
+}
+
+fn mmio_write16(addr: u64, value: u16) void {
+    const ptr: *volatile u16 = @ptrFromInt(addr);
+    ptr.* = value;
+}
+
+fn delay_us(us: u32) void {
+    _ = us;
+    // Platform delay
+}
+
+// =============================================================================
+// Laptop Platform Initialization
+// =============================================================================
+
+pub fn laptop_platform_init() !void {
+    log_info("Initializing laptop platform features...", .{});
+
+    // Initialize all subsystems
+    try lid_init();
+    try brightness_init();
+    try kbd_backlight_init();
+    try volume_init();
+    try hotkey_init();
+    try rfkill_init();
+    try display_init();
+
+    log_info("Laptop platform features initialized", .{});
+}
+
+// Logging
+fn log_info(comptime fmt: []const u8, args: anytype) void {
+    _ = fmt;
+    _ = args;
+}
+
+fn log_error(comptime fmt: []const u8, args: anytype) void {
+    _ = fmt;
+    _ = args;
+}

@@ -1,0 +1,491 @@
+// home-os CPU Frequency Scaling for x86-64
+// Intel SpeedStep, HWP, and AMD P-State support
+
+import "../core/types"
+import "../sync/spinlock"
+
+// =============================================================================
+// CPU Frequency Constants
+// =============================================================================
+
+const MAX_CPUS: usize = 256
+const MAX_FREQ_TABLE: usize = 32
+
+// =============================================================================
+// Intel MSRs
+// =============================================================================
+
+const MSR_IA32_PERF_STATUS: u32 = 0x198
+const MSR_IA32_PERF_CTL: u32 = 0x199
+const MSR_IA32_MISC_ENABLE: u32 = 0x1A0
+const MSR_PLATFORM_INFO: u32 = 0xCE
+const MSR_TURBO_RATIO_LIMIT: u32 = 0x1AD
+const MSR_IA32_PM_ENABLE: u32 = 0x770
+const MSR_IA32_HWP_CAPABILITIES: u32 = 0x771
+const MSR_IA32_HWP_REQUEST: u32 = 0x774
+const MSR_IA32_THERM_STATUS: u32 = 0x19C
+const MSR_IA32_PACKAGE_THERM_STATUS: u32 = 0x1B1
+
+// AMD MSRs
+const MSR_AMD_PSTATE_LIMIT: u32 = 0xC0010061
+const MSR_AMD_PSTATE_CTL: u32 = 0xC0010062
+const MSR_AMD_PSTATE_DEF_BASE: u32 = 0xC0010064
+
+// Control bits
+const MISC_ENABLE_SPEEDSTEP: u64 = 1 << 16
+const MISC_ENABLE_TURBO_DISABLE: u64 = 1 << 38
+
+// HWP bits
+const HWP_MIN_PERF_SHIFT: u64 = 0
+const HWP_MAX_PERF_SHIFT: u64 = 8
+const HWP_DESIRED_PERF_SHIFT: u64 = 16
+const HWP_EPP_SHIFT: u64 = 24
+
+// Energy Performance Preference
+const EPP_PERFORMANCE: u8 = 0
+const EPP_BALANCE_PERFORMANCE: u8 = 128
+const EPP_BALANCE_POWER: u8 = 192
+const EPP_POWER_SAVE: u8 = 255
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+struct FrequencyInfo {
+    frequency: u64,
+    voltage: u32,
+    latency: u32,
+    flags: u32,
+}
+
+enum GovernorType {
+    Performance,
+    Powersave,
+    Userspace,
+    Ondemand,
+    Conservative,
+    Schedutil,
+}
+
+struct GovernorData {
+    sampling_rate: u32,
+    up_threshold: u8,
+    down_threshold: u8,
+    freq_step: u8,
+    prev_load: u8,
+    prev_wall_time: u64,
+}
+
+struct CPUFreqPolicy {
+    cpu: u32,
+    min_freq: u64,
+    max_freq: u64,
+    cur_freq: u64,
+    governor: GovernorType,
+    governor_data: GovernorData,
+    freq_table: [FrequencyInfo; MAX_FREQ_TABLE],
+    freq_table_size: usize,
+    transition_latency: u32,
+    hwp_enabled: bool,
+    turbo_enabled: bool,
+}
+
+enum DriverType {
+    None,
+    IntelPState,
+    IntelHWP,
+    AMDPState,
+    ACPI,
+}
+
+struct CPUFreqState {
+    policies: [Option<CPUFreqPolicy>; MAX_CPUS],
+    policy_count: usize,
+    boost_enabled: bool,
+    hwp_supported: bool,
+    driver_type: DriverType,
+    total_transitions: u64,
+    lock: Spinlock,
+}
+
+static mut CPUFREQ: CPUFreqState = CPUFreqState {
+    policies: [None; MAX_CPUS],
+    policy_count: 0,
+    boost_enabled: true,
+    hwp_supported: false,
+    driver_type: DriverType::None,
+    total_transitions: 0,
+    lock: Spinlock::new(),
+}
+
+// =============================================================================
+// Low-level Access
+// =============================================================================
+
+fn rdmsr(msr: u32): u64 {
+    let lo: u32
+    let hi: u32
+    asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi)
+    return ((hi as u64) << 32) | (lo as u64)
+}
+
+fn wrmsr(msr: u32, value: u64) {
+    let lo = value as u32
+    let hi = (value >> 32) as u32
+    asm!("wrmsr", in("ecx") msr, in("eax") lo, in("edx") hi)
+}
+
+fn cpuid(leaf: u32): (u32, u32, u32, u32) {
+    let eax: u32
+    let ebx: u32
+    let ecx: u32
+    let edx: u32
+    asm!("cpuid", inout("eax") leaf => eax, out("ebx") ebx, lateout("ecx") ecx, out("edx") edx)
+    return (eax, ebx, ecx, edx)
+}
+
+fn cpuid_sub(leaf: u32, subleaf: u32): (u32, u32, u32, u32) {
+    let eax: u32
+    let ebx: u32
+    let ecx: u32
+    let edx: u32
+    asm!("cpuid", inout("eax") leaf => eax, out("ebx") ebx, inout("ecx") subleaf => ecx, out("edx") edx)
+    return (eax, ebx, ecx, edx)
+}
+
+// =============================================================================
+// CPU Detection
+// =============================================================================
+
+fn is_intel(): bool {
+    let (_, ebx, ecx, edx) = cpuid(0)
+    // "GenuineIntel"
+    return ebx == 0x756E6547 && edx == 0x49656E69 && ecx == 0x6C65746E
+}
+
+fn is_amd(): bool {
+    let (_, ebx, ecx, edx) = cpuid(0)
+    // "AuthenticAMD"
+    return ebx == 0x68747541 && edx == 0x69746E65 && ecx == 0x444D4163
+}
+
+fn has_speedstep(): bool {
+    let (_, _, ecx, _) = cpuid(1)
+    return (ecx & (1 << 7)) != 0
+}
+
+fn has_hwp(): bool {
+    let (eax, _, _, _) = cpuid(6)
+    return (eax & (1 << 7)) != 0
+}
+
+fn get_base_clock(): u64 {
+    // Most modern Intel CPUs use 100 MHz base clock
+    return 100000  // kHz
+}
+
+fn get_intel_freq_range(): (u64, u64, u64) {
+    let platform_info = rdmsr(MSR_PLATFORM_INFO)
+    let max_ratio = (platform_info >> 8) & 0xFF
+    let min_ratio = (platform_info >> 40) & 0xFF
+    let base_clock = get_base_clock()
+
+    return (min_ratio * base_clock, max_ratio * base_clock, max_ratio * base_clock)
+}
+
+fn get_turbo_ratio(): u64 {
+    let turbo = rdmsr(MSR_TURBO_RATIO_LIMIT)
+    return turbo & 0xFF
+}
+
+fn get_current_freq(): u64 {
+    let status = rdmsr(MSR_IA32_PERF_STATUS)
+    let ratio = (status >> 8) & 0xFF
+    return ratio * get_base_clock()
+}
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+export fn cpufreq_x86_init(): i32 {
+    unsafe { CPUFREQ.lock.init() }
+
+    if is_intel() {
+        if has_hwp() {
+            unsafe { CPUFREQ.driver_type = DriverType::IntelHWP }
+            init_hwp()
+        } else if has_speedstep() {
+            unsafe { CPUFREQ.driver_type = DriverType::IntelPState }
+            init_pstate()
+        }
+    } else if is_amd() {
+        unsafe { CPUFREQ.driver_type = DriverType::AMDPState }
+        init_amd()
+    } else {
+        unsafe { CPUFREQ.driver_type = DriverType::ACPI }
+        init_acpi_fallback()
+    }
+
+    return 0
+}
+
+fn init_hwp() {
+    // Enable HWP
+    let pm_enable = rdmsr(MSR_IA32_PM_ENABLE)
+    if (pm_enable & 1) == 0 {
+        wrmsr(MSR_IA32_PM_ENABLE, pm_enable | 1)
+    }
+
+    let caps = rdmsr(MSR_IA32_HWP_CAPABILITIES)
+    let highest = caps & 0xFF
+    let lowest = (caps >> 24) & 0xFF
+    let base_clock = get_base_clock()
+
+    // Set balanced request
+    let request = (lowest << HWP_MIN_PERF_SHIFT) |
+                  (highest << HWP_MAX_PERF_SHIFT) |
+                  ((EPP_BALANCE_PERFORMANCE as u64) << HWP_EPP_SHIFT)
+    wrmsr(MSR_IA32_HWP_REQUEST, request)
+
+    unsafe {
+        CPUFREQ.hwp_supported = true
+        CPUFREQ.policies[0] = Some(CPUFreqPolicy {
+            cpu: 0,
+            min_freq: lowest * base_clock,
+            max_freq: highest * base_clock,
+            cur_freq: get_current_freq(),
+            governor: GovernorType::Schedutil,
+            governor_data: GovernorData::default(),
+            freq_table: [FrequencyInfo::default(); MAX_FREQ_TABLE],
+            freq_table_size: 0,
+            transition_latency: 10000,
+            hwp_enabled: true,
+            turbo_enabled: true,
+        })
+        CPUFREQ.policy_count = 1
+    }
+}
+
+fn init_pstate() {
+    // Enable SpeedStep
+    let misc = rdmsr(MSR_IA32_MISC_ENABLE)
+    if (misc & MISC_ENABLE_SPEEDSTEP) == 0 {
+        wrmsr(MSR_IA32_MISC_ENABLE, misc | MISC_ENABLE_SPEEDSTEP)
+    }
+
+    let (min_freq, max_freq, _) = get_intel_freq_range()
+    let turbo_ratio = get_turbo_ratio()
+    let turbo_freq = turbo_ratio * get_base_clock()
+
+    unsafe {
+        let mut table: [FrequencyInfo; MAX_FREQ_TABLE] = [FrequencyInfo::default(); MAX_FREQ_TABLE]
+        let mut count = 0
+        let mut f = min_freq
+
+        while f <= max_freq && count < MAX_FREQ_TABLE {
+            table[count] = FrequencyInfo { frequency: f, voltage: 0, latency: 10000, flags: 0 }
+            count += 1
+            f += 100000
+        }
+
+        if turbo_freq > max_freq && count < MAX_FREQ_TABLE {
+            table[count] = FrequencyInfo { frequency: turbo_freq, voltage: 0, latency: 10000, flags: 1 }
+            count += 1
+        }
+
+        CPUFREQ.policies[0] = Some(CPUFreqPolicy {
+            cpu: 0,
+            min_freq: min_freq,
+            max_freq: turbo_freq,
+            cur_freq: get_current_freq(),
+            governor: GovernorType::Ondemand,
+            governor_data: GovernorData::default(),
+            freq_table: table,
+            freq_table_size: count,
+            transition_latency: 10000,
+            hwp_enabled: false,
+            turbo_enabled: true,
+        })
+        CPUFREQ.policy_count = 1
+    }
+}
+
+fn init_amd() {
+    let limit = rdmsr(MSR_AMD_PSTATE_LIMIT)
+    let max_pstate = limit & 0x7
+
+    unsafe {
+        let mut table: [FrequencyInfo; MAX_FREQ_TABLE] = [FrequencyInfo::default(); MAX_FREQ_TABLE]
+        let mut count = 0
+
+        for p in 0..=max_pstate {
+            let def = rdmsr(MSR_AMD_PSTATE_DEF_BASE + p as u32)
+            if (def & (1 << 63)) != 0 {
+                let fid = (def & 0xFF) as u64
+                let did = ((def >> 8) & 0x3F) as u64
+                let freq = if did > 0 { (fid * 100000) / did } else { 0 }
+
+                if freq > 0 && count < MAX_FREQ_TABLE {
+                    table[count] = FrequencyInfo { frequency: freq, voltage: 0, latency: 10000, flags: 0 }
+                    count += 1
+                }
+            }
+        }
+
+        if count > 0 {
+            CPUFREQ.policies[0] = Some(CPUFreqPolicy {
+                cpu: 0,
+                min_freq: table[count - 1].frequency,
+                max_freq: table[0].frequency,
+                cur_freq: get_current_freq(),
+                governor: GovernorType::Ondemand,
+                governor_data: GovernorData::default(),
+                freq_table: table,
+                freq_table_size: count,
+                transition_latency: 10000,
+                hwp_enabled: false,
+                turbo_enabled: true,
+            })
+            CPUFREQ.policy_count = 1
+        }
+    }
+}
+
+fn init_acpi_fallback() {
+    unsafe {
+        CPUFREQ.policies[0] = Some(CPUFreqPolicy {
+            cpu: 0,
+            min_freq: 800000,
+            max_freq: 3000000,
+            cur_freq: 2000000,
+            governor: GovernorType::Performance,
+            governor_data: GovernorData::default(),
+            freq_table: [FrequencyInfo::default(); MAX_FREQ_TABLE],
+            freq_table_size: 0,
+            transition_latency: 10000,
+            hwp_enabled: false,
+            turbo_enabled: false,
+        })
+        CPUFREQ.policy_count = 1
+    }
+}
+
+// =============================================================================
+// Frequency Control
+// =============================================================================
+
+export fn cpufreq_x86_set_freq(cpu: u32, freq_khz: u64): i32 {
+    unsafe {
+        if cpu as usize >= CPUFREQ.policy_count { return -1 }
+        let policy = match &mut CPUFREQ.policies[cpu as usize] {
+            Some(p) => p,
+            None => return -1,
+        }
+
+        let target = freq_khz.max(policy.min_freq).min(policy.max_freq)
+        let ratio = target / get_base_clock()
+
+        if policy.hwp_enabled {
+            let req = rdmsr(MSR_IA32_HWP_REQUEST)
+            let new_req = (req & !(0xFF << HWP_DESIRED_PERF_SHIFT)) | (ratio << HWP_DESIRED_PERF_SHIFT)
+            wrmsr(MSR_IA32_HWP_REQUEST, new_req)
+        } else {
+            let ctl = rdmsr(MSR_IA32_PERF_CTL)
+            let new_ctl = (ctl & !0xFF00) | (ratio << 8)
+            wrmsr(MSR_IA32_PERF_CTL, new_ctl)
+        }
+
+        policy.cur_freq = target
+        CPUFREQ.total_transitions += 1
+    }
+    return 0
+}
+
+export fn cpufreq_x86_set_governor(cpu: u32, gov: GovernorType): i32 {
+    unsafe {
+        if cpu as usize >= CPUFREQ.policy_count { return -1 }
+        let policy = match &mut CPUFREQ.policies[cpu as usize] {
+            Some(p) => p,
+            None => return -1,
+        }
+
+        policy.governor = gov
+
+        match gov {
+            GovernorType::Performance => {
+                cpufreq_x86_set_freq(cpu, policy.max_freq)
+                if policy.hwp_enabled { set_epp(EPP_PERFORMANCE) }
+            },
+            GovernorType::Powersave => {
+                cpufreq_x86_set_freq(cpu, policy.min_freq)
+                if policy.hwp_enabled { set_epp(EPP_POWER_SAVE) }
+            },
+            _ => {
+                if policy.hwp_enabled { set_epp(EPP_BALANCE_PERFORMANCE) }
+            }
+        }
+    }
+    return 0
+}
+
+fn set_epp(epp: u8) {
+    let req = rdmsr(MSR_IA32_HWP_REQUEST)
+    let new_req = (req & !(0xFF << HWP_EPP_SHIFT)) | ((epp as u64) << HWP_EPP_SHIFT)
+    wrmsr(MSR_IA32_HWP_REQUEST, new_req)
+}
+
+export fn cpufreq_x86_enable_turbo(enable: bool): i32 {
+    unsafe {
+        CPUFREQ.boost_enabled = enable
+        let misc = rdmsr(MSR_IA32_MISC_ENABLE)
+        let new_misc = if enable { misc & !MISC_ENABLE_TURBO_DISABLE } else { misc | MISC_ENABLE_TURBO_DISABLE }
+        wrmsr(MSR_IA32_MISC_ENABLE, new_misc)
+    }
+    return 0
+}
+
+// =============================================================================
+// Query Functions
+// =============================================================================
+
+export fn cpufreq_x86_get_freq(cpu: u32): u64 {
+    return get_current_freq()
+}
+
+export fn cpufreq_x86_get_limits(cpu: u32): (u64, u64) {
+    unsafe {
+        if cpu as usize >= CPUFREQ.policy_count { return (0, 0) }
+        match &CPUFREQ.policies[cpu as usize] {
+            Some(p) => (p.min_freq, p.max_freq),
+            None => (0, 0),
+        }
+    }
+}
+
+export fn cpufreq_x86_is_hwp(): bool {
+    unsafe { CPUFREQ.hwp_supported }
+}
+
+// =============================================================================
+// Defaults
+// =============================================================================
+
+impl FrequencyInfo {
+    fn default(): FrequencyInfo {
+        FrequencyInfo { frequency: 0, voltage: 0, latency: 0, flags: 0 }
+    }
+}
+
+impl GovernorData {
+    fn default(): GovernorData {
+        GovernorData {
+            sampling_rate: 10000,
+            up_threshold: 80,
+            down_threshold: 20,
+            freq_step: 5,
+            prev_load: 50,
+            prev_wall_time: 0,
+        }
+    }
+}

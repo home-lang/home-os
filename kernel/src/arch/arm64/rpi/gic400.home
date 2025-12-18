@@ -1,0 +1,684 @@
+// home-os GIC-400 Generic Interrupt Controller
+// ARM GICv2 implementation for Raspberry Pi 4
+
+import "../../../core/types"
+import "../../../sync/spinlock"
+
+// =============================================================================
+// GIC-400 Base Addresses (BCM2711)
+// =============================================================================
+
+// The GIC-400 on BCM2711 is at a fixed address
+const GIC_BASE_PI4: u64 = 0xFF840000
+
+// GIC component offsets from base
+const GICD_OFFSET: u64 = 0x1000    // Distributor
+const GICC_OFFSET: u64 = 0x2000    // CPU Interface
+const GICH_OFFSET: u64 = 0x4000    // Virtual Interface Control (Hypervisor)
+const GICV_OFFSET: u64 = 0x6000    // Virtual CPU Interface
+
+// =============================================================================
+// GIC Distributor Registers (GICD)
+// =============================================================================
+
+const GICD_CTLR: u64 = 0x000           // Distributor Control Register
+const GICD_TYPER: u64 = 0x004          // Interrupt Controller Type Register
+const GICD_IIDR: u64 = 0x008           // Distributor Implementer ID
+const GICD_IGROUPR: u64 = 0x080        // Interrupt Group Registers (32 per reg)
+const GICD_ISENABLER: u64 = 0x100      // Interrupt Set-Enable Registers
+const GICD_ICENABLER: u64 = 0x180      // Interrupt Clear-Enable Registers
+const GICD_ISPENDR: u64 = 0x200        // Interrupt Set-Pending Registers
+const GICD_ICPENDR: u64 = 0x280        // Interrupt Clear-Pending Registers
+const GICD_ISACTIVER: u64 = 0x300      // Interrupt Set-Active Registers
+const GICD_ICACTIVER: u64 = 0x380      // Interrupt Clear-Active Registers
+const GICD_IPRIORITYR: u64 = 0x400     // Interrupt Priority Registers (4 per reg)
+const GICD_ITARGETSR: u64 = 0x800      // Interrupt Processor Targets (4 per reg)
+const GICD_ICFGR: u64 = 0xC00          // Interrupt Configuration Registers
+const GICD_PPISR: u64 = 0xD00          // Private Peripheral Interrupt Status
+const GICD_SPISR: u64 = 0xD04          // Shared Peripheral Interrupt Status
+const GICD_SGIR: u64 = 0xF00           // Software Generated Interrupt Register
+const GICD_CPENDSGIR: u64 = 0xF10      // SGI Clear-Pending Registers
+const GICD_SPENDSGIR: u64 = 0xF20      // SGI Set-Pending Registers
+const GICD_PIDR2: u64 = 0xFE8          // Peripheral ID 2 Register
+
+// GICD_CTLR bits
+const GICD_CTLR_ENABLE: u32 = 1 << 0
+const GICD_CTLR_ENABLE_GRP0: u32 = 1 << 0
+const GICD_CTLR_ENABLE_GRP1: u32 = 1 << 1
+
+// GICD_TYPER fields
+const GICD_TYPER_IT_LINES_MASK: u32 = 0x1F
+const GICD_TYPER_CPU_NUMBER_SHIFT: u32 = 5
+const GICD_TYPER_CPU_NUMBER_MASK: u32 = 0x7
+
+// =============================================================================
+// GIC CPU Interface Registers (GICC)
+// =============================================================================
+
+const GICC_CTLR: u64 = 0x000           // CPU Interface Control Register
+const GICC_PMR: u64 = 0x004            // Interrupt Priority Mask Register
+const GICC_BPR: u64 = 0x008            // Binary Point Register
+const GICC_IAR: u64 = 0x00C            // Interrupt Acknowledge Register
+const GICC_EOIR: u64 = 0x010           // End of Interrupt Register
+const GICC_RPR: u64 = 0x014            // Running Priority Register
+const GICC_HPPIR: u64 = 0x018          // Highest Priority Pending Interrupt
+const GICC_ABPR: u64 = 0x01C           // Aliased Binary Point Register
+const GICC_AIAR: u64 = 0x020           // Aliased Interrupt Acknowledge Register
+const GICC_AEOIR: u64 = 0x024          // Aliased End of Interrupt Register
+const GICC_AHPPIR: u64 = 0x028         // Aliased Highest Priority Pending Int
+const GICC_APR: u64 = 0x0D0            // Active Priorities Registers
+const GICC_NSAPR: u64 = 0x0E0          // Non-secure Active Priorities
+const GICC_IIDR: u64 = 0x0FC           // CPU Interface ID Register
+const GICC_DIR: u64 = 0x1000           // Deactivate Interrupt Register
+
+// GICC_CTLR bits
+const GICC_CTLR_ENABLE: u32 = 1 << 0
+const GICC_CTLR_ENABLE_GRP0: u32 = 1 << 0
+const GICC_CTLR_ENABLE_GRP1: u32 = 1 << 1
+const GICC_CTLR_ACKCTL: u32 = 1 << 2
+const GICC_CTLR_FIQEN: u32 = 1 << 3
+const GICC_CTLR_CBPR: u32 = 1 << 4
+const GICC_CTLR_EOIMODE: u32 = 1 << 9
+const GICC_CTLR_EOIMODE_NS: u32 = 1 << 10
+
+// =============================================================================
+// Interrupt Numbers
+// =============================================================================
+
+// Interrupt types
+const GIC_SGI_START: u32 = 0       // Software Generated Interrupts (0-15)
+const GIC_SGI_END: u32 = 15
+const GIC_PPI_START: u32 = 16      // Private Peripheral Interrupts (16-31)
+const GIC_PPI_END: u32 = 31
+const GIC_SPI_START: u32 = 32      // Shared Peripheral Interrupts (32+)
+
+// Special interrupt numbers
+const GIC_SPURIOUS_IRQ: u32 = 1023
+
+// Maximum interrupts supported by GIC-400
+const GIC_MAX_IRQS: usize = 256
+
+// BCM2711 Peripheral Interrupts (SPIs)
+const IRQ_TIMER0: u32 = 96
+const IRQ_TIMER1: u32 = 97
+const IRQ_TIMER2: u32 = 98
+const IRQ_TIMER3: u32 = 99
+const IRQ_USB: u32 = 137
+const IRQ_UART0: u32 = 153
+const IRQ_UART2: u32 = 153
+const IRQ_UART3: u32 = 153
+const IRQ_UART4: u32 = 153
+const IRQ_UART5: u32 = 153
+const IRQ_SPI0: u32 = 150
+const IRQ_SPI3: u32 = 150
+const IRQ_SPI4: u32 = 150
+const IRQ_SPI5: u32 = 150
+const IRQ_SPI6: u32 = 150
+const IRQ_I2C0: u32 = 149
+const IRQ_I2C1: u32 = 149
+const IRQ_I2C3: u32 = 149
+const IRQ_I2C4: u32 = 149
+const IRQ_I2C5: u32 = 149
+const IRQ_I2C6: u32 = 149
+const IRQ_I2C7: u32 = 149
+const IRQ_EMMC: u32 = 158
+const IRQ_EMMC2: u32 = 158
+const IRQ_GPIO0: u32 = 145
+const IRQ_GPIO1: u32 = 146
+const IRQ_GPIO2: u32 = 147
+const IRQ_GPIO3: u32 = 148
+const IRQ_ETH: u32 = 157
+const IRQ_PCIE: u32 = 143
+const IRQ_DMA0: u32 = 112
+const IRQ_DMA1: u32 = 113
+const IRQ_DMA2: u32 = 114
+const IRQ_DMA3: u32 = 115
+const IRQ_DMA4: u32 = 116
+const IRQ_DMA5: u32 = 117
+const IRQ_DMA6: u32 = 118
+const IRQ_DMA7: u32 = 119
+const IRQ_DMA8: u32 = 120
+const IRQ_DMA9: u32 = 121
+const IRQ_DMA10: u32 = 122
+const IRQ_DMA11: u32 = 123
+const IRQ_MAILBOX: u32 = 65
+const IRQ_VCHIQ: u32 = 66
+
+// ARM Local Peripheral Interrupts (PPIs)
+const IRQ_CNTPNSIRQ: u32 = 30      // Non-secure physical timer
+const IRQ_CNTHPIRQ: u32 = 26       // Hypervisor timer
+const IRQ_CNTVIRQ: u32 = 27        // Virtual timer
+const IRQ_CNTPSIRQ: u32 = 29       // Secure physical timer
+
+// =============================================================================
+// Interrupt Priority Levels
+// =============================================================================
+
+const GIC_PRIO_HIGHEST: u8 = 0x00
+const GIC_PRIO_HIGH: u8 = 0x40
+const GIC_PRIO_MEDIUM: u8 = 0x80
+const GIC_PRIO_LOW: u8 = 0xC0
+const GIC_PRIO_LOWEST: u8 = 0xF0
+
+// =============================================================================
+// Interrupt Trigger Types
+// =============================================================================
+
+enum IrqTrigger {
+    Level = 0,      // Level-sensitive
+    Edge = 1,       // Edge-triggered
+}
+
+// =============================================================================
+// Interrupt Handler Type
+// =============================================================================
+
+type IrqHandler = fn(irq: u32, ctx: *mut ())
+
+// =============================================================================
+// GIC State
+// =============================================================================
+
+struct IrqDescriptor {
+    handler: Option<IrqHandler>,
+    context: *mut (),
+    enabled: bool,
+    pending: bool,
+    trigger: IrqTrigger,
+    priority: u8,
+    cpu_mask: u8,
+    name: [u8; 32],
+}
+
+struct GicState {
+    gicd_base: u64,
+    gicc_base: u64,
+    max_irqs: u32,
+    num_cpus: u32,
+    gic_version: u8,
+    irq_descriptors: [IrqDescriptor; GIC_MAX_IRQS],
+    lock: Spinlock,
+    irq_counts: [u64; GIC_MAX_IRQS],
+    spurious_count: u64,
+}
+
+static mut GIC: GicState = GicState {
+    gicd_base: 0,
+    gicc_base: 0,
+    max_irqs: 0,
+    num_cpus: 0,
+    gic_version: 2,
+    irq_descriptors: [IrqDescriptor {
+        handler: None,
+        context: 0 as *mut (),
+        enabled: false,
+        pending: false,
+        trigger: IrqTrigger::Level,
+        priority: GIC_PRIO_MEDIUM,
+        cpu_mask: 1,
+        name: [0u8; 32],
+    }; GIC_MAX_IRQS],
+    lock: Spinlock::new(),
+    irq_counts: [0u64; GIC_MAX_IRQS],
+    spurious_count: 0,
+}
+
+// =============================================================================
+// Register Access
+// =============================================================================
+
+fn gicd_read(offset: u64): u32 {
+    unsafe {
+        let addr = GIC.gicd_base + offset
+        let value: u32
+        asm!("ldr {0:w}, [{1}]", out(reg) value, in(reg) addr)
+        return value
+    }
+}
+
+fn gicd_write(offset: u64, value: u32) {
+    unsafe {
+        let addr = GIC.gicd_base + offset
+        asm!("str {0:w}, [{1}]", in(reg) value, in(reg) addr)
+    }
+}
+
+fn gicc_read(offset: u64): u32 {
+    unsafe {
+        let addr = GIC.gicc_base + offset
+        let value: u32
+        asm!("ldr {0:w}, [{1}]", out(reg) value, in(reg) addr)
+        return value
+    }
+}
+
+fn gicc_write(offset: u64, value: u32) {
+    unsafe {
+        let addr = GIC.gicc_base + offset
+        asm!("str {0:w}, [{1}]", in(reg) value, in(reg) addr)
+    }
+}
+
+fn dsb() {
+    asm!("dsb sy")
+}
+
+fn isb() {
+    asm!("isb")
+}
+
+// =============================================================================
+// GIC Initialization
+// =============================================================================
+
+// Initialize GIC controller
+export fn gic_init(gic_base: u64): i32 {
+    unsafe {
+        GIC.gicd_base = gic_base + GICD_OFFSET
+        GIC.gicc_base = gic_base + GICC_OFFSET
+        GIC.lock.init()
+    }
+
+    // Disable distributor
+    gicd_write(GICD_CTLR, 0)
+    dsb()
+
+    // Read GIC configuration
+    let typer = gicd_read(GICD_TYPER)
+    let it_lines = (typer & GICD_TYPER_IT_LINES_MASK) + 1
+    let max_irqs = it_lines * 32
+    let num_cpus = ((typer >> GICD_TYPER_CPU_NUMBER_SHIFT) & GICD_TYPER_CPU_NUMBER_MASK) + 1
+
+    unsafe {
+        GIC.max_irqs = max_irqs
+        GIC.num_cpus = num_cpus
+    }
+
+    // Read GIC version from PIDR2
+    let pidr2 = gicd_read(GICD_PIDR2)
+    let arch_rev = (pidr2 >> 4) & 0xF
+    unsafe {
+        GIC.gic_version = if arch_rev >= 2 { 2 } else { 1 }
+    }
+
+    // Configure all SPIs
+    let spi_regs = (max_irqs - GIC_SPI_START) / 32
+    for i in 0..spi_regs {
+        let reg_offset = i * 4
+
+        // Disable all SPIs
+        gicd_write(GICD_ICENABLER + 4 + reg_offset as u64, 0xFFFFFFFF)
+
+        // Clear pending
+        gicd_write(GICD_ICPENDR + 4 + reg_offset as u64, 0xFFFFFFFF)
+
+        // Set all SPIs to Group 1 (non-secure)
+        gicd_write(GICD_IGROUPR + 4 + reg_offset as u64, 0xFFFFFFFF)
+    }
+
+    // Set default priority for all interrupts
+    for i in 0..(max_irqs / 4) {
+        let offset = (GIC_SPI_START / 4 + i) * 4
+        gicd_write(GICD_IPRIORITYR + offset as u64, 0xA0A0A0A0)
+    }
+
+    // Route all SPIs to CPU 0
+    for i in 0..(max_irqs - GIC_SPI_START) / 4 {
+        let offset = (GIC_SPI_START / 4 + i) * 4
+        gicd_write(GICD_ITARGETSR + offset as u64, 0x01010101)
+    }
+
+    // Configure all SPIs as level-sensitive
+    for i in 0..(max_irqs - GIC_SPI_START) / 16 {
+        let offset = (GIC_SPI_START / 16 + i) * 4
+        gicd_write(GICD_ICFGR + offset as u64, 0)
+    }
+
+    dsb()
+
+    // Enable distributor
+    gicd_write(GICD_CTLR, GICD_CTLR_ENABLE_GRP0 | GICD_CTLR_ENABLE_GRP1)
+
+    dsb()
+    isb()
+
+    return 0
+}
+
+// Initialize CPU interface (call on each CPU)
+export fn gic_cpu_init(): i32 {
+    // Configure PPIs (per-CPU)
+    // Disable all PPIs
+    gicd_write(GICD_ICENABLER, 0xFFFF0000)
+
+    // Clear pending PPIs
+    gicd_write(GICD_ICPENDR, 0xFFFF0000)
+
+    // Set PPIs to Group 1
+    let grp = gicd_read(GICD_IGROUPR)
+    gicd_write(GICD_IGROUPR, grp | 0xFFFF0000)
+
+    // Set PPI priorities
+    for i in 4..8 {  // PPIs are at priority registers 4-7 (IRQs 16-31)
+        gicd_write(GICD_IPRIORITYR + (i * 4) as u64, 0xA0A0A0A0)
+    }
+
+    dsb()
+
+    // Set priority mask (allow all priorities)
+    gicc_write(GICC_PMR, 0xFF)
+
+    // Set binary point
+    gicc_write(GICC_BPR, 0)
+
+    // Enable CPU interface
+    gicc_write(GICC_CTLR, GICC_CTLR_ENABLE_GRP0 | GICC_CTLR_ENABLE_GRP1)
+
+    dsb()
+    isb()
+
+    return 0
+}
+
+// =============================================================================
+// Interrupt Control
+// =============================================================================
+
+// Enable an interrupt
+export fn gic_enable_irq(irq: u32): i32 {
+    if irq >= GIC_MAX_IRQS as u32 {
+        return -1
+    }
+
+    let reg = irq / 32
+    let bit = 1u32 << (irq % 32)
+
+    gicd_write(GICD_ISENABLER + (reg * 4) as u64, bit)
+    dsb()
+
+    unsafe {
+        GIC.irq_descriptors[irq as usize].enabled = true
+    }
+
+    return 0
+}
+
+// Disable an interrupt
+export fn gic_disable_irq(irq: u32): i32 {
+    if irq >= GIC_MAX_IRQS as u32 {
+        return -1
+    }
+
+    let reg = irq / 32
+    let bit = 1u32 << (irq % 32)
+
+    gicd_write(GICD_ICENABLER + (reg * 4) as u64, bit)
+    dsb()
+
+    unsafe {
+        GIC.irq_descriptors[irq as usize].enabled = false
+    }
+
+    return 0
+}
+
+// Set interrupt priority
+export fn gic_set_priority(irq: u32, priority: u8): i32 {
+    if irq >= GIC_MAX_IRQS as u32 {
+        return -1
+    }
+
+    let reg = irq / 4
+    let offset = (irq % 4) * 8
+    let mask = 0xFFu32 << offset
+
+    let val = gicd_read(GICD_IPRIORITYR + (reg * 4) as u64)
+    gicd_write(GICD_IPRIORITYR + (reg * 4) as u64, (val & !mask) | ((priority as u32) << offset))
+
+    unsafe {
+        GIC.irq_descriptors[irq as usize].priority = priority
+    }
+
+    return 0
+}
+
+// Set interrupt target CPUs
+export fn gic_set_target(irq: u32, cpu_mask: u8): i32 {
+    if irq < GIC_SPI_START || irq >= GIC_MAX_IRQS as u32 {
+        return -1  // Only valid for SPIs
+    }
+
+    let reg = irq / 4
+    let offset = (irq % 4) * 8
+    let mask = 0xFFu32 << offset
+
+    let val = gicd_read(GICD_ITARGETSR + (reg * 4) as u64)
+    gicd_write(GICD_ITARGETSR + (reg * 4) as u64, (val & !mask) | ((cpu_mask as u32) << offset))
+
+    unsafe {
+        GIC.irq_descriptors[irq as usize].cpu_mask = cpu_mask
+    }
+
+    return 0
+}
+
+// Set interrupt trigger type
+export fn gic_set_trigger(irq: u32, trigger: IrqTrigger): i32 {
+    if irq < GIC_PPI_START || irq >= GIC_MAX_IRQS as u32 {
+        return -1  // Only valid for PPIs and SPIs
+    }
+
+    let reg = irq / 16
+    let offset = ((irq % 16) * 2) + 1  // Configuration is in bits [2n+1]
+    let mask = 1u32 << offset
+
+    let val = gicd_read(GICD_ICFGR + (reg * 4) as u64)
+    let new_val = match trigger {
+        IrqTrigger::Level => val & !mask,
+        IrqTrigger::Edge => val | mask,
+    }
+    gicd_write(GICD_ICFGR + (reg * 4) as u64, new_val)
+
+    unsafe {
+        GIC.irq_descriptors[irq as usize].trigger = trigger
+    }
+
+    return 0
+}
+
+// Check if interrupt is pending
+export fn gic_is_pending(irq: u32): bool {
+    if irq >= GIC_MAX_IRQS as u32 {
+        return false
+    }
+
+    let reg = irq / 32
+    let bit = 1u32 << (irq % 32)
+
+    return (gicd_read(GICD_ISPENDR + (reg * 4) as u64) & bit) != 0
+}
+
+// Set interrupt pending
+export fn gic_set_pending(irq: u32) {
+    if irq >= GIC_MAX_IRQS as u32 {
+        return
+    }
+
+    let reg = irq / 32
+    let bit = 1u32 << (irq % 32)
+
+    gicd_write(GICD_ISPENDR + (reg * 4) as u64, bit)
+}
+
+// Clear interrupt pending
+export fn gic_clear_pending(irq: u32) {
+    if irq >= GIC_MAX_IRQS as u32 {
+        return
+    }
+
+    let reg = irq / 32
+    let bit = 1u32 << (irq % 32)
+
+    gicd_write(GICD_ICPENDR + (reg * 4) as u64, bit)
+}
+
+// =============================================================================
+// Interrupt Handling
+// =============================================================================
+
+// Register interrupt handler
+export fn gic_register_handler(irq: u32, handler: IrqHandler, ctx: *mut ()): i32 {
+    if irq >= GIC_MAX_IRQS as u32 {
+        return -1
+    }
+
+    unsafe {
+        GIC.lock.lock()
+        GIC.irq_descriptors[irq as usize].handler = Some(handler)
+        GIC.irq_descriptors[irq as usize].context = ctx
+        GIC.lock.unlock()
+    }
+
+    return 0
+}
+
+// Unregister interrupt handler
+export fn gic_unregister_handler(irq: u32) {
+    if irq >= GIC_MAX_IRQS as u32 {
+        return
+    }
+
+    gic_disable_irq(irq)
+
+    unsafe {
+        GIC.lock.lock()
+        GIC.irq_descriptors[irq as usize].handler = None
+        GIC.irq_descriptors[irq as usize].context = 0 as *mut ()
+        GIC.lock.unlock()
+    }
+}
+
+// Acknowledge interrupt and get IRQ number
+export fn gic_ack_irq(): u32 {
+    return gicc_read(GICC_IAR)
+}
+
+// Signal end of interrupt
+export fn gic_eoi(irq: u32) {
+    gicc_write(GICC_EOIR, irq)
+}
+
+// Main IRQ handler (called from exception vector)
+export fn gic_handle_irq() {
+    loop {
+        let iar = gic_ack_irq()
+        let irq = iar & 0x3FF
+
+        if irq >= GIC_SPURIOUS_IRQ {
+            // Spurious interrupt
+            unsafe {
+                GIC.spurious_count += 1
+            }
+            break
+        }
+
+        if irq >= GIC_MAX_IRQS as u32 {
+            gic_eoi(iar)
+            continue
+        }
+
+        unsafe {
+            GIC.irq_counts[irq as usize] += 1
+
+            let desc = &GIC.irq_descriptors[irq as usize]
+            if let Some(handler) = desc.handler {
+                handler(irq, desc.context)
+            }
+        }
+
+        gic_eoi(iar)
+    }
+}
+
+// =============================================================================
+// Software Generated Interrupts (SGIs)
+// =============================================================================
+
+// Send SGI to specific CPUs
+export fn gic_send_sgi(sgi: u32, target_list: u8, filter: u8) {
+    if sgi > 15 {
+        return
+    }
+
+    // SGIR format:
+    // [25:24] - Target list filter
+    // [23:16] - CPU target list
+    // [15] - NSATT (non-secure)
+    // [3:0] - SGI interrupt ID
+
+    let sgir = (filter as u32 & 0x3) << 24 |
+               (target_list as u32) << 16 |
+               (sgi & 0xF)
+
+    gicd_write(GICD_SGIR, sgir)
+}
+
+// Send SGI to all other CPUs
+export fn gic_send_sgi_others(sgi: u32) {
+    gic_send_sgi(sgi, 0, 1)  // Filter 1 = all except self
+}
+
+// Send SGI to self
+export fn gic_send_sgi_self(sgi: u32) {
+    gic_send_sgi(sgi, 0, 2)  // Filter 2 = self only
+}
+
+// =============================================================================
+// CPU Interface Control
+// =============================================================================
+
+// Set priority mask
+export fn gic_set_priority_mask(priority: u8) {
+    gicc_write(GICC_PMR, priority as u32)
+}
+
+// Get current running priority
+export fn gic_get_running_priority(): u8 {
+    return (gicc_read(GICC_RPR) & 0xFF) as u8
+}
+
+// Get highest pending interrupt
+export fn gic_get_highest_pending(): u32 {
+    return gicc_read(GICC_HPPIR) & 0x3FF
+}
+
+// =============================================================================
+// Statistics
+// =============================================================================
+
+export fn gic_get_irq_count(irq: u32): u64 {
+    if irq >= GIC_MAX_IRQS as u32 {
+        return 0
+    }
+    unsafe {
+        return GIC.irq_counts[irq as usize]
+    }
+}
+
+export fn gic_get_spurious_count(): u64 {
+    unsafe {
+        return GIC.spurious_count
+    }
+}
+
+export fn gic_get_max_irqs(): u32 {
+    unsafe {
+        return GIC.max_irqs
+    }
+}
+
+export fn gic_get_num_cpus(): u32 {
+    unsafe {
+        return GIC.num_cpus
+    }
+}

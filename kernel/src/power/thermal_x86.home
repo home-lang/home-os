@@ -1,0 +1,669 @@
+// home-os Thermal Management for x86-64
+// CPU thermal monitoring, throttling, and cooling control
+
+import "../core/types"
+import "../sync/spinlock"
+
+// =============================================================================
+// Thermal MSRs
+// =============================================================================
+
+// Intel Thermal MSRs
+const MSR_IA32_THERM_STATUS: u32 = 0x19C
+const MSR_IA32_THERM_INTERRUPT: u32 = 0x19B
+const MSR_IA32_PACKAGE_THERM_STATUS: u32 = 0x1B1
+const MSR_IA32_PACKAGE_THERM_INTERRUPT: u32 = 0x1B2
+const MSR_TEMPERATURE_TARGET: u32 = 0x1A2
+const MSR_IA32_THERM_CONTROL: u32 = 0x19A
+
+// AMD Thermal MSRs
+const MSR_AMD_HARDWARE_THERMAL_CTRL: u32 = 0xC0010015
+const MSR_AMD_REPORTED_TEMP_CTRL: u32 = 0xC0010419
+
+// Thermal Status bits
+const THERM_STATUS_PROCHOT: u32 = 1 << 0
+const THERM_STATUS_PROCHOT_LOG: u32 = 1 << 1
+const THERM_STATUS_CRIT_TEMP: u32 = 1 << 4
+const THERM_STATUS_CRIT_TEMP_LOG: u32 = 1 << 5
+const THERM_STATUS_THRESHOLD1: u32 = 1 << 6
+const THERM_STATUS_THRESHOLD1_LOG: u32 = 1 << 7
+const THERM_STATUS_THRESHOLD2: u32 = 1 << 8
+const THERM_STATUS_THRESHOLD2_LOG: u32 = 1 << 9
+const THERM_STATUS_POWER_LIMIT: u32 = 1 << 10
+const THERM_STATUS_READING_VALID: u32 = 1 << 31
+
+// Thermal Interrupt bits
+const THERM_INT_HIGH_TEMP: u32 = 1 << 0
+const THERM_INT_LOW_TEMP: u32 = 1 << 1
+const THERM_INT_PROCHOT: u32 = 1 << 2
+const THERM_INT_CRITICAL: u32 = 1 << 4
+const THERM_INT_THRESHOLD1: u32 = 1 << 8
+const THERM_INT_THRESHOLD2: u32 = 1 << 9
+
+// =============================================================================
+// Temperature Thresholds (Celsius)
+// =============================================================================
+
+const TEMP_TARGET_DEFAULT: i32 = 100    // TjMax default
+const TEMP_WARNING: i32 = 80
+const TEMP_HIGH: i32 = 90
+const TEMP_CRITICAL: i32 = 95
+const TEMP_EMERGENCY: i32 = 100
+
+// =============================================================================
+// Thermal Zones
+// =============================================================================
+
+enum ThermalZone {
+    Normal,
+    Warning,
+    High,
+    Critical,
+    Emergency,
+}
+
+// =============================================================================
+// Cooling Policies
+// =============================================================================
+
+enum CoolingPolicy {
+    Passive,        // Throttle CPU
+    Active,         // Increase fan speed
+    Hybrid,         // Both
+}
+
+// Throttle levels (percentage of max frequency)
+const THROTTLE_NONE: u8 = 100
+const THROTTLE_LIGHT: u8 = 80
+const THROTTLE_MEDIUM: u8 = 60
+const THROTTLE_HEAVY: u8 = 40
+const THROTTLE_EXTREME: u8 = 20
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+const MAX_CPUS: usize = 256
+const MAX_THERMAL_ZONES: usize = 8
+const MAX_COOLING_DEVICES: usize = 16
+const TEMP_HISTORY_SIZE: usize = 16
+
+struct ThermalSensor {
+    cpu_id: u32,
+    tj_max: i32,                // Maximum junction temperature
+    current_temp: i32,          // Current temperature in Celsius
+    current_zone: ThermalZone,
+    throttled: bool,
+    throttle_level: u8,
+    temp_history: [i32; TEMP_HISTORY_SIZE],
+    history_index: usize,
+    prochot_active: bool,
+    critical_logged: bool,
+}
+
+struct PackageThermal {
+    package_id: u32,
+    tj_max: i32,
+    current_temp: i32,
+    current_zone: ThermalZone,
+    power_limit_throttled: bool,
+}
+
+enum CoolingDeviceType {
+    Fan,
+    Peltier,
+    LiquidCooling,
+    Passive,
+}
+
+struct CoolingDevice {
+    id: u32,
+    device_type: CoolingDeviceType,
+    max_state: u32,
+    current_state: u32,
+    enabled: bool,
+}
+
+struct ThermalState {
+    // Per-CPU thermal sensors
+    sensors: [Option<ThermalSensor>; MAX_CPUS],
+    sensor_count: usize,
+
+    // Package thermal
+    packages: [Option<PackageThermal>; 8],
+    package_count: usize,
+
+    // Cooling devices
+    cooling_devices: [Option<CoolingDevice>; MAX_COOLING_DEVICES],
+    cooling_device_count: usize,
+
+    // Global settings
+    policy: CoolingPolicy,
+    warning_threshold: i32,
+    high_threshold: i32,
+    critical_threshold: i32,
+
+    // Statistics
+    total_throttle_events: u64,
+    max_temp_seen: i32,
+    time_in_throttle: u64,
+
+    lock: Spinlock,
+}
+
+static mut THERMAL: ThermalState = ThermalState {
+    sensors: [None; MAX_CPUS],
+    sensor_count: 0,
+    packages: [None; 8],
+    package_count: 0,
+    cooling_devices: [None; MAX_COOLING_DEVICES],
+    cooling_device_count: 0,
+    policy: CoolingPolicy::Hybrid,
+    warning_threshold: TEMP_WARNING,
+    high_threshold: TEMP_HIGH,
+    critical_threshold: TEMP_CRITICAL,
+    total_throttle_events: 0,
+    max_temp_seen: 0,
+    time_in_throttle: 0,
+    lock: Spinlock::new(),
+}
+
+// =============================================================================
+// MSR Access
+// =============================================================================
+
+fn rdmsr(msr: u32): u64 {
+    let lo: u32
+    let hi: u32
+    asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi)
+    return ((hi as u64) << 32) | (lo as u64)
+}
+
+fn wrmsr(msr: u32, value: u64) {
+    let lo = value as u32
+    let hi = (value >> 32) as u32
+    asm!("wrmsr", in("ecx") msr, in("eax") lo, in("edx") hi)
+}
+
+fn cpuid(leaf: u32): (u32, u32, u32, u32) {
+    let eax: u32
+    let ebx: u32
+    let ecx: u32
+    let edx: u32
+    asm!("cpuid", inout("eax") leaf => eax, out("ebx") ebx, lateout("ecx") ecx, out("edx") edx)
+    return (eax, ebx, ecx, edx)
+}
+
+// =============================================================================
+// CPU Detection
+// =============================================================================
+
+fn is_intel(): bool {
+    let (_, ebx, ecx, edx) = cpuid(0)
+    return ebx == 0x756E6547 && edx == 0x49656E69 && ecx == 0x6C65746E
+}
+
+fn is_amd(): bool {
+    let (_, ebx, ecx, edx) = cpuid(0)
+    return ebx == 0x68747541 && edx == 0x69746E65 && ecx == 0x444D4163
+}
+
+fn has_digital_thermal_sensor(): bool {
+    let (eax, _, _, _) = cpuid(6)
+    return (eax & 1) != 0
+}
+
+fn has_package_thermal(): bool {
+    let (eax, _, _, _) = cpuid(6)
+    return (eax & (1 << 6)) != 0
+}
+
+// =============================================================================
+// Temperature Reading
+// =============================================================================
+
+fn get_tj_max(): i32 {
+    if is_intel() {
+        let target = rdmsr(MSR_TEMPERATURE_TARGET)
+        let tj_max = ((target >> 16) & 0xFF) as i32
+        if tj_max > 0 && tj_max <= 120 {
+            return tj_max
+        }
+    }
+    return TEMP_TARGET_DEFAULT
+}
+
+fn read_intel_core_temp(tj_max: i32): (i32, bool, bool) {
+    let status = rdmsr(MSR_IA32_THERM_STATUS) as u32
+
+    let valid = (status & THERM_STATUS_READING_VALID) != 0
+    if !valid {
+        return (0, false, false)
+    }
+
+    let offset = ((status >> 16) & 0x7F) as i32
+    let temp = tj_max - offset
+
+    let prochot = (status & THERM_STATUS_PROCHOT) != 0
+    let critical = (status & THERM_STATUS_CRIT_TEMP) != 0
+
+    return (temp, prochot, critical)
+}
+
+fn read_intel_package_temp(tj_max: i32): (i32, bool) {
+    let status = rdmsr(MSR_IA32_PACKAGE_THERM_STATUS) as u32
+
+    let valid = (status & THERM_STATUS_READING_VALID) != 0
+    if !valid {
+        return (0, false)
+    }
+
+    let offset = ((status >> 16) & 0x7F) as i32
+    let temp = tj_max - offset
+
+    let power_limit = (status & THERM_STATUS_POWER_LIMIT) != 0
+
+    return (temp, power_limit)
+}
+
+fn read_amd_temp(): i32 {
+    // AMD uses different method depending on family
+    let status = rdmsr(MSR_AMD_REPORTED_TEMP_CTRL)
+    let temp = ((status >> 21) & 0x7FF) as i32
+
+    // Temperature is in 0.125°C increments
+    return temp / 8
+}
+
+// =============================================================================
+// Thermal Zone Determination
+// =============================================================================
+
+fn determine_zone(temp: i32): ThermalZone {
+    unsafe {
+        if temp >= THERMAL.critical_threshold {
+            return ThermalZone::Critical
+        } else if temp >= THERMAL.high_threshold {
+            return ThermalZone::High
+        } else if temp >= THERMAL.warning_threshold {
+            return ThermalZone::Warning
+        }
+        return ThermalZone::Normal
+    }
+}
+
+fn get_throttle_level(zone: ThermalZone): u8 {
+    match zone {
+        ThermalZone::Normal => THROTTLE_NONE,
+        ThermalZone::Warning => THROTTLE_LIGHT,
+        ThermalZone::High => THROTTLE_MEDIUM,
+        ThermalZone::Critical => THROTTLE_HEAVY,
+        ThermalZone::Emergency => THROTTLE_EXTREME,
+    }
+}
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+export fn thermal_init(): i32 {
+    unsafe { THERMAL.lock.init() }
+
+    if !has_digital_thermal_sensor() {
+        return -1  // No thermal sensor support
+    }
+
+    let tj_max = get_tj_max()
+
+    // Initialize per-CPU sensors (for CPU 0)
+    unsafe {
+        THERMAL.sensors[0] = Some(ThermalSensor {
+            cpu_id: 0,
+            tj_max: tj_max,
+            current_temp: 0,
+            current_zone: ThermalZone::Normal,
+            throttled: false,
+            throttle_level: THROTTLE_NONE,
+            temp_history: [0i32; TEMP_HISTORY_SIZE],
+            history_index: 0,
+            prochot_active: false,
+            critical_logged: false,
+        })
+        THERMAL.sensor_count = 1
+
+        // Initialize package thermal if supported
+        if has_package_thermal() {
+            THERMAL.packages[0] = Some(PackageThermal {
+                package_id: 0,
+                tj_max: tj_max,
+                current_temp: 0,
+                current_zone: ThermalZone::Normal,
+                power_limit_throttled: false,
+            })
+            THERMAL.package_count = 1
+        }
+    }
+
+    // Enable thermal interrupts
+    enable_thermal_interrupts()
+
+    return 0
+}
+
+fn enable_thermal_interrupts() {
+    // Set threshold temperatures
+    let tj_max = get_tj_max()
+    let threshold1_offset = tj_max - TEMP_WARNING
+    let threshold2_offset = tj_max - TEMP_HIGH
+
+    // Configure thermal interrupt
+    let mut int_config = rdmsr(MSR_IA32_THERM_INTERRUPT)
+
+    // Enable high temp and threshold interrupts
+    int_config |= (THERM_INT_HIGH_TEMP | THERM_INT_THRESHOLD1 | THERM_INT_THRESHOLD2 | THERM_INT_CRITICAL) as u64
+
+    // Set thresholds
+    int_config &= !((0x7F << 8) | (0x7F << 16))
+    int_config |= ((threshold1_offset as u64) << 8) | ((threshold2_offset as u64) << 16)
+
+    wrmsr(MSR_IA32_THERM_INTERRUPT, int_config)
+}
+
+// =============================================================================
+// Thermal Monitoring
+// =============================================================================
+
+// Called periodically to update thermal state
+export fn thermal_update(): i32 {
+    unsafe {
+        THERMAL.lock.lock()
+
+        // Update per-CPU temperatures
+        for i in 0..THERMAL.sensor_count {
+            if let Some(ref mut sensor) = THERMAL.sensors[i] {
+                let (temp, prochot, critical) = if is_intel() {
+                    read_intel_core_temp(sensor.tj_max)
+                } else if is_amd() {
+                    (read_amd_temp(), false, false)
+                } else {
+                    (0, false, false)
+                }
+
+                sensor.current_temp = temp
+                sensor.prochot_active = prochot
+
+                // Update history
+                sensor.temp_history[sensor.history_index] = temp
+                sensor.history_index = (sensor.history_index + 1) % TEMP_HISTORY_SIZE
+
+                // Update zone and throttle
+                let old_zone = sensor.current_zone
+                sensor.current_zone = determine_zone(temp)
+
+                let new_throttle = get_throttle_level(sensor.current_zone)
+                if new_throttle != sensor.throttle_level {
+                    apply_throttle(sensor.cpu_id, new_throttle)
+                    sensor.throttle_level = new_throttle
+                    sensor.throttled = new_throttle < THROTTLE_NONE
+
+                    if sensor.throttled {
+                        THERMAL.total_throttle_events += 1
+                    }
+                }
+
+                // Update max temp
+                if temp > THERMAL.max_temp_seen {
+                    THERMAL.max_temp_seen = temp
+                }
+
+                // Handle critical temperature
+                if critical && !sensor.critical_logged {
+                    sensor.critical_logged = true
+                    // Log critical temperature event
+                }
+            }
+        }
+
+        // Update package temperature
+        for i in 0..THERMAL.package_count {
+            if let Some(ref mut pkg) = THERMAL.packages[i] {
+                let (temp, power_limit) = read_intel_package_temp(pkg.tj_max)
+                pkg.current_temp = temp
+                pkg.power_limit_throttled = power_limit
+                pkg.current_zone = determine_zone(temp)
+            }
+        }
+
+        // Update cooling devices based on temperature
+        update_cooling()
+
+        THERMAL.lock.unlock()
+    }
+
+    return 0
+}
+
+fn apply_throttle(cpu: u32, level: u8) {
+    // Use cpufreq to set frequency limit
+    // level is percentage of max frequency
+    extern fn cpufreq_x86_get_limits(cpu: u32): (u64, u64)
+    extern fn cpufreq_x86_set_freq(cpu: u32, freq: u64): i32
+
+    let (min_freq, max_freq) = cpufreq_x86_get_limits(cpu)
+    let target_freq = min_freq + (max_freq - min_freq) * level as u64 / 100
+
+    cpufreq_x86_set_freq(cpu, target_freq)
+}
+
+fn update_cooling() {
+    // Get max temperature across all sensors
+    let mut max_temp: i32 = 0
+
+    unsafe {
+        for i in 0..THERMAL.sensor_count {
+            if let Some(ref sensor) = THERMAL.sensors[i] {
+                if sensor.current_temp > max_temp {
+                    max_temp = sensor.current_temp
+                }
+            }
+        }
+
+        // Adjust cooling devices based on temperature
+        for i in 0..THERMAL.cooling_device_count {
+            if let Some(ref mut device) = THERMAL.cooling_devices[i] {
+                if !device.enabled {
+                    continue
+                }
+
+                // Calculate target state based on temperature
+                let temp_range = THERMAL.critical_threshold - THERMAL.warning_threshold
+                let temp_above_warning = (max_temp - THERMAL.warning_threshold).max(0)
+                let ratio = (temp_above_warning * device.max_state as i32 / temp_range).min(device.max_state as i32) as u32
+
+                device.current_state = ratio
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Thermal Interrupt Handler
+// =============================================================================
+
+export fn thermal_interrupt_handler() {
+    // Clear interrupt status
+    let status = rdmsr(MSR_IA32_THERM_STATUS)
+    wrmsr(MSR_IA32_THERM_STATUS, status)
+
+    // Update thermal state
+    thermal_update()
+}
+
+// =============================================================================
+// Cooling Device Management
+// =============================================================================
+
+export fn thermal_register_cooling_device(
+    device_type: CoolingDeviceType,
+    max_state: u32
+): i32 {
+    unsafe {
+        if THERMAL.cooling_device_count >= MAX_COOLING_DEVICES {
+            return -1
+        }
+
+        let id = THERMAL.cooling_device_count as u32
+
+        THERMAL.cooling_devices[THERMAL.cooling_device_count] = Some(CoolingDevice {
+            id: id,
+            device_type: device_type,
+            max_state: max_state,
+            current_state: 0,
+            enabled: true,
+        })
+
+        THERMAL.cooling_device_count += 1
+        return id as i32
+    }
+}
+
+export fn thermal_set_cooling_state(device_id: u32, state: u32): i32 {
+    unsafe {
+        if device_id as usize >= THERMAL.cooling_device_count {
+            return -1
+        }
+
+        if let Some(ref mut device) = THERMAL.cooling_devices[device_id as usize] {
+            device.current_state = state.min(device.max_state)
+            return 0
+        }
+        return -1
+    }
+}
+
+// =============================================================================
+// Query Functions
+// =============================================================================
+
+export fn thermal_get_temp(cpu: u32): i32 {
+    unsafe {
+        if cpu as usize >= THERMAL.sensor_count {
+            return 0
+        }
+        match &THERMAL.sensors[cpu as usize] {
+            Some(s) => s.current_temp,
+            None => 0,
+        }
+    }
+}
+
+export fn thermal_get_zone(cpu: u32): ThermalZone {
+    unsafe {
+        if cpu as usize >= THERMAL.sensor_count {
+            return ThermalZone::Normal
+        }
+        match &THERMAL.sensors[cpu as usize] {
+            Some(s) => s.current_zone,
+            None => ThermalZone::Normal,
+        }
+    }
+}
+
+export fn thermal_get_package_temp(package: u32): i32 {
+    unsafe {
+        if package as usize >= THERMAL.package_count {
+            return 0
+        }
+        match &THERMAL.packages[package as usize] {
+            Some(p) => p.current_temp,
+            None => 0,
+        }
+    }
+}
+
+export fn thermal_is_throttled(cpu: u32): bool {
+    unsafe {
+        if cpu as usize >= THERMAL.sensor_count {
+            return false
+        }
+        match &THERMAL.sensors[cpu as usize] {
+            Some(s) => s.throttled,
+            None => false,
+        }
+    }
+}
+
+export fn thermal_get_throttle_count(): u64 {
+    unsafe { THERMAL.total_throttle_events }
+}
+
+export fn thermal_get_max_temp(): i32 {
+    unsafe { THERMAL.max_temp_seen }
+}
+
+export fn thermal_get_tj_max(cpu: u32): i32 {
+    unsafe {
+        if cpu as usize >= THERMAL.sensor_count {
+            return TEMP_TARGET_DEFAULT
+        }
+        match &THERMAL.sensors[cpu as usize] {
+            Some(s) => s.tj_max,
+            None => TEMP_TARGET_DEFAULT,
+        }
+    }
+}
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+export fn thermal_set_policy(policy: CoolingPolicy) {
+    unsafe { THERMAL.policy = policy }
+}
+
+export fn thermal_set_thresholds(warning: i32, high: i32, critical: i32) {
+    unsafe {
+        THERMAL.warning_threshold = warning
+        THERMAL.high_threshold = high
+        THERMAL.critical_threshold = critical
+    }
+}
+
+export fn thermal_get_temp_history(cpu: u32): &[i32; TEMP_HISTORY_SIZE] {
+    unsafe {
+        static DEFAULT: [i32; TEMP_HISTORY_SIZE] = [0i32; TEMP_HISTORY_SIZE]
+        if cpu as usize >= THERMAL.sensor_count {
+            return &DEFAULT
+        }
+        match &THERMAL.sensors[cpu as usize] {
+            Some(s) => &s.temp_history,
+            None => &DEFAULT,
+        }
+    }
+}
+
+// =============================================================================
+// Average Temperature
+// =============================================================================
+
+export fn thermal_get_avg_temp(cpu: u32): i32 {
+    unsafe {
+        if cpu as usize >= THERMAL.sensor_count {
+            return 0
+        }
+        match &THERMAL.sensors[cpu as usize] {
+            Some(s) => {
+                let mut sum: i32 = 0
+                let mut count = 0
+                for t in &s.temp_history {
+                    if *t > 0 {
+                        sum += *t
+                        count += 1
+                    }
+                }
+                if count > 0 { sum / count } else { 0 }
+            },
+            None => 0,
+        }
+    }
+}
