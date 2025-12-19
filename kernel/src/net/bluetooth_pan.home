@@ -1,0 +1,1293 @@
+// HomeOS Bluetooth PAN (Personal Area Network) Implementation
+// BNEP (Bluetooth Network Encapsulation Protocol) support
+//
+// Features:
+// - PAN User (PANU) role
+// - Network Access Point (NAP) role
+// - Group Ad-hoc Network (GN) role
+// - BNEP protocol implementation
+// - Ethernet frame encapsulation over Bluetooth
+// - Network bridge integration
+// - DHCP support
+// - Multiple concurrent connections
+
+const std = @import("std")
+const bluetooth = @import("bluetooth")
+const net = @import("net")
+const l2cap = @import("bluetooth_l2cap")
+
+// ============================================
+// Constants
+// ============================================
+
+// BNEP PSM
+pub const BNEP_PSM: u16 = 0x000F
+
+// BNEP Packet Types
+pub const BNEP_GENERAL_ETHERNET: u8 = 0x00
+pub const BNEP_CONTROL: u8 = 0x01
+pub const BNEP_COMPRESSED_ETHERNET: u8 = 0x02
+pub const BNEP_COMPRESSED_ETHERNET_SRC_ONLY: u8 = 0x03
+pub const BNEP_COMPRESSED_ETHERNET_DEST_ONLY: u8 = 0x04
+
+// BNEP Control Types
+pub const BNEP_CONTROL_COMMAND_NOT_UNDERSTOOD: u8 = 0x00
+pub const BNEP_SETUP_CONNECTION_REQUEST: u8 = 0x01
+pub const BNEP_SETUP_CONNECTION_RESPONSE: u8 = 0x02
+pub const BNEP_FILTER_NET_TYPE_SET: u8 = 0x03
+pub const BNEP_FILTER_NET_TYPE_RESPONSE: u8 = 0x04
+pub const BNEP_FILTER_MULTI_ADDR_SET: u8 = 0x05
+pub const BNEP_FILTER_MULTI_ADDR_RESPONSE: u8 = 0x06
+
+// BNEP Setup Response Codes
+pub const BNEP_SETUP_SUCCESS: u16 = 0x0000
+pub const BNEP_SETUP_INVALID_DEST_UUID: u16 = 0x0001
+pub const BNEP_SETUP_INVALID_SRC_UUID: u16 = 0x0002
+pub const BNEP_SETUP_INVALID_UUID_SIZE: u16 = 0x0003
+pub const BNEP_SETUP_NOT_ALLOWED: u16 = 0x0004
+
+// BNEP Filter Response Codes
+pub const BNEP_FILTER_SUCCESS: u16 = 0x0000
+pub const BNEP_FILTER_UNSUPPORTED: u16 = 0x0001
+pub const BNEP_FILTER_INVALID_RANGE: u16 = 0x0002
+pub const BNEP_FILTER_TOO_MANY: u16 = 0x0003
+pub const BNEP_FILTER_SECURITY_FAILURE: u16 = 0x0004
+
+// PAN UUIDs
+pub const UUID_PANU: u16 = 0x1115
+pub const UUID_NAP: u16 = 0x1116
+pub const UUID_GN: u16 = 0x1117
+
+// Max connections
+pub const MAX_PAN_CONNECTIONS: usize = 7
+
+// ============================================
+// PAN Roles
+// ============================================
+
+pub const PanRole = enum {
+    PANU     // PAN User - connects to NAP/GN
+    NAP      // Network Access Point - provides network access
+    GN       // Group Ad-hoc Network - peer-to-peer networking
+}
+
+// ============================================
+// Connection State
+// ============================================
+
+pub const ConnectionState = enum {
+    DISCONNECTED
+    CONNECTING
+    CONNECTED
+    DISCONNECTING
+}
+
+// ============================================
+// BNEP Extension Header
+// ============================================
+
+pub const BnepExtension = struct {
+    has_extension: bool
+    extension_type: u8
+    length: u8
+    data: [128]u8
+}
+
+// ============================================
+// Network Type Filter
+// ============================================
+
+pub const NetworkTypeFilter = struct {
+    start: u16
+    end: u16
+
+    pub fn matches(self: *const NetworkTypeFilter, protocol: u16): bool {
+        return protocol >= self.start and protocol <= self.end
+    }
+}
+
+// ============================================
+// Multicast Address Filter
+// ============================================
+
+pub const MulticastFilter = struct {
+    start: [6]u8
+    end: [6]u8
+
+    pub fn matches(self: *const MulticastFilter, addr: [6]u8): bool {
+        return std.mem.order(u8, &addr, &self.start) != .lt and
+               std.mem.order(u8, &addr, &self.end) != .gt
+    }
+}
+
+// ============================================
+// PAN Connection
+// ============================================
+
+pub const PanConnection = struct {
+    // Connection state
+    state: ConnectionState
+    role: PanRole
+    remote_role: PanRole
+
+    // L2CAP channel
+    l2cap_channel: i32
+    l2cap_mtu: u16
+
+    // Remote device
+    remote_addr: [6]u8
+    local_addr: [6]u8
+
+    // Filters
+    net_type_filters: [16]NetworkTypeFilter
+    net_type_filter_count: usize
+    multicast_filters: [16]MulticastFilter
+    multicast_filter_count: usize
+
+    // Statistics
+    rx_bytes: u64
+    tx_bytes: u64
+    rx_packets: u64
+    tx_packets: u64
+    rx_errors: u64
+    tx_errors: u64
+
+    // Connection time
+    connected_time: u64
+
+    pub fn init(): PanConnection {
+        var conn: PanConnection = undefined
+        conn.state = .DISCONNECTED
+        conn.role = .PANU
+        conn.remote_role = .NAP
+        conn.l2cap_channel = -1
+        conn.l2cap_mtu = 1691  // Default BNEP MTU
+        @memset(&conn.remote_addr, 0)
+        @memset(&conn.local_addr, 0)
+        conn.net_type_filters = [_]NetworkTypeFilter{NetworkTypeFilter{ .start = 0, .end = 0 }} ** 16
+        conn.net_type_filter_count = 0
+        conn.multicast_filters = [_]MulticastFilter{MulticastFilter{ .start = [_]u8{0} ** 6, .end = [_]u8{0} ** 6 }} ** 16
+        conn.multicast_filter_count = 0
+        conn.rx_bytes = 0
+        conn.tx_bytes = 0
+        conn.rx_packets = 0
+        conn.tx_packets = 0
+        conn.rx_errors = 0
+        conn.tx_errors = 0
+        conn.connected_time = 0
+        return conn
+    }
+}
+
+// ============================================
+// Bluetooth PAN Manager
+// ============================================
+
+pub const BluetoothPanManager = struct {
+    // Local configuration
+    role: PanRole
+    local_addr: [6]u8
+    device_name: [64]u8
+    device_name_len: usize
+
+    // Connections
+    connections: [MAX_PAN_CONNECTIONS]PanConnection
+    connection_count: usize
+
+    // Network interface
+    interface_name: [16]u8
+    interface_up: bool
+
+    // Bridge (for NAP mode)
+    bridge_name: [16]u8
+    bridge_enabled: bool
+
+    // DHCP settings (for NAP mode)
+    dhcp_enabled: bool
+    gateway_ip: [4]u8
+    subnet_mask: [4]u8
+    dhcp_start: [4]u8
+    dhcp_end: [4]u8
+
+    // L2CAP socket
+    l2cap_socket: i32
+
+    // State
+    running: bool
+
+    // Callbacks
+    on_connection: ?fn(*PanConnection) void
+    on_disconnection: ?fn(*PanConnection) void
+    on_data: ?fn(*PanConnection, []const u8) void
+
+    // Statistics
+    total_connections: u64
+
+    pub fn init(role: PanRole): BluetoothPanManager {
+        var mgr: BluetoothPanManager = undefined
+        mgr.role = role
+        @memset(&mgr.local_addr, 0)
+        @memset(&mgr.device_name, 0)
+        mgr.device_name_len = 0
+        mgr.connections = [_]PanConnection{PanConnection.init()} ** MAX_PAN_CONNECTIONS
+        mgr.connection_count = 0
+        @memcpy(mgr.interface_name[0..4], "bnep")
+        mgr.interface_name[4] = '0'
+        @memset(mgr.interface_name[5..], 0)
+        mgr.interface_up = false
+        @memcpy(mgr.bridge_name[0..4], "pan0")
+        @memset(mgr.bridge_name[4..], 0)
+        mgr.bridge_enabled = false
+        mgr.dhcp_enabled = false
+        mgr.gateway_ip = [_]u8{ 10, 0, 0, 1 }
+        mgr.subnet_mask = [_]u8{ 255, 255, 255, 0 }
+        mgr.dhcp_start = [_]u8{ 10, 0, 0, 10 }
+        mgr.dhcp_end = [_]u8{ 10, 0, 0, 100 }
+        mgr.l2cap_socket = -1
+        mgr.running = false
+        mgr.on_connection = null
+        mgr.on_disconnection = null
+        mgr.on_data = null
+        mgr.total_connections = 0
+        return mgr
+    }
+
+    pub fn start(self: *BluetoothPanManager): bool {
+        if self.running {
+            return false
+        }
+
+        // Get local Bluetooth address
+        if !bluetooth.get_local_address(&self.local_addr) {
+            return false
+        }
+
+        // Create L2CAP socket
+        self.l2cap_socket = l2cap.socket()
+        if self.l2cap_socket < 0 {
+            return false
+        }
+
+        // Bind to BNEP PSM
+        if !l2cap.bind(self.l2cap_socket, BNEP_PSM) {
+            l2cap.close(self.l2cap_socket)
+            self.l2cap_socket = -1
+            return false
+        }
+
+        // For NAP/GN, listen for connections
+        if self.role != .PANU {
+            if !l2cap.listen(self.l2cap_socket, MAX_PAN_CONNECTIONS) {
+                l2cap.close(self.l2cap_socket)
+                self.l2cap_socket = -1
+                return false
+            }
+
+            // Create bridge interface
+            if self.role == .NAP {
+                self.setup_nap_bridge()
+            }
+        }
+
+        // Register SDP record
+        self.register_sdp_record()
+
+        self.running = true
+        return true
+    }
+
+    pub fn stop(self: *BluetoothPanManager): void {
+        if !self.running {
+            return
+        }
+
+        // Disconnect all connections
+        for (0..MAX_PAN_CONNECTIONS) |i| {
+            if self.connections[i].state != .DISCONNECTED {
+                self.disconnect(i)
+            }
+        }
+
+        // Remove SDP record
+        self.unregister_sdp_record()
+
+        // Close L2CAP socket
+        if self.l2cap_socket >= 0 {
+            l2cap.close(self.l2cap_socket)
+            self.l2cap_socket = -1
+        }
+
+        // Remove bridge
+        if self.bridge_enabled {
+            self.remove_nap_bridge()
+        }
+
+        self.running = false
+    }
+
+    // ============================================
+    // Connection Management
+    // ============================================
+
+    pub fn connect(self: *BluetoothPanManager, remote_addr: [6]u8, remote_role: PanRole): ?usize {
+        if !self.running or self.role != .PANU {
+            return null
+        }
+
+        // Find free slot
+        var slot: ?usize = null
+        for (0..MAX_PAN_CONNECTIONS) |i| {
+            if self.connections[i].state == .DISCONNECTED {
+                slot = i
+                break
+            }
+        }
+
+        if slot == null {
+            return null
+        }
+
+        const idx = slot.?
+
+        // Initialize connection
+        self.connections[idx] = PanConnection.init()
+        self.connections[idx].role = .PANU
+        self.connections[idx].remote_role = remote_role
+        @memcpy(&self.connections[idx].remote_addr, &remote_addr)
+        @memcpy(&self.connections[idx].local_addr, &self.local_addr)
+        self.connections[idx].state = .CONNECTING
+
+        // Connect L2CAP
+        const channel = l2cap.connect(self.l2cap_socket, &remote_addr, BNEP_PSM)
+        if channel < 0 {
+            self.connections[idx].state = .DISCONNECTED
+            return null
+        }
+
+        self.connections[idx].l2cap_channel = channel
+
+        // Get MTU
+        self.connections[idx].l2cap_mtu = l2cap.get_mtu(channel)
+
+        // Send BNEP setup request
+        if !self.send_setup_request(idx, remote_role) {
+            l2cap.close(channel)
+            self.connections[idx].state = .DISCONNECTED
+            return null
+        }
+
+        return idx
+    }
+
+    pub fn disconnect(self: *BluetoothPanManager, conn_idx: usize): void {
+        if conn_idx >= MAX_PAN_CONNECTIONS {
+            return
+        }
+
+        var conn = &self.connections[conn_idx]
+        if conn.state == .DISCONNECTED {
+            return
+        }
+
+        conn.state = .DISCONNECTING
+
+        // Close L2CAP channel
+        if conn.l2cap_channel >= 0 {
+            l2cap.close(conn.l2cap_channel)
+            conn.l2cap_channel = -1
+        }
+
+        // Remove from bridge if NAP
+        if self.role == .NAP and self.bridge_enabled {
+            self.remove_from_bridge(conn_idx)
+        }
+
+        // Callback
+        if self.on_disconnection != null {
+            self.on_disconnection.?(conn)
+        }
+
+        conn.state = .DISCONNECTED
+
+        if self.connection_count > 0 {
+            self.connection_count -= 1
+        }
+    }
+
+    pub fn accept_connection(self: *BluetoothPanManager): ?usize {
+        if !self.running or self.role == .PANU {
+            return null
+        }
+
+        // Accept incoming connection
+        var remote_addr: [6]u8 = undefined
+        const channel = l2cap.accept(self.l2cap_socket, &remote_addr)
+        if channel < 0 {
+            return null
+        }
+
+        // Find free slot
+        var slot: ?usize = null
+        for (0..MAX_PAN_CONNECTIONS) |i| {
+            if self.connections[i].state == .DISCONNECTED {
+                slot = i
+                break
+            }
+        }
+
+        if slot == null {
+            l2cap.close(channel)
+            return null
+        }
+
+        const idx = slot.?
+
+        // Initialize connection
+        self.connections[idx] = PanConnection.init()
+        self.connections[idx].role = self.role
+        self.connections[idx].remote_role = .PANU
+        @memcpy(&self.connections[idx].remote_addr, &remote_addr)
+        @memcpy(&self.connections[idx].local_addr, &self.local_addr)
+        self.connections[idx].l2cap_channel = channel
+        self.connections[idx].l2cap_mtu = l2cap.get_mtu(channel)
+        self.connections[idx].state = .CONNECTING
+
+        return idx
+    }
+
+    fn send_setup_request(self: *BluetoothPanManager, conn_idx: usize, remote_role: PanRole): bool {
+        var conn = &self.connections[conn_idx]
+
+        var packet: [64]u8 = undefined
+        var offset: usize = 0
+
+        // BNEP type: Control
+        packet[offset] = BNEP_CONTROL
+        offset += 1
+
+        // Control type: Setup Connection Request
+        packet[offset] = BNEP_SETUP_CONNECTION_REQUEST
+        offset += 1
+
+        // UUID size (2 bytes for 16-bit UUIDs)
+        packet[offset] = 2
+        offset += 1
+
+        // Destination UUID (remote role)
+        const dest_uuid: u16 = switch remote_role {
+            .PANU => UUID_PANU,
+            .NAP => UUID_NAP,
+            .GN => UUID_GN,
+        }
+        packet[offset] = @truncate((dest_uuid >> 8) & 0xFF)
+        packet[offset + 1] = @truncate(dest_uuid & 0xFF)
+        offset += 2
+
+        // Source UUID (our role)
+        const src_uuid: u16 = switch self.role {
+            .PANU => UUID_PANU,
+            .NAP => UUID_NAP,
+            .GN => UUID_GN,
+        }
+        packet[offset] = @truncate((src_uuid >> 8) & 0xFF)
+        packet[offset + 1] = @truncate(src_uuid & 0xFF)
+        offset += 2
+
+        // Send
+        const sent = l2cap.send(conn.l2cap_channel, packet[0..offset])
+        return sent == @as(i32, @intCast(offset))
+    }
+
+    fn send_setup_response(self: *BluetoothPanManager, conn_idx: usize, response: u16): bool {
+        var conn = &self.connections[conn_idx]
+
+        var packet: [4]u8 = undefined
+
+        // BNEP type: Control
+        packet[0] = BNEP_CONTROL
+
+        // Control type: Setup Connection Response
+        packet[1] = BNEP_SETUP_CONNECTION_RESPONSE
+
+        // Response code
+        packet[2] = @truncate((response >> 8) & 0xFF)
+        packet[3] = @truncate(response & 0xFF)
+
+        const sent = l2cap.send(conn.l2cap_channel, &packet)
+        return sent == 4
+    }
+
+    // ============================================
+    // Data Handling
+    // ============================================
+
+    pub fn send_ethernet_frame(self: *BluetoothPanManager, conn_idx: usize, frame: []const u8): bool {
+        if conn_idx >= MAX_PAN_CONNECTIONS {
+            return false
+        }
+
+        var conn = &self.connections[conn_idx]
+        if conn.state != .CONNECTED {
+            return false
+        }
+
+        if frame.len < 14 {
+            return false
+        }
+
+        // Check if we can compress
+        const dest_addr = frame[0..6]
+        const src_addr = frame[6..12]
+        const eth_type = (@as(u16, frame[12]) << 8) | @as(u16, frame[13])
+
+        var packet: [1700]u8 = undefined
+        var offset: usize = 0
+
+        // Check network type filter (if any)
+        if conn.net_type_filter_count > 0 {
+            var allowed = false
+            for (0..conn.net_type_filter_count) |i| {
+                if conn.net_type_filters[i].matches(eth_type) {
+                    allowed = true
+                    break
+                }
+            }
+            if !allowed {
+                return false
+            }
+        }
+
+        // Determine compression type
+        const dest_is_local = std.mem.eql(u8, dest_addr, &conn.local_addr)
+        const src_is_remote = std.mem.eql(u8, src_addr, &conn.remote_addr)
+
+        if dest_is_local and src_is_remote {
+            // Fully compressed
+            packet[offset] = BNEP_COMPRESSED_ETHERNET
+            offset += 1
+
+            // Protocol type
+            packet[offset] = @truncate((eth_type >> 8) & 0xFF)
+            packet[offset + 1] = @truncate(eth_type & 0xFF)
+            offset += 2
+
+            // Payload
+            @memcpy(packet[offset..offset + frame.len - 14], frame[14..])
+            offset += frame.len - 14
+        } else if dest_is_local {
+            // Dest compressed
+            packet[offset] = BNEP_COMPRESSED_ETHERNET_DEST_ONLY
+            offset += 1
+
+            // Source address
+            @memcpy(packet[offset..offset + 6], src_addr)
+            offset += 6
+
+            // Protocol type
+            packet[offset] = @truncate((eth_type >> 8) & 0xFF)
+            packet[offset + 1] = @truncate(eth_type & 0xFF)
+            offset += 2
+
+            // Payload
+            @memcpy(packet[offset..offset + frame.len - 14], frame[14..])
+            offset += frame.len - 14
+        } else if src_is_remote {
+            // Source compressed
+            packet[offset] = BNEP_COMPRESSED_ETHERNET_SRC_ONLY
+            offset += 1
+
+            // Dest address
+            @memcpy(packet[offset..offset + 6], dest_addr)
+            offset += 6
+
+            // Protocol type
+            packet[offset] = @truncate((eth_type >> 8) & 0xFF)
+            packet[offset + 1] = @truncate(eth_type & 0xFF)
+            offset += 2
+
+            // Payload
+            @memcpy(packet[offset..offset + frame.len - 14], frame[14..])
+            offset += frame.len - 14
+        } else {
+            // General ethernet (no compression)
+            packet[offset] = BNEP_GENERAL_ETHERNET
+            offset += 1
+
+            // Full frame
+            @memcpy(packet[offset..offset + 6], dest_addr)
+            offset += 6
+            @memcpy(packet[offset..offset + 6], src_addr)
+            offset += 6
+            packet[offset] = @truncate((eth_type >> 8) & 0xFF)
+            packet[offset + 1] = @truncate(eth_type & 0xFF)
+            offset += 2
+
+            // Payload
+            @memcpy(packet[offset..offset + frame.len - 14], frame[14..])
+            offset += frame.len - 14
+        }
+
+        // Send
+        const sent = l2cap.send(conn.l2cap_channel, packet[0..offset])
+        if sent > 0 {
+            conn.tx_bytes += @as(u64, @intCast(sent))
+            conn.tx_packets += 1
+            return true
+        } else {
+            conn.tx_errors += 1
+            return false
+        }
+    }
+
+    pub fn receive_data(self: *BluetoothPanManager, conn_idx: usize): void {
+        if conn_idx >= MAX_PAN_CONNECTIONS {
+            return
+        }
+
+        var conn = &self.connections[conn_idx]
+        if conn.state == .DISCONNECTED {
+            return
+        }
+
+        var buffer: [1700]u8 = undefined
+        const received = l2cap.recv(conn.l2cap_channel, &buffer)
+
+        if received <= 0 {
+            if received < 0 {
+                conn.rx_errors += 1
+            }
+            return
+        }
+
+        conn.rx_bytes += @as(u64, @intCast(received))
+        conn.rx_packets += 1
+
+        const data = buffer[0..@as(usize, @intCast(received))]
+        self.process_bnep_packet(conn_idx, data)
+    }
+
+    fn process_bnep_packet(self: *BluetoothPanManager, conn_idx: usize, data: []const u8): void {
+        if data.len < 1 {
+            return
+        }
+
+        var conn = &self.connections[conn_idx]
+        const packet_type = data[0] & 0x7F
+        const has_extension = (data[0] & 0x80) != 0
+
+        var offset: usize = 1
+
+        // Process extension headers if present
+        if has_extension {
+            offset = self.process_extensions(data[1..])
+            if offset == 0 {
+                return  // Invalid extension
+            }
+            offset += 1
+        }
+
+        switch packet_type {
+            BNEP_CONTROL => {
+                self.process_control_packet(conn_idx, data[offset..])
+            }
+            BNEP_GENERAL_ETHERNET => {
+                // Full ethernet frame
+                if data.len < offset + 14 {
+                    return
+                }
+
+                var frame: [1514]u8 = undefined
+                @memcpy(frame[0..6], data[offset..offset + 6])    // Dest
+                @memcpy(frame[6..12], data[offset + 6..offset + 12])  // Src
+                @memcpy(frame[12..14], data[offset + 12..offset + 14])  // Type
+                @memcpy(frame[14..14 + data.len - offset - 14], data[offset + 14..])
+
+                self.deliver_frame(conn_idx, frame[0..data.len - offset + 14])
+            }
+            BNEP_COMPRESSED_ETHERNET => {
+                // Both addresses compressed
+                if data.len < offset + 2 {
+                    return
+                }
+
+                var frame: [1514]u8 = undefined
+                @memcpy(frame[0..6], &conn.remote_addr)   // Dest = our local
+                @memcpy(frame[6..12], &conn.local_addr)   // Src = remote's local
+                @memcpy(frame[12..14], data[offset..offset + 2])  // Type
+                @memcpy(frame[14..14 + data.len - offset - 2], data[offset + 2..])
+
+                self.deliver_frame(conn_idx, frame[0..data.len - offset + 12])
+            }
+            BNEP_COMPRESSED_ETHERNET_SRC_ONLY => {
+                // Source compressed
+                if data.len < offset + 8 {
+                    return
+                }
+
+                var frame: [1514]u8 = undefined
+                @memcpy(frame[0..6], data[offset..offset + 6])  // Dest from packet
+                @memcpy(frame[6..12], &conn.local_addr)  // Src = remote
+                @memcpy(frame[12..14], data[offset + 6..offset + 8])  // Type
+                @memcpy(frame[14..14 + data.len - offset - 8], data[offset + 8..])
+
+                self.deliver_frame(conn_idx, frame[0..data.len - offset + 6])
+            }
+            BNEP_COMPRESSED_ETHERNET_DEST_ONLY => {
+                // Dest compressed
+                if data.len < offset + 8 {
+                    return
+                }
+
+                var frame: [1514]u8 = undefined
+                @memcpy(frame[0..6], &conn.remote_addr)  // Dest = our local
+                @memcpy(frame[6..12], data[offset..offset + 6])  // Src from packet
+                @memcpy(frame[12..14], data[offset + 6..offset + 8])  // Type
+                @memcpy(frame[14..14 + data.len - offset - 8], data[offset + 8..])
+
+                self.deliver_frame(conn_idx, frame[0..data.len - offset + 6])
+            }
+            else => {
+                // Unknown packet type
+            }
+        }
+    }
+
+    fn process_extensions(self: *BluetoothPanManager, data: []const u8): usize {
+        var offset: usize = 0
+
+        while offset < data.len {
+            if offset + 2 > data.len {
+                return 0
+            }
+
+            const ext_type = data[offset] & 0x7F
+            const has_more = (data[offset] & 0x80) != 0
+            const ext_len = data[offset + 1]
+
+            if offset + 2 + ext_len > data.len {
+                return 0
+            }
+
+            // Process extension based on type
+            _ = ext_type  // Currently we just skip extensions
+
+            offset += 2 + ext_len
+
+            if !has_more {
+                break
+            }
+        }
+
+        return offset
+    }
+
+    fn process_control_packet(self: *BluetoothPanManager, conn_idx: usize, data: []const u8): void {
+        if data.len < 1 {
+            return
+        }
+
+        var conn = &self.connections[conn_idx]
+        const control_type = data[0]
+
+        switch control_type {
+            BNEP_SETUP_CONNECTION_REQUEST => {
+                self.handle_setup_request(conn_idx, data[1..])
+            }
+            BNEP_SETUP_CONNECTION_RESPONSE => {
+                self.handle_setup_response(conn_idx, data[1..])
+            }
+            BNEP_FILTER_NET_TYPE_SET => {
+                self.handle_filter_net_type_set(conn_idx, data[1..])
+            }
+            BNEP_FILTER_NET_TYPE_RESPONSE => {
+                // Acknowledge filter set
+            }
+            BNEP_FILTER_MULTI_ADDR_SET => {
+                self.handle_filter_multicast_set(conn_idx, data[1..])
+            }
+            BNEP_FILTER_MULTI_ADDR_RESPONSE => {
+                // Acknowledge filter set
+            }
+            BNEP_CONTROL_COMMAND_NOT_UNDERSTOOD => {
+                // Remote didn't understand our command
+            }
+            else => {
+                // Send "command not understood"
+                self.send_command_not_understood(conn_idx, control_type)
+            }
+        }
+    }
+
+    fn handle_setup_request(self: *BluetoothPanManager, conn_idx: usize, data: []const u8): void {
+        if data.len < 5 {
+            _ = self.send_setup_response(conn_idx, BNEP_SETUP_INVALID_UUID_SIZE)
+            return
+        }
+
+        var conn = &self.connections[conn_idx]
+        const uuid_size = data[0]
+
+        if uuid_size != 2 and uuid_size != 4 and uuid_size != 16 {
+            _ = self.send_setup_response(conn_idx, BNEP_SETUP_INVALID_UUID_SIZE)
+            return
+        }
+
+        // Parse UUIDs
+        var dest_uuid: u16 = 0
+        var src_uuid: u16 = 0
+
+        if uuid_size == 2 {
+            if data.len < 5 {
+                return
+            }
+            dest_uuid = (@as(u16, data[1]) << 8) | @as(u16, data[2])
+            src_uuid = (@as(u16, data[3]) << 8) | @as(u16, data[4])
+        } else if uuid_size == 4 {
+            if data.len < 9 {
+                return
+            }
+            dest_uuid = (@as(u16, data[3]) << 8) | @as(u16, data[4])
+            src_uuid = (@as(u16, data[7]) << 8) | @as(u16, data[8])
+        } else {
+            // 128-bit UUID - extract 16-bit part
+            if data.len < 33 {
+                return
+            }
+            dest_uuid = (@as(u16, data[3]) << 8) | @as(u16, data[4])
+            src_uuid = (@as(u16, data[19]) << 8) | @as(u16, data[20])
+        }
+
+        // Validate roles
+        var valid = false
+        if self.role == .NAP and dest_uuid == UUID_NAP and src_uuid == UUID_PANU {
+            conn.remote_role = .PANU
+            valid = true
+        } else if self.role == .GN and dest_uuid == UUID_GN and src_uuid == UUID_PANU {
+            conn.remote_role = .PANU
+            valid = true
+        } else if self.role == .GN and dest_uuid == UUID_GN and src_uuid == UUID_GN {
+            conn.remote_role = .GN
+            valid = true
+        }
+
+        if valid {
+            _ = self.send_setup_response(conn_idx, BNEP_SETUP_SUCCESS)
+            conn.state = .CONNECTED
+            conn.connected_time = get_timestamp()
+            self.connection_count += 1
+            self.total_connections += 1
+
+            // Add to bridge if NAP
+            if self.role == .NAP and self.bridge_enabled {
+                self.add_to_bridge(conn_idx)
+            }
+
+            // Callback
+            if self.on_connection != null {
+                self.on_connection.?(conn)
+            }
+        } else {
+            _ = self.send_setup_response(conn_idx, BNEP_SETUP_NOT_ALLOWED)
+        }
+    }
+
+    fn handle_setup_response(self: *BluetoothPanManager, conn_idx: usize, data: []const u8): void {
+        if data.len < 2 {
+            return
+        }
+
+        var conn = &self.connections[conn_idx]
+        const response = (@as(u16, data[0]) << 8) | @as(u16, data[1])
+
+        if response == BNEP_SETUP_SUCCESS {
+            conn.state = .CONNECTED
+            conn.connected_time = get_timestamp()
+            self.connection_count += 1
+            self.total_connections += 1
+
+            // Callback
+            if self.on_connection != null {
+                self.on_connection.?(conn)
+            }
+        } else {
+            // Setup failed
+            conn.state = .DISCONNECTED
+            l2cap.close(conn.l2cap_channel)
+            conn.l2cap_channel = -1
+        }
+    }
+
+    fn handle_filter_net_type_set(self: *BluetoothPanManager, conn_idx: usize, data: []const u8): void {
+        if data.len < 2 {
+            self.send_filter_net_type_response(conn_idx, BNEP_FILTER_UNSUPPORTED)
+            return
+        }
+
+        var conn = &self.connections[conn_idx]
+        const list_len = (@as(u16, data[0]) << 8) | @as(u16, data[1])
+
+        if list_len % 4 != 0 {
+            self.send_filter_net_type_response(conn_idx, BNEP_FILTER_INVALID_RANGE)
+            return
+        }
+
+        const num_filters = list_len / 4
+        if num_filters > 16 {
+            self.send_filter_net_type_response(conn_idx, BNEP_FILTER_TOO_MANY)
+            return
+        }
+
+        if data.len < 2 + list_len {
+            return
+        }
+
+        // Parse filters
+        conn.net_type_filter_count = num_filters
+        var offset: usize = 2
+
+        for (0..num_filters) |i| {
+            conn.net_type_filters[i].start = (@as(u16, data[offset]) << 8) | @as(u16, data[offset + 1])
+            conn.net_type_filters[i].end = (@as(u16, data[offset + 2]) << 8) | @as(u16, data[offset + 3])
+            offset += 4
+        }
+
+        self.send_filter_net_type_response(conn_idx, BNEP_FILTER_SUCCESS)
+    }
+
+    fn handle_filter_multicast_set(self: *BluetoothPanManager, conn_idx: usize, data: []const u8): void {
+        if data.len < 2 {
+            self.send_filter_multicast_response(conn_idx, BNEP_FILTER_UNSUPPORTED)
+            return
+        }
+
+        var conn = &self.connections[conn_idx]
+        const list_len = (@as(u16, data[0]) << 8) | @as(u16, data[1])
+
+        if list_len % 12 != 0 {
+            self.send_filter_multicast_response(conn_idx, BNEP_FILTER_INVALID_RANGE)
+            return
+        }
+
+        const num_filters = list_len / 12
+        if num_filters > 16 {
+            self.send_filter_multicast_response(conn_idx, BNEP_FILTER_TOO_MANY)
+            return
+        }
+
+        if data.len < 2 + list_len {
+            return
+        }
+
+        // Parse filters
+        conn.multicast_filter_count = num_filters
+        var offset: usize = 2
+
+        for (0..num_filters) |i| {
+            @memcpy(&conn.multicast_filters[i].start, data[offset..offset + 6])
+            @memcpy(&conn.multicast_filters[i].end, data[offset + 6..offset + 12])
+            offset += 12
+        }
+
+        self.send_filter_multicast_response(conn_idx, BNEP_FILTER_SUCCESS)
+    }
+
+    fn send_filter_net_type_response(self: *BluetoothPanManager, conn_idx: usize, response: u16): void {
+        var conn = &self.connections[conn_idx]
+        var packet: [4]u8 = undefined
+
+        packet[0] = BNEP_CONTROL
+        packet[1] = BNEP_FILTER_NET_TYPE_RESPONSE
+        packet[2] = @truncate((response >> 8) & 0xFF)
+        packet[3] = @truncate(response & 0xFF)
+
+        _ = l2cap.send(conn.l2cap_channel, &packet)
+    }
+
+    fn send_filter_multicast_response(self: *BluetoothPanManager, conn_idx: usize, response: u16): void {
+        var conn = &self.connections[conn_idx]
+        var packet: [4]u8 = undefined
+
+        packet[0] = BNEP_CONTROL
+        packet[1] = BNEP_FILTER_MULTI_ADDR_RESPONSE
+        packet[2] = @truncate((response >> 8) & 0xFF)
+        packet[3] = @truncate(response & 0xFF)
+
+        _ = l2cap.send(conn.l2cap_channel, &packet)
+    }
+
+    fn send_command_not_understood(self: *BluetoothPanManager, conn_idx: usize, command: u8): void {
+        var conn = &self.connections[conn_idx]
+        var packet: [3]u8 = undefined
+
+        packet[0] = BNEP_CONTROL
+        packet[1] = BNEP_CONTROL_COMMAND_NOT_UNDERSTOOD
+        packet[2] = command
+
+        _ = l2cap.send(conn.l2cap_channel, &packet)
+    }
+
+    fn deliver_frame(self: *BluetoothPanManager, conn_idx: usize, frame: []const u8): void {
+        var conn = &self.connections[conn_idx]
+
+        // Check multicast filter
+        if frame[0] & 0x01 != 0 {  // Multicast bit set
+            if conn.multicast_filter_count > 0 {
+                var allowed = false
+                for (0..conn.multicast_filter_count) |i| {
+                    if conn.multicast_filters[i].matches(frame[0..6].*) {
+                        allowed = true
+                        break
+                    }
+                }
+                if !allowed {
+                    return
+                }
+            }
+        }
+
+        // Deliver to callback or network interface
+        if self.on_data != null {
+            self.on_data.?(conn, frame)
+        }
+
+        // If NAP with bridge, forward to bridge
+        if self.role == .NAP and self.bridge_enabled {
+            self.forward_to_bridge(frame)
+        }
+    }
+
+    // ============================================
+    // NAP Bridge Management
+    // ============================================
+
+    fn setup_nap_bridge(self: *BluetoothPanManager): void {
+        // Create bridge interface
+        if !net.create_bridge(&self.bridge_name) {
+            return
+        }
+
+        // Configure IP
+        if !net.configure_interface(&self.bridge_name, self.gateway_ip, self.subnet_mask) {
+            net.delete_bridge(&self.bridge_name)
+            return
+        }
+
+        // Bring up
+        if !net.set_interface_up(&self.bridge_name) {
+            net.delete_bridge(&self.bridge_name)
+            return
+        }
+
+        // Start DHCP server
+        if self.dhcp_enabled {
+            _ = start_dhcp_server(&self.bridge_name, self.gateway_ip, self.dhcp_start, self.dhcp_end)
+        }
+
+        self.bridge_enabled = true
+    }
+
+    fn remove_nap_bridge(self: *BluetoothPanManager): void {
+        if !self.bridge_enabled {
+            return
+        }
+
+        // Stop DHCP
+        if self.dhcp_enabled {
+            stop_dhcp_server(&self.bridge_name)
+        }
+
+        // Delete bridge
+        net.delete_bridge(&self.bridge_name)
+
+        self.bridge_enabled = false
+    }
+
+    fn add_to_bridge(self: *BluetoothPanManager, conn_idx: usize): void {
+        // Create virtual network interface for this connection
+        var iface_name: [16]u8 = undefined
+        @memcpy(iface_name[0..4], "bnep")
+        iface_name[4] = '0' + @as(u8, @truncate(conn_idx))
+        @memset(iface_name[5..], 0)
+
+        // Create tap-like interface
+        // ... (kernel interface creation)
+
+        // Add to bridge
+        _ = net.add_interface_to_bridge(&self.bridge_name, &iface_name)
+    }
+
+    fn remove_from_bridge(self: *BluetoothPanManager, conn_idx: usize): void {
+        var iface_name: [16]u8 = undefined
+        @memcpy(iface_name[0..4], "bnep")
+        iface_name[4] = '0' + @as(u8, @truncate(conn_idx))
+        @memset(iface_name[5..], 0)
+
+        // Remove from bridge
+        _ = net.remove_interface_from_bridge(&self.bridge_name, &iface_name)
+    }
+
+    fn forward_to_bridge(self: *BluetoothPanManager, frame: []const u8): void {
+        // Forward frame to bridge interface
+        _ = net.send_frame(&self.bridge_name, frame)
+    }
+
+    // ============================================
+    // SDP Registration
+    // ============================================
+
+    fn register_sdp_record(self: *BluetoothPanManager): void {
+        const uuid: u16 = switch self.role {
+            .PANU => UUID_PANU,
+            .NAP => UUID_NAP,
+            .GN => UUID_GN,
+        }
+
+        const name: []const u8 = switch self.role {
+            .PANU => "HomeOS PAN User",
+            .NAP => "HomeOS Network Access",
+            .GN => "HomeOS Ad-hoc Network",
+        }
+
+        var record: SdpRecord = undefined
+        record.uuid = uuid
+        record.psm = BNEP_PSM
+        @memcpy(record.name[0..name.len], name)
+        record.name_len = name.len
+
+        // Security: authentication required
+        record.security_level = 1
+
+        bluetooth.register_sdp_record(&record)
+    }
+
+    fn unregister_sdp_record(self: *BluetoothPanManager): void {
+        const uuid: u16 = switch self.role {
+            .PANU => UUID_PANU,
+            .NAP => UUID_NAP,
+            .GN => UUID_GN,
+        }
+
+        bluetooth.unregister_sdp_record(uuid)
+    }
+
+    // ============================================
+    // Statistics
+    // ============================================
+
+    pub fn get_stats(self: *BluetoothPanManager): PanStats {
+        var stats = PanStats{
+            .connection_count = self.connection_count,
+            .total_connections = self.total_connections,
+            .rx_bytes = 0,
+            .tx_bytes = 0,
+            .rx_packets = 0,
+            .tx_packets = 0,
+            .rx_errors = 0,
+            .tx_errors = 0,
+        }
+
+        for (0..MAX_PAN_CONNECTIONS) |i| {
+            if self.connections[i].state == .CONNECTED {
+                stats.rx_bytes += self.connections[i].rx_bytes
+                stats.tx_bytes += self.connections[i].tx_bytes
+                stats.rx_packets += self.connections[i].rx_packets
+                stats.tx_packets += self.connections[i].tx_packets
+                stats.rx_errors += self.connections[i].rx_errors
+                stats.tx_errors += self.connections[i].tx_errors
+            }
+        }
+
+        return stats
+    }
+}
+
+// ============================================
+// Supporting Types
+// ============================================
+
+const SdpRecord = struct {
+    uuid: u16
+    psm: u16
+    name: [64]u8
+    name_len: usize
+    security_level: u8
+}
+
+const PanStats = struct {
+    connection_count: usize
+    total_connections: u64
+    rx_bytes: u64
+    tx_bytes: u64
+    rx_packets: u64
+    tx_packets: u64
+    rx_errors: u64
+    tx_errors: u64
+}
+
+// ============================================
+// Helper Functions
+// ============================================
+
+fn get_timestamp(): u64 {
+    var ts: struct { tv_sec: i64, tv_nsec: i64 } = undefined
+    _ = @import("time").clock_gettime(0, &ts)
+    return @as(u64, @intCast(ts.tv_sec))
+}
+
+extern fn start_dhcp_server(iface: *const [16]u8, gateway: [4]u8, start: [4]u8, end: [4]u8): bool
+extern fn stop_dhcp_server(iface: *const [16]u8): void
+
+// ============================================
+// Public API
+// ============================================
+
+var global_pan: ?*BluetoothPanManager = null
+
+pub fn bluetooth_pan_start(role: PanRole): bool {
+    if global_pan != null {
+        return false
+    }
+
+    global_pan = @ptrCast(*BluetoothPanManager, alloc(@sizeOf(BluetoothPanManager)))
+    global_pan.?.* = BluetoothPanManager.init(role)
+
+    return global_pan.?.start()
+}
+
+pub fn bluetooth_pan_stop(): void {
+    if global_pan == null {
+        return
+    }
+
+    global_pan.?.stop()
+    free(global_pan.?)
+    global_pan = null
+}
+
+pub fn bluetooth_pan_connect(remote_addr: [6]u8): bool {
+    if global_pan == null {
+        return false
+    }
+
+    const idx = global_pan.?.connect(remote_addr, .NAP)
+    return idx != null
+}
+
+pub fn bluetooth_pan_disconnect(conn_idx: usize): void {
+    if global_pan == null {
+        return
+    }
+
+    global_pan.?.disconnect(conn_idx)
+}
+
+pub fn bluetooth_pan_get_connections(): []PanConnection {
+    if global_pan == null {
+        return &[_]PanConnection{}
+    }
+
+    return global_pan.?.connections[0..global_pan.?.connection_count]
+}
+
+extern fn alloc(size: usize): *void
+extern fn free(ptr: *void): void

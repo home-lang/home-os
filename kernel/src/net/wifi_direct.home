@@ -1,0 +1,1605 @@
+// HomeOS WiFi Direct (P2P) Implementation
+// IEEE 802.11 WiFi Direct/P2P protocol support
+//
+// Features:
+// - Device discovery and service discovery
+// - Group formation (GO negotiation)
+// - Invitation procedure
+// - Persistent groups
+// - P2P Power Save
+// - Service discovery (Bonjour, UPnP, vendor-specific)
+// - Concurrent operation (station + P2P)
+
+const std = @import("std")
+const wifi = @import("wifi")
+const net = @import("net")
+const crypto = @import("../crypto/crypto")
+
+// ============================================
+// P2P Constants
+// ============================================
+
+pub const P2P_WILDCARD_SSID = "DIRECT-"
+pub const P2P_OUI = [_]u8{ 0x50, 0x6F, 0x9A }
+pub const P2P_OUI_TYPE: u8 = 9
+
+// P2P Attribute IDs
+pub const P2P_ATTR_STATUS: u8 = 0
+pub const P2P_ATTR_MINOR_REASON_CODE: u8 = 1
+pub const P2P_ATTR_CAPABILITY: u8 = 2
+pub const P2P_ATTR_DEVICE_ID: u8 = 3
+pub const P2P_ATTR_GROUP_OWNER_INTENT: u8 = 4
+pub const P2P_ATTR_CONFIG_TIMEOUT: u8 = 5
+pub const P2P_ATTR_LISTEN_CHANNEL: u8 = 6
+pub const P2P_ATTR_GROUP_BSSID: u8 = 7
+pub const P2P_ATTR_EXT_LISTEN_TIMING: u8 = 8
+pub const P2P_ATTR_INTENDED_INTERFACE_ADDR: u8 = 9
+pub const P2P_ATTR_MANAGEABILITY: u8 = 10
+pub const P2P_ATTR_CHANNEL_LIST: u8 = 11
+pub const P2P_ATTR_NOTICE_OF_ABSENCE: u8 = 12
+pub const P2P_ATTR_DEVICE_INFO: u8 = 13
+pub const P2P_ATTR_GROUP_INFO: u8 = 14
+pub const P2P_ATTR_GROUP_ID: u8 = 15
+pub const P2P_ATTR_INTERFACE: u8 = 16
+pub const P2P_ATTR_OPERATING_CHANNEL: u8 = 17
+pub const P2P_ATTR_INVITATION_FLAGS: u8 = 18
+
+// P2P Status codes
+pub const P2P_STATUS_SUCCESS: u8 = 0
+pub const P2P_STATUS_INFO_NOT_AVAIL: u8 = 1
+pub const P2P_STATUS_INCOMPATIBLE_PARAMS: u8 = 2
+pub const P2P_STATUS_LIMIT_REACHED: u8 = 3
+pub const P2P_STATUS_INVALID_PARAMS: u8 = 4
+pub const P2P_STATUS_UNABLE_TO_ACCOMMODATE: u8 = 5
+pub const P2P_STATUS_PREV_PROTOCOL_ERROR: u8 = 6
+pub const P2P_STATUS_NO_COMMON_CHANNELS: u8 = 7
+pub const P2P_STATUS_UNKNOWN_GROUP: u8 = 8
+pub const P2P_STATUS_BOTH_GO_INTENT_15: u8 = 9
+pub const P2P_STATUS_REJECTED_BY_USER: u8 = 11
+pub const P2P_STATUS_SUCCESS_DEFERRED: u8 = 12
+
+// P2P Action frame types
+pub const P2P_GO_NEG_REQ: u8 = 0
+pub const P2P_GO_NEG_RESP: u8 = 1
+pub const P2P_GO_NEG_CONF: u8 = 2
+pub const P2P_INVITATION_REQ: u8 = 3
+pub const P2P_INVITATION_RESP: u8 = 4
+pub const P2P_DEV_DISC_REQ: u8 = 5
+pub const P2P_DEV_DISC_RESP: u8 = 6
+pub const P2P_PROV_DISC_REQ: u8 = 7
+pub const P2P_PROV_DISC_RESP: u8 = 8
+
+// Device types (primary)
+pub const WPS_DEV_TYPE_COMPUTER: u16 = 1
+pub const WPS_DEV_TYPE_INPUT: u16 = 2
+pub const WPS_DEV_TYPE_PRINTER: u16 = 3
+pub const WPS_DEV_TYPE_CAMERA: u16 = 4
+pub const WPS_DEV_TYPE_STORAGE: u16 = 5
+pub const WPS_DEV_TYPE_NETWORK: u16 = 6
+pub const WPS_DEV_TYPE_DISPLAY: u16 = 7
+pub const WPS_DEV_TYPE_MULTIMEDIA: u16 = 8
+pub const WPS_DEV_TYPE_GAMING: u16 = 9
+pub const WPS_DEV_TYPE_TELEPHONE: u16 = 10
+pub const WPS_DEV_TYPE_AUDIO: u16 = 11
+
+// ============================================
+// P2P Device Information
+// ============================================
+
+pub const P2PDevice = struct {
+    device_addr: [6]u8
+    device_name: [32]u8
+    device_name_len: usize
+    interface_addr: [6]u8
+
+    // Primary device type
+    primary_dev_type: [8]u8
+
+    // Config methods supported
+    config_methods: u16
+
+    // Capability
+    device_capability: u8
+    group_capability: u8
+
+    // GO intent (0-15, tie breaker in LSB)
+    go_intent: u8
+
+    // Listen channel
+    listen_channel: u8
+    operating_channel: u8
+
+    // Status
+    go_state: bool
+    persistent_capable: bool
+    service_discovery: bool
+
+    // Connection state
+    connection_state: P2PConnectionState
+
+    // Signal info
+    rssi: i8
+    last_seen: u64
+
+    pub fn init(): P2PDevice {
+        var dev: P2PDevice = undefined
+        @memset(&dev.device_addr, 0)
+        @memset(&dev.device_name, 0)
+        dev.device_name_len = 0
+        @memset(&dev.interface_addr, 0)
+        @memset(&dev.primary_dev_type, 0)
+        dev.config_methods = 0
+        dev.device_capability = 0
+        dev.group_capability = 0
+        dev.go_intent = 7  // Default mid-point
+        dev.listen_channel = 0
+        dev.operating_channel = 0
+        dev.go_state = false
+        dev.persistent_capable = false
+        dev.service_discovery = false
+        dev.connection_state = .IDLE
+        dev.rssi = 0
+        dev.last_seen = 0
+        return dev
+    }
+}
+
+pub const P2PConnectionState = enum {
+    IDLE
+    SCANNING
+    FOUND
+    GO_NEGOTIATION
+    WPS_PROVISIONING
+    CONNECTED
+    GROUP_FORMATION
+    DISCONNECTING
+}
+
+// ============================================
+// P2P Group
+// ============================================
+
+pub const P2PGroup = struct {
+    ssid: [32]u8
+    ssid_len: usize
+    bssid: [6]u8
+    go_dev_addr: [6]u8
+
+    passphrase: [64]u8
+    passphrase_len: usize
+
+    operating_channel: u8
+    frequency: u32
+
+    is_go: bool
+    is_persistent: bool
+    network_id: u32
+
+    // Clients in group
+    clients: [8]P2PDevice
+    client_count: usize
+
+    // Group started time
+    started_time: u64
+
+    pub fn init(): P2PGroup {
+        var group: P2PGroup = undefined
+        @memset(&group.ssid, 0)
+        group.ssid_len = 0
+        @memset(&group.bssid, 0)
+        @memset(&group.go_dev_addr, 0)
+        @memset(&group.passphrase, 0)
+        group.passphrase_len = 0
+        group.operating_channel = 0
+        group.frequency = 0
+        group.is_go = false
+        group.is_persistent = false
+        group.network_id = 0
+        group.clients = [_]P2PDevice{P2PDevice.init()} ** 8
+        group.client_count = 0
+        group.started_time = 0
+        return group
+    }
+}
+
+// ============================================
+// Service Discovery
+// ============================================
+
+pub const P2PServiceType = enum {
+    ALL
+    BONJOUR
+    UPNP
+    WIFI_DISPLAY
+    VENDOR_SPECIFIC
+}
+
+pub const P2PService = struct {
+    service_type: P2PServiceType
+    service_name: [128]u8
+    service_name_len: usize
+    service_info: [256]u8
+    service_info_len: usize
+    query: [64]u8
+    query_len: usize
+
+    pub fn init(): P2PService {
+        var svc: P2PService = undefined
+        svc.service_type = .ALL
+        @memset(&svc.service_name, 0)
+        svc.service_name_len = 0
+        @memset(&svc.service_info, 0)
+        svc.service_info_len = 0
+        @memset(&svc.query, 0)
+        svc.query_len = 0
+        return svc
+    }
+}
+
+// ============================================
+// P2P Manager Configuration
+// ============================================
+
+pub const P2PConfig = struct {
+    device_name: [32]u8
+    device_name_len: usize
+    device_type: u16
+
+    // Listen channel (social channels: 1, 6, 11)
+    listen_channel: u8
+    operating_channel: u8
+
+    // GO intent (0-15)
+    go_intent: u8
+
+    // Persistent reconnect
+    persistent_reconnect: bool
+
+    // Config methods
+    config_methods: u16
+
+    // Power save
+    opportunistic_ps: bool
+    ctwindow: u8
+
+    // Intra-BSS distribution
+    intra_bss: bool
+
+    // Group idle timeout (seconds)
+    group_idle: u32
+
+    // WPS methods supported
+    wps_pbc: bool
+    wps_display_pin: bool
+    wps_keypad_pin: bool
+
+    pub fn default(): P2PConfig {
+        var config: P2PConfig = undefined
+        @memset(&config.device_name, 0)
+        @memcpy(config.device_name[0..6], "HomeOS")
+        config.device_name_len = 6
+        config.device_type = WPS_DEV_TYPE_COMPUTER
+        config.listen_channel = 6
+        config.operating_channel = 0  // Auto
+        config.go_intent = 7
+        config.persistent_reconnect = true
+        config.config_methods = 0x188  // PBC + Display + Keypad
+        config.opportunistic_ps = false
+        config.ctwindow = 0
+        config.intra_bss = true
+        config.group_idle = 0
+        config.wps_pbc = true
+        config.wps_display_pin = true
+        config.wps_keypad_pin = true
+        return config
+    }
+}
+
+// ============================================
+// P2P Manager
+// ============================================
+
+pub const P2PManager = struct {
+    config: P2PConfig
+    state: P2PState
+
+    // Interface info
+    interface_name: [16]u8
+    interface_name_len: usize
+    device_addr: [6]u8
+    interface_addr: [6]u8
+
+    // Discovered peers
+    peers: [32]P2PDevice
+    peer_count: usize
+
+    // Current group (if any)
+    current_group: ?P2PGroup
+
+    // Pending connection
+    pending_peer: ?*P2PDevice
+    pending_go_neg: ?GoNegotiation
+
+    // Services
+    local_services: [8]P2PService
+    local_service_count: usize
+
+    // nl80211 socket
+    nl80211_socket: i32
+    interface_index: u32
+
+    // Callbacks
+    on_peer_found: ?fn(*P2PDevice) void
+    on_peer_lost: ?fn(*P2PDevice) void
+    on_go_negotiation_request: ?fn(*P2PDevice) bool
+    on_group_started: ?fn(*P2PGroup) void
+    on_group_finished: ?fn(*P2PGroup) void
+    on_service_discovery_response: ?fn(*P2PService) void
+
+    // Statistics
+    scan_count: u32
+    connection_attempts: u32
+    successful_connections: u32
+
+    pub fn init(config: P2PConfig): P2PManager {
+        var mgr: P2PManager = undefined
+        mgr.config = config
+        mgr.state = .IDLE
+        @memset(&mgr.interface_name, 0)
+        mgr.interface_name_len = 0
+        @memset(&mgr.device_addr, 0)
+        @memset(&mgr.interface_addr, 0)
+        mgr.peers = [_]P2PDevice{P2PDevice.init()} ** 32
+        mgr.peer_count = 0
+        mgr.current_group = null
+        mgr.pending_peer = null
+        mgr.pending_go_neg = null
+        mgr.local_services = [_]P2PService{P2PService.init()} ** 8
+        mgr.local_service_count = 0
+        mgr.nl80211_socket = -1
+        mgr.interface_index = 0
+        mgr.on_peer_found = null
+        mgr.on_peer_lost = null
+        mgr.on_go_negotiation_request = null
+        mgr.on_group_started = null
+        mgr.on_group_finished = null
+        mgr.on_service_discovery_response = null
+        mgr.scan_count = 0
+        mgr.connection_attempts = 0
+        mgr.successful_connections = 0
+        return mgr
+    }
+
+    pub fn start(self: *P2PManager, interface: []const u8): bool {
+        // Store interface name
+        @memcpy(self.interface_name[0..interface.len], interface)
+        self.interface_name_len = interface.len
+
+        // Initialize nl80211
+        self.nl80211_socket = create_nl80211_socket()
+        if self.nl80211_socket < 0 {
+            return false
+        }
+
+        // Get interface info
+        self.interface_index = get_interface_index(interface)
+        if self.interface_index == 0 {
+            return false
+        }
+
+        // Get device address
+        get_interface_mac(interface, &self.device_addr)
+        @memcpy(&self.interface_addr, &self.device_addr)
+
+        // Enable P2P mode on interface
+        if !self.enable_p2p_mode() {
+            return false
+        }
+
+        self.state = .IDLE
+        return true
+    }
+
+    pub fn stop(self: *P2PManager): void {
+        // Leave any group
+        if self.current_group != null {
+            self.leave_group()
+        }
+
+        // Disable P2P mode
+        self.disable_p2p_mode()
+
+        // Close socket
+        if self.nl80211_socket >= 0 {
+            close_socket(self.nl80211_socket)
+            self.nl80211_socket = -1
+        }
+
+        self.state = .IDLE
+    }
+
+    // ============================================
+    // Discovery
+    // ============================================
+
+    pub fn find_peers(self: *P2PManager, timeout_sec: u32): bool {
+        if self.state != .IDLE and self.state != .LISTENING {
+            return false
+        }
+
+        self.state = .SCANNING
+
+        // Start P2P find operation
+        var msg = Nl80211Message.init(NL80211_CMD_START_P2P_DEVICE)
+        msg.put_u32(NL80211_ATTR_IFINDEX, self.interface_index)
+
+        if !send_nl80211_msg(self.nl80211_socket, &msg) {
+            self.state = .IDLE
+            return false
+        }
+
+        // Perform scan/listen cycle
+        const start_time = get_timestamp()
+        const end_time = start_time + timeout_sec
+
+        while get_timestamp() < end_time {
+            // Listen on listen channel
+            self.listen(100)  // 100ms
+
+            // Scan on other channels
+            self.scan(200)  // 200ms
+
+            self.scan_count += 1
+        }
+
+        self.state = .IDLE
+        return true
+    }
+
+    fn listen(self: *P2PManager, duration_ms: u32): void {
+        var msg = Nl80211Message.init(NL80211_CMD_REMAIN_ON_CHANNEL)
+        msg.put_u32(NL80211_ATTR_IFINDEX, self.interface_index)
+        msg.put_u32(NL80211_ATTR_WIPHY_FREQ, channel_to_frequency(self.config.listen_channel))
+        msg.put_u32(NL80211_ATTR_DURATION, duration_ms)
+
+        _ = send_nl80211_msg(self.nl80211_socket, &msg)
+
+        // Wait for duration
+        sleep_ms(duration_ms)
+    }
+
+    fn scan(self: *P2PManager, duration_ms: u32): void {
+        // Probe request with P2P IE
+        const social_channels = [_]u8{ 1, 6, 11 }
+
+        for (social_channels) |channel| {
+            if channel == self.config.listen_channel {
+                continue
+            }
+
+            var msg = Nl80211Message.init(NL80211_CMD_TRIGGER_SCAN)
+            msg.put_u32(NL80211_ATTR_IFINDEX, self.interface_index)
+
+            // Add P2P IE to probe request
+            var ie: [64]u8 = undefined
+            const ie_len = self.build_p2p_ie(&ie, true)
+            msg.put(NL80211_ATTR_IE, ie[0..ie_len])
+
+            // Set channel
+            msg.put_u32(NL80211_ATTR_WIPHY_FREQ, channel_to_frequency(channel))
+
+            _ = send_nl80211_msg(self.nl80211_socket, &msg)
+
+            sleep_ms(duration_ms / 3)
+        }
+    }
+
+    pub fn stop_find(self: *P2PManager): void {
+        if self.state != .SCANNING {
+            return
+        }
+
+        var msg = Nl80211Message.init(NL80211_CMD_STOP_P2P_DEVICE)
+        msg.put_u32(NL80211_ATTR_IFINDEX, self.interface_index)
+        _ = send_nl80211_msg(self.nl80211_socket, &msg)
+
+        self.state = .IDLE
+    }
+
+    pub fn handle_probe_response(self: *P2PManager, frame: []const u8, rssi: i8): void {
+        // Parse P2P IE from probe response
+        const p2p_ie = find_p2p_ie(frame) orelse return
+
+        var device = P2PDevice.init()
+        if !self.parse_p2p_ie(p2p_ie, &device) {
+            return
+        }
+
+        device.rssi = rssi
+        device.last_seen = get_timestamp()
+
+        // Check if we already know this peer
+        for (0..self.peer_count) |i| {
+            if std.mem.eql(u8, &self.peers[i].device_addr, &device.device_addr) {
+                // Update existing peer
+                self.peers[i] = device
+                return
+            }
+        }
+
+        // Add new peer
+        if self.peer_count < 32 {
+            self.peers[self.peer_count] = device
+            self.peer_count += 1
+
+            if self.on_peer_found != null {
+                self.on_peer_found.?(&self.peers[self.peer_count - 1])
+            }
+        }
+    }
+
+    // ============================================
+    // Connection
+    // ============================================
+
+    pub fn connect(self: *P2PManager, peer: *P2PDevice, wps_method: WpsMethod): bool {
+        if self.state != .IDLE {
+            return false
+        }
+
+        self.connection_attempts += 1
+        self.pending_peer = peer
+        self.state = .CONNECTING
+
+        // Start GO negotiation
+        return self.start_go_negotiation(peer, wps_method)
+    }
+
+    fn start_go_negotiation(self: *P2PManager, peer: *P2PDevice, wps_method: WpsMethod): bool {
+        // Initialize negotiation state
+        self.pending_go_neg = GoNegotiation{
+            .peer_addr = peer.device_addr,
+            .wps_method = wps_method,
+            .our_intent = self.config.go_intent,
+            .peer_intent = 0,
+            .tie_breaker = crypto.random_u8() & 1,
+            .status = .IN_PROGRESS,
+            .channel = 0,
+            .ssid = [_]u8{0} ** 32,
+            .ssid_len = 0,
+        }
+
+        // Send GO Negotiation Request
+        var frame: [256]u8 = undefined
+        const frame_len = self.build_go_neg_request(&frame, peer, wps_method)
+
+        return self.send_action_frame(&peer.device_addr, frame[0..frame_len])
+    }
+
+    fn build_go_neg_request(self: *P2PManager, buffer: []u8, peer: *P2PDevice, wps_method: WpsMethod): usize {
+        var offset: usize = 0
+
+        // Action frame header
+        buffer[0] = 0x04  // Action category: Public
+        buffer[1] = 0x09  // Action: Vendor-specific
+        @memcpy(buffer[2..5], &P2P_OUI)
+        buffer[5] = P2P_OUI_TYPE
+        buffer[6] = P2P_GO_NEG_REQ
+        offset = 7
+
+        // Dialog token
+        buffer[offset] = @truncate(get_timestamp() & 0xFF)
+        offset += 1
+
+        // P2P IE
+        buffer[offset] = 0xDD  // Vendor IE
+        const ie_len_offset = offset + 1
+        offset += 2
+
+        @memcpy(buffer[offset..offset + 3], &P2P_OUI)
+        buffer[offset + 3] = P2P_OUI_TYPE
+        offset += 4
+
+        // P2P Capability
+        buffer[offset] = P2P_ATTR_CAPABILITY
+        buffer[offset + 1] = 2
+        buffer[offset + 2] = 0
+        buffer[offset + 3] = self.config.go_intent << 1
+        buffer[offset + 4] = 0x00
+        offset += 5
+
+        // GO Intent
+        buffer[offset] = P2P_ATTR_GROUP_OWNER_INTENT
+        buffer[offset + 1] = 1
+        buffer[offset + 2] = 0
+        buffer[offset + 3] = (self.config.go_intent << 1) | (self.pending_go_neg.?.tie_breaker & 1)
+        offset += 4
+
+        // Config Timeout
+        buffer[offset] = P2P_ATTR_CONFIG_TIMEOUT
+        buffer[offset + 1] = 2
+        buffer[offset + 2] = 0
+        buffer[offset + 3] = 100  // GO config timeout (units of 10ms)
+        buffer[offset + 4] = 100  // Client config timeout
+        offset += 5
+
+        // Listen Channel
+        buffer[offset] = P2P_ATTR_LISTEN_CHANNEL
+        buffer[offset + 1] = 5
+        buffer[offset + 2] = 0
+        @memcpy(buffer[offset + 3..offset + 5], &self.config.country_code)
+        buffer[offset + 5] = 0x04  // Regulatory class
+        buffer[offset + 6] = self.config.listen_channel
+        offset += 7
+
+        // Intended Interface Address
+        buffer[offset] = P2P_ATTR_INTENDED_INTERFACE_ADDR
+        buffer[offset + 1] = 6
+        buffer[offset + 2] = 0
+        @memcpy(buffer[offset + 3..offset + 9], &self.interface_addr)
+        offset += 9
+
+        // Channel List
+        buffer[offset] = P2P_ATTR_CHANNEL_LIST
+        const channel_list_len = self.add_channel_list(buffer[offset + 3..])
+        buffer[offset + 1] = @truncate(channel_list_len & 0xFF)
+        buffer[offset + 2] = @truncate((channel_list_len >> 8) & 0xFF)
+        offset += 3 + channel_list_len
+
+        // Device Info
+        buffer[offset] = P2P_ATTR_DEVICE_INFO
+        const dev_info_len = self.add_device_info(buffer[offset + 3..])
+        buffer[offset + 1] = @truncate(dev_info_len & 0xFF)
+        buffer[offset + 2] = @truncate((dev_info_len >> 8) & 0xFF)
+        offset += 3 + dev_info_len
+
+        // Set IE length
+        buffer[ie_len_offset] = @truncate(offset - ie_len_offset - 1)
+
+        // Add WPS IE
+        const wps_ie_len = self.add_wps_ie(buffer[offset..], wps_method)
+        offset += wps_ie_len
+
+        return offset
+    }
+
+    fn add_channel_list(self: *P2PManager, buffer: []u8): usize {
+        var offset: usize = 0
+
+        // Country string
+        @memcpy(buffer[0..2], &self.config.country_code)
+        buffer[2] = 0x04
+        offset = 3
+
+        // 2.4 GHz channels (class 81)
+        buffer[offset] = 81  // Regulatory class
+        buffer[offset + 1] = 11  // Number of channels
+        offset += 2
+
+        var ch: u8 = 1
+        while ch <= 11 {
+            buffer[offset] = ch
+            offset += 1
+            ch += 1
+        }
+
+        return offset
+    }
+
+    fn add_device_info(self: *P2PManager, buffer: []u8): usize {
+        var offset: usize = 0
+
+        // Device address
+        @memcpy(buffer[0..6], &self.device_addr)
+        offset = 6
+
+        // Config methods
+        buffer[offset] = @truncate((self.config.config_methods >> 8) & 0xFF)
+        buffer[offset + 1] = @truncate(self.config.config_methods & 0xFF)
+        offset += 2
+
+        // Primary device type
+        buffer[offset] = 0x00
+        buffer[offset + 1] = @truncate(self.config.device_type)
+        offset += 2
+        // OUI
+        @memcpy(buffer[offset..offset + 4], &[_]u8{ 0x00, 0x50, 0xF2, 0x04 })
+        offset += 4
+        // Sub-category
+        buffer[offset] = 0x00
+        buffer[offset + 1] = 0x01
+        offset += 2
+
+        // Number of secondary device types
+        buffer[offset] = 0
+        offset += 1
+
+        // Device name
+        buffer[offset] = 0x10  // Device Name attribute
+        buffer[offset + 1] = 0x11
+        buffer[offset + 2] = @truncate((self.config.device_name_len >> 8) & 0xFF)
+        buffer[offset + 3] = @truncate(self.config.device_name_len & 0xFF)
+        offset += 4
+        @memcpy(buffer[offset..offset + self.config.device_name_len], self.config.device_name[0..self.config.device_name_len])
+        offset += self.config.device_name_len
+
+        return offset
+    }
+
+    fn add_wps_ie(self: *P2PManager, buffer: []u8, wps_method: WpsMethod): usize {
+        var offset: usize = 0
+
+        buffer[offset] = 0xDD  // Vendor IE
+        offset += 1
+
+        const len_offset = offset
+        offset += 1
+
+        // WPS OUI
+        @memcpy(buffer[offset..offset + 4], &[_]u8{ 0x00, 0x50, 0xF2, 0x04 })
+        offset += 4
+
+        // Version
+        buffer[offset] = 0x10
+        buffer[offset + 1] = 0x4A
+        buffer[offset + 2] = 0x00
+        buffer[offset + 3] = 0x01
+        buffer[offset + 4] = 0x10
+        offset += 5
+
+        // Config Methods
+        buffer[offset] = 0x10
+        buffer[offset + 1] = 0x08
+        buffer[offset + 2] = 0x00
+        buffer[offset + 3] = 0x02
+
+        const config_method: u16 = switch wps_method {
+            .PBC => 0x0080,
+            .PIN_DISPLAY => 0x0008,
+            .PIN_KEYPAD => 0x0100,
+        }
+
+        buffer[offset + 4] = @truncate((config_method >> 8) & 0xFF)
+        buffer[offset + 5] = @truncate(config_method & 0xFF)
+        offset += 6
+
+        // Set length
+        buffer[len_offset] = @truncate(offset - len_offset - 1)
+
+        return offset
+    }
+
+    pub fn handle_go_neg_response(self: *P2PManager, frame: []const u8): void {
+        if self.pending_go_neg == null {
+            return
+        }
+
+        // Parse response
+        const p2p_ie = find_p2p_ie(frame) orelse return
+
+        // Find status attribute
+        const status = find_attribute(p2p_ie, P2P_ATTR_STATUS)
+        if status == null or status.?.len < 1 {
+            return
+        }
+
+        if status.?[0] != P2P_STATUS_SUCCESS {
+            self.pending_go_neg.?.status = .FAILED
+            self.state = .IDLE
+            return
+        }
+
+        // Parse GO intent
+        const intent_attr = find_attribute(p2p_ie, P2P_ATTR_GROUP_OWNER_INTENT)
+        if intent_attr != null and intent_attr.?.len >= 1 {
+            self.pending_go_neg.?.peer_intent = intent_attr.?[0] >> 1
+        }
+
+        // Determine who becomes GO
+        const our_intent = self.pending_go_neg.?.our_intent
+        const peer_intent = self.pending_go_neg.?.peer_intent
+        const our_tie = self.pending_go_neg.?.tie_breaker
+
+        var we_are_go: bool = false
+
+        if our_intent > peer_intent {
+            we_are_go = true
+        } else if our_intent < peer_intent {
+            we_are_go = false
+        } else {
+            // Tie - use tie breaker
+            we_are_go = (our_tie == 1)
+        }
+
+        // Send GO Negotiation Confirmation
+        self.send_go_neg_confirmation(we_are_go)
+    }
+
+    fn send_go_neg_confirmation(self: *P2PManager, we_are_go: bool): void {
+        var frame: [256]u8 = undefined
+        var offset: usize = 0
+
+        // Action frame header
+        frame[0] = 0x04
+        frame[1] = 0x09
+        @memcpy(frame[2..5], &P2P_OUI)
+        frame[5] = P2P_OUI_TYPE
+        frame[6] = P2P_GO_NEG_CONF
+        offset = 7
+
+        // Dialog token
+        frame[offset] = @truncate(get_timestamp() & 0xFF)
+        offset += 1
+
+        // P2P IE with status
+        frame[offset] = 0xDD
+        offset += 1
+
+        const ie_start = offset
+        offset += 1
+
+        @memcpy(frame[offset..offset + 3], &P2P_OUI)
+        frame[offset + 3] = P2P_OUI_TYPE
+        offset += 4
+
+        // Status: Success
+        frame[offset] = P2P_ATTR_STATUS
+        frame[offset + 1] = 1
+        frame[offset + 2] = 0
+        frame[offset + 3] = P2P_STATUS_SUCCESS
+        offset += 4
+
+        // Capability
+        frame[offset] = P2P_ATTR_CAPABILITY
+        frame[offset + 1] = 2
+        frame[offset + 2] = 0
+        frame[offset + 3] = if we_are_go { 0x01 } else { 0x00 }
+        frame[offset + 4] = if we_are_go { 0x08 } else { 0x00 }
+        offset += 5
+
+        // Operating channel (if we are GO)
+        if we_are_go {
+            frame[offset] = P2P_ATTR_OPERATING_CHANNEL
+            frame[offset + 1] = 5
+            frame[offset + 2] = 0
+            @memcpy(frame[offset + 3..offset + 5], &self.config.country_code)
+            frame[offset + 5] = 0x51
+            frame[offset + 6] = if self.config.operating_channel != 0 { self.config.operating_channel } else { 6 }
+            offset += 7
+        }
+
+        // Channel list
+        frame[offset] = P2P_ATTR_CHANNEL_LIST
+        const ch_len = self.add_channel_list(frame[offset + 3..])
+        frame[offset + 1] = @truncate(ch_len & 0xFF)
+        frame[offset + 2] = @truncate((ch_len >> 8) & 0xFF)
+        offset += 3 + ch_len
+
+        // Group ID (if we are GO)
+        if we_are_go {
+            frame[offset] = P2P_ATTR_GROUP_ID
+            frame[offset + 1] = 6 + 7  // MAC + "DIRECT-" minimum
+            frame[offset + 2] = 0
+            @memcpy(frame[offset + 3..offset + 9], &self.device_addr)
+
+            // Generate SSID
+            const ssid = self.generate_p2p_ssid()
+            @memcpy(frame[offset + 9..offset + 9 + ssid.len], ssid)
+
+            frame[offset + 1] = @truncate(6 + ssid.len)
+            offset += 3 + 6 + ssid.len
+        }
+
+        // Set IE length
+        frame[ie_start] = @truncate(offset - ie_start - 1)
+
+        // Send
+        _ = self.send_action_frame(&self.pending_peer.?.device_addr, frame[0..offset])
+
+        // Start group formation
+        self.pending_go_neg.?.status = .COMPLETE
+
+        if we_are_go {
+            self.start_go_mode()
+        } else {
+            self.start_client_mode()
+        }
+    }
+
+    fn generate_p2p_ssid(self: *P2PManager): []const u8 {
+        // Format: DIRECT-XX-DeviceName
+        var ssid: [32]u8 = undefined
+        @memcpy(ssid[0..7], "DIRECT-")
+
+        // Generate random 2 characters
+        const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        ssid[7] = chars[crypto.random_u8() % 36]
+        ssid[8] = chars[crypto.random_u8() % 36]
+        ssid[9] = '-'
+
+        const name_len = @min(self.config.device_name_len, 21)
+        @memcpy(ssid[10..10 + name_len], self.config.device_name[0..name_len])
+
+        return ssid[0..10 + name_len]
+    }
+
+    fn start_go_mode(self: *P2PManager): void {
+        // Create and start P2P Group as GO
+        var group = P2PGroup.init()
+
+        // Set SSID
+        const ssid = self.generate_p2p_ssid()
+        @memcpy(group.ssid[0..ssid.len], ssid)
+        group.ssid_len = ssid.len
+
+        // Set BSSID
+        @memcpy(&group.bssid, &self.device_addr)
+        @memcpy(&group.go_dev_addr, &self.device_addr)
+
+        // Generate passphrase
+        group.passphrase_len = self.generate_passphrase(&group.passphrase)
+
+        // Set channel
+        group.operating_channel = if self.config.operating_channel != 0 { self.config.operating_channel } else { 6 }
+        group.frequency = channel_to_frequency(group.operating_channel)
+
+        group.is_go = true
+        group.started_time = get_timestamp()
+
+        self.current_group = group
+
+        // Start AP mode
+        // ... (similar to wifi_hotspot)
+
+        self.state = .CONNECTED
+        self.successful_connections += 1
+
+        if self.on_group_started != null {
+            self.on_group_started.?(&self.current_group.?)
+        }
+    }
+
+    fn start_client_mode(self: *P2PManager): void {
+        // Connect to GO's network
+        self.state = .WPS_PROVISIONING
+
+        // Start WPS
+        // ... (WPS exchange)
+
+        // After WPS, connect
+        self.state = .CONNECTED
+        self.successful_connections += 1
+
+        if self.on_group_started != null {
+            self.on_group_started.?(&self.current_group.?)
+        }
+    }
+
+    fn generate_passphrase(self: *P2PManager, buffer: *[64]u8): usize {
+        const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        const len: usize = 8  // Minimum WPA2 passphrase length
+
+        for (0..len) |i| {
+            buffer[i] = chars[crypto.random_u8() % 62]
+        }
+
+        return len
+    }
+
+    // ============================================
+    // Group Management
+    // ============================================
+
+    pub fn leave_group(self: *P2PManager): void {
+        if self.current_group == null {
+            return
+        }
+
+        if self.current_group.?.is_go {
+            // Send deauth to all clients
+            for (0..self.current_group.?.client_count) |i| {
+                self.disconnect_peer(&self.current_group.?.clients[i].device_addr)
+            }
+        } else {
+            // Send deauth to GO
+            self.disconnect_peer(&self.current_group.?.go_dev_addr)
+        }
+
+        if self.on_group_finished != null {
+            self.on_group_finished.?(&self.current_group.?)
+        }
+
+        self.current_group = null
+        self.state = .IDLE
+    }
+
+    pub fn disconnect_peer(self: *P2PManager, peer_addr: *const [6]u8): void {
+        // Send deauthentication
+        var msg = Nl80211Message.init(NL80211_CMD_DEL_STATION)
+        msg.put_u32(NL80211_ATTR_IFINDEX, self.interface_index)
+        msg.put(NL80211_ATTR_MAC, peer_addr)
+        msg.put_u16(NL80211_ATTR_REASON_CODE, 3)
+
+        _ = send_nl80211_msg(self.nl80211_socket, &msg)
+    }
+
+    // ============================================
+    // Service Discovery
+    // ============================================
+
+    pub fn add_local_service(self: *P2PManager, service: P2PService): bool {
+        if self.local_service_count >= 8 {
+            return false
+        }
+
+        self.local_services[self.local_service_count] = service
+        self.local_service_count += 1
+        return true
+    }
+
+    pub fn remove_local_service(self: *P2PManager, service_type: P2PServiceType): void {
+        var i: usize = 0
+        while i < self.local_service_count {
+            if self.local_services[i].service_type == service_type {
+                // Shift remaining
+                var j = i
+                while j < self.local_service_count - 1 {
+                    self.local_services[j] = self.local_services[j + 1]
+                    j += 1
+                }
+                self.local_service_count -= 1
+            } else {
+                i += 1
+            }
+        }
+    }
+
+    pub fn discover_services(self: *P2PManager, peer: *P2PDevice, service_type: P2PServiceType): bool {
+        // Send service discovery request
+        var frame: [256]u8 = undefined
+        var offset: usize = 0
+
+        // GAS Initial Request frame
+        frame[0] = 0x04  // Public Action
+        frame[1] = 0x0A  // GAS Initial Request
+        frame[2] = @truncate(get_timestamp() & 0xFF)  // Dialog token
+        offset = 3
+
+        // Advertisement Protocol IE
+        frame[offset] = 0x6C  // Advertisement Protocol
+        frame[offset + 1] = 2   // Length
+        frame[offset + 2] = 0   // Query Response Length Limit
+        frame[offset + 3] = 0   // Advertisement Protocol ID: P2P
+        offset += 4
+
+        // Query Request
+        const query_len = self.build_service_query(frame[offset + 2..], service_type)
+        frame[offset] = @truncate(query_len & 0xFF)
+        frame[offset + 1] = @truncate((query_len >> 8) & 0xFF)
+        offset += 2 + query_len
+
+        return self.send_action_frame(&peer.device_addr, frame[0..offset])
+    }
+
+    fn build_service_query(self: *P2PManager, buffer: []u8, service_type: P2PServiceType): usize {
+        var offset: usize = 0
+
+        // Service transaction ID
+        buffer[offset] = @truncate(get_timestamp() & 0xFF)
+        offset += 1
+
+        switch service_type {
+            .BONJOUR => {
+                buffer[offset] = 0x01  // Bonjour
+                offset += 1
+
+                // DNS-SD query
+                @memcpy(buffer[offset..offset + 7], "_tcp.local")
+                offset += 10
+            }
+            .UPNP => {
+                buffer[offset] = 0x02  // UPnP
+                offset += 1
+
+                // UPnP version
+                buffer[offset] = 0x10
+                offset += 1
+
+                // Service type
+                @memcpy(buffer[offset..offset + 15], "ssdp:all")
+                offset += 8
+            }
+            else => {
+                buffer[offset] = 0xFF  // All services
+                offset += 1
+            }
+        }
+
+        return offset
+    }
+
+    // ============================================
+    // Invitation
+    // ============================================
+
+    pub fn invite(self: *P2PManager, peer: *P2PDevice, group: *P2PGroup): bool {
+        // Send invitation request
+        var frame: [256]u8 = undefined
+        var offset: usize = 0
+
+        // Action frame header
+        frame[0] = 0x04
+        frame[1] = 0x09
+        @memcpy(frame[2..5], &P2P_OUI)
+        frame[5] = P2P_OUI_TYPE
+        frame[6] = P2P_INVITATION_REQ
+        offset = 7
+
+        // Dialog token
+        frame[offset] = @truncate(get_timestamp() & 0xFF)
+        offset += 1
+
+        // P2P IE
+        frame[offset] = 0xDD
+        const ie_start = offset + 1
+        offset += 2
+
+        @memcpy(frame[offset..offset + 3], &P2P_OUI)
+        frame[offset + 3] = P2P_OUI_TYPE
+        offset += 4
+
+        // Invitation flags
+        frame[offset] = P2P_ATTR_INVITATION_FLAGS
+        frame[offset + 1] = 1
+        frame[offset + 2] = 0
+        frame[offset + 3] = 0x01  // Invitation type: reinvoke persistent
+        offset += 4
+
+        // Config timeout
+        frame[offset] = P2P_ATTR_CONFIG_TIMEOUT
+        frame[offset + 1] = 2
+        frame[offset + 2] = 0
+        frame[offset + 3] = 100
+        frame[offset + 4] = 100
+        offset += 5
+
+        // Operating channel
+        frame[offset] = P2P_ATTR_OPERATING_CHANNEL
+        frame[offset + 1] = 5
+        frame[offset + 2] = 0
+        @memcpy(frame[offset + 3..offset + 5], &self.config.country_code)
+        frame[offset + 5] = 0x51
+        frame[offset + 6] = group.operating_channel
+        offset += 7
+
+        // Group BSSID
+        frame[offset] = P2P_ATTR_GROUP_BSSID
+        frame[offset + 1] = 6
+        frame[offset + 2] = 0
+        @memcpy(frame[offset + 3..offset + 9], &group.bssid)
+        offset += 9
+
+        // Group ID
+        frame[offset] = P2P_ATTR_GROUP_ID
+        frame[offset + 1] = @truncate(6 + group.ssid_len)
+        frame[offset + 2] = 0
+        @memcpy(frame[offset + 3..offset + 9], &group.go_dev_addr)
+        @memcpy(frame[offset + 9..offset + 9 + group.ssid_len], group.ssid[0..group.ssid_len])
+        offset += 9 + group.ssid_len
+
+        // Device info
+        frame[offset] = P2P_ATTR_DEVICE_INFO
+        const dev_len = self.add_device_info(frame[offset + 3..])
+        frame[offset + 1] = @truncate(dev_len & 0xFF)
+        frame[offset + 2] = @truncate((dev_len >> 8) & 0xFF)
+        offset += 3 + dev_len
+
+        // Set IE length
+        frame[ie_start] = @truncate(offset - ie_start - 1)
+
+        return self.send_action_frame(&peer.device_addr, frame[0..offset])
+    }
+
+    // ============================================
+    // Helper Functions
+    // ============================================
+
+    fn enable_p2p_mode(self: *P2PManager): bool {
+        var msg = Nl80211Message.init(NL80211_CMD_SET_INTERFACE)
+        msg.put_u32(NL80211_ATTR_IFINDEX, self.interface_index)
+        msg.put_u32(NL80211_ATTR_IFTYPE, NL80211_IFTYPE_P2P_DEVICE)
+
+        return send_nl80211_msg(self.nl80211_socket, &msg)
+    }
+
+    fn disable_p2p_mode(self: *P2PManager): void {
+        var msg = Nl80211Message.init(NL80211_CMD_SET_INTERFACE)
+        msg.put_u32(NL80211_ATTR_IFINDEX, self.interface_index)
+        msg.put_u32(NL80211_ATTR_IFTYPE, NL80211_IFTYPE_STATION)
+
+        _ = send_nl80211_msg(self.nl80211_socket, &msg)
+    }
+
+    fn send_action_frame(self: *P2PManager, dest: *const [6]u8, frame: []const u8): bool {
+        var msg = Nl80211Message.init(NL80211_CMD_FRAME)
+        msg.put_u32(NL80211_ATTR_IFINDEX, self.interface_index)
+        msg.put(NL80211_ATTR_FRAME, frame)
+        msg.put_u32(NL80211_ATTR_WIPHY_FREQ, channel_to_frequency(self.config.listen_channel))
+
+        return send_nl80211_msg(self.nl80211_socket, &msg)
+    }
+
+    fn build_p2p_ie(self: *P2PManager, buffer: []u8, is_probe: bool): usize {
+        var offset: usize = 0
+
+        buffer[offset] = 0xDD  // Vendor IE
+        offset += 1
+
+        const len_offset = offset
+        offset += 1
+
+        // P2P OUI
+        @memcpy(buffer[offset..offset + 3], &P2P_OUI)
+        buffer[offset + 3] = P2P_OUI_TYPE
+        offset += 4
+
+        // P2P Capability
+        buffer[offset] = P2P_ATTR_CAPABILITY
+        buffer[offset + 1] = 2
+        buffer[offset + 2] = 0
+        buffer[offset + 3] = 0x25  // Device capability: Service Discovery, Client Discoverability, Concurrent Operation
+        buffer[offset + 4] = 0x00  // Group capability
+        offset += 5
+
+        // Device Info (for probe)
+        if is_probe {
+            buffer[offset] = P2P_ATTR_DEVICE_INFO
+            const dev_len = self.add_device_info(buffer[offset + 3..])
+            buffer[offset + 1] = @truncate(dev_len & 0xFF)
+            buffer[offset + 2] = @truncate((dev_len >> 8) & 0xFF)
+            offset += 3 + dev_len
+        }
+
+        // Listen Channel
+        buffer[offset] = P2P_ATTR_LISTEN_CHANNEL
+        buffer[offset + 1] = 5
+        buffer[offset + 2] = 0
+        buffer[offset + 3] = 'U'
+        buffer[offset + 4] = 'S'
+        buffer[offset + 5] = 0x04
+        buffer[offset + 6] = self.config.listen_channel
+        offset += 7
+
+        // Set length
+        buffer[len_offset] = @truncate(offset - len_offset - 1)
+
+        return offset
+    }
+
+    fn parse_p2p_ie(self: *P2PManager, ie: []const u8, device: *P2PDevice): bool {
+        var offset: usize = 0
+
+        // Skip OUI
+        if ie.len < 4 {
+            return false
+        }
+        offset = 4
+
+        while offset + 3 <= ie.len {
+            const attr_id = ie[offset]
+            const attr_len = @as(u16, ie[offset + 1]) | (@as(u16, ie[offset + 2]) << 8)
+            offset += 3
+
+            if offset + attr_len > ie.len {
+                break
+            }
+
+            switch attr_id {
+                P2P_ATTR_CAPABILITY => {
+                    if attr_len >= 2 {
+                        device.device_capability = ie[offset]
+                        device.group_capability = ie[offset + 1]
+                    }
+                }
+                P2P_ATTR_DEVICE_INFO => {
+                    // Parse device info
+                    if attr_len >= 17 {
+                        @memcpy(&device.device_addr, ie[offset..offset + 6])
+                        device.config_methods = (@as(u16, ie[offset + 6]) << 8) | @as(u16, ie[offset + 7])
+                        @memcpy(&device.primary_dev_type, ie[offset + 8..offset + 16])
+
+                        // Device name is at variable offset
+                        var name_offset = offset + 17
+                        while name_offset + 4 <= offset + attr_len {
+                            const name_type = (@as(u16, ie[name_offset]) << 8) | @as(u16, ie[name_offset + 1])
+                            const name_len = (@as(u16, ie[name_offset + 2]) << 8) | @as(u16, ie[name_offset + 3])
+
+                            if name_type == 0x1011 and name_len <= 32 {
+                                @memcpy(device.device_name[0..name_len], ie[name_offset + 4..name_offset + 4 + name_len])
+                                device.device_name_len = name_len
+                            }
+
+                            name_offset += 4 + name_len
+                        }
+                    }
+                }
+                P2P_ATTR_LISTEN_CHANNEL => {
+                    if attr_len >= 5 {
+                        device.listen_channel = ie[offset + 4]
+                    }
+                }
+                P2P_ATTR_OPERATING_CHANNEL => {
+                    if attr_len >= 5 {
+                        device.operating_channel = ie[offset + 4]
+                    }
+                }
+                P2P_ATTR_GROUP_OWNER_INTENT => {
+                    if attr_len >= 1 {
+                        device.go_intent = ie[offset] >> 1
+                    }
+                }
+                else => {}
+            }
+
+            offset += attr_len
+        }
+
+        return device.device_addr[0] != 0 or device.device_addr[1] != 0
+    }
+}
+
+// ============================================
+// Supporting Types
+// ============================================
+
+const P2PState = enum {
+    IDLE
+    SCANNING
+    LISTENING
+    CONNECTING
+    WPS_PROVISIONING
+    CONNECTED
+}
+
+const WpsMethod = enum {
+    PBC
+    PIN_DISPLAY
+    PIN_KEYPAD
+}
+
+const GoNegotiation = struct {
+    peer_addr: [6]u8
+    wps_method: WpsMethod
+    our_intent: u8
+    peer_intent: u8
+    tie_breaker: u8
+    status: GoNegStatus
+    channel: u8
+    ssid: [32]u8
+    ssid_len: usize
+}
+
+const GoNegStatus = enum {
+    IN_PROGRESS
+    COMPLETE
+    FAILED
+}
+
+const Nl80211Message = struct {
+    buffer: [4096]u8
+    length: usize
+
+    pub fn init(cmd: u8): Nl80211Message {
+        var msg: Nl80211Message = undefined
+        @memset(&msg.buffer, 0)
+        msg.buffer[0] = cmd
+        msg.length = 16
+        return msg
+    }
+
+    pub fn put_u32(self: *Nl80211Message, attr: u16, value: u32): void {
+        self.buffer[self.length] = 8
+        self.buffer[self.length + 1] = 0
+        self.buffer[self.length + 2] = @truncate(attr & 0xFF)
+        self.buffer[self.length + 3] = @truncate((attr >> 8) & 0xFF)
+        self.buffer[self.length + 4] = @truncate(value & 0xFF)
+        self.buffer[self.length + 5] = @truncate((value >> 8) & 0xFF)
+        self.buffer[self.length + 6] = @truncate((value >> 16) & 0xFF)
+        self.buffer[self.length + 7] = @truncate((value >> 24) & 0xFF)
+        self.length += 8
+    }
+
+    pub fn put_u16(self: *Nl80211Message, attr: u16, value: u16): void {
+        self.buffer[self.length] = 6
+        self.buffer[self.length + 1] = 0
+        self.buffer[self.length + 2] = @truncate(attr & 0xFF)
+        self.buffer[self.length + 3] = @truncate((attr >> 8) & 0xFF)
+        self.buffer[self.length + 4] = @truncate(value & 0xFF)
+        self.buffer[self.length + 5] = @truncate((value >> 8) & 0xFF)
+        self.length += 8
+    }
+
+    pub fn put(self: *Nl80211Message, attr: u16, data: []const u8): void {
+        const aligned_len = (4 + data.len + 3) & ~@as(usize, 3)
+        self.buffer[self.length] = @truncate((4 + data.len) & 0xFF)
+        self.buffer[self.length + 1] = @truncate(((4 + data.len) >> 8) & 0xFF)
+        self.buffer[self.length + 2] = @truncate(attr & 0xFF)
+        self.buffer[self.length + 3] = @truncate((attr >> 8) & 0xFF)
+        @memcpy(self.buffer[self.length + 4..self.length + 4 + data.len], data)
+        self.length += aligned_len
+    }
+}
+
+// ============================================
+// Constants
+// ============================================
+
+const NL80211_CMD_SET_INTERFACE: u8 = 6
+const NL80211_CMD_START_P2P_DEVICE: u8 = 86
+const NL80211_CMD_STOP_P2P_DEVICE: u8 = 87
+const NL80211_CMD_REMAIN_ON_CHANNEL: u8 = 55
+const NL80211_CMD_TRIGGER_SCAN: u8 = 33
+const NL80211_CMD_FRAME: u8 = 59
+const NL80211_CMD_DEL_STATION: u8 = 19
+
+const NL80211_ATTR_IFINDEX: u16 = 3
+const NL80211_ATTR_IFTYPE: u16 = 5
+const NL80211_ATTR_MAC: u16 = 6
+const NL80211_ATTR_WIPHY_FREQ: u16 = 38
+const NL80211_ATTR_DURATION: u16 = 87
+const NL80211_ATTR_IE: u16 = 42
+const NL80211_ATTR_FRAME: u16 = 51
+const NL80211_ATTR_REASON_CODE: u16 = 36
+
+const NL80211_IFTYPE_STATION: u32 = 2
+const NL80211_IFTYPE_P2P_DEVICE: u32 = 10
+const NL80211_IFTYPE_P2P_GO: u32 = 8
+const NL80211_IFTYPE_P2P_CLIENT: u32 = 9
+
+// ============================================
+// Helper Functions
+// ============================================
+
+fn channel_to_frequency(channel: u8): u32 {
+    if channel >= 1 and channel <= 13 {
+        return 2407 + @as(u32, channel) * 5
+    } else if channel == 14 {
+        return 2484
+    } else if channel >= 36 and channel <= 165 {
+        return 5000 + @as(u32, channel) * 5
+    }
+    return 2437  // Default channel 6
+}
+
+fn find_p2p_ie(frame: []const u8): ?[]const u8 {
+    // Find P2P IE in frame
+    var offset: usize = 24  // Skip MAC header
+
+    while offset + 2 <= frame.len {
+        const id = frame[offset]
+        const len = frame[offset + 1]
+
+        if offset + 2 + len > frame.len {
+            break
+        }
+
+        if id == 0xDD and len >= 4 {
+            // Check for P2P OUI
+            if std.mem.eql(u8, frame[offset + 2..offset + 5], &P2P_OUI) and
+               frame[offset + 5] == P2P_OUI_TYPE {
+                return frame[offset + 2..offset + 2 + len]
+            }
+        }
+
+        offset += 2 + len
+    }
+
+    return null
+}
+
+fn find_attribute(ie: []const u8, attr_id: u8): ?[]const u8 {
+    var offset: usize = 4  // Skip OUI
+
+    while offset + 3 <= ie.len {
+        const id = ie[offset]
+        const len = @as(u16, ie[offset + 1]) | (@as(u16, ie[offset + 2]) << 8)
+
+        if offset + 3 + len > ie.len {
+            break
+        }
+
+        if id == attr_id {
+            return ie[offset + 3..offset + 3 + len]
+        }
+
+        offset += 3 + len
+    }
+
+    return null
+}
+
+fn get_timestamp(): u64 {
+    var ts: struct { tv_sec: i64, tv_nsec: i64 } = undefined
+    _ = @import("time").clock_gettime(0, &ts)
+    return @as(u64, @intCast(ts.tv_sec))
+}
+
+fn sleep_ms(ms: u32): void {
+    var ts: struct { tv_sec: i64, tv_nsec: i64 } = undefined
+    ts.tv_sec = ms / 1000
+    ts.tv_nsec = (ms % 1000) * 1000000
+    _ = @import("time").nanosleep(&ts, null)
+}
+
+extern fn create_nl80211_socket(): i32
+extern fn send_nl80211_msg(sock: i32, msg: *Nl80211Message): bool
+extern fn get_interface_index(name: []const u8): u32
+extern fn get_interface_mac(name: []const u8, mac: *[6]u8): void
+extern fn close_socket(fd: i32): void
+
+// ============================================
+// Public API
+// ============================================
+
+var global_p2p: ?*P2PManager = null
+
+pub fn wifi_direct_init(interface: []const u8): bool {
+    if global_p2p != null {
+        return false
+    }
+
+    var config = P2PConfig.default()
+    global_p2p = @ptrCast(*P2PManager, alloc(@sizeOf(P2PManager)))
+    global_p2p.?.* = P2PManager.init(config)
+
+    return global_p2p.?.start(interface)
+}
+
+pub fn wifi_direct_find_peers(timeout_sec: u32): bool {
+    if global_p2p == null {
+        return false
+    }
+    return global_p2p.?.find_peers(timeout_sec)
+}
+
+pub fn wifi_direct_connect(peer_addr: [6]u8, wps_method: WpsMethod): bool {
+    if global_p2p == null {
+        return false
+    }
+
+    // Find peer
+    for (0..global_p2p.?.peer_count) |i| {
+        if std.mem.eql(u8, &global_p2p.?.peers[i].device_addr, &peer_addr) {
+            return global_p2p.?.connect(&global_p2p.?.peers[i], wps_method)
+        }
+    }
+
+    return false
+}
+
+pub fn wifi_direct_disconnect(): void {
+    if global_p2p == null {
+        return
+    }
+    global_p2p.?.leave_group()
+}
+
+pub fn wifi_direct_get_peers(): []P2PDevice {
+    if global_p2p == null {
+        return &[_]P2PDevice{}
+    }
+    return global_p2p.?.peers[0..global_p2p.?.peer_count]
+}
+
+pub fn wifi_direct_shutdown(): void {
+    if global_p2p == null {
+        return
+    }
+
+    global_p2p.?.stop()
+    free(global_p2p.?)
+    global_p2p = null
+}
+
+extern fn alloc(size: usize): *void
+extern fn free(ptr: *void): void

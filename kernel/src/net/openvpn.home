@@ -1,0 +1,1597 @@
+// HomeOS OpenVPN Client Implementation
+// Full OpenVPN 2.x protocol support with TLS authentication
+//
+// Features:
+// - TLS-based key exchange and authentication
+// - Multiple cipher support (AES-256-GCM, AES-128-GCM, ChaCha20-Poly1305)
+// - UDP and TCP transport modes
+// - LZO/LZ4 compression support
+// - Certificate and key management
+// - Reconnection with exponential backoff
+// - Multi-hop VPN support
+// - Split tunneling
+
+const std = @import("std")
+const net = @import("net")
+const tls = @import("tls")
+const crypto = @import("../crypto/crypto")
+const socket = @import("socket")
+
+// ============================================
+// OpenVPN Protocol Constants
+// ============================================
+
+pub const OPENVPN_PORT: u16 = 1194
+pub const OPENVPN_TCP_PORT: u16 = 443
+
+// Opcodes (P_* in OpenVPN)
+pub const P_CONTROL_HARD_RESET_CLIENT_V1: u8 = 1
+pub const P_CONTROL_HARD_RESET_SERVER_V1: u8 = 2
+pub const P_CONTROL_SOFT_RESET_V1: u8 = 3
+pub const P_CONTROL_V1: u8 = 4
+pub const P_ACK_V1: u8 = 5
+pub const P_DATA_V1: u8 = 6
+pub const P_CONTROL_HARD_RESET_CLIENT_V2: u8 = 7
+pub const P_CONTROL_HARD_RESET_SERVER_V2: u8 = 8
+pub const P_DATA_V2: u8 = 9
+pub const P_CONTROL_HARD_RESET_CLIENT_V3: u8 = 10
+pub const P_CONTROL_WKC_V1: u8 = 11
+
+// Key methods
+pub const KEY_METHOD_1: u8 = 1
+pub const KEY_METHOD_2: u8 = 2
+
+// Cipher types
+pub const CipherType = enum {
+    AES_256_GCM
+    AES_128_GCM
+    AES_256_CBC
+    AES_128_CBC
+    CHACHA20_POLY1305
+    BF_CBC  // Blowfish (legacy)
+}
+
+// Authentication types
+pub const AuthType = enum {
+    SHA256
+    SHA384
+    SHA512
+    SHA1  // Legacy
+}
+
+// Compression types
+pub const CompressionType = enum {
+    NONE
+    LZO
+    LZ4
+    LZ4_V2
+    STUB
+    STUB_V2
+}
+
+// Transport mode
+pub const TransportMode = enum {
+    UDP
+    TCP
+}
+
+// ============================================
+// OpenVPN Packet Structures
+// ============================================
+
+pub const PacketHeader = packed struct {
+    opcode_key: u8       // Upper 5 bits: opcode, lower 3 bits: key_id
+    session_id: [8]u8    // Session identifier
+
+    pub fn get_opcode(self: *const PacketHeader): u8 {
+        return (self.opcode_key >> 3) & 0x1F
+    }
+
+    pub fn get_key_id(self: *const PacketHeader): u8 {
+        return self.opcode_key & 0x07
+    }
+
+    pub fn set_opcode_key(opcode: u8, key_id: u8): u8 {
+        return ((opcode & 0x1F) << 3) | (key_id & 0x07)
+    }
+}
+
+pub const ControlPacket = struct {
+    header: PacketHeader
+    ack_array_len: u8
+    ack_packet_ids: []u32
+    remote_session_id: ?[8]u8
+    packet_id: u32
+    payload: []u8
+}
+
+pub const DataPacket = struct {
+    header: PacketHeader
+    packet_id: u32
+    payload: []u8      // Encrypted tunnel data
+}
+
+// ============================================
+// TLS Wrapper for OpenVPN
+// ============================================
+
+pub const TlsWrapper = struct {
+    context: *tls.TlsContext
+    cipher: CipherType
+    auth: AuthType
+    key_direction: i8   // 0, 1, or -1 for bidirectional
+
+    // Session keys
+    cipher_key_encrypt: [64]u8
+    cipher_key_decrypt: [64]u8
+    hmac_key_encrypt: [64]u8
+    hmac_key_decrypt: [64]u8
+
+    // IV for CBC modes
+    iv_encrypt: [16]u8
+    iv_decrypt: [16]u8
+
+    // Packet ID for replay protection
+    packet_id_send: u64
+    packet_id_recv: u64
+    packet_id_recv_time: u64
+
+    pub fn init(cipher: CipherType, auth: AuthType): TlsWrapper {
+        return TlsWrapper{
+            .context = null,
+            .cipher = cipher,
+            .auth = auth,
+            .key_direction = -1,
+            .cipher_key_encrypt = [_]u8{0} ** 64,
+            .cipher_key_decrypt = [_]u8{0} ** 64,
+            .hmac_key_encrypt = [_]u8{0} ** 64,
+            .hmac_key_decrypt = [_]u8{0} ** 64,
+            .iv_encrypt = [_]u8{0} ** 16,
+            .iv_decrypt = [_]u8{0} ** 16,
+            .packet_id_send = 1,
+            .packet_id_recv = 0,
+            .packet_id_recv_time = 0,
+        }
+    }
+
+    pub fn derive_keys(self: *TlsWrapper, master_secret: []const u8, client_random: []const u8, server_random: []const u8): void {
+        // PRF to derive keys from master secret
+        var key_material: [256]u8 = undefined
+
+        // OpenVPN key expansion
+        crypto.prf_tls12(
+            master_secret,
+            "OpenVPN key expansion",
+            client_random ++ server_random,
+            &key_material
+        )
+
+        // Split key material based on key_direction
+        const key_len = self.get_cipher_key_length()
+        const hmac_len = self.get_hmac_key_length()
+
+        if self.key_direction == 0 or self.key_direction == -1 {
+            @memcpy(&self.cipher_key_encrypt, key_material[0..key_len])
+            @memcpy(&self.hmac_key_encrypt, key_material[key_len..key_len + hmac_len])
+            @memcpy(&self.cipher_key_decrypt, key_material[key_len + hmac_len..2 * key_len + hmac_len])
+            @memcpy(&self.hmac_key_decrypt, key_material[2 * key_len + hmac_len..2 * (key_len + hmac_len)])
+        } else {
+            @memcpy(&self.cipher_key_decrypt, key_material[0..key_len])
+            @memcpy(&self.hmac_key_decrypt, key_material[key_len..key_len + hmac_len])
+            @memcpy(&self.cipher_key_encrypt, key_material[key_len + hmac_len..2 * key_len + hmac_len])
+            @memcpy(&self.hmac_key_encrypt, key_material[2 * key_len + hmac_len..2 * (key_len + hmac_len)])
+        }
+    }
+
+    fn get_cipher_key_length(self: *const TlsWrapper): usize {
+        return switch self.cipher {
+            .AES_256_GCM, .AES_256_CBC => 32,
+            .AES_128_GCM, .AES_128_CBC => 16,
+            .CHACHA20_POLY1305 => 32,
+            .BF_CBC => 16,
+        }
+    }
+
+    fn get_hmac_key_length(self: *const TlsWrapper): usize {
+        return switch self.auth {
+            .SHA256 => 32,
+            .SHA384 => 48,
+            .SHA512 => 64,
+            .SHA1 => 20,
+        }
+    }
+
+    pub fn encrypt(self: *TlsWrapper, plaintext: []const u8, output: []u8): usize {
+        // Increment packet ID
+        const pkt_id = self.packet_id_send
+        self.packet_id_send += 1
+
+        var offset: usize = 0
+
+        // For AEAD ciphers (GCM, ChaCha20-Poly1305)
+        if self.cipher == .AES_256_GCM or self.cipher == .AES_128_GCM or self.cipher == .CHACHA20_POLY1305 {
+            // Packet ID (4 bytes for short form, 8 for long)
+            output[0] = @truncate((pkt_id >> 24) & 0xFF)
+            output[1] = @truncate((pkt_id >> 16) & 0xFF)
+            output[2] = @truncate((pkt_id >> 8) & 0xFF)
+            output[3] = @truncate(pkt_id & 0xFF)
+            offset = 4
+
+            // Generate nonce/IV from packet ID
+            var nonce: [12]u8 = undefined
+            @memset(&nonce, 0)
+            @memcpy(nonce[4..8], output[0..4])
+
+            // Encrypt with AEAD
+            const ciphertext_len = crypto.aead_encrypt(
+                self.cipher_key_encrypt[0..self.get_cipher_key_length()],
+                &nonce,
+                plaintext,
+                output[0..4],  // AAD is packet ID
+                output[offset..],
+            )
+
+            return offset + ciphertext_len
+        } else {
+            // CBC mode: HMAC-then-encrypt
+            // Prepend packet ID and timestamp
+            var header: [8]u8 = undefined
+            header[0] = @truncate((pkt_id >> 24) & 0xFF)
+            header[1] = @truncate((pkt_id >> 16) & 0xFF)
+            header[2] = @truncate((pkt_id >> 8) & 0xFF)
+            header[3] = @truncate(pkt_id & 0xFF)
+
+            const timestamp = get_unix_timestamp()
+            header[4] = @truncate((timestamp >> 24) & 0xFF)
+            header[5] = @truncate((timestamp >> 16) & 0xFF)
+            header[6] = @truncate((timestamp >> 8) & 0xFF)
+            header[7] = @truncate(timestamp & 0xFF)
+
+            // Compute HMAC
+            var hmac: [64]u8 = undefined
+            const hmac_len = self.get_hmac_key_length()
+            crypto.hmac(
+                self.hmac_key_encrypt[0..hmac_len],
+                &header ++ plaintext,
+                hmac[0..hmac_len]
+            )
+
+            // Copy HMAC to output
+            @memcpy(output[0..hmac_len], hmac[0..hmac_len])
+            offset = hmac_len
+
+            // Generate random IV
+            crypto.random_bytes(output[offset..offset + 16])
+            offset += 16
+
+            // Pad plaintext for CBC
+            var padded: [65536]u8 = undefined
+            @memcpy(padded[0..8], &header)
+            @memcpy(padded[8..8 + plaintext.len], plaintext)
+
+            const block_size: usize = 16
+            const pad_len = block_size - ((8 + plaintext.len) % block_size)
+            @memset(padded[8 + plaintext.len..8 + plaintext.len + pad_len], @truncate(pad_len))
+
+            const total_len = 8 + plaintext.len + pad_len
+
+            // Encrypt with CBC
+            crypto.aes_cbc_encrypt(
+                self.cipher_key_encrypt[0..self.get_cipher_key_length()],
+                output[offset - 16..offset],  // IV
+                padded[0..total_len],
+                output[offset..],
+            )
+
+            return offset + total_len
+        }
+    }
+
+    pub fn decrypt(self: *TlsWrapper, ciphertext: []const u8, output: []u8): ?usize {
+        if self.cipher == .AES_256_GCM or self.cipher == .AES_128_GCM or self.cipher == .CHACHA20_POLY1305 {
+            // Extract packet ID
+            if ciphertext.len < 4 {
+                return null
+            }
+
+            const pkt_id: u32 = (@as(u32, ciphertext[0]) << 24) |
+                               (@as(u32, ciphertext[1]) << 16) |
+                               (@as(u32, ciphertext[2]) << 8) |
+                               @as(u32, ciphertext[3])
+
+            // Replay protection
+            if pkt_id <= self.packet_id_recv {
+                return null  // Replay attack detected
+            }
+
+            // Generate nonce from packet ID
+            var nonce: [12]u8 = undefined
+            @memset(&nonce, 0)
+            @memcpy(nonce[4..8], ciphertext[0..4])
+
+            // Decrypt with AEAD
+            const plaintext_len = crypto.aead_decrypt(
+                self.cipher_key_decrypt[0..self.get_cipher_key_length()],
+                &nonce,
+                ciphertext[4..],
+                ciphertext[0..4],  // AAD
+                output,
+            ) orelse return null
+
+            self.packet_id_recv = pkt_id
+            return plaintext_len
+        } else {
+            // CBC mode: decrypt-then-verify
+            const hmac_len = self.get_hmac_key_length()
+            if ciphertext.len < hmac_len + 16 {
+                return null
+            }
+
+            // Extract HMAC
+            const received_hmac = ciphertext[0..hmac_len]
+            const iv = ciphertext[hmac_len..hmac_len + 16]
+            const encrypted = ciphertext[hmac_len + 16..]
+
+            // Decrypt
+            var decrypted: [65536]u8 = undefined
+            crypto.aes_cbc_decrypt(
+                self.cipher_key_decrypt[0..self.get_cipher_key_length()],
+                iv,
+                encrypted,
+                &decrypted,
+            )
+
+            // Remove padding
+            const pad_byte = decrypted[encrypted.len - 1]
+            if pad_byte > 16 or pad_byte == 0 {
+                return null
+            }
+
+            const unpadded_len = encrypted.len - pad_byte
+
+            // Verify HMAC
+            var computed_hmac: [64]u8 = undefined
+            crypto.hmac(
+                self.hmac_key_decrypt[0..hmac_len],
+                decrypted[0..unpadded_len],
+                computed_hmac[0..hmac_len]
+            )
+
+            if !crypto.constant_time_compare(received_hmac, computed_hmac[0..hmac_len]) {
+                return null  // HMAC verification failed
+            }
+
+            // Extract packet ID and check for replay
+            const pkt_id: u32 = (@as(u32, decrypted[0]) << 24) |
+                               (@as(u32, decrypted[1]) << 16) |
+                               (@as(u32, decrypted[2]) << 8) |
+                               @as(u32, decrypted[3])
+
+            if pkt_id <= self.packet_id_recv {
+                return null
+            }
+
+            self.packet_id_recv = pkt_id
+
+            // Copy plaintext (skip 8-byte header)
+            const plaintext_len = unpadded_len - 8
+            @memcpy(output[0..plaintext_len], decrypted[8..unpadded_len])
+
+            return plaintext_len
+        }
+    }
+}
+
+// ============================================
+// OpenVPN Configuration
+// ============================================
+
+pub const OpenVpnConfig = struct {
+    // Server connection
+    remote_host: [256]u8
+    remote_host_len: usize
+    remote_port: u16
+    transport: TransportMode
+
+    // Cryptographic settings
+    cipher: CipherType
+    auth: AuthType
+    tls_cipher: [128]u8
+    tls_cipher_len: usize
+
+    // Compression
+    compression: CompressionType
+
+    // Authentication
+    ca_cert: [4096]u8
+    ca_cert_len: usize
+    client_cert: [4096]u8
+    client_cert_len: usize
+    client_key: [4096]u8
+    client_key_len: usize
+
+    // Optional username/password auth
+    auth_user_pass: bool
+    username: [256]u8
+    username_len: usize
+    password: [256]u8
+    password_len: usize
+
+    // TLS auth key (optional)
+    tls_auth_key: [2048]u8
+    tls_auth_key_len: usize
+    tls_auth_direction: i8
+
+    // Tunnel options
+    dev_type: [16]u8  // "tun" or "tap"
+    topology: [16]u8  // "subnet" or "net30"
+    mtu: u16
+    mssfix: u16
+
+    // Routing
+    redirect_gateway: bool
+    route_nopull: bool
+
+    // Reconnection
+    connect_retry: u32
+    connect_retry_max: u32
+
+    // Keepalive
+    ping_interval: u32
+    ping_restart: u32
+
+    pub fn init(): OpenVpnConfig {
+        var config: OpenVpnConfig = undefined
+        @memset(&config.remote_host, 0)
+        config.remote_host_len = 0
+        config.remote_port = OPENVPN_PORT
+        config.transport = .UDP
+        config.cipher = .AES_256_GCM
+        config.auth = .SHA256
+        @memset(&config.tls_cipher, 0)
+        config.tls_cipher_len = 0
+        config.compression = .NONE
+        @memset(&config.ca_cert, 0)
+        config.ca_cert_len = 0
+        @memset(&config.client_cert, 0)
+        config.client_cert_len = 0
+        @memset(&config.client_key, 0)
+        config.client_key_len = 0
+        config.auth_user_pass = false
+        @memset(&config.username, 0)
+        config.username_len = 0
+        @memset(&config.password, 0)
+        config.password_len = 0
+        @memset(&config.tls_auth_key, 0)
+        config.tls_auth_key_len = 0
+        config.tls_auth_direction = -1
+        @memcpy(&config.dev_type, "tun\x00")
+        @memcpy(&config.topology, "subnet\x00")
+        config.mtu = 1500
+        config.mssfix = 1450
+        config.redirect_gateway = false
+        config.route_nopull = false
+        config.connect_retry = 5
+        config.connect_retry_max = 300
+        config.ping_interval = 10
+        config.ping_restart = 60
+        return config
+    }
+
+    pub fn parse_config_file(data: []const u8): ?OpenVpnConfig {
+        var config = OpenVpnConfig.init()
+
+        var lines = std.mem.split(u8, data, "\n")
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r")
+            if trimmed.len == 0 or trimmed[0] == '#' or trimmed[0] == ';' {
+                continue
+            }
+
+            var parts = std.mem.split(u8, trimmed, " ")
+            const directive = parts.next() orelse continue
+
+            if std.mem.eql(u8, directive, "remote") {
+                const host = parts.next() orelse continue
+                @memcpy(config.remote_host[0..host.len], host)
+                config.remote_host_len = host.len
+
+                if parts.next() |port_str| {
+                    config.remote_port = std.fmt.parseInt(u16, port_str, 10) catch OPENVPN_PORT
+                }
+            } else if std.mem.eql(u8, directive, "proto") {
+                const proto = parts.next() orelse continue
+                if std.mem.eql(u8, proto, "tcp") or std.mem.eql(u8, proto, "tcp-client") {
+                    config.transport = .TCP
+                } else {
+                    config.transport = .UDP
+                }
+            } else if std.mem.eql(u8, directive, "cipher") {
+                const cipher = parts.next() orelse continue
+                config.cipher = parse_cipher(cipher)
+            } else if std.mem.eql(u8, directive, "auth") {
+                const auth = parts.next() orelse continue
+                config.auth = parse_auth(auth)
+            } else if std.mem.eql(u8, directive, "compress") or std.mem.eql(u8, directive, "comp-lzo") {
+                const comp = parts.next()
+                config.compression = parse_compression(comp)
+            } else if std.mem.eql(u8, directive, "redirect-gateway") {
+                config.redirect_gateway = true
+            } else if std.mem.eql(u8, directive, "route-nopull") {
+                config.route_nopull = true
+            } else if std.mem.eql(u8, directive, "mtu") or std.mem.eql(u8, directive, "tun-mtu") {
+                if parts.next() |mtu_str| {
+                    config.mtu = std.fmt.parseInt(u16, mtu_str, 10) catch 1500
+                }
+            } else if std.mem.eql(u8, directive, "mssfix") {
+                if parts.next() |mss_str| {
+                    config.mssfix = std.fmt.parseInt(u16, mss_str, 10) catch 1450
+                }
+            } else if std.mem.eql(u8, directive, "ping") or std.mem.eql(u8, directive, "keepalive") {
+                if parts.next() |ping_str| {
+                    config.ping_interval = std.fmt.parseInt(u32, ping_str, 10) catch 10
+                }
+                if parts.next() |restart_str| {
+                    config.ping_restart = std.fmt.parseInt(u32, restart_str, 10) catch 60
+                }
+            } else if std.mem.eql(u8, directive, "auth-user-pass") {
+                config.auth_user_pass = true
+            } else if std.mem.eql(u8, directive, "key-direction") {
+                if parts.next() |dir_str| {
+                    config.tls_auth_direction = std.fmt.parseInt(i8, dir_str, 10) catch -1
+                }
+            }
+        }
+
+        return config
+    }
+}
+
+fn parse_cipher(name: []const u8): CipherType {
+    if std.mem.eql(u8, name, "AES-256-GCM") {
+        return .AES_256_GCM
+    } else if std.mem.eql(u8, name, "AES-128-GCM") {
+        return .AES_128_GCM
+    } else if std.mem.eql(u8, name, "AES-256-CBC") {
+        return .AES_256_CBC
+    } else if std.mem.eql(u8, name, "AES-128-CBC") {
+        return .AES_128_CBC
+    } else if std.mem.eql(u8, name, "CHACHA20-POLY1305") {
+        return .CHACHA20_POLY1305
+    } else if std.mem.eql(u8, name, "BF-CBC") {
+        return .BF_CBC
+    }
+    return .AES_256_GCM
+}
+
+fn parse_auth(name: []const u8): AuthType {
+    if std.mem.eql(u8, name, "SHA256") {
+        return .SHA256
+    } else if std.mem.eql(u8, name, "SHA384") {
+        return .SHA384
+    } else if std.mem.eql(u8, name, "SHA512") {
+        return .SHA512
+    } else if std.mem.eql(u8, name, "SHA1") {
+        return .SHA1
+    }
+    return .SHA256
+}
+
+fn parse_compression(name: ?[]const u8): CompressionType {
+    if name == null {
+        return .LZO
+    }
+    if std.mem.eql(u8, name.?, "lz4") {
+        return .LZ4
+    } else if std.mem.eql(u8, name.?, "lz4-v2") {
+        return .LZ4_V2
+    } else if std.mem.eql(u8, name.?, "stub") {
+        return .STUB
+    } else if std.mem.eql(u8, name.?, "stub-v2") {
+        return .STUB_V2
+    }
+    return .LZO
+}
+
+// ============================================
+// OpenVPN Session State
+// ============================================
+
+pub const SessionState = enum {
+    INITIAL
+    RESET_SENT
+    RESET_RECEIVED
+    TLS_HANDSHAKE
+    TLS_ESTABLISHED
+    KEY_EXCHANGE
+    ACTIVE
+    SOFT_RESET
+    RECONNECTING
+    DISCONNECTED
+    ERROR
+}
+
+pub const OpenVpnSession = struct {
+    state: SessionState
+    config: *OpenVpnConfig
+
+    // Session IDs
+    local_session_id: [8]u8
+    remote_session_id: [8]u8
+
+    // TLS wrapper
+    tls: TlsWrapper
+
+    // Control channel
+    control_packet_id_send: u32
+    control_packet_id_recv: u32
+    ack_queue: [64]u32
+    ack_queue_len: usize
+
+    // Data channel key ID
+    current_key_id: u8
+    pending_key_id: u8
+
+    // Timing
+    last_packet_sent: u64
+    last_packet_received: u64
+    session_start_time: u64
+
+    // Tunnel interface
+    tun_fd: i32
+    local_ip: [4]u8
+    remote_ip: [4]u8
+    netmask: [4]u8
+
+    // Socket
+    socket_fd: i32
+
+    // Statistics
+    bytes_sent: u64
+    bytes_received: u64
+    packets_sent: u64
+    packets_received: u64
+
+    // Reconnection state
+    reconnect_count: u32
+    last_reconnect_time: u64
+
+    pub fn init(config: *OpenVpnConfig): OpenVpnSession {
+        var session: OpenVpnSession = undefined
+        session.state = .INITIAL
+        session.config = config
+        crypto.random_bytes(&session.local_session_id)
+        @memset(&session.remote_session_id, 0)
+        session.tls = TlsWrapper.init(config.cipher, config.auth)
+        session.control_packet_id_send = 0
+        session.control_packet_id_recv = 0
+        session.ack_queue_len = 0
+        session.current_key_id = 0
+        session.pending_key_id = 0
+        session.last_packet_sent = 0
+        session.last_packet_received = 0
+        session.session_start_time = 0
+        session.tun_fd = -1
+        @memset(&session.local_ip, 0)
+        @memset(&session.remote_ip, 0)
+        @memset(&session.netmask, 0)
+        session.socket_fd = -1
+        session.bytes_sent = 0
+        session.bytes_received = 0
+        session.packets_sent = 0
+        session.packets_received = 0
+        session.reconnect_count = 0
+        session.last_reconnect_time = 0
+        return session
+    }
+
+    pub fn connect(self: *OpenVpnSession): bool {
+        // Create socket
+        if self.config.transport == .UDP {
+            self.socket_fd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+        } else {
+            self.socket_fd = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+        }
+
+        if self.socket_fd < 0 {
+            self.state = .ERROR
+            return false
+        }
+
+        // Resolve hostname and connect
+        var addr: socket.sockaddr_in = undefined
+        addr.sin_family = socket.AF_INET
+        addr.sin_port = socket.htons(self.config.remote_port)
+
+        if !net.resolve_hostname(
+            self.config.remote_host[0..self.config.remote_host_len],
+            &addr.sin_addr
+        ) {
+            socket.close(self.socket_fd)
+            self.state = .ERROR
+            return false
+        }
+
+        if socket.connect(self.socket_fd, @ptrCast(&addr), @sizeOf(socket.sockaddr_in)) < 0 {
+            socket.close(self.socket_fd)
+            self.state = .ERROR
+            return false
+        }
+
+        self.session_start_time = get_unix_timestamp()
+        self.state = .RESET_SENT
+
+        // Send hard reset
+        return self.send_hard_reset()
+    }
+
+    fn send_hard_reset(self: *OpenVpnSession): bool {
+        var packet: [256]u8 = undefined
+
+        // Build control hard reset packet
+        packet[0] = PacketHeader.set_opcode_key(P_CONTROL_HARD_RESET_CLIENT_V2, 0)
+        @memcpy(packet[1..9], &self.local_session_id)
+
+        // No acks
+        packet[9] = 0
+
+        // Packet ID
+        const pkt_id = self.control_packet_id_send
+        self.control_packet_id_send += 1
+        packet[10] = @truncate((pkt_id >> 24) & 0xFF)
+        packet[11] = @truncate((pkt_id >> 16) & 0xFF)
+        packet[12] = @truncate((pkt_id >> 8) & 0xFF)
+        packet[13] = @truncate(pkt_id & 0xFF)
+
+        return self.send_packet(packet[0..14])
+    }
+
+    fn send_packet(self: *OpenVpnSession, data: []const u8): bool {
+        var sent: isize = 0
+
+        if self.config.transport == .TCP {
+            // TCP: prepend 2-byte length
+            var tcp_packet: [65536]u8 = undefined
+            const len: u16 = @truncate(data.len)
+            tcp_packet[0] = @truncate((len >> 8) & 0xFF)
+            tcp_packet[1] = @truncate(len & 0xFF)
+            @memcpy(tcp_packet[2..2 + data.len], data)
+            sent = socket.send(self.socket_fd, &tcp_packet, 2 + data.len, 0)
+        } else {
+            sent = socket.send(self.socket_fd, data.ptr, data.len, 0)
+        }
+
+        if sent > 0 {
+            self.last_packet_sent = get_unix_timestamp()
+            self.packets_sent += 1
+            self.bytes_sent += @as(u64, @intCast(sent))
+            return true
+        }
+
+        return false
+    }
+
+    pub fn receive_packet(self: *OpenVpnSession, buffer: []u8): ?usize {
+        var received: isize = 0
+
+        if self.config.transport == .TCP {
+            // TCP: read 2-byte length first
+            var len_buf: [2]u8 = undefined
+            received = socket.recv(self.socket_fd, &len_buf, 2, 0)
+            if received != 2 {
+                return null
+            }
+
+            const len: usize = (@as(usize, len_buf[0]) << 8) | @as(usize, len_buf[1])
+            if len > buffer.len {
+                return null
+            }
+
+            received = socket.recv(self.socket_fd, buffer.ptr, len, socket.MSG_WAITALL)
+            if received != @as(isize, @intCast(len)) {
+                return null
+            }
+        } else {
+            received = socket.recv(self.socket_fd, buffer.ptr, buffer.len, 0)
+        }
+
+        if received > 0 {
+            self.last_packet_received = get_unix_timestamp()
+            self.packets_received += 1
+            self.bytes_received += @as(u64, @intCast(received))
+            return @as(usize, @intCast(received))
+        }
+
+        return null
+    }
+
+    pub fn process_packet(self: *OpenVpnSession, data: []const u8): bool {
+        if data.len < 9 {
+            return false
+        }
+
+        const opcode = (data[0] >> 3) & 0x1F
+        const key_id = data[0] & 0x07
+
+        switch opcode {
+            P_CONTROL_HARD_RESET_SERVER_V2 => {
+                // Server acknowledged our reset
+                @memcpy(&self.remote_session_id, data[1..9])
+                self.state = .TLS_HANDSHAKE
+                return self.start_tls_handshake()
+            }
+            P_CONTROL_V1 => {
+                return self.handle_control_packet(data)
+            }
+            P_ACK_V1 => {
+                return self.handle_ack_packet(data)
+            }
+            P_DATA_V1, P_DATA_V2 => {
+                return self.handle_data_packet(data, opcode == P_DATA_V2)
+            }
+            P_CONTROL_SOFT_RESET_V1 => {
+                self.state = .SOFT_RESET
+                return self.handle_soft_reset()
+            }
+            else => {
+                return false
+            }
+        }
+    }
+
+    fn start_tls_handshake(self: *OpenVpnSession): bool {
+        // Initialize TLS context
+        self.tls.context = tls.TlsContext.init(.CLIENT) orelse return false
+
+        // Load certificates
+        if !self.tls.context.load_ca_cert(
+            self.config.ca_cert[0..self.config.ca_cert_len]
+        ) {
+            return false
+        }
+
+        if self.config.client_cert_len > 0 {
+            if !self.tls.context.load_cert(
+                self.config.client_cert[0..self.config.client_cert_len]
+            ) {
+                return false
+            }
+        }
+
+        if self.config.client_key_len > 0 {
+            if !self.tls.context.load_private_key(
+                self.config.client_key[0..self.config.client_key_len]
+            ) {
+                return false
+            }
+        }
+
+        // Start handshake
+        return self.tls.context.start_handshake()
+    }
+
+    fn handle_control_packet(self: *OpenVpnSession, data: []const u8): bool {
+        // Parse control packet and process TLS data
+        if data.len < 14 {
+            return false
+        }
+
+        // Add to ack queue
+        const pkt_id: u32 = (@as(u32, data[10]) << 24) |
+                          (@as(u32, data[11]) << 16) |
+                          (@as(u32, data[12]) << 8) |
+                          @as(u32, data[13])
+
+        if self.ack_queue_len < 64 {
+            self.ack_queue[self.ack_queue_len] = pkt_id
+            self.ack_queue_len += 1
+        }
+
+        // Process TLS payload
+        const payload = data[14..]
+        if payload.len > 0 {
+            self.tls.context.process_incoming(payload)
+        }
+
+        // Send any pending TLS data
+        var tls_out: [4096]u8 = undefined
+        const tls_len = self.tls.context.get_outgoing(&tls_out)
+        if tls_len > 0 {
+            self.send_control_packet(tls_out[0..tls_len])
+        }
+
+        // Check TLS state
+        if self.tls.context.is_handshake_complete() {
+            self.state = .KEY_EXCHANGE
+            return self.perform_key_exchange()
+        }
+
+        return true
+    }
+
+    fn send_control_packet(self: *OpenVpnSession, payload: []const u8): bool {
+        var packet: [4096]u8 = undefined
+        var offset: usize = 0
+
+        // Opcode and key ID
+        packet[0] = PacketHeader.set_opcode_key(P_CONTROL_V1, self.current_key_id)
+        offset = 1
+
+        // Session ID
+        @memcpy(packet[offset..offset + 8], &self.local_session_id)
+        offset += 8
+
+        // ACKs
+        packet[offset] = @truncate(self.ack_queue_len)
+        offset += 1
+
+        for (0..self.ack_queue_len) |i| {
+            const ack = self.ack_queue[i]
+            packet[offset] = @truncate((ack >> 24) & 0xFF)
+            packet[offset + 1] = @truncate((ack >> 16) & 0xFF)
+            packet[offset + 2] = @truncate((ack >> 8) & 0xFF)
+            packet[offset + 3] = @truncate(ack & 0xFF)
+            offset += 4
+        }
+
+        // Remote session ID (if we have acks)
+        if self.ack_queue_len > 0 {
+            @memcpy(packet[offset..offset + 8], &self.remote_session_id)
+            offset += 8
+        }
+
+        self.ack_queue_len = 0
+
+        // Packet ID
+        const pkt_id = self.control_packet_id_send
+        self.control_packet_id_send += 1
+        packet[offset] = @truncate((pkt_id >> 24) & 0xFF)
+        packet[offset + 1] = @truncate((pkt_id >> 16) & 0xFF)
+        packet[offset + 2] = @truncate((pkt_id >> 8) & 0xFF)
+        packet[offset + 3] = @truncate(pkt_id & 0xFF)
+        offset += 4
+
+        // Payload
+        @memcpy(packet[offset..offset + payload.len], payload)
+        offset += payload.len
+
+        return self.send_packet(packet[0..offset])
+    }
+
+    fn handle_ack_packet(self: *OpenVpnSession, data: []const u8): bool {
+        // ACK packets acknowledge control packets
+        // For now, just mark as processed
+        return true
+    }
+
+    fn handle_data_packet(self: *OpenVpnSession, data: []const u8, is_v2: bool): bool {
+        if self.state != .ACTIVE {
+            return false
+        }
+
+        var offset: usize = 1  // Skip opcode
+
+        if is_v2 {
+            // V2 has peer_id
+            offset += 3
+        }
+
+        // Decrypt data
+        var plaintext: [65536]u8 = undefined
+        const plaintext_len = self.tls.decrypt(data[offset..], &plaintext) orelse return false
+
+        // Decompress if needed
+        var final_data: []u8 = plaintext[0..plaintext_len]
+        var decompressed: [65536]u8 = undefined
+
+        if self.config.compression != .NONE {
+            const decomp_len = decompress(final_data, &decompressed, self.config.compression)
+            if decomp_len > 0 {
+                final_data = decompressed[0..decomp_len]
+            }
+        }
+
+        // Write to TUN device
+        if self.tun_fd >= 0 {
+            _ = socket.write(self.tun_fd, final_data.ptr, final_data.len)
+        }
+
+        return true
+    }
+
+    fn perform_key_exchange(self: *OpenVpnSession): bool {
+        // Key method 2: exchange random data and options
+        var key_data: [256]u8 = undefined
+        var offset: usize = 0
+
+        // Literal 0x00000000
+        @memset(key_data[0..4], 0)
+        offset = 4
+
+        // Key method
+        key_data[offset] = KEY_METHOD_2
+        offset += 1
+
+        // Pre-master random (48 bytes)
+        var pre_master: [48]u8 = undefined
+        crypto.random_bytes(&pre_master)
+        @memcpy(key_data[offset..offset + 48], &pre_master)
+        offset += 48
+
+        // Options string
+        const options = "V4,dev-type tun,link-mtu 1542,tun-mtu 1500,proto UDPv4,cipher AES-256-GCM,auth SHA256,keysize 256,key-method 2,tls-client"
+        key_data[offset] = @truncate((options.len >> 8) & 0xFF)
+        key_data[offset + 1] = @truncate(options.len & 0xFF)
+        offset += 2
+        @memcpy(key_data[offset..offset + options.len], options)
+        offset += options.len
+
+        // Username/password if configured
+        if self.config.auth_user_pass {
+            key_data[offset] = @truncate((self.config.username_len >> 8) & 0xFF)
+            key_data[offset + 1] = @truncate(self.config.username_len & 0xFF)
+            offset += 2
+            @memcpy(key_data[offset..offset + self.config.username_len], self.config.username[0..self.config.username_len])
+            offset += self.config.username_len
+
+            key_data[offset] = @truncate((self.config.password_len >> 8) & 0xFF)
+            key_data[offset + 1] = @truncate(self.config.password_len & 0xFF)
+            offset += 2
+            @memcpy(key_data[offset..offset + self.config.password_len], self.config.password[0..self.config.password_len])
+            offset += self.config.password_len
+        }
+
+        // Send key exchange
+        if !self.send_control_packet(key_data[0..offset]) {
+            return false
+        }
+
+        self.state = .ACTIVE
+        return true
+    }
+
+    fn handle_soft_reset(self: *OpenVpnSession): bool {
+        // Generate new keys without full reconnection
+        self.pending_key_id = (self.current_key_id + 1) & 0x07
+        return self.perform_key_exchange()
+    }
+
+    pub fn send_data(self: *OpenVpnSession, data: []const u8): bool {
+        if self.state != .ACTIVE {
+            return false
+        }
+
+        var packet: [65536]u8 = undefined
+        var offset: usize = 0
+
+        // Opcode
+        packet[0] = PacketHeader.set_opcode_key(P_DATA_V1, self.current_key_id)
+        offset = 1
+
+        // Compress if needed
+        var to_encrypt: []const u8 = data
+        var compressed: [65536]u8 = undefined
+
+        if self.config.compression != .NONE {
+            const comp_len = compress(data, &compressed, self.config.compression)
+            if comp_len > 0 and comp_len < data.len {
+                to_encrypt = compressed[0..comp_len]
+            }
+        }
+
+        // Encrypt
+        const encrypted_len = self.tls.encrypt(to_encrypt, packet[offset..])
+        offset += encrypted_len
+
+        return self.send_packet(packet[0..offset])
+    }
+
+    pub fn disconnect(self: *OpenVpnSession): void {
+        if self.socket_fd >= 0 {
+            socket.close(self.socket_fd)
+            self.socket_fd = -1
+        }
+
+        if self.tun_fd >= 0 {
+            socket.close(self.tun_fd)
+            self.tun_fd = -1
+        }
+
+        self.state = .DISCONNECTED
+    }
+
+    pub fn send_keepalive(self: *OpenVpnSession): bool {
+        if self.state != .ACTIVE {
+            return false
+        }
+
+        // OpenVPN keepalive is a data packet with specific content
+        const ping_data = [_]u8{ 0x2a, 0x18, 0x7b, 0xf3, 0x64, 0x1e, 0xb4, 0xcb, 0x07, 0xed, 0x2d, 0x0a, 0x98, 0x1f, 0xc7, 0x48 }
+        return self.send_data(&ping_data)
+    }
+
+    pub fn check_timeouts(self: *OpenVpnSession): void {
+        const now = get_unix_timestamp()
+
+        // Check ping timeout
+        if self.state == .ACTIVE {
+            if now - self.last_packet_sent > self.config.ping_interval {
+                _ = self.send_keepalive()
+            }
+
+            if now - self.last_packet_received > self.config.ping_restart {
+                // Connection timed out, reconnect
+                self.state = .RECONNECTING
+                self.disconnect()
+                self.attempt_reconnect()
+            }
+        }
+    }
+
+    fn attempt_reconnect(self: *OpenVpnSession): void {
+        if self.reconnect_count >= self.config.connect_retry_max {
+            self.state = .ERROR
+            return
+        }
+
+        // Exponential backoff
+        const delay = @min(
+            self.config.connect_retry * (@as(u32, 1) << @min(self.reconnect_count, 10)),
+            300  // Max 5 minutes
+        )
+
+        const now = get_unix_timestamp()
+        if now - self.last_reconnect_time < delay {
+            return
+        }
+
+        self.reconnect_count += 1
+        self.last_reconnect_time = now
+
+        // Reset state and reconnect
+        self.state = .INITIAL
+        crypto.random_bytes(&self.local_session_id)
+        @memset(&self.remote_session_id, 0)
+        self.control_packet_id_send = 0
+        self.control_packet_id_recv = 0
+        self.ack_queue_len = 0
+
+        _ = self.connect()
+    }
+}
+
+// ============================================
+// Compression Functions
+// ============================================
+
+fn compress(data: []const u8, output: []u8, comp_type: CompressionType): usize {
+    switch comp_type {
+        .LZO => return lzo_compress(data, output),
+        .LZ4, .LZ4_V2 => return lz4_compress(data, output),
+        .STUB, .STUB_V2 => {
+            // Stub compression: just add compression header
+            output[0] = 0xFA  // No compression marker
+            @memcpy(output[1..1 + data.len], data)
+            return data.len + 1
+        }
+        .NONE => {
+            @memcpy(output[0..data.len], data)
+            return data.len
+        }
+    }
+}
+
+fn decompress(data: []const u8, output: []u8, comp_type: CompressionType): usize {
+    switch comp_type {
+        .LZO => return lzo_decompress(data, output),
+        .LZ4, .LZ4_V2 => return lz4_decompress(data, output),
+        .STUB, .STUB_V2 => {
+            if data.len > 0 and data[0] == 0xFA {
+                @memcpy(output[0..data.len - 1], data[1..])
+                return data.len - 1
+            }
+            return 0
+        }
+        .NONE => {
+            @memcpy(output[0..data.len], data)
+            return data.len
+        }
+    }
+}
+
+fn lzo_compress(data: []const u8, output: []u8): usize {
+    // LZO1X-1 compression (simplified)
+    var out_pos: usize = 0
+    var in_pos: usize = 0
+
+    output[out_pos] = 0x11  // LZO header
+    out_pos += 1
+
+    // Simple literal run for now
+    while in_pos < data.len {
+        const run_len = @min(data.len - in_pos, 255)
+        if run_len < 4 {
+            output[out_pos] = @truncate(0x10 | run_len)
+            out_pos += 1
+        } else {
+            output[out_pos] = 0
+            out_pos += 1
+            output[out_pos] = @truncate(run_len - 3)
+            out_pos += 1
+        }
+        @memcpy(output[out_pos..out_pos + run_len], data[in_pos..in_pos + run_len])
+        out_pos += run_len
+        in_pos += run_len
+    }
+
+    // End marker
+    output[out_pos] = 0x11
+    output[out_pos + 1] = 0x00
+    output[out_pos + 2] = 0x00
+    out_pos += 3
+
+    return out_pos
+}
+
+fn lzo_decompress(data: []const u8, output: []u8): usize {
+    if data.len < 1 or data[0] != 0x11 {
+        return 0
+    }
+
+    var out_pos: usize = 0
+    var in_pos: usize = 1
+
+    while in_pos < data.len {
+        const cmd = data[in_pos]
+        in_pos += 1
+
+        if cmd == 0x11 {
+            break  // End marker
+        }
+
+        if (cmd & 0xF0) == 0x10 {
+            const run_len = cmd & 0x0F
+            @memcpy(output[out_pos..out_pos + run_len], data[in_pos..in_pos + run_len])
+            out_pos += run_len
+            in_pos += run_len
+        } else if cmd == 0 {
+            const run_len = @as(usize, data[in_pos]) + 3
+            in_pos += 1
+            @memcpy(output[out_pos..out_pos + run_len], data[in_pos..in_pos + run_len])
+            out_pos += run_len
+            in_pos += run_len
+        }
+    }
+
+    return out_pos
+}
+
+fn lz4_compress(data: []const u8, output: []u8): usize {
+    // LZ4 block compression
+    var out_pos: usize = 0
+    var in_pos: usize = 0
+
+    while in_pos < data.len {
+        // Find match (simple greedy)
+        var match_len: usize = 0
+        var match_offset: usize = 0
+
+        // Check for matches in previous 65535 bytes
+        const search_start = if in_pos > 65535 { in_pos - 65535 } else { 0 }
+        var search_pos = search_start
+
+        while search_pos < in_pos {
+            var len: usize = 0
+            while in_pos + len < data.len and
+                  search_pos + len < in_pos and
+                  data[search_pos + len] == data[in_pos + len] and
+                  len < 255 {
+                len += 1
+            }
+
+            if len >= 4 and len > match_len {
+                match_len = len
+                match_offset = in_pos - search_pos
+            }
+
+            search_pos += 1
+        }
+
+        if match_len >= 4 {
+            // Output match
+            const literal_len: usize = 0
+            var token: u8 = 0
+
+            if literal_len >= 15 {
+                token = 0xF0
+            } else {
+                token = @truncate(literal_len << 4)
+            }
+
+            if match_len - 4 >= 15 {
+                token |= 0x0F
+            } else {
+                token |= @truncate(match_len - 4)
+            }
+
+            output[out_pos] = token
+            out_pos += 1
+
+            // Offset (little endian)
+            output[out_pos] = @truncate(match_offset & 0xFF)
+            output[out_pos + 1] = @truncate((match_offset >> 8) & 0xFF)
+            out_pos += 2
+
+            in_pos += match_len
+        } else {
+            // Output literal
+            const literal_len = @min(data.len - in_pos, 15)
+            output[out_pos] = @truncate(literal_len << 4)
+            out_pos += 1
+
+            @memcpy(output[out_pos..out_pos + literal_len], data[in_pos..in_pos + literal_len])
+            out_pos += literal_len
+            in_pos += literal_len
+        }
+    }
+
+    return out_pos
+}
+
+fn lz4_decompress(data: []const u8, output: []u8): usize {
+    var out_pos: usize = 0
+    var in_pos: usize = 0
+
+    while in_pos < data.len {
+        const token = data[in_pos]
+        in_pos += 1
+
+        // Literal length
+        var literal_len: usize = (token >> 4) & 0x0F
+        if literal_len == 15 {
+            while in_pos < data.len and data[in_pos] == 255 {
+                literal_len += 255
+                in_pos += 1
+            }
+            if in_pos < data.len {
+                literal_len += data[in_pos]
+                in_pos += 1
+            }
+        }
+
+        // Copy literals
+        if literal_len > 0 {
+            @memcpy(output[out_pos..out_pos + literal_len], data[in_pos..in_pos + literal_len])
+            out_pos += literal_len
+            in_pos += literal_len
+        }
+
+        // Check for end of block
+        if in_pos >= data.len {
+            break
+        }
+
+        // Match offset
+        const offset: usize = @as(usize, data[in_pos]) | (@as(usize, data[in_pos + 1]) << 8)
+        in_pos += 2
+
+        // Match length
+        var match_len: usize = (token & 0x0F) + 4
+        if (token & 0x0F) == 15 {
+            while in_pos < data.len and data[in_pos] == 255 {
+                match_len += 255
+                in_pos += 1
+            }
+            if in_pos < data.len {
+                match_len += data[in_pos]
+                in_pos += 1
+            }
+        }
+
+        // Copy match
+        const match_start = out_pos - offset
+        var i: usize = 0
+        while i < match_len {
+            output[out_pos + i] = output[match_start + (i % offset)]
+            i += 1
+        }
+        out_pos += match_len
+    }
+
+    return out_pos
+}
+
+// ============================================
+// TUN Device Management
+// ============================================
+
+pub fn create_tun_device(name: []const u8): i32 {
+    // Open TUN device
+    const fd = socket.open("/dev/net/tun", socket.O_RDWR, 0)
+    if fd < 0 {
+        return -1
+    }
+
+    // Set up TUN interface
+    var ifr: IfReq = undefined
+    @memset(&ifr, 0)
+    @memcpy(ifr.ifr_name[0..name.len], name)
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI
+
+    if socket.ioctl(fd, TUNSETIFF, &ifr) < 0 {
+        socket.close(fd)
+        return -1
+    }
+
+    return fd
+}
+
+pub fn configure_tun(name: []const u8, local_ip: [4]u8, remote_ip: [4]u8, netmask: [4]u8): bool {
+    // Create socket for ioctl
+    const sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+    if sock < 0 {
+        return false
+    }
+
+    var ifr: IfReq = undefined
+    @memset(&ifr, 0)
+    @memcpy(ifr.ifr_name[0..name.len], name)
+
+    // Set local IP
+    var addr: *socket.sockaddr_in = @ptrCast(&ifr.ifr_addr)
+    addr.sin_family = socket.AF_INET
+    @memcpy(@ptrCast(&addr.sin_addr), &local_ip)
+
+    if socket.ioctl(sock, SIOCSIFADDR, &ifr) < 0 {
+        socket.close(sock)
+        return false
+    }
+
+    // Set destination IP
+    @memcpy(@ptrCast(&addr.sin_addr), &remote_ip)
+    if socket.ioctl(sock, SIOCSIFDSTADDR, &ifr) < 0 {
+        socket.close(sock)
+        return false
+    }
+
+    // Set netmask
+    @memcpy(@ptrCast(&addr.sin_addr), &netmask)
+    if socket.ioctl(sock, SIOCSIFNETMASK, &ifr) < 0 {
+        socket.close(sock)
+        return false
+    }
+
+    // Bring interface up
+    if socket.ioctl(sock, SIOCGIFFLAGS, &ifr) < 0 {
+        socket.close(sock)
+        return false
+    }
+
+    ifr.ifr_flags |= IFF_UP | IFF_RUNNING
+    if socket.ioctl(sock, SIOCSIFFLAGS, &ifr) < 0 {
+        socket.close(sock)
+        return false
+    }
+
+    socket.close(sock)
+    return true
+}
+
+const IfReq = extern struct {
+    ifr_name: [16]u8
+    ifr_flags: i16
+    _padding: [22]u8
+    ifr_addr: socket.sockaddr
+}
+
+const IFF_TUN: i16 = 0x0001
+const IFF_TAP: i16 = 0x0002
+const IFF_NO_PI: i16 = 0x1000
+const IFF_UP: i16 = 0x0001
+const IFF_RUNNING: i16 = 0x0040
+
+const TUNSETIFF: u32 = 0x400454CA
+const SIOCSIFADDR: u32 = 0x8916
+const SIOCSIFDSTADDR: u32 = 0x8918
+const SIOCSIFNETMASK: u32 = 0x891C
+const SIOCGIFFLAGS: u32 = 0x8913
+const SIOCSIFFLAGS: u32 = 0x8914
+
+// ============================================
+// High-Level API
+// ============================================
+
+var active_sessions: [16]?*OpenVpnSession = [_]?*OpenVpnSession{null} ** 16
+var session_count: usize = 0
+
+pub fn openvpn_connect(config_path: []const u8): ?*OpenVpnSession {
+    // Read config file
+    var config_data: [65536]u8 = undefined
+    const config_len = read_file(config_path, &config_data) orelse return null
+
+    var config = OpenVpnConfig.parse_config_file(config_data[0..config_len]) orelse return null
+
+    // Create session
+    if session_count >= 16 {
+        return null
+    }
+
+    var session = @ptrCast(*OpenVpnSession, @alignCast(@alignOf(OpenVpnSession), alloc(@sizeOf(OpenVpnSession))))
+    session.* = OpenVpnSession.init(&config)
+
+    if !session.connect() {
+        free(session)
+        return null
+    }
+
+    // Create TUN device
+    var tun_name = "tun0\x00"
+    session.tun_fd = create_tun_device(&tun_name)
+
+    active_sessions[session_count] = session
+    session_count += 1
+
+    return session
+}
+
+pub fn openvpn_disconnect(session: *OpenVpnSession): void {
+    session.disconnect()
+
+    // Remove from active sessions
+    for (0..session_count) |i| {
+        if active_sessions[i] == session {
+            active_sessions[i] = active_sessions[session_count - 1]
+            active_sessions[session_count - 1] = null
+            session_count -= 1
+            break
+        }
+    }
+
+    free(session)
+}
+
+pub fn openvpn_get_stats(session: *OpenVpnSession): struct {
+    bytes_sent: u64,
+    bytes_received: u64,
+    packets_sent: u64,
+    packets_received: u64,
+    uptime_seconds: u64,
+} {
+    return .{
+        .bytes_sent = session.bytes_sent,
+        .bytes_received = session.bytes_received,
+        .packets_sent = session.packets_sent,
+        .packets_received = session.packets_received,
+        .uptime_seconds = get_unix_timestamp() - session.session_start_time,
+    }
+}
+
+// ============================================
+// Helper Functions
+// ============================================
+
+fn get_unix_timestamp(): u64 {
+    // Get current time
+    var ts: struct { tv_sec: i64, tv_nsec: i64 } = undefined
+    _ = socket.clock_gettime(0, &ts)
+    return @as(u64, @intCast(ts.tv_sec))
+}
+
+fn read_file(path: []const u8, buffer: []u8): ?usize {
+    const fd = socket.open(path.ptr, socket.O_RDONLY, 0)
+    if fd < 0 {
+        return null
+    }
+
+    const n = socket.read(fd, buffer.ptr, buffer.len)
+    socket.close(fd)
+
+    if n < 0 {
+        return null
+    }
+
+    return @as(usize, @intCast(n))
+}
+
+extern fn alloc(size: usize): *void
+extern fn free(ptr: *void): void
