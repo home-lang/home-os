@@ -1,0 +1,684 @@
+// home-os Kernel - Time Series Database
+// Lightweight time-series storage for IoT sensor data
+
+import "../core/foundation.home" as foundation
+import "../fs/vfs.home" as vfs
+
+// ============================================================================
+// TIME SERIES CONSTANTS
+// ============================================================================
+
+const MAX_METRICS: u32 = 256
+const MAX_TAGS_PER_METRIC: u32 = 16
+const MAX_TAG_KEY_LEN: u32 = 32
+const MAX_TAG_VALUE_LEN: u32 = 64
+const MAX_METRIC_NAME_LEN: u32 = 64
+
+const POINTS_PER_BLOCK: u32 = 1024
+const MAX_BLOCKS_PER_METRIC: u32 = 256
+const RETENTION_HOURS_DEFAULT: u32 = 168  // 7 days
+
+// Aggregation types
+const AGG_NONE: u32 = 0
+const AGG_SUM: u32 = 1
+const AGG_AVG: u32 = 2
+const AGG_MIN: u32 = 3
+const AGG_MAX: u32 = 4
+const AGG_COUNT: u32 = 5
+const AGG_FIRST: u32 = 6
+const AGG_LAST: u32 = 7
+const AGG_STDDEV: u32 = 8
+
+// Data types
+const DTYPE_INT64: u32 = 0
+const DTYPE_FLOAT64: u32 = 1
+const DTYPE_BOOL: u32 = 2
+const DTYPE_STRING: u32 = 3
+
+// Compression
+const COMPRESS_NONE: u32 = 0
+const COMPRESS_GORILLA: u32 = 1  // Facebook's Gorilla compression
+const COMPRESS_DELTA: u32 = 2
+const COMPRESS_RLE: u32 = 3
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct Tag {
+  key: [u8; 32],
+  value: [u8; 64]
+}
+
+struct DataPoint {
+  timestamp: u64,    // Unix timestamp in milliseconds
+  value_int: i64,
+  value_float: f64,
+  value_bool: u32,
+  flags: u32
+}
+
+struct DataBlock {
+  start_time: u64,
+  end_time: u64,
+  point_count: u32,
+  points: [DataPoint; 1024],
+  compressed: u32,
+  compressed_size: u32
+}
+
+struct Metric {
+  id: u32,
+  name: [u8; 64],
+  data_type: u32,
+  tags: [Tag; 16],
+  tag_count: u32,
+  blocks: [*DataBlock; 256],
+  block_count: u32,
+  current_block: u32,
+  retention_hours: u32,
+  compression: u32,
+  total_points: u64,
+  last_write: u64
+}
+
+struct Query {
+  metric_name: [u8; 64],
+  tags: [Tag; 16],
+  tag_count: u32,
+  start_time: u64,
+  end_time: u64,
+  aggregation: u32,
+  interval_ms: u64,
+  limit: u32
+}
+
+struct QueryResult {
+  points: [DataPoint; 4096],
+  point_count: u32,
+  metric_name: [u8; 64],
+  aggregation: u32
+}
+
+struct TSDBStats {
+  total_metrics: u32,
+  total_points: u64,
+  total_bytes: u64,
+  oldest_point: u64,
+  newest_point: u64,
+  writes_per_sec: u32,
+  reads_per_sec: u32
+}
+
+// ============================================================================
+// DATABASE STATE
+// ============================================================================
+
+var tsdb_metrics: [Metric; 256]
+var tsdb_metric_count: u32 = 0
+var tsdb_initialized: u32 = 0
+var tsdb_data_dir: [u8; 128]
+var tsdb_stats: TSDBStats
+
+// Memory pool for data blocks
+var block_pool: [DataBlock; 1024]
+var block_pool_used: [u32; 1024]
+var block_pool_count: u32 = 0
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn tsdb_init(data_dir: u64): u32 {
+  foundation.serial_write_string("[TSDB] Initializing time-series database...\n")
+
+  copy_string_long(&tsdb_data_dir, data_dir)
+
+  // Initialize block pool
+  var i: u32 = 0
+  while i < 1024 {
+    block_pool_used[i] = 0
+    i = i + 1
+  }
+  block_pool_count = 1024
+
+  tsdb_metric_count = 0
+  tsdb_stats.total_metrics = 0
+  tsdb_stats.total_points = 0
+  tsdb_stats.total_bytes = 0
+
+  // Load existing data from disk
+  tsdb_load_from_disk()
+
+  tsdb_initialized = 1
+
+  foundation.serial_write_string("[TSDB] Initialized with ")
+  foundation.serial_write_hex(tsdb_metric_count)
+  foundation.serial_write_string(" metrics\n")
+
+  return 1
+}
+
+fn tsdb_load_from_disk() {
+  // Would scan data directory and load metric metadata
+  // For now, start fresh
+}
+
+export fn tsdb_shutdown() {
+  foundation.serial_write_string("[TSDB] Shutting down...\n")
+
+  // Flush all pending writes
+  tsdb_flush()
+
+  tsdb_initialized = 0
+}
+
+// ============================================================================
+// METRIC MANAGEMENT
+// ============================================================================
+
+export fn tsdb_create_metric(name: u64, data_type: u32): u32 {
+  if tsdb_metric_count >= MAX_METRICS { return 0xFFFFFFFF }
+
+  // Check if metric already exists
+  var existing: u32 = tsdb_find_metric(name)
+  if existing != 0xFFFFFFFF { return existing }
+
+  var idx: u32 = tsdb_metric_count
+  var metric: *Metric = &tsdb_metrics[idx]
+
+  metric.id = idx
+  copy_string(&metric.name, name)
+  metric.data_type = data_type
+  metric.tag_count = 0
+  metric.block_count = 0
+  metric.current_block = 0
+  metric.retention_hours = RETENTION_HOURS_DEFAULT
+  metric.compression = COMPRESS_DELTA
+  metric.total_points = 0
+  metric.last_write = 0
+
+  // Allocate first block
+  metric.blocks[0] = allocate_block()
+  if metric.blocks[0] != null {
+    metric.block_count = 1
+    metric.blocks[0].point_count = 0
+    metric.blocks[0].compressed = 0
+  }
+
+  tsdb_metric_count = tsdb_metric_count + 1
+  tsdb_stats.total_metrics = tsdb_metric_count
+
+  foundation.serial_write_string("[TSDB] Created metric: ")
+  foundation.serial_write_string(name)
+  foundation.serial_write_string("\n")
+
+  return idx
+}
+
+fn tsdb_find_metric(name: u64): u32 {
+  var i: u32 = 0
+  while i < tsdb_metric_count {
+    if string_equals(@ptrFromInt(&tsdb_metrics[i].name), name) {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+export fn tsdb_add_tag(metric_id: u32, key: u64, value: u64): u32 {
+  if metric_id >= tsdb_metric_count { return 0 }
+
+  var metric: *Metric = &tsdb_metrics[metric_id]
+  if metric.tag_count >= MAX_TAGS_PER_METRIC { return 0 }
+
+  var idx: u32 = metric.tag_count
+  copy_string_32(&metric.tags[idx].key, key)
+  copy_string(&metric.tags[idx].value, value)
+  metric.tag_count = metric.tag_count + 1
+
+  return 1
+}
+
+export fn tsdb_set_retention(metric_id: u32, hours: u32): u32 {
+  if metric_id >= tsdb_metric_count { return 0 }
+  tsdb_metrics[metric_id].retention_hours = hours
+  return 1
+}
+
+// ============================================================================
+// DATA WRITING
+// ============================================================================
+
+export fn tsdb_write_int(metric_id: u32, timestamp: u64, value: i64): u32 {
+  if metric_id >= tsdb_metric_count { return 0 }
+
+  var metric: *Metric = &tsdb_metrics[metric_id]
+  var block: *DataBlock = metric.blocks[metric.current_block]
+
+  // Check if block is full
+  if block.point_count >= POINTS_PER_BLOCK {
+    // Compress current block
+    compress_block(block, metric.compression)
+
+    // Allocate new block
+    if metric.block_count < MAX_BLOCKS_PER_METRIC {
+      metric.current_block = metric.block_count
+      metric.blocks[metric.current_block] = allocate_block()
+      if metric.blocks[metric.current_block] == null { return 0 }
+      metric.block_count = metric.block_count + 1
+      block = metric.blocks[metric.current_block]
+      block.point_count = 0
+      block.start_time = timestamp
+    } else {
+      // Evict oldest block
+      evict_oldest_block(metric)
+      block = metric.blocks[metric.current_block]
+    }
+  }
+
+  // Write point
+  var idx: u32 = block.point_count
+  block.points[idx].timestamp = timestamp
+  block.points[idx].value_int = value
+  block.points[idx].flags = DTYPE_INT64
+  block.point_count = block.point_count + 1
+
+  if block.point_count == 1 {
+    block.start_time = timestamp
+  }
+  block.end_time = timestamp
+
+  metric.total_points = metric.total_points + 1
+  metric.last_write = timestamp
+  tsdb_stats.total_points = tsdb_stats.total_points + 1
+
+  return 1
+}
+
+export fn tsdb_write_float(metric_id: u32, timestamp: u64, value: f64): u32 {
+  if metric_id >= tsdb_metric_count { return 0 }
+
+  var metric: *Metric = &tsdb_metrics[metric_id]
+  var block: *DataBlock = metric.blocks[metric.current_block]
+
+  if block.point_count >= POINTS_PER_BLOCK {
+    compress_block(block, metric.compression)
+
+    if metric.block_count < MAX_BLOCKS_PER_METRIC {
+      metric.current_block = metric.block_count
+      metric.blocks[metric.current_block] = allocate_block()
+      if metric.blocks[metric.current_block] == null { return 0 }
+      metric.block_count = metric.block_count + 1
+      block = metric.blocks[metric.current_block]
+      block.point_count = 0
+      block.start_time = timestamp
+    } else {
+      evict_oldest_block(metric)
+      block = metric.blocks[metric.current_block]
+    }
+  }
+
+  var idx: u32 = block.point_count
+  block.points[idx].timestamp = timestamp
+  block.points[idx].value_float = value
+  block.points[idx].flags = DTYPE_FLOAT64
+  block.point_count = block.point_count + 1
+
+  if block.point_count == 1 {
+    block.start_time = timestamp
+  }
+  block.end_time = timestamp
+
+  metric.total_points = metric.total_points + 1
+  metric.last_write = timestamp
+  tsdb_stats.total_points = tsdb_stats.total_points + 1
+
+  return 1
+}
+
+export fn tsdb_write_bool(metric_id: u32, timestamp: u64, value: u32): u32 {
+  if metric_id >= tsdb_metric_count { return 0 }
+
+  var metric: *Metric = &tsdb_metrics[metric_id]
+  var block: *DataBlock = metric.blocks[metric.current_block]
+
+  if block.point_count >= POINTS_PER_BLOCK {
+    if metric.block_count < MAX_BLOCKS_PER_METRIC {
+      metric.current_block = metric.block_count
+      metric.blocks[metric.current_block] = allocate_block()
+      if metric.blocks[metric.current_block] == null { return 0 }
+      metric.block_count = metric.block_count + 1
+      block = metric.blocks[metric.current_block]
+      block.point_count = 0
+    } else {
+      evict_oldest_block(metric)
+      block = metric.blocks[metric.current_block]
+    }
+  }
+
+  var idx: u32 = block.point_count
+  block.points[idx].timestamp = timestamp
+  block.points[idx].value_bool = value
+  block.points[idx].flags = DTYPE_BOOL
+  block.point_count = block.point_count + 1
+
+  if block.point_count == 1 {
+    block.start_time = timestamp
+  }
+  block.end_time = timestamp
+
+  metric.total_points = metric.total_points + 1
+  metric.last_write = timestamp
+  tsdb_stats.total_points = tsdb_stats.total_points + 1
+
+  return 1
+}
+
+// ============================================================================
+// DATA QUERYING
+// ============================================================================
+
+export fn tsdb_query(query: *Query, result: *QueryResult): u32 {
+  var metric_id: u32 = tsdb_find_metric(@ptrFromInt(&query.metric_name))
+  if metric_id == 0xFFFFFFFF { return 0 }
+
+  var metric: *Metric = &tsdb_metrics[metric_id]
+
+  result.point_count = 0
+  copy_string(&result.metric_name, @ptrFromInt(&metric.name))
+  result.aggregation = query.aggregation
+
+  // Find blocks in time range
+  var i: u32 = 0
+  while i < metric.block_count {
+    var block: *DataBlock = metric.blocks[i]
+    if block == null { i = i + 1; continue }
+
+    if block.end_time >= query.start_time && block.start_time <= query.end_time {
+      // This block overlaps with query range
+      query_block(block, query, result)
+    }
+    i = i + 1
+  }
+
+  // Apply aggregation if requested
+  if query.aggregation != AGG_NONE && query.interval_ms > 0 {
+    aggregate_results(result, query.aggregation, query.interval_ms)
+  }
+
+  return result.point_count
+}
+
+fn query_block(block: *DataBlock, query: *Query, result: *QueryResult) {
+  var i: u32 = 0
+  while i < block.point_count && result.point_count < 4096 {
+    var point: *DataPoint = &block.points[i]
+
+    if point.timestamp >= query.start_time && point.timestamp <= query.end_time {
+      result.points[result.point_count] = *point
+      result.point_count = result.point_count + 1
+
+      if query.limit > 0 && result.point_count >= query.limit {
+        return
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn aggregate_results(result: *QueryResult, agg_type: u32, interval_ms: u64) {
+  if result.point_count == 0 { return }
+
+  var aggregated: [DataPoint; 4096]
+  var agg_count: u32 = 0
+
+  var bucket_start: u64 = result.points[0].timestamp
+  var bucket_sum: f64 = 0
+  var bucket_count: u32 = 0
+  var bucket_min: f64 = result.points[0].value_float
+  var bucket_max: f64 = result.points[0].value_float
+
+  var i: u32 = 0
+  while i < result.point_count {
+    var point: *DataPoint = &result.points[i]
+
+    if point.timestamp >= bucket_start + interval_ms {
+      // Emit aggregated point
+      if bucket_count > 0 {
+        aggregated[agg_count].timestamp = bucket_start
+        if agg_type == AGG_SUM {
+          aggregated[agg_count].value_float = bucket_sum
+        } else if agg_type == AGG_AVG {
+          aggregated[agg_count].value_float = bucket_sum / (bucket_count as f64)
+        } else if agg_type == AGG_MIN {
+          aggregated[agg_count].value_float = bucket_min
+        } else if agg_type == AGG_MAX {
+          aggregated[agg_count].value_float = bucket_max
+        } else if agg_type == AGG_COUNT {
+          aggregated[agg_count].value_int = bucket_count as i64
+        }
+        agg_count = agg_count + 1
+      }
+
+      // Start new bucket
+      bucket_start = point.timestamp
+      bucket_sum = 0
+      bucket_count = 0
+      bucket_min = point.value_float
+      bucket_max = point.value_float
+    }
+
+    // Add to current bucket
+    var val: f64 = point.value_float
+    if point.flags == DTYPE_INT64 {
+      val = point.value_int as f64
+    }
+
+    bucket_sum = bucket_sum + val
+    bucket_count = bucket_count + 1
+    if val < bucket_min { bucket_min = val }
+    if val > bucket_max { bucket_max = val }
+
+    i = i + 1
+  }
+
+  // Emit last bucket
+  if bucket_count > 0 {
+    aggregated[agg_count].timestamp = bucket_start
+    if agg_type == AGG_AVG {
+      aggregated[agg_count].value_float = bucket_sum / (bucket_count as f64)
+    } else if agg_type == AGG_SUM {
+      aggregated[agg_count].value_float = bucket_sum
+    }
+    agg_count = agg_count + 1
+  }
+
+  // Copy back to result
+  i = 0
+  while i < agg_count {
+    result.points[i] = aggregated[i]
+    i = i + 1
+  }
+  result.point_count = agg_count
+}
+
+export fn tsdb_get_latest(metric_id: u32, point: *DataPoint): u32 {
+  if metric_id >= tsdb_metric_count { return 0 }
+
+  var metric: *Metric = &tsdb_metrics[metric_id]
+  if metric.block_count == 0 { return 0 }
+
+  var block: *DataBlock = metric.blocks[metric.current_block]
+  if block.point_count == 0 { return 0 }
+
+  *point = block.points[block.point_count - 1]
+  return 1
+}
+
+// ============================================================================
+// MAINTENANCE
+// ============================================================================
+
+export fn tsdb_flush(): u32 {
+  // Write all pending data to disk
+  var i: u32 = 0
+  while i < tsdb_metric_count {
+    flush_metric(i)
+    i = i + 1
+  }
+  return 1
+}
+
+fn flush_metric(metric_id: u32) {
+  var metric: *Metric = &tsdb_metrics[metric_id]
+  // Would write blocks to disk
+}
+
+export fn tsdb_compact() {
+  // Merge small blocks, apply retention policy
+  foundation.serial_write_string("[TSDB] Running compaction...\n")
+
+  var now: u64 = foundation.get_tick_count()
+
+  var i: u32 = 0
+  while i < tsdb_metric_count {
+    apply_retention(&tsdb_metrics[i], now)
+    i = i + 1
+  }
+}
+
+fn apply_retention(metric: *Metric, now: u64) {
+  var retention_ms: u64 = metric.retention_hours * 3600 * 1000
+  var cutoff: u64 = now - retention_ms
+
+  // Remove blocks older than cutoff
+  var i: u32 = 0
+  while i < metric.block_count {
+    var block: *DataBlock = metric.blocks[i]
+    if block != null && block.end_time < cutoff {
+      free_block(block)
+      metric.blocks[i] = null
+    }
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// BLOCK MANAGEMENT
+// ============================================================================
+
+fn allocate_block(): *DataBlock {
+  var i: u32 = 0
+  while i < block_pool_count {
+    if block_pool_used[i] == 0 {
+      block_pool_used[i] = 1
+      return &block_pool[i]
+    }
+    i = i + 1
+  }
+  return null
+}
+
+fn free_block(block: *DataBlock) {
+  var i: u32 = 0
+  while i < block_pool_count {
+    if &block_pool[i] == block {
+      block_pool_used[i] = 0
+      return
+    }
+    i = i + 1
+  }
+}
+
+fn evict_oldest_block(metric: *Metric) {
+  // Find and free oldest block
+  var oldest_idx: u32 = 0
+  var oldest_time: u64 = 0xFFFFFFFFFFFFFFFF
+
+  var i: u32 = 0
+  while i < metric.block_count {
+    if metric.blocks[i] != null {
+      if metric.blocks[i].start_time < oldest_time {
+        oldest_time = metric.blocks[i].start_time
+        oldest_idx = i
+      }
+    }
+    i = i + 1
+  }
+
+  if metric.blocks[oldest_idx] != null {
+    free_block(metric.blocks[oldest_idx])
+    metric.blocks[oldest_idx] = null
+  }
+}
+
+fn compress_block(block: *DataBlock, compression: u32) {
+  if compression == COMPRESS_NONE { return }
+
+  // Delta compression for timestamps
+  // XOR compression for values (Gorilla-style)
+  block.compressed = 1
+}
+
+// ============================================================================
+// STATISTICS
+// ============================================================================
+
+export fn tsdb_get_stats(stats: *TSDBStats) {
+  *stats = tsdb_stats
+}
+
+export fn tsdb_get_metric_count(): u32 {
+  return tsdb_metric_count
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn copy_string(dest: *[u8; 64], src: u64) {
+  var i: u32 = 0
+  while i < 63 {
+    var ch: u8 = @intToPtr(src + i, u8)
+    (*dest)[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  (*dest)[i] = 0
+}
+
+fn copy_string_32(dest: *[u8; 32], src: u64) {
+  var i: u32 = 0
+  while i < 31 {
+    var ch: u8 = @intToPtr(src + i, u8)
+    (*dest)[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  (*dest)[i] = 0
+}
+
+fn copy_string_long(dest: *[u8; 128], src: u64) {
+  var i: u32 = 0
+  while i < 127 {
+    var ch: u8 = @intToPtr(src + i, u8)
+    (*dest)[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  (*dest)[i] = 0
+}
+
+fn string_equals(a: u64, b: u64): u32 {
+  var i: u32 = 0
+  while i < 64 {
+    var ca: u8 = @intToPtr(a + i, u8)
+    var cb: u8 = @intToPtr(b + i, u8)
+    if ca != cb { return 0 }
+    if ca == 0 { return 1 }
+    i = i + 1
+  }
+  return 1
+}

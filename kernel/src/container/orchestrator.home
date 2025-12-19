@@ -1,0 +1,838 @@
+// home-os Kernel - Container Orchestrator
+// Lightweight Kubernetes-like orchestration for edge computing (k3s-inspired)
+
+import "../core/foundation.home" as foundation
+import "runtime.home" as runtime
+import "namespaces.home" as ns
+
+// ============================================================================
+// ORCHESTRATOR CONSTANTS
+// ============================================================================
+
+const MAX_PODS: u32 = 128
+const MAX_CONTAINERS_PER_POD: u32 = 8
+const MAX_SERVICES: u32 = 64
+const MAX_DEPLOYMENTS: u32 = 32
+const MAX_NODES: u32 = 16
+const MAX_LABEL_KEY_LEN: u32 = 64
+const MAX_LABEL_VALUE_LEN: u32 = 128
+const MAX_LABELS_PER_RESOURCE: u32 = 16
+
+// Pod phases
+const POD_PENDING: u32 = 0
+const POD_RUNNING: u32 = 1
+const POD_SUCCEEDED: u32 = 2
+const POD_FAILED: u32 = 3
+const POD_UNKNOWN: u32 = 4
+
+// Container states
+const CONTAINER_WAITING: u32 = 0
+const CONTAINER_RUNNING: u32 = 1
+const CONTAINER_TERMINATED: u32 = 2
+
+// Restart policies
+const RESTART_ALWAYS: u32 = 0
+const RESTART_ON_FAILURE: u32 = 1
+const RESTART_NEVER: u32 = 2
+
+// Service types
+const SERVICE_CLUSTER_IP: u32 = 0
+const SERVICE_NODE_PORT: u32 = 1
+const SERVICE_LOAD_BALANCER: u32 = 2
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+struct Label {
+  key: [u8; 64],
+  value: [u8; 128]
+}
+
+struct ResourceRequirements {
+  cpu_millicores: u32,      // 1000 = 1 CPU
+  memory_bytes: u64,
+  storage_bytes: u64
+}
+
+struct ContainerPort {
+  name: [u8; 32],
+  container_port: u16,
+  host_port: u16,
+  protocol: u32             // 0=TCP, 1=UDP
+}
+
+struct EnvVar {
+  name: [u8; 64],
+  value: [u8; 256]
+}
+
+struct VolumeMount {
+  name: [u8; 32],
+  mount_path: [u8; 128],
+  read_only: u32
+}
+
+struct ContainerSpec {
+  name: [u8; 64],
+  image: [u8; 256],
+  command: [u8; 256],
+  args: [u8; 256],
+  ports: [ContainerPort; 8],
+  port_count: u32,
+  env: [EnvVar; 16],
+  env_count: u32,
+  resources: ResourceRequirements,
+  volume_mounts: [VolumeMount; 8],
+  mount_count: u32
+}
+
+struct ContainerStatus {
+  name: [u8; 64],
+  state: u32,
+  ready: u32,
+  restart_count: u32,
+  started_at: u64,
+  finished_at: u64,
+  exit_code: i32,
+  container_id: u32
+}
+
+struct PodSpec {
+  containers: [ContainerSpec; 8],
+  container_count: u32,
+  restart_policy: u32,
+  hostname: [u8; 64],
+  node_selector: [Label; 4],
+  selector_count: u32
+}
+
+struct PodStatus {
+  phase: u32,
+  host_ip: u32,
+  pod_ip: u32,
+  start_time: u64,
+  container_statuses: [ContainerStatus; 8]
+}
+
+struct Pod {
+  name: [u8; 64],
+  namespace: [u8; 32],
+  uid: u64,
+  labels: [Label; 16],
+  label_count: u32,
+  spec: PodSpec,
+  status: PodStatus,
+  created_at: u64
+}
+
+struct ServicePort {
+  name: [u8; 32],
+  protocol: u32,
+  port: u16,
+  target_port: u16,
+  node_port: u16
+}
+
+struct Service {
+  name: [u8; 64],
+  namespace: [u8; 32],
+  uid: u64,
+  labels: [Label; 16],
+  label_count: u32,
+  selector: [Label; 8],
+  selector_count: u32,
+  service_type: u32,
+  cluster_ip: u32,
+  ports: [ServicePort; 8],
+  port_count: u32
+}
+
+struct DeploymentSpec {
+  replicas: u32,
+  selector: [Label; 8],
+  selector_count: u32,
+  pod_template: PodSpec,
+  pod_labels: [Label; 16],
+  pod_label_count: u32
+}
+
+struct DeploymentStatus {
+  replicas: u32,
+  ready_replicas: u32,
+  available_replicas: u32,
+  updated_replicas: u32
+}
+
+struct Deployment {
+  name: [u8; 64],
+  namespace: [u8; 32],
+  uid: u64,
+  labels: [Label; 16],
+  label_count: u32,
+  spec: DeploymentSpec,
+  status: DeploymentStatus,
+  created_at: u64
+}
+
+struct Node {
+  name: [u8; 64],
+  uid: u64,
+  labels: [Label; 16],
+  label_count: u32,
+  ip_address: u32,
+  capacity: ResourceRequirements,
+  allocatable: ResourceRequirements,
+  allocated: ResourceRequirements,
+  ready: u32,
+  last_heartbeat: u64
+}
+
+// ============================================================================
+// ORCHESTRATOR STATE
+// ============================================================================
+
+var orch_pods: [Pod; 128]
+var orch_pod_count: u32 = 0
+var orch_services: [Service; 64]
+var orch_service_count: u32 = 0
+var orch_deployments: [Deployment; 32]
+var orch_deployment_count: u32 = 0
+var orch_nodes: [Node; 16]
+var orch_node_count: u32 = 0
+
+var orch_initialized: u32 = 0
+var orch_next_uid: u64 = 1
+var orch_next_cluster_ip: u32 = 0x0A600001  // 10.96.0.1
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+export fn orchestrator_init(): u32 {
+  foundation.serial_write_string("[Orchestrator] Initializing...\n")
+
+  orch_pod_count = 0
+  orch_service_count = 0
+  orch_deployment_count = 0
+  orch_node_count = 0
+  orch_next_uid = 1
+
+  // Register local node
+  register_local_node()
+
+  orch_initialized = 1
+
+  foundation.serial_write_string("[Orchestrator] Ready\n")
+  return 1
+}
+
+fn register_local_node() {
+  var node: *Node = &orch_nodes[0]
+
+  copy_string(&node.name, "local")
+  node.uid = orch_next_uid
+  orch_next_uid = orch_next_uid + 1
+
+  node.ip_address = 0x7F000001  // 127.0.0.1
+
+  // Set capacity based on system resources
+  node.capacity.cpu_millicores = 4000   // 4 CPUs
+  node.capacity.memory_bytes = 4 * 1024 * 1024 * 1024  // 4 GB
+  node.capacity.storage_bytes = 100 * 1024 * 1024 * 1024  // 100 GB
+
+  // Reserve some for system
+  node.allocatable.cpu_millicores = 3500
+  node.allocatable.memory_bytes = 3 * 1024 * 1024 * 1024
+  node.allocatable.storage_bytes = 90 * 1024 * 1024 * 1024
+
+  node.allocated.cpu_millicores = 0
+  node.allocated.memory_bytes = 0
+  node.allocated.storage_bytes = 0
+
+  node.ready = 1
+  node.last_heartbeat = foundation.get_tick_count()
+
+  orch_node_count = 1
+}
+
+// ============================================================================
+// POD MANAGEMENT
+// ============================================================================
+
+export fn create_pod(name: u64, namespace: u64, spec: *PodSpec): u32 {
+  if orch_pod_count >= MAX_PODS { return 0xFFFFFFFF }
+
+  var idx: u32 = orch_pod_count
+  var pod: *Pod = &orch_pods[idx]
+
+  copy_string(&pod.name, name)
+  copy_string_32(&pod.namespace, namespace)
+  pod.uid = orch_next_uid
+  orch_next_uid = orch_next_uid + 1
+
+  pod.spec = *spec
+  pod.label_count = 0
+  pod.status.phase = POD_PENDING
+  pod.created_at = foundation.get_tick_count()
+
+  orch_pod_count = orch_pod_count + 1
+
+  foundation.serial_write_string("[Orchestrator] Pod created: ")
+  foundation.serial_write_string(name)
+  foundation.serial_write_string("\n")
+
+  // Schedule the pod
+  schedule_pod(idx)
+
+  return idx
+}
+
+export fn delete_pod(pod_idx: u32): u32 {
+  if pod_idx >= orch_pod_count { return 0 }
+
+  var pod: *Pod = &orch_pods[pod_idx]
+
+  foundation.serial_write_string("[Orchestrator] Deleting pod: ")
+  foundation.serial_write_string(@ptrFromInt(&pod.name))
+  foundation.serial_write_string("\n")
+
+  // Stop all containers
+  var i: u32 = 0
+  while i < pod.spec.container_count {
+    var status: *ContainerStatus = &pod.status.container_statuses[i]
+    if status.state == CONTAINER_RUNNING {
+      stop_container(status.container_id)
+    }
+    i = i + 1
+  }
+
+  // Mark as terminated
+  pod.status.phase = POD_SUCCEEDED
+
+  return 1
+}
+
+fn schedule_pod(pod_idx: u32) {
+  var pod: *Pod = &orch_pods[pod_idx]
+
+  // Find suitable node
+  var node_idx: u32 = find_suitable_node(pod)
+  if node_idx == 0xFFFFFFFF {
+    foundation.serial_write_string("[Orchestrator] No suitable node for pod\n")
+    pod.status.phase = POD_PENDING
+    return
+  }
+
+  // Allocate resources on node
+  var node: *Node = &orch_nodes[node_idx]
+  var total_cpu: u32 = 0
+  var total_mem: u64 = 0
+
+  var i: u32 = 0
+  while i < pod.spec.container_count {
+    total_cpu = total_cpu + pod.spec.containers[i].resources.cpu_millicores
+    total_mem = total_mem + pod.spec.containers[i].resources.memory_bytes
+    i = i + 1
+  }
+
+  node.allocated.cpu_millicores = node.allocated.cpu_millicores + total_cpu
+  node.allocated.memory_bytes = node.allocated.memory_bytes + total_mem
+
+  // Start containers
+  start_pod_containers(pod_idx)
+}
+
+fn find_suitable_node(pod: *Pod): u32 {
+  var total_cpu: u32 = 0
+  var total_mem: u64 = 0
+
+  var i: u32 = 0
+  while i < pod.spec.container_count {
+    total_cpu = total_cpu + pod.spec.containers[i].resources.cpu_millicores
+    total_mem = total_mem + pod.spec.containers[i].resources.memory_bytes
+    i = i + 1
+  }
+
+  // Find node with enough resources
+  i = 0
+  while i < orch_node_count {
+    var node: *Node = &orch_nodes[i]
+
+    if node.ready == 0 { i = i + 1; continue }
+
+    var avail_cpu: u32 = node.allocatable.cpu_millicores - node.allocated.cpu_millicores
+    var avail_mem: u64 = node.allocatable.memory_bytes - node.allocated.memory_bytes
+
+    if avail_cpu >= total_cpu && avail_mem >= total_mem {
+      // Check node selector
+      if matches_node_selector(pod, node) {
+        return i
+      }
+    }
+    i = i + 1
+  }
+
+  return 0xFFFFFFFF
+}
+
+fn matches_node_selector(pod: *Pod, node: *Node): u32 {
+  if pod.spec.selector_count == 0 { return 1 }
+
+  var i: u32 = 0
+  while i < pod.spec.selector_count {
+    var found: u32 = 0
+    var j: u32 = 0
+    while j < node.label_count {
+      if label_matches(&pod.spec.node_selector[i], &node.labels[j]) {
+        found = 1
+        break
+      }
+      j = j + 1
+    }
+    if found == 0 { return 0 }
+    i = i + 1
+  }
+
+  return 1
+}
+
+fn label_matches(a: *Label, b: *Label): u32 {
+  if !string_equals_64(@ptrFromInt(&a.key), @ptrFromInt(&b.key)) { return 0 }
+  if !string_equals_128(@ptrFromInt(&a.value), @ptrFromInt(&b.value)) { return 0 }
+  return 1
+}
+
+fn start_pod_containers(pod_idx: u32) {
+  var pod: *Pod = &orch_pods[pod_idx]
+
+  var i: u32 = 0
+  while i < pod.spec.container_count {
+    var container: *ContainerSpec = &pod.spec.containers[i]
+    var status: *ContainerStatus = &pod.status.container_statuses[i]
+
+    copy_string(&status.name, @ptrFromInt(&container.name))
+    status.state = CONTAINER_WAITING
+    status.restart_count = 0
+
+    // Create container via runtime
+    var container_id: u32 = runtime.container_create(@ptrFromInt(&container.image))
+    if container_id != 0xFFFFFFFF {
+      status.container_id = container_id
+
+      // Start container
+      if runtime.container_start(container_id) == 1 {
+        status.state = CONTAINER_RUNNING
+        status.started_at = foundation.get_tick_count()
+        status.ready = 1
+      }
+    }
+
+    i = i + 1
+  }
+
+  // Update pod phase
+  pod.status.phase = POD_RUNNING
+  pod.status.start_time = foundation.get_tick_count()
+}
+
+fn stop_container(container_id: u32) {
+  runtime.container_stop(container_id)
+}
+
+export fn get_pod(pod_idx: u32, pod: *Pod): u32 {
+  if pod_idx >= orch_pod_count { return 0 }
+  *pod = orch_pods[pod_idx]
+  return 1
+}
+
+export fn get_pod_count(): u32 {
+  return orch_pod_count
+}
+
+// ============================================================================
+// SERVICE MANAGEMENT
+// ============================================================================
+
+export fn create_service(name: u64, namespace: u64, svc_type: u32): u32 {
+  if orch_service_count >= MAX_SERVICES { return 0xFFFFFFFF }
+
+  var idx: u32 = orch_service_count
+  var svc: *Service = &orch_services[idx]
+
+  copy_string(&svc.name, name)
+  copy_string_32(&svc.namespace, namespace)
+  svc.uid = orch_next_uid
+  orch_next_uid = orch_next_uid + 1
+
+  svc.service_type = svc_type
+  svc.cluster_ip = orch_next_cluster_ip
+  orch_next_cluster_ip = orch_next_cluster_ip + 1
+
+  svc.label_count = 0
+  svc.selector_count = 0
+  svc.port_count = 0
+
+  orch_service_count = orch_service_count + 1
+
+  foundation.serial_write_string("[Orchestrator] Service created: ")
+  foundation.serial_write_string(name)
+  foundation.serial_write_string(" ClusterIP=")
+  foundation.serial_write_hex(svc.cluster_ip)
+  foundation.serial_write_string("\n")
+
+  return idx
+}
+
+export fn service_add_port(svc_idx: u32, name: u64, port: u16, target_port: u16, protocol: u32): u32 {
+  if svc_idx >= orch_service_count { return 0 }
+
+  var svc: *Service = &orch_services[svc_idx]
+  if svc.port_count >= 8 { return 0 }
+
+  var idx: u32 = svc.port_count
+  copy_string_32(&svc.ports[idx].name, name)
+  svc.ports[idx].port = port
+  svc.ports[idx].target_port = target_port
+  svc.ports[idx].protocol = protocol
+
+  if svc.service_type == SERVICE_NODE_PORT {
+    svc.ports[idx].node_port = 30000 + (orch_service_count * 8) + idx
+  }
+
+  svc.port_count = svc.port_count + 1
+  return 1
+}
+
+export fn service_add_selector(svc_idx: u32, key: u64, value: u64): u32 {
+  if svc_idx >= orch_service_count { return 0 }
+
+  var svc: *Service = &orch_services[svc_idx]
+  if svc.selector_count >= 8 { return 0 }
+
+  var idx: u32 = svc.selector_count
+  copy_string(&svc.selector[idx].key, key)
+  copy_string_128(&svc.selector[idx].value, value)
+  svc.selector_count = svc.selector_count + 1
+
+  return 1
+}
+
+export fn get_service_endpoints(svc_idx: u32, endpoints: *[u32; 32]): u32 {
+  if svc_idx >= orch_service_count { return 0 }
+
+  var svc: *Service = &orch_services[svc_idx]
+  var count: u32 = 0
+
+  // Find pods matching selector
+  var i: u32 = 0
+  while i < orch_pod_count && count < 32 {
+    var pod: *Pod = &orch_pods[i]
+
+    if pod.status.phase == POD_RUNNING {
+      if pod_matches_selector(pod, svc) {
+        (*endpoints)[count] = pod.status.pod_ip
+        count = count + 1
+      }
+    }
+    i = i + 1
+  }
+
+  return count
+}
+
+fn pod_matches_selector(pod: *Pod, svc: *Service): u32 {
+  if svc.selector_count == 0 { return 0 }
+
+  var i: u32 = 0
+  while i < svc.selector_count {
+    var found: u32 = 0
+    var j: u32 = 0
+    while j < pod.label_count {
+      if label_matches(&svc.selector[i], &pod.labels[j]) {
+        found = 1
+        break
+      }
+      j = j + 1
+    }
+    if found == 0 { return 0 }
+    i = i + 1
+  }
+
+  return 1
+}
+
+// ============================================================================
+// DEPLOYMENT MANAGEMENT
+// ============================================================================
+
+export fn create_deployment(name: u64, namespace: u64, replicas: u32, pod_spec: *PodSpec): u32 {
+  if orch_deployment_count >= MAX_DEPLOYMENTS { return 0xFFFFFFFF }
+
+  var idx: u32 = orch_deployment_count
+  var deploy: *Deployment = &orch_deployments[idx]
+
+  copy_string(&deploy.name, name)
+  copy_string_32(&deploy.namespace, namespace)
+  deploy.uid = orch_next_uid
+  orch_next_uid = orch_next_uid + 1
+
+  deploy.spec.replicas = replicas
+  deploy.spec.pod_template = *pod_spec
+  deploy.spec.selector_count = 0
+  deploy.spec.pod_label_count = 0
+
+  deploy.status.replicas = 0
+  deploy.status.ready_replicas = 0
+  deploy.status.available_replicas = 0
+  deploy.status.updated_replicas = 0
+
+  deploy.created_at = foundation.get_tick_count()
+
+  orch_deployment_count = orch_deployment_count + 1
+
+  foundation.serial_write_string("[Orchestrator] Deployment created: ")
+  foundation.serial_write_string(name)
+  foundation.serial_write_string(" replicas=")
+  foundation.serial_write_hex(replicas)
+  foundation.serial_write_string("\n")
+
+  // Create initial pods
+  reconcile_deployment(idx)
+
+  return idx
+}
+
+export fn scale_deployment(deploy_idx: u32, replicas: u32): u32 {
+  if deploy_idx >= orch_deployment_count { return 0 }
+
+  orch_deployments[deploy_idx].spec.replicas = replicas
+
+  foundation.serial_write_string("[Orchestrator] Scaling deployment to ")
+  foundation.serial_write_hex(replicas)
+  foundation.serial_write_string(" replicas\n")
+
+  reconcile_deployment(deploy_idx)
+
+  return 1
+}
+
+fn reconcile_deployment(deploy_idx: u32) {
+  var deploy: *Deployment = &orch_deployments[deploy_idx]
+
+  // Count current pods
+  var current: u32 = count_deployment_pods(deploy_idx)
+  var desired: u32 = deploy.spec.replicas
+
+  if current < desired {
+    // Create more pods
+    var to_create: u32 = desired - current
+    var i: u32 = 0
+    while i < to_create {
+      create_deployment_pod(deploy_idx, current + i)
+      i = i + 1
+    }
+  } else if current > desired {
+    // Delete excess pods
+    delete_excess_pods(deploy_idx, current - desired)
+  }
+
+  // Update status
+  deploy.status.replicas = desired
+  deploy.status.ready_replicas = count_ready_pods(deploy_idx)
+  deploy.status.available_replicas = deploy.status.ready_replicas
+  deploy.status.updated_replicas = deploy.status.replicas
+}
+
+fn count_deployment_pods(deploy_idx: u32): u32 {
+  var deploy: *Deployment = &orch_deployments[deploy_idx]
+  var count: u32 = 0
+
+  var i: u32 = 0
+  while i < orch_pod_count {
+    // Check if pod belongs to this deployment (by label)
+    // Simplified: check name prefix
+    i = i + 1
+  }
+
+  return count
+}
+
+fn count_ready_pods(deploy_idx: u32): u32 {
+  return 0  // Stub
+}
+
+fn create_deployment_pod(deploy_idx: u32, replica_num: u32) {
+  var deploy: *Deployment = &orch_deployments[deploy_idx]
+
+  // Generate pod name
+  var pod_name: [u8; 64]
+  var i: u32 = 0
+  while i < 63 && deploy.name[i] != 0 {
+    pod_name[i] = deploy.name[i]
+    i = i + 1
+  }
+  pod_name[i] = '-'
+  i = i + 1
+  // Add replica number suffix
+  pod_name[i] = '0' + (replica_num % 10)
+  i = i + 1
+  pod_name[i] = 0
+
+  create_pod(@ptrFromInt(&pod_name), @ptrFromInt(&deploy.namespace), &deploy.spec.pod_template)
+}
+
+fn delete_excess_pods(deploy_idx: u32, count: u32) {
+  // Delete `count` pods belonging to deployment
+}
+
+// ============================================================================
+// CONTROL LOOP
+// ============================================================================
+
+export fn orchestrator_run_once() {
+  if orch_initialized == 0 { return }
+
+  // Check node health
+  check_node_health()
+
+  // Reconcile deployments
+  var i: u32 = 0
+  while i < orch_deployment_count {
+    reconcile_deployment(i)
+    i = i + 1
+  }
+
+  // Check pod health
+  check_pod_health()
+
+  // Update service endpoints
+  update_service_endpoints()
+}
+
+fn check_node_health() {
+  var now: u64 = foundation.get_tick_count()
+
+  var i: u32 = 0
+  while i < orch_node_count {
+    var node: *Node = &orch_nodes[i]
+
+    // Mark node not ready if no heartbeat for 30 seconds
+    if now - node.last_heartbeat > 30000 {
+      if node.ready == 1 {
+        node.ready = 0
+        foundation.serial_write_string("[Orchestrator] Node ")
+        foundation.serial_write_string(@ptrFromInt(&node.name))
+        foundation.serial_write_string(" marked NotReady\n")
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn check_pod_health() {
+  var i: u32 = 0
+  while i < orch_pod_count {
+    var pod: *Pod = &orch_pods[i]
+
+    if pod.status.phase == POD_RUNNING {
+      // Check container health
+      var all_running: u32 = 1
+      var j: u32 = 0
+      while j < pod.spec.container_count {
+        if pod.status.container_statuses[j].state != CONTAINER_RUNNING {
+          all_running = 0
+
+          // Restart if policy allows
+          if pod.spec.restart_policy == RESTART_ALWAYS {
+            restart_container(pod, j)
+          }
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn restart_container(pod: *Pod, container_idx: u32) {
+  var status: *ContainerStatus = &pod.status.container_statuses[container_idx]
+  status.restart_count = status.restart_count + 1
+
+  foundation.serial_write_string("[Orchestrator] Restarting container ")
+  foundation.serial_write_string(@ptrFromInt(&status.name))
+  foundation.serial_write_string(" (restart #")
+  foundation.serial_write_hex(status.restart_count)
+  foundation.serial_write_string(")\n")
+
+  // Stop and start container
+  runtime.container_stop(status.container_id)
+  runtime.container_start(status.container_id)
+  status.state = CONTAINER_RUNNING
+  status.started_at = foundation.get_tick_count()
+}
+
+fn update_service_endpoints() {
+  // Update kube-proxy-like endpoint tracking
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn copy_string(dest: *[u8; 64], src: u64) {
+  var i: u32 = 0
+  while i < 63 {
+    var ch: u8 = @intToPtr(src + i, u8)
+    (*dest)[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  (*dest)[i] = 0
+}
+
+fn copy_string_32(dest: *[u8; 32], src: u64) {
+  var i: u32 = 0
+  while i < 31 {
+    var ch: u8 = @intToPtr(src + i, u8)
+    (*dest)[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  (*dest)[i] = 0
+}
+
+fn copy_string_128(dest: *[u8; 128], src: u64) {
+  var i: u32 = 0
+  while i < 127 {
+    var ch: u8 = @intToPtr(src + i, u8)
+    (*dest)[i] = ch
+    if ch == 0 { break }
+    i = i + 1
+  }
+  (*dest)[i] = 0
+}
+
+fn string_equals_64(a: u64, b: u64): u32 {
+  var i: u32 = 0
+  while i < 64 {
+    var ca: u8 = @intToPtr(a + i, u8)
+    var cb: u8 = @intToPtr(b + i, u8)
+    if ca != cb { return 0 }
+    if ca == 0 { return 1 }
+    i = i + 1
+  }
+  return 1
+}
+
+fn string_equals_128(a: u64, b: u64): u32 {
+  var i: u32 = 0
+  while i < 128 {
+    var ca: u8 = @intToPtr(a + i, u8)
+    var cb: u8 = @intToPtr(b + i, u8)
+    if ca != cb { return 0 }
+    if ca == 0 { return 1 }
+    i = i + 1
+  }
+  return 1
+}

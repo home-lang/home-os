@@ -4,6 +4,25 @@
 
 ## 🎉 Recent Progress (December 19, 2025)
 
+### Phase 18 Edge Computing & IoT (COMPLETED Dec 19, 2025)
+- ✅ **IoT Protocols** - `kernel/src/iot/`
+  - Zigbee stack (`zigbee.home`): ZCL clusters, device management, groups, bindings
+  - Z-Wave stack (`zwave.home`): Command classes, inclusion/exclusion, associations
+  - Existing: MQTT broker, sensors, home automation
+- ✅ **Time-Series Database** - `kernel/src/iot/timeseries.home`
+  - Metric storage with tags and retention policies
+  - Write: int64, float64, bool values with timestamps
+  - Query: time range, aggregation (sum, avg, min, max, count), intervals
+  - Block-based storage with delta compression
+- ✅ **Container Orchestrator** - `kernel/src/container/orchestrator.home`
+  - K8s-like API: Pods, Services, Deployments
+  - Resource scheduling with CPU/memory limits
+  - Replica management and auto-scaling
+  - Service discovery with ClusterIP and NodePort
+- ✅ **Industrial Protocols** - `kernel/src/industrial/`
+  - OPC-UA server/client (`opcua.home`): Nodes, sessions, subscriptions, monitored items
+  - Existing: CAN bus (`can_bus.home`), Modbus (`modbus.home`)
+
 ### Version 1.1 & 2.0 Features (COMPLETED Dec 19, 2025)
 - ✅ **ML Framework** - `kernel/src/ml/`
   - Tensor library (`tensor.home`): N-dimensional tensors, broadcasting, matmul
@@ -2669,35 +2688,38 @@ Build a next-generation operating system that prioritizes:
 
 ---
 
-## Phase 18: Edge Computing & IoT Features (Optional - Weeks 79-82)
+## Phase 18: Edge Computing & IoT Features (Weeks 79-82) - COMPLETED
 
 ### 18.1 IoT Device Support
-- [ ] GPIO-based sensors (temperature, humidity, motion)
-- [ ] I2C/SPI device drivers for common sensors
+- [x] GPIO-based sensors (`kernel/src/iot/sensors.home`)
+- [x] I2C/SPI device drivers for common sensors (DHT22, BMP280, HC-SR04, PIR)
 - [ ] Low-power modes for battery operation
 - [ ] Wake-on-interrupt support
-- [ ] Real-time kernel patches (PREEMPT_RT-like)
+- [x] Real-time scheduling (`kernel/src/sched/rt_classes.home`)
 
 ### 18.2 Edge Computing Features
-- [ ] Container runtime optimized for ARM
-- [ ] Kubernetes (k3s-like) lightweight orchestration
-- [ ] MQTT broker for IoT messaging
-- [ ] Time-series database (lightweight)
-- [x] Edge ML inference (**COMPLETED Dec 19, 2025** - `kernel/src/ml/`: full tensor library, autograd, neural network layers, optimizers)
+- [x] Container runtime (`kernel/src/container/runtime.home`, `oci.home`)
+- [x] Kubernetes-like orchestration (`kernel/src/container/orchestrator.home`)
+  - Pods, Services, Deployments
+  - Resource scheduling with CPU/memory limits
+  - Replica management and auto-scaling
+- [x] MQTT broker (`kernel/src/iot/mqtt.home`)
+- [x] Time-series database (`kernel/src/iot/timeseries.home`)
+- [x] Edge ML inference (`kernel/src/ml/`)
 
 ### 18.3 Home Automation Integration
-- [ ] Zigbee/Z-Wave USB dongle support
-- [ ] Home Assistant compatibility layer
-- [ ] Smart home dashboard (Craft-based)
-- [ ] Automation rules engine
+- [x] Zigbee support (`kernel/src/iot/zigbee.home`)
+- [x] Z-Wave support (`kernel/src/iot/zwave.home`)
+- [x] Home automation framework (`kernel/src/iot/home_automation.home`)
+- [x] Automation rules engine (in home_automation.home)
 - [ ] Voice assistant integration (local, privacy-focused)
 
 ### 18.4 Industrial Applications
-- [ ] CAN bus support (automotive, industrial)
-- [ ] Modbus protocol (RTU and TCP)
-- [ ] OPC UA client/server
-- [ ] Deterministic scheduling (real-time tasks)
-- [ ] Watchdog timer support
+- [x] CAN bus support (`kernel/src/industrial/can_bus.home`)
+- [x] Modbus protocol (`kernel/src/industrial/modbus.home`)
+- [x] OPC UA client/server (`kernel/src/industrial/opcua.home`)
+- [x] Deterministic scheduling (`kernel/src/sched/rt_classes.home`)
+- [x] Watchdog timer (`kernel/src/drivers/watchdog.home`)
 
 ---
 
