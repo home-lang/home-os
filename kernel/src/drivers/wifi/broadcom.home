@@ -1,0 +1,861 @@
+// HomeOS Broadcom WiFi Driver (brcmfmac)
+// Support for Broadcom FullMAC 802.11 wireless devices
+
+const basics = @import("basics")
+const pci = @import("drivers/pci")
+const sdio = @import("drivers/sdio")
+const net = @import("net/core")
+const dma = @import("mm/dma")
+const irq = @import("kernel/irq")
+
+// ============================================
+// Broadcom Device IDs
+// ============================================
+
+const BROADCOM_VENDOR_ID: u16 = 0x14E4
+
+// PCIe device IDs
+const BCM4350_D11AC: u16 = 0x43A3
+const BCM4356_D11AC: u16 = 0x43EC
+const BCM4359_D11AC: u16 = 0x43EF
+const BCM4365_D11AC2G: u16 = 0x43CA
+const BCM4366_D11AC: u16 = 0x43C3
+const BCM4371_D11AC: u16 = 0x440D
+
+// SDIO device IDs
+const BCM43143: u16 = 0xA887
+const BCM43241: u16 = 0x4324
+const BCM4329: u16 = 0x4329
+const BCM4330: u16 = 0x4330
+const BCM4334: u16 = 0x4334
+const BCM43362: u16 = 0xA962
+const BCM4339: u16 = 0x4339
+const BCM43430: u16 = 0xA9A6
+const BCM43455: u16 = 0xA9BF
+
+// ============================================
+// Register Definitions
+// ============================================
+
+// Common core registers
+const BCMA_IOST: u32 = 0x0500
+const BCMA_RESET_CTL: u32 = 0x0800
+const BCMA_RESET_ST: u32 = 0x0804
+
+// SDIO core registers
+const SDIO_FUNC1_SBADDRLOW: u32 = 0x1000A
+const SDIO_FUNC1_SBADDRMID: u32 = 0x1000B
+const SDIO_FUNC1_SBADDRHIGH: u32 = 0x1000C
+
+// Chip status registers
+const CHIP_ID_REG: u32 = 0x0
+const CHIP_REV_REG: u32 = 0x4
+
+// DMA registers
+const DMA_TX_CONTROL: u32 = 0x200
+const DMA_TX_RING_ADDR_LO: u32 = 0x204
+const DMA_TX_RING_ADDR_HI: u32 = 0x208
+const DMA_TX_PTR: u32 = 0x20C
+const DMA_RX_CONTROL: u32 = 0x220
+const DMA_RX_RING_ADDR_LO: u32 = 0x224
+const DMA_RX_RING_ADDR_HI: u32 = 0x228
+const DMA_RX_PTR: u32 = 0x22C
+
+// ============================================
+// Firmware Constants
+// ============================================
+
+const BRCM_FW_NAME_LEN: u32 = 64
+const BRCM_NVRAM_LEN: u32 = 32768
+const BRCM_MAX_FW_SIZE: u32 = 0x100000  // 1MB
+
+// ============================================
+// BCDC Protocol (Broadcom Dongle Host Driver)
+// ============================================
+
+const BCDC_HEADER_LEN: u32 = 4
+const BCDC_PROTO_VER: u8 = 2
+
+const BCDC_FLAG_VER_MASK: u32 = 0xF0
+const BCDC_FLAG_VER_SHIFT: u32 = 4
+const BCDC_FLAG_SUM_NEEDED: u32 = 0x08
+const BCDC_FLAG_SUM_GOOD: u32 = 0x04
+const BCDC_FLAG_EVENT: u32 = 0x01
+
+struct BcdcHeader {
+    flags: u8
+    priority: u8
+    flags2: u8
+    data_offset: u8
+}
+
+// ============================================
+// Event Definitions
+// ============================================
+
+const BRCMF_E_SET_SSID: u32 = 0
+const BRCMF_E_JOIN: u32 = 1
+const BRCMF_E_START: u32 = 2
+const BRCMF_E_AUTH: u32 = 3
+const BRCMF_E_ASSOC: u32 = 6
+const BRCMF_E_DEAUTH: u32 = 5
+const BRCMF_E_DISASSOC: u32 = 11
+const BRCMF_E_LINK: u32 = 16
+const BRCMF_E_ROAM: u32 = 22
+const BRCMF_E_SCAN_COMPLETE: u32 = 69
+const BRCMF_E_ESCAN_RESULT: u32 = 69
+
+struct BrcmfEvent {
+    version: u16
+    flags: u16
+    event_type: u32
+    status: u32
+    reason: u32
+    auth_type: u32
+    datalen: u32
+    addr: [6]u8
+    ifname: [16]u8
+    ifidx: u8
+    bsscfgidx: u8
+}
+
+// ============================================
+// Ring Buffer Structures
+// ============================================
+
+const TX_RING_SIZE: u32 = 512
+const RX_RING_SIZE: u32 = 512
+const MAX_PKT_SIZE: u32 = 2048
+
+struct RingDescriptor {
+    addr_lo: u32
+    addr_hi: u32
+    ctrl0: u32
+    ctrl1: u32
+}
+
+// ============================================
+// Device State
+// ============================================
+
+const BUS_TYPE_PCIE: u8 = 0
+const BUS_TYPE_SDIO: u8 = 1
+
+struct BrcmDevice {
+    // Bus type
+    bus_type: u8
+
+    // PCIe device
+    pci_dev: *pci.PCIDevice
+    bar0: *volatile u8
+    bar_size: u64
+
+    // SDIO device
+    sdio_func: *sdio.SDIOFunc
+
+    // Chip info
+    chip_id: u32
+    chip_rev: u32
+
+    // IRQ
+    irq_line: u8
+
+    // DMA
+    tx_ring: *RingDescriptor
+    tx_ring_dma: u64
+    tx_buffers: [TX_RING_SIZE]*u8
+    tx_buffer_dma: [TX_RING_SIZE]u64
+    tx_write_ptr: u32
+    tx_read_ptr: u32
+
+    rx_ring: *RingDescriptor
+    rx_ring_dma: u64
+    rx_buffers: [RX_RING_SIZE]*u8
+    rx_buffer_dma: [RX_RING_SIZE]u64
+    rx_write_ptr: u32
+    rx_read_ptr: u32
+
+    // Firmware
+    fw_loaded: bool
+    fw_name: [BRCM_FW_NAME_LEN]u8
+
+    // Network interface
+    netif: *net.NetworkInterface
+    mac_addr: [6]u8
+
+    // State
+    hw_ready: bool
+    started: bool
+    scanning: bool
+
+    // Connection state
+    associated: bool
+    bssid: [6]u8
+    ssid: [32]u8
+    ssid_len: u8
+    channel: u16
+    rssi: i8
+
+    // Security
+    security: u8
+    wpa_version: u8
+
+    // Statistics
+    tx_packets: u64
+    rx_packets: u64
+    tx_bytes: u64
+    rx_bytes: u64
+    tx_errors: u64
+    rx_errors: u64
+}
+
+// ============================================
+// Global State
+// ============================================
+
+const MAX_BRCM_DEVICES: u32 = 4
+var devices: [MAX_BRCM_DEVICES]BrcmDevice = undefined
+var num_devices: u32 = 0
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn brcmfmac_init(): void {
+    basics.print("[BRCMFMAC] Initializing Broadcom WiFi driver\n")
+
+    var i: u32 = 0
+    while i < MAX_BRCM_DEVICES {
+        devices[i].pci_dev = null
+        devices[i].sdio_func = null
+        devices[i].started = false
+        i = i + 1
+    }
+
+    // Scan for PCIe devices
+    pci.scan_devices(BROADCOM_VENDOR_ID, 0xFFFF, brcm_pcie_probe)
+
+    // Scan for SDIO devices
+    sdio.scan_devices(BROADCOM_VENDOR_ID, 0xFFFF, brcm_sdio_probe)
+
+    basics.print("[BRCMFMAC] Found ")
+    basics.print_u32(num_devices)
+    basics.print(" Broadcom WiFi device(s)\n")
+}
+
+fn brcm_pcie_probe(dev: *pci.PCIDevice): bool {
+    if not is_brcm_pcie_device(dev.device_id) {
+        return false
+    }
+
+    if num_devices >= MAX_BRCM_DEVICES {
+        return false
+    }
+
+    let brcm = &devices[num_devices]
+
+    // Enable bus mastering
+    pci.enable_bus_mastering(dev)
+    pci.enable_memory_space(dev)
+
+    // Map BAR0
+    brcm.bar0 = pci.map_bar(dev, 0, &brcm.bar_size) as *volatile u8
+    if brcm.bar0 == null {
+        return false
+    }
+
+    brcm.bus_type = BUS_TYPE_PCIE
+    brcm.pci_dev = dev
+    brcm.irq_line = dev.irq_line
+
+    // Read chip ID
+    brcm.chip_id = read32(brcm, CHIP_ID_REG) & 0xFFFF
+    brcm.chip_rev = read32(brcm, CHIP_REV_REG) & 0xF
+
+    // Initialize hardware
+    if not brcm_hw_init(brcm) {
+        return false
+    }
+
+    // Allocate DMA rings
+    if not brcm_alloc_rings(brcm) {
+        return false
+    }
+
+    // Register IRQ handler
+    irq.register_handler(brcm.irq_line, brcm_irq_handler, brcm)
+
+    // Register network interface
+    brcm.netif = net.register_interface("wlan", brcm, &brcm_net_ops)
+
+    num_devices = num_devices + 1
+
+    basics.print("[BRCMFMAC] BCM")
+    basics.print_hex32(brcm.chip_id)
+    basics.print(" rev ")
+    basics.print_u32(brcm.chip_rev)
+    basics.print(" (PCIe) initialized\n")
+
+    return true
+}
+
+fn brcm_sdio_probe(func: *sdio.SDIOFunc): bool {
+    if not is_brcm_sdio_device(func.device_id) {
+        return false
+    }
+
+    if num_devices >= MAX_BRCM_DEVICES {
+        return false
+    }
+
+    let brcm = &devices[num_devices]
+
+    brcm.bus_type = BUS_TYPE_SDIO
+    brcm.sdio_func = func
+    brcm.irq_line = func.irq
+
+    // Read chip ID via SDIO
+    set_sbaddr(brcm, 0x18000000)  // ChipCommon base
+    brcm.chip_id = sdio.read32(func, CHIP_ID_REG) & 0xFFFF
+    brcm.chip_rev = sdio.read32(func, CHIP_REV_REG) & 0xF
+
+    // Initialize hardware
+    if not brcm_hw_init(brcm) {
+        return false
+    }
+
+    // Register IRQ handler
+    sdio.claim_irq(func, brcm_sdio_irq_handler, brcm)
+
+    // Register network interface
+    brcm.netif = net.register_interface("wlan", brcm, &brcm_net_ops)
+
+    num_devices = num_devices + 1
+
+    basics.print("[BRCMFMAC] BCM")
+    basics.print_hex32(brcm.chip_id)
+    basics.print(" rev ")
+    basics.print_u32(brcm.chip_rev)
+    basics.print(" (SDIO) initialized\n")
+
+    return true
+}
+
+fn is_brcm_pcie_device(device_id: u16): bool {
+    return device_id == BCM4350_D11AC or
+           device_id == BCM4356_D11AC or
+           device_id == BCM4359_D11AC or
+           device_id == BCM4365_D11AC2G or
+           device_id == BCM4366_D11AC or
+           device_id == BCM4371_D11AC
+}
+
+fn is_brcm_sdio_device(device_id: u16): bool {
+    return device_id == BCM43143 or
+           device_id == BCM43241 or
+           device_id == BCM4329 or
+           device_id == BCM4330 or
+           device_id == BCM4334 or
+           device_id == BCM43362 or
+           device_id == BCM4339 or
+           device_id == BCM43430 or
+           device_id == BCM43455
+}
+
+// ============================================
+// Hardware Access
+// ============================================
+
+fn read32(brcm: *BrcmDevice, offset: u32): u32 {
+    if brcm.bus_type == BUS_TYPE_PCIE {
+        return *(brcm.bar0 + offset) as *volatile u32
+    } else {
+        return sdio.read32(brcm.sdio_func, offset)
+    }
+}
+
+fn write32(brcm: *BrcmDevice, offset: u32, value: u32): void {
+    if brcm.bus_type == BUS_TYPE_PCIE {
+        let ptr = (brcm.bar0 + offset) as *volatile u32
+        *ptr = value
+    } else {
+        sdio.write32(brcm.sdio_func, offset, value)
+    }
+}
+
+fn set_sbaddr(brcm: *BrcmDevice, addr: u32): void {
+    if brcm.bus_type == BUS_TYPE_SDIO {
+        sdio.write8(brcm.sdio_func, SDIO_FUNC1_SBADDRLOW, (addr >> 8) as u8)
+        sdio.write8(brcm.sdio_func, SDIO_FUNC1_SBADDRMID, (addr >> 16) as u8)
+        sdio.write8(brcm.sdio_func, SDIO_FUNC1_SBADDRHIGH, (addr >> 24) as u8)
+    }
+}
+
+// ============================================
+// Hardware Initialization
+// ============================================
+
+fn brcm_hw_init(brcm: *BrcmDevice): bool {
+    // Reset cores
+    brcm_core_reset(brcm, 0x18001000)  // D11 core
+
+    // Wait for reset
+    basics.io_delay(100)
+
+    // Read MAC address
+    if not brcm_read_mac(brcm) {
+        // Generate random MAC
+        brcm.mac_addr[0] = 0x02
+        brcm.mac_addr[1] = 0x00
+        brcm.mac_addr[2] = 0x00
+        brcm.mac_addr[3] = (basics.get_timestamp() >> 16) as u8
+        brcm.mac_addr[4] = (basics.get_timestamp() >> 8) as u8
+        brcm.mac_addr[5] = basics.get_timestamp() as u8
+    }
+
+    brcm.hw_ready = true
+    return true
+}
+
+fn brcm_core_reset(brcm: *BrcmDevice, base: u32): void {
+    // Put core in reset
+    if brcm.bus_type == BUS_TYPE_SDIO {
+        set_sbaddr(brcm, base)
+    }
+
+    write32(brcm, base + BCMA_RESET_CTL, 1)
+    basics.io_delay(10)
+
+    // Take out of reset
+    write32(brcm, base + BCMA_RESET_CTL, 0)
+    basics.io_delay(50)
+}
+
+fn brcm_read_mac(brcm: *BrcmDevice): bool {
+    // MAC address stored in SROM/OTP
+    // Location varies by chip
+    let base: u32 = switch brcm.chip_id {
+        0x4330 => 0x18000100,
+        0x4339 => 0x18000100,
+        0x43430 => 0x18000100,
+        else => 0x18000100
+    }
+
+    if brcm.bus_type == BUS_TYPE_SDIO {
+        set_sbaddr(brcm, base)
+    }
+
+    // Read MAC registers
+    let mac_lo = read32(brcm, 0)
+    let mac_hi = read32(brcm, 4)
+
+    if mac_lo == 0 and mac_hi == 0 {
+        return false
+    }
+
+    brcm.mac_addr[0] = (mac_hi >> 8) as u8
+    brcm.mac_addr[1] = mac_hi as u8
+    brcm.mac_addr[2] = (mac_lo >> 24) as u8
+    brcm.mac_addr[3] = (mac_lo >> 16) as u8
+    brcm.mac_addr[4] = (mac_lo >> 8) as u8
+    brcm.mac_addr[5] = mac_lo as u8
+
+    return true
+}
+
+// ============================================
+// Ring Allocation
+// ============================================
+
+fn brcm_alloc_rings(brcm: *BrcmDevice): bool {
+    // Allocate TX ring
+    brcm.tx_ring = dma.alloc_coherent(TX_RING_SIZE * @sizeOf(RingDescriptor), &brcm.tx_ring_dma)
+    if brcm.tx_ring == null {
+        return false
+    }
+
+    // Allocate TX buffers
+    var i: u32 = 0
+    while i < TX_RING_SIZE {
+        brcm.tx_buffers[i] = dma.alloc_coherent(MAX_PKT_SIZE, &brcm.tx_buffer_dma[i])
+        if brcm.tx_buffers[i] == null {
+            return false
+        }
+        i = i + 1
+    }
+
+    // Allocate RX ring
+    brcm.rx_ring = dma.alloc_coherent(RX_RING_SIZE * @sizeOf(RingDescriptor), &brcm.rx_ring_dma)
+    if brcm.rx_ring == null {
+        return false
+    }
+
+    // Allocate RX buffers
+    i = 0
+    while i < RX_RING_SIZE {
+        brcm.rx_buffers[i] = dma.alloc_coherent(MAX_PKT_SIZE, &brcm.rx_buffer_dma[i])
+        if brcm.rx_buffers[i] == null {
+            return false
+        }
+
+        // Set up RX descriptor
+        brcm.rx_ring[i].addr_lo = brcm.rx_buffer_dma[i] as u32
+        brcm.rx_ring[i].addr_hi = (brcm.rx_buffer_dma[i] >> 32) as u32
+        brcm.rx_ring[i].ctrl0 = MAX_PKT_SIZE
+
+        i = i + 1
+    }
+
+    brcm.tx_write_ptr = 0
+    brcm.tx_read_ptr = 0
+    brcm.rx_write_ptr = 0
+    brcm.rx_read_ptr = 0
+
+    // Program DMA registers
+    if brcm.bus_type == BUS_TYPE_PCIE {
+        write32(brcm, DMA_TX_RING_ADDR_LO, brcm.tx_ring_dma as u32)
+        write32(brcm, DMA_TX_RING_ADDR_HI, (brcm.tx_ring_dma >> 32) as u32)
+        write32(brcm, DMA_TX_CONTROL, 1)
+
+        write32(brcm, DMA_RX_RING_ADDR_LO, brcm.rx_ring_dma as u32)
+        write32(brcm, DMA_RX_RING_ADDR_HI, (brcm.rx_ring_dma >> 32) as u32)
+        write32(brcm, DMA_RX_CONTROL, 1)
+        write32(brcm, DMA_RX_PTR, RX_RING_SIZE - 1)
+    }
+
+    return true
+}
+
+// ============================================
+// Interrupt Handlers
+// ============================================
+
+fn brcm_irq_handler(ctx: *void): void {
+    let brcm = ctx as *BrcmDevice
+
+    // Read interrupt status
+    let status = read32(brcm, 0x100)  // IntStatus register
+
+    if status == 0 or status == 0xFFFFFFFF {
+        return
+    }
+
+    // Acknowledge
+    write32(brcm, 0x100, status)
+
+    // RX interrupt
+    if (status & 0x10000) != 0 {
+        brcm_rx_handler(brcm)
+    }
+
+    // TX completion
+    if (status & 0x01000000) != 0 {
+        brcm_tx_complete(brcm)
+    }
+}
+
+fn brcm_sdio_irq_handler(func: *sdio.SDIOFunc, ctx: *void): void {
+    let brcm = ctx as *BrcmDevice
+
+    // Read pending data
+    var len: u16 = 0
+    sdio.read(func, 0x1000, &len as *u8, 2)
+
+    if len > 0 and len < MAX_PKT_SIZE as u16 {
+        let buf = brcm.rx_buffers[brcm.rx_read_ptr]
+        sdio.read(func, 0x1000, buf, len as u32)
+
+        process_rx_packet(brcm, buf, len)
+
+        brcm.rx_read_ptr = (brcm.rx_read_ptr + 1) & (RX_RING_SIZE - 1)
+    }
+}
+
+fn brcm_rx_handler(brcm: *BrcmDevice): void {
+    while brcm.rx_read_ptr != brcm.rx_write_ptr {
+        let desc = &brcm.rx_ring[brcm.rx_read_ptr]
+        let len = (desc.ctrl1 & 0xFFFF) as u16
+
+        if len > 0 and len < MAX_PKT_SIZE as u16 {
+            let buf = brcm.rx_buffers[brcm.rx_read_ptr]
+            process_rx_packet(brcm, buf, len)
+        }
+
+        // Reset descriptor
+        desc.ctrl0 = MAX_PKT_SIZE
+        desc.ctrl1 = 0
+
+        brcm.rx_read_ptr = (brcm.rx_read_ptr + 1) & (RX_RING_SIZE - 1)
+    }
+
+    // Update RX pointer
+    write32(brcm, DMA_RX_PTR, brcm.rx_read_ptr)
+}
+
+fn process_rx_packet(brcm: *BrcmDevice, data: *u8, len: u16): void {
+    // Parse BCDC header
+    let hdr = data as *BcdcHeader
+
+    if (hdr.flags & BCDC_FLAG_EVENT as u8) != 0 {
+        // Event packet
+        let event = (data + BCDC_HEADER_LEN + hdr.data_offset as u32) as *BrcmfEvent
+        process_event(brcm, event)
+    } else {
+        // Data packet
+        let payload = data + BCDC_HEADER_LEN + hdr.data_offset as u32
+        let payload_len = len - (BCDC_HEADER_LEN + hdr.data_offset as u32) as u16
+
+        if brcm.netif != null and payload_len > 0 {
+            net.receive_packet(brcm.netif, payload, payload_len)
+            brcm.rx_packets = brcm.rx_packets + 1
+            brcm.rx_bytes = brcm.rx_bytes + payload_len as u64
+        }
+    }
+}
+
+fn process_event(brcm: *BrcmDevice, event: *BrcmfEvent): void {
+    switch event.event_type {
+        BRCMF_E_LINK => {
+            if event.status == 0 {
+                brcm.associated = true
+                basics.memcpy(&brcm.bssid, &event.addr, 6)
+                basics.print("[BRCMFMAC] Link up\n")
+            } else {
+                brcm.associated = false
+                basics.print("[BRCMFMAC] Link down\n")
+            }
+        },
+        BRCMF_E_SCAN_COMPLETE => {
+            brcm.scanning = false
+            basics.print("[BRCMFMAC] Scan complete\n")
+        },
+        BRCMF_E_DEAUTH, BRCMF_E_DISASSOC => {
+            brcm.associated = false
+            basics.print("[BRCMFMAC] Disconnected\n")
+        },
+        else => {}
+    }
+}
+
+fn brcm_tx_complete(brcm: *BrcmDevice): void {
+    // Read completed TX pointer
+    let completed = read32(brcm, DMA_TX_PTR)
+
+    while brcm.tx_read_ptr != completed {
+        brcm.tx_packets = brcm.tx_packets + 1
+        brcm.tx_read_ptr = (brcm.tx_read_ptr + 1) & (TX_RING_SIZE - 1)
+    }
+}
+
+// ============================================
+// Network Operations
+// ============================================
+
+const brcm_net_ops = net.NetworkOps {
+    .open = brcm_open,
+    .close = brcm_close,
+    .start_xmit = brcm_start_xmit,
+    .set_mac_address = brcm_set_mac,
+    .get_stats = brcm_get_stats,
+}
+
+fn brcm_open(netif: *net.NetworkInterface): i32 {
+    let brcm = netif.priv as *BrcmDevice
+
+    if not brcm.hw_ready {
+        return -1
+    }
+
+    brcm.started = true
+    return 0
+}
+
+fn brcm_close(netif: *net.NetworkInterface): i32 {
+    let brcm = netif.priv as *BrcmDevice
+
+    brcm.started = false
+    brcm.associated = false
+    return 0
+}
+
+fn brcm_start_xmit(netif: *net.NetworkInterface, skb: *net.SkBuff): i32 {
+    let brcm = netif.priv as *BrcmDevice
+
+    if not brcm.associated {
+        return -1
+    }
+
+    // Get next TX buffer
+    let buf = brcm.tx_buffers[brcm.tx_write_ptr]
+
+    // Build BCDC header
+    let hdr = buf as *BcdcHeader
+    hdr.flags = (BCDC_PROTO_VER << BCDC_FLAG_VER_SHIFT as u8)
+    hdr.priority = 0
+    hdr.flags2 = 0
+    hdr.data_offset = 0
+
+    // Copy data
+    basics.memcpy(buf + BCDC_HEADER_LEN, skb.data, skb.len as u32)
+
+    let total_len = BCDC_HEADER_LEN + skb.len as u32
+
+    if brcm.bus_type == BUS_TYPE_PCIE {
+        // Set up TX descriptor
+        let desc = &brcm.tx_ring[brcm.tx_write_ptr]
+        desc.addr_lo = brcm.tx_buffer_dma[brcm.tx_write_ptr] as u32
+        desc.addr_hi = (brcm.tx_buffer_dma[brcm.tx_write_ptr] >> 32) as u32
+        desc.ctrl0 = total_len | 0x80000000  // SOP|EOP
+
+        brcm.tx_write_ptr = (brcm.tx_write_ptr + 1) & (TX_RING_SIZE - 1)
+
+        // Update TX pointer
+        write32(brcm, DMA_TX_PTR, brcm.tx_write_ptr)
+    } else {
+        // SDIO write
+        sdio.write(brcm.sdio_func, 0x1000, buf, total_len)
+    }
+
+    brcm.tx_bytes = brcm.tx_bytes + skb.len as u64
+    return 0
+}
+
+fn brcm_set_mac(netif: *net.NetworkInterface, addr: *[6]u8): i32 {
+    let brcm = netif.priv as *BrcmDevice
+    basics.memcpy(&brcm.mac_addr, addr, 6)
+    return 0
+}
+
+fn brcm_get_stats(netif: *net.NetworkInterface, stats: *net.NetStats): void {
+    let brcm = netif.priv as *BrcmDevice
+    stats.tx_packets = brcm.tx_packets
+    stats.rx_packets = brcm.rx_packets
+    stats.tx_bytes = brcm.tx_bytes
+    stats.rx_bytes = brcm.rx_bytes
+    stats.tx_errors = brcm.tx_errors
+    stats.rx_errors = brcm.rx_errors
+}
+
+// ============================================
+// IOCTL Commands
+// ============================================
+
+fn brcm_send_cmd(brcm: *BrcmDevice, cmd: u32, data: *u8, len: u32): i32 {
+    // Build BCDC command
+    var buf: [256]u8 = undefined
+
+    let hdr = &buf as *BcdcHeader
+    hdr.flags = (BCDC_PROTO_VER << BCDC_FLAG_VER_SHIFT as u8)
+    hdr.priority = 0
+    hdr.flags2 = cmd as u8
+    hdr.data_offset = 0
+
+    if len > 0 and len < 252 {
+        basics.memcpy(&buf[BCDC_HEADER_LEN], data, len)
+    }
+
+    if brcm.bus_type == BUS_TYPE_SDIO {
+        return sdio.write(brcm.sdio_func, 0x1000, &buf, BCDC_HEADER_LEN + len)
+    }
+
+    return 0
+}
+
+// ============================================
+// WiFi Operations
+// ============================================
+
+export fn brcm_scan(dev_id: u32): bool {
+    if dev_id >= num_devices {
+        return false
+    }
+
+    let brcm = &devices[dev_id]
+    if not brcm.started {
+        return false
+    }
+
+    brcm.scanning = true
+
+    // Send scan command
+    var params: [256]u8 = undefined
+    basics.memset(&params, 0, 256)
+
+    // Set scan type = active
+    params[0] = 1
+
+    brcm_send_cmd(brcm, 49, &params, 256)  // WLC_SCAN
+
+    basics.print("[BRCMFMAC] Starting scan...\n")
+    return true
+}
+
+export fn brcm_connect(dev_id: u32, ssid: *const u8, ssid_len: u8, password: *const u8, password_len: u8): bool {
+    if dev_id >= num_devices {
+        return false
+    }
+
+    let brcm = &devices[dev_id]
+    if not brcm.started {
+        return false
+    }
+
+    // Copy SSID
+    basics.memcpy(&brcm.ssid, ssid, ssid_len as u32)
+    brcm.ssid_len = ssid_len
+
+    // Set SSID via ioctl
+    var params: [36]u8 = undefined
+    basics.memset(&params, 0, 36)
+    params[0] = ssid_len
+    basics.memcpy(&params[4], ssid, ssid_len as u32)
+
+    brcm_send_cmd(brcm, 26, &params, 36)  // WLC_SET_SSID
+
+    basics.print("[BRCMFMAC] Connecting to ")
+    basics.print_n(ssid, ssid_len as u32)
+    basics.print("...\n")
+
+    return true
+}
+
+export fn brcm_disconnect(dev_id: u32): bool {
+    if dev_id >= num_devices {
+        return false
+    }
+
+    let brcm = &devices[dev_id]
+
+    brcm_send_cmd(brcm, 52, null, 0)  // WLC_DISASSOC
+
+    brcm.associated = false
+    basics.print("[BRCMFMAC] Disconnected\n")
+    return true
+}
+
+export fn brcm_get_mac(dev_id: u32, mac: *[6]u8): bool {
+    if dev_id >= num_devices {
+        return false
+    }
+
+    basics.memcpy(mac, &devices[dev_id].mac_addr, 6)
+    return true
+}
+
+export fn brcm_is_associated(dev_id: u32): bool {
+    if dev_id >= num_devices {
+        return false
+    }
+    return devices[dev_id].associated
+}
+
+export fn brcm_get_rssi(dev_id: u32): i8 {
+    if dev_id >= num_devices {
+        return 0
+    }
+    return devices[dev_id].rssi
+}
+
+export fn brcm_get_device_count(): u32 {
+    return num_devices
+}

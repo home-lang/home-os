@@ -1,0 +1,891 @@
+// HomeOS Intel WiFi Driver (iwlwifi)
+// Support for Intel Wireless adapters (7260, 8260, 9260, AX200, AX210, etc.)
+
+const basics = @import("basics")
+const pci = @import("drivers/pci")
+const net = @import("net/core")
+const dma = @import("mm/dma")
+const irq = @import("kernel/irq")
+
+// ============================================
+// Intel WiFi Device IDs
+// ============================================
+
+const INTEL_VENDOR_ID: u16 = 0x8086
+
+// Device IDs for common Intel WiFi adapters
+const DEVICE_7260: u16 = 0x08B1
+const DEVICE_7265: u16 = 0x095A
+const DEVICE_8260: u16 = 0x24F3
+const DEVICE_8265: u16 = 0x24FD
+const DEVICE_9260: u16 = 0x2526
+const DEVICE_9560: u16 = 0xA370
+const DEVICE_AX200: u16 = 0x2723
+const DEVICE_AX201: u16 = 0xA0F0
+const DEVICE_AX210: u16 = 0x2725
+const DEVICE_AX211: u16 = 0x51F0
+
+// ============================================
+// Hardware Registers
+// ============================================
+
+const CSR_HW_IF_CONFIG_REG: u32 = 0x000
+const CSR_INT: u32 = 0x008
+const CSR_INT_MASK: u32 = 0x00C
+const CSR_FH_INT_STATUS: u32 = 0x010
+const CSR_GPIO_IN: u32 = 0x018
+const CSR_RESET: u32 = 0x020
+const CSR_GP_CNTRL: u32 = 0x024
+const CSR_EEPROM_REG: u32 = 0x02C
+const CSR_EEPROM_GP: u32 = 0x030
+const CSR_GIO: u32 = 0x03C
+const CSR_GP_UCODE_REG: u32 = 0x048
+const CSR_UCODE_DRV_GP1: u32 = 0x054
+const CSR_UCODE_DRV_GP2: u32 = 0x058
+const CSR_LED_REG: u32 = 0x094
+const CSR_DRAM_INT_TBL_REG: u32 = 0x0A0
+const CSR_MAC_SHADOW_REG: u32 = 0x0A8
+const CSR_GIO_REG: u32 = 0x3FC
+
+// Control flags
+const CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY: u32 = 0x00000001
+const CSR_GP_CNTRL_REG_FLAG_INIT_DONE: u32 = 0x00000004
+const CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ: u32 = 0x00000008
+const CSR_GP_CNTRL_REG_FLAG_GOING_TO_SLEEP: u32 = 0x00000010
+const CSR_GP_CNTRL_REG_FLAG_XTAL_ON: u32 = 0x00000400
+const CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW: u32 = 0x08000000
+
+const CSR_INT_BIT_FH_RX: u32 = 0x80000000
+const CSR_INT_BIT_HW_ERR: u32 = 0x20000000
+const CSR_INT_BIT_RX_PERIODIC: u32 = 0x10000000
+const CSR_INT_BIT_FH_TX: u32 = 0x08000000
+const CSR_INT_BIT_SCD: u32 = 0x04000000
+const CSR_INT_BIT_SW_ERR: u32 = 0x02000000
+const CSR_INT_BIT_RF_KILL: u32 = 0x00000080
+const CSR_INT_BIT_CT_KILL: u32 = 0x00000040
+const CSR_INT_BIT_SW_RX: u32 = 0x00000008
+const CSR_INT_BIT_WAKEUP: u32 = 0x00000001
+const CSR_INT_BIT_ALIVE: u32 = 0x00000002
+
+// ============================================
+// Firmware Constants
+// ============================================
+
+const UCODE_SECTION_MAX: u32 = 16
+const MAX_FW_IMG_SIZE: u32 = 0x400000  // 4MB
+
+const FW_MEM_TB_MAX_LENGTH: u32 = 0x2000
+
+// Firmware sections
+const IWL_UCODE_SECTION_INST: u32 = 0
+const IWL_UCODE_SECTION_DATA: u32 = 1
+const IWL_UCODE_SECTION_INIT: u32 = 2
+const IWL_UCODE_SECTION_INIT_DATA: u32 = 3
+const IWL_UCODE_SECTION_PAGING: u32 = 4
+
+// ============================================
+// TX/RX Queue Definitions
+// ============================================
+
+const TFD_QUEUE_SIZE_MAX: u32 = 256
+const TFD_QUEUE_SIZE_BC_DUP: u32 = 64
+const TFD_TX_CMD_SLOTS: u32 = 256
+
+const RX_QUEUE_SIZE: u32 = 256
+const RX_QUEUE_MASK: u32 = RX_QUEUE_SIZE - 1
+const RX_BUFFER_SIZE: u32 = 4096
+
+const NUM_TX_QUEUES: u32 = 31
+const CMD_QUEUE: u32 = 0
+
+// ============================================
+// Data Structures
+// ============================================
+
+struct IwlTfd {
+    tb_num: u8
+    padding: [3]u8
+    tbs: [20]IwlTfdTb
+}
+
+struct IwlTfdTb {
+    lo: u32
+    hi_n_len: u32
+}
+
+struct IwlRxMpdu {
+    len: u16
+    next_frame_flags: u16
+    // Followed by frame data
+}
+
+struct IwlTxCmd {
+    len: u16
+    next_frame_len: u16
+    tx_flags: u32
+    rate_n_flags: u32
+    sta_id: u8
+    sec_ctl: u8
+    initial_rate_index: u8
+    reserved2: u8
+    key: [16]u8
+    reserved3: u16
+    next_frame_flags: u8
+    reserved4: u8
+    life_time: u32
+    dram_lsb_ptr: u32
+    dram_msb_ptr: u8
+    rts_retry_limit: u8
+    data_retry_limit: u8
+    tid_tspec: u8
+    pm_frame_timeout: u16
+    reserved5: u16
+}
+
+struct IwlRxon {
+    dev_type: u8
+    sta_id: u8
+    reserved: u16
+    bssid: [6]u8
+    node_addr: [6]u8
+    reserved2: u16
+    flags: u16
+    filter_flags: u16
+    channel: u16
+    ofdm_basic_rates: u8
+    cck_basic_rates: u8
+    reserved3: u16
+}
+
+// ============================================
+// WiFi State
+// ============================================
+
+struct IwlDevice {
+    // PCI device
+    pci_dev: *pci.PCIDevice
+    bar0: *volatile u8
+    bar_size: u64
+
+    // Device info
+    device_id: u16
+    hw_rev: u32
+    hw_rf_id: u32
+
+    // IRQ
+    irq_line: u8
+
+    // Firmware
+    fw_loaded: bool
+    ucode_ver: u32
+
+    // TX queues
+    txq: [NUM_TX_QUEUES]TxQueue
+
+    // RX queue
+    rxq: RxQueue
+
+    // Network interface
+    netif: *net.NetworkInterface
+    mac_addr: [6]u8
+
+    // State
+    hw_ready: bool
+    rf_kill: bool
+    started: bool
+
+    // Scan state
+    scanning: bool
+    scan_channel: u16
+
+    // Connection state
+    associated: bool
+    bssid: [6]u8
+    ssid: [32]u8
+    ssid_len: u8
+    channel: u16
+    security: u8
+
+    // Statistics
+    tx_packets: u64
+    rx_packets: u64
+    tx_bytes: u64
+    rx_bytes: u64
+    tx_errors: u64
+    rx_errors: u64
+}
+
+struct TxQueue {
+    tfds: *IwlTfd
+    tfds_dma: u64
+    cmd: *IwlTxCmd
+    cmd_dma: u64
+    write_ptr: u16
+    read_ptr: u16
+    active: bool
+}
+
+struct RxQueue {
+    bd: *u64           // Buffer descriptors
+    bd_dma: u64
+    rb: [RX_QUEUE_SIZE]*u8    // Receive buffers
+    rb_dma: [RX_QUEUE_SIZE]u64
+    write_ptr: u16
+    read_ptr: u16
+}
+
+// ============================================
+// Global State
+// ============================================
+
+const MAX_IWL_DEVICES: u32 = 4
+var devices: [MAX_IWL_DEVICES]IwlDevice = undefined
+var num_devices: u32 = 0
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn iwlwifi_init(): void {
+    basics.print("[IWLWIFI] Initializing Intel WiFi driver\n")
+
+    var i: u32 = 0
+    while i < MAX_IWL_DEVICES {
+        devices[i].pci_dev = null
+        devices[i].started = false
+        i = i + 1
+    }
+
+    // Scan PCI bus for Intel WiFi devices
+    pci.scan_devices(INTEL_VENDOR_ID, 0xFFFF, iwl_pci_probe)
+
+    basics.print("[IWLWIFI] Found ")
+    basics.print_u32(num_devices)
+    basics.print(" Intel WiFi device(s)\n")
+}
+
+fn iwl_pci_probe(dev: *pci.PCIDevice): bool {
+    // Check if this is a known Intel WiFi device
+    if not is_iwl_device(dev.device_id) {
+        return false
+    }
+
+    if num_devices >= MAX_IWL_DEVICES {
+        return false
+    }
+
+    let iwl = &devices[num_devices]
+
+    // Enable bus mastering and memory space
+    pci.enable_bus_mastering(dev)
+    pci.enable_memory_space(dev)
+
+    // Map BAR0
+    iwl.bar0 = pci.map_bar(dev, 0, &iwl.bar_size) as *volatile u8
+    if iwl.bar0 == null {
+        basics.print("[IWLWIFI] Failed to map BAR0\n")
+        return false
+    }
+
+    iwl.pci_dev = dev
+    iwl.device_id = dev.device_id
+    iwl.irq_line = dev.irq_line
+
+    // Read hardware revision
+    iwl.hw_rev = read_prph(iwl, 0xA02C) & 0xFFF
+
+    // Initialize hardware
+    if not iwl_hw_init(iwl) {
+        basics.print("[IWLWIFI] Hardware initialization failed\n")
+        return false
+    }
+
+    // Allocate TX/RX queues
+    if not iwl_alloc_queues(iwl) {
+        basics.print("[IWLWIFI] Queue allocation failed\n")
+        return false
+    }
+
+    // Register interrupt handler
+    irq.register_handler(iwl.irq_line, iwl_irq_handler, iwl)
+
+    // Register network interface
+    iwl.netif = net.register_interface("wlan", iwl, &iwl_net_ops)
+
+    num_devices = num_devices + 1
+
+    basics.print("[IWLWIFI] Intel WiFi ")
+    basics.print(get_device_name(dev.device_id))
+    basics.print(" initialized\n")
+
+    return true
+}
+
+fn is_iwl_device(device_id: u16): bool {
+    return device_id == DEVICE_7260 or
+           device_id == DEVICE_7265 or
+           device_id == DEVICE_8260 or
+           device_id == DEVICE_8265 or
+           device_id == DEVICE_9260 or
+           device_id == DEVICE_9560 or
+           device_id == DEVICE_AX200 or
+           device_id == DEVICE_AX201 or
+           device_id == DEVICE_AX210 or
+           device_id == DEVICE_AX211
+}
+
+fn get_device_name(device_id: u16): *const u8 {
+    return switch device_id {
+        DEVICE_7260 => "Wireless 7260",
+        DEVICE_7265 => "Wireless 7265",
+        DEVICE_8260 => "Wireless 8260",
+        DEVICE_8265 => "Wireless 8265",
+        DEVICE_9260 => "Wireless 9260",
+        DEVICE_9560 => "Wireless 9560",
+        DEVICE_AX200 => "Wi-Fi 6 AX200",
+        DEVICE_AX201 => "Wi-Fi 6 AX201",
+        DEVICE_AX210 => "Wi-Fi 6E AX210",
+        DEVICE_AX211 => "Wi-Fi 6E AX211",
+        else => "Unknown"
+    }
+}
+
+// ============================================
+// Hardware Access
+// ============================================
+
+fn read32(iwl: *IwlDevice, offset: u32): u32 {
+    return *(iwl.bar0 + offset) as *volatile u32
+}
+
+fn write32(iwl: *IwlDevice, offset: u32, value: u32): void {
+    let ptr = (iwl.bar0 + offset) as *volatile u32
+    *ptr = value
+}
+
+fn read_prph(iwl: *IwlDevice, addr: u32): u32 {
+    write32(iwl, CSR_DRAM_INT_TBL_REG, addr | 0x00000000)
+    basics.io_delay(5)
+    return read32(iwl, CSR_DRAM_INT_TBL_REG + 4)
+}
+
+fn write_prph(iwl: *IwlDevice, addr: u32, value: u32): void {
+    write32(iwl, CSR_DRAM_INT_TBL_REG, addr | 0x80000000)
+    basics.io_delay(5)
+    write32(iwl, CSR_DRAM_INT_TBL_REG + 4, value)
+}
+
+fn grab_nic_access(iwl: *IwlDevice): bool {
+    write32(iwl, CSR_GP_CNTRL, read32(iwl, CSR_GP_CNTRL) | CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ)
+
+    // Wait for hardware to become ready
+    var attempts: u32 = 0
+    while attempts < 1000 {
+        if (read32(iwl, CSR_GP_CNTRL) & CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY) != 0 {
+            return true
+        }
+        basics.io_delay(10)
+        attempts = attempts + 1
+    }
+
+    return false
+}
+
+fn release_nic_access(iwl: *IwlDevice): void {
+    write32(iwl, CSR_GP_CNTRL, read32(iwl, CSR_GP_CNTRL) & ~CSR_GP_CNTRL_REG_FLAG_MAC_ACCESS_REQ)
+}
+
+// ============================================
+// Hardware Initialization
+// ============================================
+
+fn iwl_hw_init(iwl: *IwlDevice): bool {
+    // Reset hardware
+    write32(iwl, CSR_RESET, CSR_RESET | 0x01)
+    basics.io_delay(50)
+    write32(iwl, CSR_RESET, read32(iwl, CSR_RESET) & ~0x01)
+    basics.io_delay(50)
+
+    // Check for RF kill
+    if (read32(iwl, CSR_GP_CNTRL) & CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW) == 0 {
+        iwl.rf_kill = true
+        basics.print("[IWLWIFI] RF kill switch is ON\n")
+        return false
+    }
+
+    // Set up clocks
+    write32(iwl, CSR_GP_CNTRL, read32(iwl, CSR_GP_CNTRL) | CSR_GP_CNTRL_REG_FLAG_INIT_DONE)
+
+    // Wait for hardware ready
+    var attempts: u32 = 0
+    while attempts < 25000 {
+        if (read32(iwl, CSR_GP_CNTRL) & CSR_GP_CNTRL_REG_FLAG_MAC_CLOCK_READY) != 0 {
+            break
+        }
+        basics.io_delay(10)
+        attempts = attempts + 1
+    }
+
+    if attempts >= 25000 {
+        basics.print("[IWLWIFI] Timeout waiting for clock\n")
+        return false
+    }
+
+    // Read MAC address from EEPROM
+    if not read_mac_address(iwl) {
+        // Generate random MAC if EEPROM read fails
+        iwl.mac_addr[0] = 0x02  // Locally administered
+        iwl.mac_addr[1] = 0x00
+        iwl.mac_addr[2] = 0x00
+        iwl.mac_addr[3] = (basics.get_timestamp() >> 16) as u8
+        iwl.mac_addr[4] = (basics.get_timestamp() >> 8) as u8
+        iwl.mac_addr[5] = basics.get_timestamp() as u8
+    }
+
+    // Disable all interrupts
+    write32(iwl, CSR_INT_MASK, 0)
+    write32(iwl, CSR_INT, 0xFFFFFFFF)
+    write32(iwl, CSR_FH_INT_STATUS, 0xFFFFFFFF)
+
+    iwl.hw_ready = true
+    return true
+}
+
+fn read_mac_address(iwl: *IwlDevice): bool {
+    // Read from EEPROM
+    write32(iwl, CSR_EEPROM_GP, 0)
+
+    // MAC address at offset 0x2A for most devices
+    let offset: u32 = 0x2A
+
+    var i: u32 = 0
+    while i < 3 {
+        write32(iwl, CSR_EEPROM_REG, (offset + i * 2) << 2)
+
+        var attempts: u32 = 0
+        while attempts < 1000 {
+            if (read32(iwl, CSR_EEPROM_REG) & 0x01) != 0 {
+                break
+            }
+            basics.io_delay(5)
+            attempts = attempts + 1
+        }
+
+        if attempts >= 1000 {
+            return false
+        }
+
+        let data = read32(iwl, CSR_EEPROM_REG) >> 16
+        iwl.mac_addr[i * 2] = (data & 0xFF) as u8
+        iwl.mac_addr[i * 2 + 1] = ((data >> 8) & 0xFF) as u8
+
+        i = i + 1
+    }
+
+    // Validate MAC address
+    if iwl.mac_addr[0] == 0xFF and iwl.mac_addr[1] == 0xFF {
+        return false
+    }
+
+    return true
+}
+
+// ============================================
+// Queue Management
+// ============================================
+
+fn iwl_alloc_queues(iwl: *IwlDevice): bool {
+    // Allocate TX queues
+    var i: u32 = 0
+    while i < NUM_TX_QUEUES {
+        let txq = &iwl.txq[i]
+
+        txq.tfds = dma.alloc_coherent(TFD_QUEUE_SIZE_MAX * @sizeOf(IwlTfd), &txq.tfds_dma)
+        if txq.tfds == null {
+            return false
+        }
+
+        txq.cmd = dma.alloc_coherent(TFD_TX_CMD_SLOTS * @sizeOf(IwlTxCmd), &txq.cmd_dma)
+        if txq.cmd == null {
+            return false
+        }
+
+        txq.write_ptr = 0
+        txq.read_ptr = 0
+        txq.active = false
+
+        i = i + 1
+    }
+
+    // Allocate RX queue
+    iwl.rxq.bd = dma.alloc_coherent(RX_QUEUE_SIZE * 8, &iwl.rxq.bd_dma)
+    if iwl.rxq.bd == null {
+        return false
+    }
+
+    // Allocate RX buffers
+    i = 0
+    while i < RX_QUEUE_SIZE {
+        iwl.rxq.rb[i] = dma.alloc_coherent(RX_BUFFER_SIZE, &iwl.rxq.rb_dma[i])
+        if iwl.rxq.rb[i] == null {
+            return false
+        }
+
+        // Store buffer address in BD
+        iwl.rxq.bd[i] = iwl.rxq.rb_dma[i]
+
+        i = i + 1
+    }
+
+    iwl.rxq.write_ptr = 0
+    iwl.rxq.read_ptr = 0
+
+    return true
+}
+
+// ============================================
+// Interrupt Handler
+// ============================================
+
+fn iwl_irq_handler(ctx: *void): void {
+    let iwl = ctx as *IwlDevice
+
+    let inta = read32(iwl, CSR_INT)
+    if inta == 0 or inta == 0xFFFFFFFF {
+        return
+    }
+
+    // Acknowledge interrupts
+    write32(iwl, CSR_INT, inta)
+
+    // RF kill
+    if (inta & CSR_INT_BIT_RF_KILL) != 0 {
+        iwl.rf_kill = (read32(iwl, CSR_GP_CNTRL) & CSR_GP_CNTRL_REG_FLAG_HW_RF_KILL_SW) == 0
+        if iwl.rf_kill {
+            basics.print("[IWLWIFI] RF kill switch activated\n")
+        } else {
+            basics.print("[IWLWIFI] RF kill switch deactivated\n")
+        }
+    }
+
+    // Hardware error
+    if (inta & CSR_INT_BIT_HW_ERR) != 0 {
+        basics.print("[IWLWIFI] Hardware error\n")
+        iwl_hw_init(iwl)
+    }
+
+    // RX
+    if (inta & (CSR_INT_BIT_FH_RX | CSR_INT_BIT_SW_RX | CSR_INT_BIT_RX_PERIODIC)) != 0 {
+        iwl_rx_handler(iwl)
+    }
+
+    // TX
+    if (inta & (CSR_INT_BIT_FH_TX | CSR_INT_BIT_SCD)) != 0 {
+        iwl_tx_complete(iwl)
+    }
+
+    // Firmware alive
+    if (inta & CSR_INT_BIT_ALIVE) != 0 {
+        iwl.fw_loaded = true
+    }
+}
+
+fn iwl_rx_handler(iwl: *IwlDevice): void {
+    while iwl.rxq.read_ptr != iwl.rxq.write_ptr {
+        let rb = iwl.rxq.rb[iwl.rxq.read_ptr]
+        let mpdu = rb as *IwlRxMpdu
+
+        if mpdu.len > 0 and mpdu.len < RX_BUFFER_SIZE as u16 {
+            // Process received frame
+            let frame_data = rb + @sizeOf(IwlRxMpdu)
+            let frame_len = mpdu.len - @sizeOf(IwlRxMpdu) as u16
+
+            process_rx_frame(iwl, frame_data, frame_len)
+
+            iwl.rx_packets = iwl.rx_packets + 1
+            iwl.rx_bytes = iwl.rx_bytes + frame_len as u64
+        }
+
+        // Advance read pointer
+        iwl.rxq.read_ptr = (iwl.rxq.read_ptr + 1) & RX_QUEUE_MASK as u16
+    }
+}
+
+fn process_rx_frame(iwl: *IwlDevice, data: *u8, len: u16): void {
+    // Check frame type (management, control, data)
+    let fc = (data[1] as u16 << 8) | data[0] as u16
+    let frame_type = (fc >> 2) & 0x03
+
+    switch frame_type {
+        0 => process_mgmt_frame(iwl, data, len),   // Management
+        1 => {},                                     // Control (ignore)
+        2 => process_data_frame(iwl, data, len),   // Data
+        else => {}
+    }
+}
+
+fn process_mgmt_frame(iwl: *IwlDevice, data: *u8, len: u16): void {
+    let fc = (data[1] as u16 << 8) | data[0] as u16
+    let subtype = (fc >> 4) & 0x0F
+
+    switch subtype {
+        0 => {},  // Association request
+        1 => handle_assoc_resp(iwl, data, len),  // Association response
+        4 => {},  // Probe request
+        5 => handle_probe_resp(iwl, data, len),  // Probe response
+        8 => handle_beacon(iwl, data, len),       // Beacon
+        11 => handle_auth_resp(iwl, data, len),   // Authentication
+        else => {}
+    }
+}
+
+fn process_data_frame(iwl: *IwlDevice, data: *u8, len: u16): void {
+    if not iwl.associated {
+        return
+    }
+
+    // Strip 802.11 header (24 bytes for data frames)
+    let payload = data + 24
+    let payload_len = len - 24
+
+    // Pass to network stack
+    if iwl.netif != null {
+        net.receive_packet(iwl.netif, payload, payload_len)
+    }
+}
+
+fn handle_beacon(iwl: *IwlDevice, data: *u8, len: u16): void {
+    if iwl.scanning {
+        // Extract SSID from beacon
+        // Management frame header is 24 bytes
+        // Fixed parameters are 12 bytes (timestamp 8 + interval 2 + capability 2)
+        let ie_start = data + 36
+        let ie_len = len - 36
+
+        // Parse information elements
+        var offset: u16 = 0
+        while offset < ie_len {
+            let ie_id = ie_start[offset]
+            let ie_length = ie_start[offset + 1]
+
+            if ie_id == 0 {  // SSID
+                // Found SSID, could add to scan results
+            }
+
+            offset = offset + 2 + ie_length as u16
+        }
+    }
+}
+
+fn handle_probe_resp(iwl: *IwlDevice, data: *u8, len: u16): void {
+    // Similar to beacon handling
+    handle_beacon(iwl, data, len)
+}
+
+fn handle_auth_resp(iwl: *IwlDevice, data: *u8, len: u16): void {
+    // Check authentication response status
+    let status = (data[29] as u16 << 8) | data[28] as u16
+
+    if status == 0 {
+        basics.print("[IWLWIFI] Authentication successful\n")
+    } else {
+        basics.print("[IWLWIFI] Authentication failed\n")
+    }
+}
+
+fn handle_assoc_resp(iwl: *IwlDevice, data: *u8, len: u16): void {
+    // Check association response status
+    let status = (data[27] as u16 << 8) | data[26] as u16
+
+    if status == 0 {
+        iwl.associated = true
+        basics.print("[IWLWIFI] Association successful\n")
+    } else {
+        basics.print("[IWLWIFI] Association failed\n")
+    }
+}
+
+fn iwl_tx_complete(iwl: *IwlDevice): void {
+    // Process TX completions for all active queues
+    var i: u32 = 0
+    while i < NUM_TX_QUEUES {
+        let txq = &iwl.txq[i]
+        if txq.active {
+            // Check for completed descriptors
+            while txq.read_ptr != txq.write_ptr {
+                // Frame transmitted
+                iwl.tx_packets = iwl.tx_packets + 1
+                txq.read_ptr = (txq.read_ptr + 1) & (TFD_QUEUE_SIZE_MAX - 1) as u16
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// Network Operations
+// ============================================
+
+const iwl_net_ops = net.NetworkOps {
+    .open = iwl_open,
+    .close = iwl_close,
+    .start_xmit = iwl_start_xmit,
+    .set_mac_address = iwl_set_mac,
+    .get_stats = iwl_get_stats,
+}
+
+fn iwl_open(netif: *net.NetworkInterface): i32 {
+    let iwl = netif.priv as *IwlDevice
+
+    if iwl.rf_kill {
+        return -1
+    }
+
+    // Enable interrupts
+    write32(iwl, CSR_INT_MASK,
+        CSR_INT_BIT_FH_RX | CSR_INT_BIT_HW_ERR | CSR_INT_BIT_RF_KILL |
+        CSR_INT_BIT_FH_TX | CSR_INT_BIT_ALIVE)
+
+    iwl.started = true
+    return 0
+}
+
+fn iwl_close(netif: *net.NetworkInterface): i32 {
+    let iwl = netif.priv as *IwlDevice
+
+    // Disable interrupts
+    write32(iwl, CSR_INT_MASK, 0)
+
+    iwl.started = false
+    iwl.associated = false
+    return 0
+}
+
+fn iwl_start_xmit(netif: *net.NetworkInterface, skb: *net.SkBuff): i32 {
+    let iwl = netif.priv as *IwlDevice
+
+    if not iwl.associated {
+        return -1
+    }
+
+    // Use queue 0 for data
+    let txq = &iwl.txq[0]
+
+    // Build TX descriptor
+    let tfd = &txq.tfds[txq.write_ptr]
+    let cmd = &txq.cmd[txq.write_ptr]
+
+    // Set up TX command
+    cmd.len = skb.len + 24  // Add 802.11 header
+    cmd.tx_flags = 0x0C  // Need ACK
+    cmd.sta_id = 0
+    cmd.life_time = 0xFFFFFFFF
+
+    // Set up TFD
+    tfd.tb_num = 1
+    tfd.tbs[0].lo = (txq.cmd_dma + txq.write_ptr as u64 * @sizeOf(IwlTxCmd)) as u32
+    tfd.tbs[0].hi_n_len = ((txq.cmd_dma >> 32) as u32) | (cmd.len as u32 << 20)
+
+    // Advance write pointer
+    txq.write_ptr = (txq.write_ptr + 1) & (TFD_QUEUE_SIZE_MAX - 1) as u16
+
+    // Notify hardware
+    write_prph(iwl, 0x1BC0, txq.write_ptr as u32)
+
+    iwl.tx_bytes = iwl.tx_bytes + skb.len as u64
+    return 0
+}
+
+fn iwl_set_mac(netif: *net.NetworkInterface, addr: *[6]u8): i32 {
+    let iwl = netif.priv as *IwlDevice
+    basics.memcpy(&iwl.mac_addr, addr, 6)
+    return 0
+}
+
+fn iwl_get_stats(netif: *net.NetworkInterface, stats: *net.NetStats): void {
+    let iwl = netif.priv as *IwlDevice
+    stats.tx_packets = iwl.tx_packets
+    stats.rx_packets = iwl.rx_packets
+    stats.tx_bytes = iwl.tx_bytes
+    stats.rx_bytes = iwl.rx_bytes
+    stats.tx_errors = iwl.tx_errors
+    stats.rx_errors = iwl.rx_errors
+}
+
+// ============================================
+// WiFi Operations
+// ============================================
+
+export fn iwl_scan(dev_id: u32): bool {
+    if dev_id >= num_devices {
+        return false
+    }
+
+    let iwl = &devices[dev_id]
+    if not iwl.started or iwl.rf_kill {
+        return false
+    }
+
+    iwl.scanning = true
+
+    // Send scan command to firmware
+    // This would require firmware command interface
+
+    basics.print("[IWLWIFI] Starting scan...\n")
+    return true
+}
+
+export fn iwl_connect(dev_id: u32, ssid: *const u8, ssid_len: u8, password: *const u8, password_len: u8): bool {
+    if dev_id >= num_devices {
+        return false
+    }
+
+    let iwl = &devices[dev_id]
+    if not iwl.started or iwl.rf_kill {
+        return false
+    }
+
+    // Copy SSID
+    basics.memcpy(&iwl.ssid, ssid, ssid_len as u32)
+    iwl.ssid_len = ssid_len
+
+    // Authentication and association would be sent via firmware commands
+
+    basics.print("[IWLWIFI] Connecting to ")
+    basics.print_n(ssid, ssid_len as u32)
+    basics.print("...\n")
+
+    return true
+}
+
+export fn iwl_disconnect(dev_id: u32): bool {
+    if dev_id >= num_devices {
+        return false
+    }
+
+    let iwl = &devices[dev_id]
+    iwl.associated = false
+
+    basics.print("[IWLWIFI] Disconnected\n")
+    return true
+}
+
+export fn iwl_get_mac(dev_id: u32, mac: *[6]u8): bool {
+    if dev_id >= num_devices {
+        return false
+    }
+
+    basics.memcpy(mac, &devices[dev_id].mac_addr, 6)
+    return true
+}
+
+export fn iwl_is_associated(dev_id: u32): bool {
+    if dev_id >= num_devices {
+        return false
+    }
+    return devices[dev_id].associated
+}
+
+export fn iwl_get_device_count(): u32 {
+    return num_devices
+}

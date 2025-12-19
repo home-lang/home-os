@@ -1,0 +1,1019 @@
+// HomeOS Gamepad Driver
+// USB HID gamepad support (Xbox, PlayStation, generic)
+
+const basics = @import("basics")
+const usb = @import("drivers/usb/core")
+const hid = @import("drivers/usb/hid")
+const input = @import("drivers/input/core")
+
+// ============================================
+// Gamepad Types
+// ============================================
+
+const GAMEPAD_TYPE_GENERIC: u8 = 0
+const GAMEPAD_TYPE_XBOX360: u8 = 1
+const GAMEPAD_TYPE_XBOXONE: u8 = 2
+const GAMEPAD_TYPE_PS3: u8 = 3
+const GAMEPAD_TYPE_PS4: u8 = 4
+const GAMEPAD_TYPE_PS5: u8 = 5
+const GAMEPAD_TYPE_SWITCH_PRO: u8 = 6
+
+// ============================================
+// Button Mapping
+// ============================================
+
+// Standard button codes (SDL-like)
+const BTN_A: u16 = 0x130
+const BTN_B: u16 = 0x131
+const BTN_X: u16 = 0x132
+const BTN_Y: u16 = 0x133
+const BTN_LB: u16 = 0x134      // Left bumper
+const BTN_RB: u16 = 0x135      // Right bumper
+const BTN_SELECT: u16 = 0x136  // Back/Share
+const BTN_START: u16 = 0x137   // Start/Options
+const BTN_GUIDE: u16 = 0x138   // Xbox/PS button
+const BTN_L3: u16 = 0x139      // Left stick click
+const BTN_R3: u16 = 0x13A      // Right stick click
+
+// D-pad can be axes or buttons
+const BTN_DPAD_UP: u16 = 0x220
+const BTN_DPAD_DOWN: u16 = 0x221
+const BTN_DPAD_LEFT: u16 = 0x222
+const BTN_DPAD_RIGHT: u16 = 0x223
+
+// ============================================
+// Axis Definitions
+// ============================================
+
+const AXIS_LX: u8 = 0    // Left stick X
+const AXIS_LY: u8 = 1    // Left stick Y
+const AXIS_RX: u8 = 2    // Right stick X
+const AXIS_RY: u8 = 3    // Right stick Y
+const AXIS_LT: u8 = 4    // Left trigger
+const AXIS_RT: u8 = 5    // Right trigger
+const AXIS_DPAD_X: u8 = 6
+const AXIS_DPAD_Y: u8 = 7
+
+// ============================================
+// Gamepad State
+// ============================================
+
+struct GamepadState {
+    // Type and identity
+    gamepad_type: u8
+    vendor_id: u16
+    product_id: u16
+
+    // USB info
+    device: *usb.USBDevice
+    interface: u8
+    endpoint_in: u8
+    endpoint_out: u8
+
+    // Button state (32 buttons max)
+    buttons: u32
+    prev_buttons: u32
+
+    // Axes (8 axes max, 16-bit signed)
+    axes: [8]i16
+    prev_axes: [8]i16
+
+    // Deadzone configuration
+    left_deadzone: u16
+    right_deadzone: u16
+    trigger_deadzone: u16
+
+    // Rumble motors
+    rumble_left: u8
+    rumble_right: u8
+    has_rumble: bool
+
+    // LEDs
+    led_pattern: u8
+    has_leds: bool
+
+    // Touchpad (PS4/PS5)
+    has_touchpad: bool
+    touch_x: u16
+    touch_y: u16
+    touch_active: bool
+
+    // Motion sensors
+    has_motion: bool
+    accel_x: i16
+    accel_y: i16
+    accel_z: i16
+    gyro_x: i16
+    gyro_y: i16
+    gyro_z: i16
+
+    // Battery
+    has_battery: bool
+    battery_level: u8
+    battery_charging: bool
+
+    // Input device
+    input_dev: *input.InputDevice
+
+    // Connected
+    connected: bool
+
+    // Statistics
+    total_presses: u64
+}
+
+// ============================================
+// Global State
+// ============================================
+
+const MAX_GAMEPADS: u32 = 8
+var gamepads: [MAX_GAMEPADS]GamepadState = undefined
+var num_gamepads: u32 = 0
+
+// ============================================
+// USB ID Tables
+// ============================================
+
+struct GamepadID {
+    vendor: u16
+    product: u16
+    gamepad_type: u8
+}
+
+const known_gamepads = [_]GamepadID {
+    // Xbox 360
+    GamepadID { .vendor = 0x045E, .product = 0x028E, .gamepad_type = GAMEPAD_TYPE_XBOX360 },
+    GamepadID { .vendor = 0x045E, .product = 0x028F, .gamepad_type = GAMEPAD_TYPE_XBOX360 },
+    // Xbox One
+    GamepadID { .vendor = 0x045E, .product = 0x02D1, .gamepad_type = GAMEPAD_TYPE_XBOXONE },
+    GamepadID { .vendor = 0x045E, .product = 0x02DD, .gamepad_type = GAMEPAD_TYPE_XBOXONE },
+    GamepadID { .vendor = 0x045E, .product = 0x02E3, .gamepad_type = GAMEPAD_TYPE_XBOXONE },
+    GamepadID { .vendor = 0x045E, .product = 0x02EA, .gamepad_type = GAMEPAD_TYPE_XBOXONE },
+    GamepadID { .vendor = 0x045E, .product = 0x0B12, .gamepad_type = GAMEPAD_TYPE_XBOXONE },
+    // PlayStation 3
+    GamepadID { .vendor = 0x054C, .product = 0x0268, .gamepad_type = GAMEPAD_TYPE_PS3 },
+    // PlayStation 4
+    GamepadID { .vendor = 0x054C, .product = 0x05C4, .gamepad_type = GAMEPAD_TYPE_PS4 },
+    GamepadID { .vendor = 0x054C, .product = 0x09CC, .gamepad_type = GAMEPAD_TYPE_PS4 },
+    // PlayStation 5
+    GamepadID { .vendor = 0x054C, .product = 0x0CE6, .gamepad_type = GAMEPAD_TYPE_PS5 },
+    // Nintendo Switch Pro
+    GamepadID { .vendor = 0x057E, .product = 0x2009, .gamepad_type = GAMEPAD_TYPE_SWITCH_PRO },
+}
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn gamepad_init(): void {
+    basics.print("[GAMEPAD] Initializing gamepad driver\n")
+
+    var i: u32 = 0
+    while i < MAX_GAMEPADS {
+        gamepads[i].connected = false
+        gamepads[i].device = null
+        gamepads[i].input_dev = null
+        gamepads[i].left_deadzone = 8000
+        gamepads[i].right_deadzone = 8000
+        gamepads[i].trigger_deadzone = 128
+        i = i + 1
+    }
+
+    // Register USB driver
+    usb.register_driver(&gamepad_usb_driver)
+
+    basics.print("[GAMEPAD] Driver initialized\n")
+}
+
+const gamepad_usb_driver = usb.USBDriver {
+    .name = "gamepad",
+    .id_table = &gamepad_id_table,
+    .probe = gamepad_probe,
+    .disconnect = gamepad_disconnect,
+}
+
+const gamepad_id_table = [_]usb.USBDeviceID {
+    // HID gamepad interface
+    usb.USBDeviceID {
+        .match_flags = usb.USB_DEVICE_ID_MATCH_INT_CLASS,
+        .bInterfaceClass = usb.USB_CLASS_HID,
+    },
+    // Xbox specific
+    usb.USBDeviceID {
+        .match_flags = usb.USB_DEVICE_ID_MATCH_INT_CLASS,
+        .bInterfaceClass = 0xFF,  // Vendor specific
+    },
+}
+
+fn gamepad_probe(device: *usb.USBDevice, interface: *usb.USBInterface): i32 {
+    // Check if it's a known gamepad
+    let gp_type = identify_gamepad(device.idVendor, device.idProduct)
+    if gp_type == 255 {
+        return -1  // Not a gamepad we recognize
+    }
+
+    if num_gamepads >= MAX_GAMEPADS {
+        return -1
+    }
+
+    let gp = &gamepads[num_gamepads]
+
+    gp.gamepad_type = gp_type
+    gp.vendor_id = device.idVendor
+    gp.product_id = device.idProduct
+    gp.device = device
+    gp.interface = interface.bInterfaceNumber
+    gp.connected = true
+    gp.buttons = 0
+    gp.prev_buttons = 0
+    gp.total_presses = 0
+
+    // Initialize axes
+    var i: u32 = 0
+    while i < 8 {
+        gp.axes[i] = 0
+        gp.prev_axes[i] = 0
+        i = i + 1
+    }
+
+    // Find endpoints
+    i = 0
+    while i < interface.bNumEndpoints {
+        let ep = &interface.endpoints[i]
+        if (ep.bmAttributes & 0x03) == usb.USB_ENDPOINT_XFER_INT {
+            if (ep.bEndpointAddress & 0x80) != 0 {
+                gp.endpoint_in = ep.bEndpointAddress
+            } else {
+                gp.endpoint_out = ep.bEndpointAddress
+            }
+        }
+        i = i + 1
+    }
+
+    // Initialize based on type
+    switch gp_type {
+        GAMEPAD_TYPE_XBOX360 => init_xbox360(gp),
+        GAMEPAD_TYPE_XBOXONE => init_xboxone(gp),
+        GAMEPAD_TYPE_PS3 => init_ps3(gp),
+        GAMEPAD_TYPE_PS4 => init_ps4(gp),
+        GAMEPAD_TYPE_PS5 => init_ps5(gp),
+        GAMEPAD_TYPE_SWITCH_PRO => init_switch_pro(gp),
+        else => init_generic(gp)
+    }
+
+    // Register input device
+    let name = get_gamepad_name(gp_type)
+    gp.input_dev = input.register_device(input.INPUT_TYPE_GAMEPAD, name)
+    if gp.input_dev == null {
+        return -1
+    }
+
+    setup_input_device(gp)
+
+    // Start reading
+    usb.submit_int_urb(device, gp.endpoint_in, &report_buffer, 64, gamepad_irq_handler, gp)
+
+    num_gamepads = num_gamepads + 1
+
+    basics.print("[GAMEPAD] ")
+    basics.print(name)
+    basics.print(" connected\n")
+
+    return 0
+}
+
+fn gamepad_disconnect(device: *usb.USBDevice, interface: *usb.USBInterface): void {
+    var i: u32 = 0
+    while i < num_gamepads {
+        if gamepads[i].device == device {
+            gamepads[i].connected = false
+
+            if gamepads[i].input_dev != null {
+                input.unregister_device(gamepads[i].input_dev)
+            }
+
+            // Move remaining gamepads down
+            while i < num_gamepads - 1 {
+                gamepads[i] = gamepads[i + 1]
+                i = i + 1
+            }
+            num_gamepads = num_gamepads - 1
+
+            basics.print("[GAMEPAD] Gamepad disconnected\n")
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn identify_gamepad(vendor: u16, product: u16): u8 {
+    var i: u32 = 0
+    while i < known_gamepads.len {
+        if known_gamepads[i].vendor == vendor and known_gamepads[i].product == product {
+            return known_gamepads[i].gamepad_type
+        }
+        i = i + 1
+    }
+    return 255  // Unknown
+}
+
+fn get_gamepad_name(gp_type: u8): *const u8 {
+    return switch gp_type {
+        GAMEPAD_TYPE_XBOX360 => "Xbox 360 Controller",
+        GAMEPAD_TYPE_XBOXONE => "Xbox One Controller",
+        GAMEPAD_TYPE_PS3 => "PlayStation 3 Controller",
+        GAMEPAD_TYPE_PS4 => "PlayStation 4 Controller",
+        GAMEPAD_TYPE_PS5 => "PlayStation 5 Controller",
+        GAMEPAD_TYPE_SWITCH_PRO => "Nintendo Switch Pro Controller",
+        else => "Generic Gamepad"
+    }
+}
+
+// ============================================
+// Controller-Specific Init
+// ============================================
+
+fn init_xbox360(gp: *GamepadState): void {
+    gp.has_rumble = true
+    gp.has_leds = true
+    gp.has_touchpad = false
+    gp.has_motion = false
+    gp.has_battery = true
+}
+
+fn init_xboxone(gp: *GamepadState): void {
+    gp.has_rumble = true
+    gp.has_leds = false
+    gp.has_touchpad = false
+    gp.has_motion = false
+    gp.has_battery = true
+
+    // Xbox One requires initialization packet
+    var init_packet: [5]u8 = [_]u8{ 0x05, 0x20, 0x00, 0x01, 0x00 }
+    usb.control_transfer(gp.device, 0x21, 0x09, 0x0305, gp.interface as u16, &init_packet, 5)
+}
+
+fn init_ps3(gp: *GamepadState): void {
+    gp.has_rumble = true
+    gp.has_leds = true
+    gp.has_touchpad = false
+    gp.has_motion = true
+    gp.has_battery = true
+
+    // Enable reports
+    var enable: [4]u8 = [_]u8{ 0x42, 0x0C, 0x00, 0x00 }
+    usb.control_transfer(gp.device, 0x21, 0x09, 0x03F4, gp.interface as u16, &enable, 4)
+}
+
+fn init_ps4(gp: *GamepadState): void {
+    gp.has_rumble = true
+    gp.has_leds = true
+    gp.has_touchpad = true
+    gp.has_motion = true
+    gp.has_battery = true
+}
+
+fn init_ps5(gp: *GamepadState): void {
+    gp.has_rumble = true
+    gp.has_leds = true
+    gp.has_touchpad = true
+    gp.has_motion = true
+    gp.has_battery = true
+}
+
+fn init_switch_pro(gp: *GamepadState): void {
+    gp.has_rumble = true
+    gp.has_leds = true
+    gp.has_touchpad = false
+    gp.has_motion = true
+    gp.has_battery = true
+
+    // Send handshake
+    var handshake: [2]u8 = [_]u8{ 0x80, 0x02 }
+    usb.interrupt_transfer(gp.device, gp.endpoint_out, &handshake, 2)
+}
+
+fn init_generic(gp: *GamepadState): void {
+    gp.has_rumble = false
+    gp.has_leds = false
+    gp.has_touchpad = false
+    gp.has_motion = false
+    gp.has_battery = false
+}
+
+fn setup_input_device(gp: *GamepadState): void {
+    // Buttons
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_A)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_B)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_X)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_Y)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_LB)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_RB)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_SELECT)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_START)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_GUIDE)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_L3)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_R3)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_DPAD_UP)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_DPAD_DOWN)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_DPAD_LEFT)
+    input.set_capability(gp.input_dev, input.EV_KEY, BTN_DPAD_RIGHT)
+
+    // Axes
+    input.set_capability(gp.input_dev, input.EV_ABS, input.ABS_X)
+    input.set_capability(gp.input_dev, input.EV_ABS, input.ABS_Y)
+    input.set_capability(gp.input_dev, input.EV_ABS, input.ABS_RX)
+    input.set_capability(gp.input_dev, input.EV_ABS, input.ABS_RY)
+    input.set_capability(gp.input_dev, input.EV_ABS, input.ABS_Z)    // LT
+    input.set_capability(gp.input_dev, input.EV_ABS, input.ABS_RZ)   // RT
+    input.set_capability(gp.input_dev, input.EV_ABS, input.ABS_HAT0X)
+    input.set_capability(gp.input_dev, input.EV_ABS, input.ABS_HAT0Y)
+
+    // Axis ranges
+    input.set_abs_info(gp.input_dev, input.ABS_X, -32768, 32767, 16, 128)
+    input.set_abs_info(gp.input_dev, input.ABS_Y, -32768, 32767, 16, 128)
+    input.set_abs_info(gp.input_dev, input.ABS_RX, -32768, 32767, 16, 128)
+    input.set_abs_info(gp.input_dev, input.ABS_RY, -32768, 32767, 16, 128)
+    input.set_abs_info(gp.input_dev, input.ABS_Z, 0, 255, 0, 0)
+    input.set_abs_info(gp.input_dev, input.ABS_RZ, 0, 255, 0, 0)
+    input.set_abs_info(gp.input_dev, input.ABS_HAT0X, -1, 1, 0, 0)
+    input.set_abs_info(gp.input_dev, input.ABS_HAT0Y, -1, 1, 0, 0)
+
+    // Force feedback
+    if gp.has_rumble {
+        input.set_capability(gp.input_dev, input.EV_FF, input.FF_RUMBLE)
+    }
+}
+
+// ============================================
+// Report Handling
+// ============================================
+
+var report_buffer: [64]u8 = undefined
+
+fn gamepad_irq_handler(urb: *usb.URB): void {
+    let gp = urb.context as *GamepadState
+
+    if urb.status != 0 or not gp.connected {
+        if gp.connected {
+            usb.submit_int_urb(gp.device, gp.endpoint_in, &report_buffer, 64, gamepad_irq_handler, gp)
+        }
+        return
+    }
+
+    // Parse based on controller type
+    switch gp.gamepad_type {
+        GAMEPAD_TYPE_XBOX360 => parse_xbox360(gp, &report_buffer, urb.actual_length),
+        GAMEPAD_TYPE_XBOXONE => parse_xboxone(gp, &report_buffer, urb.actual_length),
+        GAMEPAD_TYPE_PS3 => parse_ps3(gp, &report_buffer, urb.actual_length),
+        GAMEPAD_TYPE_PS4 => parse_ps4(gp, &report_buffer, urb.actual_length),
+        GAMEPAD_TYPE_PS5 => parse_ps5(gp, &report_buffer, urb.actual_length),
+        GAMEPAD_TYPE_SWITCH_PRO => parse_switch_pro(gp, &report_buffer, urb.actual_length),
+        else => parse_generic(gp, &report_buffer, urb.actual_length)
+    }
+
+    // Report events
+    report_gamepad_events(gp)
+
+    // Re-submit URB
+    usb.submit_int_urb(gp.device, gp.endpoint_in, &report_buffer, 64, gamepad_irq_handler, gp)
+}
+
+fn parse_xbox360(gp: *GamepadState, data: *[64]u8, len: u32): void {
+    if len < 20 or data[0] != 0x00 or data[1] != 0x14 {
+        return
+    }
+
+    // Save previous state
+    gp.prev_buttons = gp.buttons
+    var i: u32 = 0
+    while i < 8 {
+        gp.prev_axes[i] = gp.axes[i]
+        i = i + 1
+    }
+
+    // Buttons (bytes 2-3)
+    let btns: u16 = (data[3] as u16 << 8) | data[2] as u16
+    gp.buttons = 0
+    if (btns & 0x0001) != 0 { gp.buttons = gp.buttons | (1 << 0) }  // DPAD_UP
+    if (btns & 0x0002) != 0 { gp.buttons = gp.buttons | (1 << 1) }  // DPAD_DOWN
+    if (btns & 0x0004) != 0 { gp.buttons = gp.buttons | (1 << 2) }  // DPAD_LEFT
+    if (btns & 0x0008) != 0 { gp.buttons = gp.buttons | (1 << 3) }  // DPAD_RIGHT
+    if (btns & 0x0010) != 0 { gp.buttons = gp.buttons | (1 << 4) }  // START
+    if (btns & 0x0020) != 0 { gp.buttons = gp.buttons | (1 << 5) }  // SELECT
+    if (btns & 0x0040) != 0 { gp.buttons = gp.buttons | (1 << 6) }  // L3
+    if (btns & 0x0080) != 0 { gp.buttons = gp.buttons | (1 << 7) }  // R3
+    if (btns & 0x0100) != 0 { gp.buttons = gp.buttons | (1 << 8) }  // LB
+    if (btns & 0x0200) != 0 { gp.buttons = gp.buttons | (1 << 9) }  // RB
+    if (btns & 0x0400) != 0 { gp.buttons = gp.buttons | (1 << 10) } // GUIDE
+    if (btns & 0x1000) != 0 { gp.buttons = gp.buttons | (1 << 11) } // A
+    if (btns & 0x2000) != 0 { gp.buttons = gp.buttons | (1 << 12) } // B
+    if (btns & 0x4000) != 0 { gp.buttons = gp.buttons | (1 << 13) } // X
+    if (btns & 0x8000) != 0 { gp.buttons = gp.buttons | (1 << 14) } // Y
+
+    // Triggers (bytes 4-5)
+    gp.axes[AXIS_LT] = data[4] as i16
+    gp.axes[AXIS_RT] = data[5] as i16
+
+    // Left stick (bytes 6-9)
+    gp.axes[AXIS_LX] = (data[7] as i16 << 8) | data[6] as i16
+    gp.axes[AXIS_LY] = (data[9] as i16 << 8) | data[8] as i16
+
+    // Right stick (bytes 10-13)
+    gp.axes[AXIS_RX] = (data[11] as i16 << 8) | data[10] as i16
+    gp.axes[AXIS_RY] = (data[13] as i16 << 8) | data[12] as i16
+
+    // Apply deadzone
+    apply_deadzone(gp)
+}
+
+fn parse_xboxone(gp: *GamepadState, data: *[64]u8, len: u32): void {
+    if len < 18 or data[0] != 0x20 {
+        return
+    }
+
+    gp.prev_buttons = gp.buttons
+    var i: u32 = 0
+    while i < 8 {
+        gp.prev_axes[i] = gp.axes[i]
+        i = i + 1
+    }
+
+    let btns: u16 = (data[5] as u16 << 8) | data[4] as u16
+
+    gp.buttons = 0
+    if (btns & 0x0001) != 0 { gp.buttons = gp.buttons | (1 << 4) }  // MENU
+    if (btns & 0x0002) != 0 { gp.buttons = gp.buttons | (1 << 5) }  // VIEW
+    if (btns & 0x0004) != 0 { gp.buttons = gp.buttons | (1 << 11) } // A
+    if (btns & 0x0008) != 0 { gp.buttons = gp.buttons | (1 << 12) } // B
+    if (btns & 0x0010) != 0 { gp.buttons = gp.buttons | (1 << 13) } // X
+    if (btns & 0x0020) != 0 { gp.buttons = gp.buttons | (1 << 14) } // Y
+    if (btns & 0x0040) != 0 { gp.buttons = gp.buttons | (1 << 0) }  // DPAD_UP
+    if (btns & 0x0080) != 0 { gp.buttons = gp.buttons | (1 << 1) }  // DPAD_DOWN
+    if (btns & 0x0100) != 0 { gp.buttons = gp.buttons | (1 << 2) }  // DPAD_LEFT
+    if (btns & 0x0200) != 0 { gp.buttons = gp.buttons | (1 << 3) }  // DPAD_RIGHT
+    if (btns & 0x0400) != 0 { gp.buttons = gp.buttons | (1 << 8) }  // LB
+    if (btns & 0x0800) != 0 { gp.buttons = gp.buttons | (1 << 9) }  // RB
+    if (btns & 0x1000) != 0 { gp.buttons = gp.buttons | (1 << 6) }  // L3
+    if (btns & 0x2000) != 0 { gp.buttons = gp.buttons | (1 << 7) }  // R3
+
+    // Triggers
+    gp.axes[AXIS_LT] = ((data[7] as u16 << 8) | data[6] as u16) as i16 >> 2
+    gp.axes[AXIS_RT] = ((data[9] as u16 << 8) | data[8] as u16) as i16 >> 2
+
+    // Sticks
+    gp.axes[AXIS_LX] = (data[11] as i16 << 8) | data[10] as i16
+    gp.axes[AXIS_LY] = (data[13] as i16 << 8) | data[12] as i16
+    gp.axes[AXIS_RX] = (data[15] as i16 << 8) | data[14] as i16
+    gp.axes[AXIS_RY] = (data[17] as i16 << 8) | data[16] as i16
+
+    apply_deadzone(gp)
+}
+
+fn parse_ps3(gp: *GamepadState, data: *[64]u8, len: u32): void {
+    if len < 49 {
+        return
+    }
+
+    gp.prev_buttons = gp.buttons
+    var i: u32 = 0
+    while i < 8 {
+        gp.prev_axes[i] = gp.axes[i]
+        i = i + 1
+    }
+
+    let btns1 = data[2]
+    let btns2 = data[3]
+    let btns3 = data[4]
+
+    gp.buttons = 0
+    if (btns1 & 0x01) != 0 { gp.buttons = gp.buttons | (1 << 5) }   // SELECT
+    if (btns1 & 0x02) != 0 { gp.buttons = gp.buttons | (1 << 6) }   // L3
+    if (btns1 & 0x04) != 0 { gp.buttons = gp.buttons | (1 << 7) }   // R3
+    if (btns1 & 0x08) != 0 { gp.buttons = gp.buttons | (1 << 4) }   // START
+    if (btns1 & 0x10) != 0 { gp.buttons = gp.buttons | (1 << 0) }   // DPAD_UP
+    if (btns1 & 0x20) != 0 { gp.buttons = gp.buttons | (1 << 3) }   // DPAD_RIGHT
+    if (btns1 & 0x40) != 0 { gp.buttons = gp.buttons | (1 << 1) }   // DPAD_DOWN
+    if (btns1 & 0x80) != 0 { gp.buttons = gp.buttons | (1 << 2) }   // DPAD_LEFT
+
+    if (btns2 & 0x01) != 0 { gp.buttons = gp.buttons | (1 << 8) }   // L2 (as button)
+    if (btns2 & 0x02) != 0 { gp.buttons = gp.buttons | (1 << 9) }   // R2 (as button)
+    if (btns2 & 0x04) != 0 { gp.buttons = gp.buttons | (1 << 8) }   // L1
+    if (btns2 & 0x08) != 0 { gp.buttons = gp.buttons | (1 << 9) }   // R1
+    if (btns2 & 0x10) != 0 { gp.buttons = gp.buttons | (1 << 14) }  // Triangle (Y)
+    if (btns2 & 0x20) != 0 { gp.buttons = gp.buttons | (1 << 12) }  // Circle (B)
+    if (btns2 & 0x40) != 0 { gp.buttons = gp.buttons | (1 << 11) }  // Cross (A)
+    if (btns2 & 0x80) != 0 { gp.buttons = gp.buttons | (1 << 13) }  // Square (X)
+
+    if (btns3 & 0x01) != 0 { gp.buttons = gp.buttons | (1 << 10) }  // PS
+
+    // Sticks (0-255, convert to signed)
+    gp.axes[AXIS_LX] = (data[6] as i16 - 128) * 256
+    gp.axes[AXIS_LY] = (data[7] as i16 - 128) * 256
+    gp.axes[AXIS_RX] = (data[8] as i16 - 128) * 256
+    gp.axes[AXIS_RY] = (data[9] as i16 - 128) * 256
+
+    // Triggers
+    gp.axes[AXIS_LT] = data[18] as i16
+    gp.axes[AXIS_RT] = data[19] as i16
+
+    // Motion sensors
+    if gp.has_motion {
+        gp.accel_x = (data[41] as i16 << 8) | data[42] as i16
+        gp.accel_y = (data[43] as i16 << 8) | data[44] as i16
+        gp.accel_z = (data[45] as i16 << 8) | data[46] as i16
+        gp.gyro_z = (data[47] as i16 << 8) | data[48] as i16
+    }
+
+    apply_deadzone(gp)
+}
+
+fn parse_ps4(gp: *GamepadState, data: *[64]u8, len: u32): void {
+    if len < 10 {
+        return
+    }
+
+    gp.prev_buttons = gp.buttons
+    var i: u32 = 0
+    while i < 8 {
+        gp.prev_axes[i] = gp.axes[i]
+        i = i + 1
+    }
+
+    // Sticks
+    gp.axes[AXIS_LX] = (data[1] as i16 - 128) * 256
+    gp.axes[AXIS_LY] = (data[2] as i16 - 128) * 256
+    gp.axes[AXIS_RX] = (data[3] as i16 - 128) * 256
+    gp.axes[AXIS_RY] = (data[4] as i16 - 128) * 256
+
+    // D-pad and buttons
+    let dpad = data[5] & 0x0F
+    gp.buttons = 0
+
+    // D-pad
+    if dpad == 0 or dpad == 1 or dpad == 7 { gp.buttons = gp.buttons | (1 << 0) }  // UP
+    if dpad == 1 or dpad == 2 or dpad == 3 { gp.buttons = gp.buttons | (1 << 3) }  // RIGHT
+    if dpad == 3 or dpad == 4 or dpad == 5 { gp.buttons = gp.buttons | (1 << 1) }  // DOWN
+    if dpad == 5 or dpad == 6 or dpad == 7 { gp.buttons = gp.buttons | (1 << 2) }  // LEFT
+
+    if (data[5] & 0x10) != 0 { gp.buttons = gp.buttons | (1 << 13) }  // Square
+    if (data[5] & 0x20) != 0 { gp.buttons = gp.buttons | (1 << 11) }  // Cross
+    if (data[5] & 0x40) != 0 { gp.buttons = gp.buttons | (1 << 12) }  // Circle
+    if (data[5] & 0x80) != 0 { gp.buttons = gp.buttons | (1 << 14) }  // Triangle
+
+    if (data[6] & 0x01) != 0 { gp.buttons = gp.buttons | (1 << 8) }   // L1
+    if (data[6] & 0x02) != 0 { gp.buttons = gp.buttons | (1 << 9) }   // R1
+    if (data[6] & 0x10) != 0 { gp.buttons = gp.buttons | (1 << 5) }   // SHARE
+    if (data[6] & 0x20) != 0 { gp.buttons = gp.buttons | (1 << 4) }   // OPTIONS
+    if (data[6] & 0x40) != 0 { gp.buttons = gp.buttons | (1 << 6) }   // L3
+    if (data[6] & 0x80) != 0 { gp.buttons = gp.buttons | (1 << 7) }   // R3
+
+    if (data[7] & 0x01) != 0 { gp.buttons = gp.buttons | (1 << 10) }  // PS
+    if (data[7] & 0x02) != 0 { gp.buttons = gp.buttons | (1 << 15) }  // TOUCHPAD
+
+    // Triggers
+    gp.axes[AXIS_LT] = data[8] as i16
+    gp.axes[AXIS_RT] = data[9] as i16
+
+    // Motion and touchpad in extended report
+    if len >= 44 and gp.has_motion {
+        gp.gyro_x = (data[14] as i16) | (data[15] as i16 << 8)
+        gp.gyro_y = (data[16] as i16) | (data[17] as i16 << 8)
+        gp.gyro_z = (data[18] as i16) | (data[19] as i16 << 8)
+        gp.accel_x = (data[20] as i16) | (data[21] as i16 << 8)
+        gp.accel_y = (data[22] as i16) | (data[23] as i16 << 8)
+        gp.accel_z = (data[24] as i16) | (data[25] as i16 << 8)
+    }
+
+    // Touchpad
+    if len >= 44 and gp.has_touchpad {
+        gp.touch_active = (data[35] & 0x80) == 0
+        if gp.touch_active {
+            gp.touch_x = (data[36] as u16) | ((data[37] & 0x0F) as u16 << 8)
+            gp.touch_y = ((data[37] >> 4) as u16) | (data[38] as u16 << 4)
+        }
+    }
+
+    // Battery
+    if len >= 30 and gp.has_battery {
+        gp.battery_level = data[30] & 0x0F
+        gp.battery_charging = (data[30] & 0x10) != 0
+    }
+
+    apply_deadzone(gp)
+}
+
+fn parse_ps5(gp: *GamepadState, data: *[64]u8, len: u32): void {
+    // PS5 DualSense has similar format to PS4
+    parse_ps4(gp, data, len)
+}
+
+fn parse_switch_pro(gp: *GamepadState, data: *[64]u8, len: u32): void {
+    if len < 12 {
+        return
+    }
+
+    gp.prev_buttons = gp.buttons
+    var i: u32 = 0
+    while i < 8 {
+        gp.prev_axes[i] = gp.axes[i]
+        i = i + 1
+    }
+
+    // Standard input report
+    if data[0] == 0x30 {
+        let btns1 = data[3]
+        let btns2 = data[4]
+        let btns3 = data[5]
+
+        gp.buttons = 0
+        // Right buttons
+        if (btns1 & 0x01) != 0 { gp.buttons = gp.buttons | (1 << 14) }  // Y
+        if (btns1 & 0x02) != 0 { gp.buttons = gp.buttons | (1 << 13) }  // X
+        if (btns1 & 0x04) != 0 { gp.buttons = gp.buttons | (1 << 12) }  // B
+        if (btns1 & 0x08) != 0 { gp.buttons = gp.buttons | (1 << 11) }  // A
+        if (btns1 & 0x40) != 0 { gp.buttons = gp.buttons | (1 << 9) }   // R
+        if (btns1 & 0x80) != 0 { gp.buttons = gp.buttons | (1 << 9) }   // ZR
+
+        // Middle buttons
+        if (btns2 & 0x01) != 0 { gp.buttons = gp.buttons | (1 << 5) }   // Minus
+        if (btns2 & 0x02) != 0 { gp.buttons = gp.buttons | (1 << 4) }   // Plus
+        if (btns2 & 0x04) != 0 { gp.buttons = gp.buttons | (1 << 7) }   // R3
+        if (btns2 & 0x08) != 0 { gp.buttons = gp.buttons | (1 << 6) }   // L3
+        if (btns2 & 0x10) != 0 { gp.buttons = gp.buttons | (1 << 10) }  // Home
+        if (btns2 & 0x20) != 0 { gp.buttons = gp.buttons | (1 << 15) }  // Capture
+
+        // Left buttons
+        if (btns3 & 0x01) != 0 { gp.buttons = gp.buttons | (1 << 1) }   // Down
+        if (btns3 & 0x02) != 0 { gp.buttons = gp.buttons | (1 << 0) }   // Up
+        if (btns3 & 0x04) != 0 { gp.buttons = gp.buttons | (1 << 3) }   // Right
+        if (btns3 & 0x08) != 0 { gp.buttons = gp.buttons | (1 << 2) }   // Left
+        if (btns3 & 0x40) != 0 { gp.buttons = gp.buttons | (1 << 8) }   // L
+        if (btns3 & 0x80) != 0 { gp.buttons = gp.buttons | (1 << 8) }   // ZL
+
+        // Sticks (12-bit)
+        let lx = (data[6] as u16) | ((data[7] & 0x0F) as u16 << 8)
+        let ly = ((data[7] >> 4) as u16) | (data[8] as u16 << 4)
+        let rx = (data[9] as u16) | ((data[10] & 0x0F) as u16 << 8)
+        let ry = ((data[10] >> 4) as u16) | (data[11] as u16 << 4)
+
+        gp.axes[AXIS_LX] = (lx as i32 - 2048) as i16 * 16
+        gp.axes[AXIS_LY] = (ly as i32 - 2048) as i16 * 16
+        gp.axes[AXIS_RX] = (rx as i32 - 2048) as i16 * 16
+        gp.axes[AXIS_RY] = (ry as i32 - 2048) as i16 * 16
+    }
+
+    apply_deadzone(gp)
+}
+
+fn parse_generic(gp: *GamepadState, data: *[64]u8, len: u32): void {
+    // Try to parse as standard HID gamepad
+    if len < 8 {
+        return
+    }
+
+    gp.prev_buttons = gp.buttons
+    var i: u32 = 0
+    while i < 8 {
+        gp.prev_axes[i] = gp.axes[i]
+        i = i + 1
+    }
+
+    // Assume common layout
+    gp.axes[AXIS_LX] = (data[0] as i16 - 128) * 256
+    gp.axes[AXIS_LY] = (data[1] as i16 - 128) * 256
+    gp.axes[AXIS_RX] = (data[2] as i16 - 128) * 256
+    gp.axes[AXIS_RY] = (data[3] as i16 - 128) * 256
+
+    gp.buttons = (data[5] as u32 << 8) | data[4] as u32
+
+    apply_deadzone(gp)
+}
+
+// ============================================
+// Deadzone Processing
+// ============================================
+
+fn apply_deadzone(gp: *GamepadState): void {
+    // Left stick
+    if basics.abs(gp.axes[AXIS_LX]) < gp.left_deadzone as i16 {
+        gp.axes[AXIS_LX] = 0
+    }
+    if basics.abs(gp.axes[AXIS_LY]) < gp.left_deadzone as i16 {
+        gp.axes[AXIS_LY] = 0
+    }
+
+    // Right stick
+    if basics.abs(gp.axes[AXIS_RX]) < gp.right_deadzone as i16 {
+        gp.axes[AXIS_RX] = 0
+    }
+    if basics.abs(gp.axes[AXIS_RY]) < gp.right_deadzone as i16 {
+        gp.axes[AXIS_RY] = 0
+    }
+
+    // Triggers
+    if gp.axes[AXIS_LT] < gp.trigger_deadzone as i16 {
+        gp.axes[AXIS_LT] = 0
+    }
+    if gp.axes[AXIS_RT] < gp.trigger_deadzone as i16 {
+        gp.axes[AXIS_RT] = 0
+    }
+}
+
+// ============================================
+// Event Reporting
+// ============================================
+
+fn report_gamepad_events(gp: *GamepadState): void {
+    let changed = gp.buttons ^ gp.prev_buttons
+
+    // Buttons
+    if (changed & (1 << 0)) != 0 {
+        input.report_key(gp.input_dev, BTN_DPAD_UP, (gp.buttons & (1 << 0)) != 0)
+        if (gp.buttons & (1 << 0)) != 0 { gp.total_presses = gp.total_presses + 1 }
+    }
+    if (changed & (1 << 1)) != 0 {
+        input.report_key(gp.input_dev, BTN_DPAD_DOWN, (gp.buttons & (1 << 1)) != 0)
+    }
+    if (changed & (1 << 2)) != 0 {
+        input.report_key(gp.input_dev, BTN_DPAD_LEFT, (gp.buttons & (1 << 2)) != 0)
+    }
+    if (changed & (1 << 3)) != 0 {
+        input.report_key(gp.input_dev, BTN_DPAD_RIGHT, (gp.buttons & (1 << 3)) != 0)
+    }
+    if (changed & (1 << 4)) != 0 {
+        input.report_key(gp.input_dev, BTN_START, (gp.buttons & (1 << 4)) != 0)
+    }
+    if (changed & (1 << 5)) != 0 {
+        input.report_key(gp.input_dev, BTN_SELECT, (gp.buttons & (1 << 5)) != 0)
+    }
+    if (changed & (1 << 6)) != 0 {
+        input.report_key(gp.input_dev, BTN_L3, (gp.buttons & (1 << 6)) != 0)
+    }
+    if (changed & (1 << 7)) != 0 {
+        input.report_key(gp.input_dev, BTN_R3, (gp.buttons & (1 << 7)) != 0)
+    }
+    if (changed & (1 << 8)) != 0 {
+        input.report_key(gp.input_dev, BTN_LB, (gp.buttons & (1 << 8)) != 0)
+    }
+    if (changed & (1 << 9)) != 0 {
+        input.report_key(gp.input_dev, BTN_RB, (gp.buttons & (1 << 9)) != 0)
+    }
+    if (changed & (1 << 10)) != 0 {
+        input.report_key(gp.input_dev, BTN_GUIDE, (gp.buttons & (1 << 10)) != 0)
+    }
+    if (changed & (1 << 11)) != 0 {
+        input.report_key(gp.input_dev, BTN_A, (gp.buttons & (1 << 11)) != 0)
+        if (gp.buttons & (1 << 11)) != 0 { gp.total_presses = gp.total_presses + 1 }
+    }
+    if (changed & (1 << 12)) != 0 {
+        input.report_key(gp.input_dev, BTN_B, (gp.buttons & (1 << 12)) != 0)
+    }
+    if (changed & (1 << 13)) != 0 {
+        input.report_key(gp.input_dev, BTN_X, (gp.buttons & (1 << 13)) != 0)
+    }
+    if (changed & (1 << 14)) != 0 {
+        input.report_key(gp.input_dev, BTN_Y, (gp.buttons & (1 << 14)) != 0)
+    }
+
+    // Axes
+    if gp.axes[AXIS_LX] != gp.prev_axes[AXIS_LX] {
+        input.report_abs(gp.input_dev, input.ABS_X, gp.axes[AXIS_LX] as i32)
+    }
+    if gp.axes[AXIS_LY] != gp.prev_axes[AXIS_LY] {
+        input.report_abs(gp.input_dev, input.ABS_Y, gp.axes[AXIS_LY] as i32)
+    }
+    if gp.axes[AXIS_RX] != gp.prev_axes[AXIS_RX] {
+        input.report_abs(gp.input_dev, input.ABS_RX, gp.axes[AXIS_RX] as i32)
+    }
+    if gp.axes[AXIS_RY] != gp.prev_axes[AXIS_RY] {
+        input.report_abs(gp.input_dev, input.ABS_RY, gp.axes[AXIS_RY] as i32)
+    }
+    if gp.axes[AXIS_LT] != gp.prev_axes[AXIS_LT] {
+        input.report_abs(gp.input_dev, input.ABS_Z, gp.axes[AXIS_LT] as i32)
+    }
+    if gp.axes[AXIS_RT] != gp.prev_axes[AXIS_RT] {
+        input.report_abs(gp.input_dev, input.ABS_RZ, gp.axes[AXIS_RT] as i32)
+    }
+
+    input.report_sync(gp.input_dev)
+}
+
+// ============================================
+// Rumble/Force Feedback
+// ============================================
+
+export fn gamepad_rumble(gp_id: u32, left: u8, right: u8): bool {
+    if gp_id >= num_gamepads {
+        return false
+    }
+
+    let gp = &gamepads[gp_id]
+    if not gp.has_rumble {
+        return false
+    }
+
+    gp.rumble_left = left
+    gp.rumble_right = right
+
+    switch gp.gamepad_type {
+        GAMEPAD_TYPE_XBOX360 => {
+            var cmd: [8]u8 = [_]u8{ 0x00, 0x08, 0x00, left, right, 0x00, 0x00, 0x00 }
+            usb.interrupt_transfer(gp.device, gp.endpoint_out, &cmd, 8)
+        },
+        GAMEPAD_TYPE_XBOXONE => {
+            var cmd: [9]u8 = [_]u8{ 0x09, 0x00, 0x00, 0x09, 0x00, 0x0F, left, right, 0xFF }
+            usb.interrupt_transfer(gp.device, gp.endpoint_out, &cmd, 9)
+        },
+        GAMEPAD_TYPE_PS4, GAMEPAD_TYPE_PS5 => {
+            var cmd: [32]u8 = undefined
+            basics.memset(&cmd, 0, 32)
+            cmd[0] = 0x05
+            cmd[1] = 0xFF
+            cmd[4] = right
+            cmd[5] = left
+            usb.interrupt_transfer(gp.device, gp.endpoint_out, &cmd, 32)
+        },
+        else => return false
+    }
+
+    return true
+}
+
+// ============================================
+// LED Control
+// ============================================
+
+export fn gamepad_set_led(gp_id: u32, pattern: u8): bool {
+    if gp_id >= num_gamepads {
+        return false
+    }
+
+    let gp = &gamepads[gp_id]
+    if not gp.has_leds {
+        return false
+    }
+
+    gp.led_pattern = pattern
+
+    switch gp.gamepad_type {
+        GAMEPAD_TYPE_XBOX360 => {
+            var cmd: [3]u8 = [_]u8{ 0x01, 0x03, pattern }
+            usb.control_transfer(gp.device, 0x21, 0x09, 0x0201, gp.interface as u16, &cmd, 3)
+        },
+        GAMEPAD_TYPE_PS4, GAMEPAD_TYPE_PS5 => {
+            // RGB LED - pattern as R, G, B
+            var cmd: [32]u8 = undefined
+            basics.memset(&cmd, 0, 32)
+            cmd[0] = 0x05
+            cmd[1] = 0xFF
+            cmd[6] = (pattern >> 5) * 36    // R
+            cmd[7] = ((pattern >> 2) & 7) * 36  // G
+            cmd[8] = (pattern & 3) * 85     // B
+            usb.interrupt_transfer(gp.device, gp.endpoint_out, &cmd, 32)
+        },
+        else => return false
+    }
+
+    return true
+}
+
+// ============================================
+// Configuration
+// ============================================
+
+export fn gamepad_set_deadzone(gp_id: u32, left: u16, right: u16, trigger: u16): bool {
+    if gp_id >= num_gamepads {
+        return false
+    }
+
+    gamepads[gp_id].left_deadzone = left
+    gamepads[gp_id].right_deadzone = right
+    gamepads[gp_id].trigger_deadzone = trigger
+    return true
+}
+
+export fn gamepad_get_count(): u32 {
+    return num_gamepads
+}
+
+export fn gamepad_get_battery(gp_id: u32): u8 {
+    if gp_id >= num_gamepads {
+        return 0
+    }
+    return gamepads[gp_id].battery_level
+}
+
+export fn gamepad_is_charging(gp_id: u32): bool {
+    if gp_id >= num_gamepads {
+        return false
+    }
+    return gamepads[gp_id].battery_charging
+}
+
+export fn gamepad_get_type(gp_id: u32): u8 {
+    if gp_id >= num_gamepads {
+        return 255
+    }
+    return gamepads[gp_id].gamepad_type
+}

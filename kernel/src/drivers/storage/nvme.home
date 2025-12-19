@@ -1,0 +1,709 @@
+// HomeOS NVMe Driver
+// NVM Express storage controller support for PCIe SSDs
+
+const basics = @import("basics")
+const pci = @import("drivers/pci")
+const block = @import("drivers/block")
+
+// ============================================
+// NVMe Constants
+// ============================================
+
+// PCI Class codes
+const PCI_CLASS_STORAGE: u8 = 0x01
+const PCI_SUBCLASS_NVM: u8 = 0x08
+const PCI_PROGIF_NVME: u8 = 0x02
+
+// Controller registers (BAR0)
+const NVME_CAP: u32 = 0x00        // Controller Capabilities
+const NVME_VS: u32 = 0x08         // Version
+const NVME_INTMS: u32 = 0x0C      // Interrupt Mask Set
+const NVME_INTMC: u32 = 0x10      // Interrupt Mask Clear
+const NVME_CC: u32 = 0x14         // Controller Configuration
+const NVME_CSTS: u32 = 0x1C       // Controller Status
+const NVME_NSSR: u32 = 0x20       // NVM Subsystem Reset
+const NVME_AQA: u32 = 0x24        // Admin Queue Attributes
+const NVME_ASQ: u32 = 0x28        // Admin Submission Queue Base Address
+const NVME_ACQ: u32 = 0x30        // Admin Completion Queue Base Address
+
+// Doorbell stride (CAP.DSTRD)
+const NVME_SQ0TDBL: u32 = 0x1000  // Submission Queue 0 Tail Doorbell
+
+// CC bits
+const CC_EN: u32 = 1 << 0         // Enable
+const CC_CSS_NVM: u32 = 0 << 4    // NVM Command Set
+const CC_MPS_SHIFT: u32 = 7       // Memory Page Size
+const CC_AMS_RR: u32 = 0 << 11    // Round Robin arbitration
+const CC_SHN_NONE: u32 = 0 << 14  // No shutdown notification
+const CC_IOSQES_SHIFT: u32 = 16   // I/O SQ Entry Size
+const CC_IOCQES_SHIFT: u32 = 20   // I/O CQ Entry Size
+
+// CSTS bits
+const CSTS_RDY: u32 = 1 << 0      // Ready
+const CSTS_CFS: u32 = 1 << 1      // Controller Fatal Status
+const CSTS_SHST_MASK: u32 = 3 << 2 // Shutdown Status
+const CSTS_NSSRO: u32 = 1 << 4    // NVM Subsystem Reset Occurred
+const CSTS_PP: u32 = 1 << 5       // Processing Paused
+
+// Admin opcodes
+const NVME_ADMIN_DELETE_SQ: u8 = 0x00
+const NVME_ADMIN_CREATE_SQ: u8 = 0x01
+const NVME_ADMIN_DELETE_CQ: u8 = 0x04
+const NVME_ADMIN_CREATE_CQ: u8 = 0x05
+const NVME_ADMIN_IDENTIFY: u8 = 0x06
+const NVME_ADMIN_SET_FEATURES: u8 = 0x09
+const NVME_ADMIN_GET_FEATURES: u8 = 0x0A
+
+// NVM opcodes
+const NVME_CMD_FLUSH: u8 = 0x00
+const NVME_CMD_WRITE: u8 = 0x01
+const NVME_CMD_READ: u8 = 0x02
+
+// Identify CNS values
+const NVME_ID_CNS_NS: u8 = 0x00   // Namespace
+const NVME_ID_CNS_CTRL: u8 = 0x01 // Controller
+
+// ============================================
+// Data Structures
+// ============================================
+
+// Submission Queue Entry (64 bytes)
+struct NVMeCommand {
+    opcode: u8
+    flags: u8
+    cid: u16           // Command ID
+    nsid: u32          // Namespace ID
+    reserved: u64
+    mptr: u64          // Metadata Pointer
+    prp1: u64          // PRP Entry 1
+    prp2: u64          // PRP Entry 2
+    cdw10: u32
+    cdw11: u32
+    cdw12: u32
+    cdw13: u32
+    cdw14: u32
+    cdw15: u32
+}
+
+// Completion Queue Entry (16 bytes)
+struct NVMeCompletion {
+    result: u32        // Command specific result
+    reserved: u32
+    sq_head: u16       // SQ Head Pointer
+    sq_id: u16         // SQ Identifier
+    cid: u16           // Command ID
+    status: u16        // Status Field (bit 0 = Phase Tag)
+}
+
+// Identify Controller structure (4096 bytes)
+struct NVMeIdentifyController {
+    vid: u16           // PCI Vendor ID
+    ssvid: u16         // PCI Subsystem Vendor ID
+    sn: [20]u8         // Serial Number
+    mn: [40]u8         // Model Number
+    fr: [8]u8          // Firmware Revision
+    rab: u8            // Recommended Arbitration Burst
+    ieee: [3]u8        // IEEE OUI Identifier
+    cmic: u8           // Controller Multi-Path I/O and Namespace Sharing Capabilities
+    mdts: u8           // Maximum Data Transfer Size
+    cntlid: u16        // Controller ID
+    ver: u32           // Version
+    rtd3r: u32         // RTD3 Resume Latency
+    rtd3e: u32         // RTD3 Entry Latency
+    oaes: u32          // Optional Async Events Supported
+    ctratt: u32        // Controller Attributes
+    reserved0: [12]u8
+    fguid: [16]u8      // FRU Globally Unique Identifier
+    reserved1: [112]u8
+    reserved2: [16]u8
+    // ... remaining fields
+    reserved_rest: [3780]u8
+}
+
+// Identify Namespace structure (4096 bytes)
+struct NVMeIdentifyNamespace {
+    nsze: u64          // Namespace Size (total blocks)
+    ncap: u64          // Namespace Capacity
+    nuse: u64          // Namespace Utilization
+    nsfeat: u8         // Namespace Features
+    nlbaf: u8          // Number of LBA Formats
+    flbas: u8          // Formatted LBA Size
+    mc: u8             // Metadata Capabilities
+    dpc: u8            // End-to-end Data Protection Capabilities
+    dps: u8            // End-to-end Data Protection Type Settings
+    nmic: u8           // Namespace Multi-path I/O and Namespace Sharing
+    rescap: u8         // Reservation Capabilities
+    fpi: u8            // Format Progress Indicator
+    dlfeat: u8         // Deallocate Logical Block Features
+    nawun: u16         // Namespace Atomic Write Unit Normal
+    nawupf: u16        // Namespace Atomic Write Unit Power Fail
+    nacwu: u16         // Namespace Atomic Compare & Write Unit
+    nabsn: u16         // Namespace Atomic Boundary Size Normal
+    nabo: u16          // Namespace Atomic Boundary Offset
+    nabspf: u16        // Namespace Atomic Boundary Size Power Fail
+    noiob: u16         // Namespace Optimal I/O Boundary
+    nvmcap: [16]u8     // NVM Capacity
+    reserved: [40]u8
+    nguid: [16]u8      // Namespace Globally Unique Identifier
+    eui64: [8]u8       // IEEE Extended Unique Identifier
+    lbaf: [16]u32      // LBA Format Support (16 formats)
+    reserved2: [192]u8
+    vs: [3712]u8       // Vendor Specific
+}
+
+// ============================================
+// NVMe Controller State
+// ============================================
+
+const MAX_NVME_CONTROLLERS: u32 = 4
+const QUEUE_DEPTH: u32 = 64
+const MAX_NAMESPACES: u32 = 16
+
+struct NVMeQueue {
+    sq: *NVMeCommand         // Submission Queue
+    cq: *NVMeCompletion      // Completion Queue
+    sq_tail: u32
+    cq_head: u32
+    cq_phase: bool
+    depth: u32
+    qid: u16
+}
+
+struct NVMeNamespace {
+    nsid: u32
+    block_count: u64
+    block_size: u32
+    active: bool
+    block_dev: *block.BlockDevice
+}
+
+struct NVMeController {
+    pci_dev: *pci.PCIDevice
+    bar0: u64                // BAR0 MMIO base
+    doorbell_stride: u32
+    max_transfer_shift: u8
+
+    // Queues
+    admin_queue: NVMeQueue
+    io_queues: [16]NVMeQueue
+    num_io_queues: u32
+
+    // Namespaces
+    namespaces: [MAX_NAMESPACES]NVMeNamespace
+    num_namespaces: u32
+
+    // Controller info
+    model: [41]u8
+    serial: [21]u8
+    firmware: [9]u8
+
+    // Command ID tracking
+    next_cid: u16
+
+    // Statistics
+    reads: u64
+    writes: u64
+    errors: u64
+}
+
+var controllers: [MAX_NVME_CONTROLLERS]NVMeController = undefined
+var num_controllers: u32 = 0
+
+// ============================================
+// MMIO Access
+// ============================================
+
+fn nvme_read32(ctrl: *NVMeController, offset: u32): u32 {
+    let addr = (ctrl.bar0 + (offset as u64)) as *volatile u32
+    return *addr
+}
+
+fn nvme_write32(ctrl: *NVMeController, offset: u32, value: u32): void {
+    let addr = (ctrl.bar0 + (offset as u64)) as *volatile u32
+    *addr = value
+}
+
+fn nvme_read64(ctrl: *NVMeController, offset: u32): u64 {
+    let addr = (ctrl.bar0 + (offset as u64)) as *volatile u64
+    return *addr
+}
+
+fn nvme_write64(ctrl: *NVMeController, offset: u32, value: u64): void {
+    let addr = (ctrl.bar0 + (offset as u64)) as *volatile u64
+    *addr = value
+}
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn nvme_init(): void {
+    num_controllers = 0
+
+    // Scan PCI for NVMe controllers
+    pci.pci_scan_class(PCI_CLASS_STORAGE, PCI_SUBCLASS_NVM, PCI_PROGIF_NVME,
+                       nvme_probe_controller)
+}
+
+fn nvme_probe_controller(dev: *pci.PCIDevice): void {
+    if num_controllers >= MAX_NVME_CONTROLLERS {
+        return
+    }
+
+    let ctrl = &controllers[num_controllers]
+    ctrl.pci_dev = dev
+    ctrl.reads = 0
+    ctrl.writes = 0
+    ctrl.errors = 0
+    ctrl.next_cid = 0
+
+    // Get BAR0
+    ctrl.bar0 = pci.pci_read_bar(dev, 0) & ~0xFFF
+
+    if ctrl.bar0 == 0 {
+        return
+    }
+
+    // Enable bus mastering and memory space
+    pci.pci_enable_bus_master(dev)
+    pci.pci_enable_memory_space(dev)
+
+    // Read capabilities
+    let cap = nvme_read64(ctrl, NVME_CAP)
+    ctrl.doorbell_stride = 4 << ((cap >> 32) & 0xF)
+    ctrl.max_transfer_shift = ((cap >> 37) & 0xFF) as u8
+
+    // Disable controller
+    nvme_write32(ctrl, NVME_CC, 0)
+
+    // Wait for not ready
+    if not nvme_wait_ready(ctrl, false) {
+        return
+    }
+
+    // Allocate admin queues
+    if not nvme_alloc_queue(ctrl, &ctrl.admin_queue, 0, QUEUE_DEPTH) {
+        return
+    }
+
+    // Configure admin queue
+    let aqa = ((QUEUE_DEPTH - 1) << 16) | (QUEUE_DEPTH - 1)
+    nvme_write32(ctrl, NVME_AQA, aqa)
+
+    let asq_phys = basics.virt_to_phys(ctrl.admin_queue.sq as u64)
+    let acq_phys = basics.virt_to_phys(ctrl.admin_queue.cq as u64)
+    nvme_write64(ctrl, NVME_ASQ, asq_phys)
+    nvme_write64(ctrl, NVME_ACQ, acq_phys)
+
+    // Enable controller
+    let cc = CC_EN | CC_CSS_NVM |
+             (0 << CC_MPS_SHIFT) |         // 4KB pages
+             (6 << CC_IOSQES_SHIFT) |      // 64-byte SQ entries
+             (4 << CC_IOCQES_SHIFT)        // 16-byte CQ entries
+    nvme_write32(ctrl, NVME_CC, cc)
+
+    // Wait for ready
+    if not nvme_wait_ready(ctrl, true) {
+        return
+    }
+
+    // Identify controller
+    if not nvme_identify_controller(ctrl) {
+        return
+    }
+
+    // Create I/O queues
+    nvme_create_io_queues(ctrl)
+
+    // Identify namespaces
+    nvme_identify_namespaces(ctrl)
+
+    num_controllers = num_controllers + 1
+}
+
+fn nvme_wait_ready(ctrl: *NVMeController, ready: bool): bool {
+    var timeout: u32 = 5000
+
+    while timeout > 0 {
+        let csts = nvme_read32(ctrl, NVME_CSTS)
+
+        if (csts & CSTS_CFS) != 0 {
+            return false  // Controller fatal status
+        }
+
+        let is_ready = (csts & CSTS_RDY) != 0
+        if is_ready == ready {
+            return true
+        }
+
+        basics.sleep_ms(1)
+        timeout = timeout - 1
+    }
+
+    return false
+}
+
+// ============================================
+// Queue Management
+// ============================================
+
+fn nvme_alloc_queue(ctrl: *NVMeController, queue: *NVMeQueue, qid: u16, depth: u32): bool {
+    let sq_size = depth * basics.sizeof(NVMeCommand)
+    let cq_size = depth * basics.sizeof(NVMeCompletion)
+
+    queue.sq = basics.aligned_alloc(4096, sq_size) as *NVMeCommand
+    if queue.sq == null {
+        return false
+    }
+
+    queue.cq = basics.aligned_alloc(4096, cq_size) as *NVMeCompletion
+    if queue.cq == null {
+        basics.aligned_free(queue.sq)
+        return false
+    }
+
+    basics.memset(queue.sq, 0, sq_size)
+    basics.memset(queue.cq, 0, cq_size)
+
+    queue.sq_tail = 0
+    queue.cq_head = 0
+    queue.cq_phase = true
+    queue.depth = depth
+    queue.qid = qid
+
+    return true
+}
+
+fn nvme_submit_command(ctrl: *NVMeController, queue: *NVMeQueue, cmd: *NVMeCommand): u16 {
+    let cid = ctrl.next_cid
+    ctrl.next_cid = ctrl.next_cid + 1
+
+    cmd.cid = cid
+
+    // Copy command to SQ
+    basics.memcpy(&queue.sq[queue.sq_tail], cmd, basics.sizeof(NVMeCommand))
+
+    // Update tail
+    queue.sq_tail = (queue.sq_tail + 1) % queue.depth
+
+    // Ring doorbell
+    let doorbell = NVME_SQ0TDBL + (queue.qid as u32) * 2 * ctrl.doorbell_stride
+    nvme_write32(ctrl, doorbell, queue.sq_tail)
+
+    return cid
+}
+
+fn nvme_poll_completion(ctrl: *NVMeController, queue: *NVMeQueue, cid: u16): *NVMeCompletion {
+    var timeout: u32 = 5000
+
+    while timeout > 0 {
+        let cqe = &queue.cq[queue.cq_head]
+        let phase = ((cqe.status & 1) != 0)
+
+        if phase == queue.cq_phase {
+            if cqe.cid == cid {
+                // Advance CQ head
+                queue.cq_head = queue.cq_head + 1
+                if queue.cq_head >= queue.depth {
+                    queue.cq_head = 0
+                    queue.cq_phase = not queue.cq_phase
+                }
+
+                // Ring CQ doorbell
+                let doorbell = NVME_SQ0TDBL + ((queue.qid as u32) * 2 + 1) * ctrl.doorbell_stride
+                nvme_write32(ctrl, doorbell, queue.cq_head)
+
+                return cqe
+            }
+        }
+
+        basics.sleep_us(100)
+        timeout = timeout - 1
+    }
+
+    return null
+}
+
+// ============================================
+// Admin Commands
+// ============================================
+
+fn nvme_identify_controller(ctrl: *NVMeController): bool {
+    var identify: NVMeIdentifyController align(4096) = undefined
+    let identify_phys = basics.virt_to_phys(&identify as u64)
+
+    var cmd: NVMeCommand = undefined
+    basics.memset(&cmd, 0, basics.sizeof(NVMeCommand))
+    cmd.opcode = NVME_ADMIN_IDENTIFY
+    cmd.nsid = 0
+    cmd.prp1 = identify_phys
+    cmd.cdw10 = NVME_ID_CNS_CTRL as u32
+
+    let cid = nvme_submit_command(ctrl, &ctrl.admin_queue, &cmd)
+    let cqe = nvme_poll_completion(ctrl, &ctrl.admin_queue, cid)
+
+    if cqe == null or (cqe.status >> 1) != 0 {
+        return false
+    }
+
+    // Copy info
+    basics.memcpy(&ctrl.model, &identify.mn, 40)
+    ctrl.model[40] = 0
+    basics.memcpy(&ctrl.serial, &identify.sn, 20)
+    ctrl.serial[20] = 0
+    basics.memcpy(&ctrl.firmware, &identify.fr, 8)
+    ctrl.firmware[8] = 0
+
+    // Trim trailing spaces
+    trim_string(&ctrl.model, 40)
+    trim_string(&ctrl.serial, 20)
+
+    return true
+}
+
+fn trim_string(s: *u8, max_len: u32): void {
+    var i: i32 = (max_len - 1) as i32
+    while i >= 0 and (s[i as u32] == ' ' or s[i as u32] == 0) {
+        s[i as u32] = 0
+        i = i - 1
+    }
+}
+
+fn nvme_create_io_queues(ctrl: *NVMeController): void {
+    // Create one I/O queue pair for now
+    ctrl.num_io_queues = 1
+
+    let io_queue = &ctrl.io_queues[0]
+    if not nvme_alloc_queue(ctrl, io_queue, 1, QUEUE_DEPTH) {
+        return
+    }
+
+    // Create Completion Queue
+    var cmd: NVMeCommand = undefined
+    basics.memset(&cmd, 0, basics.sizeof(NVMeCommand))
+    cmd.opcode = NVME_ADMIN_CREATE_CQ
+    cmd.prp1 = basics.virt_to_phys(io_queue.cq as u64)
+    cmd.cdw10 = ((QUEUE_DEPTH - 1) << 16) | 1  // QSIZE | QID
+    cmd.cdw11 = 1  // Physically Contiguous
+
+    let cid = nvme_submit_command(ctrl, &ctrl.admin_queue, &cmd)
+    let cqe = nvme_poll_completion(ctrl, &ctrl.admin_queue, cid)
+
+    if cqe == null or (cqe.status >> 1) != 0 {
+        return
+    }
+
+    // Create Submission Queue
+    basics.memset(&cmd, 0, basics.sizeof(NVMeCommand))
+    cmd.opcode = NVME_ADMIN_CREATE_SQ
+    cmd.prp1 = basics.virt_to_phys(io_queue.sq as u64)
+    cmd.cdw10 = ((QUEUE_DEPTH - 1) << 16) | 1  // QSIZE | QID
+    cmd.cdw11 = (1 << 16) | 1  // CQID | Physically Contiguous
+
+    let cid2 = nvme_submit_command(ctrl, &ctrl.admin_queue, &cmd)
+    let cqe2 = nvme_poll_completion(ctrl, &ctrl.admin_queue, cid2)
+
+    if cqe2 == null or (cqe2.status >> 1) != 0 {
+        ctrl.num_io_queues = 0
+    }
+}
+
+fn nvme_identify_namespaces(ctrl: *NVMeController): void {
+    ctrl.num_namespaces = 0
+
+    // Try namespace IDs 1 through MAX_NAMESPACES
+    var nsid: u32 = 1
+    while nsid <= MAX_NAMESPACES and ctrl.num_namespaces < MAX_NAMESPACES {
+        var identify: NVMeIdentifyNamespace align(4096) = undefined
+        let identify_phys = basics.virt_to_phys(&identify as u64)
+
+        var cmd: NVMeCommand = undefined
+        basics.memset(&cmd, 0, basics.sizeof(NVMeCommand))
+        cmd.opcode = NVME_ADMIN_IDENTIFY
+        cmd.nsid = nsid
+        cmd.prp1 = identify_phys
+        cmd.cdw10 = NVME_ID_CNS_NS as u32
+
+        let cid = nvme_submit_command(ctrl, &ctrl.admin_queue, &cmd)
+        let cqe = nvme_poll_completion(ctrl, &ctrl.admin_queue, cid)
+
+        if cqe != null and (cqe.status >> 1) == 0 and identify.nsze > 0 {
+            let ns = &ctrl.namespaces[ctrl.num_namespaces]
+            ns.nsid = nsid
+            ns.block_count = identify.nsze
+            ns.active = true
+
+            // Get block size from LBA format
+            let lba_format = identify.flbas & 0x0F
+            let lbads = (identify.lbaf[lba_format] >> 16) & 0xFF
+            ns.block_size = 1 << lbads
+
+            // Register block device
+            nvme_register_block_device(ctrl, ns)
+
+            ctrl.num_namespaces = ctrl.num_namespaces + 1
+        }
+
+        nsid = nsid + 1
+    }
+}
+
+// ============================================
+// Block Device Interface
+// ============================================
+
+fn nvme_register_block_device(ctrl: *NVMeController, ns: *NVMeNamespace): void {
+    let dev = block.block_device_create()
+    if dev == null {
+        return
+    }
+
+    dev.read = nvme_block_read
+    dev.write = nvme_block_write
+    dev.flush = nvme_block_flush
+    dev.sector_size = ns.block_size
+    dev.sector_count = ns.block_count
+
+    // Store both controller and namespace info
+    dev.private_data = basics.alloc(16) as *void
+    if dev.private_data != null {
+        let priv = dev.private_data as *u64
+        priv[0] = ctrl as u64
+        priv[1] = ns.nsid as u64
+    }
+
+    basics.memcpy(&dev.model, &ctrl.model, 40)
+
+    ns.block_dev = dev
+    block.block_device_register(dev)
+}
+
+fn nvme_block_read(dev: *block.BlockDevice, lba: u64, count: u32, buffer: *void): i32 {
+    let priv = dev.private_data as *u64
+    let ctrl = priv[0] as *NVMeController
+    let nsid = priv[1] as u32
+
+    if ctrl.num_io_queues == 0 {
+        return -1
+    }
+
+    let io_queue = &ctrl.io_queues[0]
+
+    var cmd: NVMeCommand = undefined
+    basics.memset(&cmd, 0, basics.sizeof(NVMeCommand))
+    cmd.opcode = NVME_CMD_READ
+    cmd.nsid = nsid
+    cmd.prp1 = basics.virt_to_phys(buffer as u64)
+    cmd.cdw10 = (lba & 0xFFFFFFFF) as u32
+    cmd.cdw11 = (lba >> 32) as u32
+    cmd.cdw12 = count - 1  // 0-based count
+
+    let cid = nvme_submit_command(ctrl, io_queue, &cmd)
+    let cqe = nvme_poll_completion(ctrl, io_queue, cid)
+
+    if cqe == null or (cqe.status >> 1) != 0 {
+        ctrl.errors = ctrl.errors + 1
+        return -1
+    }
+
+    ctrl.reads = ctrl.reads + 1
+    return 0
+}
+
+fn nvme_block_write(dev: *block.BlockDevice, lba: u64, count: u32, buffer: *void): i32 {
+    let priv = dev.private_data as *u64
+    let ctrl = priv[0] as *NVMeController
+    let nsid = priv[1] as u32
+
+    if ctrl.num_io_queues == 0 {
+        return -1
+    }
+
+    let io_queue = &ctrl.io_queues[0]
+
+    var cmd: NVMeCommand = undefined
+    basics.memset(&cmd, 0, basics.sizeof(NVMeCommand))
+    cmd.opcode = NVME_CMD_WRITE
+    cmd.nsid = nsid
+    cmd.prp1 = basics.virt_to_phys(buffer as u64)
+    cmd.cdw10 = (lba & 0xFFFFFFFF) as u32
+    cmd.cdw11 = (lba >> 32) as u32
+    cmd.cdw12 = count - 1
+
+    let cid = nvme_submit_command(ctrl, io_queue, &cmd)
+    let cqe = nvme_poll_completion(ctrl, io_queue, cid)
+
+    if cqe == null or (cqe.status >> 1) != 0 {
+        ctrl.errors = ctrl.errors + 1
+        return -1
+    }
+
+    ctrl.writes = ctrl.writes + 1
+    return 0
+}
+
+fn nvme_block_flush(dev: *block.BlockDevice): i32 {
+    let priv = dev.private_data as *u64
+    let ctrl = priv[0] as *NVMeController
+    let nsid = priv[1] as u32
+
+    if ctrl.num_io_queues == 0 {
+        return -1
+    }
+
+    let io_queue = &ctrl.io_queues[0]
+
+    var cmd: NVMeCommand = undefined
+    basics.memset(&cmd, 0, basics.sizeof(NVMeCommand))
+    cmd.opcode = NVME_CMD_FLUSH
+    cmd.nsid = nsid
+
+    let cid = nvme_submit_command(ctrl, io_queue, &cmd)
+    let cqe = nvme_poll_completion(ctrl, io_queue, cid)
+
+    if cqe == null or (cqe.status >> 1) != 0 {
+        return -1
+    }
+
+    return 0
+}
+
+// ============================================
+// Statistics
+// ============================================
+
+export fn nvme_get_controller_count(): u32 {
+    return num_controllers
+}
+
+export fn nvme_get_controller_info(idx: u32, model: *u8, serial: *u8,
+                                    ns_count: *u32): bool {
+    if idx >= num_controllers {
+        return false
+    }
+
+    let ctrl = &controllers[idx]
+    basics.memcpy(model, &ctrl.model, 40)
+    basics.memcpy(serial, &ctrl.serial, 20)
+    *ns_count = ctrl.num_namespaces
+
+    return true
+}
+
+export fn nvme_get_namespace_info(ctrl_idx: u32, ns_idx: u32,
+                                   block_count: *u64, block_size: *u32): bool {
+    if ctrl_idx >= num_controllers {
+        return false
+    }
+
+    let ctrl = &controllers[ctrl_idx]
+    if ns_idx >= ctrl.num_namespaces {
+        return false
+    }
+
+    let ns = &ctrl.namespaces[ns_idx]
+    *block_count = ns.block_count
+    *block_size = ns.block_size
+
+    return true
+}

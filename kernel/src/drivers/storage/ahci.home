@@ -1,0 +1,817 @@
+// HomeOS AHCI (Advanced Host Controller Interface) Driver
+// SATA storage controller support
+
+const basics = @import("basics")
+const pci = @import("drivers/pci")
+const block = @import("drivers/block")
+
+// ============================================
+// AHCI Constants
+// ============================================
+
+// PCI Class codes
+const PCI_CLASS_STORAGE: u8 = 0x01
+const PCI_SUBCLASS_SATA: u8 = 0x06
+const PCI_PROGIF_AHCI: u8 = 0x01
+
+// Generic Host Control registers
+const AHCI_CAP: u32 = 0x00        // Host Capabilities
+const AHCI_GHC: u32 = 0x04        // Global Host Control
+const AHCI_IS: u32 = 0x08         // Interrupt Status
+const AHCI_PI: u32 = 0x0C         // Ports Implemented
+const AHCI_VS: u32 = 0x10         // Version
+const AHCI_CCC_CTL: u32 = 0x14    // Command Completion Coalescing Control
+const AHCI_CCC_PORTS: u32 = 0x18  // CCC Ports
+const AHCI_EM_LOC: u32 = 0x1C     // Enclosure Management Location
+const AHCI_EM_CTL: u32 = 0x20     // Enclosure Management Control
+const AHCI_CAP2: u32 = 0x24       // Host Capabilities Extended
+const AHCI_BOHC: u32 = 0x28       // BIOS/OS Handoff Control
+
+// GHC bits
+const GHC_HR: u32 = 1 << 0        // HBA Reset
+const GHC_IE: u32 = 1 << 1        // Interrupt Enable
+const GHC_AE: u32 = 1 << 31       // AHCI Enable
+
+// Port registers (offset 0x100 + port * 0x80)
+const PORT_CLB: u32 = 0x00        // Command List Base Address
+const PORT_CLBU: u32 = 0x04       // Command List Base Address Upper 32 bits
+const PORT_FB: u32 = 0x08         // FIS Base Address
+const PORT_FBU: u32 = 0x0C        // FIS Base Address Upper 32 bits
+const PORT_IS: u32 = 0x10         // Interrupt Status
+const PORT_IE: u32 = 0x14         // Interrupt Enable
+const PORT_CMD: u32 = 0x18        // Command and Status
+const PORT_TFD: u32 = 0x20        // Task File Data
+const PORT_SIG: u32 = 0x24        // Signature
+const PORT_SSTS: u32 = 0x28       // SATA Status
+const PORT_SCTL: u32 = 0x2C       // SATA Control
+const PORT_SERR: u32 = 0x30       // SATA Error
+const PORT_SACT: u32 = 0x34       // SATA Active
+const PORT_CI: u32 = 0x38         // Command Issue
+
+// Port CMD bits
+const PORT_CMD_ST: u32 = 1 << 0   // Start
+const PORT_CMD_SUD: u32 = 1 << 1  // Spin-Up Device
+const PORT_CMD_POD: u32 = 1 << 2  // Power On Device
+const PORT_CMD_FRE: u32 = 1 << 4  // FIS Receive Enable
+const PORT_CMD_FR: u32 = 1 << 14  // FIS Receive Running
+const PORT_CMD_CR: u32 = 1 << 15  // Command List Running
+
+// Device signatures
+const SATA_SIG_ATA: u32 = 0x00000101   // SATA drive
+const SATA_SIG_ATAPI: u32 = 0xEB140101 // SATAPI drive
+const SATA_SIG_SEMB: u32 = 0xC33C0101  // Enclosure management bridge
+const SATA_SIG_PM: u32 = 0x96690101    // Port multiplier
+
+// FIS Types
+const FIS_TYPE_REG_H2D: u8 = 0x27      // Register FIS - Host to Device
+const FIS_TYPE_REG_D2H: u8 = 0x34      // Register FIS - Device to Host
+const FIS_TYPE_DMA_ACT: u8 = 0x39      // DMA Activate FIS
+const FIS_TYPE_DMA_SETUP: u8 = 0x41    // DMA Setup FIS
+const FIS_TYPE_DATA: u8 = 0x46         // Data FIS
+const FIS_TYPE_BIST: u8 = 0x58         // BIST Activate FIS
+const FIS_TYPE_PIO_SETUP: u8 = 0x5F    // PIO Setup FIS
+const FIS_TYPE_DEV_BITS: u8 = 0xA1     // Set Device Bits FIS
+
+// ATA Commands
+const ATA_CMD_READ_DMA_EX: u8 = 0x25
+const ATA_CMD_WRITE_DMA_EX: u8 = 0x35
+const ATA_CMD_IDENTIFY: u8 = 0xEC
+const ATA_CMD_IDENTIFY_PACKET: u8 = 0xA1
+const ATA_CMD_FLUSH_CACHE_EX: u8 = 0xEA
+
+// ============================================
+// Data Structures
+// ============================================
+
+// Host to Device Register FIS
+struct FIS_REG_H2D {
+    fis_type: u8
+    flags: u8           // bit 7: C (command), bits 3:0: port multiplier
+    command: u8
+    feature_low: u8
+
+    lba0: u8
+    lba1: u8
+    lba2: u8
+    device: u8
+
+    lba3: u8
+    lba4: u8
+    lba5: u8
+    feature_high: u8
+
+    count_low: u8
+    count_high: u8
+    icc: u8
+    control: u8
+
+    reserved: [4]u8
+}
+
+// Device to Host Register FIS
+struct FIS_REG_D2H {
+    fis_type: u8
+    flags: u8
+    status: u8
+    error: u8
+
+    lba0: u8
+    lba1: u8
+    lba2: u8
+    device: u8
+
+    lba3: u8
+    lba4: u8
+    lba5: u8
+    reserved0: u8
+
+    count_low: u8
+    count_high: u8
+    reserved1: [6]u8
+}
+
+// Command Header (32 bytes)
+struct HBA_CMD_HEADER {
+    flags: u16          // DW0: bits 4:0 = CFL, bit 5 = A, bit 6 = W, bit 7 = P
+    prdtl: u16          // Physical Region Descriptor Table Length
+    prdbc: u32          // PRD Byte Count
+    ctba: u32           // Command Table Base Address
+    ctbau: u32          // Command Table Base Address Upper 32 bits
+    reserved: [4]u32
+}
+
+// Physical Region Descriptor Table Entry
+struct HBA_PRDT_ENTRY {
+    dba: u32            // Data Base Address
+    dbau: u32           // Data Base Address Upper 32 bits
+    reserved: u32
+    dbc: u32            // Data Byte Count (bit 31 = I - Interrupt on completion)
+}
+
+// Command Table
+const MAX_PRDT_ENTRIES: u32 = 8
+
+struct HBA_CMD_TBL {
+    cfis: [64]u8        // Command FIS
+    acmd: [16]u8        // ATAPI Command
+    reserved: [48]u8
+    prdt: [MAX_PRDT_ENTRIES]HBA_PRDT_ENTRY
+}
+
+// Received FIS structure
+struct HBA_FIS {
+    dsfis: [28]u8       // DMA Setup FIS
+    pad0: [4]u8
+    psfis: [20]u8       // PIO Setup FIS
+    pad1: [12]u8
+    rfis: [20]u8        // D2H Register FIS
+    pad2: [4]u8
+    sdbfis: [8]u8       // Set Device Bits FIS
+    ufis: [64]u8        // Unknown FIS
+    reserved: [96]u8
+}
+
+// ============================================
+// AHCI Controller State
+// ============================================
+
+const MAX_AHCI_CONTROLLERS: u32 = 4
+const MAX_PORTS_PER_CONTROLLER: u32 = 32
+const COMMAND_SLOTS: u32 = 32
+
+struct AHCIPort {
+    port_num: u32
+    controller: *AHCIController
+    present: bool
+    device_type: u32     // SATA_SIG_*
+
+    // Memory areas
+    cmd_list: *HBA_CMD_HEADER
+    cmd_tables: [COMMAND_SLOTS]*HBA_CMD_TBL
+    fis: *HBA_FIS
+
+    // Device info
+    sector_count: u64
+    sector_size: u32
+    model: [41]u8
+    serial: [21]u8
+
+    // Block device
+    block_dev: *block.BlockDevice
+
+    // Statistics
+    reads: u64
+    writes: u64
+    errors: u64
+}
+
+struct AHCIController {
+    pci_dev: *pci.PCIDevice
+    abar: u64            // AHCI Base Memory Register
+    num_ports: u32
+    num_cmd_slots: u32
+    supports_64bit: bool
+    supports_ncq: bool
+
+    ports: [MAX_PORTS_PER_CONTROLLER]AHCIPort
+}
+
+var controllers: [MAX_AHCI_CONTROLLERS]AHCIController = undefined
+var num_controllers: u32 = 0
+
+// ============================================
+// MMIO Access
+// ============================================
+
+fn ahci_read32(ctrl: *AHCIController, offset: u32): u32 {
+    let addr = (ctrl.abar + (offset as u64)) as *volatile u32
+    return *addr
+}
+
+fn ahci_write32(ctrl: *AHCIController, offset: u32, value: u32): void {
+    let addr = (ctrl.abar + (offset as u64)) as *volatile u32
+    *addr = value
+}
+
+fn port_read32(port: *AHCIPort, offset: u32): u32 {
+    let port_base = 0x100 + port.port_num * 0x80
+    return ahci_read32(port.controller, port_base + offset)
+}
+
+fn port_write32(port: *AHCIPort, offset: u32, value: u32): void {
+    let port_base = 0x100 + port.port_num * 0x80
+    ahci_write32(port.controller, port_base + offset, value)
+}
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn ahci_init(): void {
+    num_controllers = 0
+
+    // Scan PCI for AHCI controllers
+    pci.pci_scan_class(PCI_CLASS_STORAGE, PCI_SUBCLASS_SATA, PCI_PROGIF_AHCI,
+                       ahci_probe_controller)
+}
+
+fn ahci_probe_controller(dev: *pci.PCIDevice): void {
+    if num_controllers >= MAX_AHCI_CONTROLLERS {
+        return
+    }
+
+    let ctrl = &controllers[num_controllers]
+    ctrl.pci_dev = dev
+
+    // Get ABAR (BAR5)
+    ctrl.abar = pci.pci_read_bar(dev, 5) & ~0xFFF
+
+    if ctrl.abar == 0 {
+        return
+    }
+
+    // Enable bus mastering and memory space
+    pci.pci_enable_bus_master(dev)
+    pci.pci_enable_memory_space(dev)
+
+    // Take ownership from BIOS
+    ahci_bios_handoff(ctrl)
+
+    // Reset controller
+    ahci_reset(ctrl)
+
+    // Enable AHCI mode
+    let ghc = ahci_read32(ctrl, AHCI_GHC)
+    ahci_write32(ctrl, AHCI_GHC, ghc | GHC_AE)
+
+    // Read capabilities
+    let cap = ahci_read32(ctrl, AHCI_CAP)
+    ctrl.num_ports = (cap & 0x1F) + 1
+    ctrl.num_cmd_slots = ((cap >> 8) & 0x1F) + 1
+    ctrl.supports_64bit = (cap & (1 << 31)) != 0
+    ctrl.supports_ncq = (cap & (1 << 30)) != 0
+
+    // Initialize ports
+    let pi = ahci_read32(ctrl, AHCI_PI)
+    var i: u32 = 0
+    while i < 32 {
+        if (pi & (1 << i)) != 0 {
+            ahci_init_port(ctrl, i)
+        }
+        i = i + 1
+    }
+
+    // Enable interrupts
+    ahci_write32(ctrl, AHCI_GHC, ahci_read32(ctrl, AHCI_GHC) | GHC_IE)
+
+    num_controllers = num_controllers + 1
+}
+
+fn ahci_bios_handoff(ctrl: *AHCIController): void {
+    let cap2 = ahci_read32(ctrl, AHCI_CAP2)
+    if (cap2 & 1) == 0 {
+        return  // BIOS handoff not supported
+    }
+
+    let bohc = ahci_read32(ctrl, AHCI_BOHC)
+    if (bohc & 1) == 0 {
+        return  // BIOS doesn't own the controller
+    }
+
+    // Request ownership
+    ahci_write32(ctrl, AHCI_BOHC, bohc | 2)
+
+    // Wait for ownership transfer
+    var timeout: u32 = 25
+    while timeout > 0 {
+        let new_bohc = ahci_read32(ctrl, AHCI_BOHC)
+        if (new_bohc & 1) == 0 {
+            break
+        }
+        basics.sleep_ms(1)
+        timeout = timeout - 1
+    }
+
+    // Clear busy bit
+    ahci_write32(ctrl, AHCI_BOHC, ahci_read32(ctrl, AHCI_BOHC) & ~(1 << 4))
+}
+
+fn ahci_reset(ctrl: *AHCIController): void {
+    ahci_write32(ctrl, AHCI_GHC, GHC_HR)
+
+    // Wait for reset to complete
+    var timeout: u32 = 1000
+    while timeout > 0 {
+        if (ahci_read32(ctrl, AHCI_GHC) & GHC_HR) == 0 {
+            break
+        }
+        basics.sleep_ms(1)
+        timeout = timeout - 1
+    }
+}
+
+// ============================================
+// Port Initialization
+// ============================================
+
+fn ahci_init_port(ctrl: *AHCIController, port_num: u32): void {
+    let port = &ctrl.ports[port_num]
+    port.port_num = port_num
+    port.controller = ctrl
+    port.present = false
+    port.reads = 0
+    port.writes = 0
+    port.errors = 0
+
+    // Stop port
+    ahci_port_stop(port)
+
+    // Allocate command list (1KB aligned)
+    port.cmd_list = basics.aligned_alloc(1024, 1024) as *HBA_CMD_HEADER
+    if port.cmd_list == null {
+        return
+    }
+    basics.memset(port.cmd_list, 0, 1024)
+
+    // Allocate FIS buffer (256 bytes aligned)
+    port.fis = basics.aligned_alloc(256, 256) as *HBA_FIS
+    if port.fis == null {
+        basics.aligned_free(port.cmd_list)
+        return
+    }
+    basics.memset(port.fis, 0, 256)
+
+    // Allocate command tables
+    var i: u32 = 0
+    while i < ctrl.num_cmd_slots {
+        let tbl_size = basics.sizeof(HBA_CMD_TBL)
+        port.cmd_tables[i] = basics.aligned_alloc(128, tbl_size) as *HBA_CMD_TBL
+        if port.cmd_tables[i] != null {
+            basics.memset(port.cmd_tables[i], 0, tbl_size)
+        }
+        i = i + 1
+    }
+
+    // Set up port registers
+    let clb_phys = basics.virt_to_phys(port.cmd_list as u64)
+    let fb_phys = basics.virt_to_phys(port.fis as u64)
+
+    port_write32(port, PORT_CLB, clb_phys as u32)
+    port_write32(port, PORT_CLBU, (clb_phys >> 32) as u32)
+    port_write32(port, PORT_FB, fb_phys as u32)
+    port_write32(port, PORT_FBU, (fb_phys >> 32) as u32)
+
+    // Set up command headers to point to command tables
+    i = 0
+    while i < ctrl.num_cmd_slots {
+        let hdr = &port.cmd_list[i]
+        let tbl_phys = basics.virt_to_phys(port.cmd_tables[i] as u64)
+        hdr.ctba = tbl_phys as u32
+        hdr.ctbau = (tbl_phys >> 32) as u32
+        i = i + 1
+    }
+
+    // Clear error register
+    port_write32(port, PORT_SERR, 0xFFFFFFFF)
+
+    // Enable interrupts
+    port_write32(port, PORT_IE, 0x7DC000FF)
+
+    // Start port
+    ahci_port_start(port)
+
+    // Check for device
+    let ssts = port_read32(port, PORT_SSTS)
+    let det = ssts & 0x0F
+    let ipm = (ssts >> 8) & 0x0F
+
+    if det == 3 and ipm == 1 {
+        port.present = true
+        port.device_type = port_read32(port, PORT_SIG)
+
+        // Identify device
+        if port.device_type == SATA_SIG_ATA {
+            ahci_identify_device(port)
+            ahci_register_block_device(port)
+        }
+    }
+}
+
+fn ahci_port_stop(port: *AHCIPort): void {
+    let cmd = port_read32(port, PORT_CMD)
+
+    // Clear ST and FRE
+    port_write32(port, PORT_CMD, cmd & ~(PORT_CMD_ST | PORT_CMD_FRE))
+
+    // Wait for FR and CR to clear
+    var timeout: u32 = 500
+    while timeout > 0 {
+        let new_cmd = port_read32(port, PORT_CMD)
+        if (new_cmd & (PORT_CMD_FR | PORT_CMD_CR)) == 0 {
+            break
+        }
+        basics.sleep_ms(1)
+        timeout = timeout - 1
+    }
+}
+
+fn ahci_port_start(port: *AHCIPort): void {
+    // Wait for CR to clear
+    var timeout: u32 = 500
+    while timeout > 0 {
+        if (port_read32(port, PORT_CMD) & PORT_CMD_CR) == 0 {
+            break
+        }
+        basics.sleep_ms(1)
+        timeout = timeout - 1
+    }
+
+    // Enable FRE and ST
+    let cmd = port_read32(port, PORT_CMD)
+    port_write32(port, PORT_CMD, cmd | PORT_CMD_FRE | PORT_CMD_ST)
+}
+
+// ============================================
+// Device Identification
+// ============================================
+
+fn ahci_identify_device(port: *AHCIPort): bool {
+    var identify_data: [256]u16 = undefined
+
+    // Set up command
+    let slot = ahci_find_slot(port)
+    if slot < 0 {
+        return false
+    }
+
+    let hdr = &port.cmd_list[slot as u32]
+    let tbl = port.cmd_tables[slot as u32]
+
+    hdr.flags = 5  // FIS length in DWORDs (5 = 20 bytes), not ATAPI
+    hdr.prdtl = 1
+
+    // Set up command FIS
+    let cfis = &tbl.cfis as *FIS_REG_H2D
+    basics.memset(cfis, 0, basics.sizeof(FIS_REG_H2D))
+    cfis.fis_type = FIS_TYPE_REG_H2D
+    cfis.flags = 0x80  // Command
+    cfis.command = ATA_CMD_IDENTIFY
+    cfis.device = 0
+
+    // Set up PRDT
+    let prdt = &tbl.prdt[0]
+    let data_phys = basics.virt_to_phys(&identify_data as u64)
+    prdt.dba = data_phys as u32
+    prdt.dbau = (data_phys >> 32) as u32
+    prdt.dbc = 511  // 512 bytes - 1
+
+    // Issue command
+    port_write32(port, PORT_CI, 1 << (slot as u32))
+
+    // Wait for completion
+    if not ahci_wait_command(port, slot as u32) {
+        return false
+    }
+
+    // Parse identify data
+    port.sector_count = (identify_data[100] as u64) |
+                        ((identify_data[101] as u64) << 16) |
+                        ((identify_data[102] as u64) << 32) |
+                        ((identify_data[103] as u64) << 48)
+
+    // Check for 4K sectors
+    if (identify_data[106] & 0x4000) != 0 and (identify_data[106] & 0x1000) != 0 {
+        port.sector_size = (identify_data[117] as u32) | ((identify_data[118] as u32) << 16)
+        port.sector_size = port.sector_size * 2  // Words to bytes
+    } else {
+        port.sector_size = 512
+    }
+
+    // Copy model and serial
+    copy_ata_string(&port.model, &identify_data[27], 40)
+    copy_ata_string(&port.serial, &identify_data[10], 20)
+
+    return true
+}
+
+fn copy_ata_string(dst: *u8, src: *u16, words: u32): void {
+    var i: u32 = 0
+    while i < words {
+        let word = src[i]
+        dst[i * 2] = (word >> 8) as u8
+        dst[i * 2 + 1] = (word & 0xFF) as u8
+        i = i + 1
+    }
+    dst[words * 2] = 0
+
+    // Trim trailing spaces
+    var j: i32 = (words * 2 - 1) as i32
+    while j >= 0 and (dst[j as u32] == ' ' or dst[j as u32] == 0) {
+        dst[j as u32] = 0
+        j = j - 1
+    }
+}
+
+// ============================================
+// Command Execution
+// ============================================
+
+fn ahci_find_slot(port: *AHCIPort): i32 {
+    let slots = port_read32(port, PORT_SACT) | port_read32(port, PORT_CI)
+
+    var i: u32 = 0
+    while i < port.controller.num_cmd_slots {
+        if (slots & (1 << i)) == 0 {
+            return i as i32
+        }
+        i = i + 1
+    }
+
+    return -1
+}
+
+fn ahci_wait_command(port: *AHCIPort, slot: u32): bool {
+    var timeout: u32 = 5000
+
+    while timeout > 0 {
+        let ci = port_read32(port, PORT_CI)
+        if (ci & (1 << slot)) == 0 {
+            // Check for errors
+            let is = port_read32(port, PORT_IS)
+            if (is & (1 << 30)) != 0 {  // TFES - Task File Error Status
+                port.errors = port.errors + 1
+                port_write32(port, PORT_IS, is)
+                return false
+            }
+            return true
+        }
+
+        basics.sleep_ms(1)
+        timeout = timeout - 1
+    }
+
+    port.errors = port.errors + 1
+    return false
+}
+
+// ============================================
+// Block Device Interface
+// ============================================
+
+fn ahci_register_block_device(port: *AHCIPort): void {
+    let dev = block.block_device_create()
+    if dev == null {
+        return
+    }
+
+    dev.read = ahci_block_read
+    dev.write = ahci_block_write
+    dev.flush = ahci_block_flush
+    dev.sector_size = port.sector_size
+    dev.sector_count = port.sector_count
+    dev.private_data = port as *void
+
+    basics.memcpy(&dev.model, &port.model, 40)
+
+    port.block_dev = dev
+    block.block_device_register(dev)
+}
+
+fn ahci_block_read(dev: *block.BlockDevice, lba: u64, count: u32, buffer: *void): i32 {
+    let port = dev.private_data as *AHCIPort
+
+    let slot = ahci_find_slot(port)
+    if slot < 0 {
+        return -1
+    }
+
+    let hdr = &port.cmd_list[slot as u32]
+    let tbl = port.cmd_tables[slot as u32]
+
+    hdr.flags = 5  // FIS length
+    hdr.prdtl = 1
+
+    // Command FIS
+    let cfis = &tbl.cfis as *FIS_REG_H2D
+    basics.memset(cfis, 0, basics.sizeof(FIS_REG_H2D))
+    cfis.fis_type = FIS_TYPE_REG_H2D
+    cfis.flags = 0x80
+    cfis.command = ATA_CMD_READ_DMA_EX
+    cfis.device = 0x40  // LBA mode
+
+    cfis.lba0 = (lba & 0xFF) as u8
+    cfis.lba1 = ((lba >> 8) & 0xFF) as u8
+    cfis.lba2 = ((lba >> 16) & 0xFF) as u8
+    cfis.lba3 = ((lba >> 24) & 0xFF) as u8
+    cfis.lba4 = ((lba >> 32) & 0xFF) as u8
+    cfis.lba5 = ((lba >> 40) & 0xFF) as u8
+
+    cfis.count_low = (count & 0xFF) as u8
+    cfis.count_high = ((count >> 8) & 0xFF) as u8
+
+    // PRDT
+    let prdt = &tbl.prdt[0]
+    let data_phys = basics.virt_to_phys(buffer as u64)
+    prdt.dba = data_phys as u32
+    prdt.dbau = (data_phys >> 32) as u32
+    prdt.dbc = ((count * dev.sector_size) - 1) as u32
+
+    // Issue and wait
+    port_write32(port, PORT_CI, 1 << (slot as u32))
+
+    if ahci_wait_command(port, slot as u32) {
+        port.reads = port.reads + 1
+        return 0
+    }
+
+    return -1
+}
+
+fn ahci_block_write(dev: *block.BlockDevice, lba: u64, count: u32, buffer: *void): i32 {
+    let port = dev.private_data as *AHCIPort
+
+    let slot = ahci_find_slot(port)
+    if slot < 0 {
+        return -1
+    }
+
+    let hdr = &port.cmd_list[slot as u32]
+    let tbl = port.cmd_tables[slot as u32]
+
+    hdr.flags = 5 | (1 << 6)  // FIS length + Write
+    hdr.prdtl = 1
+
+    let cfis = &tbl.cfis as *FIS_REG_H2D
+    basics.memset(cfis, 0, basics.sizeof(FIS_REG_H2D))
+    cfis.fis_type = FIS_TYPE_REG_H2D
+    cfis.flags = 0x80
+    cfis.command = ATA_CMD_WRITE_DMA_EX
+    cfis.device = 0x40
+
+    cfis.lba0 = (lba & 0xFF) as u8
+    cfis.lba1 = ((lba >> 8) & 0xFF) as u8
+    cfis.lba2 = ((lba >> 16) & 0xFF) as u8
+    cfis.lba3 = ((lba >> 24) & 0xFF) as u8
+    cfis.lba4 = ((lba >> 32) & 0xFF) as u8
+    cfis.lba5 = ((lba >> 40) & 0xFF) as u8
+
+    cfis.count_low = (count & 0xFF) as u8
+    cfis.count_high = ((count >> 8) & 0xFF) as u8
+
+    let prdt = &tbl.prdt[0]
+    let data_phys = basics.virt_to_phys(buffer as u64)
+    prdt.dba = data_phys as u32
+    prdt.dbau = (data_phys >> 32) as u32
+    prdt.dbc = ((count * dev.sector_size) - 1) as u32
+
+    port_write32(port, PORT_CI, 1 << (slot as u32))
+
+    if ahci_wait_command(port, slot as u32) {
+        port.writes = port.writes + 1
+        return 0
+    }
+
+    return -1
+}
+
+fn ahci_block_flush(dev: *block.BlockDevice): i32 {
+    let port = dev.private_data as *AHCIPort
+
+    let slot = ahci_find_slot(port)
+    if slot < 0 {
+        return -1
+    }
+
+    let hdr = &port.cmd_list[slot as u32]
+    let tbl = port.cmd_tables[slot as u32]
+
+    hdr.flags = 5
+    hdr.prdtl = 0
+
+    let cfis = &tbl.cfis as *FIS_REG_H2D
+    basics.memset(cfis, 0, basics.sizeof(FIS_REG_H2D))
+    cfis.fis_type = FIS_TYPE_REG_H2D
+    cfis.flags = 0x80
+    cfis.command = ATA_CMD_FLUSH_CACHE_EX
+    cfis.device = 0
+
+    port_write32(port, PORT_CI, 1 << (slot as u32))
+
+    if ahci_wait_command(port, slot as u32) {
+        return 0
+    }
+
+    return -1
+}
+
+// ============================================
+// Interrupt Handler
+// ============================================
+
+export fn ahci_interrupt_handler(): void {
+    var c: u32 = 0
+    while c < num_controllers {
+        let ctrl = &controllers[c]
+        let is = ahci_read32(ctrl, AHCI_IS)
+
+        if is != 0 {
+            // Check each port
+            var p: u32 = 0
+            while p < 32 {
+                if (is & (1 << p)) != 0 {
+                    ahci_port_interrupt(&ctrl.ports[p])
+                }
+                p = p + 1
+            }
+
+            // Acknowledge controller interrupt
+            ahci_write32(ctrl, AHCI_IS, is)
+        }
+
+        c = c + 1
+    }
+}
+
+fn ahci_port_interrupt(port: *AHCIPort): void {
+    let is = port_read32(port, PORT_IS)
+
+    // Clear interrupt status
+    port_write32(port, PORT_IS, is)
+
+    // Handle errors
+    if (is & (1 << 30)) != 0 {  // TFES
+        let serr = port_read32(port, PORT_SERR)
+        port_write32(port, PORT_SERR, serr)
+        port.errors = port.errors + 1
+    }
+}
+
+// ============================================
+// Statistics
+// ============================================
+
+export fn ahci_get_controller_count(): u32 {
+    return num_controllers
+}
+
+export fn ahci_get_port_info(ctrl_idx: u32, port_idx: u32,
+                             present: *bool, model: *u8, sectors: *u64): bool {
+    if ctrl_idx >= num_controllers {
+        return false
+    }
+
+    let ctrl = &controllers[ctrl_idx]
+    if port_idx >= MAX_PORTS_PER_CONTROLLER {
+        return false
+    }
+
+    let port = &ctrl.ports[port_idx]
+    *present = port.present
+    *sectors = port.sector_count
+
+    if port.present {
+        basics.memcpy(model, &port.model, 40)
+    }
+
+    return true
+}

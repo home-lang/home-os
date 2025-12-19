@@ -1,0 +1,584 @@
+// HomeOS USB Keyboard Driver
+// HID keyboard support for UHCI, EHCI, and XHCI controllers
+
+const basics = @import("basics")
+const usb = @import("drivers/usb")
+const input = @import("drivers/input")
+
+// ============================================
+// USB HID Keyboard Constants
+// ============================================
+
+const USB_CLASS_HID: u8 = 0x03
+const USB_SUBCLASS_BOOT: u8 = 0x01
+const USB_PROTOCOL_KEYBOARD: u8 = 0x01
+
+// HID Report Types
+const HID_REPORT_INPUT: u8 = 0x01
+const HID_REPORT_OUTPUT: u8 = 0x02
+const HID_REPORT_FEATURE: u8 = 0x03
+
+// HID Requests
+const HID_GET_REPORT: u8 = 0x01
+const HID_GET_IDLE: u8 = 0x02
+const HID_GET_PROTOCOL: u8 = 0x03
+const HID_SET_REPORT: u8 = 0x09
+const HID_SET_IDLE: u8 = 0x0A
+const HID_SET_PROTOCOL: u8 = 0x0B
+
+// Keyboard LED bits
+const LED_NUM_LOCK: u8 = 0x01
+const LED_CAPS_LOCK: u8 = 0x02
+const LED_SCROLL_LOCK: u8 = 0x04
+
+// Modifier keys
+const MOD_LEFT_CTRL: u8 = 0x01
+const MOD_LEFT_SHIFT: u8 = 0x02
+const MOD_LEFT_ALT: u8 = 0x04
+const MOD_LEFT_GUI: u8 = 0x08
+const MOD_RIGHT_CTRL: u8 = 0x10
+const MOD_RIGHT_SHIFT: u8 = 0x20
+const MOD_RIGHT_ALT: u8 = 0x40
+const MOD_RIGHT_GUI: u8 = 0x80
+
+// ============================================
+// Boot Protocol Report (8 bytes)
+// ============================================
+
+struct BootKeyboardReport {
+    modifiers: u8      // Modifier keys bitmap
+    reserved: u8       // Reserved (always 0)
+    keys: [6]u8        // Up to 6 simultaneous keys
+}
+
+// ============================================
+// USB Keyboard Device
+// ============================================
+
+const MAX_USB_KEYBOARDS: u32 = 8
+
+struct USBKeyboard {
+    // USB device info
+    device: *usb.USBDevice
+    interface_num: u8
+    endpoint_in: u8
+    endpoint_out: u8
+    max_packet_size: u16
+
+    // State
+    active: bool
+    boot_protocol: bool
+
+    // Current key state
+    current_report: BootKeyboardReport
+    prev_report: BootKeyboardReport
+
+    // LED state
+    led_state: u8
+
+    // Repeat state
+    repeat_key: u8
+    repeat_timer: u64
+    repeat_delay: u32      // ms before repeat starts
+    repeat_rate: u32       // ms between repeats
+
+    // Statistics
+    reports_received: u64
+    errors: u64
+}
+
+var keyboards: [MAX_USB_KEYBOARDS]USBKeyboard = undefined
+var num_keyboards: u32 = 0
+
+// ============================================
+// USB HID Scancode to ASCII Tables
+// ============================================
+
+// Normal (unshifted) characters
+const SCANCODE_TO_ASCII: [256]u8 = [
+    0, 0, 0, 0,                         // 0x00-0x03: Reserved
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',  // 0x04-0x10
+    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',  // 0x11-0x1D
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0',  // 0x1E-0x27
+    '\n', 0x1B, '\b', '\t', ' ',        // Enter, Escape, Backspace, Tab, Space
+    '-', '=', '[', ']', '\\',           // 0x2D-0x31
+    0, ';', '\'', '`', ',', '.', '/',   // 0x32-0x38
+    0,                                   // Caps Lock
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // F1-F12
+    0, 0, 0,                             // PrintScreen, ScrollLock, Pause
+    0, 0, 0, 0,                          // Insert, Home, PageUp, Delete
+    0, 0,                                // End, PageDown
+    0, 0, 0, 0,                          // Arrows: Right, Left, Down, Up
+    0,                                   // NumLock
+    '/', '*', '-', '+', '\n',           // Keypad
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '.',  // Keypad digits
+    // ... rest initialized to 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+// Shifted characters
+const SCANCODE_TO_ASCII_SHIFT: [256]u8 = [
+    0, 0, 0, 0,
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+    'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+    '!', '@', '#', '$', '%', '^', '&', '*', '(', ')',
+    '\n', 0x1B, '\b', '\t', ' ',
+    '_', '+', '{', '}', '|',
+    0, ':', '"', '~', '<', '>', '?',
+    // ... rest same pattern
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn usb_keyboard_init(): void {
+    num_keyboards = 0
+
+    var i: u32 = 0
+    while i < MAX_USB_KEYBOARDS {
+        keyboards[i].active = false
+        keyboards[i].device = null
+        i = i + 1
+    }
+
+    // Register with USB subsystem
+    usb.usb_register_driver(USB_CLASS_HID, USB_SUBCLASS_BOOT,
+                            USB_PROTOCOL_KEYBOARD, usb_keyboard_probe)
+}
+
+// ============================================
+// Device Probe
+// ============================================
+
+fn usb_keyboard_probe(dev: *usb.USBDevice, interface: *usb.USBInterface): i32 {
+    if num_keyboards >= MAX_USB_KEYBOARDS {
+        return -1  // No slots available
+    }
+
+    // Find interrupt IN endpoint
+    var ep_in: u8 = 0
+    var max_packet: u16 = 8
+
+    var i: u32 = 0
+    while i < interface.num_endpoints {
+        let ep = &interface.endpoints[i]
+        if (ep.address & 0x80) != 0 and ep.transfer_type == usb.USB_TRANSFER_INTERRUPT {
+            ep_in = ep.address
+            max_packet = ep.max_packet_size
+            break
+        }
+        i = i + 1
+    }
+
+    if ep_in == 0 {
+        return -1  // No interrupt IN endpoint found
+    }
+
+    // Set up keyboard structure
+    let kbd = &keyboards[num_keyboards]
+    kbd.device = dev
+    kbd.interface_num = interface.interface_number
+    kbd.endpoint_in = ep_in
+    kbd.endpoint_out = 0  // Optional for LEDs
+    kbd.max_packet_size = max_packet
+    kbd.active = true
+    kbd.boot_protocol = true
+    kbd.led_state = 0
+    kbd.repeat_key = 0
+    kbd.repeat_delay = 500
+    kbd.repeat_rate = 30
+    kbd.reports_received = 0
+    kbd.errors = 0
+
+    basics.memset(&kbd.current_report, 0, basics.sizeof(BootKeyboardReport))
+    basics.memset(&kbd.prev_report, 0, basics.sizeof(BootKeyboardReport))
+
+    // Set boot protocol
+    usb_keyboard_set_protocol(kbd, 0)  // 0 = boot protocol
+
+    // Set idle rate (0 = report only on change)
+    usb_keyboard_set_idle(kbd, 0)
+
+    // Find LED endpoint (optional)
+    i = 0
+    while i < interface.num_endpoints {
+        let ep = &interface.endpoints[i]
+        if (ep.address & 0x80) == 0 and ep.transfer_type == usb.USB_TRANSFER_INTERRUPT {
+            kbd.endpoint_out = ep.address
+            break
+        }
+        i = i + 1
+    }
+
+    num_keyboards = num_keyboards + 1
+
+    // Start polling
+    usb_keyboard_start_polling(kbd)
+
+    return 0
+}
+
+// ============================================
+// USB Control Transfers
+// ============================================
+
+fn usb_keyboard_set_protocol(kbd: *USBKeyboard, protocol: u8): i32 {
+    return usb.usb_control_transfer(
+        kbd.device,
+        0x21,              // Host to device, Class, Interface
+        HID_SET_PROTOCOL,
+        protocol as u16,
+        kbd.interface_num as u16,
+        null,
+        0
+    )
+}
+
+fn usb_keyboard_set_idle(kbd: *USBKeyboard, duration: u8): i32 {
+    return usb.usb_control_transfer(
+        kbd.device,
+        0x21,
+        HID_SET_IDLE,
+        (duration as u16) << 8,
+        kbd.interface_num as u16,
+        null,
+        0
+    )
+}
+
+fn usb_keyboard_set_leds(kbd: *USBKeyboard, leds: u8): i32 {
+    var report: [1]u8 = [leds]
+
+    return usb.usb_control_transfer(
+        kbd.device,
+        0x21,
+        HID_SET_REPORT,
+        (HID_REPORT_OUTPUT as u16) << 8,
+        kbd.interface_num as u16,
+        &report as *void,
+        1
+    )
+}
+
+// ============================================
+// Polling and Report Processing
+// ============================================
+
+fn usb_keyboard_start_polling(kbd: *USBKeyboard): void {
+    // Set up interrupt transfer for polling
+    usb.usb_submit_interrupt_transfer(
+        kbd.device,
+        kbd.endpoint_in,
+        &kbd.current_report as *void,
+        8,
+        usb_keyboard_report_callback,
+        kbd as *void
+    )
+}
+
+fn usb_keyboard_report_callback(status: i32, data: *void, length: u32, context: *void): void {
+    let kbd = context as *USBKeyboard
+
+    if status != 0 {
+        kbd.errors = kbd.errors + 1
+        // Re-submit transfer
+        usb_keyboard_start_polling(kbd)
+        return
+    }
+
+    kbd.reports_received = kbd.reports_received + 1
+
+    // Process the report
+    usb_keyboard_process_report(kbd)
+
+    // Save current as previous
+    basics.memcpy(&kbd.prev_report, &kbd.current_report, basics.sizeof(BootKeyboardReport))
+
+    // Re-submit transfer
+    usb_keyboard_start_polling(kbd)
+}
+
+fn usb_keyboard_process_report(kbd: *USBKeyboard): void {
+    let curr = &kbd.current_report
+    let prev = &kbd.prev_report
+
+    // Process modifier changes
+    let mod_changed = curr.modifiers ^ prev.modifiers
+
+    if mod_changed != 0 {
+        process_modifier_change(prev.modifiers, curr.modifiers)
+    }
+
+    // Find newly pressed keys
+    var i: u32 = 0
+    while i < 6 {
+        let key = curr.keys[i]
+        if key != 0 {
+            // Check if this key was already pressed
+            var was_pressed = false
+            var j: u32 = 0
+            while j < 6 {
+                if prev.keys[j] == key {
+                    was_pressed = true
+                    break
+                }
+                j = j + 1
+            }
+
+            if not was_pressed {
+                // New key press
+                process_key_press(key, curr.modifiers)
+                kbd.repeat_key = key
+                kbd.repeat_timer = basics.get_timestamp() + (kbd.repeat_delay as u64) * 1000
+            }
+        }
+        i = i + 1
+    }
+
+    // Find released keys
+    i = 0
+    while i < 6 {
+        let key = prev.keys[i]
+        if key != 0 {
+            var still_pressed = false
+            var j: u32 = 0
+            while j < 6 {
+                if curr.keys[j] == key {
+                    still_pressed = true
+                    break
+                }
+                j = j + 1
+            }
+
+            if not still_pressed {
+                // Key released
+                process_key_release(key)
+                if kbd.repeat_key == key {
+                    kbd.repeat_key = 0
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // Update LEDs based on toggle states
+    update_keyboard_leds(kbd)
+}
+
+fn process_modifier_change(old_mods: u8, new_mods: u8): void {
+    let changed = old_mods ^ new_mods
+
+    if (changed & MOD_LEFT_CTRL) != 0 {
+        input.input_event(input.EV_KEY, input.KEY_LEFTCTRL,
+                         if (new_mods & MOD_LEFT_CTRL) != 0 { 1 } else { 0 })
+    }
+    if (changed & MOD_LEFT_SHIFT) != 0 {
+        input.input_event(input.EV_KEY, input.KEY_LEFTSHIFT,
+                         if (new_mods & MOD_LEFT_SHIFT) != 0 { 1 } else { 0 })
+    }
+    if (changed & MOD_LEFT_ALT) != 0 {
+        input.input_event(input.EV_KEY, input.KEY_LEFTALT,
+                         if (new_mods & MOD_LEFT_ALT) != 0 { 1 } else { 0 })
+    }
+    if (changed & MOD_LEFT_GUI) != 0 {
+        input.input_event(input.EV_KEY, input.KEY_LEFTMETA,
+                         if (new_mods & MOD_LEFT_GUI) != 0 { 1 } else { 0 })
+    }
+    if (changed & MOD_RIGHT_CTRL) != 0 {
+        input.input_event(input.EV_KEY, input.KEY_RIGHTCTRL,
+                         if (new_mods & MOD_RIGHT_CTRL) != 0 { 1 } else { 0 })
+    }
+    if (changed & MOD_RIGHT_SHIFT) != 0 {
+        input.input_event(input.EV_KEY, input.KEY_RIGHTSHIFT,
+                         if (new_mods & MOD_RIGHT_SHIFT) != 0 { 1 } else { 0 })
+    }
+    if (changed & MOD_RIGHT_ALT) != 0 {
+        input.input_event(input.EV_KEY, input.KEY_RIGHTALT,
+                         if (new_mods & MOD_RIGHT_ALT) != 0 { 1 } else { 0 })
+    }
+    if (changed & MOD_RIGHT_GUI) != 0 {
+        input.input_event(input.EV_KEY, input.KEY_RIGHTMETA,
+                         if (new_mods & MOD_RIGHT_GUI) != 0 { 1 } else { 0 })
+    }
+}
+
+fn process_key_press(scancode: u8, modifiers: u8): void {
+    // Convert USB HID scancode to Linux input keycode
+    let keycode = usb_to_linux_keycode(scancode)
+
+    // Send key down event
+    input.input_event(input.EV_KEY, keycode, 1)
+
+    // Also translate to ASCII for console
+    let shifted = (modifiers & (MOD_LEFT_SHIFT | MOD_RIGHT_SHIFT)) != 0
+    let ascii = if shifted {
+        SCANCODE_TO_ASCII_SHIFT[scancode]
+    } else {
+        SCANCODE_TO_ASCII[scancode]
+    }
+
+    if ascii != 0 {
+        input.input_char(ascii)
+    }
+}
+
+fn process_key_release(scancode: u8): void {
+    let keycode = usb_to_linux_keycode(scancode)
+    input.input_event(input.EV_KEY, keycode, 0)
+}
+
+// ============================================
+// LED Management
+// ============================================
+
+var caps_lock_state: bool = false
+var num_lock_state: bool = false
+var scroll_lock_state: bool = false
+
+fn update_keyboard_leds(kbd: *USBKeyboard): void {
+    var new_leds: u8 = 0
+
+    if num_lock_state { new_leds = new_leds | LED_NUM_LOCK }
+    if caps_lock_state { new_leds = new_leds | LED_CAPS_LOCK }
+    if scroll_lock_state { new_leds = new_leds | LED_SCROLL_LOCK }
+
+    if new_leds != kbd.led_state {
+        kbd.led_state = new_leds
+        usb_keyboard_set_leds(kbd, new_leds)
+    }
+}
+
+export fn usb_keyboard_toggle_caps_lock(): void {
+    caps_lock_state = not caps_lock_state
+}
+
+export fn usb_keyboard_toggle_num_lock(): void {
+    num_lock_state = not num_lock_state
+}
+
+export fn usb_keyboard_toggle_scroll_lock(): void {
+    scroll_lock_state = not scroll_lock_state
+}
+
+// ============================================
+// Keycode Conversion
+// ============================================
+
+fn usb_to_linux_keycode(usb_code: u8): u16 {
+    // USB HID to Linux input keycode mapping
+    const USB_TO_LINUX: [256]u16 = [
+        0, 0, 0, 0,                                    // 0x00-0x03
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37,   // a-k (0x04-0x0E)
+        38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47,   // l-v (0x0F-0x19)
+        17, 45, 21, 44,                                // w-z (0x1A-0x1D)
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11,               // 1-0 (0x1E-0x27)
+        28, 1, 14, 15, 57,                             // Enter, Esc, BS, Tab, Space
+        12, 13, 26, 27, 43,                            // -=[]\ (0x2D-0x31)
+        43, 39, 40, 41, 51, 52, 53,                    // ;'`,./
+        58,                                            // Caps Lock
+        59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88, // F1-F12
+        99, 70, 119,                                   // PrtSc, ScrLk, Pause
+        110, 102, 104, 111, 107, 109,                  // Ins, Home, PgUp, Del, End, PgDn
+        106, 105, 108, 103,                            // Right, Left, Down, Up
+        69,                                            // NumLock
+        98, 55, 74, 78, 96,                            // KP / * - + Enter
+        79, 80, 81, 75, 76, 77, 71, 72, 73, 82, 83,   // KP 1-9, 0, .
+        // ... rest
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    ]
+
+    return USB_TO_LINUX[usb_code]
+}
+
+// ============================================
+// Key Repeat Timer
+// ============================================
+
+export fn usb_keyboard_timer_tick(): void {
+    let now = basics.get_timestamp()
+
+    var i: u32 = 0
+    while i < num_keyboards {
+        let kbd = &keyboards[i]
+        if kbd.active and kbd.repeat_key != 0 {
+            if now >= kbd.repeat_timer {
+                // Generate repeat event
+                process_key_press(kbd.repeat_key, kbd.current_report.modifiers)
+                kbd.repeat_timer = now + (kbd.repeat_rate as u64) * 1000
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// Device Removal
+// ============================================
+
+export fn usb_keyboard_disconnect(dev: *usb.USBDevice): void {
+    var i: u32 = 0
+    while i < num_keyboards {
+        if keyboards[i].device == dev {
+            keyboards[i].active = false
+            keyboards[i].device = null
+
+            // Compact array
+            var j: u32 = i
+            while j < num_keyboards - 1 {
+                keyboards[j] = keyboards[j + 1]
+                j = j + 1
+            }
+            num_keyboards = num_keyboards - 1
+            return
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// Statistics
+// ============================================
+
+export fn usb_keyboard_get_count(): u32 {
+    return num_keyboards
+}
+
+export fn usb_keyboard_get_stats(idx: u32, reports: *u64, errors: *u64): bool {
+    if idx >= num_keyboards {
+        return false
+    }
+
+    *reports = keyboards[idx].reports_received
+    *errors = keyboards[idx].errors
+    return true
+}

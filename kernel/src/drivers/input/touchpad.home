@@ -1,0 +1,619 @@
+// HomeOS Touchpad Driver
+// Multi-touch touchpad with gesture recognition
+
+const basics = @import("basics")
+const i2c = @import("drivers/i2c")
+const input = @import("drivers/input/core")
+
+// ============================================
+// Touchpad Types
+// ============================================
+
+const TOUCHPAD_TYPE_PS2: u8 = 0
+const TOUCHPAD_TYPE_I2C: u8 = 1
+const TOUCHPAD_TYPE_USB: u8 = 2
+
+// ============================================
+// Touch Point
+// ============================================
+
+const MAX_TOUCH_POINTS: u32 = 5
+
+struct TouchPoint {
+    id: u8
+    active: bool
+    x: u16
+    y: u16
+    pressure: u8
+    width_major: u8
+    width_minor: u8
+}
+
+// ============================================
+// Gesture Types
+// ============================================
+
+const GESTURE_NONE: u8 = 0
+const GESTURE_TAP: u8 = 1
+const GESTURE_DOUBLE_TAP: u8 = 2
+const GESTURE_TWO_FINGER_TAP: u8 = 3
+const GESTURE_THREE_FINGER_TAP: u8 = 4
+const GESTURE_SCROLL_UP: u8 = 5
+const GESTURE_SCROLL_DOWN: u8 = 6
+const GESTURE_SCROLL_LEFT: u8 = 7
+const GESTURE_SCROLL_RIGHT: u8 = 8
+const GESTURE_PINCH_IN: u8 = 9
+const GESTURE_PINCH_OUT: u8 = 10
+const GESTURE_SWIPE_LEFT: u8 = 11
+const GESTURE_SWIPE_RIGHT: u8 = 12
+const GESTURE_SWIPE_UP: u8 = 13
+const GESTURE_SWIPE_DOWN: u8 = 14
+const GESTURE_THREE_FINGER_SWIPE_LEFT: u8 = 15
+const GESTURE_THREE_FINGER_SWIPE_RIGHT: u8 = 16
+const GESTURE_THREE_FINGER_SWIPE_UP: u8 = 17
+const GESTURE_THREE_FINGER_SWIPE_DOWN: u8 = 18
+const GESTURE_ROTATE_CW: u8 = 19
+const GESTURE_ROTATE_CCW: u8 = 20
+
+// ============================================
+// Touchpad State
+// ============================================
+
+struct TouchpadState {
+    // Hardware info
+    touchpad_type: u8
+    vendor_id: u16
+    product_id: u16
+
+    // Dimensions
+    x_min: u16
+    x_max: u16
+    y_min: u16
+    y_max: u16
+
+    // Current touches
+    touches: [MAX_TOUCH_POINTS]TouchPoint
+    num_touches: u8
+    prev_num_touches: u8
+
+    // Button state
+    buttons: u8
+    prev_buttons: u8
+
+    // Gesture recognition state
+    gesture_start_time: u64
+    gesture_start_touches: [MAX_TOUCH_POINTS]TouchPoint
+    gesture_start_num: u8
+    current_gesture: u8
+
+    // Configuration
+    tap_to_click: bool
+    two_finger_scroll: bool
+    natural_scroll: bool
+    palm_rejection: bool
+    sensitivity: u16
+    scroll_speed: u16
+
+    // Palm rejection
+    palm_threshold: u8
+
+    // Input device
+    input_dev: *input.InputDevice
+
+    // I2C/USB info
+    i2c_addr: u8
+    usb_interface: u8
+
+    // Statistics
+    total_taps: u64
+    total_scrolls: u64
+    total_gestures: u64
+}
+
+// ============================================
+// Global State
+// ============================================
+
+const MAX_TOUCHPADS: u32 = 4
+var touchpads: [MAX_TOUCHPADS]TouchpadState = undefined
+var num_touchpads: u32 = 0
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn touchpad_init(): void {
+    basics.print("[TOUCHPAD] Initializing touchpad driver\n")
+
+    var i: u32 = 0
+    while i < MAX_TOUCHPADS {
+        touchpads[i].input_dev = null
+        touchpads[i].tap_to_click = true
+        touchpads[i].two_finger_scroll = true
+        touchpads[i].natural_scroll = false
+        touchpads[i].palm_rejection = true
+        touchpads[i].sensitivity = 100
+        touchpads[i].scroll_speed = 100
+        touchpads[i].palm_threshold = 200
+        i = i + 1
+    }
+
+    // Probe for I2C touchpads
+    probe_i2c_touchpads()
+
+    basics.print("[TOUCHPAD] Driver initialized, found ")
+    basics.print_u32(num_touchpads)
+    basics.print(" touchpad(s)\n")
+}
+
+fn probe_i2c_touchpads(): void {
+    // Common I2C addresses for touchpads
+    const addresses = [_]u8{ 0x2C, 0x4B, 0x4A, 0x20 }
+
+    var i: u32 = 0
+    while i < addresses.len {
+        if i2c.probe_device(0, addresses[i]) {
+            if detect_touchpad_type(addresses[i]) {
+                init_i2c_touchpad(addresses[i])
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn detect_touchpad_type(addr: u8): bool {
+    // Try to read device ID
+    var id_buf: [2]u8 = undefined
+
+    if i2c.read_register(0, addr, 0x00, &id_buf, 2) == 0 {
+        let vendor = (id_buf[0] as u16 << 8) | id_buf[1] as u16
+        // Known touchpad vendors
+        return vendor == 0x06CB or  // Synaptics
+               vendor == 0x04F3 or  // Elan
+               vendor == 0x0002     // Alps
+    }
+
+    return false
+}
+
+fn init_i2c_touchpad(addr: u8): void {
+    if num_touchpads >= MAX_TOUCHPADS {
+        return
+    }
+
+    let tp = &touchpads[num_touchpads]
+
+    tp.touchpad_type = TOUCHPAD_TYPE_I2C
+    tp.i2c_addr = addr
+
+    // Read capabilities
+    var caps: [8]u8 = undefined
+    i2c.read_register(0, addr, 0x01, &caps, 8)
+
+    tp.x_min = 0
+    tp.x_max = (caps[0] as u16 << 8) | caps[1] as u16
+    tp.y_min = 0
+    tp.y_max = (caps[2] as u16 << 8) | caps[3] as u16
+
+    if tp.x_max == 0 { tp.x_max = 1024 }
+    if tp.y_max == 0 { tp.y_max = 768 }
+
+    // Initialize touches
+    var i: u32 = 0
+    while i < MAX_TOUCH_POINTS {
+        tp.touches[i].active = false
+        tp.touches[i].id = i as u8
+        i = i + 1
+    }
+
+    // Register input device
+    tp.input_dev = input.register_device(input.INPUT_TYPE_TOUCHPAD, "I2C Touchpad")
+    if tp.input_dev == null {
+        return
+    }
+
+    // Set capabilities
+    input.set_capability(tp.input_dev, input.EV_KEY, input.BTN_LEFT)
+    input.set_capability(tp.input_dev, input.EV_KEY, input.BTN_RIGHT)
+    input.set_capability(tp.input_dev, input.EV_KEY, input.BTN_MIDDLE)
+    input.set_capability(tp.input_dev, input.EV_ABS, input.ABS_X)
+    input.set_capability(tp.input_dev, input.EV_ABS, input.ABS_Y)
+    input.set_capability(tp.input_dev, input.EV_ABS, input.ABS_PRESSURE)
+    input.set_capability(tp.input_dev, input.EV_ABS, input.ABS_MT_SLOT)
+    input.set_capability(tp.input_dev, input.EV_ABS, input.ABS_MT_POSITION_X)
+    input.set_capability(tp.input_dev, input.EV_ABS, input.ABS_MT_POSITION_Y)
+    input.set_capability(tp.input_dev, input.EV_ABS, input.ABS_MT_TRACKING_ID)
+
+    // Set absolute axis info
+    input.set_abs_info(tp.input_dev, input.ABS_X, tp.x_min as i32, tp.x_max as i32, 0, 0)
+    input.set_abs_info(tp.input_dev, input.ABS_Y, tp.y_min as i32, tp.y_max as i32, 0, 0)
+    input.set_abs_info(tp.input_dev, input.ABS_MT_POSITION_X, tp.x_min as i32, tp.x_max as i32, 0, 0)
+    input.set_abs_info(tp.input_dev, input.ABS_MT_POSITION_Y, tp.y_min as i32, tp.y_max as i32, 0, 0)
+    input.set_abs_info(tp.input_dev, input.ABS_MT_SLOT, 0, MAX_TOUCH_POINTS as i32 - 1, 0, 0)
+
+    // Enable device
+    i2c.write_register(0, addr, 0x05, 0x01)  // Enable reporting
+
+    num_touchpads = num_touchpads + 1
+}
+
+// ============================================
+// Polling
+// ============================================
+
+export fn touchpad_poll(): void {
+    var i: u32 = 0
+    while i < num_touchpads {
+        let tp = &touchpads[i]
+
+        if tp.touchpad_type == TOUCHPAD_TYPE_I2C {
+            poll_i2c_touchpad(tp)
+        }
+
+        i = i + 1
+    }
+}
+
+fn poll_i2c_touchpad(tp: *TouchpadState): void {
+    var report: [32]u8 = undefined
+
+    if i2c.read_register(0, tp.i2c_addr, 0x10, &report, 32) != 0 {
+        return
+    }
+
+    // Parse report
+    tp.prev_num_touches = tp.num_touches
+    tp.prev_buttons = tp.buttons
+
+    tp.buttons = report[0] & 0x07
+    tp.num_touches = (report[1] & 0x0F) as u8
+
+    if tp.num_touches > MAX_TOUCH_POINTS as u8 {
+        tp.num_touches = MAX_TOUCH_POINTS as u8
+    }
+
+    // Parse touch points
+    var touch_idx: u32 = 0
+    var report_idx: u32 = 2
+
+    while touch_idx < tp.num_touches as u32 {
+        let touch = &tp.touches[touch_idx]
+
+        touch.active = true
+        touch.id = report[report_idx] & 0x0F
+        touch.x = (report[report_idx + 1] as u16 << 4) | ((report[report_idx + 3] >> 4) as u16)
+        touch.y = (report[report_idx + 2] as u16 << 4) | (report[report_idx + 3] & 0x0F) as u16
+        touch.pressure = report[report_idx + 4]
+        touch.width_major = report[report_idx + 5]
+        touch.width_minor = report[report_idx + 6]
+
+        report_idx = report_idx + 7
+        touch_idx = touch_idx + 1
+    }
+
+    // Mark remaining touches as inactive
+    while touch_idx < MAX_TOUCH_POINTS {
+        tp.touches[touch_idx].active = false
+        touch_idx = touch_idx + 1
+    }
+
+    // Process
+    process_touchpad_input(tp)
+}
+
+fn process_touchpad_input(tp: *TouchpadState): void {
+    // Palm rejection
+    if tp.palm_rejection {
+        var i: u32 = 0
+        while i < tp.num_touches as u32 {
+            let touch = &tp.touches[i]
+            if touch.width_major > tp.palm_threshold or touch.width_minor > tp.palm_threshold {
+                touch.active = false
+            }
+            i = i + 1
+        }
+    }
+
+    // Count active touches
+    var active_count: u8 = 0
+    var i: u32 = 0
+    while i < MAX_TOUCH_POINTS {
+        if tp.touches[i].active {
+            active_count = active_count + 1
+        }
+        i = i + 1
+    }
+
+    // Gesture recognition
+    recognize_gestures(tp, active_count)
+
+    // Report multi-touch
+    i = 0
+    while i < MAX_TOUCH_POINTS {
+        let touch = &tp.touches[i]
+
+        input.report_abs(tp.input_dev, input.ABS_MT_SLOT, i as i32)
+
+        if touch.active {
+            input.report_abs(tp.input_dev, input.ABS_MT_TRACKING_ID, touch.id as i32)
+            input.report_abs(tp.input_dev, input.ABS_MT_POSITION_X, touch.x as i32)
+            input.report_abs(tp.input_dev, input.ABS_MT_POSITION_Y, touch.y as i32)
+            input.report_abs(tp.input_dev, input.ABS_PRESSURE, touch.pressure as i32)
+        } else {
+            input.report_abs(tp.input_dev, input.ABS_MT_TRACKING_ID, -1)
+        }
+
+        i = i + 1
+    }
+
+    // Report primary touch position
+    if active_count > 0 {
+        i = 0
+        while i < MAX_TOUCH_POINTS {
+            if tp.touches[i].active {
+                input.report_abs(tp.input_dev, input.ABS_X, tp.touches[i].x as i32)
+                input.report_abs(tp.input_dev, input.ABS_Y, tp.touches[i].y as i32)
+                break
+            }
+            i = i + 1
+        }
+    }
+
+    // Report buttons
+    let btn_changed = tp.buttons ^ tp.prev_buttons
+    if (btn_changed & 0x01) != 0 {
+        input.report_key(tp.input_dev, input.BTN_LEFT, (tp.buttons & 0x01) != 0)
+    }
+    if (btn_changed & 0x02) != 0 {
+        input.report_key(tp.input_dev, input.BTN_RIGHT, (tp.buttons & 0x02) != 0)
+    }
+    if (btn_changed & 0x04) != 0 {
+        input.report_key(tp.input_dev, input.BTN_MIDDLE, (tp.buttons & 0x04) != 0)
+    }
+
+    input.report_sync(tp.input_dev)
+}
+
+// ============================================
+// Gesture Recognition
+// ============================================
+
+fn recognize_gestures(tp: *TouchpadState, active_count: u8): void {
+    let now = basics.get_timestamp()
+
+    // Detect gesture start
+    if tp.prev_num_touches == 0 and active_count > 0 {
+        tp.gesture_start_time = now
+        tp.gesture_start_num = active_count
+
+        var i: u32 = 0
+        while i < MAX_TOUCH_POINTS {
+            tp.gesture_start_touches[i] = tp.touches[i]
+            i = i + 1
+        }
+
+        tp.current_gesture = GESTURE_NONE
+    }
+
+    // Detect gesture end
+    if tp.prev_num_touches > 0 and active_count == 0 {
+        let duration = now - tp.gesture_start_time
+
+        // Check for tap
+        if duration < 200000000 {  // 200ms
+            if tp.tap_to_click {
+                if tp.gesture_start_num == 1 {
+                    generate_tap(tp, GESTURE_TAP)
+                } else if tp.gesture_start_num == 2 {
+                    generate_tap(tp, GESTURE_TWO_FINGER_TAP)
+                } else if tp.gesture_start_num == 3 {
+                    generate_tap(tp, GESTURE_THREE_FINGER_TAP)
+                }
+            }
+        }
+
+        tp.current_gesture = GESTURE_NONE
+        return
+    }
+
+    // Ongoing gestures
+    if active_count >= 2 {
+        // Two finger scroll
+        if tp.two_finger_scroll and active_count == 2 {
+            let dx = calculate_avg_delta_x(tp)
+            let dy = calculate_avg_delta_y(tp)
+
+            if basics.abs(dy) > 5 {
+                var scroll = dy
+                if tp.natural_scroll {
+                    scroll = -scroll
+                }
+                scroll = (scroll * tp.scroll_speed as i32) / 100
+                input.report_rel(tp.input_dev, input.REL_WHEEL, -scroll / 10)
+                tp.total_scrolls = tp.total_scrolls + 1
+            }
+
+            if basics.abs(dx) > 5 {
+                var h_scroll = dx
+                if tp.natural_scroll {
+                    h_scroll = -h_scroll
+                }
+                h_scroll = (h_scroll * tp.scroll_speed as i32) / 100
+                input.report_rel(tp.input_dev, input.REL_HWHEEL, h_scroll / 10)
+            }
+        }
+
+        // Pinch gesture
+        if active_count == 2 {
+            let initial_dist = calculate_initial_distance(tp)
+            let current_dist = calculate_current_distance(tp)
+
+            if initial_dist > 0 {
+                let ratio = (current_dist * 100) / initial_dist
+
+                if ratio < 80 {
+                    tp.current_gesture = GESTURE_PINCH_IN
+                    tp.total_gestures = tp.total_gestures + 1
+                } else if ratio > 120 {
+                    tp.current_gesture = GESTURE_PINCH_OUT
+                    tp.total_gestures = tp.total_gestures + 1
+                }
+            }
+        }
+    }
+}
+
+fn generate_tap(tp: *TouchpadState, gesture: u8): void {
+    if gesture == GESTURE_TAP {
+        // Single tap = left click
+        input.report_key(tp.input_dev, input.BTN_LEFT, true)
+        input.report_sync(tp.input_dev)
+        input.report_key(tp.input_dev, input.BTN_LEFT, false)
+        input.report_sync(tp.input_dev)
+        tp.total_taps = tp.total_taps + 1
+    } else if gesture == GESTURE_TWO_FINGER_TAP {
+        // Two finger tap = right click
+        input.report_key(tp.input_dev, input.BTN_RIGHT, true)
+        input.report_sync(tp.input_dev)
+        input.report_key(tp.input_dev, input.BTN_RIGHT, false)
+        input.report_sync(tp.input_dev)
+        tp.total_taps = tp.total_taps + 1
+    } else if gesture == GESTURE_THREE_FINGER_TAP {
+        // Three finger tap = middle click
+        input.report_key(tp.input_dev, input.BTN_MIDDLE, true)
+        input.report_sync(tp.input_dev)
+        input.report_key(tp.input_dev, input.BTN_MIDDLE, false)
+        input.report_sync(tp.input_dev)
+        tp.total_taps = tp.total_taps + 1
+    }
+}
+
+fn calculate_avg_delta_x(tp: *TouchpadState): i32 {
+    var sum: i32 = 0
+    var count: i32 = 0
+
+    var i: u32 = 0
+    while i < MAX_TOUCH_POINTS {
+        if tp.touches[i].active and tp.gesture_start_touches[i].active {
+            sum = sum + (tp.touches[i].x as i32 - tp.gesture_start_touches[i].x as i32)
+            count = count + 1
+        }
+        i = i + 1
+    }
+
+    if count > 0 {
+        return sum / count
+    }
+    return 0
+}
+
+fn calculate_avg_delta_y(tp: *TouchpadState): i32 {
+    var sum: i32 = 0
+    var count: i32 = 0
+
+    var i: u32 = 0
+    while i < MAX_TOUCH_POINTS {
+        if tp.touches[i].active and tp.gesture_start_touches[i].active {
+            sum = sum + (tp.touches[i].y as i32 - tp.gesture_start_touches[i].y as i32)
+            count = count + 1
+        }
+        i = i + 1
+    }
+
+    if count > 0 {
+        return sum / count
+    }
+    return 0
+}
+
+fn calculate_initial_distance(tp: *TouchpadState): i32 {
+    var p1: *TouchPoint = null
+    var p2: *TouchPoint = null
+
+    var i: u32 = 0
+    while i < MAX_TOUCH_POINTS {
+        if tp.gesture_start_touches[i].active {
+            if p1 == null {
+                p1 = &tp.gesture_start_touches[i]
+            } else {
+                p2 = &tp.gesture_start_touches[i]
+                break
+            }
+        }
+        i = i + 1
+    }
+
+    if p1 != null and p2 != null {
+        let dx = p2.x as i32 - p1.x as i32
+        let dy = p2.y as i32 - p1.y as i32
+        return basics.isqrt(dx * dx + dy * dy)
+    }
+
+    return 0
+}
+
+fn calculate_current_distance(tp: *TouchpadState): i32 {
+    var p1: *TouchPoint = null
+    var p2: *TouchPoint = null
+
+    var i: u32 = 0
+    while i < MAX_TOUCH_POINTS {
+        if tp.touches[i].active {
+            if p1 == null {
+                p1 = &tp.touches[i]
+            } else {
+                p2 = &tp.touches[i]
+                break
+            }
+        }
+        i = i + 1
+    }
+
+    if p1 != null and p2 != null {
+        let dx = p2.x as i32 - p1.x as i32
+        let dy = p2.y as i32 - p1.y as i32
+        return basics.isqrt(dx * dx + dy * dy)
+    }
+
+    return 0
+}
+
+// ============================================
+// Configuration
+// ============================================
+
+export fn touchpad_set_tap_to_click(tp_id: u32, enabled: bool): bool {
+    if tp_id >= num_touchpads {
+        return false
+    }
+    touchpads[tp_id].tap_to_click = enabled
+    return true
+}
+
+export fn touchpad_set_two_finger_scroll(tp_id: u32, enabled: bool): bool {
+    if tp_id >= num_touchpads {
+        return false
+    }
+    touchpads[tp_id].two_finger_scroll = enabled
+    return true
+}
+
+export fn touchpad_set_natural_scroll(tp_id: u32, enabled: bool): bool {
+    if tp_id >= num_touchpads {
+        return false
+    }
+    touchpads[tp_id].natural_scroll = enabled
+    return true
+}
+
+export fn touchpad_set_sensitivity(tp_id: u32, sensitivity: u16): bool {
+    if tp_id >= num_touchpads {
+        return false
+    }
+    touchpads[tp_id].sensitivity = sensitivity
+    return true
+}
+
+export fn touchpad_get_count(): u32 {
+    return num_touchpads
+}

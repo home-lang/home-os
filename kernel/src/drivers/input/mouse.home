@@ -1,0 +1,414 @@
+// HomeOS USB Mouse Driver
+// HID compliant mouse with scroll wheel support
+
+const basics = @import("basics")
+const usb = @import("drivers/usb/core")
+const hid = @import("drivers/usb/hid")
+const input = @import("drivers/input/core")
+
+// ============================================
+// Mouse Button Definitions
+// ============================================
+
+const MOUSE_BTN_LEFT: u8 = 0x01
+const MOUSE_BTN_RIGHT: u8 = 0x02
+const MOUSE_BTN_MIDDLE: u8 = 0x04
+const MOUSE_BTN_SIDE: u8 = 0x08
+const MOUSE_BTN_EXTRA: u8 = 0x10
+
+// ============================================
+// Mouse Report Format
+// ============================================
+
+struct MouseReport {
+    buttons: u8
+    x_movement: i8
+    y_movement: i8
+    wheel: i8
+    h_wheel: i8  // Horizontal scroll (optional)
+}
+
+// ============================================
+// Mouse State
+// ============================================
+
+struct MouseState {
+    // Button state
+    buttons: u8
+    prev_buttons: u8
+
+    // Position (absolute or relative depending on mode)
+    x: i32
+    y: i32
+
+    // Scroll accumulators
+    scroll_y: i32
+    scroll_x: i32
+
+    // Configuration
+    sensitivity: u16     // Movement multiplier (100 = 1.0x)
+    scroll_speed: u16    // Scroll multiplier
+    swap_buttons: bool   // Swap left/right
+    natural_scroll: bool // Invert scroll direction
+
+    // USB device info
+    device: *usb.USBDevice
+    interface: u8
+    endpoint: u8
+
+    // Input device handle
+    input_dev: *input.InputDevice
+
+    // Double click detection
+    last_click_time: u64
+    click_count: u32
+    double_click_threshold: u32  // ms
+
+    // Statistics
+    total_clicks: u64
+    total_distance: u64
+}
+
+// ============================================
+// Global State
+// ============================================
+
+const MAX_MICE: u32 = 8
+var mice: [MAX_MICE]MouseState = undefined
+var num_mice: u32 = 0
+
+// ============================================
+// USB Mouse Driver
+// ============================================
+
+export fn mouse_init(): void {
+    basics.print("[MOUSE] Initializing USB mouse driver\n")
+
+    var i: u32 = 0
+    while i < MAX_MICE {
+        mice[i].device = null
+        mice[i].input_dev = null
+        mice[i].sensitivity = 100
+        mice[i].scroll_speed = 100
+        mice[i].swap_buttons = false
+        mice[i].natural_scroll = false
+        mice[i].double_click_threshold = 400
+        i = i + 1
+    }
+
+    // Register with USB subsystem
+    usb.register_driver(&mouse_usb_driver)
+
+    basics.print("[MOUSE] Driver initialized\n")
+}
+
+const mouse_usb_driver = usb.USBDriver {
+    .name = "mouse",
+    .id_table = &mouse_id_table,
+    .probe = mouse_probe,
+    .disconnect = mouse_disconnect,
+}
+
+const mouse_id_table = [_]usb.USBDeviceID {
+    // Generic HID mouse
+    usb.USBDeviceID {
+        .match_flags = usb.USB_DEVICE_ID_MATCH_INT_CLASS | usb.USB_DEVICE_ID_MATCH_INT_SUBCLASS | usb.USB_DEVICE_ID_MATCH_INT_PROTOCOL,
+        .bInterfaceClass = usb.USB_CLASS_HID,
+        .bInterfaceSubClass = 0x01,  // Boot interface
+        .bInterfaceProtocol = 0x02,  // Mouse
+    },
+}
+
+fn mouse_probe(device: *usb.USBDevice, interface: *usb.USBInterface): i32 {
+    if num_mice >= MAX_MICE {
+        return -1
+    }
+
+    let mouse = &mice[num_mice]
+
+    // Initialize mouse state
+    mouse.device = device
+    mouse.interface = interface.bInterfaceNumber
+    mouse.buttons = 0
+    mouse.prev_buttons = 0
+    mouse.x = 0
+    mouse.y = 0
+    mouse.scroll_x = 0
+    mouse.scroll_y = 0
+    mouse.total_clicks = 0
+    mouse.total_distance = 0
+    mouse.last_click_time = 0
+    mouse.click_count = 0
+
+    // Find interrupt IN endpoint
+    var i: u32 = 0
+    while i < interface.bNumEndpoints {
+        let ep = &interface.endpoints[i]
+        if (ep.bmAttributes & 0x03) == usb.USB_ENDPOINT_XFER_INT {
+            if (ep.bEndpointAddress & 0x80) != 0 {
+                mouse.endpoint = ep.bEndpointAddress
+                break
+            }
+        }
+        i = i + 1
+    }
+
+    // Set boot protocol
+    hid.set_protocol(device, interface.bInterfaceNumber, hid.HID_BOOT_PROTOCOL)
+
+    // Set idle rate (infinite)
+    hid.set_idle(device, interface.bInterfaceNumber, 0, 0)
+
+    // Register input device
+    mouse.input_dev = input.register_device(input.INPUT_TYPE_MOUSE, "USB Mouse")
+    if mouse.input_dev == null {
+        return -1
+    }
+
+    // Set up capabilities
+    input.set_capability(mouse.input_dev, input.EV_KEY, input.BTN_LEFT)
+    input.set_capability(mouse.input_dev, input.EV_KEY, input.BTN_RIGHT)
+    input.set_capability(mouse.input_dev, input.EV_KEY, input.BTN_MIDDLE)
+    input.set_capability(mouse.input_dev, input.EV_REL, input.REL_X)
+    input.set_capability(mouse.input_dev, input.EV_REL, input.REL_Y)
+    input.set_capability(mouse.input_dev, input.EV_REL, input.REL_WHEEL)
+    input.set_capability(mouse.input_dev, input.EV_REL, input.REL_HWHEEL)
+
+    // Start polling
+    usb.submit_int_urb(device, mouse.endpoint, &mouse_report_buffer, 8, mouse_irq_handler, mouse)
+
+    num_mice = num_mice + 1
+
+    basics.print("[MOUSE] USB mouse connected\n")
+    return 0
+}
+
+fn mouse_disconnect(device: *usb.USBDevice, interface: *usb.USBInterface): void {
+    var i: u32 = 0
+    while i < num_mice {
+        if mice[i].device == device {
+            // Unregister input device
+            if mice[i].input_dev != null {
+                input.unregister_device(mice[i].input_dev)
+            }
+
+            // Remove from array
+            while i < num_mice - 1 {
+                mice[i] = mice[i + 1]
+                i = i + 1
+            }
+            num_mice = num_mice - 1
+
+            basics.print("[MOUSE] USB mouse disconnected\n")
+            return
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// Report Handling
+// ============================================
+
+var mouse_report_buffer: [8]u8 = undefined
+
+fn mouse_irq_handler(urb: *usb.URB): void {
+    let mouse = urb.context as *MouseState
+
+    if urb.status != 0 {
+        // Re-submit URB
+        usb.submit_int_urb(mouse.device, mouse.endpoint, &mouse_report_buffer, 8, mouse_irq_handler, mouse)
+        return
+    }
+
+    // Parse report
+    let report = MouseReport {
+        .buttons = mouse_report_buffer[0],
+        .x_movement = mouse_report_buffer[1] as i8,
+        .y_movement = mouse_report_buffer[2] as i8,
+        .wheel = if urb.actual_length > 3 { mouse_report_buffer[3] as i8 } else { 0 },
+        .h_wheel = if urb.actual_length > 4 { mouse_report_buffer[4] as i8 } else { 0 },
+    }
+
+    process_mouse_report(mouse, &report)
+
+    // Re-submit URB
+    usb.submit_int_urb(mouse.device, mouse.endpoint, &mouse_report_buffer, 8, mouse_irq_handler, mouse)
+}
+
+fn process_mouse_report(mouse: *MouseState, report: *MouseReport): void {
+    // Apply button swapping
+    var buttons = report.buttons
+    if mouse.swap_buttons {
+        let left = buttons & MOUSE_BTN_LEFT
+        let right = buttons & MOUSE_BTN_RIGHT
+        buttons = (buttons & ~(MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT)) | (left << 1) | (right >> 1)
+    }
+
+    // Process button changes
+    let changed = buttons ^ mouse.prev_buttons
+
+    if (changed & MOUSE_BTN_LEFT) != 0 {
+        let pressed = (buttons & MOUSE_BTN_LEFT) != 0
+        input.report_key(mouse.input_dev, input.BTN_LEFT, pressed)
+        if pressed {
+            handle_click(mouse)
+        }
+    }
+
+    if (changed & MOUSE_BTN_RIGHT) != 0 {
+        input.report_key(mouse.input_dev, input.BTN_RIGHT, (buttons & MOUSE_BTN_RIGHT) != 0)
+    }
+
+    if (changed & MOUSE_BTN_MIDDLE) != 0 {
+        input.report_key(mouse.input_dev, input.BTN_MIDDLE, (buttons & MOUSE_BTN_MIDDLE) != 0)
+    }
+
+    if (changed & MOUSE_BTN_SIDE) != 0 {
+        input.report_key(mouse.input_dev, input.BTN_SIDE, (buttons & MOUSE_BTN_SIDE) != 0)
+    }
+
+    if (changed & MOUSE_BTN_EXTRA) != 0 {
+        input.report_key(mouse.input_dev, input.BTN_EXTRA, (buttons & MOUSE_BTN_EXTRA) != 0)
+    }
+
+    mouse.prev_buttons = buttons
+    mouse.buttons = buttons
+
+    // Process movement with sensitivity
+    let dx = (report.x_movement as i32 * mouse.sensitivity as i32) / 100
+    let dy = (report.y_movement as i32 * mouse.sensitivity as i32) / 100
+
+    if dx != 0 {
+        input.report_rel(mouse.input_dev, input.REL_X, dx)
+        mouse.x = mouse.x + dx
+    }
+
+    if dy != 0 {
+        input.report_rel(mouse.input_dev, input.REL_Y, dy)
+        mouse.y = mouse.y + dy
+    }
+
+    // Track movement distance
+    if dx != 0 or dy != 0 {
+        mouse.total_distance = mouse.total_distance + basics.abs(dx) as u64 + basics.abs(dy) as u64
+    }
+
+    // Process scroll
+    if report.wheel != 0 {
+        var wheel = (report.wheel as i32 * mouse.scroll_speed as i32) / 100
+        if mouse.natural_scroll {
+            wheel = -wheel
+        }
+        input.report_rel(mouse.input_dev, input.REL_WHEEL, wheel)
+        mouse.scroll_y = mouse.scroll_y + wheel
+    }
+
+    if report.h_wheel != 0 {
+        var h_wheel = (report.h_wheel as i32 * mouse.scroll_speed as i32) / 100
+        if mouse.natural_scroll {
+            h_wheel = -h_wheel
+        }
+        input.report_rel(mouse.input_dev, input.REL_HWHEEL, h_wheel)
+        mouse.scroll_x = mouse.scroll_x + h_wheel
+    }
+
+    // Sync event
+    input.report_sync(mouse.input_dev)
+}
+
+fn handle_click(mouse: *MouseState): void {
+    let now = basics.get_timestamp()
+    let elapsed = now - mouse.last_click_time
+
+    if elapsed < mouse.double_click_threshold as u64 * 1000000 {
+        mouse.click_count = mouse.click_count + 1
+        if mouse.click_count == 2 {
+            // Double click detected
+            input.report_key(mouse.input_dev, input.BTN_DOUBLE, true)
+            input.report_key(mouse.input_dev, input.BTN_DOUBLE, false)
+            mouse.click_count = 0
+        }
+    } else {
+        mouse.click_count = 1
+    }
+
+    mouse.last_click_time = now
+    mouse.total_clicks = mouse.total_clicks + 1
+}
+
+// ============================================
+// Configuration
+// ============================================
+
+export fn mouse_set_sensitivity(mouse_id: u32, sensitivity: u16): bool {
+    if mouse_id >= num_mice {
+        return false
+    }
+
+    mice[mouse_id].sensitivity = sensitivity
+    return true
+}
+
+export fn mouse_set_scroll_speed(mouse_id: u32, speed: u16): bool {
+    if mouse_id >= num_mice {
+        return false
+    }
+
+    mice[mouse_id].scroll_speed = speed
+    return true
+}
+
+export fn mouse_set_swap_buttons(mouse_id: u32, swap: bool): bool {
+    if mouse_id >= num_mice {
+        return false
+    }
+
+    mice[mouse_id].swap_buttons = swap
+    return true
+}
+
+export fn mouse_set_natural_scroll(mouse_id: u32, natural: bool): bool {
+    if mouse_id >= num_mice {
+        return false
+    }
+
+    mice[mouse_id].natural_scroll = natural
+    return true
+}
+
+// ============================================
+// Statistics
+// ============================================
+
+export fn mouse_get_stats(mouse_id: u32, clicks: *u64, distance: *u64): bool {
+    if mouse_id >= num_mice {
+        return false
+    }
+
+    *clicks = mice[mouse_id].total_clicks
+    *distance = mice[mouse_id].total_distance
+    return true
+}
+
+export fn mouse_get_position(mouse_id: u32, x: *i32, y: *i32): bool {
+    if mouse_id >= num_mice {
+        return false
+    }
+
+    *x = mice[mouse_id].x
+    *y = mice[mouse_id].y
+    return true
+}
+
+export fn mouse_get_buttons(mouse_id: u32): u8 {
+    if mouse_id >= num_mice {
+        return 0
+    }
+
+    return mice[mouse_id].buttons
+}
+
+export fn mouse_get_count(): u32 {
+    return num_mice
+}
