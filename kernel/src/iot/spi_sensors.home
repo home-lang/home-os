@@ -1,0 +1,809 @@
+// home-os SPI Sensor Drivers
+// Support for MAX31855, MCP3008, ADXL345, NRF24L01, and more
+
+import "../core/foundation.home" as foundation
+import "../drivers/spi.home" as spi
+
+// ============================================================================
+// SPI Sensor Types
+// ============================================================================
+
+const SPI_SENSOR_MAX31855: u8 = 0      // Thermocouple amplifier
+const SPI_SENSOR_MAX31865: u8 = 1      // RTD-to-Digital converter
+const SPI_SENSOR_MCP3008: u8 = 2       // 10-bit 8-channel ADC
+const SPI_SENSOR_MCP3208: u8 = 3       // 12-bit 8-channel ADC
+const SPI_SENSOR_ADXL345: u8 = 4       // 3-axis accelerometer
+const SPI_SENSOR_LIS3DH: u8 = 5        // 3-axis accelerometer
+const SPI_SENSOR_BME280_SPI: u8 = 6    // Environmental sensor (SPI mode)
+const SPI_SENSOR_NRF24L01: u8 = 7      // 2.4GHz transceiver
+const SPI_SENSOR_RFM69: u8 = 8         // Sub-GHz transceiver
+const SPI_SENSOR_MAX7219: u8 = 9       // LED display driver
+const SPI_SENSOR_MCP2515: u8 = 10      // CAN controller
+const SPI_SENSOR_W25Q: u8 = 11         // SPI Flash memory
+const SPI_SENSOR_SD_CARD: u8 = 12      // SD card (SPI mode)
+
+const MAX_SPI_SENSORS: u32 = 16
+
+// ============================================================================
+// MAX31855 Thermocouple
+// ============================================================================
+
+const MAX31855_FAULT_OPEN: u32 = 0x01
+const MAX31855_FAULT_SHORT_GND: u32 = 0x02
+const MAX31855_FAULT_SHORT_VCC: u32 = 0x04
+
+// ============================================================================
+// MCP3008/MCP3208 ADC
+// ============================================================================
+
+const MCP_START_BIT: u8 = 0x01
+const MCP_SINGLE_ENDED: u8 = 0x08
+const MCP_DIFFERENTIAL: u8 = 0x00
+
+// ============================================================================
+// ADXL345 Accelerometer Registers
+// ============================================================================
+
+const ADXL345_REG_DEVID: u8 = 0x00
+const ADXL345_REG_POWER_CTL: u8 = 0x2D
+const ADXL345_REG_DATA_FORMAT: u8 = 0x31
+const ADXL345_REG_DATAX0: u8 = 0x32
+const ADXL345_REG_BW_RATE: u8 = 0x2C
+
+const ADXL345_DEVID: u8 = 0xE5
+
+// ============================================================================
+// NRF24L01 Registers
+// ============================================================================
+
+const NRF_REG_CONFIG: u8 = 0x00
+const NRF_REG_EN_AA: u8 = 0x01
+const NRF_REG_EN_RXADDR: u8 = 0x02
+const NRF_REG_SETUP_AW: u8 = 0x03
+const NRF_REG_SETUP_RETR: u8 = 0x04
+const NRF_REG_RF_CH: u8 = 0x05
+const NRF_REG_RF_SETUP: u8 = 0x06
+const NRF_REG_STATUS: u8 = 0x07
+const NRF_REG_RX_ADDR_P0: u8 = 0x0A
+const NRF_REG_TX_ADDR: u8 = 0x10
+const NRF_REG_RX_PW_P0: u8 = 0x11
+const NRF_REG_FIFO_STATUS: u8 = 0x17
+const NRF_REG_DYNPD: u8 = 0x1C
+const NRF_REG_FEATURE: u8 = 0x1D
+
+const NRF_CMD_R_REGISTER: u8 = 0x00
+const NRF_CMD_W_REGISTER: u8 = 0x20
+const NRF_CMD_R_RX_PAYLOAD: u8 = 0x61
+const NRF_CMD_W_TX_PAYLOAD: u8 = 0xA0
+const NRF_CMD_FLUSH_TX: u8 = 0xE1
+const NRF_CMD_FLUSH_RX: u8 = 0xE2
+const NRF_CMD_NOP: u8 = 0xFF
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// Thermocouple reading
+struct ThermocoupleReading {
+    temperature_c: i32,      // Temperature in 0.01°C
+    internal_temp_c: i32,    // Internal reference temp in 0.01°C
+    fault: u8,
+    valid: u8,
+    timestamp: u64
+}
+
+// ADC reading
+struct AdcReading {
+    channels: [u16; 8],      // Up to 8 channels
+    channel_count: u8,
+    valid: u8,
+    timestamp: u64
+}
+
+// Accelerometer reading
+struct AccelReading {
+    x: i16,                  // X-axis in raw units
+    y: i16,                  // Y-axis
+    z: i16,                  // Z-axis
+    range: u8,               // Current range setting
+    valid: u8,
+    timestamp: u64
+}
+
+// RF transceiver state
+struct RfState {
+    channel: u8,
+    data_rate: u8,           // 0=250kbps, 1=1Mbps, 2=2Mbps
+    power_level: u8,         // 0-3
+    rx_pipe_enabled: u8,
+    tx_mode: u8,
+    packets_sent: u32,
+    packets_received: u32,
+    tx_errors: u32
+}
+
+// SPI sensor configuration
+struct SpiSensor {
+    sensor_type: u8,
+    spi_controller: u32,
+    spi_device: u32,         // Device handle from SPI driver
+    cs_pin: u8,
+    poll_interval_ms: u32,
+    last_poll: u64,
+
+    // Sensor-specific data
+    thermocouple: ThermocoupleReading,
+    adc: AdcReading,
+    accel: AccelReading,
+    rf_state: RfState,
+
+    active: u8
+}
+
+// Statistics
+struct SpiSensorStats {
+    total_reads: u64,
+    successful_reads: u64,
+    failed_reads: u64,
+    init_failures: u64,
+    rf_tx_count: u64,
+    rf_rx_count: u64
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var spi_sensors: [SpiSensor; 16]
+var spi_sensor_count: u32 = 0
+var spi_sensor_stats: SpiSensorStats
+var spi_sensors_initialized: u32 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn spi_sensors_init(): u32 {
+    if spi_sensors_initialized == 1 {
+        return 1
+    }
+
+    var i: u32 = 0
+    while i < MAX_SPI_SENSORS {
+        spi_sensors[i].active = 0
+        i = i + 1
+    }
+
+    spi_sensor_stats.total_reads = 0
+    spi_sensor_stats.successful_reads = 0
+    spi_sensor_stats.failed_reads = 0
+    spi_sensor_stats.init_failures = 0
+    spi_sensor_stats.rf_tx_count = 0
+    spi_sensor_stats.rf_rx_count = 0
+
+    spi_sensor_count = 0
+    spi_sensors_initialized = 1
+
+    foundation.serial_write_string("[SPI-Sensors] Initialized\n")
+    return 1
+}
+
+// ============================================================================
+// MAX31855 Thermocouple Amplifier
+// ============================================================================
+
+// Register MAX31855 sensor
+export fn spi_sensor_register_max31855(controller: u32, cs: u8): u32 {
+    if spi_sensor_count >= MAX_SPI_SENSORS {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = spi_sensor_count
+
+    // Register SPI device (1MHz, Mode 0)
+    var dev_handle: u32 = spi.spi_register_device(controller, cs, spi.SPI_MODE_0, 1000000)
+    if dev_handle == 0xFFFFFFFF {
+        spi_sensor_stats.init_failures = spi_sensor_stats.init_failures + 1
+        return 0xFFFFFFFF
+    }
+
+    spi_sensors[idx].sensor_type = SPI_SENSOR_MAX31855
+    spi_sensors[idx].spi_controller = controller
+    spi_sensors[idx].spi_device = dev_handle
+    spi_sensors[idx].cs_pin = cs
+    spi_sensors[idx].poll_interval_ms = 250  // Read every 250ms
+    spi_sensors[idx].last_poll = 0
+    spi_sensors[idx].active = 1
+
+    spi_sensor_count = spi_sensor_count + 1
+
+    foundation.serial_write_string("[SPI-Sensors] MAX31855 registered on CS")
+    foundation.serial_write_hex(cs)
+    foundation.serial_write_string("\n")
+
+    return idx
+}
+
+// Read MAX31855 sensor
+export fn spi_sensor_read_max31855(handle: u32): u32 {
+    if handle >= spi_sensor_count { return 0 }
+    if spi_sensors[handle].active == 0 { return 0 }
+
+    spi_sensor_stats.total_reads = spi_sensor_stats.total_reads + 1
+
+    var dev: u32 = spi_sensors[handle].spi_device
+
+    // Read 4 bytes
+    var raw_data: [u8; 4]
+    var bytes_read: u32 = spi.spi_read(dev, @ptrFromInt(raw_data), 4)
+    if bytes_read != 4 {
+        spi_sensor_stats.failed_reads = spi_sensor_stats.failed_reads + 1
+        spi_sensors[handle].thermocouple.valid = 0
+        return 0
+    }
+
+    var raw32: u32 = (raw_data[0] << 24) | (raw_data[1] << 16) | (raw_data[2] << 8) | raw_data[3]
+
+    // Check for fault
+    if (raw32 & 0x00010000) != 0 {
+        spi_sensors[handle].thermocouple.fault = raw32 & 0x07
+        spi_sensors[handle].thermocouple.valid = 0
+        spi_sensor_stats.failed_reads = spi_sensor_stats.failed_reads + 1
+        return 0
+    }
+
+    // Extract thermocouple temperature (bits 31-18, 14-bit signed)
+    var tc_temp: i32 = (raw32 >> 18) & 0x3FFF
+    if (tc_temp & 0x2000) != 0 {
+        tc_temp = tc_temp | 0xFFFFC000  // Sign extend
+    }
+    // Temperature is in 0.25°C increments, convert to 0.01°C
+    spi_sensors[handle].thermocouple.temperature_c = tc_temp * 25
+
+    // Extract internal temperature (bits 15-4, 12-bit signed)
+    var int_temp: i32 = (raw32 >> 4) & 0x0FFF
+    if (int_temp & 0x0800) != 0 {
+        int_temp = int_temp | 0xFFFFF000  // Sign extend
+    }
+    // Temperature is in 0.0625°C increments, convert to 0.01°C
+    spi_sensors[handle].thermocouple.internal_temp_c = (int_temp * 625) / 100
+
+    spi_sensors[handle].thermocouple.fault = 0
+    spi_sensors[handle].thermocouple.valid = 1
+    spi_sensors[handle].thermocouple.timestamp = foundation.timer_get_ticks()
+    spi_sensors[handle].last_poll = foundation.timer_get_ticks()
+
+    spi_sensor_stats.successful_reads = spi_sensor_stats.successful_reads + 1
+    return 1
+}
+
+// ============================================================================
+// MCP3008 10-bit ADC
+// ============================================================================
+
+// Register MCP3008 sensor
+export fn spi_sensor_register_mcp3008(controller: u32, cs: u8): u32 {
+    if spi_sensor_count >= MAX_SPI_SENSORS {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = spi_sensor_count
+
+    // Register SPI device (1MHz, Mode 0)
+    var dev_handle: u32 = spi.spi_register_device(controller, cs, spi.SPI_MODE_0, 1000000)
+    if dev_handle == 0xFFFFFFFF {
+        spi_sensor_stats.init_failures = spi_sensor_stats.init_failures + 1
+        return 0xFFFFFFFF
+    }
+
+    spi_sensors[idx].sensor_type = SPI_SENSOR_MCP3008
+    spi_sensors[idx].spi_controller = controller
+    spi_sensors[idx].spi_device = dev_handle
+    spi_sensors[idx].cs_pin = cs
+    spi_sensors[idx].poll_interval_ms = 100
+    spi_sensors[idx].last_poll = 0
+    spi_sensors[idx].adc.channel_count = 8
+    spi_sensors[idx].active = 1
+
+    spi_sensor_count = spi_sensor_count + 1
+
+    foundation.serial_write_string("[SPI-Sensors] MCP3008 registered on CS")
+    foundation.serial_write_hex(cs)
+    foundation.serial_write_string("\n")
+
+    return idx
+}
+
+// Read single MCP3008 channel
+export fn spi_sensor_read_mcp3008_channel(handle: u32, channel: u8): u16 {
+    if handle >= spi_sensor_count { return 0xFFFF }
+    if spi_sensors[handle].active == 0 { return 0xFFFF }
+    if channel > 7 { return 0xFFFF }
+
+    spi_sensor_stats.total_reads = spi_sensor_stats.total_reads + 1
+
+    var dev: u32 = spi_sensors[handle].spi_device
+
+    // Build command: start bit, single-ended, channel
+    var tx_data: [u8; 3]
+    tx_data[0] = MCP_START_BIT
+    tx_data[1] = (MCP_SINGLE_ENDED | channel) << 4
+    tx_data[2] = 0x00
+
+    var rx_data: [u8; 3]
+    var bytes: u32 = spi.spi_transfer(dev, @ptrFromInt(tx_data), @ptrFromInt(rx_data), 3)
+    if bytes != 3 {
+        spi_sensor_stats.failed_reads = spi_sensor_stats.failed_reads + 1
+        return 0xFFFF
+    }
+
+    // Extract 10-bit result
+    var result: u16 = ((rx_data[1] & 0x03) << 8) | rx_data[2]
+
+    spi_sensors[handle].adc.channels[channel] = result
+    spi_sensors[handle].adc.valid = 1
+    spi_sensors[handle].adc.timestamp = foundation.timer_get_ticks()
+
+    spi_sensor_stats.successful_reads = spi_sensor_stats.successful_reads + 1
+    return result
+}
+
+// Read all MCP3008 channels
+export fn spi_sensor_read_mcp3008_all(handle: u32): u32 {
+    if handle >= spi_sensor_count { return 0 }
+    if spi_sensors[handle].active == 0 { return 0 }
+
+    var channel: u8 = 0
+    while channel < 8 {
+        spi_sensor_read_mcp3008_channel(handle, channel)
+        channel = channel + 1
+    }
+
+    spi_sensors[handle].last_poll = foundation.timer_get_ticks()
+    return 1
+}
+
+// ============================================================================
+// ADXL345 3-Axis Accelerometer
+// ============================================================================
+
+// Register ADXL345 sensor
+export fn spi_sensor_register_adxl345(controller: u32, cs: u8): u32 {
+    if spi_sensor_count >= MAX_SPI_SENSORS {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = spi_sensor_count
+
+    // Register SPI device (5MHz, Mode 3)
+    var dev_handle: u32 = spi.spi_register_device(controller, cs, spi.SPI_MODE_3, 5000000)
+    if dev_handle == 0xFFFFFFFF {
+        spi_sensor_stats.init_failures = spi_sensor_stats.init_failures + 1
+        return 0xFFFFFFFF
+    }
+
+    // Check device ID
+    var devid: u8 = spi_adxl345_read_reg(dev_handle, ADXL345_REG_DEVID)
+    if devid != ADXL345_DEVID {
+        spi.spi_unregister_device(dev_handle)
+        spi_sensor_stats.init_failures = spi_sensor_stats.init_failures + 1
+        return 0xFFFFFFFF
+    }
+
+    spi_sensors[idx].sensor_type = SPI_SENSOR_ADXL345
+    spi_sensors[idx].spi_controller = controller
+    spi_sensors[idx].spi_device = dev_handle
+    spi_sensors[idx].cs_pin = cs
+    spi_sensors[idx].poll_interval_ms = 10   // 100 Hz
+    spi_sensors[idx].last_poll = 0
+    spi_sensors[idx].accel.range = 2         // ±2g default
+    spi_sensors[idx].active = 1
+
+    // Configure: ±2g, full resolution
+    spi_adxl345_write_reg(dev_handle, ADXL345_REG_DATA_FORMAT, 0x0B)
+    // Set sample rate: 100 Hz
+    spi_adxl345_write_reg(dev_handle, ADXL345_REG_BW_RATE, 0x0A)
+    // Enable measurement mode
+    spi_adxl345_write_reg(dev_handle, ADXL345_REG_POWER_CTL, 0x08)
+
+    spi_sensor_count = spi_sensor_count + 1
+
+    foundation.serial_write_string("[SPI-Sensors] ADXL345 registered on CS")
+    foundation.serial_write_hex(cs)
+    foundation.serial_write_string("\n")
+
+    return idx
+}
+
+// Read register from ADXL345
+fn spi_adxl345_read_reg(dev: u32, reg: u8): u8 {
+    var tx: [u8; 2]
+    var rx: [u8; 2]
+    tx[0] = reg | 0x80  // Read flag
+    tx[1] = 0x00
+    spi.spi_transfer(dev, @ptrFromInt(tx), @ptrFromInt(rx), 2)
+    return rx[1]
+}
+
+// Write register to ADXL345
+fn spi_adxl345_write_reg(dev: u32, reg: u8, value: u8) {
+    var tx: [u8; 2]
+    tx[0] = reg
+    tx[1] = value
+    spi.spi_write(dev, @ptrFromInt(tx), 2)
+}
+
+// Read ADXL345 accelerometer
+export fn spi_sensor_read_adxl345(handle: u32): u32 {
+    if handle >= spi_sensor_count { return 0 }
+    if spi_sensors[handle].active == 0 { return 0 }
+
+    spi_sensor_stats.total_reads = spi_sensor_stats.total_reads + 1
+
+    var dev: u32 = spi_sensors[handle].spi_device
+
+    // Read 6 bytes of data (multi-byte read)
+    var tx: [u8; 7]
+    var rx: [u8; 7]
+    tx[0] = ADXL345_REG_DATAX0 | 0x80 | 0x40  // Read + Multi-byte
+    spi.spi_transfer(dev, @ptrFromInt(tx), @ptrFromInt(rx), 7)
+
+    // Parse acceleration data (little-endian)
+    spi_sensors[handle].accel.x = (rx[2] << 8) | rx[1]
+    spi_sensors[handle].accel.y = (rx[4] << 8) | rx[3]
+    spi_sensors[handle].accel.z = (rx[6] << 8) | rx[5]
+    spi_sensors[handle].accel.valid = 1
+    spi_sensors[handle].accel.timestamp = foundation.timer_get_ticks()
+    spi_sensors[handle].last_poll = foundation.timer_get_ticks()
+
+    spi_sensor_stats.successful_reads = spi_sensor_stats.successful_reads + 1
+    return 1
+}
+
+// ============================================================================
+// NRF24L01+ 2.4GHz Transceiver
+// ============================================================================
+
+// Register NRF24L01 transceiver
+export fn spi_sensor_register_nrf24(controller: u32, cs: u8, ce_pin: u8): u32 {
+    if spi_sensor_count >= MAX_SPI_SENSORS {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = spi_sensor_count
+
+    // Register SPI device (8MHz, Mode 0)
+    var dev_handle: u32 = spi.spi_register_device(controller, cs, spi.SPI_MODE_0, 8000000)
+    if dev_handle == 0xFFFFFFFF {
+        spi_sensor_stats.init_failures = spi_sensor_stats.init_failures + 1
+        return 0xFFFFFFFF
+    }
+
+    spi_sensors[idx].sensor_type = SPI_SENSOR_NRF24L01
+    spi_sensors[idx].spi_controller = controller
+    spi_sensors[idx].spi_device = dev_handle
+    spi_sensors[idx].cs_pin = cs
+    spi_sensors[idx].poll_interval_ms = 0    // Event-driven
+    spi_sensors[idx].last_poll = 0
+    spi_sensors[idx].rf_state.channel = 76   // Default channel
+    spi_sensors[idx].rf_state.data_rate = 1  // 1 Mbps
+    spi_sensors[idx].rf_state.power_level = 3 // Max power
+    spi_sensors[idx].rf_state.packets_sent = 0
+    spi_sensors[idx].rf_state.packets_received = 0
+    spi_sensors[idx].rf_state.tx_errors = 0
+    spi_sensors[idx].active = 1
+
+    // Initialize NRF24L01
+    nrf24_init(idx)
+
+    spi_sensor_count = spi_sensor_count + 1
+
+    foundation.serial_write_string("[SPI-Sensors] NRF24L01 registered on CS")
+    foundation.serial_write_hex(cs)
+    foundation.serial_write_string("\n")
+
+    return idx
+}
+
+// Initialize NRF24L01
+fn nrf24_init(idx: u32) {
+    var dev: u32 = spi_sensors[idx].spi_device
+
+    // Power down first
+    nrf24_write_reg(dev, NRF_REG_CONFIG, 0x08)  // PWR_UP=0, EN_CRC=1
+
+    // Set auto-acknowledge on all pipes
+    nrf24_write_reg(dev, NRF_REG_EN_AA, 0x3F)
+
+    // Enable RX pipe 0
+    nrf24_write_reg(dev, NRF_REG_EN_RXADDR, 0x01)
+
+    // Set address width to 5 bytes
+    nrf24_write_reg(dev, NRF_REG_SETUP_AW, 0x03)
+
+    // Set auto-retransmit: 500us delay, 3 retries
+    nrf24_write_reg(dev, NRF_REG_SETUP_RETR, 0x13)
+
+    // Set channel
+    nrf24_write_reg(dev, NRF_REG_RF_CH, spi_sensors[idx].rf_state.channel)
+
+    // Set data rate and power (1Mbps, 0dBm)
+    nrf24_write_reg(dev, NRF_REG_RF_SETUP, 0x06)
+
+    // Set payload size for pipe 0 (32 bytes)
+    nrf24_write_reg(dev, NRF_REG_RX_PW_P0, 32)
+
+    // Clear status flags
+    nrf24_write_reg(dev, NRF_REG_STATUS, 0x70)
+
+    // Flush FIFOs
+    nrf24_command(dev, NRF_CMD_FLUSH_TX)
+    nrf24_command(dev, NRF_CMD_FLUSH_RX)
+
+    // Power up in RX mode
+    nrf24_write_reg(dev, NRF_REG_CONFIG, 0x0F)  // PWR_UP=1, PRIM_RX=1, EN_CRC=1
+}
+
+// Write NRF24 register
+fn nrf24_write_reg(dev: u32, reg: u8, value: u8) {
+    var tx: [u8; 2]
+    tx[0] = NRF_CMD_W_REGISTER | reg
+    tx[1] = value
+    spi.spi_write(dev, @ptrFromInt(tx), 2)
+}
+
+// Read NRF24 register
+fn nrf24_read_reg(dev: u32, reg: u8): u8 {
+    var tx: [u8; 2]
+    var rx: [u8; 2]
+    tx[0] = NRF_CMD_R_REGISTER | reg
+    tx[1] = 0xFF
+    spi.spi_transfer(dev, @ptrFromInt(tx), @ptrFromInt(rx), 2)
+    return rx[1]
+}
+
+// Send NRF24 command
+fn nrf24_command(dev: u32, cmd: u8) {
+    spi.spi_write_byte(dev, cmd)
+}
+
+// Set NRF24 channel
+export fn spi_sensor_nrf24_set_channel(handle: u32, channel: u8) {
+    if handle >= spi_sensor_count { return }
+    if spi_sensors[handle].active == 0 { return }
+    if channel > 125 { return }
+
+    var dev: u32 = spi_sensors[handle].spi_device
+    nrf24_write_reg(dev, NRF_REG_RF_CH, channel)
+    spi_sensors[handle].rf_state.channel = channel
+}
+
+// Set TX address (5 bytes)
+export fn spi_sensor_nrf24_set_tx_addr(handle: u32, addr: u64) {
+    if handle >= spi_sensor_count { return }
+    if spi_sensors[handle].active == 0 { return }
+
+    var dev: u32 = spi_sensors[handle].spi_device
+
+    var tx: [u8; 6]
+    tx[0] = NRF_CMD_W_REGISTER | NRF_REG_TX_ADDR
+
+    // Copy 5-byte address
+    var i: u32 = 0
+    while i < 5 {
+        tx[i + 1] = @intToPtr(addr + i, u8)
+        i = i + 1
+    }
+
+    spi.spi_write(dev, @ptrFromInt(tx), 6)
+
+    // Also set RX pipe 0 to same address for auto-ack
+    tx[0] = NRF_CMD_W_REGISTER | NRF_REG_RX_ADDR_P0
+    spi.spi_write(dev, @ptrFromInt(tx), 6)
+}
+
+// Transmit data
+export fn spi_sensor_nrf24_transmit(handle: u32, data: u64, length: u8): u32 {
+    if handle >= spi_sensor_count { return 0 }
+    if spi_sensors[handle].active == 0 { return 0 }
+    if length > 32 { return 0 }
+
+    var dev: u32 = spi_sensors[handle].spi_device
+
+    // Switch to TX mode
+    nrf24_write_reg(dev, NRF_REG_CONFIG, 0x0E)  // PWR_UP=1, PRIM_RX=0
+
+    // Write TX payload
+    var tx: [u8; 33]
+    tx[0] = NRF_CMD_W_TX_PAYLOAD
+
+    var i: u8 = 0
+    while i < length {
+        tx[i + 1] = @intToPtr(data + i, u8)
+        i = i + 1
+    }
+
+    spi.spi_write(dev, @ptrFromInt(tx), length + 1)
+
+    // Pulse CE high for >10us to start transmission
+    // (CE pin control would be handled by GPIO)
+
+    // Wait for TX complete or timeout
+    var timeout: u32 = 100
+    while timeout > 0 {
+        var status: u8 = nrf24_read_reg(dev, NRF_REG_STATUS)
+
+        if (status & 0x20) != 0 {
+            // TX_DS: Data sent
+            nrf24_write_reg(dev, NRF_REG_STATUS, 0x20)  // Clear flag
+            spi_sensors[handle].rf_state.packets_sent =
+                spi_sensors[handle].rf_state.packets_sent + 1
+            spi_sensor_stats.rf_tx_count = spi_sensor_stats.rf_tx_count + 1
+
+            // Switch back to RX mode
+            nrf24_write_reg(dev, NRF_REG_CONFIG, 0x0F)
+            return 1
+        }
+
+        if (status & 0x10) != 0 {
+            // MAX_RT: Max retries exceeded
+            nrf24_write_reg(dev, NRF_REG_STATUS, 0x10)  // Clear flag
+            nrf24_command(dev, NRF_CMD_FLUSH_TX)
+            spi_sensors[handle].rf_state.tx_errors =
+                spi_sensors[handle].rf_state.tx_errors + 1
+
+            // Switch back to RX mode
+            nrf24_write_reg(dev, NRF_REG_CONFIG, 0x0F)
+            return 0
+        }
+
+        delay_us(10)
+        timeout = timeout - 1
+    }
+
+    // Timeout
+    nrf24_command(dev, NRF_CMD_FLUSH_TX)
+    nrf24_write_reg(dev, NRF_REG_CONFIG, 0x0F)
+    return 0
+}
+
+// Receive data
+export fn spi_sensor_nrf24_receive(handle: u32, buffer: u64, max_length: u8): u8 {
+    if handle >= spi_sensor_count { return 0 }
+    if spi_sensors[handle].active == 0 { return 0 }
+
+    var dev: u32 = spi_sensors[handle].spi_device
+
+    // Check if data available
+    var status: u8 = nrf24_read_reg(dev, NRF_REG_STATUS)
+    if (status & 0x40) == 0 {
+        return 0  // No data
+    }
+
+    // Read payload
+    var tx: [u8; 33]
+    var rx: [u8; 33]
+    tx[0] = NRF_CMD_R_RX_PAYLOAD
+
+    var read_len: u8 = if max_length > 32 { 32 } else { max_length }
+    spi.spi_transfer(dev, @ptrFromInt(tx), @ptrFromInt(rx), read_len + 1)
+
+    // Copy to buffer
+    var i: u8 = 0
+    while i < read_len {
+        @ptrToInt(buffer + i, u8) = rx[i + 1]
+        i = i + 1
+    }
+
+    // Clear RX_DR flag
+    nrf24_write_reg(dev, NRF_REG_STATUS, 0x40)
+
+    spi_sensors[handle].rf_state.packets_received =
+        spi_sensors[handle].rf_state.packets_received + 1
+    spi_sensor_stats.rf_rx_count = spi_sensor_stats.rf_rx_count + 1
+
+    return read_len
+}
+
+// ============================================================================
+// Generic Functions
+// ============================================================================
+
+// Get thermocouple temperature in 0.01°C
+export fn spi_sensor_get_thermocouple_temp(handle: u32): i32 {
+    if handle >= spi_sensor_count { return -27300 }
+    return spi_sensors[handle].thermocouple.temperature_c
+}
+
+// Get ADC channel value
+export fn spi_sensor_get_adc_value(handle: u32, channel: u8): u16 {
+    if handle >= spi_sensor_count { return 0 }
+    if channel >= spi_sensors[handle].adc.channel_count { return 0 }
+    return spi_sensors[handle].adc.channels[channel]
+}
+
+// Get accelerometer reading
+export fn spi_sensor_get_accel(handle: u32): u64 {
+    if handle >= spi_sensor_count { return 0 }
+    return @ptrFromInt(spi_sensors[handle].accel)
+}
+
+// Poll sensor
+export fn spi_sensor_read(handle: u32): u32 {
+    if handle >= spi_sensor_count { return 0 }
+
+    var sensor_type: u8 = spi_sensors[handle].sensor_type
+
+    if sensor_type == SPI_SENSOR_MAX31855 {
+        return spi_sensor_read_max31855(handle)
+    } else if sensor_type == SPI_SENSOR_MCP3008 {
+        return spi_sensor_read_mcp3008_all(handle)
+    } else if sensor_type == SPI_SENSOR_ADXL345 {
+        return spi_sensor_read_adxl345(handle)
+    }
+
+    return 0
+}
+
+// Poll all sensors
+export fn spi_sensors_poll_all() {
+    var now: u64 = foundation.timer_get_ticks()
+
+    var i: u32 = 0
+    while i < spi_sensor_count {
+        if spi_sensors[i].active == 1 {
+            if spi_sensors[i].poll_interval_ms > 0 {
+                if now - spi_sensors[i].last_poll >= spi_sensors[i].poll_interval_ms {
+                    spi_sensor_read(i)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// Utility
+// ============================================================================
+
+fn delay_us(us: u32) {
+    var start: u64 = foundation.timer_get_ticks()
+    while foundation.timer_get_ticks() - start < us {
+        // Busy wait
+    }
+}
+
+// Get sensor count
+export fn spi_sensors_get_count(): u32 {
+    return spi_sensor_count
+}
+
+// Unregister sensor
+export fn spi_sensor_unregister(handle: u32) {
+    if handle >= spi_sensor_count { return }
+    if spi_sensors[handle].active == 0 { return }
+
+    spi.spi_unregister_device(spi_sensors[handle].spi_device)
+    spi_sensors[handle].active = 0
+}
+
+// Get statistics
+export fn spi_sensors_get_stats(): u64 {
+    return @ptrFromInt(spi_sensor_stats)
+}
+
+// Shutdown
+export fn spi_sensors_shutdown() {
+    if spi_sensors_initialized == 0 { return }
+
+    var i: u32 = 0
+    while i < spi_sensor_count {
+        if spi_sensors[i].active == 1 {
+            spi_sensor_unregister(i)
+        }
+        i = i + 1
+    }
+
+    spi_sensors_initialized = 0
+    foundation.serial_write_string("[SPI-Sensors] Shutdown complete\n")
+}

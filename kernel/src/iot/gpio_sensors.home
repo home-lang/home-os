@@ -1,0 +1,779 @@
+// home-os GPIO-based Sensor Drivers
+// Support for DHT11/22, PIR motion, ultrasonic, soil moisture, and more
+
+import "../core/foundation.home" as foundation
+import "../drivers/gpio.home" as gpio
+
+// ============================================================================
+// Sensor Type Definitions
+// ============================================================================
+
+const GPIO_SENSOR_DHT11: u8 = 0        // Temperature + Humidity
+const GPIO_SENSOR_DHT22: u8 = 1        // Temperature + Humidity (higher precision)
+const GPIO_SENSOR_PIR: u8 = 2          // Passive Infrared Motion
+const GPIO_SENSOR_ULTRASONIC: u8 = 3   // HC-SR04 distance sensor
+const GPIO_SENSOR_REED: u8 = 4         // Reed switch (door/window)
+const GPIO_SENSOR_TILT: u8 = 5         // Tilt/vibration sensor
+const GPIO_SENSOR_FLAME: u8 = 6        // Flame detector
+const GPIO_SENSOR_SOUND: u8 = 7        // Sound level detector
+const GPIO_SENSOR_SOIL: u8 = 8         // Soil moisture (analog via GPIO)
+const GPIO_SENSOR_GAS: u8 = 9          // MQ gas sensors (analog via GPIO)
+const GPIO_SENSOR_RAIN: u8 = 10        // Rain detector
+const GPIO_SENSOR_TOUCH: u8 = 11       // Capacitive touch
+
+// Sensor states
+const SENSOR_STATE_IDLE: u8 = 0
+const SENSOR_STATE_READING: u8 = 1
+const SENSOR_STATE_READY: u8 = 2
+const SENSOR_STATE_ERROR: u8 = 3
+
+// Motion detection states
+const MOTION_NONE: u8 = 0
+const MOTION_DETECTED: u8 = 1
+
+// DHT timing constants (microseconds)
+const DHT_START_LOW_US: u32 = 18000    // Start signal low time
+const DHT_START_HIGH_US: u32 = 40      // Start signal high time
+const DHT_BIT_THRESHOLD_US: u32 = 50   // Threshold for 0/1 bit
+const DHT_TIMEOUT_US: u32 = 100        // Timeout for edge detection
+
+// Ultrasonic constants
+const ULTRASONIC_TRIGGER_US: u32 = 10  // Trigger pulse width
+const ULTRASONIC_TIMEOUT_US: u64 = 30000  // Max echo timeout (30ms = ~5m)
+const SPEED_OF_SOUND_CM_US: u32 = 343  // Speed of sound * 10000 / 1000000
+
+const MAX_GPIO_SENSORS: u32 = 32
+
+// ============================================================================
+// Sensor Structures
+// ============================================================================
+
+// DHT sensor reading
+struct DhtReading {
+    temperature_c: i16,          // Temperature in 0.1°C units
+    humidity_percent: u16,       // Humidity in 0.1% units
+    checksum_valid: u8,
+    timestamp: u64
+}
+
+// Motion sensor state
+struct MotionState {
+    detected: u8,
+    last_trigger: u64,
+    trigger_count: u32,
+    cooldown_ms: u32             // Minimum time between triggers
+}
+
+// Ultrasonic sensor reading
+struct UltrasonicReading {
+    distance_mm: u32,            // Distance in millimeters
+    echo_time_us: u32,           // Echo pulse time
+    valid: u8,
+    timestamp: u64
+}
+
+// GPIO sensor configuration
+struct GpioSensor {
+    sensor_type: u8,
+    state: u8,
+    gpio_pin: u32,               // Primary GPIO pin
+    gpio_pin2: u32,              // Secondary GPIO (for ultrasonic trigger/echo)
+    controller: u32,             // GPIO controller
+    poll_interval_ms: u32,       // Auto-poll interval (0 = manual)
+    last_poll: u64,
+    callback: u64,               // Callback function pointer
+    user_data: u64,
+
+    // Sensor-specific data union
+    dht_reading: DhtReading,
+    motion_state: MotionState,
+    ultrasonic_reading: UltrasonicReading,
+    digital_value: u8,           // For simple digital sensors
+    analog_value: u16,           // For analog sensors (via ADC GPIO)
+
+    active: u8
+}
+
+// Statistics
+struct GpioSensorStats {
+    total_reads: u64,
+    successful_reads: u64,
+    failed_reads: u64,
+    checksum_errors: u64,
+    timeout_errors: u64,
+    motion_events: u64
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var gpio_sensors: [GpioSensor; 32]
+var gpio_sensor_count: u32 = 0
+var gpio_sensor_stats: GpioSensorStats
+var gpio_sensors_initialized: u32 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn gpio_sensors_init(): u32 {
+    if gpio_sensors_initialized == 1 {
+        return 1
+    }
+
+    // Clear sensors
+    var i: u32 = 0
+    while i < MAX_GPIO_SENSORS {
+        gpio_sensors[i].active = 0
+        i = i + 1
+    }
+
+    // Clear stats
+    gpio_sensor_stats.total_reads = 0
+    gpio_sensor_stats.successful_reads = 0
+    gpio_sensor_stats.failed_reads = 0
+    gpio_sensor_stats.checksum_errors = 0
+    gpio_sensor_stats.timeout_errors = 0
+    gpio_sensor_stats.motion_events = 0
+
+    gpio_sensor_count = 0
+    gpio_sensors_initialized = 1
+
+    foundation.serial_write_string("[GPIO-Sensors] Initialized\n")
+    return 1
+}
+
+// ============================================================================
+// Sensor Registration
+// ============================================================================
+
+// Register a DHT11/22 temperature+humidity sensor
+export fn gpio_sensor_register_dht(controller: u32, pin: u32, dht_type: u8): u32 {
+    if gpio_sensor_count >= MAX_GPIO_SENSORS {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = gpio_sensor_count
+
+    gpio_sensors[idx].sensor_type = dht_type
+    gpio_sensors[idx].state = SENSOR_STATE_IDLE
+    gpio_sensors[idx].gpio_pin = pin
+    gpio_sensors[idx].gpio_pin2 = 0
+    gpio_sensors[idx].controller = controller
+    gpio_sensors[idx].poll_interval_ms = 2000  // DHT requires 2s between reads
+    gpio_sensors[idx].last_poll = 0
+    gpio_sensors[idx].callback = 0
+    gpio_sensors[idx].user_data = 0
+    gpio_sensors[idx].active = 1
+
+    // Request GPIO pin
+    var gpio_handle: u32 = gpio.gpio_request(controller, pin)
+    if gpio_handle == 0xFFFFFFFF {
+        return 0xFFFFFFFF
+    }
+
+    // Configure as output initially (for start signal)
+    gpio.gpio_set_mode(gpio_handle, gpio.GPIO_MODE_OUTPUT)
+    gpio.gpio_write(gpio_handle, 1)  // Idle high
+
+    gpio_sensor_count = gpio_sensor_count + 1
+
+    foundation.serial_write_string("[GPIO-Sensors] DHT sensor registered on pin ")
+    foundation.serial_write_hex(pin)
+    foundation.serial_write_string("\n")
+
+    return idx
+}
+
+// Register a PIR motion sensor
+export fn gpio_sensor_register_pir(controller: u32, pin: u32, cooldown_ms: u32): u32 {
+    if gpio_sensor_count >= MAX_GPIO_SENSORS {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = gpio_sensor_count
+
+    gpio_sensors[idx].sensor_type = GPIO_SENSOR_PIR
+    gpio_sensors[idx].state = SENSOR_STATE_IDLE
+    gpio_sensors[idx].gpio_pin = pin
+    gpio_sensors[idx].gpio_pin2 = 0
+    gpio_sensors[idx].controller = controller
+    gpio_sensors[idx].poll_interval_ms = 100   // Check every 100ms
+    gpio_sensors[idx].last_poll = 0
+    gpio_sensors[idx].callback = 0
+    gpio_sensors[idx].user_data = 0
+    gpio_sensors[idx].motion_state.detected = 0
+    gpio_sensors[idx].motion_state.last_trigger = 0
+    gpio_sensors[idx].motion_state.trigger_count = 0
+    gpio_sensors[idx].motion_state.cooldown_ms = cooldown_ms
+    gpio_sensors[idx].active = 1
+
+    // Request GPIO pin as input with pull-down
+    var gpio_handle: u32 = gpio.gpio_request(controller, pin)
+    if gpio_handle == 0xFFFFFFFF {
+        return 0xFFFFFFFF
+    }
+
+    gpio.gpio_set_mode(gpio_handle, gpio.GPIO_MODE_INPUT)
+    gpio.gpio_set_pull(gpio_handle, gpio.GPIO_PULL_DOWN)
+
+    gpio_sensor_count = gpio_sensor_count + 1
+
+    foundation.serial_write_string("[GPIO-Sensors] PIR sensor registered on pin ")
+    foundation.serial_write_hex(pin)
+    foundation.serial_write_string("\n")
+
+    return idx
+}
+
+// Register an HC-SR04 ultrasonic distance sensor
+export fn gpio_sensor_register_ultrasonic(controller: u32, trigger_pin: u32, echo_pin: u32): u32 {
+    if gpio_sensor_count >= MAX_GPIO_SENSORS {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = gpio_sensor_count
+
+    gpio_sensors[idx].sensor_type = GPIO_SENSOR_ULTRASONIC
+    gpio_sensors[idx].state = SENSOR_STATE_IDLE
+    gpio_sensors[idx].gpio_pin = trigger_pin
+    gpio_sensors[idx].gpio_pin2 = echo_pin
+    gpio_sensors[idx].controller = controller
+    gpio_sensors[idx].poll_interval_ms = 60    // Min 60ms between measurements
+    gpio_sensors[idx].last_poll = 0
+    gpio_sensors[idx].callback = 0
+    gpio_sensors[idx].user_data = 0
+    gpio_sensors[idx].active = 1
+
+    // Request trigger pin as output
+    var trig_handle: u32 = gpio.gpio_request(controller, trigger_pin)
+    if trig_handle == 0xFFFFFFFF {
+        return 0xFFFFFFFF
+    }
+    gpio.gpio_set_mode(trig_handle, gpio.GPIO_MODE_OUTPUT)
+    gpio.gpio_write(trig_handle, 0)
+
+    // Request echo pin as input
+    var echo_handle: u32 = gpio.gpio_request(controller, echo_pin)
+    if echo_handle == 0xFFFFFFFF {
+        gpio.gpio_free(trig_handle)
+        return 0xFFFFFFFF
+    }
+    gpio.gpio_set_mode(echo_handle, gpio.GPIO_MODE_INPUT)
+    gpio.gpio_set_pull(echo_handle, gpio.GPIO_PULL_DOWN)
+
+    gpio_sensor_count = gpio_sensor_count + 1
+
+    foundation.serial_write_string("[GPIO-Sensors] Ultrasonic sensor registered (trig=")
+    foundation.serial_write_hex(trigger_pin)
+    foundation.serial_write_string(", echo=")
+    foundation.serial_write_hex(echo_pin)
+    foundation.serial_write_string(")\n")
+
+    return idx
+}
+
+// Register a simple digital sensor (reed switch, tilt, flame, etc.)
+export fn gpio_sensor_register_digital(controller: u32, pin: u32, sensor_type: u8, pull: u8): u32 {
+    if gpio_sensor_count >= MAX_GPIO_SENSORS {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = gpio_sensor_count
+
+    gpio_sensors[idx].sensor_type = sensor_type
+    gpio_sensors[idx].state = SENSOR_STATE_IDLE
+    gpio_sensors[idx].gpio_pin = pin
+    gpio_sensors[idx].gpio_pin2 = 0
+    gpio_sensors[idx].controller = controller
+    gpio_sensors[idx].poll_interval_ms = 50
+    gpio_sensors[idx].last_poll = 0
+    gpio_sensors[idx].callback = 0
+    gpio_sensors[idx].user_data = 0
+    gpio_sensors[idx].digital_value = 0
+    gpio_sensors[idx].active = 1
+
+    // Request GPIO pin as input
+    var gpio_handle: u32 = gpio.gpio_request(controller, pin)
+    if gpio_handle == 0xFFFFFFFF {
+        return 0xFFFFFFFF
+    }
+
+    gpio.gpio_set_mode(gpio_handle, gpio.GPIO_MODE_INPUT)
+    gpio.gpio_set_pull(gpio_handle, pull)
+
+    gpio_sensor_count = gpio_sensor_count + 1
+
+    return idx
+}
+
+// ============================================================================
+// DHT11/22 Reading
+// ============================================================================
+
+// Read DHT sensor
+export fn gpio_sensor_read_dht(handle: u32): u32 {
+    if handle >= gpio_sensor_count { return 0 }
+    if gpio_sensors[handle].active == 0 { return 0 }
+    if gpio_sensors[handle].sensor_type != GPIO_SENSOR_DHT11 &&
+       gpio_sensors[handle].sensor_type != GPIO_SENSOR_DHT22 {
+        return 0
+    }
+
+    gpio_sensor_stats.total_reads = gpio_sensor_stats.total_reads + 1
+    gpio_sensors[handle].state = SENSOR_STATE_READING
+
+    var pin: u32 = gpio_sensors[handle].gpio_pin
+    var controller: u32 = gpio_sensors[handle].controller
+    var gpio_handle: u32 = gpio.gpio_request(controller, pin)
+
+    // Data buffer for 40 bits (5 bytes)
+    var data: [u8; 5]
+    data[0] = 0
+    data[1] = 0
+    data[2] = 0
+    data[3] = 0
+    data[4] = 0
+
+    // Step 1: Send start signal
+    // Pull low for 18ms
+    gpio.gpio_set_mode(gpio_handle, gpio.GPIO_MODE_OUTPUT)
+    gpio.gpio_write(gpio_handle, 0)
+    delay_us(DHT_START_LOW_US)
+
+    // Pull high for 40us
+    gpio.gpio_write(gpio_handle, 1)
+    delay_us(DHT_START_HIGH_US)
+
+    // Step 2: Switch to input and wait for response
+    gpio.gpio_set_mode(gpio_handle, gpio.GPIO_MODE_INPUT)
+    gpio.gpio_set_pull(gpio_handle, gpio.GPIO_PULL_UP)
+
+    // Wait for DHT to pull low (response signal)
+    if wait_for_level(gpio_handle, 0, DHT_TIMEOUT_US) == 0 {
+        gpio_sensors[handle].state = SENSOR_STATE_ERROR
+        gpio_sensor_stats.timeout_errors = gpio_sensor_stats.timeout_errors + 1
+        gpio_sensor_stats.failed_reads = gpio_sensor_stats.failed_reads + 1
+        return 0
+    }
+
+    // Wait for DHT to pull high
+    if wait_for_level(gpio_handle, 1, DHT_TIMEOUT_US) == 0 {
+        gpio_sensors[handle].state = SENSOR_STATE_ERROR
+        gpio_sensor_stats.timeout_errors = gpio_sensor_stats.timeout_errors + 1
+        gpio_sensor_stats.failed_reads = gpio_sensor_stats.failed_reads + 1
+        return 0
+    }
+
+    // Wait for DHT to pull low (start of data)
+    if wait_for_level(gpio_handle, 0, DHT_TIMEOUT_US) == 0 {
+        gpio_sensors[handle].state = SENSOR_STATE_ERROR
+        gpio_sensor_stats.timeout_errors = gpio_sensor_stats.timeout_errors + 1
+        gpio_sensor_stats.failed_reads = gpio_sensor_stats.failed_reads + 1
+        return 0
+    }
+
+    // Step 3: Read 40 bits of data
+    var bit: u32 = 0
+    while bit < 40 {
+        // Wait for high (start of bit)
+        if wait_for_level(gpio_handle, 1, DHT_TIMEOUT_US) == 0 {
+            gpio_sensors[handle].state = SENSOR_STATE_ERROR
+            gpio_sensor_stats.timeout_errors = gpio_sensor_stats.timeout_errors + 1
+            gpio_sensor_stats.failed_reads = gpio_sensor_stats.failed_reads + 1
+            return 0
+        }
+
+        // Measure high time to determine 0 or 1
+        var high_time: u32 = measure_high_time(gpio_handle)
+
+        // Shift in the bit
+        var byte_idx: u32 = bit / 8
+        data[byte_idx] = data[byte_idx] << 1
+
+        if high_time > DHT_BIT_THRESHOLD_US {
+            data[byte_idx] = data[byte_idx] | 1
+        }
+
+        bit = bit + 1
+    }
+
+    // Step 4: Verify checksum
+    var checksum: u8 = data[0] + data[1] + data[2] + data[3]
+    if checksum != data[4] {
+        gpio_sensors[handle].state = SENSOR_STATE_ERROR
+        gpio_sensors[handle].dht_reading.checksum_valid = 0
+        gpio_sensor_stats.checksum_errors = gpio_sensor_stats.checksum_errors + 1
+        gpio_sensor_stats.failed_reads = gpio_sensor_stats.failed_reads + 1
+        return 0
+    }
+
+    // Step 5: Parse data based on sensor type
+    if gpio_sensors[handle].sensor_type == GPIO_SENSOR_DHT11 {
+        // DHT11: Integer values only
+        gpio_sensors[handle].dht_reading.humidity_percent = data[0] * 10
+        gpio_sensors[handle].dht_reading.temperature_c = data[2] * 10
+    } else {
+        // DHT22: 16-bit values with 0.1 resolution
+        gpio_sensors[handle].dht_reading.humidity_percent = (data[0] << 8) | data[1]
+        var temp: i16 = ((data[2] & 0x7F) << 8) | data[3]
+        if (data[2] & 0x80) != 0 {
+            temp = -temp  // Negative temperature
+        }
+        gpio_sensors[handle].dht_reading.temperature_c = temp
+    }
+
+    gpio_sensors[handle].dht_reading.checksum_valid = 1
+    gpio_sensors[handle].dht_reading.timestamp = foundation.timer_get_ticks()
+    gpio_sensors[handle].state = SENSOR_STATE_READY
+    gpio_sensors[handle].last_poll = foundation.timer_get_ticks()
+
+    gpio_sensor_stats.successful_reads = gpio_sensor_stats.successful_reads + 1
+
+    return 1
+}
+
+// Get DHT temperature in 0.1°C units
+export fn gpio_sensor_get_temperature(handle: u32): i16 {
+    if handle >= gpio_sensor_count { return -9999 }
+    if gpio_sensors[handle].active == 0 { return -9999 }
+    return gpio_sensors[handle].dht_reading.temperature_c
+}
+
+// Get DHT humidity in 0.1% units
+export fn gpio_sensor_get_humidity(handle: u32): u16 {
+    if handle >= gpio_sensor_count { return 0 }
+    if gpio_sensors[handle].active == 0 { return 0 }
+    return gpio_sensors[handle].dht_reading.humidity_percent
+}
+
+// ============================================================================
+// PIR Motion Sensor
+// ============================================================================
+
+// Read PIR sensor (returns 1 if motion detected)
+export fn gpio_sensor_read_pir(handle: u32): u8 {
+    if handle >= gpio_sensor_count { return 0 }
+    if gpio_sensors[handle].active == 0 { return 0 }
+    if gpio_sensors[handle].sensor_type != GPIO_SENSOR_PIR { return 0 }
+
+    var pin: u32 = gpio_sensors[handle].gpio_pin
+    var controller: u32 = gpio_sensors[handle].controller
+    var gpio_handle: u32 = gpio.gpio_request(controller, pin)
+
+    var value: u8 = gpio.gpio_read(gpio_handle)
+    var now: u64 = foundation.timer_get_ticks()
+
+    // Check cooldown period
+    var cooldown: u32 = gpio_sensors[handle].motion_state.cooldown_ms
+    var last_trigger: u64 = gpio_sensors[handle].motion_state.last_trigger
+
+    if value == 1 {
+        if now - last_trigger >= cooldown {
+            gpio_sensors[handle].motion_state.detected = 1
+            gpio_sensors[handle].motion_state.last_trigger = now
+            gpio_sensors[handle].motion_state.trigger_count =
+                gpio_sensors[handle].motion_state.trigger_count + 1
+            gpio_sensor_stats.motion_events = gpio_sensor_stats.motion_events + 1
+
+            // Call callback if registered
+            if gpio_sensors[handle].callback != 0 {
+                // Would invoke callback here
+            }
+        }
+    } else {
+        gpio_sensors[handle].motion_state.detected = 0
+    }
+
+    gpio_sensors[handle].last_poll = now
+    gpio_sensor_stats.total_reads = gpio_sensor_stats.total_reads + 1
+    gpio_sensor_stats.successful_reads = gpio_sensor_stats.successful_reads + 1
+
+    return gpio_sensors[handle].motion_state.detected
+}
+
+// Get motion trigger count
+export fn gpio_sensor_get_motion_count(handle: u32): u32 {
+    if handle >= gpio_sensor_count { return 0 }
+    return gpio_sensors[handle].motion_state.trigger_count
+}
+
+// Reset motion trigger count
+export fn gpio_sensor_reset_motion_count(handle: u32) {
+    if handle >= gpio_sensor_count { return }
+    gpio_sensors[handle].motion_state.trigger_count = 0
+}
+
+// ============================================================================
+// Ultrasonic Distance Sensor (HC-SR04)
+// ============================================================================
+
+// Read ultrasonic sensor
+export fn gpio_sensor_read_ultrasonic(handle: u32): u32 {
+    if handle >= gpio_sensor_count { return 0xFFFFFFFF }
+    if gpio_sensors[handle].active == 0 { return 0xFFFFFFFF }
+    if gpio_sensors[handle].sensor_type != GPIO_SENSOR_ULTRASONIC { return 0xFFFFFFFF }
+
+    gpio_sensor_stats.total_reads = gpio_sensor_stats.total_reads + 1
+    gpio_sensors[handle].state = SENSOR_STATE_READING
+
+    var trigger_pin: u32 = gpio_sensors[handle].gpio_pin
+    var echo_pin: u32 = gpio_sensors[handle].gpio_pin2
+    var controller: u32 = gpio_sensors[handle].controller
+
+    var trig_handle: u32 = gpio.gpio_request(controller, trigger_pin)
+    var echo_handle: u32 = gpio.gpio_request(controller, echo_pin)
+
+    // Send 10us trigger pulse
+    gpio.gpio_write(trig_handle, 0)
+    delay_us(2)
+    gpio.gpio_write(trig_handle, 1)
+    delay_us(ULTRASONIC_TRIGGER_US)
+    gpio.gpio_write(trig_handle, 0)
+
+    // Wait for echo to go high
+    var start_time: u64 = foundation.timer_get_ticks()
+    while gpio.gpio_read(echo_handle) == 0 {
+        if foundation.timer_get_ticks() - start_time > ULTRASONIC_TIMEOUT_US {
+            gpio_sensors[handle].state = SENSOR_STATE_ERROR
+            gpio_sensors[handle].ultrasonic_reading.valid = 0
+            gpio_sensor_stats.timeout_errors = gpio_sensor_stats.timeout_errors + 1
+            gpio_sensor_stats.failed_reads = gpio_sensor_stats.failed_reads + 1
+            return 0xFFFFFFFF
+        }
+    }
+
+    // Measure echo high time
+    var echo_start: u64 = foundation.timer_get_ticks()
+    while gpio.gpio_read(echo_handle) == 1 {
+        if foundation.timer_get_ticks() - echo_start > ULTRASONIC_TIMEOUT_US {
+            gpio_sensors[handle].state = SENSOR_STATE_ERROR
+            gpio_sensors[handle].ultrasonic_reading.valid = 0
+            gpio_sensor_stats.timeout_errors = gpio_sensor_stats.timeout_errors + 1
+            gpio_sensor_stats.failed_reads = gpio_sensor_stats.failed_reads + 1
+            return 0xFFFFFFFF
+        }
+    }
+    var echo_end: u64 = foundation.timer_get_ticks()
+
+    // Calculate distance
+    // Distance = (Time * Speed of Sound) / 2
+    // Speed of sound ≈ 343 m/s = 0.0343 cm/us = 0.343 mm/us
+    var echo_time_us: u32 = echo_end - echo_start
+    var distance_mm: u32 = (echo_time_us * 343) / 2000  // Convert to mm
+
+    gpio_sensors[handle].ultrasonic_reading.echo_time_us = echo_time_us
+    gpio_sensors[handle].ultrasonic_reading.distance_mm = distance_mm
+    gpio_sensors[handle].ultrasonic_reading.valid = 1
+    gpio_sensors[handle].ultrasonic_reading.timestamp = foundation.timer_get_ticks()
+    gpio_sensors[handle].state = SENSOR_STATE_READY
+    gpio_sensors[handle].last_poll = foundation.timer_get_ticks()
+
+    gpio_sensor_stats.successful_reads = gpio_sensor_stats.successful_reads + 1
+
+    return distance_mm
+}
+
+// Get distance in millimeters
+export fn gpio_sensor_get_distance_mm(handle: u32): u32 {
+    if handle >= gpio_sensor_count { return 0xFFFFFFFF }
+    return gpio_sensors[handle].ultrasonic_reading.distance_mm
+}
+
+// Get distance in centimeters
+export fn gpio_sensor_get_distance_cm(handle: u32): u32 {
+    if handle >= gpio_sensor_count { return 0xFFFFFFFF }
+    return gpio_sensors[handle].ultrasonic_reading.distance_mm / 10
+}
+
+// ============================================================================
+// Digital Sensors (Reed, Tilt, Flame, etc.)
+// ============================================================================
+
+// Read digital sensor value
+export fn gpio_sensor_read_digital(handle: u32): u8 {
+    if handle >= gpio_sensor_count { return 0xFF }
+    if gpio_sensors[handle].active == 0 { return 0xFF }
+
+    var pin: u32 = gpio_sensors[handle].gpio_pin
+    var controller: u32 = gpio_sensors[handle].controller
+    var gpio_handle: u32 = gpio.gpio_request(controller, pin)
+
+    var value: u8 = gpio.gpio_read(gpio_handle)
+    gpio_sensors[handle].digital_value = value
+    gpio_sensors[handle].last_poll = foundation.timer_get_ticks()
+
+    gpio_sensor_stats.total_reads = gpio_sensor_stats.total_reads + 1
+    gpio_sensor_stats.successful_reads = gpio_sensor_stats.successful_reads + 1
+
+    return value
+}
+
+// ============================================================================
+// Interrupt-based Sensing
+// ============================================================================
+
+// Enable interrupt for sensor (motion, reed, etc.)
+export fn gpio_sensor_enable_interrupt(handle: u32, mode: u8) {
+    if handle >= gpio_sensor_count { return }
+    if gpio_sensors[handle].active == 0 { return }
+
+    var pin: u32 = gpio_sensors[handle].gpio_pin
+    var controller: u32 = gpio_sensors[handle].controller
+    var gpio_handle: u32 = gpio.gpio_request(controller, pin)
+
+    gpio.gpio_enable_interrupt(gpio_handle, mode,
+        gpio_sensors[handle].callback,
+        gpio_sensors[handle].user_data)
+}
+
+// Set callback for sensor events
+export fn gpio_sensor_set_callback(handle: u32, callback: u64, user_data: u64) {
+    if handle >= gpio_sensor_count { return }
+    gpio_sensors[handle].callback = callback
+    gpio_sensors[handle].user_data = user_data
+}
+
+// ============================================================================
+// Auto-polling
+// ============================================================================
+
+// Poll all sensors that have auto-polling enabled
+export fn gpio_sensors_poll_all() {
+    var now: u64 = foundation.timer_get_ticks()
+
+    var i: u32 = 0
+    while i < gpio_sensor_count {
+        if gpio_sensors[i].active == 1 {
+            if gpio_sensors[i].poll_interval_ms > 0 {
+                if now - gpio_sensors[i].last_poll >= gpio_sensors[i].poll_interval_ms {
+                    gpio_sensor_read(i)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Generic read based on sensor type
+export fn gpio_sensor_read(handle: u32): u32 {
+    if handle >= gpio_sensor_count { return 0 }
+    if gpio_sensors[handle].active == 0 { return 0 }
+
+    var sensor_type: u8 = gpio_sensors[handle].sensor_type
+
+    if sensor_type == GPIO_SENSOR_DHT11 || sensor_type == GPIO_SENSOR_DHT22 {
+        return gpio_sensor_read_dht(handle)
+    } else if sensor_type == GPIO_SENSOR_PIR {
+        return gpio_sensor_read_pir(handle)
+    } else if sensor_type == GPIO_SENSOR_ULTRASONIC {
+        return if gpio_sensor_read_ultrasonic(handle) != 0xFFFFFFFF { 1 } else { 0 }
+    } else {
+        return gpio_sensor_read_digital(handle)
+    }
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+// Set poll interval for a sensor
+export fn gpio_sensor_set_poll_interval(handle: u32, interval_ms: u32) {
+    if handle >= gpio_sensor_count { return }
+    gpio_sensors[handle].poll_interval_ms = interval_ms
+}
+
+// Get sensor type
+export fn gpio_sensor_get_type(handle: u32): u8 {
+    if handle >= gpio_sensor_count { return 0xFF }
+    return gpio_sensors[handle].sensor_type
+}
+
+// Get sensor state
+export fn gpio_sensor_get_state(handle: u32): u8 {
+    if handle >= gpio_sensor_count { return SENSOR_STATE_ERROR }
+    return gpio_sensors[handle].state
+}
+
+// Unregister sensor
+export fn gpio_sensor_unregister(handle: u32) {
+    if handle >= gpio_sensor_count { return }
+    if gpio_sensors[handle].active == 0 { return }
+
+    var pin: u32 = gpio_sensors[handle].gpio_pin
+    var controller: u32 = gpio_sensors[handle].controller
+    var gpio_handle: u32 = gpio.gpio_request(controller, pin)
+
+    gpio.gpio_free(gpio_handle)
+
+    if gpio_sensors[handle].gpio_pin2 != 0 {
+        var gpio_handle2: u32 = gpio.gpio_request(controller, gpio_sensors[handle].gpio_pin2)
+        gpio.gpio_free(gpio_handle2)
+    }
+
+    gpio_sensors[handle].active = 0
+    gpio_sensor_count = gpio_sensor_count - 1
+}
+
+// Get statistics
+export fn gpio_sensors_get_stats(): u64 {
+    return @ptrFromInt(gpio_sensor_stats)
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Wait for GPIO to reach specified level (with timeout)
+fn wait_for_level(gpio_handle: u32, level: u8, timeout_us: u32): u32 {
+    var start: u64 = foundation.timer_get_ticks()
+
+    while gpio.gpio_read(gpio_handle) != level {
+        if foundation.timer_get_ticks() - start > timeout_us {
+            return 0
+        }
+    }
+
+    return 1
+}
+
+// Measure how long GPIO stays high
+fn measure_high_time(gpio_handle: u32): u32 {
+    var start: u64 = foundation.timer_get_ticks()
+
+    while gpio.gpio_read(gpio_handle) == 1 {
+        if foundation.timer_get_ticks() - start > 100 {
+            break
+        }
+    }
+
+    return foundation.timer_get_ticks() - start
+}
+
+// Microsecond delay
+fn delay_us(us: u32) {
+    var start: u64 = foundation.timer_get_ticks()
+    while foundation.timer_get_ticks() - start < us {
+        // Busy wait
+    }
+}
+
+// ============================================================================
+// Shutdown
+// ============================================================================
+
+export fn gpio_sensors_shutdown() {
+    if gpio_sensors_initialized == 0 { return }
+
+    var i: u32 = 0
+    while i < gpio_sensor_count {
+        if gpio_sensors[i].active == 1 {
+            gpio_sensor_unregister(i)
+        }
+        i = i + 1
+    }
+
+    gpio_sensors_initialized = 0
+    foundation.serial_write_string("[GPIO-Sensors] Shutdown complete\n")
+}

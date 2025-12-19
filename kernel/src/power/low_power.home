@@ -1,0 +1,921 @@
+// home-os Low-Power Modes for Battery Operation
+// Energy-efficient operation for IoT and embedded devices
+
+import "../core/foundation.home" as foundation
+import "../drivers/gpio.home" as gpio
+import "pm.home" as pm
+
+// ============================================================================
+// Power States
+// ============================================================================
+
+// System power modes (ordered by power consumption)
+const POWER_MODE_ACTIVE: u8 = 0          // Full performance
+const POWER_MODE_IDLE: u8 = 1            // CPU idle, peripherals active
+const POWER_MODE_LIGHT_SLEEP: u8 = 2     // CPU halted, fast wakeup
+const POWER_MODE_DEEP_SLEEP: u8 = 3      // Most peripherals off
+const POWER_MODE_HIBERNATE: u8 = 4       // Only RTC running
+const POWER_MODE_SHUTDOWN: u8 = 5        // Only wake sources active
+
+// CPU power states
+const CPU_STATE_C0: u8 = 0               // Active
+const CPU_STATE_C1: u8 = 1               // Halt (MWAIT/HLT)
+const CPU_STATE_C1E: u8 = 2              // Enhanced Halt
+const CPU_STATE_C3: u8 = 3               // Deep Sleep
+const CPU_STATE_C6: u8 = 4               // Power Gating
+const CPU_STATE_C7: u8 = 5               // Deep Power Gating
+
+// Peripheral power domains
+const DOMAIN_CPU_CORE: u8 = 0
+const DOMAIN_CPU_CACHE: u8 = 1
+const DOMAIN_MEMORY: u8 = 2
+const DOMAIN_USB: u8 = 3
+const DOMAIN_DISPLAY: u8 = 4
+const DOMAIN_AUDIO: u8 = 5
+const DOMAIN_NETWORK: u8 = 6
+const DOMAIN_STORAGE: u8 = 7
+const DOMAIN_GPIO: u8 = 8
+const DOMAIN_I2C: u8 = 9
+const DOMAIN_SPI: u8 = 10
+const DOMAIN_UART: u8 = 11
+const DOMAIN_ADC: u8 = 12
+const DOMAIN_DAC: u8 = 13
+const DOMAIN_TIMER: u8 = 14
+const DOMAIN_RTC: u8 = 15
+
+const MAX_POWER_DOMAINS: u32 = 16
+const MAX_WAKE_SOURCES: u32 = 32
+const MAX_POWER_POLICIES: u32 = 8
+
+// ============================================================================
+// Wake Sources
+// ============================================================================
+
+const WAKE_SOURCE_GPIO: u8 = 0           // GPIO pin interrupt
+const WAKE_SOURCE_RTC: u8 = 1            // RTC alarm
+const WAKE_SOURCE_TIMER: u8 = 2          // Hardware timer
+const WAKE_SOURCE_UART: u8 = 3           // UART activity
+const WAKE_SOURCE_USB: u8 = 4            // USB connect/disconnect
+const WAKE_SOURCE_NETWORK: u8 = 5        // Network activity (WoL)
+const WAKE_SOURCE_BUTTON: u8 = 6         // Power button
+const WAKE_SOURCE_SENSOR: u8 = 7         // Sensor threshold
+const WAKE_SOURCE_TOUCH: u8 = 8          // Touch/proximity
+const WAKE_SOURCE_ACCELEROMETER: u8 = 9  // Motion detection
+
+// Wake edge types
+const WAKE_EDGE_RISING: u8 = 0
+const WAKE_EDGE_FALLING: u8 = 1
+const WAKE_EDGE_BOTH: u8 = 2
+const WAKE_EDGE_LEVEL_HIGH: u8 = 3
+const WAKE_EDGE_LEVEL_LOW: u8 = 4
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// Power domain configuration
+struct PowerDomain {
+    domain_id: u8,
+    name: [u8; 16],
+    current_state: u8,          // 0=off, 1=on, 2=low-power
+    can_power_gate: u8,
+    can_clock_gate: u8,
+    power_gpio: u8,             // GPIO for power control (0xFF = none)
+    clock_gate_reg: u64,        // Clock gating register address
+    clock_gate_bit: u8,
+    resume_time_us: u32,        // Time to resume from off state
+    power_mw: u32,              // Power consumption when active (mW)
+    ref_count: u32,             // Number of active users
+    active: u8
+}
+
+// Wake source configuration
+struct WakeSource {
+    source_type: u8,
+    source_id: u8,              // GPIO pin or peripheral ID
+    edge_type: u8,
+    enabled: u8,
+    priority: u8,               // Higher = more important
+    callback: u64,              // Function to call on wake
+    user_data: u64,
+    trigger_count: u32,
+    last_trigger: u64,
+    active: u8
+}
+
+// Power policy
+struct PowerPolicy {
+    name: [u8; 32],
+    idle_timeout_ms: u32,       // Time before entering light sleep
+    light_sleep_timeout_ms: u32, // Time before entering deep sleep
+    deep_sleep_timeout_ms: u32,  // Time before entering hibernate
+
+    // Domain behavior in each mode
+    domain_light_sleep: [u8; 16],  // State for each domain in light sleep
+    domain_deep_sleep: [u8; 16],   // State for each domain in deep sleep
+    domain_hibernate: [u8; 16],    // State for each domain in hibernate
+
+    // Performance settings
+    min_cpu_freq_mhz: u32,
+    max_cpu_freq_mhz: u32,
+
+    active: u8
+}
+
+// Low power state tracking
+struct LowPowerState {
+    current_mode: u8,
+    target_mode: u8,
+    last_activity: u64,
+    sleep_start: u64,
+    total_sleep_time_ms: u64,
+    total_active_time_ms: u64,
+    wake_count: u32,
+    last_wake_source: u8,
+    battery_level_percent: u8,
+    charging: u8,
+    on_battery: u8
+}
+
+// Power statistics
+struct LowPowerStats {
+    active_time_ms: u64,
+    idle_time_ms: u64,
+    light_sleep_time_ms: u64,
+    deep_sleep_time_ms: u64,
+    hibernate_time_ms: u64,
+    wake_events: u64,
+    gpio_wakes: u32,
+    rtc_wakes: u32,
+    timer_wakes: u32,
+    uart_wakes: u32,
+    network_wakes: u32,
+    total_power_mwh: u32,
+    estimated_battery_hours: u32
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var power_domains: [PowerDomain; 16]
+var wake_sources: [WakeSource; 32]
+var power_policies: [PowerPolicy; 8]
+var current_policy: u32 = 0
+var low_power_state: LowPowerState
+var low_power_stats: LowPowerStats
+var low_power_initialized: u32 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn low_power_init(): u32 {
+    if low_power_initialized == 1 {
+        return 1
+    }
+
+    // Initialize power domains
+    var i: u32 = 0
+    while i < MAX_POWER_DOMAINS {
+        power_domains[i].active = 0
+        power_domains[i].current_state = 1  // On by default
+        power_domains[i].ref_count = 0
+        i = i + 1
+    }
+
+    // Initialize wake sources
+    i = 0
+    while i < MAX_WAKE_SOURCES {
+        wake_sources[i].active = 0
+        wake_sources[i].enabled = 0
+        wake_sources[i].trigger_count = 0
+        i = i + 1
+    }
+
+    // Initialize policies
+    i = 0
+    while i < MAX_POWER_POLICIES {
+        power_policies[i].active = 0
+        i = i + 1
+    }
+
+    // Initialize state
+    low_power_state.current_mode = POWER_MODE_ACTIVE
+    low_power_state.target_mode = POWER_MODE_ACTIVE
+    low_power_state.last_activity = foundation.timer_get_ticks()
+    low_power_state.sleep_start = 0
+    low_power_state.total_sleep_time_ms = 0
+    low_power_state.total_active_time_ms = 0
+    low_power_state.wake_count = 0
+    low_power_state.last_wake_source = 0xFF
+    low_power_state.battery_level_percent = 100
+    low_power_state.charging = 0
+    low_power_state.on_battery = 0
+
+    // Clear stats
+    low_power_stats.active_time_ms = 0
+    low_power_stats.idle_time_ms = 0
+    low_power_stats.light_sleep_time_ms = 0
+    low_power_stats.deep_sleep_time_ms = 0
+    low_power_stats.hibernate_time_ms = 0
+    low_power_stats.wake_events = 0
+    low_power_stats.gpio_wakes = 0
+    low_power_stats.rtc_wakes = 0
+    low_power_stats.timer_wakes = 0
+    low_power_stats.uart_wakes = 0
+    low_power_stats.network_wakes = 0
+    low_power_stats.total_power_mwh = 0
+    low_power_stats.estimated_battery_hours = 0
+
+    // Register default power domains
+    register_default_domains()
+
+    // Create default power policy
+    create_default_policy()
+
+    low_power_initialized = 1
+    foundation.serial_write_string("[Low-Power] Initialized\n")
+    return 1
+}
+
+// Register default power domains
+fn register_default_domains() {
+    // CPU core
+    power_domains[DOMAIN_CPU_CORE].domain_id = DOMAIN_CPU_CORE
+    power_domains[DOMAIN_CPU_CORE].can_power_gate = 0
+    power_domains[DOMAIN_CPU_CORE].can_clock_gate = 1
+    power_domains[DOMAIN_CPU_CORE].power_mw = 500
+    power_domains[DOMAIN_CPU_CORE].resume_time_us = 1
+    power_domains[DOMAIN_CPU_CORE].active = 1
+
+    // Memory
+    power_domains[DOMAIN_MEMORY].domain_id = DOMAIN_MEMORY
+    power_domains[DOMAIN_MEMORY].can_power_gate = 0
+    power_domains[DOMAIN_MEMORY].can_clock_gate = 1
+    power_domains[DOMAIN_MEMORY].power_mw = 200
+    power_domains[DOMAIN_MEMORY].resume_time_us = 10
+    power_domains[DOMAIN_MEMORY].active = 1
+
+    // USB
+    power_domains[DOMAIN_USB].domain_id = DOMAIN_USB
+    power_domains[DOMAIN_USB].can_power_gate = 1
+    power_domains[DOMAIN_USB].can_clock_gate = 1
+    power_domains[DOMAIN_USB].power_mw = 100
+    power_domains[DOMAIN_USB].resume_time_us = 1000
+    power_domains[DOMAIN_USB].active = 1
+
+    // Display
+    power_domains[DOMAIN_DISPLAY].domain_id = DOMAIN_DISPLAY
+    power_domains[DOMAIN_DISPLAY].can_power_gate = 1
+    power_domains[DOMAIN_DISPLAY].can_clock_gate = 1
+    power_domains[DOMAIN_DISPLAY].power_mw = 1000
+    power_domains[DOMAIN_DISPLAY].resume_time_us = 50000
+    power_domains[DOMAIN_DISPLAY].active = 1
+
+    // Network
+    power_domains[DOMAIN_NETWORK].domain_id = DOMAIN_NETWORK
+    power_domains[DOMAIN_NETWORK].can_power_gate = 1
+    power_domains[DOMAIN_NETWORK].can_clock_gate = 1
+    power_domains[DOMAIN_NETWORK].power_mw = 150
+    power_domains[DOMAIN_NETWORK].resume_time_us = 100000
+    power_domains[DOMAIN_NETWORK].active = 1
+
+    // GPIO (always on for wake capability)
+    power_domains[DOMAIN_GPIO].domain_id = DOMAIN_GPIO
+    power_domains[DOMAIN_GPIO].can_power_gate = 0
+    power_domains[DOMAIN_GPIO].can_clock_gate = 1
+    power_domains[DOMAIN_GPIO].power_mw = 5
+    power_domains[DOMAIN_GPIO].resume_time_us = 1
+    power_domains[DOMAIN_GPIO].active = 1
+
+    // I2C
+    power_domains[DOMAIN_I2C].domain_id = DOMAIN_I2C
+    power_domains[DOMAIN_I2C].can_power_gate = 1
+    power_domains[DOMAIN_I2C].can_clock_gate = 1
+    power_domains[DOMAIN_I2C].power_mw = 10
+    power_domains[DOMAIN_I2C].resume_time_us = 100
+    power_domains[DOMAIN_I2C].active = 1
+
+    // SPI
+    power_domains[DOMAIN_SPI].domain_id = DOMAIN_SPI
+    power_domains[DOMAIN_SPI].can_power_gate = 1
+    power_domains[DOMAIN_SPI].can_clock_gate = 1
+    power_domains[DOMAIN_SPI].power_mw = 10
+    power_domains[DOMAIN_SPI].resume_time_us = 50
+    power_domains[DOMAIN_SPI].active = 1
+
+    // RTC (always on)
+    power_domains[DOMAIN_RTC].domain_id = DOMAIN_RTC
+    power_domains[DOMAIN_RTC].can_power_gate = 0
+    power_domains[DOMAIN_RTC].can_clock_gate = 0
+    power_domains[DOMAIN_RTC].power_mw = 1
+    power_domains[DOMAIN_RTC].resume_time_us = 0
+    power_domains[DOMAIN_RTC].active = 1
+}
+
+// Create default power policy
+fn create_default_policy() {
+    power_policies[0].idle_timeout_ms = 1000       // 1 second to light sleep
+    power_policies[0].light_sleep_timeout_ms = 30000  // 30 seconds to deep sleep
+    power_policies[0].deep_sleep_timeout_ms = 300000  // 5 minutes to hibernate
+
+    // In light sleep: turn off display, USB selective suspend
+    power_policies[0].domain_light_sleep[DOMAIN_DISPLAY] = 0
+    power_policies[0].domain_light_sleep[DOMAIN_USB] = 2     // Low power
+    power_policies[0].domain_light_sleep[DOMAIN_NETWORK] = 1  // Keep active
+    power_policies[0].domain_light_sleep[DOMAIN_GPIO] = 1
+    power_policies[0].domain_light_sleep[DOMAIN_RTC] = 1
+
+    // In deep sleep: most peripherals off
+    power_policies[0].domain_deep_sleep[DOMAIN_DISPLAY] = 0
+    power_policies[0].domain_deep_sleep[DOMAIN_USB] = 0
+    power_policies[0].domain_deep_sleep[DOMAIN_NETWORK] = 0
+    power_policies[0].domain_deep_sleep[DOMAIN_I2C] = 0
+    power_policies[0].domain_deep_sleep[DOMAIN_SPI] = 0
+    power_policies[0].domain_deep_sleep[DOMAIN_GPIO] = 1
+    power_policies[0].domain_deep_sleep[DOMAIN_RTC] = 1
+
+    // In hibernate: only RTC and GPIO for wake
+    power_policies[0].domain_hibernate[DOMAIN_GPIO] = 1
+    power_policies[0].domain_hibernate[DOMAIN_RTC] = 1
+
+    power_policies[0].min_cpu_freq_mhz = 100
+    power_policies[0].max_cpu_freq_mhz = 1000
+
+    power_policies[0].active = 1
+}
+
+// ============================================================================
+// Power Domain Control
+// ============================================================================
+
+// Acquire power domain (increment reference count)
+export fn low_power_domain_acquire(domain: u8): u32 {
+    if domain >= MAX_POWER_DOMAINS { return 0 }
+
+    power_domains[domain].ref_count = power_domains[domain].ref_count + 1
+
+    // Power on if needed
+    if power_domains[domain].current_state == 0 {
+        low_power_domain_on(domain)
+    }
+
+    return 1
+}
+
+// Release power domain (decrement reference count)
+export fn low_power_domain_release(domain: u8) {
+    if domain >= MAX_POWER_DOMAINS { return }
+
+    if power_domains[domain].ref_count > 0 {
+        power_domains[domain].ref_count = power_domains[domain].ref_count - 1
+    }
+
+    // Power off if no users and allowed
+    if power_domains[domain].ref_count == 0 {
+        if power_domains[domain].can_power_gate == 1 {
+            // Don't power off immediately, let policy decide
+        }
+    }
+}
+
+// Power on domain
+fn low_power_domain_on(domain: u8) {
+    if domain >= MAX_POWER_DOMAINS { return }
+    if power_domains[domain].current_state == 1 { return }
+
+    // Enable power if GPIO controlled
+    if power_domains[domain].power_gpio != 0xFF {
+        // Would set GPIO high here
+    }
+
+    // Enable clock
+    if power_domains[domain].clock_gate_reg != 0 {
+        var reg: u64 = power_domains[domain].clock_gate_reg
+        var bit: u8 = power_domains[domain].clock_gate_bit
+        var value: u32 = @intToPtr(reg, u32)
+        value = value | (1 << bit)
+        @ptrToInt(reg, u32) = value
+    }
+
+    // Wait for domain to stabilize
+    delay_us(power_domains[domain].resume_time_us)
+
+    power_domains[domain].current_state = 1
+}
+
+// Power off domain
+fn low_power_domain_off(domain: u8) {
+    if domain >= MAX_POWER_DOMAINS { return }
+    if power_domains[domain].current_state == 0 { return }
+    if power_domains[domain].can_power_gate == 0 { return }
+    if power_domains[domain].ref_count > 0 { return }
+
+    // Disable clock
+    if power_domains[domain].clock_gate_reg != 0 {
+        var reg: u64 = power_domains[domain].clock_gate_reg
+        var bit: u8 = power_domains[domain].clock_gate_bit
+        var value: u32 = @intToPtr(reg, u32)
+        value = value & ~(1 << bit)
+        @ptrToInt(reg, u32) = value
+    }
+
+    // Disable power if GPIO controlled
+    if power_domains[domain].power_gpio != 0xFF {
+        // Would set GPIO low here
+    }
+
+    power_domains[domain].current_state = 0
+}
+
+// ============================================================================
+// Wake Source Management
+// ============================================================================
+
+// Register wake source (GPIO)
+export fn low_power_register_gpio_wake(pin: u8, edge: u8, callback: u64): u32 {
+    var i: u32 = 0
+    while i < MAX_WAKE_SOURCES {
+        if wake_sources[i].active == 0 {
+            wake_sources[i].source_type = WAKE_SOURCE_GPIO
+            wake_sources[i].source_id = pin
+            wake_sources[i].edge_type = edge
+            wake_sources[i].enabled = 1
+            wake_sources[i].priority = 5
+            wake_sources[i].callback = callback
+            wake_sources[i].trigger_count = 0
+            wake_sources[i].active = 1
+
+            foundation.serial_write_string("[Low-Power] GPIO wake registered on pin ")
+            foundation.serial_write_hex(pin)
+            foundation.serial_write_string("\n")
+
+            return i
+        }
+        i = i + 1
+    }
+
+    return 0xFFFFFFFF
+}
+
+// Register wake source (RTC alarm)
+export fn low_power_register_rtc_wake(seconds: u32, callback: u64): u32 {
+    var i: u32 = 0
+    while i < MAX_WAKE_SOURCES {
+        if wake_sources[i].active == 0 {
+            wake_sources[i].source_type = WAKE_SOURCE_RTC
+            wake_sources[i].source_id = 0
+            wake_sources[i].edge_type = 0
+            wake_sources[i].enabled = 1
+            wake_sources[i].priority = 3
+            wake_sources[i].callback = callback
+            wake_sources[i].user_data = seconds
+            wake_sources[i].trigger_count = 0
+            wake_sources[i].active = 1
+
+            // Would configure RTC alarm here
+
+            foundation.serial_write_string("[Low-Power] RTC wake registered for ")
+            foundation.serial_write_hex(seconds)
+            foundation.serial_write_string(" seconds\n")
+
+            return i
+        }
+        i = i + 1
+    }
+
+    return 0xFFFFFFFF
+}
+
+// Register wake source (Timer)
+export fn low_power_register_timer_wake(interval_ms: u32, callback: u64): u32 {
+    var i: u32 = 0
+    while i < MAX_WAKE_SOURCES {
+        if wake_sources[i].active == 0 {
+            wake_sources[i].source_type = WAKE_SOURCE_TIMER
+            wake_sources[i].source_id = 0
+            wake_sources[i].edge_type = 0
+            wake_sources[i].enabled = 1
+            wake_sources[i].priority = 4
+            wake_sources[i].callback = callback
+            wake_sources[i].user_data = interval_ms
+            wake_sources[i].trigger_count = 0
+            wake_sources[i].active = 1
+
+            return i
+        }
+        i = i + 1
+    }
+
+    return 0xFFFFFFFF
+}
+
+// Enable/disable wake source
+export fn low_power_wake_enable(handle: u32, enabled: u8) {
+    if handle >= MAX_WAKE_SOURCES { return }
+    if wake_sources[handle].active == 0 { return }
+
+    wake_sources[handle].enabled = enabled
+}
+
+// Unregister wake source
+export fn low_power_wake_unregister(handle: u32) {
+    if handle >= MAX_WAKE_SOURCES { return }
+    wake_sources[handle].active = 0
+}
+
+// ============================================================================
+// Sleep Mode Entry/Exit
+// ============================================================================
+
+// Enter light sleep mode
+export fn low_power_enter_light_sleep(): u32 {
+    if low_power_state.current_mode != POWER_MODE_ACTIVE &&
+       low_power_state.current_mode != POWER_MODE_IDLE {
+        return 0  // Already in deeper sleep
+    }
+
+    foundation.serial_write_string("[Low-Power] Entering light sleep\n")
+
+    // Save state
+    low_power_state.sleep_start = foundation.timer_get_ticks()
+    low_power_state.current_mode = POWER_MODE_LIGHT_SLEEP
+
+    // Apply policy for light sleep
+    apply_domain_policy(POWER_MODE_LIGHT_SLEEP)
+
+    // Configure wake sources
+    configure_wake_sources()
+
+    // Enter CPU low-power state (WFI/HLT)
+    cpu_enter_c1()
+
+    // We return here after wake
+    return 1
+}
+
+// Enter deep sleep mode
+export fn low_power_enter_deep_sleep(): u32 {
+    if low_power_state.current_mode == POWER_MODE_HIBERNATE ||
+       low_power_state.current_mode == POWER_MODE_SHUTDOWN {
+        return 0
+    }
+
+    foundation.serial_write_string("[Low-Power] Entering deep sleep\n")
+
+    // Save state
+    low_power_state.sleep_start = foundation.timer_get_ticks()
+    low_power_state.current_mode = POWER_MODE_DEEP_SLEEP
+
+    // Apply policy for deep sleep
+    apply_domain_policy(POWER_MODE_DEEP_SLEEP)
+
+    // Configure wake sources
+    configure_wake_sources()
+
+    // Enter CPU deep sleep state
+    cpu_enter_c6()
+
+    return 1
+}
+
+// Enter hibernate mode
+export fn low_power_enter_hibernate(): u32 {
+    foundation.serial_write_string("[Low-Power] Entering hibernate\n")
+
+    // Save state to persistent storage
+    // ... (would save RAM to disk here)
+
+    low_power_state.sleep_start = foundation.timer_get_ticks()
+    low_power_state.current_mode = POWER_MODE_HIBERNATE
+
+    // Apply policy for hibernate
+    apply_domain_policy(POWER_MODE_HIBERNATE)
+
+    // Configure minimal wake sources
+    configure_wake_sources()
+
+    // Enter deepest CPU state
+    cpu_enter_c7()
+
+    return 1
+}
+
+// Exit sleep mode (called on wake)
+export fn low_power_exit_sleep(wake_source: u8) {
+    var sleep_duration: u64 = foundation.timer_get_ticks() - low_power_state.sleep_start
+    var previous_mode: u8 = low_power_state.current_mode
+
+    // Update statistics
+    if previous_mode == POWER_MODE_LIGHT_SLEEP {
+        low_power_stats.light_sleep_time_ms = low_power_stats.light_sleep_time_ms + (sleep_duration / 1000)
+    } else if previous_mode == POWER_MODE_DEEP_SLEEP {
+        low_power_stats.deep_sleep_time_ms = low_power_stats.deep_sleep_time_ms + (sleep_duration / 1000)
+    } else if previous_mode == POWER_MODE_HIBERNATE {
+        low_power_stats.hibernate_time_ms = low_power_stats.hibernate_time_ms + (sleep_duration / 1000)
+    }
+
+    low_power_stats.wake_events = low_power_stats.wake_events + 1
+
+    // Track wake source
+    if wake_source == WAKE_SOURCE_GPIO {
+        low_power_stats.gpio_wakes = low_power_stats.gpio_wakes + 1
+    } else if wake_source == WAKE_SOURCE_RTC {
+        low_power_stats.rtc_wakes = low_power_stats.rtc_wakes + 1
+    } else if wake_source == WAKE_SOURCE_TIMER {
+        low_power_stats.timer_wakes = low_power_stats.timer_wakes + 1
+    } else if wake_source == WAKE_SOURCE_UART {
+        low_power_stats.uart_wakes = low_power_stats.uart_wakes + 1
+    } else if wake_source == WAKE_SOURCE_NETWORK {
+        low_power_stats.network_wakes = low_power_stats.network_wakes + 1
+    }
+
+    low_power_state.last_wake_source = wake_source
+    low_power_state.wake_count = low_power_state.wake_count + 1
+    low_power_state.total_sleep_time_ms = low_power_state.total_sleep_time_ms + (sleep_duration / 1000)
+
+    // Restore power domains
+    restore_power_domains()
+
+    // Return to active mode
+    low_power_state.current_mode = POWER_MODE_ACTIVE
+    low_power_state.last_activity = foundation.timer_get_ticks()
+
+    foundation.serial_write_string("[Low-Power] Woke from sleep (source=")
+    foundation.serial_write_hex(wake_source)
+    foundation.serial_write_string(")\n")
+
+    // Call wake source callback
+    call_wake_callback(wake_source)
+}
+
+// Apply power domain policy for given mode
+fn apply_domain_policy(mode: u8) {
+    var policy: PowerPolicy = power_policies[current_policy]
+    var domain_states: u64
+
+    if mode == POWER_MODE_LIGHT_SLEEP {
+        domain_states = @ptrFromInt(policy.domain_light_sleep)
+    } else if mode == POWER_MODE_DEEP_SLEEP {
+        domain_states = @ptrFromInt(policy.domain_deep_sleep)
+    } else if mode == POWER_MODE_HIBERNATE {
+        domain_states = @ptrFromInt(policy.domain_hibernate)
+    } else {
+        return
+    }
+
+    var i: u8 = 0
+    while i < MAX_POWER_DOMAINS {
+        var target_state: u8 = @intToPtr(domain_states + i, u8)
+        if target_state == 0 {
+            low_power_domain_off(i)
+        }
+        i = i + 1
+    }
+}
+
+// Restore power domains to active state
+fn restore_power_domains() {
+    var i: u8 = 0
+    while i < MAX_POWER_DOMAINS {
+        if power_domains[i].ref_count > 0 || power_domains[i].can_power_gate == 0 {
+            low_power_domain_on(i)
+        }
+        i = i + 1
+    }
+}
+
+// Configure wake sources for current sleep mode
+fn configure_wake_sources() {
+    var i: u32 = 0
+    while i < MAX_WAKE_SOURCES {
+        if wake_sources[i].active == 1 && wake_sources[i].enabled == 1 {
+            if wake_sources[i].source_type == WAKE_SOURCE_GPIO {
+                // Configure GPIO interrupt
+                var pin: u8 = wake_sources[i].source_id
+                var edge: u8 = wake_sources[i].edge_type
+                // Would configure GPIO wake here
+            } else if wake_sources[i].source_type == WAKE_SOURCE_RTC {
+                // Configure RTC alarm
+                // Would configure RTC here
+            } else if wake_sources[i].source_type == WAKE_SOURCE_TIMER {
+                // Configure timer wake
+                // Would configure timer here
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Call callback for wake source
+fn call_wake_callback(wake_type: u8) {
+    var i: u32 = 0
+    while i < MAX_WAKE_SOURCES {
+        if wake_sources[i].active == 1 {
+            if wake_sources[i].source_type == wake_type {
+                wake_sources[i].trigger_count = wake_sources[i].trigger_count + 1
+                wake_sources[i].last_trigger = foundation.timer_get_ticks()
+                // Would call callback function here
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// CPU Power States
+// ============================================================================
+
+// Enter C1 state (light halt)
+fn cpu_enter_c1() {
+    // x86: HLT instruction
+    // ARM: WFI instruction
+    @asm("hlt")
+}
+
+// Enter C6 state (deep power down)
+fn cpu_enter_c6() {
+    // Would use MWAIT with appropriate hints
+    // For now, just use HLT
+    @asm("hlt")
+}
+
+// Enter C7 state (deepest power down)
+fn cpu_enter_c7() {
+    // Deepest state with cache flushed
+    // For now, just use HLT
+    @asm("hlt")
+}
+
+// ============================================================================
+// Activity Tracking
+// ============================================================================
+
+// Report activity (resets idle timer)
+export fn low_power_report_activity() {
+    low_power_state.last_activity = foundation.timer_get_ticks()
+
+    // If in sleep mode, we should be waking up
+    if low_power_state.current_mode != POWER_MODE_ACTIVE {
+        low_power_exit_sleep(WAKE_SOURCE_SENSOR)
+    }
+}
+
+// Get time since last activity (ms)
+export fn low_power_get_idle_time(): u64 {
+    return (foundation.timer_get_ticks() - low_power_state.last_activity) / 1000
+}
+
+// Check if should enter sleep (called by idle loop)
+export fn low_power_check_idle(): u8 {
+    if low_power_state.current_mode != POWER_MODE_ACTIVE {
+        return 0  // Already sleeping
+    }
+
+    var policy: PowerPolicy = power_policies[current_policy]
+    var idle_time: u64 = low_power_get_idle_time()
+
+    if idle_time >= policy.idle_timeout_ms {
+        return 1  // Should enter light sleep
+    }
+
+    return 0
+}
+
+// ============================================================================
+// Battery Management
+// ============================================================================
+
+// Update battery status
+export fn low_power_update_battery(level_percent: u8, charging: u8, on_battery: u8) {
+    low_power_state.battery_level_percent = level_percent
+    low_power_state.charging = charging
+    low_power_state.on_battery = on_battery
+
+    // Estimate remaining battery life
+    if on_battery == 1 && level_percent > 0 {
+        // Simple estimation based on average power consumption
+        var avg_power_mw: u32 = calculate_average_power()
+        // Assuming typical battery capacity of 5000mAh at 3.7V = 18500mWh
+        var remaining_mwh: u32 = (18500 * level_percent) / 100
+        if avg_power_mw > 0 {
+            low_power_stats.estimated_battery_hours = remaining_mwh / avg_power_mw
+        }
+    }
+}
+
+// Calculate average power consumption
+fn calculate_average_power(): u32 {
+    var total_power: u32 = 0
+
+    var i: u8 = 0
+    while i < MAX_POWER_DOMAINS {
+        if power_domains[i].active == 1 && power_domains[i].current_state == 1 {
+            total_power = total_power + power_domains[i].power_mw
+        }
+        i = i + 1
+    }
+
+    return total_power
+}
+
+// Get current power mode
+export fn low_power_get_mode(): u8 {
+    return low_power_state.current_mode
+}
+
+// Get battery level
+export fn low_power_get_battery_level(): u8 {
+    return low_power_state.battery_level_percent
+}
+
+// Check if on battery
+export fn low_power_is_on_battery(): u8 {
+    return low_power_state.on_battery
+}
+
+// ============================================================================
+// Policy Management
+// ============================================================================
+
+// Create new power policy
+export fn low_power_create_policy(idle_timeout: u32, light_sleep_timeout: u32, deep_sleep_timeout: u32): u32 {
+    var i: u32 = 0
+    while i < MAX_POWER_POLICIES {
+        if power_policies[i].active == 0 {
+            power_policies[i].idle_timeout_ms = idle_timeout
+            power_policies[i].light_sleep_timeout_ms = light_sleep_timeout
+            power_policies[i].deep_sleep_timeout_ms = deep_sleep_timeout
+            power_policies[i].active = 1
+            return i
+        }
+        i = i + 1
+    }
+    return 0xFFFFFFFF
+}
+
+// Set current policy
+export fn low_power_set_policy(policy_id: u32) {
+    if policy_id >= MAX_POWER_POLICIES { return }
+    if power_policies[policy_id].active == 0 { return }
+    current_policy = policy_id
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+// Get power statistics
+export fn low_power_get_stats(): u64 {
+    return @ptrFromInt(low_power_stats)
+}
+
+// Get current state
+export fn low_power_get_state(): u64 {
+    return @ptrFromInt(low_power_state)
+}
+
+// Reset statistics
+export fn low_power_reset_stats() {
+    low_power_stats.active_time_ms = 0
+    low_power_stats.idle_time_ms = 0
+    low_power_stats.light_sleep_time_ms = 0
+    low_power_stats.deep_sleep_time_ms = 0
+    low_power_stats.hibernate_time_ms = 0
+    low_power_stats.wake_events = 0
+    low_power_stats.gpio_wakes = 0
+    low_power_stats.rtc_wakes = 0
+    low_power_stats.timer_wakes = 0
+    low_power_stats.uart_wakes = 0
+    low_power_stats.network_wakes = 0
+}
+
+// ============================================================================
+// Utility
+// ============================================================================
+
+fn delay_us(us: u32) {
+    var start: u64 = foundation.timer_get_ticks()
+    while foundation.timer_get_ticks() - start < us {
+        // Busy wait
+    }
+}
+
+// ============================================================================
+// Shutdown
+// ============================================================================
+
+export fn low_power_shutdown() {
+    if low_power_initialized == 0 { return }
+
+    // Disable all wake sources
+    var i: u32 = 0
+    while i < MAX_WAKE_SOURCES {
+        wake_sources[i].active = 0
+        i = i + 1
+    }
+
+    low_power_initialized = 0
+    foundation.serial_write_string("[Low-Power] Shutdown complete\n")
+}
