@@ -1,0 +1,476 @@
+// HomeOS PS/2 Mouse Driver
+// Standard PS/2 mouse with scroll wheel support
+
+const basics = @import("basics")
+const irq = @import("kernel/irq")
+const input = @import("drivers/input/core")
+
+// ============================================
+// PS/2 Controller Ports
+// ============================================
+
+const PS2_DATA_PORT: u16 = 0x60
+const PS2_STATUS_PORT: u16 = 0x64
+const PS2_COMMAND_PORT: u16 = 0x64
+
+// Status register bits
+const PS2_STATUS_OUTPUT_FULL: u8 = 0x01
+const PS2_STATUS_INPUT_FULL: u8 = 0x02
+const PS2_STATUS_MOUSE_DATA: u8 = 0x20
+
+// Controller commands
+const PS2_CMD_READ_CONFIG: u8 = 0x20
+const PS2_CMD_WRITE_CONFIG: u8 = 0x60
+const PS2_CMD_DISABLE_MOUSE: u8 = 0xA7
+const PS2_CMD_ENABLE_MOUSE: u8 = 0xA8
+const PS2_CMD_TEST_MOUSE: u8 = 0xA9
+const PS2_CMD_WRITE_MOUSE: u8 = 0xD4
+
+// Mouse commands
+const MOUSE_CMD_RESET: u8 = 0xFF
+const MOUSE_CMD_RESEND: u8 = 0xFE
+const MOUSE_CMD_SET_DEFAULTS: u8 = 0xF6
+const MOUSE_CMD_DISABLE_STREAM: u8 = 0xF5
+const MOUSE_CMD_ENABLE_STREAM: u8 = 0xF4
+const MOUSE_CMD_SET_SAMPLE_RATE: u8 = 0xF3
+const MOUSE_CMD_GET_DEVICE_ID: u8 = 0xF2
+const MOUSE_CMD_SET_REMOTE: u8 = 0xF0
+const MOUSE_CMD_SET_WRAP: u8 = 0xEE
+const MOUSE_CMD_RESET_WRAP: u8 = 0xEC
+const MOUSE_CMD_READ_DATA: u8 = 0xEB
+const MOUSE_CMD_SET_STREAM: u8 = 0xEA
+const MOUSE_CMD_STATUS_REQUEST: u8 = 0xE9
+const MOUSE_CMD_SET_RESOLUTION: u8 = 0xE8
+const MOUSE_CMD_SET_SCALING_2_1: u8 = 0xE7
+const MOUSE_CMD_SET_SCALING_1_1: u8 = 0xE6
+
+// Mouse responses
+const MOUSE_ACK: u8 = 0xFA
+const MOUSE_RESEND: u8 = 0xFE
+const MOUSE_ERROR: u8 = 0xFC
+
+// Device IDs
+const MOUSE_ID_STANDARD: u8 = 0x00
+const MOUSE_ID_WHEEL: u8 = 0x03
+const MOUSE_ID_5_BUTTON: u8 = 0x04
+
+// ============================================
+// Mouse State
+// ============================================
+
+struct PS2MouseState {
+    // Packet state
+    packet: [4]u8
+    packet_index: u8
+    packet_size: u8
+
+    // Button state
+    buttons: u8
+    prev_buttons: u8
+
+    // Movement
+    x: i32
+    y: i32
+    scroll: i32
+
+    // Configuration
+    device_id: u8
+    has_wheel: bool
+    has_5_buttons: bool
+    sample_rate: u8
+    resolution: u8
+
+    // Input device
+    input_dev: *input.InputDevice
+
+    // Statistics
+    total_packets: u64
+    errors: u64
+}
+
+var mouse: PS2MouseState = undefined
+var mouse_initialized: bool = false
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn ps2_mouse_init(): bool {
+    basics.print("[PS2_MOUSE] Initializing PS/2 mouse driver\n")
+
+    // Initialize state
+    mouse.packet_index = 0
+    mouse.packet_size = 3
+    mouse.buttons = 0
+    mouse.prev_buttons = 0
+    mouse.x = 0
+    mouse.y = 0
+    mouse.scroll = 0
+    mouse.device_id = 0
+    mouse.has_wheel = false
+    mouse.has_5_buttons = false
+    mouse.sample_rate = 100
+    mouse.resolution = 2
+    mouse.total_packets = 0
+    mouse.errors = 0
+
+    // Enable mouse port
+    ps2_wait_input()
+    basics.outb(PS2_COMMAND_PORT, PS2_CMD_ENABLE_MOUSE)
+
+    // Test mouse port
+    ps2_wait_input()
+    basics.outb(PS2_COMMAND_PORT, PS2_CMD_TEST_MOUSE)
+    ps2_wait_output()
+    let test_result = basics.inb(PS2_DATA_PORT)
+
+    if test_result != 0x00 {
+        basics.print("[PS2_MOUSE] Mouse port test failed\n")
+        return false
+    }
+
+    // Enable mouse in config
+    ps2_wait_input()
+    basics.outb(PS2_COMMAND_PORT, PS2_CMD_READ_CONFIG)
+    ps2_wait_output()
+    var config = basics.inb(PS2_DATA_PORT)
+    config = config | 0x02    // Enable mouse interrupt
+    config = config & ~0x20   // Enable mouse clock
+
+    ps2_wait_input()
+    basics.outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_CONFIG)
+    ps2_wait_input()
+    basics.outb(PS2_DATA_PORT, config)
+
+    // Reset mouse
+    if not mouse_send_command(MOUSE_CMD_RESET) {
+        basics.print("[PS2_MOUSE] Mouse reset failed\n")
+        return false
+    }
+
+    // Wait for self-test completion
+    ps2_wait_output()
+    let _ = basics.inb(PS2_DATA_PORT)  // BAT completion (0xAA)
+    ps2_wait_output()
+    let _ = basics.inb(PS2_DATA_PORT)  // Device ID (0x00)
+
+    // Set defaults
+    mouse_send_command(MOUSE_CMD_SET_DEFAULTS)
+
+    // Try to enable scroll wheel (magic sequence)
+    enable_scroll_wheel()
+
+    // Try to enable 5 buttons
+    enable_5_buttons()
+
+    // Get device ID to confirm features
+    mouse_send_command(MOUSE_CMD_GET_DEVICE_ID)
+    ps2_wait_output()
+    mouse.device_id = basics.inb(PS2_DATA_PORT)
+
+    if mouse.device_id == MOUSE_ID_WHEEL {
+        mouse.has_wheel = true
+        mouse.packet_size = 4
+        basics.print("[PS2_MOUSE] Scroll wheel enabled\n")
+    } else if mouse.device_id == MOUSE_ID_5_BUTTON {
+        mouse.has_wheel = true
+        mouse.has_5_buttons = true
+        mouse.packet_size = 4
+        basics.print("[PS2_MOUSE] 5-button mouse enabled\n")
+    }
+
+    // Set sample rate
+    mouse_send_command(MOUSE_CMD_SET_SAMPLE_RATE)
+    mouse_send_data(mouse.sample_rate)
+
+    // Set resolution (2 = 4 counts/mm)
+    mouse_send_command(MOUSE_CMD_SET_RESOLUTION)
+    mouse_send_data(mouse.resolution)
+
+    // Enable streaming
+    mouse_send_command(MOUSE_CMD_ENABLE_STREAM)
+
+    // Register input device
+    mouse.input_dev = input.register_device(input.INPUT_TYPE_MOUSE, "PS/2 Mouse")
+    if mouse.input_dev == null {
+        return false
+    }
+
+    // Set capabilities
+    input.set_capability(mouse.input_dev, input.EV_KEY, input.BTN_LEFT)
+    input.set_capability(mouse.input_dev, input.EV_KEY, input.BTN_RIGHT)
+    input.set_capability(mouse.input_dev, input.EV_KEY, input.BTN_MIDDLE)
+    input.set_capability(mouse.input_dev, input.EV_REL, input.REL_X)
+    input.set_capability(mouse.input_dev, input.EV_REL, input.REL_Y)
+
+    if mouse.has_wheel {
+        input.set_capability(mouse.input_dev, input.EV_REL, input.REL_WHEEL)
+    }
+
+    if mouse.has_5_buttons {
+        input.set_capability(mouse.input_dev, input.EV_KEY, input.BTN_SIDE)
+        input.set_capability(mouse.input_dev, input.EV_KEY, input.BTN_EXTRA)
+    }
+
+    // Register IRQ handler (IRQ 12 for PS/2 mouse)
+    irq.register_handler(12, ps2_mouse_irq, null)
+    irq.enable(12)
+
+    mouse_initialized = true
+
+    basics.print("[PS2_MOUSE] Initialization complete\n")
+    return true
+}
+
+fn enable_scroll_wheel(): void {
+    // Magic sequence to enable scroll wheel:
+    // Set sample rate to 200, 100, 80
+    mouse_send_command(MOUSE_CMD_SET_SAMPLE_RATE)
+    mouse_send_data(200)
+    mouse_send_command(MOUSE_CMD_SET_SAMPLE_RATE)
+    mouse_send_data(100)
+    mouse_send_command(MOUSE_CMD_SET_SAMPLE_RATE)
+    mouse_send_data(80)
+}
+
+fn enable_5_buttons(): void {
+    // Magic sequence to enable 5-button mode:
+    // Set sample rate to 200, 200, 80
+    mouse_send_command(MOUSE_CMD_SET_SAMPLE_RATE)
+    mouse_send_data(200)
+    mouse_send_command(MOUSE_CMD_SET_SAMPLE_RATE)
+    mouse_send_data(200)
+    mouse_send_command(MOUSE_CMD_SET_SAMPLE_RATE)
+    mouse_send_data(80)
+}
+
+// ============================================
+// PS/2 Communication
+// ============================================
+
+fn ps2_wait_input(): void {
+    var timeout: u32 = 100000
+    while timeout > 0 {
+        if (basics.inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL) == 0 {
+            return
+        }
+        timeout = timeout - 1
+    }
+}
+
+fn ps2_wait_output(): void {
+    var timeout: u32 = 100000
+    while timeout > 0 {
+        if (basics.inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) != 0 {
+            return
+        }
+        timeout = timeout - 1
+    }
+}
+
+fn mouse_send_command(cmd: u8): bool {
+    ps2_wait_input()
+    basics.outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_MOUSE)
+    ps2_wait_input()
+    basics.outb(PS2_DATA_PORT, cmd)
+
+    ps2_wait_output()
+    let response = basics.inb(PS2_DATA_PORT)
+
+    return response == MOUSE_ACK
+}
+
+fn mouse_send_data(data: u8): bool {
+    ps2_wait_input()
+    basics.outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_MOUSE)
+    ps2_wait_input()
+    basics.outb(PS2_DATA_PORT, data)
+
+    ps2_wait_output()
+    let response = basics.inb(PS2_DATA_PORT)
+
+    return response == MOUSE_ACK
+}
+
+// ============================================
+// IRQ Handler
+// ============================================
+
+fn ps2_mouse_irq(ctx: *void): void {
+    let status = basics.inb(PS2_STATUS_PORT)
+
+    // Verify it's mouse data
+    if (status & PS2_STATUS_MOUSE_DATA) == 0 {
+        return
+    }
+
+    if (status & PS2_STATUS_OUTPUT_FULL) == 0 {
+        return
+    }
+
+    let data = basics.inb(PS2_DATA_PORT)
+
+    // First byte validation
+    if mouse.packet_index == 0 {
+        // Bit 3 must always be set in first byte
+        if (data & 0x08) == 0 {
+            mouse.errors = mouse.errors + 1
+            return
+        }
+    }
+
+    mouse.packet[mouse.packet_index] = data
+    mouse.packet_index = mouse.packet_index + 1
+
+    if mouse.packet_index >= mouse.packet_size {
+        process_packet()
+        mouse.packet_index = 0
+    }
+}
+
+fn process_packet(): void {
+    mouse.total_packets = mouse.total_packets + 1
+
+    // Save previous button state
+    mouse.prev_buttons = mouse.buttons
+
+    // Parse buttons from first byte
+    mouse.buttons = mouse.packet[0] & 0x07
+
+    // Parse X movement
+    var dx: i32 = mouse.packet[1] as i32
+    if (mouse.packet[0] & 0x10) != 0 {
+        dx = dx - 256  // Sign extend
+    }
+
+    // Parse Y movement
+    var dy: i32 = mouse.packet[2] as i32
+    if (mouse.packet[0] & 0x20) != 0 {
+        dy = dy - 256  // Sign extend
+    }
+
+    // Y is inverted in PS/2 protocol
+    dy = -dy
+
+    // Check for overflow
+    if (mouse.packet[0] & 0x40) != 0 {
+        dx = 0  // X overflow
+    }
+    if (mouse.packet[0] & 0x80) != 0 {
+        dy = 0  // Y overflow
+    }
+
+    // Parse scroll wheel and extra buttons
+    var dz: i32 = 0
+    if mouse.packet_size == 4 {
+        if mouse.has_5_buttons {
+            // 5-button mode: Z is 4 bits signed
+            dz = (mouse.packet[3] & 0x0F) as i32
+            if (dz & 0x08) != 0 {
+                dz = dz - 16
+            }
+
+            // Extra buttons
+            if (mouse.packet[3] & 0x10) != 0 {
+                mouse.buttons = mouse.buttons | 0x08  // Button 4
+            }
+            if (mouse.packet[3] & 0x20) != 0 {
+                mouse.buttons = mouse.buttons | 0x10  // Button 5
+            }
+        } else {
+            // Wheel mode: Z is 8 bits signed
+            dz = mouse.packet[3] as i8 as i32
+        }
+    }
+
+    // Update position
+    mouse.x = mouse.x + dx
+    mouse.y = mouse.y + dy
+    mouse.scroll = mouse.scroll + dz
+
+    // Report events
+    let btn_changed = mouse.buttons ^ mouse.prev_buttons
+
+    if (btn_changed & 0x01) != 0 {
+        input.report_key(mouse.input_dev, input.BTN_LEFT, (mouse.buttons & 0x01) != 0)
+    }
+    if (btn_changed & 0x02) != 0 {
+        input.report_key(mouse.input_dev, input.BTN_RIGHT, (mouse.buttons & 0x02) != 0)
+    }
+    if (btn_changed & 0x04) != 0 {
+        input.report_key(mouse.input_dev, input.BTN_MIDDLE, (mouse.buttons & 0x04) != 0)
+    }
+    if mouse.has_5_buttons {
+        if (btn_changed & 0x08) != 0 {
+            input.report_key(mouse.input_dev, input.BTN_SIDE, (mouse.buttons & 0x08) != 0)
+        }
+        if (btn_changed & 0x10) != 0 {
+            input.report_key(mouse.input_dev, input.BTN_EXTRA, (mouse.buttons & 0x10) != 0)
+        }
+    }
+
+    if dx != 0 {
+        input.report_rel(mouse.input_dev, input.REL_X, dx)
+    }
+    if dy != 0 {
+        input.report_rel(mouse.input_dev, input.REL_Y, dy)
+    }
+    if dz != 0 and mouse.has_wheel {
+        input.report_rel(mouse.input_dev, input.REL_WHEEL, dz)
+    }
+
+    input.report_sync(mouse.input_dev)
+}
+
+// ============================================
+// Configuration
+// ============================================
+
+export fn ps2_mouse_set_sample_rate(rate: u8): bool {
+    if not mouse_initialized {
+        return false
+    }
+
+    // Valid rates: 10, 20, 40, 60, 80, 100, 200
+    if rate != 10 and rate != 20 and rate != 40 and rate != 60 and rate != 80 and rate != 100 and rate != 200 {
+        return false
+    }
+
+    mouse_send_command(MOUSE_CMD_SET_SAMPLE_RATE)
+    mouse_send_data(rate)
+    mouse.sample_rate = rate
+    return true
+}
+
+export fn ps2_mouse_set_resolution(res: u8): bool {
+    if not mouse_initialized {
+        return false
+    }
+
+    // 0 = 1 count/mm, 1 = 2, 2 = 4, 3 = 8
+    if res > 3 {
+        return false
+    }
+
+    mouse_send_command(MOUSE_CMD_SET_RESOLUTION)
+    mouse_send_data(res)
+    mouse.resolution = res
+    return true
+}
+
+export fn ps2_mouse_get_position(x: *i32, y: *i32): void {
+    *x = mouse.x
+    *y = mouse.y
+}
+
+export fn ps2_mouse_get_buttons(): u8 {
+    return mouse.buttons
+}
+
+export fn ps2_mouse_has_wheel(): bool {
+    return mouse.has_wheel
+}
+
+export fn ps2_mouse_get_device_id(): u8 {
+    return mouse.device_id
+}

@@ -1,0 +1,956 @@
+// HomeOS libc - POSIX Threads (pthread.h)
+// POSIX-compatible threading functions
+
+const basics = @import("basics")
+const string = @import("string")
+const time = @import("time")
+
+// ============================================
+// Type Definitions
+// ============================================
+
+pub type pthread_t = u64
+
+pub struct pthread_attr_t {
+    detachstate: i32
+    stacksize: u32
+    stackaddr: *void
+    guardsize: u32
+    schedpolicy: i32
+    schedparam: sched_param
+    inheritsched: i32
+    scope: i32
+}
+
+pub struct pthread_mutex_t {
+    lock: u32
+    owner: pthread_t
+    count: u32
+    type: i32
+    waiting: u32
+}
+
+pub struct pthread_mutexattr_t {
+    type: i32
+    pshared: i32
+    protocol: i32
+    prioceiling: i32
+    robust: i32
+}
+
+pub struct pthread_cond_t {
+    seq: u32
+    mutex: *pthread_mutex_t
+    waiters: u32
+}
+
+pub struct pthread_condattr_t {
+    pshared: i32
+    clock: i32
+}
+
+pub struct pthread_rwlock_t {
+    readers: u32
+    writer: pthread_t
+    pending_readers: u32
+    pending_writers: u32
+    lock: u32
+}
+
+pub struct pthread_rwlockattr_t {
+    pshared: i32
+    kind: i32
+}
+
+pub struct pthread_barrier_t {
+    count: u32
+    current: u32
+    seq: u32
+    lock: u32
+}
+
+pub struct pthread_barrierattr_t {
+    pshared: i32
+}
+
+pub struct pthread_spinlock_t {
+    lock: u32
+}
+
+pub struct pthread_once_t {
+    done: u32
+    lock: u32
+}
+
+pub struct pthread_key_t {
+    seq: u32
+    destructor: fn(*void): void
+}
+
+pub struct sched_param {
+    sched_priority: i32
+}
+
+// ============================================
+// Constants
+// ============================================
+
+const PTHREAD_CREATE_JOINABLE: i32 = 0
+const PTHREAD_CREATE_DETACHED: i32 = 1
+
+const PTHREAD_MUTEX_NORMAL: i32 = 0
+const PTHREAD_MUTEX_RECURSIVE: i32 = 1
+const PTHREAD_MUTEX_ERRORCHECK: i32 = 2
+const PTHREAD_MUTEX_DEFAULT: i32 = PTHREAD_MUTEX_NORMAL
+
+const PTHREAD_PROCESS_PRIVATE: i32 = 0
+const PTHREAD_PROCESS_SHARED: i32 = 1
+
+const PTHREAD_INHERIT_SCHED: i32 = 0
+const PTHREAD_EXPLICIT_SCHED: i32 = 1
+
+const PTHREAD_SCOPE_SYSTEM: i32 = 0
+const PTHREAD_SCOPE_PROCESS: i32 = 1
+
+const PTHREAD_CANCEL_ENABLE: i32 = 0
+const PTHREAD_CANCEL_DISABLE: i32 = 1
+
+const PTHREAD_CANCEL_DEFERRED: i32 = 0
+const PTHREAD_CANCEL_ASYNCHRONOUS: i32 = 1
+
+const PTHREAD_CANCELED: *void = @intToPtr(*void, ~0 as u64)
+
+const PTHREAD_BARRIER_SERIAL_THREAD: i32 = -1
+
+const PTHREAD_ONCE_INIT: pthread_once_t = pthread_once_t{ done: 0, lock: 0 }
+
+const MAX_KEYS: u32 = 128
+const MAX_THREADS: u32 = 1024
+
+// ============================================
+// Thread-local Storage
+// ============================================
+
+var keys: [MAX_KEYS]pthread_key_t
+var key_count: u32 = 0
+
+struct ThreadData {
+    thread_id: pthread_t
+    stack: *void
+    stack_size: u32
+    start_routine: fn(*void): *void
+    arg: *void
+    result: *void
+    detached: bool
+    joined: bool
+    canceled: bool
+    cleanup_handlers: [16]CleanupHandler
+    cleanup_count: u32
+    tls: [MAX_KEYS]*void
+    cancelstate: i32
+    canceltype: i32
+}
+
+struct CleanupHandler {
+    routine: fn(*void): void
+    arg: *void
+}
+
+var threads: [MAX_THREADS]ThreadData
+var thread_count: u32 = 0
+var current_thread: *ThreadData = null
+
+// ============================================
+// Thread Functions
+// ============================================
+
+export fn pthread_create(thread: *pthread_t, attr: *const pthread_attr_t, start_routine: fn(*void): *void, arg: *void): i32 {
+    if thread_count >= MAX_THREADS {
+        return 11  // EAGAIN
+    }
+
+    let idx = thread_count
+    thread_count = thread_count + 1
+
+    let td = &threads[idx]
+    td.thread_id = idx as pthread_t + 1
+    td.start_routine = start_routine
+    td.arg = arg
+    td.result = null
+    td.joined = false
+    td.canceled = false
+    td.cleanup_count = 0
+    td.cancelstate = PTHREAD_CANCEL_ENABLE
+    td.canceltype = PTHREAD_CANCEL_DEFERRED
+
+    // Set up stack
+    let stack_size = if attr != null and attr.stacksize > 0 { attr.stacksize } else { 65536 }
+    td.stack_size = stack_size
+
+    if attr != null and attr.stackaddr != null {
+        td.stack = attr.stackaddr
+    } else {
+        td.stack = basics.malloc(stack_size)
+        if td.stack == null {
+            thread_count = thread_count - 1
+            return 12  // ENOMEM
+        }
+    }
+
+    td.detached = attr != null and attr.detachstate == PTHREAD_CREATE_DETACHED
+
+    // Clear TLS
+    var i: u32 = 0
+    while i < MAX_KEYS {
+        td.tls[i] = null
+        i = i + 1
+    }
+
+    // Start the thread
+    let result = basics.thread_create(&td.thread_id, thread_entry, td)
+    if result != 0 {
+        if attr == null or attr.stackaddr == null {
+            basics.free(td.stack)
+        }
+        thread_count = thread_count - 1
+        return result
+    }
+
+    *thread = td.thread_id
+    return 0
+}
+
+fn thread_entry(data: *void): *void {
+    let td = data as *ThreadData
+    current_thread = td
+
+    let result = td.start_routine(td.arg)
+    td.result = result
+
+    // Run cleanup handlers
+    while td.cleanup_count > 0 {
+        td.cleanup_count = td.cleanup_count - 1
+        let handler = td.cleanup_handlers[td.cleanup_count]
+        handler.routine(handler.arg)
+    }
+
+    // Run TLS destructors
+    var i: u32 = 0
+    while i < key_count {
+        if td.tls[i] != null and keys[i].destructor != null {
+            keys[i].destructor(td.tls[i])
+        }
+        i = i + 1
+    }
+
+    if td.detached {
+        // Free resources immediately
+        basics.free(td.stack)
+    }
+
+    return result
+}
+
+export fn pthread_exit(value_ptr: *void): never {
+    if current_thread != null {
+        current_thread.result = value_ptr
+
+        // Run cleanup handlers
+        while current_thread.cleanup_count > 0 {
+            current_thread.cleanup_count = current_thread.cleanup_count - 1
+            let handler = current_thread.cleanup_handlers[current_thread.cleanup_count]
+            handler.routine(handler.arg)
+        }
+
+        // Run TLS destructors
+        var i: u32 = 0
+        while i < key_count {
+            if current_thread.tls[i] != null and keys[i].destructor != null {
+                keys[i].destructor(current_thread.tls[i])
+            }
+            i = i + 1
+        }
+    }
+
+    basics.thread_exit()
+}
+
+export fn pthread_join(thread: pthread_t, value_ptr: **void): i32 {
+    let td = find_thread(thread)
+    if td == null {
+        return 3  // ESRCH
+    }
+
+    if td.detached {
+        return 22  // EINVAL
+    }
+
+    if td.joined {
+        return 22  // EINVAL - already joined
+    }
+
+    // Wait for thread to finish
+    let result = basics.thread_join(thread)
+    if result != 0 {
+        return result
+    }
+
+    td.joined = true
+
+    if value_ptr != null {
+        *value_ptr = td.result
+    }
+
+    // Free resources
+    basics.free(td.stack)
+
+    return 0
+}
+
+export fn pthread_detach(thread: pthread_t): i32 {
+    let td = find_thread(thread)
+    if td == null {
+        return 3  // ESRCH
+    }
+
+    if td.joined {
+        return 22  // EINVAL
+    }
+
+    td.detached = true
+    return 0
+}
+
+export fn pthread_self(): pthread_t {
+    if current_thread != null {
+        return current_thread.thread_id
+    }
+    return 0
+}
+
+export fn pthread_equal(t1: pthread_t, t2: pthread_t): i32 {
+    return if t1 == t2 { 1 } else { 0 }
+}
+
+fn find_thread(thread: pthread_t): *ThreadData {
+    var i: u32 = 0
+    while i < thread_count {
+        if threads[i].thread_id == thread {
+            return &threads[i]
+        }
+        i = i + 1
+    }
+    return null
+}
+
+// ============================================
+// Thread Attributes
+// ============================================
+
+export fn pthread_attr_init(attr: *pthread_attr_t): i32 {
+    attr.detachstate = PTHREAD_CREATE_JOINABLE
+    attr.stacksize = 65536
+    attr.stackaddr = null
+    attr.guardsize = 4096
+    attr.schedpolicy = 0
+    attr.schedparam.sched_priority = 0
+    attr.inheritsched = PTHREAD_INHERIT_SCHED
+    attr.scope = PTHREAD_SCOPE_SYSTEM
+    return 0
+}
+
+export fn pthread_attr_destroy(attr: *pthread_attr_t): i32 {
+    return 0
+}
+
+export fn pthread_attr_setdetachstate(attr: *pthread_attr_t, detachstate: i32): i32 {
+    if detachstate != PTHREAD_CREATE_JOINABLE and detachstate != PTHREAD_CREATE_DETACHED {
+        return 22  // EINVAL
+    }
+    attr.detachstate = detachstate
+    return 0
+}
+
+export fn pthread_attr_getdetachstate(attr: *const pthread_attr_t, detachstate: *i32): i32 {
+    *detachstate = attr.detachstate
+    return 0
+}
+
+export fn pthread_attr_setstacksize(attr: *pthread_attr_t, stacksize: u32): i32 {
+    if stacksize < 4096 {
+        return 22  // EINVAL
+    }
+    attr.stacksize = stacksize
+    return 0
+}
+
+export fn pthread_attr_getstacksize(attr: *const pthread_attr_t, stacksize: *u32): i32 {
+    *stacksize = attr.stacksize
+    return 0
+}
+
+export fn pthread_attr_setstack(attr: *pthread_attr_t, stackaddr: *void, stacksize: u32): i32 {
+    if stacksize < 4096 {
+        return 22  // EINVAL
+    }
+    attr.stackaddr = stackaddr
+    attr.stacksize = stacksize
+    return 0
+}
+
+export fn pthread_attr_getstack(attr: *const pthread_attr_t, stackaddr: **void, stacksize: *u32): i32 {
+    *stackaddr = attr.stackaddr
+    *stacksize = attr.stacksize
+    return 0
+}
+
+// ============================================
+// Mutex Functions
+// ============================================
+
+export fn pthread_mutex_init(mutex: *pthread_mutex_t, attr: *const pthread_mutexattr_t): i32 {
+    mutex.lock = 0
+    mutex.owner = 0
+    mutex.count = 0
+    mutex.type = if attr != null { attr.type } else { PTHREAD_MUTEX_DEFAULT }
+    mutex.waiting = 0
+    return 0
+}
+
+export fn pthread_mutex_destroy(mutex: *pthread_mutex_t): i32 {
+    if mutex.lock != 0 or mutex.waiting != 0 {
+        return 16  // EBUSY
+    }
+    return 0
+}
+
+export fn pthread_mutex_lock(mutex: *pthread_mutex_t): i32 {
+    let self = pthread_self()
+
+    // Check for recursive lock
+    if mutex.type == PTHREAD_MUTEX_RECURSIVE and mutex.owner == self {
+        mutex.count = mutex.count + 1
+        return 0
+    }
+
+    // Check for deadlock
+    if mutex.type == PTHREAD_MUTEX_ERRORCHECK and mutex.owner == self {
+        return 35  // EDEADLK
+    }
+
+    // Spin until lock acquired
+    while basics.atomic_cmpxchg(&mutex.lock, 0, 1) != 0 {
+        mutex.waiting = mutex.waiting + 1
+        basics.thread_yield()
+        mutex.waiting = mutex.waiting - 1
+    }
+
+    mutex.owner = self
+    mutex.count = 1
+    return 0
+}
+
+export fn pthread_mutex_trylock(mutex: *pthread_mutex_t): i32 {
+    let self = pthread_self()
+
+    if mutex.type == PTHREAD_MUTEX_RECURSIVE and mutex.owner == self {
+        mutex.count = mutex.count + 1
+        return 0
+    }
+
+    if basics.atomic_cmpxchg(&mutex.lock, 0, 1) != 0 {
+        return 16  // EBUSY
+    }
+
+    mutex.owner = self
+    mutex.count = 1
+    return 0
+}
+
+export fn pthread_mutex_timedlock(mutex: *pthread_mutex_t, abstime: *const time.timespec): i32 {
+    let self = pthread_self()
+
+    if mutex.type == PTHREAD_MUTEX_RECURSIVE and mutex.owner == self {
+        mutex.count = mutex.count + 1
+        return 0
+    }
+
+    var now: time.timespec
+    time.clock_gettime(0, &now)  // CLOCK_REALTIME
+
+    while basics.atomic_cmpxchg(&mutex.lock, 0, 1) != 0 {
+        time.clock_gettime(0, &now)
+        if now.tv_sec > abstime.tv_sec or
+           (now.tv_sec == abstime.tv_sec and now.tv_nsec >= abstime.tv_nsec) {
+            return 110  // ETIMEDOUT
+        }
+        basics.thread_yield()
+    }
+
+    mutex.owner = self
+    mutex.count = 1
+    return 0
+}
+
+export fn pthread_mutex_unlock(mutex: *pthread_mutex_t): i32 {
+    let self = pthread_self()
+
+    if mutex.owner != self {
+        return 1  // EPERM
+    }
+
+    mutex.count = mutex.count - 1
+    if mutex.count == 0 {
+        mutex.owner = 0
+        basics.atomic_store(&mutex.lock, 0)
+    }
+
+    return 0
+}
+
+// ============================================
+// Mutex Attributes
+// ============================================
+
+export fn pthread_mutexattr_init(attr: *pthread_mutexattr_t): i32 {
+    attr.type = PTHREAD_MUTEX_DEFAULT
+    attr.pshared = PTHREAD_PROCESS_PRIVATE
+    attr.protocol = 0
+    attr.prioceiling = 0
+    attr.robust = 0
+    return 0
+}
+
+export fn pthread_mutexattr_destroy(attr: *pthread_mutexattr_t): i32 {
+    return 0
+}
+
+export fn pthread_mutexattr_settype(attr: *pthread_mutexattr_t, type: i32): i32 {
+    if type < 0 or type > 2 {
+        return 22  // EINVAL
+    }
+    attr.type = type
+    return 0
+}
+
+export fn pthread_mutexattr_gettype(attr: *const pthread_mutexattr_t, type: *i32): i32 {
+    *type = attr.type
+    return 0
+}
+
+// ============================================
+// Condition Variable Functions
+// ============================================
+
+export fn pthread_cond_init(cond: *pthread_cond_t, attr: *const pthread_condattr_t): i32 {
+    cond.seq = 0
+    cond.mutex = null
+    cond.waiters = 0
+    return 0
+}
+
+export fn pthread_cond_destroy(cond: *pthread_cond_t): i32 {
+    if cond.waiters != 0 {
+        return 16  // EBUSY
+    }
+    return 0
+}
+
+export fn pthread_cond_wait(cond: *pthread_cond_t, mutex: *pthread_mutex_t): i32 {
+    let seq = cond.seq
+    cond.mutex = mutex
+    cond.waiters = cond.waiters + 1
+
+    pthread_mutex_unlock(mutex)
+
+    // Wait for signal
+    while cond.seq == seq {
+        basics.thread_yield()
+    }
+
+    cond.waiters = cond.waiters - 1
+    pthread_mutex_lock(mutex)
+
+    return 0
+}
+
+export fn pthread_cond_timedwait(cond: *pthread_cond_t, mutex: *pthread_mutex_t, abstime: *const time.timespec): i32 {
+    let seq = cond.seq
+    cond.mutex = mutex
+    cond.waiters = cond.waiters + 1
+
+    pthread_mutex_unlock(mutex)
+
+    var now: time.timespec
+    time.clock_gettime(0, &now)
+
+    while cond.seq == seq {
+        time.clock_gettime(0, &now)
+        if now.tv_sec > abstime.tv_sec or
+           (now.tv_sec == abstime.tv_sec and now.tv_nsec >= abstime.tv_nsec) {
+            cond.waiters = cond.waiters - 1
+            pthread_mutex_lock(mutex)
+            return 110  // ETIMEDOUT
+        }
+        basics.thread_yield()
+    }
+
+    cond.waiters = cond.waiters - 1
+    pthread_mutex_lock(mutex)
+
+    return 0
+}
+
+export fn pthread_cond_signal(cond: *pthread_cond_t): i32 {
+    cond.seq = cond.seq + 1
+    return 0
+}
+
+export fn pthread_cond_broadcast(cond: *pthread_cond_t): i32 {
+    cond.seq = cond.seq + 1
+    return 0
+}
+
+// ============================================
+// Read-Write Lock Functions
+// ============================================
+
+export fn pthread_rwlock_init(rwlock: *pthread_rwlock_t, attr: *const pthread_rwlockattr_t): i32 {
+    rwlock.readers = 0
+    rwlock.writer = 0
+    rwlock.pending_readers = 0
+    rwlock.pending_writers = 0
+    rwlock.lock = 0
+    return 0
+}
+
+export fn pthread_rwlock_destroy(rwlock: *pthread_rwlock_t): i32 {
+    if rwlock.readers != 0 or rwlock.writer != 0 {
+        return 16  // EBUSY
+    }
+    return 0
+}
+
+export fn pthread_rwlock_rdlock(rwlock: *pthread_rwlock_t): i32 {
+    while true {
+        // Wait for lock
+        while basics.atomic_cmpxchg(&rwlock.lock, 0, 1) != 0 {
+            basics.thread_yield()
+        }
+
+        // Check if we can acquire read lock
+        if rwlock.writer == 0 and rwlock.pending_writers == 0 {
+            rwlock.readers = rwlock.readers + 1
+            basics.atomic_store(&rwlock.lock, 0)
+            return 0
+        }
+
+        rwlock.pending_readers = rwlock.pending_readers + 1
+        basics.atomic_store(&rwlock.lock, 0)
+        basics.thread_yield()
+        rwlock.pending_readers = rwlock.pending_readers - 1
+    }
+}
+
+export fn pthread_rwlock_tryrdlock(rwlock: *pthread_rwlock_t): i32 {
+    if basics.atomic_cmpxchg(&rwlock.lock, 0, 1) != 0 {
+        return 16  // EBUSY
+    }
+
+    if rwlock.writer != 0 {
+        basics.atomic_store(&rwlock.lock, 0)
+        return 16  // EBUSY
+    }
+
+    rwlock.readers = rwlock.readers + 1
+    basics.atomic_store(&rwlock.lock, 0)
+    return 0
+}
+
+export fn pthread_rwlock_wrlock(rwlock: *pthread_rwlock_t): i32 {
+    let self = pthread_self()
+
+    while true {
+        while basics.atomic_cmpxchg(&rwlock.lock, 0, 1) != 0 {
+            basics.thread_yield()
+        }
+
+        if rwlock.readers == 0 and rwlock.writer == 0 {
+            rwlock.writer = self
+            basics.atomic_store(&rwlock.lock, 0)
+            return 0
+        }
+
+        rwlock.pending_writers = rwlock.pending_writers + 1
+        basics.atomic_store(&rwlock.lock, 0)
+        basics.thread_yield()
+        rwlock.pending_writers = rwlock.pending_writers - 1
+    }
+}
+
+export fn pthread_rwlock_trywrlock(rwlock: *pthread_rwlock_t): i32 {
+    let self = pthread_self()
+
+    if basics.atomic_cmpxchg(&rwlock.lock, 0, 1) != 0 {
+        return 16  // EBUSY
+    }
+
+    if rwlock.readers != 0 or rwlock.writer != 0 {
+        basics.atomic_store(&rwlock.lock, 0)
+        return 16  // EBUSY
+    }
+
+    rwlock.writer = self
+    basics.atomic_store(&rwlock.lock, 0)
+    return 0
+}
+
+export fn pthread_rwlock_unlock(rwlock: *pthread_rwlock_t): i32 {
+    while basics.atomic_cmpxchg(&rwlock.lock, 0, 1) != 0 {
+        basics.thread_yield()
+    }
+
+    if rwlock.writer == pthread_self() {
+        rwlock.writer = 0
+    } else if rwlock.readers > 0 {
+        rwlock.readers = rwlock.readers - 1
+    }
+
+    basics.atomic_store(&rwlock.lock, 0)
+    return 0
+}
+
+// ============================================
+// Barrier Functions
+// ============================================
+
+export fn pthread_barrier_init(barrier: *pthread_barrier_t, attr: *const pthread_barrierattr_t, count: u32): i32 {
+    if count == 0 {
+        return 22  // EINVAL
+    }
+    barrier.count = count
+    barrier.current = 0
+    barrier.seq = 0
+    barrier.lock = 0
+    return 0
+}
+
+export fn pthread_barrier_destroy(barrier: *pthread_barrier_t): i32 {
+    return 0
+}
+
+export fn pthread_barrier_wait(barrier: *pthread_barrier_t): i32 {
+    while basics.atomic_cmpxchg(&barrier.lock, 0, 1) != 0 {
+        basics.thread_yield()
+    }
+
+    barrier.current = barrier.current + 1
+    let current = barrier.current
+    let seq = barrier.seq
+
+    if current == barrier.count {
+        // Last thread to arrive
+        barrier.current = 0
+        barrier.seq = barrier.seq + 1
+        basics.atomic_store(&barrier.lock, 0)
+        return PTHREAD_BARRIER_SERIAL_THREAD
+    }
+
+    basics.atomic_store(&barrier.lock, 0)
+
+    // Wait for all threads
+    while barrier.seq == seq {
+        basics.thread_yield()
+    }
+
+    return 0
+}
+
+// ============================================
+// Spin Lock Functions
+// ============================================
+
+export fn pthread_spin_init(lock: *pthread_spinlock_t, pshared: i32): i32 {
+    lock.lock = 0
+    return 0
+}
+
+export fn pthread_spin_destroy(lock: *pthread_spinlock_t): i32 {
+    return 0
+}
+
+export fn pthread_spin_lock(lock: *pthread_spinlock_t): i32 {
+    while basics.atomic_cmpxchg(&lock.lock, 0, 1) != 0 {
+        // Spin
+    }
+    return 0
+}
+
+export fn pthread_spin_trylock(lock: *pthread_spinlock_t): i32 {
+    if basics.atomic_cmpxchg(&lock.lock, 0, 1) != 0 {
+        return 16  // EBUSY
+    }
+    return 0
+}
+
+export fn pthread_spin_unlock(lock: *pthread_spinlock_t): i32 {
+    basics.atomic_store(&lock.lock, 0)
+    return 0
+}
+
+// ============================================
+// Once Functions
+// ============================================
+
+export fn pthread_once(once_control: *pthread_once_t, init_routine: fn(): void): i32 {
+    if once_control.done != 0 {
+        return 0
+    }
+
+    while basics.atomic_cmpxchg(&once_control.lock, 0, 1) != 0 {
+        basics.thread_yield()
+    }
+
+    if once_control.done == 0 {
+        init_routine()
+        once_control.done = 1
+    }
+
+    basics.atomic_store(&once_control.lock, 0)
+    return 0
+}
+
+// ============================================
+// Thread-Specific Data
+// ============================================
+
+export fn pthread_key_create(key: *pthread_key_t, destructor: fn(*void): void): i32 {
+    if key_count >= MAX_KEYS {
+        return 11  // EAGAIN
+    }
+
+    let idx = key_count
+    key_count = key_count + 1
+
+    keys[idx].seq = idx
+    keys[idx].destructor = destructor
+    key.seq = idx
+
+    return 0
+}
+
+export fn pthread_key_delete(key: pthread_key_t): i32 {
+    if key.seq >= key_count {
+        return 22  // EINVAL
+    }
+    keys[key.seq].destructor = null
+    return 0
+}
+
+export fn pthread_setspecific(key: pthread_key_t, value: *const void): i32 {
+    if key.seq >= key_count {
+        return 22  // EINVAL
+    }
+    if current_thread != null {
+        current_thread.tls[key.seq] = value as *void
+    }
+    return 0
+}
+
+export fn pthread_getspecific(key: pthread_key_t): *void {
+    if key.seq >= key_count {
+        return null
+    }
+    if current_thread != null {
+        return current_thread.tls[key.seq]
+    }
+    return null
+}
+
+// ============================================
+// Cancellation Functions
+// ============================================
+
+export fn pthread_cancel(thread: pthread_t): i32 {
+    let td = find_thread(thread)
+    if td == null {
+        return 3  // ESRCH
+    }
+    td.canceled = true
+    return 0
+}
+
+export fn pthread_setcancelstate(state: i32, oldstate: *i32): i32 {
+    if current_thread == null {
+        return 22  // EINVAL
+    }
+    if oldstate != null {
+        *oldstate = current_thread.cancelstate
+    }
+    current_thread.cancelstate = state
+    return 0
+}
+
+export fn pthread_setcanceltype(type: i32, oldtype: *i32): i32 {
+    if current_thread == null {
+        return 22  // EINVAL
+    }
+    if oldtype != null {
+        *oldtype = current_thread.canceltype
+    }
+    current_thread.canceltype = type
+    return 0
+}
+
+export fn pthread_testcancel(): void {
+    if current_thread != null and current_thread.canceled and
+       current_thread.cancelstate == PTHREAD_CANCEL_ENABLE {
+        pthread_exit(PTHREAD_CANCELED)
+    }
+}
+
+// ============================================
+// Cleanup Handler Functions
+// ============================================
+
+export fn pthread_cleanup_push(routine: fn(*void): void, arg: *void): void {
+    if current_thread != null and current_thread.cleanup_count < 16 {
+        let idx = current_thread.cleanup_count
+        current_thread.cleanup_handlers[idx].routine = routine
+        current_thread.cleanup_handlers[idx].arg = arg
+        current_thread.cleanup_count = current_thread.cleanup_count + 1
+    }
+}
+
+export fn pthread_cleanup_pop(execute: i32): void {
+    if current_thread != null and current_thread.cleanup_count > 0 {
+        current_thread.cleanup_count = current_thread.cleanup_count - 1
+        if execute != 0 {
+            let handler = current_thread.cleanup_handlers[current_thread.cleanup_count]
+            handler.routine(handler.arg)
+        }
+    }
+}
+
+// ============================================
+// Scheduling Functions
+// ============================================
+
+export fn pthread_setschedparam(thread: pthread_t, policy: i32, param: *const sched_param): i32 {
+    return basics.thread_setpriority(thread, param.sched_priority)
+}
+
+export fn pthread_getschedparam(thread: pthread_t, policy: *i32, param: *sched_param): i32 {
+    *policy = 0  // SCHED_OTHER
+    param.sched_priority = basics.thread_getpriority(thread)
+    return 0
+}
+
+export fn sched_yield(): i32 {
+    basics.thread_yield()
+    return 0
+}
+
+export fn pthread_yield(): i32 {
+    return sched_yield()
+}

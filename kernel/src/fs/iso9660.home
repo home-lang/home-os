@@ -1,63 +1,973 @@
-// home-os ISO 9660 Filesystem
-// CD/DVD filesystem support
+// HomeOS ISO 9660 Filesystem Driver
+// CD-ROM/DVD-ROM filesystem support (ECMA-119)
+// Supports Rock Ridge extensions for POSIX compatibility
 
-import "../core/foundation.home" as foundation
-import "../drivers/cdrom.home" as cdrom
+const foundation = @import("../core/foundation.home")
+const memory = @import("../core/memory.home")
+const vfs = @import("vfs.home")
+
+// ============================================
+// ISO 9660 Constants
+// ============================================
 
 const ISO_SECTOR_SIZE: u32 = 2048
-const ISO_MAGIC: u32 = 0x30304443  // "CD001"
+const ISO_MAGIC: [5]u8 = ['C', 'D', '0', '0', '1']
+const MAX_PATH_LEN: u32 = 256
+const MAX_FILENAME_LEN: u32 = 255
+const MAX_OPEN_FILES: u32 = 32
+
+// Volume descriptor types
+const VD_TYPE_BOOT: u8 = 0
+const VD_TYPE_PRIMARY: u8 = 1
+const VD_TYPE_SUPPLEMENTARY: u8 = 2
+const VD_TYPE_PARTITION: u8 = 3
+const VD_TYPE_TERMINATOR: u8 = 255
+
+// Directory record flags
+const FLAG_HIDDEN: u8 = 0x01
+const FLAG_DIRECTORY: u8 = 0x02
+const FLAG_ASSOCIATED: u8 = 0x04
+const FLAG_EXTENDED_ATTR: u8 = 0x08
+const FLAG_PERMISSIONS: u8 = 0x10
+const FLAG_MULTI_EXTENT: u8 = 0x80
+
+// Rock Ridge extension signatures
+const RR_SIG_PX: u16 = 0x5850  // "PX" - POSIX file attributes
+const RR_SIG_PN: u16 = 0x4E50  // "PN" - POSIX device modes
+const RR_SIG_SL: u16 = 0x4C53  // "SL" - Symbolic link
+const RR_SIG_NM: u16 = 0x4D4E  // "NM" - Alternate name
+const RR_SIG_CL: u16 = 0x4C43  // "CL" - Child link
+const RR_SIG_PL: u16 = 0x4C50  // "PL" - Parent link
+const RR_SIG_RE: u16 = 0x4552  // "RE" - Relocate
+const RR_SIG_TF: u16 = 0x4654  // "TF" - Time stamps
+const RR_SIG_SF: u16 = 0x4653  // "SF" - Sparse file
+const RR_SIG_SP: u16 = 0x5053  // "SP" - SUSP indicator
+const RR_SIG_RR: u16 = 0x5252  // "RR" - Rock Ridge extensions
+
+// ============================================
+// ISO 9660 Structures
+// ============================================
+
+// Both-endian 16-bit value (LSB first, then MSB)
+struct BothEndian16 {
+    le: u16
+    be: u16
+}
+
+// Both-endian 32-bit value (LSB first, then MSB)
+struct BothEndian32 {
+    le: u32
+    be: u32
+}
+
+// Date and time format (7 bytes)
+struct IsoDateTime {
+    year: u8       // Years since 1900
+    month: u8      // 1-12
+    day: u8        // 1-31
+    hour: u8       // 0-23
+    minute: u8     // 0-59
+    second: u8     // 0-59
+    gmt_offset: i8 // 15-min intervals from GMT
+}
+
+// Extended date format (17 bytes)
+struct IsoExtDateTime {
+    year: [4]u8
+    month: [2]u8
+    day: [2]u8
+    hour: [2]u8
+    minute: [2]u8
+    second: [2]u8
+    hundredths: [2]u8
+    gmt_offset: i8
+}
 
 struct IsoVolumeDescriptor {
-  type: u8,
-  id: [u8; 5],
-  version: u8,
-  unused1: u8,
-  system_id: [u8; 32],
-  volume_id: [u8; 32],
-  unused2: [u8; 8],
-  volume_space_size: u32,
-  unused3: [u8; 32],
-  volume_set_size: u16,
-  volume_sequence_number: u16,
-  logical_block_size: u16
+    type: u8
+    id: [5]u8
+    version: u8
+    unused1: u8
+    system_id: [32]u8
+    volume_id: [32]u8
+    unused2: [8]u8
+    volume_space_size: BothEndian32
+    unused3: [32]u8
+    volume_set_size: BothEndian16
+    volume_sequence_number: BothEndian16
+    logical_block_size: BothEndian16
+    path_table_size: BothEndian32
+    path_table_lba_le: u32
+    optional_path_table_lba_le: u32
+    path_table_lba_be: u32
+    optional_path_table_lba_be: u32
+    root_directory_record: [34]u8
+    volume_set_id: [128]u8
+    publisher_id: [128]u8
+    preparer_id: [128]u8
+    application_id: [128]u8
+    copyright_file_id: [37]u8
+    abstract_file_id: [37]u8
+    bibliographic_file_id: [37]u8
+    creation_date: IsoExtDateTime
+    modification_date: IsoExtDateTime
+    expiration_date: IsoExtDateTime
+    effective_date: IsoExtDateTime
+    file_structure_version: u8
+    reserved: u8
+    application_use: [512]u8
+    reserved2: [653]u8
 }
 
-struct IsoDirectoryEntry {
-  length: u8,
-  ext_attr_length: u8,
-  extent: u32,
-  size: u32,
-  date: [u8; 7],
-  flags: u8,
-  file_unit_size: u8,
-  interleave: u8,
-  volume_sequence: u16,
-  name_len: u8
+struct IsoDirectoryRecord {
+    length: u8
+    ext_attr_length: u8
+    extent_lba: BothEndian32
+    data_length: BothEndian32
+    recording_date: IsoDateTime
+    flags: u8
+    file_unit_size: u8
+    interleave_gap: u8
+    volume_sequence_number: BothEndian16
+    name_length: u8
+    // File name follows (variable length)
+    // System Use Area follows file name (if any)
 }
 
-var iso_initialized: u32 = 0
-var root_extent: u32 = 0
-
-export fn iso9660_init() {
-  if iso_initialized == 1 { return }
-  
-  cdrom.cdrom_init()
-  
-  var buffer: [u8; 2048]
-  cdrom.cdrom_read_sector(16, @ptrFromInt(buffer))
-  
-  var vd: IsoVolumeDescriptor = @intToPtr(@ptrFromInt(buffer), IsoVolumeDescriptor)
-  
-  if vd.type == 1 {
-    root_extent = 0  // Parse root directory
-    iso_initialized = 1
-    foundation.serial_write_string("[ISO9660] Initialized\n")
-  }
+struct IsoPathTableEntry {
+    name_length: u8
+    ext_attr_length: u8
+    extent_lba: u32
+    parent_directory_number: u16
+    // Directory name follows (variable length)
 }
 
-export fn iso9660_read_file(path: u64, buffer: u64, size: u32): u32 {
-  if iso_initialized == 0 { return 0 }
-  
-  // Find file and read (stub)
-  return 0
+// Internal file/directory handle
+struct IsoFile {
+    in_use: bool
+    is_directory: bool
+    extent_lba: u32
+    size: u32
+    position: u32
+    dir_position: u32  // For directory iteration
+    name: [MAX_FILENAME_LEN + 1]u8
+}
+
+// Volume state
+struct IsoVolume {
+    initialized: bool
+    device_id: u32
+
+    // Volume descriptor info
+    block_size: u32
+    volume_size: u32
+    root_extent: u32
+    root_size: u32
+    volume_id: [33]u8
+
+    // Path table
+    path_table_lba: u32
+    path_table_size: u32
+
+    // Rock Ridge support
+    rock_ridge: bool
+    susp_skip: u8
+
+    // Open files
+    files: [MAX_OPEN_FILES]IsoFile
+
+    // Sector buffer
+    sector_buffer: *u8
+}
+
+var volume: IsoVolume
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn iso9660_init(): i32 {
+    if volume.initialized {
+        return 0
+    }
+
+    memory.memset(&volume as *u8, 0, @sizeOf(IsoVolume))
+    foundation.serial_write_string("[ISO9660] Driver initialized\n")
+    return 0
+}
+
+export fn iso9660_mount(device_id: u32): i32 {
+    if volume.initialized {
+        return -1
+    }
+
+    volume.device_id = device_id
+
+    // Allocate sector buffer
+    volume.sector_buffer = memory.kmalloc(ISO_SECTOR_SIZE as u64) as *u8
+    if volume.sector_buffer == null {
+        return -1
+    }
+
+    // Read volume descriptors starting at sector 16
+    var sector: u32 = 16
+    var found_primary: bool = false
+
+    while sector < 256 {
+        if read_sector(sector, volume.sector_buffer) != 0 {
+            memory.kfree(volume.sector_buffer as u64)
+            return -1
+        }
+
+        let vd = volume.sector_buffer as *IsoVolumeDescriptor
+
+        // Check magic
+        var i: u32 = 0
+        var valid: bool = true
+        while i < 5 {
+            if vd.id[i] != ISO_MAGIC[i] {
+                valid = false
+                break
+            }
+            i = i + 1
+        }
+
+        if not valid {
+            sector = sector + 1
+            continue
+        }
+
+        if vd.type == VD_TYPE_TERMINATOR {
+            break
+        }
+
+        if vd.type == VD_TYPE_PRIMARY and not found_primary {
+            // Parse primary volume descriptor
+            volume.block_size = vd.logical_block_size.le
+            volume.volume_size = vd.volume_space_size.le
+            volume.path_table_lba = vd.path_table_lba_le
+            volume.path_table_size = vd.path_table_size.le
+
+            // Copy volume ID (trimmed)
+            i = 0
+            while i < 32 {
+                volume.volume_id[i] = vd.volume_id[i]
+                i = i + 1
+            }
+            volume.volume_id[32] = 0
+
+            // Parse root directory record
+            let root_record = (&vd.root_directory_record) as *IsoDirectoryRecord
+            volume.root_extent = root_record.extent_lba.le
+            volume.root_size = root_record.data_length.le
+
+            found_primary = true
+
+            // Check for Rock Ridge extensions
+            check_rock_ridge(root_record)
+        }
+
+        sector = sector + 1
+    }
+
+    if not found_primary {
+        memory.kfree(volume.sector_buffer as u64)
+        foundation.serial_write_string("[ISO9660] No primary volume descriptor found\n")
+        return -1
+    }
+
+    volume.initialized = true
+
+    foundation.serial_write_string("[ISO9660] Mounted volume: ")
+    foundation.serial_write_string(&volume.volume_id as *const u8)
+    foundation.serial_write_string("\n")
+
+    if volume.rock_ridge {
+        foundation.serial_write_string("[ISO9660] Rock Ridge extensions enabled\n")
+    }
+
+    return 0
+}
+
+export fn iso9660_unmount(): i32 {
+    if not volume.initialized {
+        return -1
+    }
+
+    // Close all open files
+    var i: u32 = 0
+    while i < MAX_OPEN_FILES {
+        volume.files[i].in_use = false
+        i = i + 1
+    }
+
+    // Free sector buffer
+    if volume.sector_buffer != null {
+        memory.kfree(volume.sector_buffer as u64)
+        volume.sector_buffer = null
+    }
+
+    volume.initialized = false
+    foundation.serial_write_string("[ISO9660] Unmounted\n")
+
+    return 0
+}
+
+// ============================================
+// Low-Level I/O
+// ============================================
+
+fn read_sector(sector: u32, buffer: *u8): i32 {
+    return vfs.block_read(volume.device_id, sector as u64, 1, buffer)
+}
+
+fn read_sectors(start_sector: u32, count: u32, buffer: *u8): i32 {
+    var i: u32 = 0
+    while i < count {
+        let result = read_sector(start_sector + i, buffer + i * ISO_SECTOR_SIZE)
+        if result != 0 {
+            return -1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ============================================
+// Rock Ridge Extension Detection
+// ============================================
+
+fn check_rock_ridge(root_record: *IsoDirectoryRecord): void {
+    // Read root directory first entry
+    if read_sector(volume.root_extent, volume.sector_buffer) != 0 {
+        return
+    }
+
+    let first_entry = volume.sector_buffer as *IsoDirectoryRecord
+    if first_entry.length == 0 {
+        return
+    }
+
+    // Look for SUSP signature in system use area
+    let sua_offset = 33 + first_entry.name_length
+    // Pad to even boundary
+    let sua_start = if (sua_offset % 2) != 0 { sua_offset + 1 } else { sua_offset }
+
+    if sua_start >= first_entry.length {
+        return
+    }
+
+    let sua = volume.sector_buffer + sua_start
+
+    // Check for SP (SUSP indicator)
+    if sua[0] == 'S' and sua[1] == 'P' {
+        volume.rock_ridge = true
+        volume.susp_skip = sua[4]  // Number of bytes to skip
+    }
+}
+
+fn get_rock_ridge_name(record: *IsoDirectoryRecord, sua: *u8, sua_length: u8, name: *u8, max_len: u32): bool {
+    if not volume.rock_ridge {
+        return false
+    }
+
+    var offset: u8 = volume.susp_skip
+    while offset + 4 <= sua_length {
+        let sig = (sua[offset] as u16) | ((sua[offset + 1] as u16) << 8)
+        let len = sua[offset + 2]
+        let version = sua[offset + 3]
+
+        if len == 0 {
+            break
+        }
+
+        if sig == RR_SIG_NM {
+            // Alternate name entry
+            let flags = sua[offset + 4]
+            let name_len = len - 5
+            if name_len > 0 and name_len as u32 <= max_len {
+                memory.memcpy(name, sua + offset + 5, name_len as u64)
+                name[name_len] = 0
+                return true
+            }
+        }
+
+        offset = offset + len
+    }
+
+    return false
+}
+
+// ============================================
+// Directory Operations
+// ============================================
+
+fn parse_directory_name(record: *IsoDirectoryRecord, name: *u8, max_len: u32): void {
+    let name_ptr = (record as *u8) + 33
+    let name_len = record.name_length
+
+    // Check for Rock Ridge alternate name first
+    let sua_offset = 33 + name_len
+    let sua_start = if (sua_offset % 2) != 0 { sua_offset + 1 } else { sua_offset }
+
+    if sua_start < record.length {
+        let sua = (record as *u8) + sua_start
+        let sua_length = record.length - sua_start
+
+        if get_rock_ridge_name(record, sua, sua_length, name, max_len) {
+            return
+        }
+    }
+
+    // Fall back to ISO 9660 name
+    if name_len == 1 and name_ptr[0] == 0 {
+        // Current directory "."
+        name[0] = '.'
+        name[1] = 0
+        return
+    }
+
+    if name_len == 1 and name_ptr[0] == 1 {
+        // Parent directory ".."
+        name[0] = '.'
+        name[1] = '.'
+        name[2] = 0
+        return
+    }
+
+    // Copy name, removing version number (;1)
+    var i: u8 = 0
+    var out_idx: u32 = 0
+
+    while i < name_len and out_idx < max_len - 1 {
+        let c = name_ptr[i]
+
+        if c == ';' {
+            break  // Stop at version separator
+        }
+
+        // Remove trailing period for directories
+        if c == '.' and i == name_len - 1 {
+            break
+        }
+
+        // Convert to lowercase if not Rock Ridge
+        if c >= 'A' and c <= 'Z' {
+            name[out_idx] = c + ('a' - 'A')
+        } else {
+            name[out_idx] = c
+        }
+
+        out_idx = out_idx + 1
+        i = i + 1
+    }
+
+    name[out_idx] = 0
+}
+
+fn find_in_directory(dir_extent: u32, dir_size: u32, search_name: *const u8, found_record: *IsoDirectoryRecord): i32 {
+    let sectors = (dir_size + ISO_SECTOR_SIZE - 1) / ISO_SECTOR_SIZE
+    var dir_buffer = memory.kmalloc(sectors as u64 * ISO_SECTOR_SIZE as u64) as *u8
+
+    if dir_buffer == null {
+        return -1
+    }
+
+    if read_sectors(dir_extent, sectors, dir_buffer) != 0 {
+        memory.kfree(dir_buffer as u64)
+        return -1
+    }
+
+    var offset: u32 = 0
+    var name_buffer: [MAX_FILENAME_LEN + 1]u8
+
+    while offset < dir_size {
+        let record = (dir_buffer + offset) as *IsoDirectoryRecord
+
+        // End of entries in this sector
+        if record.length == 0 {
+            // Move to next sector boundary
+            offset = ((offset / ISO_SECTOR_SIZE) + 1) * ISO_SECTOR_SIZE
+            continue
+        }
+
+        // Skip . and .. entries
+        if record.name_length == 1 {
+            let first_char = (record as *u8)[33]
+            if first_char == 0 or first_char == 1 {
+                offset = offset + record.length as u32
+                continue
+            }
+        }
+
+        // Parse name
+        parse_directory_name(record, &name_buffer as *u8, MAX_FILENAME_LEN)
+
+        // Compare names (case-insensitive)
+        if strcasecmp(&name_buffer as *const u8, search_name) == 0 {
+            // Found - copy record
+            memory.memcpy(found_record as *u8, record as *u8, record.length as u64)
+            memory.kfree(dir_buffer as u64)
+            return 0
+        }
+
+        offset = offset + record.length as u32
+    }
+
+    memory.kfree(dir_buffer as u64)
+    return -1
+}
+
+fn strcasecmp(s1: *const u8, s2: *const u8): i32 {
+    var i: u32 = 0
+    while s1[i] != 0 and s2[i] != 0 {
+        var c1 = s1[i]
+        var c2 = s2[i]
+
+        if c1 >= 'A' and c1 <= 'Z' {
+            c1 = c1 + ('a' - 'A')
+        }
+        if c2 >= 'A' and c2 <= 'Z' {
+            c2 = c2 + ('a' - 'A')
+        }
+
+        if c1 != c2 {
+            return (c1 as i32) - (c2 as i32)
+        }
+
+        i = i + 1
+    }
+
+    return (s1[i] as i32) - (s2[i] as i32)
+}
+
+// ============================================
+// File Operations
+// ============================================
+
+fn find_free_handle(): i32 {
+    var i: u32 = 0
+    while i < MAX_OPEN_FILES {
+        if not volume.files[i].in_use {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+export fn iso9660_open(path: *const u8): i32 {
+    if not volume.initialized {
+        return -1
+    }
+
+    let handle = find_free_handle()
+    if handle < 0 {
+        return -1
+    }
+
+    // Parse path
+    var current_extent = volume.root_extent
+    var current_size = volume.root_size
+    var current_flags: u8 = FLAG_DIRECTORY
+
+    var path_copy: [MAX_PATH_LEN]u8
+    memory.strcpy(&path_copy as *u8, path)
+
+    var component = &path_copy as *u8
+    if component[0] == '/' {
+        component = component + 1
+    }
+
+    var record_buffer: [256]u8
+    let record = &record_buffer as *IsoDirectoryRecord
+
+    while component[0] != 0 {
+        // Find next path separator
+        var end = component
+        while *end != 0 and *end != '/' {
+            end = end + 1
+        }
+
+        let was_end = *end == 0
+        *end = 0
+
+        // Find component in current directory
+        if find_in_directory(current_extent, current_size, component, record) != 0 {
+            return -1  // Not found
+        }
+
+        current_extent = record.extent_lba.le
+        current_size = record.data_length.le
+        current_flags = record.flags
+
+        if was_end {
+            break
+        }
+
+        if (current_flags & FLAG_DIRECTORY) == 0 {
+            return -1  // Not a directory
+        }
+
+        component = end + 1
+    }
+
+    // Set up file handle
+    let file = &volume.files[handle as u32]
+    file.in_use = true
+    file.is_directory = (current_flags & FLAG_DIRECTORY) != 0
+    file.extent_lba = current_extent
+    file.size = current_size
+    file.position = 0
+    file.dir_position = 0
+
+    parse_directory_name(record, &file.name as *u8, MAX_FILENAME_LEN)
+
+    return handle
+}
+
+export fn iso9660_close(handle: i32): i32 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    if not volume.files[handle as u32].in_use {
+        return -1
+    }
+
+    volume.files[handle as u32].in_use = false
+    return 0
+}
+
+export fn iso9660_read(handle: i32, buffer: *u8, size: u32): i32 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use or file.is_directory {
+        return -1
+    }
+
+    // Calculate bytes to read
+    var bytes_to_read = size
+    if file.position + bytes_to_read > file.size {
+        bytes_to_read = file.size - file.position
+    }
+
+    if bytes_to_read == 0 {
+        return 0
+    }
+
+    var bytes_read: u32 = 0
+    var sector = file.extent_lba + (file.position / ISO_SECTOR_SIZE)
+    var offset_in_sector = file.position % ISO_SECTOR_SIZE
+
+    while bytes_read < bytes_to_read {
+        if read_sector(sector, volume.sector_buffer) != 0 {
+            return bytes_read as i32
+        }
+
+        let bytes_in_sector = ISO_SECTOR_SIZE - offset_in_sector
+        let bytes_this_read = if bytes_in_sector < bytes_to_read - bytes_read {
+            bytes_in_sector
+        } else {
+            bytes_to_read - bytes_read
+        }
+
+        memory.memcpy(buffer + bytes_read, volume.sector_buffer + offset_in_sector, bytes_this_read as u64)
+
+        bytes_read = bytes_read + bytes_this_read
+        offset_in_sector = 0
+        sector = sector + 1
+    }
+
+    file.position = file.position + bytes_read
+    return bytes_read as i32
+}
+
+export fn iso9660_seek(handle: i32, offset: i64, whence: i32): i64 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use {
+        return -1
+    }
+
+    var new_position: i64 = 0
+
+    if whence == 0 {  // SEEK_SET
+        new_position = offset
+    } else if whence == 1 {  // SEEK_CUR
+        new_position = file.position as i64 + offset
+    } else if whence == 2 {  // SEEK_END
+        new_position = file.size as i64 + offset
+    } else {
+        return -1
+    }
+
+    if new_position < 0 or new_position > file.size as i64 {
+        return -1
+    }
+
+    file.position = new_position as u32
+    return new_position
+}
+
+export fn iso9660_tell(handle: i32): i64 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use {
+        return -1
+    }
+
+    return file.position as i64
+}
+
+export fn iso9660_size(handle: i32): i64 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use {
+        return -1
+    }
+
+    return file.size as i64
+}
+
+// ============================================
+// Directory Listing
+// ============================================
+
+export fn iso9660_opendir(path: *const u8): i32 {
+    let handle = iso9660_open(path)
+    if handle < 0 {
+        return -1
+    }
+
+    if not volume.files[handle as u32].is_directory {
+        iso9660_close(handle)
+        return -1
+    }
+
+    // Skip . and .. entries
+    volume.files[handle as u32].dir_position = 0
+
+    return handle
+}
+
+export fn iso9660_readdir(handle: i32, name: *u8, max_len: u32): i32 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use or not file.is_directory {
+        return -1
+    }
+
+    // Read directory data
+    let sectors = (file.size + ISO_SECTOR_SIZE - 1) / ISO_SECTOR_SIZE
+    var dir_buffer = memory.kmalloc(sectors as u64 * ISO_SECTOR_SIZE as u64) as *u8
+
+    if dir_buffer == null {
+        return -1
+    }
+
+    if read_sectors(file.extent_lba, sectors, dir_buffer) != 0 {
+        memory.kfree(dir_buffer as u64)
+        return -1
+    }
+
+    var offset = file.dir_position
+
+    while offset < file.size {
+        let record = (dir_buffer + offset) as *IsoDirectoryRecord
+
+        // End of entries in this sector
+        if record.length == 0 {
+            offset = ((offset / ISO_SECTOR_SIZE) + 1) * ISO_SECTOR_SIZE
+            continue
+        }
+
+        let next_offset = offset + record.length as u32
+
+        // Skip . and .. entries
+        if record.name_length == 1 {
+            let first_char = (record as *u8)[33]
+            if first_char == 0 or first_char == 1 {
+                offset = next_offset
+                continue
+            }
+        }
+
+        // Parse name
+        parse_directory_name(record, name, max_len)
+
+        file.dir_position = next_offset
+        memory.kfree(dir_buffer as u64)
+        return 1  // Found entry
+    }
+
+    memory.kfree(dir_buffer as u64)
+    return 0  // End of directory
+}
+
+export fn iso9660_closedir(handle: i32): i32 {
+    return iso9660_close(handle)
+}
+
+// ============================================
+// File Information
+// ============================================
+
+struct IsoFileInfo {
+    name: [MAX_FILENAME_LEN + 1]u8
+    size: u32
+    is_directory: bool
+    is_hidden: bool
+    recording_date: IsoDateTime
+}
+
+export fn iso9660_stat(path: *const u8, info: *IsoFileInfo): i32 {
+    let handle = iso9660_open(path)
+    if handle < 0 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+
+    memory.strcpy(&info.name as *u8, &file.name as *const u8)
+    info.size = file.size
+    info.is_directory = file.is_directory
+
+    // Re-read the record for flags and date
+    // This is simplified - ideally we'd cache this info
+    info.is_hidden = false
+
+    iso9660_close(handle)
+    return 0
+}
+
+// ============================================
+// Volume Information
+// ============================================
+
+export fn iso9660_get_volume_id(buffer: *u8, max_len: u32): i32 {
+    if not volume.initialized {
+        return -1
+    }
+
+    var len: u32 = 0
+    while len < 32 and volume.volume_id[len] != 0 and volume.volume_id[len] != ' ' {
+        len = len + 1
+    }
+
+    if len >= max_len {
+        len = max_len - 1
+    }
+
+    memory.memcpy(buffer, &volume.volume_id as *u8, len as u64)
+    buffer[len] = 0
+
+    return len as i32
+}
+
+export fn iso9660_get_block_size(): u32 {
+    if not volume.initialized {
+        return 0
+    }
+    return volume.block_size
+}
+
+export fn iso9660_get_volume_size(): u64 {
+    if not volume.initialized {
+        return 0
+    }
+    return volume.volume_size as u64 * volume.block_size as u64
+}
+
+export fn iso9660_has_rock_ridge(): bool {
+    return volume.rock_ridge
+}
+
+// ============================================
+// Path Table Operations (Optional optimization)
+// ============================================
+
+export fn iso9660_find_directory_fast(name: *const u8): u32 {
+    if not volume.initialized {
+        return 0
+    }
+
+    // Read path table
+    let pt_sectors = (volume.path_table_size + ISO_SECTOR_SIZE - 1) / ISO_SECTOR_SIZE
+    var pt_buffer = memory.kmalloc(pt_sectors as u64 * ISO_SECTOR_SIZE as u64) as *u8
+
+    if pt_buffer == null {
+        return 0
+    }
+
+    if read_sectors(volume.path_table_lba, pt_sectors, pt_buffer) != 0 {
+        memory.kfree(pt_buffer as u64)
+        return 0
+    }
+
+    var offset: u32 = 0
+
+    while offset < volume.path_table_size {
+        let entry = (pt_buffer + offset) as *IsoPathTableEntry
+        let entry_name_len = entry.name_length
+
+        if entry_name_len == 0 {
+            break
+        }
+
+        let entry_name = pt_buffer + offset + 8
+
+        // Compare names
+        var match: bool = true
+        var i: u8 = 0
+        while i < entry_name_len {
+            var c1 = entry_name[i]
+            var c2 = name[i]
+
+            if c1 >= 'A' and c1 <= 'Z' {
+                c1 = c1 + ('a' - 'A')
+            }
+            if c2 >= 'A' and c2 <= 'Z' {
+                c2 = c2 + ('a' - 'A')
+            }
+
+            if c1 != c2 {
+                match = false
+                break
+            }
+
+            i = i + 1
+        }
+
+        if match and name[entry_name_len] == 0 {
+            let lba = entry.extent_lba
+            memory.kfree(pt_buffer as u64)
+            return lba
+        }
+
+        // Move to next entry (8 bytes header + name + padding)
+        let entry_size = 8 + entry_name_len as u32
+        offset = offset + entry_size
+        if (offset % 2) != 0 {
+            offset = offset + 1  // Pad to even boundary
+        }
+    }
+
+    memory.kfree(pt_buffer as u64)
+    return 0
 }

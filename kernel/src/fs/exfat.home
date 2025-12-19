@@ -1,49 +1,1177 @@
-// home-os exFAT Filesystem
-// Extended FAT for large drives
+// HomeOS exFAT Filesystem Driver
+// Extended FAT for large external drives (>32GB, >4GB files)
+// Supports SDXC cards, large USB drives, and modern storage devices
 
-import "../core/foundation.home" as foundation
-import "../drivers/ata.home" as ata
+const foundation = @import("../core/foundation.home")
+const memory = @import("../core/memory.home")
+const vfs = @import("vfs.home")
 
-const EXFAT_SIGNATURE: u64 = 0x5441465845  // "EXFAT"
+// ============================================
+// exFAT Constants
+// ============================================
+
+const EXFAT_SIGNATURE: u64 = 0x5441465845  // "EXFAT" in little endian
+const SECTOR_SIZE: u32 = 512
+const MAX_FILENAME_LEN: u32 = 255
+const MAX_OPEN_FILES: u32 = 64
+
+// Directory entry types
+const ENTRY_TYPE_END: u8 = 0x00
+const ENTRY_TYPE_BITMAP: u8 = 0x81
+const ENTRY_TYPE_UPCASE: u8 = 0x82
+const ENTRY_TYPE_LABEL: u8 = 0x83
+const ENTRY_TYPE_FILE: u8 = 0x85
+const ENTRY_TYPE_STREAM: u8 = 0xC0
+const ENTRY_TYPE_NAME: u8 = 0xC1
+const ENTRY_TYPE_VENDOR: u8 = 0xE0
+const ENTRY_TYPE_VENDOR_ALLOC: u8 = 0xE1
+
+// File attributes
+const ATTR_READ_ONLY: u16 = 0x0001
+const ATTR_HIDDEN: u16 = 0x0002
+const ATTR_SYSTEM: u16 = 0x0004
+const ATTR_DIRECTORY: u16 = 0x0010
+const ATTR_ARCHIVE: u16 = 0x0020
+
+// ============================================
+// exFAT Structures
+// ============================================
 
 struct ExfatBootSector {
-  jump_boot: [u8; 3],
-  file_system_name: [u8; 8],
-  must_be_zero: [u8; 53],
-  partition_offset: u64,
-  volume_length: u64,
-  fat_offset: u32,
-  fat_length: u32,
-  cluster_heap_offset: u32,
-  cluster_count: u32,
-  root_directory_cluster: u32,
-  volume_serial_number: u32,
-  file_system_revision: u16,
-  volume_flags: u16,
-  bytes_per_sector_shift: u8,
-  sectors_per_cluster_shift: u8
+    jump_boot: [3]u8
+    file_system_name: [8]u8
+    must_be_zero: [53]u8
+    partition_offset: u64
+    volume_length: u64
+    fat_offset: u32
+    fat_length: u32
+    cluster_heap_offset: u32
+    cluster_count: u32
+    root_directory_cluster: u32
+    volume_serial_number: u32
+    file_system_revision: u16
+    volume_flags: u16
+    bytes_per_sector_shift: u8
+    sectors_per_cluster_shift: u8
+    number_of_fats: u8
+    drive_select: u8
+    percent_in_use: u8
+    reserved: [7]u8
+    boot_code: [390]u8
+    boot_signature: u16
 }
 
-var exfat_initialized: u32 = 0
-var boot_sector: ExfatBootSector
-
-export fn exfat_init() {
-  if exfat_initialized == 1 { return }
-  
-  var buffer: [u8; 512]
-  ata.ata_read_sector(0, 0, @ptrFromInt(buffer))
-  
-  boot_sector = @intToPtr(@ptrFromInt(buffer), ExfatBootSector)
-  
-  exfat_initialized = 1
-  foundation.serial_write_string("[exFAT] Initialized\n")
+struct ExfatFileEntry {
+    entry_type: u8
+    secondary_count: u8
+    set_checksum: u16
+    file_attributes: u16
+    reserved1: u16
+    create_timestamp: u32
+    modify_timestamp: u32
+    access_timestamp: u32
+    create_10ms: u8
+    modify_10ms: u8
+    create_utc_offset: u8
+    modify_utc_offset: u8
+    access_utc_offset: u8
+    reserved2: [7]u8
 }
 
-export fn exfat_read_cluster(cluster: u32, buffer: u64): u32 {
-  if exfat_initialized == 0 { return 1 }
-  
-  var sector: u32 = boot_sector.cluster_heap_offset + (cluster << boot_sector.sectors_per_cluster_shift)
-  ata.ata_read_sector(0, sector, buffer)
-  
-  return 0
+struct ExfatStreamEntry {
+    entry_type: u8
+    general_flags: u8
+    reserved1: u8
+    name_length: u8
+    name_hash: u16
+    reserved2: u16
+    valid_data_length: u64
+    reserved3: u32
+    first_cluster: u32
+    data_length: u64
+}
+
+struct ExfatNameEntry {
+    entry_type: u8
+    general_flags: u8
+    file_name: [30]u8  // UTF-16LE, 15 characters
+}
+
+struct ExfatBitmapEntry {
+    entry_type: u8
+    bitmap_flags: u8
+    reserved: [18]u8
+    first_cluster: u32
+    data_length: u64
+}
+
+struct ExfatUpcaseEntry {
+    entry_type: u8
+    reserved1: [3]u8
+    table_checksum: u32
+    reserved2: [12]u8
+    first_cluster: u32
+    data_length: u64
+}
+
+struct ExfatLabelEntry {
+    entry_type: u8
+    character_count: u8
+    volume_label: [22]u8  // UTF-16LE, 11 characters
+    reserved: [8]u8
+}
+
+// Internal file handle
+struct ExfatFile {
+    in_use: bool
+    cluster: u32
+    offset: u64
+    size: u64
+    attributes: u16
+    is_directory: bool
+    name: [MAX_FILENAME_LEN + 1]u8
+}
+
+// exFAT volume state
+struct ExfatVolume {
+    initialized: bool
+    device_id: u32
+    partition_start: u64
+
+    // Boot sector info
+    bytes_per_sector: u32
+    sectors_per_cluster: u32
+    bytes_per_cluster: u32
+    fat_offset: u32
+    fat_length: u32
+    cluster_heap_offset: u32
+    cluster_count: u32
+    root_cluster: u32
+
+    // Allocation bitmap
+    bitmap_cluster: u32
+    bitmap_length: u64
+    bitmap_data: *u8
+
+    // Upcase table
+    upcase_cluster: u32
+    upcase_length: u64
+    upcase_table: *u16
+
+    // Volume label
+    label: [12]u16
+    label_length: u8
+
+    // Open files
+    files: [MAX_OPEN_FILES]ExfatFile
+}
+
+var volume: ExfatVolume
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn exfat_init(): i32 {
+    if volume.initialized {
+        return 0
+    }
+
+    // Clear volume state
+    memory.memset(&volume as *u8, 0, @sizeOf(ExfatVolume))
+
+    foundation.serial_write_string("[exFAT] Driver initialized\n")
+    return 0
+}
+
+export fn exfat_mount(device_id: u32, partition_offset: u64): i32 {
+    if volume.initialized {
+        return -1  // Already mounted
+    }
+
+    volume.device_id = device_id
+    volume.partition_start = partition_offset
+
+    // Read boot sector
+    var boot_sector: ExfatBootSector
+    let result = read_sector(0, &boot_sector as *u8)
+    if result != 0 {
+        foundation.serial_write_string("[exFAT] Failed to read boot sector\n")
+        return -1
+    }
+
+    // Verify signature
+    var i: u32 = 0
+    let sig = "EXFAT   "
+    while i < 8 {
+        if boot_sector.file_system_name[i] != sig[i] {
+            foundation.serial_write_string("[exFAT] Invalid signature\n")
+            return -1
+        }
+        i = i + 1
+    }
+
+    // Check boot signature
+    if boot_sector.boot_signature != 0xAA55 {
+        foundation.serial_write_string("[exFAT] Invalid boot signature\n")
+        return -1
+    }
+
+    // Parse boot sector
+    volume.bytes_per_sector = 1 << boot_sector.bytes_per_sector_shift
+    volume.sectors_per_cluster = 1 << boot_sector.sectors_per_cluster_shift
+    volume.bytes_per_cluster = volume.bytes_per_sector * volume.sectors_per_cluster
+    volume.fat_offset = boot_sector.fat_offset
+    volume.fat_length = boot_sector.fat_length
+    volume.cluster_heap_offset = boot_sector.cluster_heap_offset
+    volume.cluster_count = boot_sector.cluster_count
+    volume.root_cluster = boot_sector.root_directory_cluster
+
+    // Read root directory to find bitmap and upcase table
+    if parse_root_directory() != 0 {
+        foundation.serial_write_string("[exFAT] Failed to parse root directory\n")
+        return -1
+    }
+
+    // Load allocation bitmap
+    if load_bitmap() != 0 {
+        foundation.serial_write_string("[exFAT] Failed to load allocation bitmap\n")
+        return -1
+    }
+
+    volume.initialized = true
+
+    foundation.serial_write_string("[exFAT] Mounted successfully\n")
+    foundation.serial_write_string("[exFAT] Cluster size: ")
+    foundation.serial_write_u32(volume.bytes_per_cluster)
+    foundation.serial_write_string(" bytes\n")
+    foundation.serial_write_string("[exFAT] Total clusters: ")
+    foundation.serial_write_u32(volume.cluster_count)
+    foundation.serial_write_string("\n")
+
+    return 0
+}
+
+export fn exfat_unmount(): i32 {
+    if not volume.initialized {
+        return -1
+    }
+
+    // Free bitmap
+    if volume.bitmap_data != null {
+        memory.kfree(volume.bitmap_data as u64)
+        volume.bitmap_data = null
+    }
+
+    // Free upcase table
+    if volume.upcase_table != null {
+        memory.kfree(volume.upcase_table as u64)
+        volume.upcase_table = null
+    }
+
+    // Close all files
+    var i: u32 = 0
+    while i < MAX_OPEN_FILES {
+        volume.files[i].in_use = false
+        i = i + 1
+    }
+
+    volume.initialized = false
+    foundation.serial_write_string("[exFAT] Unmounted\n")
+
+    return 0
+}
+
+// ============================================
+// Low-Level I/O
+// ============================================
+
+fn read_sector(sector: u64, buffer: *u8): i32 {
+    let abs_sector = volume.partition_start + sector
+    return vfs.block_read(volume.device_id, abs_sector, 1, buffer)
+}
+
+fn write_sector(sector: u64, buffer: *const u8): i32 {
+    let abs_sector = volume.partition_start + sector
+    return vfs.block_write(volume.device_id, abs_sector, 1, buffer)
+}
+
+fn read_cluster(cluster: u32, buffer: *u8): i32 {
+    if cluster < 2 or cluster >= volume.cluster_count + 2 {
+        return -1
+    }
+
+    let sector = volume.cluster_heap_offset as u64 +
+                 ((cluster - 2) as u64 * volume.sectors_per_cluster as u64)
+
+    var i: u32 = 0
+    while i < volume.sectors_per_cluster {
+        let result = read_sector(sector + i as u64, buffer + i * volume.bytes_per_sector)
+        if result != 0 {
+            return -1
+        }
+        i = i + 1
+    }
+
+    return 0
+}
+
+fn write_cluster(cluster: u32, buffer: *const u8): i32 {
+    if cluster < 2 or cluster >= volume.cluster_count + 2 {
+        return -1
+    }
+
+    let sector = volume.cluster_heap_offset as u64 +
+                 ((cluster - 2) as u64 * volume.sectors_per_cluster as u64)
+
+    var i: u32 = 0
+    while i < volume.sectors_per_cluster {
+        let result = write_sector(sector + i as u64, buffer + i * volume.bytes_per_sector)
+        if result != 0 {
+            return -1
+        }
+        i = i + 1
+    }
+
+    return 0
+}
+
+// ============================================
+// FAT Operations
+// ============================================
+
+fn get_fat_entry(cluster: u32): u32 {
+    if cluster < 2 or cluster >= volume.cluster_count + 2 {
+        return 0xFFFFFFFF
+    }
+
+    let fat_offset = cluster * 4
+    let fat_sector = volume.fat_offset as u64 + (fat_offset / volume.bytes_per_sector) as u64
+    let entry_offset = fat_offset % volume.bytes_per_sector
+
+    var sector_data: [512]u8
+    if read_sector(fat_sector, &sector_data) != 0 {
+        return 0xFFFFFFFF
+    }
+
+    let entry_ptr = (&sector_data + entry_offset) as *u32
+    return *entry_ptr
+}
+
+fn set_fat_entry(cluster: u32, value: u32): i32 {
+    if cluster < 2 or cluster >= volume.cluster_count + 2 {
+        return -1
+    }
+
+    let fat_offset = cluster * 4
+    let fat_sector = volume.fat_offset as u64 + (fat_offset / volume.bytes_per_sector) as u64
+    let entry_offset = fat_offset % volume.bytes_per_sector
+
+    var sector_data: [512]u8
+    if read_sector(fat_sector, &sector_data) != 0 {
+        return -1
+    }
+
+    let entry_ptr = (&sector_data + entry_offset) as *u32
+    *entry_ptr = value
+
+    return write_sector(fat_sector, &sector_data)
+}
+
+fn is_end_of_chain(cluster: u32): bool {
+    return cluster >= 0xFFFFFFF8
+}
+
+fn get_next_cluster(cluster: u32): u32 {
+    let next = get_fat_entry(cluster)
+    if is_end_of_chain(next) {
+        return 0
+    }
+    return next
+}
+
+// ============================================
+// Allocation Bitmap Operations
+// ============================================
+
+fn load_bitmap(): i32 {
+    if volume.bitmap_cluster == 0 {
+        return -1
+    }
+
+    let bitmap_bytes = (volume.cluster_count + 7) / 8
+    volume.bitmap_data = memory.kmalloc(bitmap_bytes as u64) as *u8
+
+    if volume.bitmap_data == null {
+        return -1
+    }
+
+    // Read bitmap clusters
+    var cluster = volume.bitmap_cluster
+    var offset: u32 = 0
+
+    while cluster != 0 and offset < bitmap_bytes {
+        let bytes_to_read = if volume.bytes_per_cluster < bitmap_bytes - offset {
+            volume.bytes_per_cluster
+        } else {
+            bitmap_bytes - offset
+        }
+
+        if read_cluster(cluster, volume.bitmap_data + offset) != 0 {
+            memory.kfree(volume.bitmap_data as u64)
+            volume.bitmap_data = null
+            return -1
+        }
+
+        offset = offset + volume.bytes_per_cluster
+        cluster = get_next_cluster(cluster)
+    }
+
+    return 0
+}
+
+fn is_cluster_allocated(cluster: u32): bool {
+    if cluster < 2 or cluster >= volume.cluster_count + 2 {
+        return true  // Invalid cluster is "allocated"
+    }
+
+    let index = cluster - 2
+    let byte_index = index / 8
+    let bit_index = index % 8
+
+    return (volume.bitmap_data[byte_index] & (1 << bit_index)) != 0
+}
+
+fn set_cluster_allocated(cluster: u32, allocated: bool): void {
+    if cluster < 2 or cluster >= volume.cluster_count + 2 {
+        return
+    }
+
+    let index = cluster - 2
+    let byte_index = index / 8
+    let bit_index = index % 8
+
+    if allocated {
+        volume.bitmap_data[byte_index] = volume.bitmap_data[byte_index] | (1 << bit_index)
+    } else {
+        volume.bitmap_data[byte_index] = volume.bitmap_data[byte_index] & ~(1 << bit_index)
+    }
+}
+
+fn allocate_cluster(): u32 {
+    var i: u32 = 0
+    while i < volume.cluster_count {
+        if not is_cluster_allocated(i + 2) {
+            set_cluster_allocated(i + 2, true)
+            set_fat_entry(i + 2, 0xFFFFFFFF)  // End of chain
+            return i + 2
+        }
+        i = i + 1
+    }
+    return 0  // No free clusters
+}
+
+fn free_cluster_chain(start_cluster: u32): void {
+    var cluster = start_cluster
+
+    while cluster != 0 and not is_end_of_chain(cluster) {
+        let next = get_next_cluster(cluster)
+        set_cluster_allocated(cluster, false)
+        set_fat_entry(cluster, 0)
+        cluster = next
+    }
+
+    if cluster != 0 and cluster < 0xFFFFFFF8 {
+        set_cluster_allocated(cluster, false)
+        set_fat_entry(cluster, 0)
+    }
+}
+
+// ============================================
+// Directory Operations
+// ============================================
+
+fn parse_root_directory(): i32 {
+    var cluster_buffer = memory.kmalloc(volume.bytes_per_cluster as u64) as *u8
+    if cluster_buffer == null {
+        return -1
+    }
+
+    var cluster = volume.root_cluster
+
+    while cluster != 0 {
+        if read_cluster(cluster, cluster_buffer) != 0 {
+            memory.kfree(cluster_buffer as u64)
+            return -1
+        }
+
+        // Parse directory entries (32 bytes each)
+        var offset: u32 = 0
+        while offset < volume.bytes_per_cluster {
+            let entry_type = cluster_buffer[offset]
+
+            if entry_type == ENTRY_TYPE_END {
+                break
+            }
+
+            if entry_type == ENTRY_TYPE_BITMAP {
+                let bitmap_entry = (cluster_buffer + offset) as *ExfatBitmapEntry
+                volume.bitmap_cluster = bitmap_entry.first_cluster
+                volume.bitmap_length = bitmap_entry.data_length
+            } else if entry_type == ENTRY_TYPE_UPCASE {
+                let upcase_entry = (cluster_buffer + offset) as *ExfatUpcaseEntry
+                volume.upcase_cluster = upcase_entry.first_cluster
+                volume.upcase_length = upcase_entry.data_length
+            } else if entry_type == ENTRY_TYPE_LABEL {
+                let label_entry = (cluster_buffer + offset) as *ExfatLabelEntry
+                volume.label_length = label_entry.character_count
+                memory.memcpy(&volume.label as *u8, &label_entry.volume_label as *u8, 22)
+            }
+
+            offset = offset + 32
+        }
+
+        cluster = get_next_cluster(cluster)
+    }
+
+    memory.kfree(cluster_buffer as u64)
+    return 0
+}
+
+struct DirEntry {
+    name: [MAX_FILENAME_LEN + 1]u8
+    attributes: u16
+    size: u64
+    cluster: u32
+    create_time: u32
+    modify_time: u32
+    access_time: u32
+}
+
+fn find_entry_in_directory(dir_cluster: u32, name: *const u8, entry: *DirEntry): i32 {
+    var cluster_buffer = memory.kmalloc(volume.bytes_per_cluster as u64) as *u8
+    if cluster_buffer == null {
+        return -1
+    }
+
+    var cluster = dir_cluster
+
+    while cluster != 0 {
+        if read_cluster(cluster, cluster_buffer) != 0 {
+            memory.kfree(cluster_buffer as u64)
+            return -1
+        }
+
+        var offset: u32 = 0
+        while offset < volume.bytes_per_cluster {
+            let entry_type = cluster_buffer[offset]
+
+            if entry_type == ENTRY_TYPE_END {
+                memory.kfree(cluster_buffer as u64)
+                return -1  // Not found
+            }
+
+            if entry_type == ENTRY_TYPE_FILE {
+                let file_entry = (cluster_buffer + offset) as *ExfatFileEntry
+
+                // Read secondary entries
+                let secondary_count = file_entry.secondary_count
+                if secondary_count >= 2 {
+                    // Stream extension entry
+                    let stream_entry = (cluster_buffer + offset + 32) as *ExfatStreamEntry
+
+                    // Name entries
+                    var full_name: [MAX_FILENAME_LEN + 1]u8
+                    memory.memset(&full_name as *u8, 0, MAX_FILENAME_LEN + 1)
+
+                    var name_offset: u32 = 0
+                    var name_entry_idx: u8 = 0
+
+                    while name_entry_idx < secondary_count - 1 {
+                        let name_entry = (cluster_buffer + offset + 64 + name_entry_idx as u32 * 32) as *ExfatNameEntry
+
+                        if name_entry.entry_type == ENTRY_TYPE_NAME {
+                            // Convert UTF-16LE to ASCII (simplified)
+                            var j: u32 = 0
+                            while j < 15 and name_offset < MAX_FILENAME_LEN {
+                                let char16 = (name_entry.file_name[j * 2] as u16) |
+                                            ((name_entry.file_name[j * 2 + 1] as u16) << 8)
+                                if char16 == 0 {
+                                    break
+                                }
+                                full_name[name_offset] = char16 as u8  // ASCII only
+                                name_offset = name_offset + 1
+                                j = j + 1
+                            }
+                        }
+
+                        name_entry_idx = name_entry_idx + 1
+                    }
+
+                    // Compare names (case-insensitive)
+                    if strcasecmp(&full_name as *const u8, name) == 0 {
+                        // Found!
+                        memory.strcpy(&entry.name as *u8, &full_name as *u8)
+                        entry.attributes = file_entry.file_attributes
+                        entry.size = stream_entry.data_length
+                        entry.cluster = stream_entry.first_cluster
+                        entry.create_time = file_entry.create_timestamp
+                        entry.modify_time = file_entry.modify_timestamp
+                        entry.access_time = file_entry.access_timestamp
+
+                        memory.kfree(cluster_buffer as u64)
+                        return 0
+                    }
+                }
+
+                // Skip all secondary entries
+                offset = offset + (1 + file_entry.secondary_count as u32) * 32
+                continue
+            }
+
+            offset = offset + 32
+        }
+
+        cluster = get_next_cluster(cluster)
+    }
+
+    memory.kfree(cluster_buffer as u64)
+    return -1
+}
+
+fn strcasecmp(s1: *const u8, s2: *const u8): i32 {
+    var i: u32 = 0
+    while s1[i] != 0 and s2[i] != 0 {
+        var c1 = s1[i]
+        var c2 = s2[i]
+
+        if c1 >= 'A' and c1 <= 'Z' {
+            c1 = c1 + ('a' - 'A')
+        }
+        if c2 >= 'A' and c2 <= 'Z' {
+            c2 = c2 + ('a' - 'A')
+        }
+
+        if c1 != c2 {
+            return (c1 as i32) - (c2 as i32)
+        }
+
+        i = i + 1
+    }
+
+    return (s1[i] as i32) - (s2[i] as i32)
+}
+
+// ============================================
+// File Operations
+// ============================================
+
+fn find_free_file_handle(): i32 {
+    var i: u32 = 0
+    while i < MAX_OPEN_FILES {
+        if not volume.files[i].in_use {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+export fn exfat_open(path: *const u8): i32 {
+    if not volume.initialized {
+        return -1
+    }
+
+    let handle = find_free_file_handle()
+    if handle < 0 {
+        return -1
+    }
+
+    // Parse path and find file
+    var current_cluster = volume.root_cluster
+    var path_copy: [512]u8
+    memory.strcpy(&path_copy as *u8, path)
+
+    var component = &path_copy as *u8
+    if component[0] == '/' {
+        component = component + 1
+    }
+
+    var entry: DirEntry
+
+    while component[0] != 0 {
+        // Find next path separator
+        var end = component
+        while *end != 0 and *end != '/' {
+            end = end + 1
+        }
+
+        let was_end = *end == 0
+        *end = 0
+
+        if find_entry_in_directory(current_cluster, component, &entry) != 0 {
+            return -1  // Not found
+        }
+
+        if was_end {
+            break
+        }
+
+        if (entry.attributes & ATTR_DIRECTORY) == 0 {
+            return -1  // Not a directory in the middle of path
+        }
+
+        current_cluster = entry.cluster
+        component = end + 1
+    }
+
+    // Set up file handle
+    let file = &volume.files[handle as u32]
+    file.in_use = true
+    file.cluster = entry.cluster
+    file.offset = 0
+    file.size = entry.size
+    file.attributes = entry.attributes
+    file.is_directory = (entry.attributes & ATTR_DIRECTORY) != 0
+    memory.strcpy(&file.name as *u8, &entry.name as *u8)
+
+    return handle
+}
+
+export fn exfat_close(handle: i32): i32 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    if not volume.files[handle as u32].in_use {
+        return -1
+    }
+
+    volume.files[handle as u32].in_use = false
+    return 0
+}
+
+export fn exfat_read(handle: i32, buffer: *u8, size: u32): i32 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use or file.is_directory {
+        return -1
+    }
+
+    // Calculate actual bytes to read
+    var bytes_to_read = size
+    if file.offset + bytes_to_read as u64 > file.size {
+        bytes_to_read = (file.size - file.offset) as u32
+    }
+
+    if bytes_to_read == 0 {
+        return 0
+    }
+
+    var cluster_buffer = memory.kmalloc(volume.bytes_per_cluster as u64) as *u8
+    if cluster_buffer == null {
+        return -1
+    }
+
+    // Find starting cluster
+    var cluster = file.cluster
+    var cluster_offset = file.offset / volume.bytes_per_cluster as u64
+
+    var i: u64 = 0
+    while i < cluster_offset and cluster != 0 {
+        cluster = get_next_cluster(cluster)
+        i = i + 1
+    }
+
+    if cluster == 0 {
+        memory.kfree(cluster_buffer as u64)
+        return -1
+    }
+
+    // Read data
+    var bytes_read: u32 = 0
+    var offset_in_cluster = (file.offset % volume.bytes_per_cluster as u64) as u32
+
+    while bytes_read < bytes_to_read and cluster != 0 {
+        if read_cluster(cluster, cluster_buffer) != 0 {
+            memory.kfree(cluster_buffer as u64)
+            return bytes_read as i32
+        }
+
+        let bytes_in_cluster = volume.bytes_per_cluster - offset_in_cluster
+        let bytes_this_read = if bytes_in_cluster < bytes_to_read - bytes_read {
+            bytes_in_cluster
+        } else {
+            bytes_to_read - bytes_read
+        }
+
+        memory.memcpy(buffer + bytes_read, cluster_buffer + offset_in_cluster, bytes_this_read as u64)
+
+        bytes_read = bytes_read + bytes_this_read
+        offset_in_cluster = 0
+        cluster = get_next_cluster(cluster)
+    }
+
+    file.offset = file.offset + bytes_read as u64
+
+    memory.kfree(cluster_buffer as u64)
+    return bytes_read as i32
+}
+
+export fn exfat_write(handle: i32, buffer: *const u8, size: u32): i32 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use or file.is_directory {
+        return -1
+    }
+
+    if (file.attributes & ATTR_READ_ONLY) != 0 {
+        return -1
+    }
+
+    var cluster_buffer = memory.kmalloc(volume.bytes_per_cluster as u64) as *u8
+    if cluster_buffer == null {
+        return -1
+    }
+
+    // Find/allocate starting cluster
+    var cluster = file.cluster
+    var prev_cluster: u32 = 0
+    var cluster_offset = file.offset / volume.bytes_per_cluster as u64
+
+    // Navigate to the right cluster
+    var i: u64 = 0
+    while i < cluster_offset {
+        if cluster == 0 {
+            // Need to allocate new cluster
+            let new_cluster = allocate_cluster()
+            if new_cluster == 0 {
+                memory.kfree(cluster_buffer as u64)
+                return -1
+            }
+
+            if prev_cluster != 0 {
+                set_fat_entry(prev_cluster, new_cluster)
+            } else {
+                file.cluster = new_cluster
+            }
+
+            cluster = new_cluster
+        }
+
+        prev_cluster = cluster
+        cluster = get_next_cluster(cluster)
+        i = i + 1
+    }
+
+    // Write data
+    var bytes_written: u32 = 0
+    var offset_in_cluster = (file.offset % volume.bytes_per_cluster as u64) as u32
+
+    while bytes_written < size {
+        if cluster == 0 {
+            // Allocate new cluster
+            let new_cluster = allocate_cluster()
+            if new_cluster == 0 {
+                memory.kfree(cluster_buffer as u64)
+                return bytes_written as i32
+            }
+
+            if prev_cluster != 0 {
+                set_fat_entry(prev_cluster, new_cluster)
+            } else {
+                file.cluster = new_cluster
+            }
+
+            cluster = new_cluster
+            memory.memset(cluster_buffer, 0, volume.bytes_per_cluster as u64)
+        } else if offset_in_cluster != 0 or (size - bytes_written) < volume.bytes_per_cluster {
+            // Partial cluster write - read first
+            if read_cluster(cluster, cluster_buffer) != 0 {
+                memory.kfree(cluster_buffer as u64)
+                return bytes_written as i32
+            }
+        }
+
+        let bytes_in_cluster = volume.bytes_per_cluster - offset_in_cluster
+        let bytes_this_write = if bytes_in_cluster < size - bytes_written {
+            bytes_in_cluster
+        } else {
+            size - bytes_written
+        }
+
+        memory.memcpy(cluster_buffer + offset_in_cluster, buffer + bytes_written, bytes_this_write as u64)
+
+        if write_cluster(cluster, cluster_buffer) != 0 {
+            memory.kfree(cluster_buffer as u64)
+            return bytes_written as i32
+        }
+
+        bytes_written = bytes_written + bytes_this_write
+        offset_in_cluster = 0
+        prev_cluster = cluster
+        cluster = get_next_cluster(cluster)
+    }
+
+    file.offset = file.offset + bytes_written as u64
+
+    // Update file size if needed
+    if file.offset > file.size {
+        file.size = file.offset
+        // TODO: Update directory entry
+    }
+
+    memory.kfree(cluster_buffer as u64)
+    return bytes_written as i32
+}
+
+export fn exfat_seek(handle: i32, offset: i64, whence: i32): i64 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use {
+        return -1
+    }
+
+    var new_offset: i64 = 0
+
+    if whence == 0 {  // SEEK_SET
+        new_offset = offset
+    } else if whence == 1 {  // SEEK_CUR
+        new_offset = file.offset as i64 + offset
+    } else if whence == 2 {  // SEEK_END
+        new_offset = file.size as i64 + offset
+    } else {
+        return -1
+    }
+
+    if new_offset < 0 {
+        return -1
+    }
+
+    file.offset = new_offset as u64
+    return new_offset
+}
+
+export fn exfat_tell(handle: i32): i64 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use {
+        return -1
+    }
+
+    return file.offset as i64
+}
+
+export fn exfat_size(handle: i32): i64 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use {
+        return -1
+    }
+
+    return file.size as i64
+}
+
+// ============================================
+// Directory Listing
+// ============================================
+
+export fn exfat_opendir(path: *const u8): i32 {
+    let handle = exfat_open(path)
+    if handle < 0 {
+        return -1
+    }
+
+    if not volume.files[handle as u32].is_directory {
+        exfat_close(handle)
+        return -1
+    }
+
+    return handle
+}
+
+export fn exfat_readdir(handle: i32, name: *u8, max_len: u32): i32 {
+    if handle < 0 or handle >= MAX_OPEN_FILES as i32 {
+        return -1
+    }
+
+    let file = &volume.files[handle as u32]
+    if not file.in_use or not file.is_directory {
+        return -1
+    }
+
+    var cluster_buffer = memory.kmalloc(volume.bytes_per_cluster as u64) as *u8
+    if cluster_buffer == null {
+        return -1
+    }
+
+    // Navigate to current position
+    var cluster = file.cluster
+    var cluster_idx = file.offset / volume.bytes_per_cluster as u64
+
+    var i: u64 = 0
+    while i < cluster_idx and cluster != 0 {
+        cluster = get_next_cluster(cluster)
+        i = i + 1
+    }
+
+    if cluster == 0 {
+        memory.kfree(cluster_buffer as u64)
+        return 0  // End of directory
+    }
+
+    // Read current cluster
+    if read_cluster(cluster, cluster_buffer) != 0 {
+        memory.kfree(cluster_buffer as u64)
+        return -1
+    }
+
+    var offset = (file.offset % volume.bytes_per_cluster as u64) as u32
+
+    while true {
+        if offset >= volume.bytes_per_cluster {
+            cluster = get_next_cluster(cluster)
+            if cluster == 0 {
+                memory.kfree(cluster_buffer as u64)
+                return 0  // End of directory
+            }
+
+            if read_cluster(cluster, cluster_buffer) != 0 {
+                memory.kfree(cluster_buffer as u64)
+                return -1
+            }
+
+            offset = 0
+        }
+
+        let entry_type = cluster_buffer[offset]
+
+        if entry_type == ENTRY_TYPE_END {
+            memory.kfree(cluster_buffer as u64)
+            return 0  // End of directory
+        }
+
+        if entry_type == ENTRY_TYPE_FILE {
+            let file_entry = (cluster_buffer + offset) as *ExfatFileEntry
+            let secondary_count = file_entry.secondary_count
+
+            if secondary_count >= 2 {
+                // Read name from name entries
+                var full_name: [MAX_FILENAME_LEN + 1]u8
+                memory.memset(&full_name as *u8, 0, MAX_FILENAME_LEN + 1)
+
+                var name_offset: u32 = 0
+                var name_entry_idx: u8 = 0
+
+                while name_entry_idx < secondary_count - 1 and name_entry_idx < 17 {
+                    let entry_off = offset + 64 + name_entry_idx as u32 * 32
+
+                    // Handle cluster boundary
+                    if entry_off >= volume.bytes_per_cluster {
+                        // Would need to read next cluster - simplified for now
+                        break
+                    }
+
+                    let name_entry = (cluster_buffer + entry_off) as *ExfatNameEntry
+
+                    if name_entry.entry_type == ENTRY_TYPE_NAME {
+                        var j: u32 = 0
+                        while j < 15 and name_offset < MAX_FILENAME_LEN {
+                            let char16 = (name_entry.file_name[j * 2] as u16) |
+                                        ((name_entry.file_name[j * 2 + 1] as u16) << 8)
+                            if char16 == 0 {
+                                break
+                            }
+                            full_name[name_offset] = char16 as u8
+                            name_offset = name_offset + 1
+                            j = j + 1
+                        }
+                    }
+
+                    name_entry_idx = name_entry_idx + 1
+                }
+
+                // Copy name to output
+                var copy_len = name_offset
+                if copy_len >= max_len {
+                    copy_len = max_len - 1
+                }
+                memory.memcpy(name, &full_name as *u8, copy_len as u64)
+                name[copy_len] = 0
+
+                // Update position
+                file.offset = file.offset + (1 + secondary_count as u32) as u64 * 32
+
+                memory.kfree(cluster_buffer as u64)
+                return 1  // Found entry
+            }
+
+            offset = offset + (1 + file_entry.secondary_count as u32) * 32
+            file.offset = file.offset + (1 + file_entry.secondary_count as u32) as u64 * 32
+            continue
+        }
+
+        offset = offset + 32
+        file.offset = file.offset + 32
+    }
+
+    memory.kfree(cluster_buffer as u64)
+    return 0
+}
+
+export fn exfat_closedir(handle: i32): i32 {
+    return exfat_close(handle)
+}
+
+// ============================================
+// Utility Functions
+// ============================================
+
+export fn exfat_get_free_space(): u64 {
+    if not volume.initialized {
+        return 0
+    }
+
+    var free_clusters: u64 = 0
+    var i: u32 = 0
+
+    while i < volume.cluster_count {
+        if not is_cluster_allocated(i + 2) {
+            free_clusters = free_clusters + 1
+        }
+        i = i + 1
+    }
+
+    return free_clusters * volume.bytes_per_cluster as u64
+}
+
+export fn exfat_get_total_space(): u64 {
+    if not volume.initialized {
+        return 0
+    }
+
+    return volume.cluster_count as u64 * volume.bytes_per_cluster as u64
+}
+
+export fn exfat_get_cluster_size(): u32 {
+    if not volume.initialized {
+        return 0
+    }
+
+    return volume.bytes_per_cluster
 }

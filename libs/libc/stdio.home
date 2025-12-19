@@ -1,0 +1,869 @@
+// HomeOS libc - Standard I/O (stdio.h)
+// POSIX-compatible standard I/O library
+
+const basics = @import("basics")
+const syscall = @import("kernel/syscall")
+
+// ============================================
+// Constants
+// ============================================
+
+const BUFSIZ: u32 = 8192
+const EOF: i32 = -1
+const FILENAME_MAX: u32 = 4096
+const FOPEN_MAX: u32 = 256
+const L_tmpnam: u32 = 20
+const TMP_MAX: u32 = 10000
+
+// Seek origins
+const SEEK_SET: i32 = 0
+const SEEK_CUR: i32 = 1
+const SEEK_END: i32 = 2
+
+// File modes
+const _IOFBF: i32 = 0    // Fully buffered
+const _IOLBF: i32 = 1    // Line buffered
+const _IONBF: i32 = 2    // Unbuffered
+
+// ============================================
+// FILE Structure
+// ============================================
+
+struct FILE {
+    fd: i32
+    flags: u32
+    buffer: *u8
+    buf_size: u32
+    buf_pos: u32
+    buf_end: u32
+    buf_mode: i32
+
+    // Error and EOF flags
+    error: bool
+    eof: bool
+
+    // Unget buffer
+    unget_buf: [4]u8
+    unget_count: u8
+
+    // For wide character support
+    orientation: i8  // 0=unset, >0=wide, <0=byte
+
+    // Lock for thread safety
+    lock: u32
+}
+
+// File flags
+const FILE_READ: u32 = 0x01
+const FILE_WRITE: u32 = 0x02
+const FILE_APPEND: u32 = 0x04
+const FILE_BINARY: u32 = 0x08
+const FILE_OWNBUF: u32 = 0x10
+
+// ============================================
+// Standard Streams
+// ============================================
+
+var stdin_buf: [BUFSIZ]u8 = undefined
+var stdout_buf: [BUFSIZ]u8 = undefined
+var stderr_buf: [1]u8 = undefined
+
+var stdin_file: FILE = FILE {
+    .fd = 0,
+    .flags = FILE_READ,
+    .buffer = &stdin_buf,
+    .buf_size = BUFSIZ,
+    .buf_pos = 0,
+    .buf_end = 0,
+    .buf_mode = _IOLBF,
+    .error = false,
+    .eof = false,
+    .unget_count = 0,
+    .orientation = 0,
+    .lock = 0,
+}
+
+var stdout_file: FILE = FILE {
+    .fd = 1,
+    .flags = FILE_WRITE,
+    .buffer = &stdout_buf,
+    .buf_size = BUFSIZ,
+    .buf_pos = 0,
+    .buf_end = 0,
+    .buf_mode = _IOLBF,
+    .error = false,
+    .eof = false,
+    .unget_count = 0,
+    .orientation = 0,
+    .lock = 0,
+}
+
+var stderr_file: FILE = FILE {
+    .fd = 2,
+    .flags = FILE_WRITE,
+    .buffer = &stderr_buf,
+    .buf_size = 1,
+    .buf_pos = 0,
+    .buf_end = 0,
+    .buf_mode = _IONBF,
+    .error = false,
+    .eof = false,
+    .unget_count = 0,
+    .orientation = 0,
+    .lock = 0,
+}
+
+export var stdin: *FILE = &stdin_file
+export var stdout: *FILE = &stdout_file
+export var stderr: *FILE = &stderr_file
+
+// ============================================
+// File Table
+// ============================================
+
+var files: [FOPEN_MAX]FILE = undefined
+var files_used: [FOPEN_MAX]bool = undefined
+
+fn allocate_file(): *FILE {
+    var i: u32 = 0
+    while i < FOPEN_MAX {
+        if not files_used[i] {
+            files_used[i] = true
+            return &files[i]
+        }
+        i = i + 1
+    }
+    return null
+}
+
+fn free_file(f: *FILE): void {
+    var i: u32 = 0
+    while i < FOPEN_MAX {
+        if &files[i] == f {
+            files_used[i] = false
+            return
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// File Operations
+// ============================================
+
+export fn fopen(filename: *const u8, mode: *const u8): *FILE {
+    var flags: i32 = 0
+    var file_flags: u32 = 0
+
+    // Parse mode string
+    var i: u32 = 0
+    var has_plus: bool = false
+    var has_b: bool = false
+
+    while mode[i] != 0 {
+        if mode[i] == '+' { has_plus = true }
+        if mode[i] == 'b' { has_b = true }
+        i = i + 1
+    }
+
+    if mode[0] == 'r' {
+        if has_plus {
+            flags = syscall.O_RDWR
+            file_flags = FILE_READ | FILE_WRITE
+        } else {
+            flags = syscall.O_RDONLY
+            file_flags = FILE_READ
+        }
+    } else if mode[0] == 'w' {
+        flags = syscall.O_CREAT | syscall.O_TRUNC
+        if has_plus {
+            flags = flags | syscall.O_RDWR
+            file_flags = FILE_READ | FILE_WRITE
+        } else {
+            flags = flags | syscall.O_WRONLY
+            file_flags = FILE_WRITE
+        }
+    } else if mode[0] == 'a' {
+        flags = syscall.O_CREAT | syscall.O_APPEND
+        if has_plus {
+            flags = flags | syscall.O_RDWR
+            file_flags = FILE_READ | FILE_WRITE | FILE_APPEND
+        } else {
+            flags = flags | syscall.O_WRONLY
+            file_flags = FILE_WRITE | FILE_APPEND
+        }
+    } else {
+        return null
+    }
+
+    if has_b {
+        file_flags = file_flags | FILE_BINARY
+    }
+
+    let fd = syscall.open(filename, flags, 0o644)
+    if fd < 0 {
+        return null
+    }
+
+    let f = allocate_file()
+    if f == null {
+        syscall.close(fd)
+        return null
+    }
+
+    f.fd = fd
+    f.flags = file_flags
+    f.buffer = basics.malloc(BUFSIZ)
+    f.buf_size = BUFSIZ
+    f.buf_pos = 0
+    f.buf_end = 0
+    f.buf_mode = _IOFBF
+    f.error = false
+    f.eof = false
+    f.unget_count = 0
+    f.orientation = 0
+    f.lock = 0
+
+    if f.buffer != null {
+        f.flags = f.flags | FILE_OWNBUF
+    } else {
+        f.buf_size = 0
+    }
+
+    return f
+}
+
+export fn fclose(stream: *FILE): i32 {
+    if stream == null {
+        return EOF
+    }
+
+    // Flush output
+    if (stream.flags & FILE_WRITE) != 0 {
+        fflush(stream)
+    }
+
+    // Free buffer
+    if (stream.flags & FILE_OWNBUF) != 0 and stream.buffer != null {
+        basics.free(stream.buffer)
+    }
+
+    let result = syscall.close(stream.fd)
+
+    // Don't free standard streams
+    if stream != stdin and stream != stdout and stream != stderr {
+        free_file(stream)
+    }
+
+    return if result < 0 { EOF } else { 0 }
+}
+
+export fn fflush(stream: *FILE): i32 {
+    if stream == null {
+        // Flush all streams
+        fflush(stdout)
+        fflush(stderr)
+        return 0
+    }
+
+    if (stream.flags & FILE_WRITE) == 0 {
+        return 0
+    }
+
+    if stream.buf_pos > 0 {
+        let written = syscall.write(stream.fd, stream.buffer, stream.buf_pos)
+        if written < 0 {
+            stream.error = true
+            return EOF
+        }
+        stream.buf_pos = 0
+    }
+
+    return 0
+}
+
+export fn fread(ptr: *void, size: u32, nmemb: u32, stream: *FILE): u32 {
+    if stream == null or (stream.flags & FILE_READ) == 0 {
+        return 0
+    }
+
+    let total = size * nmemb
+    var read: u32 = 0
+    let dest = ptr as *u8
+
+    while read < total {
+        // Check unget buffer first
+        if stream.unget_count > 0 {
+            stream.unget_count = stream.unget_count - 1
+            dest[read] = stream.unget_buf[stream.unget_count]
+            read = read + 1
+            continue
+        }
+
+        // Check buffer
+        if stream.buf_pos < stream.buf_end {
+            dest[read] = stream.buffer[stream.buf_pos]
+            stream.buf_pos = stream.buf_pos + 1
+            read = read + 1
+        } else {
+            // Refill buffer
+            let bytes = syscall.read(stream.fd, stream.buffer, stream.buf_size)
+            if bytes <= 0 {
+                if bytes == 0 {
+                    stream.eof = true
+                } else {
+                    stream.error = true
+                }
+                break
+            }
+            stream.buf_pos = 0
+            stream.buf_end = bytes as u32
+        }
+    }
+
+    return read / size
+}
+
+export fn fwrite(ptr: *const void, size: u32, nmemb: u32, stream: *FILE): u32 {
+    if stream == null or (stream.flags & FILE_WRITE) == 0 {
+        return 0
+    }
+
+    let total = size * nmemb
+    var written: u32 = 0
+    let src = ptr as *const u8
+
+    while written < total {
+        // Add to buffer
+        if stream.buf_pos < stream.buf_size {
+            stream.buffer[stream.buf_pos] = src[written]
+            stream.buf_pos = stream.buf_pos + 1
+            written = written + 1
+
+            // Line buffered: flush on newline
+            if stream.buf_mode == _IOLBF and src[written - 1] == '\n' {
+                fflush(stream)
+            }
+        } else {
+            // Buffer full - flush
+            if fflush(stream) == EOF {
+                break
+            }
+        }
+    }
+
+    // Unbuffered mode: flush immediately
+    if stream.buf_mode == _IONBF {
+        fflush(stream)
+    }
+
+    return written / size
+}
+
+export fn fgetc(stream: *FILE): i32 {
+    var c: u8 = 0
+    if fread(&c, 1, 1, stream) != 1 {
+        return EOF
+    }
+    return c as i32
+}
+
+export fn fputc(c: i32, stream: *FILE): i32 {
+    let ch = c as u8
+    if fwrite(&ch, 1, 1, stream) != 1 {
+        return EOF
+    }
+    return c
+}
+
+export fn fgets(s: *u8, n: i32, stream: *FILE): *u8 {
+    if n <= 0 {
+        return null
+    }
+
+    var i: i32 = 0
+    while i < n - 1 {
+        let c = fgetc(stream)
+        if c == EOF {
+            if i == 0 {
+                return null
+            }
+            break
+        }
+        s[i] = c as u8
+        i = i + 1
+        if c == '\n' as i32 {
+            break
+        }
+    }
+
+    s[i] = 0
+    return s
+}
+
+export fn fputs(s: *const u8, stream: *FILE): i32 {
+    let len = basics.strlen(s)
+    if fwrite(s, 1, len, stream) != len {
+        return EOF
+    }
+    return 0
+}
+
+export fn ungetc(c: i32, stream: *FILE): i32 {
+    if c == EOF or stream == null {
+        return EOF
+    }
+
+    if stream.unget_count >= 4 {
+        return EOF
+    }
+
+    stream.unget_buf[stream.unget_count] = c as u8
+    stream.unget_count = stream.unget_count + 1
+    stream.eof = false
+
+    return c
+}
+
+export fn fseek(stream: *FILE, offset: i64, whence: i32): i32 {
+    if stream == null {
+        return -1
+    }
+
+    // Flush output buffer
+    if (stream.flags & FILE_WRITE) != 0 {
+        fflush(stream)
+    }
+
+    // Clear input buffer
+    stream.buf_pos = 0
+    stream.buf_end = 0
+    stream.unget_count = 0
+    stream.eof = false
+
+    let result = syscall.lseek(stream.fd, offset, whence)
+    if result < 0 {
+        stream.error = true
+        return -1
+    }
+
+    return 0
+}
+
+export fn ftell(stream: *FILE): i64 {
+    if stream == null {
+        return -1
+    }
+
+    let pos = syscall.lseek(stream.fd, 0, SEEK_CUR)
+    if pos < 0 {
+        return -1
+    }
+
+    // Adjust for buffer position
+    if (stream.flags & FILE_WRITE) != 0 {
+        return pos + stream.buf_pos as i64
+    } else {
+        return pos - (stream.buf_end - stream.buf_pos) as i64 + stream.unget_count as i64
+    }
+}
+
+export fn rewind(stream: *FILE): void {
+    fseek(stream, 0, SEEK_SET)
+    stream.error = false
+}
+
+export fn feof(stream: *FILE): i32 {
+    if stream == null {
+        return 0
+    }
+    return if stream.eof { 1 } else { 0 }
+}
+
+export fn ferror(stream: *FILE): i32 {
+    if stream == null {
+        return 0
+    }
+    return if stream.error { 1 } else { 0 }
+}
+
+export fn clearerr(stream: *FILE): void {
+    if stream != null {
+        stream.error = false
+        stream.eof = false
+    }
+}
+
+export fn fileno(stream: *FILE): i32 {
+    if stream == null {
+        return -1
+    }
+    return stream.fd
+}
+
+// ============================================
+// Printf Family
+// ============================================
+
+export fn printf(format: *const u8, ...): i32 {
+    var buf: [4096]u8 = undefined
+    let len = vsnprintf(&buf, 4096, format, @va_start())
+    return fwrite(&buf, 1, len as u32, stdout) as i32
+}
+
+export fn fprintf(stream: *FILE, format: *const u8, ...): i32 {
+    var buf: [4096]u8 = undefined
+    let len = vsnprintf(&buf, 4096, format, @va_start())
+    return fwrite(&buf, 1, len as u32, stream) as i32
+}
+
+export fn sprintf(str: *u8, format: *const u8, ...): i32 {
+    return vsnprintf(str, 0xFFFFFFFF, format, @va_start())
+}
+
+export fn snprintf(str: *u8, size: u32, format: *const u8, ...): i32 {
+    return vsnprintf(str, size, format, @va_start())
+}
+
+fn vsnprintf(str: *u8, size: u32, format: *const u8, args: @va_list): i32 {
+    var pos: u32 = 0
+    var i: u32 = 0
+
+    while format[i] != 0 and pos < size - 1 {
+        if format[i] == '%' {
+            i = i + 1
+
+            // Parse flags, width, precision (simplified)
+            var width: i32 = 0
+            var zero_pad: bool = false
+
+            if format[i] == '0' {
+                zero_pad = true
+                i = i + 1
+            }
+
+            while format[i] >= '0' and format[i] <= '9' {
+                width = width * 10 + (format[i] - '0') as i32
+                i = i + 1
+            }
+
+            // Format specifier
+            switch format[i] {
+                'd', 'i' => {
+                    let val = @va_arg(args, i32)
+                    pos = pos + format_int(str + pos, size - pos, val, 10, false, width, zero_pad)
+                },
+                'u' => {
+                    let val = @va_arg(args, u32)
+                    pos = pos + format_uint(str + pos, size - pos, val, 10, false, width, zero_pad)
+                },
+                'x' => {
+                    let val = @va_arg(args, u32)
+                    pos = pos + format_uint(str + pos, size - pos, val, 16, false, width, zero_pad)
+                },
+                'X' => {
+                    let val = @va_arg(args, u32)
+                    pos = pos + format_uint(str + pos, size - pos, val, 16, true, width, zero_pad)
+                },
+                'p' => {
+                    let val = @va_arg(args, u64)
+                    if pos < size - 1 { str[pos] = '0'; pos = pos + 1 }
+                    if pos < size - 1 { str[pos] = 'x'; pos = pos + 1 }
+                    pos = pos + format_uint64(str + pos, size - pos, val, 16, false, 16, true)
+                },
+                's' => {
+                    let s = @va_arg(args, *const u8)
+                    if s != null {
+                        var j: u32 = 0
+                        while s[j] != 0 and pos < size - 1 {
+                            str[pos] = s[j]
+                            pos = pos + 1
+                            j = j + 1
+                        }
+                    }
+                },
+                'c' => {
+                    let c = @va_arg(args, i32)
+                    if pos < size - 1 {
+                        str[pos] = c as u8
+                        pos = pos + 1
+                    }
+                },
+                '%' => {
+                    if pos < size - 1 {
+                        str[pos] = '%'
+                        pos = pos + 1
+                    }
+                },
+                else => {}
+            }
+            i = i + 1
+        } else {
+            str[pos] = format[i]
+            pos = pos + 1
+            i = i + 1
+        }
+    }
+
+    str[pos] = 0
+    return pos as i32
+}
+
+fn format_int(buf: *u8, size: u32, val: i32, base: u32, upper: bool, width: i32, zero_pad: bool): u32 {
+    var pos: u32 = 0
+
+    if val < 0 {
+        if pos < size - 1 {
+            buf[pos] = '-'
+            pos = pos + 1
+        }
+        return pos + format_uint(buf + pos, size - pos, (-val) as u32, base, upper, width - 1, zero_pad)
+    }
+
+    return format_uint(buf, size, val as u32, base, upper, width, zero_pad)
+}
+
+fn format_uint(buf: *u8, size: u32, val: u32, base: u32, upper: bool, width: i32, zero_pad: bool): u32 {
+    const digits_lower = "0123456789abcdef"
+    const digits_upper = "0123456789ABCDEF"
+    let digits = if upper { digits_upper } else { digits_lower }
+
+    var tmp: [32]u8 = undefined
+    var tmp_pos: u32 = 0
+
+    var v = val
+    loop {
+        tmp[tmp_pos] = digits[v % base]
+        tmp_pos = tmp_pos + 1
+        v = v / base
+        if v == 0 { break }
+    }
+
+    // Padding
+    var pos: u32 = 0
+    let pad_char = if zero_pad { '0' } else { ' ' }
+    while width as u32 > tmp_pos and pos < size - 1 {
+        buf[pos] = pad_char
+        pos = pos + 1
+        width = width - 1
+    }
+
+    // Reverse digits
+    while tmp_pos > 0 and pos < size - 1 {
+        tmp_pos = tmp_pos - 1
+        buf[pos] = tmp[tmp_pos]
+        pos = pos + 1
+    }
+
+    return pos
+}
+
+fn format_uint64(buf: *u8, size: u32, val: u64, base: u32, upper: bool, width: i32, zero_pad: bool): u32 {
+    const digits_lower = "0123456789abcdef"
+    const digits_upper = "0123456789ABCDEF"
+    let digits = if upper { digits_upper } else { digits_lower }
+
+    var tmp: [64]u8 = undefined
+    var tmp_pos: u32 = 0
+
+    var v = val
+    loop {
+        tmp[tmp_pos] = digits[(v % base as u64) as u32]
+        tmp_pos = tmp_pos + 1
+        v = v / base as u64
+        if v == 0 { break }
+    }
+
+    var pos: u32 = 0
+    let pad_char = if zero_pad { '0' } else { ' ' }
+    while width as u32 > tmp_pos and pos < size - 1 {
+        buf[pos] = pad_char
+        pos = pos + 1
+        width = width - 1
+    }
+
+    while tmp_pos > 0 and pos < size - 1 {
+        tmp_pos = tmp_pos - 1
+        buf[pos] = tmp[tmp_pos]
+        pos = pos + 1
+    }
+
+    return pos
+}
+
+// ============================================
+// Scanf Family (simplified)
+// ============================================
+
+export fn scanf(format: *const u8, ...): i32 {
+    return fscanf(stdin, format, @va_start())
+}
+
+export fn fscanf(stream: *FILE, format: *const u8, ...): i32 {
+    // Simplified scanf implementation
+    var matched: i32 = 0
+    var i: u32 = 0
+    let args = @va_start()
+
+    while format[i] != 0 {
+        if format[i] == '%' {
+            i = i + 1
+
+            switch format[i] {
+                'd' => {
+                    let ptr = @va_arg(args, *i32)
+                    var val: i32 = 0
+                    var neg: bool = false
+                    var c = fgetc(stream)
+
+                    // Skip whitespace
+                    while c == ' ' as i32 or c == '\t' as i32 or c == '\n' as i32 {
+                        c = fgetc(stream)
+                    }
+
+                    if c == '-' as i32 {
+                        neg = true
+                        c = fgetc(stream)
+                    }
+
+                    if c < '0' as i32 or c > '9' as i32 {
+                        ungetc(c, stream)
+                        return matched
+                    }
+
+                    while c >= '0' as i32 and c <= '9' as i32 {
+                        val = val * 10 + (c - '0' as i32)
+                        c = fgetc(stream)
+                    }
+
+                    ungetc(c, stream)
+                    *ptr = if neg { -val } else { val }
+                    matched = matched + 1
+                },
+                's' => {
+                    let ptr = @va_arg(args, *u8)
+                    var pos: u32 = 0
+                    var c = fgetc(stream)
+
+                    // Skip whitespace
+                    while c == ' ' as i32 or c == '\t' as i32 or c == '\n' as i32 {
+                        c = fgetc(stream)
+                    }
+
+                    while c != EOF and c != ' ' as i32 and c != '\t' as i32 and c != '\n' as i32 {
+                        ptr[pos] = c as u8
+                        pos = pos + 1
+                        c = fgetc(stream)
+                    }
+
+                    if pos > 0 {
+                        ptr[pos] = 0
+                        matched = matched + 1
+                    }
+                    ungetc(c, stream)
+                },
+                else => {}
+            }
+            i = i + 1
+        } else if format[i] == ' ' or format[i] == '\t' or format[i] == '\n' {
+            // Skip whitespace in input
+            var c = fgetc(stream)
+            while c == ' ' as i32 or c == '\t' as i32 or c == '\n' as i32 {
+                c = fgetc(stream)
+            }
+            ungetc(c, stream)
+            i = i + 1
+        } else {
+            // Match literal character
+            let c = fgetc(stream)
+            if c != format[i] as i32 {
+                ungetc(c, stream)
+                return matched
+            }
+            i = i + 1
+        }
+    }
+
+    return matched
+}
+
+// ============================================
+// Convenience Functions
+// ============================================
+
+export fn puts(s: *const u8): i32 {
+    if fputs(s, stdout) == EOF {
+        return EOF
+    }
+    if fputc('\n' as i32, stdout) == EOF {
+        return EOF
+    }
+    return 1
+}
+
+export fn getchar(): i32 {
+    return fgetc(stdin)
+}
+
+export fn putchar(c: i32): i32 {
+    return fputc(c, stdout)
+}
+
+export fn gets(s: *u8): *u8 {
+    // Deprecated but included for compatibility
+    return fgets(s, 0x7FFFFFFF, stdin)
+}
+
+export fn perror(s: *const u8): void {
+    if s != null and s[0] != 0 {
+        fputs(s, stderr)
+        fputs(": ", stderr)
+    }
+    fputs(basics.strerror(basics.errno), stderr)
+    fputc('\n' as i32, stderr)
+}
+
+// ============================================
+// Buffer Control
+// ============================================
+
+export fn setbuf(stream: *FILE, buf: *u8): void {
+    setvbuf(stream, buf, if buf != null { _IOFBF } else { _IONBF }, BUFSIZ)
+}
+
+export fn setvbuf(stream: *FILE, buf: *u8, mode: i32, size: u32): i32 {
+    if stream == null {
+        return -1
+    }
+
+    fflush(stream)
+
+    // Free old buffer if owned
+    if (stream.flags & FILE_OWNBUF) != 0 and stream.buffer != null {
+        basics.free(stream.buffer)
+        stream.flags = stream.flags & ~FILE_OWNBUF
+    }
+
+    stream.buf_mode = mode
+
+    if mode == _IONBF {
+        stream.buffer = null
+        stream.buf_size = 0
+    } else if buf != null {
+        stream.buffer = buf
+        stream.buf_size = size
+    } else {
+        stream.buffer = basics.malloc(size)
+        if stream.buffer != null {
+            stream.buf_size = size
+            stream.flags = stream.flags | FILE_OWNBUF
+        } else {
+            stream.buf_size = 0
+        }
+    }
+
+    stream.buf_pos = 0
+    stream.buf_end = 0
+
+    return 0
+}

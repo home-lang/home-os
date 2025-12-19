@@ -1,0 +1,620 @@
+// HomeOS Shell Tab Completion
+// Intelligent command and path completion
+
+const basics = @import("basics")
+const fs = @import("kernel/fs/vfs")
+const path = @import("kernel/fs/path")
+
+// ============================================
+// Completion Types
+// ============================================
+
+const COMPLETION_COMMAND: u8 = 0
+const COMPLETION_FILE: u8 = 1
+const COMPLETION_DIRECTORY: u8 = 2
+const COMPLETION_OPTION: u8 = 3
+const COMPLETION_VARIABLE: u8 = 4
+const COMPLETION_HOSTNAME: u8 = 5
+const COMPLETION_USERNAME: u8 = 6
+
+// ============================================
+// Completion Result
+// ============================================
+
+const MAX_COMPLETIONS: u32 = 256
+const MAX_COMPLETION_LEN: u32 = 256
+
+struct CompletionResult {
+    completions: [MAX_COMPLETIONS][MAX_COMPLETION_LEN]u8
+    types: [MAX_COMPLETIONS]u8
+    count: u32
+    common_prefix_len: u32
+}
+
+// ============================================
+// Command Database
+// ============================================
+
+const builtin_commands = [_]*const u8 {
+    "alias", "bg", "cd", "clear", "echo", "exit", "export",
+    "fg", "help", "history", "jobs", "pwd", "read", "set",
+    "source", "type", "unalias", "unset", "wait",
+}
+
+const PATH_COMMANDS_CACHE_SIZE: u32 = 512
+var path_commands_cache: [PATH_COMMANDS_CACHE_SIZE][64]u8 = undefined
+var path_commands_count: u32 = 0
+var path_cache_valid: bool = false
+
+// ============================================
+// Completion State
+// ============================================
+
+struct CompletionState {
+    input: [1024]u8
+    input_len: u32
+    cursor_pos: u32
+
+    word_start: u32
+    word_end: u32
+    word: [256]u8
+    word_len: u32
+
+    result: CompletionResult
+    result_index: u32
+
+    // For cycling through completions
+    cycling: bool
+    original_word: [256]u8
+    original_len: u32
+}
+
+var state: CompletionState = undefined
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn completion_init(): void {
+    state.input_len = 0
+    state.cursor_pos = 0
+    state.result.count = 0
+    state.result_index = 0
+    state.cycling = false
+    path_cache_valid = false
+
+    // Pre-populate command cache
+    refresh_path_commands()
+}
+
+fn refresh_path_commands(): void {
+    path_commands_count = 0
+
+    // Get PATH environment variable
+    let path_env = basics.getenv("PATH")
+    if path_env == null {
+        path_cache_valid = true
+        return
+    }
+
+    // Parse PATH and scan directories
+    var path_copy: [1024]u8 = undefined
+    basics.strcpy(&path_copy, path_env)
+
+    var dir_start: u32 = 0
+    var i: u32 = 0
+
+    while path_copy[i] != 0 and path_commands_count < PATH_COMMANDS_CACHE_SIZE {
+        if path_copy[i] == ':' or path_copy[i + 1] == 0 {
+            let end = if path_copy[i] == ':' { i } else { i + 1 }
+
+            // Extract directory path
+            var dir_path: [256]u8 = undefined
+            basics.memcpy(&dir_path, &path_copy[dir_start], end - dir_start)
+            dir_path[end - dir_start] = 0
+
+            // Scan directory for executables
+            scan_directory_for_commands(&dir_path)
+
+            dir_start = i + 1
+        }
+        i = i + 1
+    }
+
+    path_cache_valid = true
+}
+
+fn scan_directory_for_commands(dir_path: *[256]u8): void {
+    let dir = fs.opendir(dir_path)
+    if dir == null {
+        return
+    }
+
+    var entry: fs.DirEntry = undefined
+    while fs.readdir(dir, &entry) {
+        if entry.name[0] == '.' {
+            continue
+        }
+
+        // Check if executable
+        var full_path: [512]u8 = undefined
+        basics.strcpy(&full_path, dir_path)
+        basics.strcat(&full_path, "/")
+        basics.strcat(&full_path, &entry.name)
+
+        if fs.access(&full_path, fs.X_OK) == 0 {
+            if path_commands_count < PATH_COMMANDS_CACHE_SIZE {
+                basics.strcpy(&path_commands_cache[path_commands_count], &entry.name)
+                path_commands_count = path_commands_count + 1
+            }
+        }
+    }
+
+    fs.closedir(dir)
+}
+
+// ============================================
+// Main Completion Function
+// ============================================
+
+export fn complete(input: *u8, input_len: u32, cursor_pos: u32): *CompletionResult {
+    // Copy input
+    basics.memcpy(&state.input, input, input_len)
+    state.input[input_len] = 0
+    state.input_len = input_len
+    state.cursor_pos = cursor_pos
+
+    // Find current word
+    find_current_word()
+
+    // Clear previous results
+    state.result.count = 0
+    state.result.common_prefix_len = 0
+
+    // Determine completion type and generate completions
+    if state.word_start == 0 or is_first_word() {
+        // Command completion
+        complete_commands()
+    } else if state.word_len > 0 and state.word[0] == '-' {
+        // Option completion
+        complete_options()
+    } else if state.word_len > 0 and state.word[0] == '$' {
+        // Variable completion
+        complete_variables()
+    } else if state.word_len > 0 and state.word[0] == '~' {
+        // Home directory expansion
+        complete_tilde()
+    } else {
+        // File/directory completion
+        complete_files()
+    }
+
+    // Calculate common prefix
+    if state.result.count > 1 {
+        calculate_common_prefix()
+    } else if state.result.count == 1 {
+        state.result.common_prefix_len = basics.strlen(&state.result.completions[0])
+    }
+
+    return &state.result
+}
+
+fn find_current_word(): void {
+    // Find word boundaries
+    var start: u32 = state.cursor_pos
+    while start > 0 and not is_word_separator(state.input[start - 1]) {
+        start = start - 1
+    }
+
+    var end: u32 = state.cursor_pos
+    while end < state.input_len and not is_word_separator(state.input[end]) {
+        end = end + 1
+    }
+
+    state.word_start = start
+    state.word_end = end
+    state.word_len = end - start
+
+    // Copy word
+    basics.memcpy(&state.word, &state.input[start], state.word_len)
+    state.word[state.word_len] = 0
+}
+
+fn is_word_separator(c: u8): bool {
+    return c == ' ' or c == '\t' or c == '|' or c == '&' or
+           c == ';' or c == '<' or c == '>' or c == '(' or c == ')'
+}
+
+fn is_first_word(): bool {
+    var i: u32 = 0
+    while i < state.word_start {
+        if not is_word_separator(state.input[i]) and state.input[i] != 0 {
+            // Check if this is after a command separator
+            var j: u32 = i
+            while j < state.word_start {
+                if state.input[j] == '|' or state.input[j] == ';' or state.input[j] == '&' {
+                    return true
+                }
+                j = j + 1
+            }
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ============================================
+// Command Completion
+// ============================================
+
+fn complete_commands(): void {
+    // Add matching builtins
+    var i: u32 = 0
+    while i < builtin_commands.len {
+        if starts_with(builtin_commands[i], &state.word) {
+            add_completion(builtin_commands[i], COMPLETION_COMMAND)
+        }
+        i = i + 1
+    }
+
+    // Add matching PATH commands
+    if not path_cache_valid {
+        refresh_path_commands()
+    }
+
+    i = 0
+    while i < path_commands_count {
+        if starts_with(&path_commands_cache[i], &state.word) {
+            add_completion(&path_commands_cache[i], COMPLETION_COMMAND)
+        }
+        i = i + 1
+    }
+
+    // Also complete files if word contains /
+    if basics.strchr(&state.word, '/') != null {
+        complete_files()
+    }
+}
+
+// ============================================
+// File Completion
+// ============================================
+
+fn complete_files(): void {
+    var dir_path: [256]u8 = undefined
+    var file_prefix: [256]u8 = undefined
+
+    // Split into directory and filename
+    let last_slash = basics.strrchr(&state.word, '/')
+
+    if last_slash != null {
+        let slash_pos = (last_slash as u64 - &state.word as u64) as u32
+        basics.memcpy(&dir_path, &state.word, slash_pos + 1)
+        dir_path[slash_pos + 1] = 0
+        basics.strcpy(&file_prefix, last_slash + 1)
+    } else {
+        basics.strcpy(&dir_path, ".")
+        basics.strcpy(&file_prefix, &state.word)
+    }
+
+    // Handle tilde
+    if dir_path[0] == '~' {
+        expand_tilde(&dir_path)
+    }
+
+    // Open directory
+    let dir = fs.opendir(&dir_path)
+    if dir == null {
+        return
+    }
+
+    let prefix_len = basics.strlen(&file_prefix)
+
+    var entry: fs.DirEntry = undefined
+    while fs.readdir(dir, &entry) {
+        // Skip . and .. unless explicitly typed
+        if entry.name[0] == '.' {
+            if prefix_len == 0 or file_prefix[0] != '.' {
+                continue
+            }
+        }
+
+        // Check prefix match
+        if starts_with(&entry.name, &file_prefix) {
+            // Build full path for completion
+            var completion: [256]u8 = undefined
+
+            if last_slash != null {
+                basics.strcpy(&completion, &dir_path)
+                basics.strcat(&completion, &entry.name)
+            } else {
+                basics.strcpy(&completion, &entry.name)
+            }
+
+            // Check if directory - add trailing slash
+            var stat: fs.Stat = undefined
+            var full_path: [512]u8 = undefined
+            basics.strcpy(&full_path, &dir_path)
+            if dir_path[basics.strlen(&dir_path) - 1] != '/' {
+                basics.strcat(&full_path, "/")
+            }
+            basics.strcat(&full_path, &entry.name)
+
+            if fs.stat(&full_path, &stat) == 0 {
+                if fs.S_ISDIR(stat.st_mode) {
+                    basics.strcat(&completion, "/")
+                    add_completion(&completion, COMPLETION_DIRECTORY)
+                } else {
+                    add_completion(&completion, COMPLETION_FILE)
+                }
+            }
+        }
+    }
+
+    fs.closedir(dir)
+}
+
+// ============================================
+// Variable Completion
+// ============================================
+
+fn complete_variables(): void {
+    // Get variable name without $
+    var var_prefix: [256]u8 = undefined
+    basics.strcpy(&var_prefix, &state.word[1])
+
+    // Common environment variables
+    const common_vars = [_]*const u8 {
+        "HOME", "PATH", "USER", "SHELL", "PWD", "OLDPWD",
+        "TERM", "LANG", "EDITOR", "VISUAL", "PAGER",
+        "LD_LIBRARY_PATH", "PS1", "PS2", "HISTFILE", "HISTSIZE",
+    }
+
+    var i: u32 = 0
+    while i < common_vars.len {
+        if starts_with(common_vars[i], &var_prefix) {
+            var completion: [256]u8 = undefined
+            completion[0] = '$'
+            basics.strcpy(&completion[1], common_vars[i])
+            add_completion(&completion, COMPLETION_VARIABLE)
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// Option Completion
+// ============================================
+
+fn complete_options(): void {
+    // Get command name
+    var cmd: [64]u8 = undefined
+    var i: u32 = 0
+
+    while i < state.word_start and state.input[i] == ' ' {
+        i = i + 1
+    }
+
+    var cmd_start = i
+    while i < state.word_start and state.input[i] != ' ' {
+        i = i + 1
+    }
+
+    basics.memcpy(&cmd, &state.input[cmd_start], i - cmd_start)
+    cmd[i - cmd_start] = 0
+
+    // Common options (generic)
+    const common_opts = [_]*const u8 {
+        "--help", "--version", "-h", "-v", "-V",
+        "--verbose", "--quiet", "-q",
+    }
+
+    i = 0
+    while i < common_opts.len {
+        if starts_with(common_opts[i], &state.word) {
+            add_completion(common_opts[i], COMPLETION_OPTION)
+        }
+        i = i + 1
+    }
+
+    // Command-specific options would be added here
+    add_command_specific_options(&cmd)
+}
+
+fn add_command_specific_options(cmd: *[64]u8): void {
+    // ls options
+    if basics.strcmp(cmd, "ls") == 0 {
+        const ls_opts = [_]*const u8 { "-l", "-a", "-la", "-lh", "-R", "--color", "-1" }
+        add_options_if_matching(&ls_opts)
+    }
+    // cp options
+    else if basics.strcmp(cmd, "cp") == 0 {
+        const cp_opts = [_]*const u8 { "-r", "-R", "-i", "-f", "-v", "-p", "--preserve" }
+        add_options_if_matching(&cp_opts)
+    }
+    // grep options
+    else if basics.strcmp(cmd, "grep") == 0 {
+        const grep_opts = [_]*const u8 { "-r", "-i", "-n", "-v", "-l", "-E", "-P", "--color" }
+        add_options_if_matching(&grep_opts)
+    }
+    // git options
+    else if basics.strcmp(cmd, "git") == 0 {
+        const git_opts = [_]*const u8 { "add", "commit", "push", "pull", "status", "log", "diff", "branch", "checkout" }
+        add_options_if_matching(&git_opts)
+    }
+}
+
+fn add_options_if_matching(opts: *[]*const u8): void {
+    var i: u32 = 0
+    while i < opts.len {
+        if starts_with(opts[i], &state.word) {
+            add_completion(opts[i], COMPLETION_OPTION)
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// Tilde Completion
+// ============================================
+
+fn complete_tilde(): void {
+    if state.word_len == 1 {
+        // Just ~ - complete to home
+        let home = basics.getenv("HOME")
+        if home != null {
+            add_completion(home, COMPLETION_DIRECTORY)
+        }
+    } else {
+        // ~user - complete usernames
+        complete_usernames()
+    }
+}
+
+fn complete_usernames(): void {
+    // Would read /etc/passwd
+    // For now, just complete current user
+    let user = basics.getenv("USER")
+    if user != null {
+        var completion: [256]u8 = undefined
+        completion[0] = '~'
+        basics.strcpy(&completion[1], user)
+        if starts_with(&completion, &state.word) {
+            add_completion(&completion, COMPLETION_USERNAME)
+        }
+    }
+}
+
+fn expand_tilde(path: *[256]u8): void {
+    if path[0] != '~' {
+        return
+    }
+
+    let home = basics.getenv("HOME")
+    if home == null {
+        return
+    }
+
+    var expanded: [256]u8 = undefined
+    basics.strcpy(&expanded, home)
+    basics.strcat(&expanded, &path[1])
+    basics.strcpy(path, &expanded)
+}
+
+// ============================================
+// Helpers
+// ============================================
+
+fn starts_with(str: *const u8, prefix: *const u8): bool {
+    var i: u32 = 0
+    while prefix[i] != 0 {
+        if str[i] != prefix[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn add_completion(text: *const u8, comp_type: u8): void {
+    if state.result.count >= MAX_COMPLETIONS {
+        return
+    }
+
+    // Check for duplicates
+    var i: u32 = 0
+    while i < state.result.count {
+        if basics.strcmp(&state.result.completions[i], text) == 0 {
+            return
+        }
+        i = i + 1
+    }
+
+    basics.strcpy(&state.result.completions[state.result.count], text)
+    state.result.types[state.result.count] = comp_type
+    state.result.count = state.result.count + 1
+}
+
+fn calculate_common_prefix(): void {
+    if state.result.count == 0 {
+        state.result.common_prefix_len = 0
+        return
+    }
+
+    let first = &state.result.completions[0]
+    var prefix_len: u32 = basics.strlen(first)
+
+    var i: u32 = 1
+    while i < state.result.count {
+        var j: u32 = 0
+        while j < prefix_len and state.result.completions[i][j] == first[j] {
+            j = j + 1
+        }
+        prefix_len = j
+        i = i + 1
+    }
+
+    state.result.common_prefix_len = prefix_len
+}
+
+// ============================================
+// Cycling Interface
+// ============================================
+
+export fn complete_next(): *u8 {
+    if state.result.count == 0 {
+        return null
+    }
+
+    if not state.cycling {
+        // Save original word
+        basics.strcpy(&state.original_word, &state.word)
+        state.original_len = state.word_len
+        state.cycling = true
+        state.result_index = 0
+    } else {
+        state.result_index = (state.result_index + 1) % state.result.count
+    }
+
+    return &state.result.completions[state.result_index]
+}
+
+export fn complete_prev(): *u8 {
+    if state.result.count == 0 or not state.cycling {
+        return null
+    }
+
+    if state.result_index == 0 {
+        state.result_index = state.result.count - 1
+    } else {
+        state.result_index = state.result_index - 1
+    }
+
+    return &state.result.completions[state.result_index]
+}
+
+export fn complete_accept(): void {
+    state.cycling = false
+}
+
+export fn complete_cancel(): *u8 {
+    state.cycling = false
+    return &state.original_word
+}
+
+export fn get_completion_count(): u32 {
+    return state.result.count
+}
+
+export fn get_common_prefix(): *u8 {
+    if state.result.count == 0 {
+        return null
+    }
+
+    // Return the common prefix
+    var prefix: [256]u8 = undefined
+    basics.memcpy(&prefix, &state.result.completions[0], state.result.common_prefix_len)
+    prefix[state.result.common_prefix_len] = 0
+    return &prefix
+}

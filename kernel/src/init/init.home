@@ -1,0 +1,829 @@
+// HomeOS Init System
+// systemd-inspired initialization with service management
+
+const basics = @import("basics")
+const fs = @import("fs/vfs")
+const process = @import("sched/process")
+const sched = @import("sched/scheduler")
+
+// ============================================
+// Service States
+// ============================================
+
+const SERVICE_STOPPED: u8 = 0
+const SERVICE_STARTING: u8 = 1
+const SERVICE_RUNNING: u8 = 2
+const SERVICE_STOPPING: u8 = 3
+const SERVICE_FAILED: u8 = 4
+const SERVICE_RESTARTING: u8 = 5
+
+// ============================================
+// Service Types
+// ============================================
+
+const TYPE_SIMPLE: u8 = 0       // Main process is the service
+const TYPE_FORKING: u8 = 1      // Service forks (traditional daemon)
+const TYPE_ONESHOT: u8 = 2      // Runs once then exits
+const TYPE_NOTIFY: u8 = 3       // Notifies when ready
+const TYPE_IDLE: u8 = 4         // Runs when system is idle
+
+// ============================================
+// Restart Policies
+// ============================================
+
+const RESTART_NO: u8 = 0
+const RESTART_ON_SUCCESS: u8 = 1
+const RESTART_ON_FAILURE: u8 = 2
+const RESTART_ON_ABNORMAL: u8 = 3
+const RESTART_ON_ABORT: u8 = 4
+const RESTART_ALWAYS: u8 = 5
+
+// ============================================
+// Targets (Runlevels)
+// ============================================
+
+const TARGET_POWEROFF: u8 = 0
+const TARGET_RESCUE: u8 = 1
+const TARGET_MULTI_USER: u8 = 2
+const TARGET_GRAPHICAL: u8 = 3
+const TARGET_REBOOT: u8 = 4
+
+// ============================================
+// Service Configuration
+// ============================================
+
+const MAX_DEPS: u32 = 16
+const MAX_ENV_VARS: u32 = 32
+const MAX_NAME_LEN: u32 = 64
+const MAX_PATH_LEN: u32 = 256
+
+struct ServiceConfig {
+    // Identity
+    name: [MAX_NAME_LEN]u8
+    description: [128]u8
+
+    // Execution
+    exec_start: [MAX_PATH_LEN]u8
+    exec_stop: [MAX_PATH_LEN]u8
+    exec_reload: [MAX_PATH_LEN]u8
+    working_dir: [MAX_PATH_LEN]u8
+    user: [32]u8
+    group: [32]u8
+
+    // Type and behavior
+    service_type: u8
+    restart_policy: u8
+    restart_sec: u32              // Seconds before restart
+
+    // Timeouts
+    timeout_start_sec: u32
+    timeout_stop_sec: u32
+
+    // Dependencies
+    requires: [MAX_DEPS][MAX_NAME_LEN]u8
+    requires_count: u8
+    wants: [MAX_DEPS][MAX_NAME_LEN]u8
+    wants_count: u8
+    after: [MAX_DEPS][MAX_NAME_LEN]u8
+    after_count: u8
+    before: [MAX_DEPS][MAX_NAME_LEN]u8
+    before_count: u8
+
+    // Environment
+    env_vars: [MAX_ENV_VARS][128]u8
+    env_count: u8
+
+    // Target
+    wanted_by: u8
+}
+
+// ============================================
+// Service Runtime State
+// ============================================
+
+struct Service {
+    config: ServiceConfig
+    state: u8
+    pid: i32
+    main_pid: i32
+
+    // Timing
+    start_time: u64
+    stop_time: u64
+    runtime: u64
+
+    // Restart tracking
+    restart_count: u32
+    last_restart: u64
+
+    // Exit info
+    exit_code: i32
+    exit_signal: i32
+
+    // Flags
+    enabled: bool
+    masked: bool
+}
+
+// ============================================
+// Init State
+// ============================================
+
+const MAX_SERVICES: u32 = 128
+
+struct InitState {
+    services: [MAX_SERVICES]Service
+    service_count: u32
+
+    current_target: u8
+    default_target: u8
+
+    // Boot tracking
+    boot_time: u64
+    services_started: u32
+    services_failed: u32
+
+    // System state
+    system_running: bool
+    shutting_down: bool
+}
+
+var init_state: InitState = undefined
+var init_initialized: bool = false
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn init_start(): void {
+    basics.print("[INIT] HomeOS Init System starting\n")
+
+    init_state.service_count = 0
+    init_state.current_target = TARGET_RESCUE
+    init_state.default_target = TARGET_MULTI_USER
+    init_state.boot_time = basics.get_timestamp()
+    init_state.services_started = 0
+    init_state.services_failed = 0
+    init_state.system_running = false
+    init_state.shutting_down = false
+
+    init_initialized = true
+
+    // Load service files
+    load_services()
+
+    // Determine default target
+    determine_default_target()
+
+    // Start services for default target
+    reach_target(init_state.default_target)
+
+    init_state.system_running = true
+
+    basics.print("[INIT] System startup complete\n")
+    basics.print("[INIT] Started ")
+    basics.print_u32(init_state.services_started)
+    basics.print(" services, ")
+    basics.print_u32(init_state.services_failed)
+    basics.print(" failed\n")
+}
+
+fn load_services(): void {
+    // Load from /etc/homeos/services/
+    let dir = fs.opendir("/etc/homeos/services")
+    if dir == null {
+        // Try alternate location
+        load_builtin_services()
+        return
+    }
+
+    var entry: fs.DirEntry = undefined
+    while fs.readdir(dir, &entry) {
+        if has_suffix(&entry.name, ".service") {
+            var path: [256]u8 = undefined
+            basics.strcpy(&path, "/etc/homeos/services/")
+            basics.strcat(&path, &entry.name)
+            load_service_file(&path)
+        }
+    }
+
+    fs.closedir(dir)
+}
+
+fn load_builtin_services(): void {
+    // Essential system services
+    add_builtin_service("getty", "/sbin/getty", TYPE_SIMPLE, TARGET_MULTI_USER)
+    add_builtin_service("syslog", "/sbin/syslogd", TYPE_FORKING, TARGET_MULTI_USER)
+    add_builtin_service("network", "/sbin/networkd", TYPE_NOTIFY, TARGET_MULTI_USER)
+    add_builtin_service("dbus", "/sbin/dbus-daemon", TYPE_FORKING, TARGET_MULTI_USER)
+    add_builtin_service("cron", "/sbin/crond", TYPE_FORKING, TARGET_MULTI_USER)
+
+    // Graphical services
+    add_builtin_service("display-manager", "/sbin/display-manager", TYPE_SIMPLE, TARGET_GRAPHICAL)
+}
+
+fn add_builtin_service(name: *const u8, exec: *const u8, svc_type: u8, target: u8): void {
+    if init_state.service_count >= MAX_SERVICES {
+        return
+    }
+
+    let svc = &init_state.services[init_state.service_count]
+
+    basics.strcpy(&svc.config.name, name)
+    basics.strcpy(&svc.config.exec_start, exec)
+    svc.config.service_type = svc_type
+    svc.config.restart_policy = RESTART_ON_FAILURE
+    svc.config.restart_sec = 5
+    svc.config.timeout_start_sec = 90
+    svc.config.timeout_stop_sec = 90
+    svc.config.wanted_by = target
+    svc.config.requires_count = 0
+    svc.config.wants_count = 0
+    svc.config.after_count = 0
+    svc.config.before_count = 0
+    svc.config.env_count = 0
+
+    svc.state = SERVICE_STOPPED
+    svc.pid = -1
+    svc.main_pid = -1
+    svc.enabled = true
+    svc.masked = false
+    svc.restart_count = 0
+
+    init_state.service_count = init_state.service_count + 1
+}
+
+fn load_service_file(path: *u8): void {
+    let file = fs.open(path, fs.O_RDONLY)
+    if file < 0 {
+        return
+    }
+
+    if init_state.service_count >= MAX_SERVICES {
+        fs.close(file)
+        return
+    }
+
+    let svc = &init_state.services[init_state.service_count]
+
+    // Parse service file (simplified INI-like format)
+    var buf: [4096]u8 = undefined
+    let bytes_read = fs.read(file, &buf, 4095)
+    fs.close(file)
+
+    if bytes_read <= 0 {
+        return
+    }
+
+    buf[bytes_read] = 0
+    parse_service_config(svc, &buf)
+
+    svc.state = SERVICE_STOPPED
+    svc.pid = -1
+    svc.main_pid = -1
+    svc.enabled = true
+    svc.masked = false
+    svc.restart_count = 0
+
+    init_state.service_count = init_state.service_count + 1
+}
+
+fn parse_service_config(svc: *Service, content: *u8): void {
+    // Default values
+    svc.config.service_type = TYPE_SIMPLE
+    svc.config.restart_policy = RESTART_NO
+    svc.config.restart_sec = 1
+    svc.config.timeout_start_sec = 90
+    svc.config.timeout_stop_sec = 90
+    svc.config.requires_count = 0
+    svc.config.wants_count = 0
+    svc.config.after_count = 0
+    svc.config.before_count = 0
+    svc.config.env_count = 0
+
+    // Parse line by line
+    var line_start: u32 = 0
+    var i: u32 = 0
+
+    while content[i] != 0 {
+        if content[i] == '\n' or content[i + 1] == 0 {
+            let line_end = if content[i] == '\n' { i } else { i + 1 }
+
+            // Parse line
+            var line: [256]u8 = undefined
+            let line_len = line_end - line_start
+            if line_len > 0 and line_len < 256 {
+                basics.memcpy(&line, &content[line_start], line_len)
+                line[line_len] = 0
+                parse_config_line(svc, &line)
+            }
+
+            line_start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+fn parse_config_line(svc: *Service, line: *u8): void {
+    // Skip comments and empty lines
+    if line[0] == '#' or line[0] == ';' or line[0] == 0 {
+        return
+    }
+
+    // Skip section headers
+    if line[0] == '[' {
+        return
+    }
+
+    // Find = sign
+    var eq_pos: u32 = 0
+    while line[eq_pos] != 0 and line[eq_pos] != '=' {
+        eq_pos = eq_pos + 1
+    }
+
+    if line[eq_pos] != '=' {
+        return
+    }
+
+    // Extract key and value
+    var key: [64]u8 = undefined
+    var value: [256]u8 = undefined
+
+    basics.memcpy(&key, line, eq_pos)
+    key[eq_pos] = 0
+    trim_whitespace(&key)
+
+    basics.strcpy(&value, &line[eq_pos + 1])
+    trim_whitespace(&value)
+
+    // Apply configuration
+    if basics.strcmp(&key, "Description") == 0 {
+        basics.strcpy(&svc.config.description, &value)
+    } else if basics.strcmp(&key, "ExecStart") == 0 {
+        basics.strcpy(&svc.config.exec_start, &value)
+    } else if basics.strcmp(&key, "ExecStop") == 0 {
+        basics.strcpy(&svc.config.exec_stop, &value)
+    } else if basics.strcmp(&key, "ExecReload") == 0 {
+        basics.strcpy(&svc.config.exec_reload, &value)
+    } else if basics.strcmp(&key, "WorkingDirectory") == 0 {
+        basics.strcpy(&svc.config.working_dir, &value)
+    } else if basics.strcmp(&key, "User") == 0 {
+        basics.strcpy(&svc.config.user, &value)
+    } else if basics.strcmp(&key, "Group") == 0 {
+        basics.strcpy(&svc.config.group, &value)
+    } else if basics.strcmp(&key, "Type") == 0 {
+        svc.config.service_type = parse_service_type(&value)
+    } else if basics.strcmp(&key, "Restart") == 0 {
+        svc.config.restart_policy = parse_restart_policy(&value)
+    } else if basics.strcmp(&key, "RestartSec") == 0 {
+        svc.config.restart_sec = basics.atoi(&value)
+    } else if basics.strcmp(&key, "Requires") == 0 {
+        add_dependency(&svc.config.requires, &svc.config.requires_count, &value)
+    } else if basics.strcmp(&key, "Wants") == 0 {
+        add_dependency(&svc.config.wants, &svc.config.wants_count, &value)
+    } else if basics.strcmp(&key, "After") == 0 {
+        add_dependency(&svc.config.after, &svc.config.after_count, &value)
+    } else if basics.strcmp(&key, "Before") == 0 {
+        add_dependency(&svc.config.before, &svc.config.before_count, &value)
+    } else if basics.strcmp(&key, "WantedBy") == 0 {
+        svc.config.wanted_by = parse_target(&value)
+    } else if basics.strcmp(&key, "Environment") == 0 {
+        add_env_var(svc, &value)
+    }
+}
+
+fn parse_service_type(value: *u8): u8 {
+    if basics.strcmp(value, "simple") == 0 { return TYPE_SIMPLE }
+    if basics.strcmp(value, "forking") == 0 { return TYPE_FORKING }
+    if basics.strcmp(value, "oneshot") == 0 { return TYPE_ONESHOT }
+    if basics.strcmp(value, "notify") == 0 { return TYPE_NOTIFY }
+    if basics.strcmp(value, "idle") == 0 { return TYPE_IDLE }
+    return TYPE_SIMPLE
+}
+
+fn parse_restart_policy(value: *u8): u8 {
+    if basics.strcmp(value, "no") == 0 { return RESTART_NO }
+    if basics.strcmp(value, "on-success") == 0 { return RESTART_ON_SUCCESS }
+    if basics.strcmp(value, "on-failure") == 0 { return RESTART_ON_FAILURE }
+    if basics.strcmp(value, "on-abnormal") == 0 { return RESTART_ON_ABNORMAL }
+    if basics.strcmp(value, "on-abort") == 0 { return RESTART_ON_ABORT }
+    if basics.strcmp(value, "always") == 0 { return RESTART_ALWAYS }
+    return RESTART_NO
+}
+
+fn parse_target(value: *u8): u8 {
+    if basics.strcmp(value, "poweroff.target") == 0 { return TARGET_POWEROFF }
+    if basics.strcmp(value, "rescue.target") == 0 { return TARGET_RESCUE }
+    if basics.strcmp(value, "multi-user.target") == 0 { return TARGET_MULTI_USER }
+    if basics.strcmp(value, "graphical.target") == 0 { return TARGET_GRAPHICAL }
+    if basics.strcmp(value, "reboot.target") == 0 { return TARGET_REBOOT }
+    return TARGET_MULTI_USER
+}
+
+fn add_dependency(deps: *[MAX_DEPS][MAX_NAME_LEN]u8, count: *u8, value: *u8): void {
+    if *count >= MAX_DEPS as u8 {
+        return
+    }
+    basics.strcpy(&deps[*count], value)
+    *count = *count + 1
+}
+
+fn add_env_var(svc: *Service, value: *u8): void {
+    if svc.config.env_count >= MAX_ENV_VARS as u8 {
+        return
+    }
+    basics.strcpy(&svc.config.env_vars[svc.config.env_count], value)
+    svc.config.env_count = svc.config.env_count + 1
+}
+
+fn trim_whitespace(str: *u8): void {
+    // Trim leading
+    var start: u32 = 0
+    while str[start] == ' ' or str[start] == '\t' {
+        start = start + 1
+    }
+
+    if start > 0 {
+        var i: u32 = 0
+        while str[start + i] != 0 {
+            str[i] = str[start + i]
+            i = i + 1
+        }
+        str[i] = 0
+    }
+
+    // Trim trailing
+    var len = basics.strlen(str)
+    while len > 0 and (str[len - 1] == ' ' or str[len - 1] == '\t' or str[len - 1] == '\n' or str[len - 1] == '\r') {
+        len = len - 1
+        str[len] = 0
+    }
+}
+
+fn has_suffix(str: *const u8, suffix: *const u8): bool {
+    let str_len = basics.strlen(str)
+    let suffix_len = basics.strlen(suffix)
+
+    if suffix_len > str_len {
+        return false
+    }
+
+    return basics.strcmp(str + str_len - suffix_len, suffix) == 0
+}
+
+fn determine_default_target(): void {
+    // Check kernel command line for target
+    // Default to multi-user unless graphics requested
+    init_state.default_target = TARGET_MULTI_USER
+}
+
+// ============================================
+// Target Management
+// ============================================
+
+fn reach_target(target: u8): void {
+    basics.print("[INIT] Reaching target ")
+    basics.print(get_target_name(target))
+    basics.print("\n")
+
+    init_state.current_target = target
+
+    // Start services wanted by this target
+    var i: u32 = 0
+    while i < init_state.service_count {
+        let svc = &init_state.services[i]
+
+        if svc.config.wanted_by <= target and svc.enabled and not svc.masked {
+            if svc.state == SERVICE_STOPPED {
+                start_service(svc)
+            }
+        }
+
+        i = i + 1
+    }
+}
+
+fn get_target_name(target: u8): *const u8 {
+    return switch target {
+        TARGET_POWEROFF => "poweroff.target",
+        TARGET_RESCUE => "rescue.target",
+        TARGET_MULTI_USER => "multi-user.target",
+        TARGET_GRAPHICAL => "graphical.target",
+        TARGET_REBOOT => "reboot.target",
+        else => "unknown.target"
+    }
+}
+
+// ============================================
+// Service Control
+// ============================================
+
+fn start_service(svc: *Service): bool {
+    if svc.state == SERVICE_RUNNING {
+        return true
+    }
+
+    // Check dependencies
+    if not check_dependencies(svc) {
+        return false
+    }
+
+    basics.print("[INIT] Starting ")
+    basics.print(&svc.config.name)
+    basics.print("...\n")
+
+    svc.state = SERVICE_STARTING
+    svc.start_time = basics.get_timestamp()
+
+    // Fork and exec
+    let pid = process.fork()
+
+    if pid == 0 {
+        // Child process
+        setup_service_environment(svc)
+        process.exec(&svc.config.exec_start, null, null)
+        process.exit(127)
+    } else if pid > 0 {
+        svc.pid = pid
+        svc.main_pid = pid
+
+        if svc.config.service_type == TYPE_SIMPLE or svc.config.service_type == TYPE_NOTIFY {
+            svc.state = SERVICE_RUNNING
+            init_state.services_started = init_state.services_started + 1
+            return true
+        } else if svc.config.service_type == TYPE_FORKING {
+            // Wait for process to daemonize
+            var status: i32 = 0
+            process.waitpid(pid, &status, 0)
+
+            if process.WIFEXITED(status) and process.WEXITSTATUS(status) == 0 {
+                svc.state = SERVICE_RUNNING
+                init_state.services_started = init_state.services_started + 1
+                return true
+            } else {
+                svc.state = SERVICE_FAILED
+                svc.exit_code = process.WEXITSTATUS(status)
+                init_state.services_failed = init_state.services_failed + 1
+                return false
+            }
+        } else if svc.config.service_type == TYPE_ONESHOT {
+            var status: i32 = 0
+            process.waitpid(pid, &status, 0)
+
+            if process.WIFEXITED(status) and process.WEXITSTATUS(status) == 0 {
+                svc.state = SERVICE_STOPPED  // Oneshot stays stopped after success
+                init_state.services_started = init_state.services_started + 1
+                return true
+            } else {
+                svc.state = SERVICE_FAILED
+                init_state.services_failed = init_state.services_failed + 1
+                return false
+            }
+        }
+    } else {
+        svc.state = SERVICE_FAILED
+        init_state.services_failed = init_state.services_failed + 1
+        return false
+    }
+
+    return true
+}
+
+fn stop_service(svc: *Service): bool {
+    if svc.state != SERVICE_RUNNING {
+        return true
+    }
+
+    basics.print("[INIT] Stopping ")
+    basics.print(&svc.config.name)
+    basics.print("...\n")
+
+    svc.state = SERVICE_STOPPING
+    svc.stop_time = basics.get_timestamp()
+
+    // Try graceful stop first
+    if svc.config.exec_stop[0] != 0 {
+        let pid = process.fork()
+        if pid == 0 {
+            process.exec(&svc.config.exec_stop, null, null)
+            process.exit(0)
+        } else if pid > 0 {
+            var status: i32 = 0
+            process.waitpid(pid, &status, 0)
+        }
+    } else if svc.main_pid > 0 {
+        // Send SIGTERM
+        process.kill(svc.main_pid, 15)  // SIGTERM
+    }
+
+    // Wait for process to exit
+    if svc.main_pid > 0 {
+        var status: i32 = 0
+        // Would use waitpid with timeout
+        process.waitpid(svc.main_pid, &status, 0)
+    }
+
+    svc.state = SERVICE_STOPPED
+    svc.runtime = svc.stop_time - svc.start_time
+    return true
+}
+
+fn restart_service(svc: *Service): bool {
+    stop_service(svc)
+    return start_service(svc)
+}
+
+fn reload_service(svc: *Service): bool {
+    if svc.state != SERVICE_RUNNING {
+        return false
+    }
+
+    if svc.config.exec_reload[0] != 0 {
+        let pid = process.fork()
+        if pid == 0 {
+            process.exec(&svc.config.exec_reload, null, null)
+            process.exit(0)
+        } else if pid > 0 {
+            var status: i32 = 0
+            process.waitpid(pid, &status, 0)
+            return process.WIFEXITED(status) and process.WEXITSTATUS(status) == 0
+        }
+    } else if svc.main_pid > 0 {
+        // Send SIGHUP
+        process.kill(svc.main_pid, 1)  // SIGHUP
+        return true
+    }
+
+    return false
+}
+
+fn check_dependencies(svc: *Service): bool {
+    // Check Requires dependencies
+    var i: u8 = 0
+    while i < svc.config.requires_count {
+        let dep = find_service(&svc.config.requires[i])
+        if dep == null or dep.state != SERVICE_RUNNING {
+            // Try to start required service
+            if dep != null and not start_service(dep) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+
+    // Check After dependencies (ordering only)
+    i = 0
+    while i < svc.config.after_count {
+        let dep = find_service(&svc.config.after[i])
+        if dep != null and dep.state == SERVICE_STARTING {
+            // Wait for it
+            while dep.state == SERVICE_STARTING {
+                sched.yield()
+            }
+        }
+        i = i + 1
+    }
+
+    return true
+}
+
+fn setup_service_environment(svc: *Service): void {
+    // Set working directory
+    if svc.config.working_dir[0] != 0 {
+        process.chdir(&svc.config.working_dir)
+    }
+
+    // Set environment variables
+    var i: u8 = 0
+    while i < svc.config.env_count {
+        process.putenv(&svc.config.env_vars[i])
+        i = i + 1
+    }
+
+    // Would also: set user/group, set resource limits, etc.
+}
+
+// ============================================
+// Service Lookup
+// ============================================
+
+fn find_service(name: *const u8): *Service {
+    var i: u32 = 0
+    while i < init_state.service_count {
+        if basics.strcmp(&init_state.services[i].config.name, name) == 0 {
+            return &init_state.services[i]
+        }
+        i = i + 1
+    }
+    return null
+}
+
+// ============================================
+// Public API
+// ============================================
+
+export fn service_start(name: *const u8): bool {
+    let svc = find_service(name)
+    if svc == null {
+        return false
+    }
+    return start_service(svc)
+}
+
+export fn service_stop(name: *const u8): bool {
+    let svc = find_service(name)
+    if svc == null {
+        return false
+    }
+    return stop_service(svc)
+}
+
+export fn service_restart(name: *const u8): bool {
+    let svc = find_service(name)
+    if svc == null {
+        return false
+    }
+    return restart_service(svc)
+}
+
+export fn service_reload(name: *const u8): bool {
+    let svc = find_service(name)
+    if svc == null {
+        return false
+    }
+    return reload_service(svc)
+}
+
+export fn service_status(name: *const u8): u8 {
+    let svc = find_service(name)
+    if svc == null {
+        return 255
+    }
+    return svc.state
+}
+
+export fn service_enable(name: *const u8): bool {
+    let svc = find_service(name)
+    if svc == null {
+        return false
+    }
+    svc.enabled = true
+    return true
+}
+
+export fn service_disable(name: *const u8): bool {
+    let svc = find_service(name)
+    if svc == null {
+        return false
+    }
+    svc.enabled = false
+    return true
+}
+
+export fn get_service_count(): u32 {
+    return init_state.service_count
+}
+
+export fn list_services(names: *[MAX_SERVICES][MAX_NAME_LEN]u8, states: *[MAX_SERVICES]u8): u32 {
+    var i: u32 = 0
+    while i < init_state.service_count {
+        basics.strcpy(&names[i], &init_state.services[i].config.name)
+        states[i] = init_state.services[i].state
+        i = i + 1
+    }
+    return init_state.service_count
+}
+
+// ============================================
+// System Control
+// ============================================
+
+export fn system_poweroff(): void {
+    init_state.shutting_down = true
+    reach_target(TARGET_POWEROFF)
+
+    // Stop all services in reverse order
+    var i: i32 = init_state.service_count as i32 - 1
+    while i >= 0 {
+        stop_service(&init_state.services[i as u32])
+        i = i - 1
+    }
+
+    basics.print("[INIT] System powering off\n")
+    // Would call ACPI poweroff
+}
+
+export fn system_reboot(): void {
+    init_state.shutting_down = true
+    reach_target(TARGET_REBOOT)
+
+    // Stop all services
+    var i: i32 = init_state.service_count as i32 - 1
+    while i >= 0 {
+        stop_service(&init_state.services[i as u32])
+        i = i - 1
+    }
+
+    basics.print("[INIT] System rebooting\n")
+    // Would call hardware reboot
+}

@@ -1,0 +1,627 @@
+// HomeOS Read-Ahead and Write-Behind Caching
+// Predictive I/O optimization for filesystems
+
+const basics = @import("basics")
+const vfs = @import("fs/vfs")
+const block = @import("drivers/block")
+const mm = @import("mm/vmm")
+
+// ============================================
+// Read-Ahead Configuration
+// ============================================
+
+const DEFAULT_READAHEAD_PAGES: u32 = 32      // 128KB default
+const MAX_READAHEAD_PAGES: u32 = 256         // 1MB max
+const MIN_READAHEAD_PAGES: u32 = 4           // 16KB min
+const READAHEAD_ASYNC_TRIGGER: u32 = 8       // Trigger async when 8 pages left
+
+// ============================================
+// Write-Behind Configuration
+// ============================================
+
+const WRITEBACK_DIRTY_THRESHOLD: u32 = 20    // % of cache before writeback
+const WRITEBACK_DIRTY_RATIO: u32 = 40        // Max % dirty before blocking
+const WRITEBACK_INTERVAL_MS: u64 = 5000      // 5 second writeback interval
+const WRITEBACK_BATCH_SIZE: u32 = 64         // Pages per writeback batch
+
+// ============================================
+// Access Pattern Detection
+// ============================================
+
+const PATTERN_UNKNOWN: u8 = 0
+const PATTERN_SEQUENTIAL: u8 = 1
+const PATTERN_RANDOM: u8 = 2
+const PATTERN_STRIDED: u8 = 3
+
+struct AccessPattern {
+    pattern_type: u8
+    stride: i64              // For strided access
+    confidence: u8           // 0-100
+    last_offset: u64
+    last_size: u32
+    sequential_count: u32
+    random_count: u32
+}
+
+// ============================================
+// Read-Ahead Window
+// ============================================
+
+struct ReadAheadWindow {
+    start: u64               // Start page number
+    size: u32                // Current window size (pages)
+    async_size: u32          // Async read-ahead size
+    prev_pos: u64            // Previous read position
+    prev_read: bool          // Was previous I/O a read?
+
+    // Statistics
+    hits: u64
+    misses: u64
+
+    // Pattern
+    pattern: AccessPattern
+}
+
+// ============================================
+// Read-Ahead State per File
+// ============================================
+
+struct FileReadAhead {
+    inode: u64
+    window: ReadAheadWindow
+
+    // Pending read-ahead
+    pending_start: u64
+    pending_pages: u32
+    pending_async: bool
+
+    // Configuration
+    max_pages: u32
+    enabled: bool
+}
+
+// ============================================
+// Write-Behind Buffer Entry
+// ============================================
+
+const DIRTY_FLAG: u8 = 0x01
+const WRITEBACK_FLAG: u8 = 0x02
+const LOCKED_FLAG: u8 = 0x04
+
+struct DirtyPage {
+    inode: u64
+    page_num: u64
+    data: *u8
+    flags: u8
+    dirty_time: u64
+
+    next: *DirtyPage
+    prev: *DirtyPage
+}
+
+// ============================================
+// Write-Behind Manager
+// ============================================
+
+struct WriteBackManager {
+    // Dirty page list (LRU ordered)
+    dirty_head: *DirtyPage
+    dirty_tail: *DirtyPage
+    dirty_count: u32
+
+    // Per-inode dirty tracking
+    inode_dirty_counts: [1024]u32
+
+    // Configuration
+    threshold_pages: u32
+    max_dirty_pages: u32
+    writeback_running: bool
+
+    // Statistics
+    pages_written: u64
+    sync_writes: u64
+    async_writes: u64
+
+    // Timer
+    last_writeback: u64
+}
+
+// ============================================
+// Global State
+// ============================================
+
+const MAX_READAHEAD_FILES: u32 = 256
+var readahead_files: [MAX_READAHEAD_FILES]FileReadAhead = undefined
+var num_readahead_files: u32 = 0
+var readahead_lock: u32 = 0
+
+var writeback_mgr: WriteBackManager = undefined
+var writeback_initialized: bool = false
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn readahead_init(): void {
+    basics.print("[READAHEAD] Initializing read-ahead subsystem\n")
+
+    var i: u32 = 0
+    while i < MAX_READAHEAD_FILES {
+        readahead_files[i].inode = 0
+        readahead_files[i].enabled = false
+        i = i + 1
+    }
+
+    readahead_lock = 0
+    num_readahead_files = 0
+
+    basics.print("[READAHEAD] Read-ahead initialized\n")
+}
+
+export fn writeback_init(): void {
+    basics.print("[WRITEBACK] Initializing write-behind subsystem\n")
+
+    writeback_mgr.dirty_head = null
+    writeback_mgr.dirty_tail = null
+    writeback_mgr.dirty_count = 0
+    writeback_mgr.threshold_pages = (mm.get_total_pages() * WRITEBACK_DIRTY_THRESHOLD) / 100
+    writeback_mgr.max_dirty_pages = (mm.get_total_pages() * WRITEBACK_DIRTY_RATIO) / 100
+    writeback_mgr.writeback_running = false
+    writeback_mgr.pages_written = 0
+    writeback_mgr.sync_writes = 0
+    writeback_mgr.async_writes = 0
+    writeback_mgr.last_writeback = 0
+
+    var i: u32 = 0
+    while i < 1024 {
+        writeback_mgr.inode_dirty_counts[i] = 0
+        i = i + 1
+    }
+
+    writeback_initialized = true
+
+    basics.print("[WRITEBACK] Write-behind initialized\n")
+}
+
+// ============================================
+// Read-Ahead Control
+// ============================================
+
+export fn readahead_file_open(inode: u64): *FileReadAhead {
+    spin_lock(&readahead_lock)
+
+    // Check if already tracked
+    var i: u32 = 0
+    while i < num_readahead_files {
+        if readahead_files[i].inode == inode {
+            spin_unlock(&readahead_lock)
+            return &readahead_files[i]
+        }
+        i = i + 1
+    }
+
+    // Add new entry
+    if num_readahead_files >= MAX_READAHEAD_FILES {
+        spin_unlock(&readahead_lock)
+        return null
+    }
+
+    let ra = &readahead_files[num_readahead_files]
+    ra.inode = inode
+    ra.window.start = 0
+    ra.window.size = DEFAULT_READAHEAD_PAGES
+    ra.window.async_size = DEFAULT_READAHEAD_PAGES / 4
+    ra.window.prev_pos = 0
+    ra.window.prev_read = false
+    ra.window.hits = 0
+    ra.window.misses = 0
+    ra.window.pattern.pattern_type = PATTERN_UNKNOWN
+    ra.window.pattern.confidence = 0
+    ra.pending_start = 0
+    ra.pending_pages = 0
+    ra.pending_async = false
+    ra.max_pages = MAX_READAHEAD_PAGES
+    ra.enabled = true
+
+    num_readahead_files = num_readahead_files + 1
+
+    spin_unlock(&readahead_lock)
+    return ra
+}
+
+export fn readahead_file_close(inode: u64): void {
+    spin_lock(&readahead_lock)
+
+    var i: u32 = 0
+    while i < num_readahead_files {
+        if readahead_files[i].inode == inode {
+            // Remove by shifting
+            while i < num_readahead_files - 1 {
+                readahead_files[i] = readahead_files[i + 1]
+                i = i + 1
+            }
+            num_readahead_files = num_readahead_files - 1
+            break
+        }
+        i = i + 1
+    }
+
+    spin_unlock(&readahead_lock)
+}
+
+// ============================================
+// Read-Ahead Logic
+// ============================================
+
+export fn page_cache_readahead(
+    inode: u64,
+    offset: u64,
+    req_size: u32
+): void {
+    let ra = find_readahead(inode)
+    if ra == null or not ra.enabled {
+        return
+    }
+
+    let page_num = offset / 4096
+    let end_page = (offset + req_size as u64 + 4095) / 4096
+
+    // Update access pattern
+    update_access_pattern(ra, offset, req_size)
+
+    // Check if we hit the read-ahead window
+    if page_num >= ra.window.start and page_num < ra.window.start + ra.window.size as u64 {
+        ra.window.hits = ra.window.hits + 1
+
+        // Check if we need async read-ahead
+        let remaining = (ra.window.start + ra.window.size as u64) - page_num
+        if remaining <= READAHEAD_ASYNC_TRIGGER as u64 and not ra.pending_async {
+            // Trigger async read-ahead
+            schedule_async_readahead(ra, ra.window.start + ra.window.size as u64)
+        }
+    } else {
+        ra.window.misses = ra.window.misses + 1
+
+        // Miss - need synchronous read-ahead
+        if ra.window.pattern.pattern_type == PATTERN_SEQUENTIAL {
+            // Grow window for sequential access
+            if ra.window.size < ra.max_pages {
+                ra.window.size = ra.window.size * 2
+                if ra.window.size > ra.max_pages {
+                    ra.window.size = ra.max_pages
+                }
+            }
+        } else if ra.window.pattern.pattern_type == PATTERN_RANDOM {
+            // Shrink window for random access
+            ra.window.size = MIN_READAHEAD_PAGES
+        }
+
+        // Start new read-ahead window
+        ra.window.start = page_num
+        schedule_sync_readahead(ra, page_num, ra.window.size)
+    }
+
+    ra.window.prev_pos = offset
+    ra.window.prev_read = true
+}
+
+fn update_access_pattern(ra: *FileReadAhead, offset: u64, size: u32): void {
+    let pattern = &ra.window.pattern
+
+    if pattern.last_offset == 0 {
+        pattern.last_offset = offset
+        pattern.last_size = size
+        return
+    }
+
+    let expected_sequential = pattern.last_offset + pattern.last_size as u64
+    let diff = if offset >= expected_sequential {
+        offset - expected_sequential
+    } else {
+        expected_sequential - offset
+    }
+
+    if diff == 0 {
+        // Sequential access
+        pattern.sequential_count = pattern.sequential_count + 1
+        pattern.random_count = 0
+
+        if pattern.sequential_count >= 3 {
+            pattern.pattern_type = PATTERN_SEQUENTIAL
+            pattern.confidence = if pattern.sequential_count > 10 { 100 } else { pattern.sequential_count as u8 * 10 }
+        }
+    } else if diff == pattern.stride as u64 or -diff as i64 == pattern.stride {
+        // Strided access
+        pattern.pattern_type = PATTERN_STRIDED
+        pattern.confidence = 80
+    } else {
+        // Random access
+        pattern.random_count = pattern.random_count + 1
+        pattern.sequential_count = 0
+
+        if pattern.random_count >= 3 {
+            pattern.pattern_type = PATTERN_RANDOM
+            pattern.confidence = if pattern.random_count > 10 { 100 } else { pattern.random_count as u8 * 10 }
+        }
+
+        // Update stride for potential strided pattern
+        pattern.stride = offset as i64 - pattern.last_offset as i64
+    }
+
+    pattern.last_offset = offset
+    pattern.last_size = size
+}
+
+fn schedule_sync_readahead(ra: *FileReadAhead, start: u64, pages: u32): void {
+    ra.pending_start = start
+    ra.pending_pages = pages
+    ra.pending_async = false
+
+    // Issue read requests
+    do_readahead(ra.inode, start, pages)
+}
+
+fn schedule_async_readahead(ra: *FileReadAhead, start: u64): void {
+    ra.pending_start = start
+    ra.pending_pages = ra.window.async_size
+    ra.pending_async = true
+
+    // Queue async I/O
+    do_readahead_async(ra.inode, start, ra.window.async_size)
+}
+
+fn do_readahead(inode: u64, start_page: u64, pages: u32): void {
+    // Read pages into page cache
+    var i: u32 = 0
+    while i < pages {
+        let page_offset = (start_page + i as u64) * 4096
+        vfs.read_page_into_cache(inode, page_offset)
+        i = i + 1
+    }
+}
+
+fn do_readahead_async(inode: u64, start_page: u64, pages: u32): void {
+    // Queue for background I/O
+    block.queue_read_pages(inode, start_page, pages)
+}
+
+fn find_readahead(inode: u64): *FileReadAhead {
+    var i: u32 = 0
+    while i < num_readahead_files {
+        if readahead_files[i].inode == inode {
+            return &readahead_files[i]
+        }
+        i = i + 1
+    }
+    return null
+}
+
+// ============================================
+// Write-Behind Logic
+// ============================================
+
+export fn mark_page_dirty(inode: u64, page_num: u64, data: *u8): void {
+    if not writeback_initialized {
+        return
+    }
+
+    // Check if we need to block for writeback
+    if writeback_mgr.dirty_count >= writeback_mgr.max_dirty_pages {
+        // Synchronous writeback
+        do_writeback_sync(WRITEBACK_BATCH_SIZE)
+    }
+
+    // Create dirty page entry
+    var page = basics.kmalloc(@sizeOf(DirtyPage)) as *DirtyPage
+    if page == null {
+        return
+    }
+
+    page.inode = inode
+    page.page_num = page_num
+    page.data = data
+    page.flags = DIRTY_FLAG
+    page.dirty_time = basics.get_timestamp()
+
+    // Add to tail (LRU)
+    page.next = null
+    page.prev = writeback_mgr.dirty_tail
+
+    if writeback_mgr.dirty_tail != null {
+        writeback_mgr.dirty_tail.next = page
+    } else {
+        writeback_mgr.dirty_head = page
+    }
+    writeback_mgr.dirty_tail = page
+
+    writeback_mgr.dirty_count = writeback_mgr.dirty_count + 1
+
+    // Update per-inode count
+    let hash = (inode % 1024) as u32
+    writeback_mgr.inode_dirty_counts[hash] = writeback_mgr.inode_dirty_counts[hash] + 1
+
+    // Check if we should start async writeback
+    if writeback_mgr.dirty_count >= writeback_mgr.threshold_pages and not writeback_mgr.writeback_running {
+        start_async_writeback()
+    }
+}
+
+export fn sync_dirty_pages(inode: u64): void {
+    if not writeback_initialized {
+        return
+    }
+
+    // Find and write all dirty pages for this inode
+    var page = writeback_mgr.dirty_head
+    while page != null {
+        let next = page.next
+
+        if page.inode == inode and (page.flags & DIRTY_FLAG) != 0 {
+            write_dirty_page(page)
+            remove_dirty_page(page)
+        }
+
+        page = next
+    }
+
+    writeback_mgr.sync_writes = writeback_mgr.sync_writes + 1
+}
+
+export fn sync_all_dirty(): void {
+    if not writeback_initialized {
+        return
+    }
+
+    while writeback_mgr.dirty_head != null {
+        let page = writeback_mgr.dirty_head
+        write_dirty_page(page)
+        remove_dirty_page(page)
+    }
+}
+
+fn start_async_writeback(): void {
+    writeback_mgr.writeback_running = true
+
+    // Would normally spawn a kernel thread
+    // For now, do inline writeback
+    do_writeback_async(WRITEBACK_BATCH_SIZE)
+
+    writeback_mgr.writeback_running = false
+}
+
+fn do_writeback_sync(max_pages: u32): void {
+    var written: u32 = 0
+
+    var page = writeback_mgr.dirty_head
+    while page != null and written < max_pages {
+        let next = page.next
+
+        if (page.flags & DIRTY_FLAG) != 0 and (page.flags & LOCKED_FLAG) == 0 {
+            write_dirty_page(page)
+            remove_dirty_page(page)
+            written = written + 1
+        }
+
+        page = next
+    }
+
+    writeback_mgr.sync_writes = writeback_mgr.sync_writes + 1
+}
+
+fn do_writeback_async(max_pages: u32): void {
+    var written: u32 = 0
+
+    // Write oldest dirty pages first
+    var page = writeback_mgr.dirty_head
+    while page != null and written < max_pages {
+        let next = page.next
+
+        if (page.flags & DIRTY_FLAG) != 0 and (page.flags & LOCKED_FLAG) == 0 {
+            write_dirty_page(page)
+            remove_dirty_page(page)
+            written = written + 1
+        }
+
+        page = next
+    }
+
+    writeback_mgr.async_writes = writeback_mgr.async_writes + 1
+    writeback_mgr.last_writeback = basics.get_timestamp()
+}
+
+fn write_dirty_page(page: *DirtyPage): void {
+    page.flags = page.flags | LOCKED_FLAG
+    page.flags = page.flags | WRITEBACK_FLAG
+
+    // Write to disk
+    vfs.write_page_from_cache(page.inode, page.page_num * 4096, page.data)
+
+    page.flags = page.flags & ~DIRTY_FLAG
+    page.flags = page.flags & ~WRITEBACK_FLAG
+    page.flags = page.flags & ~LOCKED_FLAG
+
+    writeback_mgr.pages_written = writeback_mgr.pages_written + 1
+}
+
+fn remove_dirty_page(page: *DirtyPage): void {
+    // Update links
+    if page.prev != null {
+        page.prev.next = page.next
+    } else {
+        writeback_mgr.dirty_head = page.next
+    }
+
+    if page.next != null {
+        page.next.prev = page.prev
+    } else {
+        writeback_mgr.dirty_tail = page.prev
+    }
+
+    // Update counts
+    writeback_mgr.dirty_count = writeback_mgr.dirty_count - 1
+
+    let hash = (page.inode % 1024) as u32
+    if writeback_mgr.inode_dirty_counts[hash] > 0 {
+        writeback_mgr.inode_dirty_counts[hash] = writeback_mgr.inode_dirty_counts[hash] - 1
+    }
+
+    basics.kfree(page)
+}
+
+// ============================================
+// Timer Callback
+// ============================================
+
+export fn writeback_timer_tick(): void {
+    if not writeback_initialized {
+        return
+    }
+
+    let now = basics.get_timestamp()
+    let elapsed = now - writeback_mgr.last_writeback
+
+    // Periodic writeback every 5 seconds
+    if elapsed >= WRITEBACK_INTERVAL_MS * 1000000 {
+        if writeback_mgr.dirty_count > 0 and not writeback_mgr.writeback_running {
+            start_async_writeback()
+        }
+    }
+}
+
+// ============================================
+// Statistics
+// ============================================
+
+export fn get_readahead_stats(hits: *u64, misses: *u64): void {
+    var total_hits: u64 = 0
+    var total_misses: u64 = 0
+
+    var i: u32 = 0
+    while i < num_readahead_files {
+        total_hits = total_hits + readahead_files[i].window.hits
+        total_misses = total_misses + readahead_files[i].window.misses
+        i = i + 1
+    }
+
+    *hits = total_hits
+    *misses = total_misses
+}
+
+export fn get_writeback_stats(dirty: *u32, written: *u64): void {
+    *dirty = writeback_mgr.dirty_count
+    *written = writeback_mgr.pages_written
+}
+
+// ============================================
+// Helpers
+// ============================================
+
+fn spin_lock(lock: *u32): void {
+    while basics.atomic_cmpxchg(lock, 0, 1) != 0 {
+        basics.cpu_pause()
+    }
+}
+
+fn spin_unlock(lock: *u32): void {
+    basics.atomic_store(lock, 0)
+}
