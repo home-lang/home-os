@@ -1,0 +1,795 @@
+// HomeOS Container Bridge Networking
+// Software bridge for container network isolation
+
+const basics = @import("basics")
+const net = @import("net")
+
+// Maximum limits
+const MAX_BRIDGES: u32 = 16
+const MAX_PORTS_PER_BRIDGE: u32 = 64
+const MAX_PORT_MAPPINGS: u32 = 256
+const MAX_NAT_RULES: u32 = 128
+const MAX_FIREWALL_RULES: u32 = 256
+
+// Bridge states
+const BRIDGE_DOWN: u32 = 0
+const BRIDGE_UP: u32 = 1
+const BRIDGE_LEARNING: u32 = 2
+
+// Port types
+const PORT_TYPE_PHYSICAL: u32 = 0
+const PORT_TYPE_VETH: u32 = 1
+const PORT_TYPE_INTERNAL: u32 = 2
+
+// Protocol types
+const PROTO_TCP: u8 = 6
+const PROTO_UDP: u8 = 17
+
+// Firewall chain types
+const CHAIN_INPUT: u32 = 0
+const CHAIN_OUTPUT: u32 = 1
+const CHAIN_FORWARD: u32 = 2
+const CHAIN_PREROUTING: u32 = 3
+const CHAIN_POSTROUTING: u32 = 4
+
+// Firewall actions
+const ACTION_ACCEPT: u32 = 0
+const ACTION_DROP: u32 = 1
+const ACTION_REJECT: u32 = 2
+const ACTION_MASQUERADE: u32 = 3
+const ACTION_DNAT: u32 = 4
+const ACTION_SNAT: u32 = 5
+
+// MAC address
+struct MacAddress {
+    bytes: [6]u8
+}
+
+// Bridge port
+struct BridgePort {
+    name: [32]u8
+    port_id: u32
+    port_type: u32
+    mac: MacAddress
+    state: u32
+
+    // Veth-specific
+    peer_name: [32]u8
+    container_id: u32
+
+    // Statistics
+    rx_packets: u64
+    tx_packets: u64
+    rx_bytes: u64
+    tx_bytes: u64
+
+    // STP state (if enabled)
+    stp_state: u32
+    path_cost: u32
+}
+
+// IP address (v4)
+struct IPv4Address {
+    bytes: [4]u8
+}
+
+// Bridge structure
+struct Bridge {
+    name: [32]u8
+    id: u32
+    state: u32
+
+    // Network configuration
+    ip_addr: IPv4Address
+    netmask: IPv4Address
+    gateway: IPv4Address
+    mac: MacAddress
+
+    // MTU
+    mtu: u32
+
+    // Ports
+    ports: [MAX_PORTS_PER_BRIDGE]BridgePort
+    port_count: u32
+
+    // Features
+    stp_enabled: bool
+    hairpin_mode: bool
+    vlan_filtering: bool
+
+    // Bridge ID for STP
+    bridge_priority: u16
+
+    // Statistics
+    rx_packets: u64
+    tx_packets: u64
+    rx_bytes: u64
+    tx_bytes: u64
+}
+
+// Port mapping for container
+struct PortMapping {
+    id: u32
+    container_id: u32
+    host_port: u16
+    container_port: u16
+    protocol: u8           // TCP or UDP
+    host_ip: IPv4Address   // 0.0.0.0 for all interfaces
+    container_ip: IPv4Address
+    active: bool
+}
+
+// NAT rule
+struct NatRule {
+    id: u32
+    chain: u32
+    action: u32
+
+    // Match criteria
+    src_ip: IPv4Address
+    src_mask: IPv4Address
+    dst_ip: IPv4Address
+    dst_mask: IPv4Address
+    src_port: u16
+    dst_port: u16
+    protocol: u8
+
+    // Action parameters
+    nat_ip: IPv4Address
+    nat_port: u16
+
+    // Interface match
+    in_interface: [32]u8
+    out_interface: [32]u8
+
+    active: bool
+}
+
+// Firewall rule
+struct FirewallRule {
+    id: u32
+    chain: u32
+    action: u32
+    priority: u32
+
+    // Match criteria
+    src_ip: IPv4Address
+    src_mask: IPv4Address
+    dst_ip: IPv4Address
+    dst_mask: IPv4Address
+    src_port_min: u16
+    src_port_max: u16
+    dst_port_min: u16
+    dst_port_max: u16
+    protocol: u8
+
+    // Interface
+    interface: [32]u8
+
+    // Counters
+    packets: u64
+    bytes: u64
+
+    active: bool
+}
+
+// Bridge registry
+struct BridgeRegistry {
+    bridges: [MAX_BRIDGES]*Bridge
+    bridge_count: u32
+    port_mappings: [MAX_PORT_MAPPINGS]PortMapping
+    port_mapping_count: u32
+    nat_rules: [MAX_NAT_RULES]NatRule
+    nat_rule_count: u32
+    firewall_rules: [MAX_FIREWALL_RULES]FirewallRule
+    firewall_rule_count: u32
+    next_bridge_id: u32
+    next_port_id: u32
+    next_mapping_id: u32
+    next_nat_id: u32
+    next_fw_id: u32
+}
+
+var registry: BridgeRegistry
+
+// Generate random MAC address (locally administered)
+fn generate_mac(): MacAddress {
+    var mac: MacAddress
+    // Use simple RNG for now
+    var seed: u32 = (basics.get_ticks() as u32) ^ 0xDEADBEEF
+    var i: u32 = 0
+    while i < 6 {
+        seed = seed * 1103515245 + 12345
+        mac.bytes[i] = ((seed >> 16) & 0xFF) as u8
+        i = i + 1
+    }
+    // Set locally administered bit, clear multicast bit
+    mac.bytes[0] = (mac.bytes[0] & 0xFE) | 0x02
+    return mac
+}
+
+// Parse IP address from string "a.b.c.d"
+fn parse_ipv4(str: *u8): IPv4Address {
+    var addr: IPv4Address = IPv4Address { bytes: [0, 0, 0, 0] }
+    var i: u32 = 0
+    var octet: u32 = 0
+    var idx: u32 = 0
+
+    while str[idx] != 0 and i < 4 {
+        if str[idx] >= '0' and str[idx] <= '9' {
+            octet = octet * 10 + ((str[idx] - '0') as u32)
+        } else if str[idx] == '.' {
+            addr.bytes[i] = octet as u8
+            octet = 0
+            i = i + 1
+        }
+        idx = idx + 1
+    }
+    if i < 4 {
+        addr.bytes[i] = octet as u8
+    }
+
+    return addr
+}
+
+// Format IP address to string
+fn format_ipv4(addr: *IPv4Address, buffer: *u8): void {
+    basics.sprintf(buffer, "%d.%d.%d.%d",
+        addr.bytes[0], addr.bytes[1], addr.bytes[2], addr.bytes[3])
+}
+
+// ============================================
+// Bridge Management
+// ============================================
+
+// Initialize bridge subsystem
+export fn bridge_init(): void {
+    registry.bridge_count = 0
+    registry.port_mapping_count = 0
+    registry.nat_rule_count = 0
+    registry.firewall_rule_count = 0
+    registry.next_bridge_id = 1
+    registry.next_port_id = 1
+    registry.next_mapping_id = 1
+    registry.next_nat_id = 1
+    registry.next_fw_id = 1
+
+    var i: u32 = 0
+    while i < MAX_BRIDGES {
+        registry.bridges[i] = null
+        i = i + 1
+    }
+}
+
+// Create a new bridge
+export fn bridge_create(name: *u8): u32 {
+    if registry.bridge_count >= MAX_BRIDGES {
+        return 0
+    }
+
+    // Check for duplicate name
+    var i: u32 = 0
+    while i < registry.bridge_count {
+        if registry.bridges[i] != null {
+            if basics.strcmp(&registry.bridges[i].name, name) == 0 {
+                return 0  // Name already exists
+            }
+        }
+        i = i + 1
+    }
+
+    // Allocate bridge
+    let br = basics.alloc(Bridge) as *Bridge
+    if br == null {
+        return 0
+    }
+
+    basics.memset(br, 0, @sizeOf(Bridge))
+
+    // Initialize bridge
+    let name_len = basics.strlen(name)
+    if name_len > 31 { name_len = 31 }
+    basics.memcpy(&br.name, name, name_len)
+
+    br.id = registry.next_bridge_id
+    registry.next_bridge_id = registry.next_bridge_id + 1
+
+    br.state = BRIDGE_DOWN
+    br.mac = generate_mac()
+    br.mtu = 1500
+    br.port_count = 0
+    br.stp_enabled = false
+    br.hairpin_mode = false
+    br.vlan_filtering = false
+    br.bridge_priority = 0x8000
+
+    // Register bridge
+    registry.bridges[registry.bridge_count] = br
+    registry.bridge_count = registry.bridge_count + 1
+
+    return br.id
+}
+
+// Delete bridge
+export fn bridge_delete(bridge_id: u32): bool {
+    var i: u32 = 0
+    while i < registry.bridge_count {
+        let br = registry.bridges[i]
+        if br != null and br.id == bridge_id {
+            // Remove all ports first
+            while br.port_count > 0 {
+                bridge_remove_port(bridge_id, &br.ports[0].name)
+            }
+
+            // Remove from registry
+            basics.free(br)
+
+            // Shift remaining bridges
+            var j = i
+            while j < registry.bridge_count - 1 {
+                registry.bridges[j] = registry.bridges[j + 1]
+                j = j + 1
+            }
+            registry.bridges[registry.bridge_count - 1] = null
+            registry.bridge_count = registry.bridge_count - 1
+
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Find bridge by ID
+fn find_bridge(bridge_id: u32): *Bridge {
+    var i: u32 = 0
+    while i < registry.bridge_count {
+        if registry.bridges[i] != null and registry.bridges[i].id == bridge_id {
+            return registry.bridges[i]
+        }
+        i = i + 1
+    }
+    return null
+}
+
+// Find bridge by name
+export fn bridge_find_by_name(name: *u8): u32 {
+    var i: u32 = 0
+    while i < registry.bridge_count {
+        if registry.bridges[i] != null {
+            if basics.strcmp(&registry.bridges[i].name, name) == 0 {
+                return registry.bridges[i].id
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Set bridge IP configuration
+export fn bridge_set_ip(bridge_id: u32, ip: *u8, netmask: *u8): bool {
+    let br = find_bridge(bridge_id)
+    if br == null {
+        return false
+    }
+
+    br.ip_addr = parse_ipv4(ip)
+    br.netmask = parse_ipv4(netmask)
+
+    return true
+}
+
+// Set bridge gateway
+export fn bridge_set_gateway(bridge_id: u32, gateway: *u8): bool {
+    let br = find_bridge(bridge_id)
+    if br == null {
+        return false
+    }
+
+    br.gateway = parse_ipv4(gateway)
+    return true
+}
+
+// Bring bridge up
+export fn bridge_up(bridge_id: u32): bool {
+    let br = find_bridge(bridge_id)
+    if br == null {
+        return false
+    }
+
+    br.state = BRIDGE_UP
+    return true
+}
+
+// Bring bridge down
+export fn bridge_down(bridge_id: u32): bool {
+    let br = find_bridge(bridge_id)
+    if br == null {
+        return false
+    }
+
+    br.state = BRIDGE_DOWN
+    return true
+}
+
+// ============================================
+// Port Management
+// ============================================
+
+// Add interface to bridge
+export fn bridge_add_port(bridge_id: u32, if_name: *u8, port_type: u32): bool {
+    let br = find_bridge(bridge_id)
+    if br == null or br.port_count >= MAX_PORTS_PER_BRIDGE {
+        return false
+    }
+
+    let port = &br.ports[br.port_count]
+    basics.memset(port, 0, @sizeOf(BridgePort))
+
+    let name_len = basics.strlen(if_name)
+    if name_len > 31 { name_len = 31 }
+    basics.memcpy(&port.name, if_name, name_len)
+
+    port.port_id = registry.next_port_id
+    registry.next_port_id = registry.next_port_id + 1
+
+    port.port_type = port_type
+    port.mac = generate_mac()
+    port.state = BRIDGE_UP
+
+    br.port_count = br.port_count + 1
+    return true
+}
+
+// Remove interface from bridge
+export fn bridge_remove_port(bridge_id: u32, if_name: *u8): bool {
+    let br = find_bridge(bridge_id)
+    if br == null {
+        return false
+    }
+
+    var i: u32 = 0
+    while i < br.port_count {
+        if basics.strcmp(&br.ports[i].name, if_name) == 0 {
+            // Shift remaining ports
+            var j = i
+            while j < br.port_count - 1 {
+                basics.memcpy(&br.ports[j], &br.ports[j + 1], @sizeOf(BridgePort))
+                j = j + 1
+            }
+            br.port_count = br.port_count - 1
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Create veth pair for container
+export fn bridge_create_veth(bridge_id: u32, host_name: *u8, peer_name: *u8, container_id: u32): bool {
+    let br = find_bridge(bridge_id)
+    if br == null or br.port_count >= MAX_PORTS_PER_BRIDGE {
+        return false
+    }
+
+    // Add host side to bridge
+    if !bridge_add_port(bridge_id, host_name, PORT_TYPE_VETH) {
+        return false
+    }
+
+    // Set peer information
+    let port = &br.ports[br.port_count - 1]
+    let peer_len = basics.strlen(peer_name)
+    if peer_len > 31 { peer_len = 31 }
+    basics.memcpy(&port.peer_name, peer_name, peer_len)
+    port.container_id = container_id
+
+    return true
+}
+
+// ============================================
+// Port Mapping
+// ============================================
+
+// Add port mapping for container
+export fn bridge_add_port_mapping(
+    container_id: u32,
+    host_port: u16,
+    container_port: u16,
+    protocol: u8,
+    container_ip: *u8
+): u32 {
+    if registry.port_mapping_count >= MAX_PORT_MAPPINGS {
+        return 0
+    }
+
+    // Check for duplicate host port
+    var i: u32 = 0
+    while i < registry.port_mapping_count {
+        let m = &registry.port_mappings[i]
+        if m.active and m.host_port == host_port and m.protocol == protocol {
+            return 0  // Port already mapped
+        }
+        i = i + 1
+    }
+
+    let mapping = &registry.port_mappings[registry.port_mapping_count]
+
+    mapping.id = registry.next_mapping_id
+    registry.next_mapping_id = registry.next_mapping_id + 1
+
+    mapping.container_id = container_id
+    mapping.host_port = host_port
+    mapping.container_port = container_port
+    mapping.protocol = protocol
+    mapping.host_ip = IPv4Address { bytes: [0, 0, 0, 0] }
+    mapping.container_ip = parse_ipv4(container_ip)
+    mapping.active = true
+
+    registry.port_mapping_count = registry.port_mapping_count + 1
+
+    // Add corresponding DNAT rule
+    nat_add_dnat(host_port, &mapping.container_ip, container_port, protocol)
+
+    return mapping.id
+}
+
+// Remove port mapping
+export fn bridge_remove_port_mapping(mapping_id: u32): bool {
+    var i: u32 = 0
+    while i < registry.port_mapping_count {
+        if registry.port_mappings[i].id == mapping_id {
+            registry.port_mappings[i].active = false
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Remove all port mappings for container
+export fn bridge_remove_container_mappings(container_id: u32): void {
+    var i: u32 = 0
+    while i < registry.port_mapping_count {
+        if registry.port_mappings[i].container_id == container_id {
+            registry.port_mappings[i].active = false
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// NAT
+// ============================================
+
+// Setup masquerade for outbound traffic
+export fn nat_setup_masquerade(bridge_id: u32): bool {
+    let br = find_bridge(bridge_id)
+    if br == null {
+        return false
+    }
+
+    if registry.nat_rule_count >= MAX_NAT_RULES {
+        return false
+    }
+
+    let rule = &registry.nat_rules[registry.nat_rule_count]
+    basics.memset(rule, 0, @sizeOf(NatRule))
+
+    rule.id = registry.next_nat_id
+    registry.next_nat_id = registry.next_nat_id + 1
+
+    rule.chain = CHAIN_POSTROUTING
+    rule.action = ACTION_MASQUERADE
+    rule.src_ip = br.ip_addr
+    rule.src_mask = br.netmask
+    basics.memcpy(&rule.in_interface, &br.name, 32)
+    rule.active = true
+
+    registry.nat_rule_count = registry.nat_rule_count + 1
+    return true
+}
+
+// Add DNAT rule for port forwarding
+fn nat_add_dnat(host_port: u16, dst_ip: *IPv4Address, dst_port: u16, protocol: u8): bool {
+    if registry.nat_rule_count >= MAX_NAT_RULES {
+        return false
+    }
+
+    let rule = &registry.nat_rules[registry.nat_rule_count]
+    basics.memset(rule, 0, @sizeOf(NatRule))
+
+    rule.id = registry.next_nat_id
+    registry.next_nat_id = registry.next_nat_id + 1
+
+    rule.chain = CHAIN_PREROUTING
+    rule.action = ACTION_DNAT
+    rule.dst_port = host_port
+    rule.protocol = protocol
+    rule.nat_ip = *dst_ip
+    rule.nat_port = dst_port
+    rule.active = true
+
+    registry.nat_rule_count = registry.nat_rule_count + 1
+    return true
+}
+
+// ============================================
+// Firewall
+// ============================================
+
+// Add firewall rule
+export fn firewall_add_rule(
+    chain: u32,
+    action: u32,
+    priority: u32,
+    src_ip: *u8,
+    dst_ip: *u8,
+    dst_port: u16,
+    protocol: u8
+): u32 {
+    if registry.firewall_rule_count >= MAX_FIREWALL_RULES {
+        return 0
+    }
+
+    let rule = &registry.firewall_rules[registry.firewall_rule_count]
+    basics.memset(rule, 0, @sizeOf(FirewallRule))
+
+    rule.id = registry.next_fw_id
+    registry.next_fw_id = registry.next_fw_id + 1
+
+    rule.chain = chain
+    rule.action = action
+    rule.priority = priority
+
+    if src_ip != null {
+        rule.src_ip = parse_ipv4(src_ip)
+        rule.src_mask = IPv4Address { bytes: [255, 255, 255, 255] }
+    }
+
+    if dst_ip != null {
+        rule.dst_ip = parse_ipv4(dst_ip)
+        rule.dst_mask = IPv4Address { bytes: [255, 255, 255, 255] }
+    }
+
+    rule.dst_port_min = dst_port
+    rule.dst_port_max = dst_port
+    rule.protocol = protocol
+    rule.active = true
+
+    registry.firewall_rule_count = registry.firewall_rule_count + 1
+    return rule.id
+}
+
+// Delete firewall rule
+export fn firewall_delete_rule(rule_id: u32): bool {
+    var i: u32 = 0
+    while i < registry.firewall_rule_count {
+        if registry.firewall_rules[i].id == rule_id {
+            registry.firewall_rules[i].active = false
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Flush all rules in a chain
+export fn firewall_flush_chain(chain: u32): void {
+    var i: u32 = 0
+    while i < registry.firewall_rule_count {
+        if registry.firewall_rules[i].chain == chain {
+            registry.firewall_rules[i].active = false
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// Packet Processing (hooks for network stack)
+// ============================================
+
+// Process incoming packet on bridge port
+export fn bridge_rx_packet(port_id: u32, packet: *u8, len: u32): bool {
+    // Find the port and its bridge
+    var bridge_idx: u32 = 0
+    while bridge_idx < registry.bridge_count {
+        let br = registry.bridges[bridge_idx]
+        if br == null {
+            bridge_idx = bridge_idx + 1
+            continue
+        }
+
+        var port_idx: u32 = 0
+        while port_idx < br.port_count {
+            if br.ports[port_idx].port_id == port_id {
+                // Update stats
+                br.ports[port_idx].rx_packets = br.ports[port_idx].rx_packets + 1
+                br.ports[port_idx].rx_bytes = br.ports[port_idx].rx_bytes + (len as u64)
+                br.rx_packets = br.rx_packets + 1
+                br.rx_bytes = br.rx_bytes + (len as u64)
+
+                // Forward to other ports (flood for now)
+                // In a real implementation, we would learn MAC addresses
+                bridge_flood_packet(br, port_idx, packet, len)
+                return true
+            }
+            port_idx = port_idx + 1
+        }
+        bridge_idx = bridge_idx + 1
+    }
+    return false
+}
+
+// Flood packet to all ports except source
+fn bridge_flood_packet(br: *Bridge, src_port: u32, packet: *u8, len: u32): void {
+    var i: u32 = 0
+    while i < br.port_count {
+        if i != src_port and br.ports[i].state == BRIDGE_UP {
+            // Send to port
+            bridge_tx_port(&br.ports[i], packet, len)
+        }
+        i = i + 1
+    }
+}
+
+// Transmit packet on port
+fn bridge_tx_port(port: *BridgePort, packet: *u8, len: u32): void {
+    port.tx_packets = port.tx_packets + 1
+    port.tx_bytes = port.tx_bytes + (len as u64)
+
+    // Actual transmission would go through the network driver
+    // net.send_packet(&port.name, packet, len)
+}
+
+// ============================================
+// Status and Debugging
+// ============================================
+
+// List all bridges
+export fn bridge_list(): void {
+    basics.print("Network bridges:\n")
+    var i: u32 = 0
+    while i < registry.bridge_count {
+        let br = registry.bridges[i]
+        if br != null {
+            basics.print("  ")
+            basics.print(&br.name)
+            basics.print(" (id=")
+            basics.print_int(br.id as i32)
+            basics.print(", state=")
+            if br.state == BRIDGE_UP {
+                basics.print("UP")
+            } else {
+                basics.print("DOWN")
+            }
+            basics.print(", ports=")
+            basics.print_int(br.port_count as i32)
+            basics.print(")\n")
+
+            // Print IP if configured
+            if br.ip_addr.bytes[0] != 0 {
+                var ip_str: [16]u8
+                format_ipv4(&br.ip_addr, &ip_str)
+                basics.print("    IP: ")
+                basics.print(&ip_str)
+                basics.print("\n")
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Get bridge statistics
+export fn bridge_get_stats(bridge_id: u32, rx_pkts: *u64, tx_pkts: *u64, rx_bytes: *u64, tx_bytes: *u64): bool {
+    let br = find_bridge(bridge_id)
+    if br == null {
+        return false
+    }
+
+    *rx_pkts = br.rx_packets
+    *tx_pkts = br.tx_packets
+    *rx_bytes = br.rx_bytes
+    *tx_bytes = br.tx_bytes
+    return true
+}

@@ -1,0 +1,523 @@
+// HomeOS Bug Tracking and Debugging Infrastructure
+// Runtime bug reporting, assertions, and diagnostics
+
+const basics = @import("basics")
+const serial = @import("drivers/serial")
+
+// ============================================
+// Bug Severity Levels
+// ============================================
+
+const BUG_INFO: u32 = 0
+const BUG_WARNING: u32 = 1
+const BUG_ERROR: u32 = 2
+const BUG_CRITICAL: u32 = 3
+const BUG_FATAL: u32 = 4
+
+// ============================================
+// Bug Categories
+// ============================================
+
+const BUG_CAT_MEMORY: u32 = 1
+const BUG_CAT_SCHEDULER: u32 = 2
+const BUG_CAT_FILESYSTEM: u32 = 3
+const BUG_CAT_NETWORK: u32 = 4
+const BUG_CAT_DRIVER: u32 = 5
+const BUG_CAT_SECURITY: u32 = 6
+const BUG_CAT_IPC: u32 = 7
+const BUG_CAT_SYSCALL: u32 = 8
+const BUG_CAT_INTERRUPT: u32 = 9
+const BUG_CAT_OTHER: u32 = 0
+
+// ============================================
+// Bug Report Structure
+// ============================================
+
+const MAX_STACK_FRAMES: u32 = 32
+const MAX_MESSAGE_LEN: u32 = 256
+
+struct BugReport {
+    // Identification
+    id: u64
+    timestamp: u64
+
+    // Classification
+    severity: u32
+    category: u32
+
+    // Location
+    file: [64]u8
+    function: [64]u8
+    line: u32
+
+    // Stack trace
+    stack_frames: [MAX_STACK_FRAMES]u64
+    num_frames: u32
+
+    // Message
+    message: [MAX_MESSAGE_LEN]u8
+
+    // Context
+    cpu_id: u32
+    thread_id: u64
+
+    // Occurrence tracking
+    count: u32
+    first_seen: u64
+    last_seen: u64
+
+    // Linked list
+    next: *BugReport
+}
+
+// ============================================
+// Bug Tracker State
+// ============================================
+
+const MAX_TRACKED_BUGS: u32 = 256
+
+struct BugTracker {
+    reports: [MAX_TRACKED_BUGS]BugReport
+    num_reports: u32
+    next_id: u64
+
+    // Statistics
+    total_bugs: u64
+    bugs_by_severity: [5]u64
+    bugs_by_category: [10]u64
+
+    // Lock
+    lock: u32
+
+    // Callbacks
+    panic_handler: fn(*BugReport): void
+    log_handler: fn(*BugReport): void
+}
+
+var global_tracker: BugTracker = undefined
+var tracker_initialized: bool = false
+
+// ============================================
+// Initialization
+// ============================================
+
+export fn bug_tracker_init(): void {
+    if tracker_initialized {
+        return
+    }
+
+    global_tracker.num_reports = 0
+    global_tracker.next_id = 1
+    global_tracker.total_bugs = 0
+    global_tracker.lock = 0
+    global_tracker.panic_handler = null
+    global_tracker.log_handler = null
+
+    var i: u32 = 0
+    while i < 5 {
+        global_tracker.bugs_by_severity[i] = 0
+        i = i + 1
+    }
+
+    i = 0
+    while i < 10 {
+        global_tracker.bugs_by_category[i] = 0
+        i = i + 1
+    }
+
+    tracker_initialized = true
+}
+
+// ============================================
+// Bug Reporting
+// ============================================
+
+export fn bug_report(
+    severity: u32,
+    category: u32,
+    file: *const u8,
+    function: *const u8,
+    line: u32,
+    message: *const u8
+): *BugReport {
+    if not tracker_initialized {
+        bug_tracker_init()
+    }
+
+    // Lock
+    while basics.atomic_cmpxchg(&global_tracker.lock, 0, 1) != 0 {
+        basics.cpu_pause()
+    }
+
+    // Check for duplicate
+    var report = find_duplicate(file, function, line)
+
+    if report != null {
+        // Update existing
+        report.count = report.count + 1
+        report.last_seen = basics.get_timestamp()
+
+        basics.atomic_store(&global_tracker.lock, 0)
+        return report
+    }
+
+    // Create new report
+    if global_tracker.num_reports >= MAX_TRACKED_BUGS {
+        basics.atomic_store(&global_tracker.lock, 0)
+        return null
+    }
+
+    report = &global_tracker.reports[global_tracker.num_reports]
+    global_tracker.num_reports = global_tracker.num_reports + 1
+
+    report.id = global_tracker.next_id
+    global_tracker.next_id = global_tracker.next_id + 1
+
+    report.timestamp = basics.get_timestamp()
+    report.severity = severity
+    report.category = category
+    report.line = line
+    report.count = 1
+    report.first_seen = report.timestamp
+    report.last_seen = report.timestamp
+    report.cpu_id = basics.get_cpu_id()
+    report.thread_id = basics.get_thread_id()
+    report.num_frames = 0
+    report.next = null
+
+    // Copy strings
+    copy_string(&report.file, file, 64)
+    copy_string(&report.function, function, 64)
+    copy_string(&report.message, message, MAX_MESSAGE_LEN)
+
+    // Capture stack trace
+    capture_stack_trace(report)
+
+    // Update statistics
+    global_tracker.total_bugs = global_tracker.total_bugs + 1
+    if severity < 5 {
+        global_tracker.bugs_by_severity[severity] = global_tracker.bugs_by_severity[severity] + 1
+    }
+    if category < 10 {
+        global_tracker.bugs_by_category[category] = global_tracker.bugs_by_category[category] + 1
+    }
+
+    basics.atomic_store(&global_tracker.lock, 0)
+
+    // Log the bug
+    log_bug_report(report)
+
+    // Call handlers
+    if global_tracker.log_handler != null {
+        global_tracker.log_handler(report)
+    }
+
+    // Handle fatal bugs
+    if severity == BUG_FATAL {
+        if global_tracker.panic_handler != null {
+            global_tracker.panic_handler(report)
+        } else {
+            kernel_panic(report)
+        }
+    }
+
+    return report
+}
+
+fn find_duplicate(file: *const u8, function: *const u8, line: u32): *BugReport {
+    var i: u32 = 0
+    while i < global_tracker.num_reports {
+        let report = &global_tracker.reports[i]
+        if report.line == line {
+            if strings_equal(&report.file, file) and strings_equal(&report.function, function) {
+                return report
+            }
+        }
+        i = i + 1
+    }
+    return null
+}
+
+fn strings_equal(a: *u8, b: *const u8): bool {
+    var i: u32 = 0
+    while i < 64 {
+        if a[i] != b[i] {
+            return false
+        }
+        if a[i] == 0 {
+            return true
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn copy_string(dst: *u8, src: *const u8, max_len: u32): void {
+    var i: u32 = 0
+    while i < max_len - 1 and src[i] != 0 {
+        dst[i] = src[i]
+        i = i + 1
+    }
+    dst[i] = 0
+}
+
+// ============================================
+// Stack Trace Capture
+// ============================================
+
+fn capture_stack_trace(report: *BugReport): void {
+    // Get frame pointer
+    var fp: u64 = 0
+    asm volatile {
+        "mov %rbp, %0"
+        : "=r" (fp)
+    }
+
+    report.num_frames = 0
+
+    while fp != 0 and report.num_frames < MAX_STACK_FRAMES {
+        let frame = fp as *u64
+
+        // Return address is at frame + 8
+        let return_addr = *(frame + 1)
+
+        if return_addr == 0 {
+            break
+        }
+
+        report.stack_frames[report.num_frames] = return_addr
+        report.num_frames = report.num_frames + 1
+
+        // Next frame pointer
+        fp = *frame
+
+        // Sanity check
+        if fp < 0x1000 or fp > 0xFFFFFFFF00000000 {
+            break
+        }
+    }
+}
+
+// ============================================
+// Bug Logging
+// ============================================
+
+fn log_bug_report(report: *BugReport): void {
+    // Format severity
+    let sev_str = switch report.severity {
+        BUG_INFO => "INFO",
+        BUG_WARNING => "WARN",
+        BUG_ERROR => "ERROR",
+        BUG_CRITICAL => "CRIT",
+        BUG_FATAL => "FATAL",
+        else => "UNKNOWN"
+    }
+
+    // Format category
+    let cat_str = switch report.category {
+        BUG_CAT_MEMORY => "MEMORY",
+        BUG_CAT_SCHEDULER => "SCHEDULER",
+        BUG_CAT_FILESYSTEM => "FS",
+        BUG_CAT_NETWORK => "NET",
+        BUG_CAT_DRIVER => "DRIVER",
+        BUG_CAT_SECURITY => "SECURITY",
+        BUG_CAT_IPC => "IPC",
+        BUG_CAT_SYSCALL => "SYSCALL",
+        BUG_CAT_INTERRUPT => "IRQ",
+        else => "OTHER"
+    }
+
+    // Output to serial
+    serial.print("[BUG #")
+    serial.print_u64(report.id)
+    serial.print("] ")
+    serial.print(sev_str)
+    serial.print("/")
+    serial.print(cat_str)
+    serial.print(": ")
+    serial.print(&report.message as *const u8)
+    serial.print("\n")
+
+    serial.print("  Location: ")
+    serial.print(&report.file as *const u8)
+    serial.print(":")
+    serial.print(&report.function as *const u8)
+    serial.print(":")
+    serial.print_u32(report.line)
+    serial.print("\n")
+
+    serial.print("  CPU: ")
+    serial.print_u32(report.cpu_id)
+    serial.print(", Thread: ")
+    serial.print_u64(report.thread_id)
+    serial.print(", Count: ")
+    serial.print_u32(report.count)
+    serial.print("\n")
+
+    // Print stack trace
+    if report.num_frames > 0 {
+        serial.print("  Stack trace:\n")
+        var i: u32 = 0
+        while i < report.num_frames {
+            serial.print("    [")
+            serial.print_u32(i)
+            serial.print("] ")
+            serial.print_hex(report.stack_frames[i])
+            serial.print("\n")
+            i = i + 1
+        }
+    }
+}
+
+fn kernel_panic(report: *BugReport): void {
+    // Disable interrupts
+    asm volatile { "cli" }
+
+    serial.print("\n\n")
+    serial.print("================================================================================\n")
+    serial.print("                           KERNEL PANIC                                        \n")
+    serial.print("================================================================================\n\n")
+
+    log_bug_report(report)
+
+    serial.print("\n")
+    serial.print("================================================================================\n")
+    serial.print("                          SYSTEM HALTED                                        \n")
+    serial.print("================================================================================\n")
+
+    // Halt all CPUs
+    loop {
+        asm volatile { "hlt" }
+    }
+}
+
+// ============================================
+// Assertion Macros (as functions)
+// ============================================
+
+export fn bug_assert(condition: bool, file: *const u8, function: *const u8, line: u32, msg: *const u8): void {
+    if not condition {
+        bug_report(BUG_FATAL, BUG_CAT_OTHER, file, function, line, msg)
+    }
+}
+
+export fn bug_warn_if(condition: bool, file: *const u8, function: *const u8, line: u32, msg: *const u8): void {
+    if condition {
+        bug_report(BUG_WARNING, BUG_CAT_OTHER, file, function, line, msg)
+    }
+}
+
+export fn bug_on(condition: bool, file: *const u8, function: *const u8, line: u32): void {
+    if condition {
+        bug_report(BUG_FATAL, BUG_CAT_OTHER, file, function, line, "BUG_ON triggered")
+    }
+}
+
+export fn warn_on(condition: bool, file: *const u8, function: *const u8, line: u32): void {
+    if condition {
+        bug_report(BUG_WARNING, BUG_CAT_OTHER, file, function, line, "WARN_ON triggered")
+    }
+}
+
+// ============================================
+// Statistics
+// ============================================
+
+export fn bug_tracker_get_stats(
+    total: *u64,
+    by_severity: *u64,
+    by_category: *u64
+): void {
+    if not tracker_initialized {
+        *total = 0
+        return
+    }
+
+    *total = global_tracker.total_bugs
+
+    var i: u32 = 0
+    while i < 5 {
+        by_severity[i] = global_tracker.bugs_by_severity[i]
+        i = i + 1
+    }
+
+    i = 0
+    while i < 10 {
+        by_category[i] = global_tracker.bugs_by_category[i]
+        i = i + 1
+    }
+}
+
+export fn bug_tracker_get_report(id: u64): *BugReport {
+    if not tracker_initialized {
+        return null
+    }
+
+    var i: u32 = 0
+    while i < global_tracker.num_reports {
+        if global_tracker.reports[i].id == id {
+            return &global_tracker.reports[i]
+        }
+        i = i + 1
+    }
+
+    return null
+}
+
+// ============================================
+// Handler Registration
+// ============================================
+
+export fn bug_tracker_set_panic_handler(handler: fn(*BugReport): void): void {
+    global_tracker.panic_handler = handler
+}
+
+export fn bug_tracker_set_log_handler(handler: fn(*BugReport): void): void {
+    global_tracker.log_handler = handler
+}
+
+// ============================================
+// Dump All Bugs
+// ============================================
+
+export fn bug_tracker_dump_all(): void {
+    if not tracker_initialized {
+        serial.print("Bug tracker not initialized\n")
+        return
+    }
+
+    serial.print("\n=== Bug Tracker Report ===\n")
+    serial.print("Total bugs: ")
+    serial.print_u64(global_tracker.total_bugs)
+    serial.print("\n")
+    serial.print("Unique bugs: ")
+    serial.print_u32(global_tracker.num_reports)
+    serial.print("\n\n")
+
+    serial.print("By severity:\n")
+    serial.print("  INFO:     ")
+    serial.print_u64(global_tracker.bugs_by_severity[0])
+    serial.print("\n")
+    serial.print("  WARNING:  ")
+    serial.print_u64(global_tracker.bugs_by_severity[1])
+    serial.print("\n")
+    serial.print("  ERROR:    ")
+    serial.print_u64(global_tracker.bugs_by_severity[2])
+    serial.print("\n")
+    serial.print("  CRITICAL: ")
+    serial.print_u64(global_tracker.bugs_by_severity[3])
+    serial.print("\n")
+    serial.print("  FATAL:    ")
+    serial.print_u64(global_tracker.bugs_by_severity[4])
+    serial.print("\n\n")
+
+    serial.print("Individual reports:\n")
+    serial.print("-----------------------------------------\n")
+
+    var i: u32 = 0
+    while i < global_tracker.num_reports {
+        log_bug_report(&global_tracker.reports[i])
+        serial.print("-----------------------------------------\n")
+        i = i + 1
+    }
+}

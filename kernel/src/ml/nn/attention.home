@@ -1,0 +1,768 @@
+// HomeOS Neural Network Attention Layers
+// MultiHeadAttention, Transformer components
+
+const basics = @import("basics")
+const tensor = @import("ml/tensor")
+const tensor_ops = @import("ml/tensor_ops")
+const module = @import("ml/nn/module")
+const linear = @import("ml/nn/linear")
+const activation = @import("ml/nn/activation")
+
+// ============================================
+// Scaled Dot-Product Attention
+// ============================================
+
+// Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V
+export fn scaled_dot_product_attention(
+    query: *tensor.Tensor,      // (batch, seq_len, d_k) or (batch, heads, seq_len, d_k)
+    key: *tensor.Tensor,        // Same shape as query
+    value: *tensor.Tensor,      // Same shape as query
+    attn_mask: *tensor.Tensor,  // Optional mask
+    dropout_p: f64,             // Dropout probability (0 to disable)
+    is_causal: bool             // Use causal mask
+): *tensor.Tensor {
+    if query == null or key == null or value == null {
+        return null
+    }
+
+    // Get dimensions
+    let d_k = query.shape[query.ndim - 1]
+    let scale = 1.0 / basics.sqrt(d_k as f64)
+
+    // Compute Q @ K^T
+    let key_t = tensor.tensor_transpose(key, query.ndim - 2, query.ndim - 1)
+    if key_t == null {
+        return null
+    }
+
+    var attn_scores = tensor_ops.tensor_matmul(query, key_t)
+    tensor.tensor_release(key_t)
+
+    if attn_scores == null {
+        return null
+    }
+
+    // Scale
+    tensor_ops.tensor_mul_scalar_(attn_scores, scale)
+
+    // Apply causal mask if requested
+    if is_causal {
+        apply_causal_mask(attn_scores)
+    }
+
+    // Apply attention mask if provided
+    if attn_mask != null {
+        apply_attention_mask(attn_scores, attn_mask)
+    }
+
+    // Softmax over last dimension
+    let attn_weights = activation.softmax(attn_scores, -1)
+    tensor.tensor_release(attn_scores)
+
+    if attn_weights == null {
+        return null
+    }
+
+    // Apply dropout (if training and p > 0)
+    // Simplified: skip dropout for now
+
+    // Compute attention @ V
+    let output = tensor_ops.tensor_matmul(attn_weights, value)
+    tensor.tensor_release(attn_weights)
+
+    return output
+}
+
+// Apply causal (lower triangular) mask
+fn apply_causal_mask(scores: *tensor.Tensor): void {
+    if scores == null or scores.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let data = scores.data as *f32
+    let neg_inf: f32 = -1e9
+
+    // Assuming scores shape: (..., seq_len, seq_len)
+    let seq_len = scores.shape[scores.ndim - 1]
+    let total = tensor.tensor_numel(scores)
+    let matrix_size = seq_len * seq_len
+
+    let num_matrices = total / matrix_size
+
+    var m: u64 = 0
+    while m < num_matrices {
+        let offset = m * matrix_size
+
+        var i: u64 = 0
+        while i < seq_len {
+            var j: u64 = i + 1
+            while j < seq_len {
+                // Mask positions where j > i (upper triangle)
+                data[offset + i * seq_len + j] = neg_inf
+                j = j + 1
+            }
+            i = i + 1
+        }
+        m = m + 1
+    }
+}
+
+// Apply arbitrary attention mask
+fn apply_attention_mask(scores: *tensor.Tensor, mask: *tensor.Tensor): void {
+    if scores == null or mask == null or scores.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let s_data = scores.data as *f32
+    let m_data = mask.data as *f32
+    let neg_inf: f32 = -1e9
+
+    let numel = tensor.tensor_numel(scores)
+    let mask_numel = tensor.tensor_numel(mask)
+
+    // Broadcasting: assume mask broadcasts to scores shape
+    var i: u64 = 0
+    while i < numel {
+        let mask_idx = i % mask_numel
+        if m_data[mask_idx] == 0.0 {
+            s_data[i] = neg_inf
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// MultiHeadAttention
+// ============================================
+
+struct MultiHeadAttentionData {
+    embed_dim: u32
+    num_heads: u32
+    head_dim: u32
+    dropout: f32
+    batch_first: bool
+    add_bias_kv: bool
+    add_zero_attn: bool
+    kdim: u32
+    vdim: u32
+}
+
+export fn MultiHeadAttention(embed_dim: u32, num_heads: u32): *module.Module {
+    return multihead_attention_create(embed_dim, num_heads, 0.0, true, false, false, embed_dim, embed_dim)
+}
+
+export fn multihead_attention_create(
+    embed_dim: u32,
+    num_heads: u32,
+    dropout: f64,
+    batch_first: bool,
+    add_bias_kv: bool,
+    add_zero_attn: bool,
+    kdim: u32,
+    vdim: u32
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "MultiHeadAttention", module.MODULE_MULTIHEAD_ATTENTION)
+
+    let extra = basics.alloc(MultiHeadAttentionData) as *MultiHeadAttentionData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.embed_dim = embed_dim
+    extra.num_heads = num_heads
+    extra.head_dim = embed_dim / num_heads
+    extra.dropout = dropout as f32
+    extra.batch_first = batch_first
+    extra.add_bias_kv = add_bias_kv
+    extra.add_zero_attn = add_zero_attn
+    extra.kdim = kdim
+    extra.vdim = vdim
+    m.extra = extra as *void
+
+    // Create projection layers
+    // Q, K, V projections (can be combined into one)
+    let q_proj = linear.Linear(embed_dim, embed_dim)
+    let k_proj = linear.Linear(kdim, embed_dim)
+    let v_proj = linear.Linear(vdim, embed_dim)
+    let out_proj = linear.Linear(embed_dim, embed_dim)
+
+    if q_proj != null {
+        module.module_add_child(m, "q_proj", q_proj)
+    }
+    if k_proj != null {
+        module.module_add_child(m, "k_proj", k_proj)
+    }
+    if v_proj != null {
+        module.module_add_child(m, "v_proj", v_proj)
+    }
+    if out_proj != null {
+        module.module_add_child(m, "out_proj", out_proj)
+    }
+
+    m.forward_fn = multihead_attention_forward
+    return m
+}
+
+fn multihead_attention_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    // For self-attention, input serves as query, key, and value
+    return multihead_attention_forward_full(m, input, input, input, null, false)
+}
+
+// Full forward with separate Q, K, V and optional mask
+export fn multihead_attention_forward_full(
+    m: *module.Module,
+    query: *tensor.Tensor,
+    key: *tensor.Tensor,
+    value: *tensor.Tensor,
+    attn_mask: *tensor.Tensor,
+    need_weights: bool
+): *tensor.Tensor {
+    let extra = m.extra as *MultiHeadAttentionData
+
+    if query == null or key == null or value == null {
+        return null
+    }
+
+    // Get child modules
+    let q_proj = module.module_get_child(m, "q_proj")
+    let k_proj = module.module_get_child(m, "k_proj")
+    let v_proj = module.module_get_child(m, "v_proj")
+    let out_proj = module.module_get_child(m, "out_proj")
+
+    if q_proj == null or k_proj == null or v_proj == null or out_proj == null {
+        return null
+    }
+
+    // Project Q, K, V
+    let q = module.module_forward(q_proj, query)
+    let k = module.module_forward(k_proj, key)
+    let v = module.module_forward(v_proj, value)
+
+    if q == null or k == null or v == null {
+        if q != null { tensor.tensor_release(q) }
+        if k != null { tensor.tensor_release(k) }
+        if v != null { tensor.tensor_release(v) }
+        return null
+    }
+
+    // Reshape for multi-head attention
+    // Input: (batch, seq, embed_dim)
+    // Output: (batch, num_heads, seq, head_dim)
+    let batch = q.shape[0]
+    let seq_len = q.shape[1]
+
+    let q_heads = reshape_for_attention(q, extra.num_heads, extra.head_dim)
+    let k_heads = reshape_for_attention(k, extra.num_heads, extra.head_dim)
+    let v_heads = reshape_for_attention(v, extra.num_heads, extra.head_dim)
+
+    tensor.tensor_release(q)
+    tensor.tensor_release(k)
+    tensor.tensor_release(v)
+
+    if q_heads == null or k_heads == null or v_heads == null {
+        if q_heads != null { tensor.tensor_release(q_heads) }
+        if k_heads != null { tensor.tensor_release(k_heads) }
+        if v_heads != null { tensor.tensor_release(v_heads) }
+        return null
+    }
+
+    // Compute attention
+    let attn_output = scaled_dot_product_attention(
+        q_heads, k_heads, v_heads, attn_mask, extra.dropout as f64, false
+    )
+
+    tensor.tensor_release(q_heads)
+    tensor.tensor_release(k_heads)
+    tensor.tensor_release(v_heads)
+
+    if attn_output == null {
+        return null
+    }
+
+    // Reshape back: (batch, num_heads, seq, head_dim) -> (batch, seq, embed_dim)
+    let concat = reshape_from_attention(attn_output, extra.num_heads, extra.head_dim)
+    tensor.tensor_release(attn_output)
+
+    if concat == null {
+        return null
+    }
+
+    // Final projection
+    let output = module.module_forward(out_proj, concat)
+    tensor.tensor_release(concat)
+
+    return output
+}
+
+// Reshape tensor for multi-head attention
+fn reshape_for_attention(t: *tensor.Tensor, num_heads: u32, head_dim: u32): *tensor.Tensor {
+    if t == null or t.ndim != 3 {
+        return null
+    }
+
+    let batch = t.shape[0]
+    let seq_len = t.shape[1]
+
+    // (batch, seq, embed) -> (batch, seq, heads, head_dim)
+    var temp_shape: [4]u64 = [batch, seq_len, num_heads as u64, head_dim as u64]
+    let reshaped = tensor.tensor_view(t, &temp_shape, 4)
+    if reshaped == null {
+        return null
+    }
+
+    // Transpose to (batch, heads, seq, head_dim)
+    let transposed = tensor.tensor_transpose(reshaped, 1, 2)
+    tensor.tensor_release(reshaped)
+
+    return transposed
+}
+
+// Reshape back from multi-head attention
+fn reshape_from_attention(t: *tensor.Tensor, num_heads: u32, head_dim: u32): *tensor.Tensor {
+    if t == null or t.ndim != 4 {
+        return null
+    }
+
+    let batch = t.shape[0]
+    let seq_len = t.shape[2]
+    let embed_dim = (num_heads * head_dim) as u64
+
+    // (batch, heads, seq, head_dim) -> (batch, seq, heads, head_dim)
+    let transposed = tensor.tensor_transpose(t, 1, 2)
+    if transposed == null {
+        return null
+    }
+
+    // Reshape to (batch, seq, embed_dim)
+    var out_shape: [3]u64 = [batch, seq_len, embed_dim]
+    let result = tensor.tensor_view(transposed, &out_shape, 3)
+    tensor.tensor_release(transposed)
+
+    return result
+}
+
+// ============================================
+// TransformerEncoderLayer
+// ============================================
+
+struct TransformerEncoderLayerData {
+    d_model: u32
+    nhead: u32
+    dim_feedforward: u32
+    dropout: f32
+    activation: u32  // 0 = ReLU, 1 = GELU
+    norm_first: bool
+}
+
+export fn TransformerEncoderLayer(d_model: u32, nhead: u32): *module.Module {
+    return transformer_encoder_layer_create(d_model, nhead, d_model * 4, 0.1, 0, false)
+}
+
+export fn transformer_encoder_layer_create(
+    d_model: u32,
+    nhead: u32,
+    dim_feedforward: u32,
+    dropout: f64,
+    activation_type: u32,
+    norm_first: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "TransformerEncoderLayer", module.MODULE_TRANSFORMER_ENCODER)
+
+    let extra = basics.alloc(TransformerEncoderLayerData) as *TransformerEncoderLayerData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.d_model = d_model
+    extra.nhead = nhead
+    extra.dim_feedforward = dim_feedforward
+    extra.dropout = dropout as f32
+    extra.activation = activation_type
+    extra.norm_first = norm_first
+    m.extra = extra as *void
+
+    // Self-attention
+    let self_attn = MultiHeadAttention(d_model, nhead)
+    if self_attn != null {
+        module.module_add_child(m, "self_attn", self_attn)
+    }
+
+    // Feedforward network
+    let linear1 = linear.Linear(d_model, dim_feedforward)
+    let linear2 = linear.Linear(dim_feedforward, d_model)
+    if linear1 != null {
+        module.module_add_child(m, "linear1", linear1)
+    }
+    if linear2 != null {
+        module.module_add_child(m, "linear2", linear2)
+    }
+
+    // Layer norms
+    var norm_shape: [1]u64 = [d_model as u64]
+    // Import normalization module would be needed here
+    // For now, skip layer norm creation
+
+    m.forward_fn = transformer_encoder_layer_forward
+    return m
+}
+
+fn transformer_encoder_layer_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *TransformerEncoderLayerData
+
+    if input == null {
+        return null
+    }
+
+    let self_attn = module.module_get_child(m, "self_attn")
+    let linear1 = module.module_get_child(m, "linear1")
+    let linear2 = module.module_get_child(m, "linear2")
+
+    if self_attn == null or linear1 == null or linear2 == null {
+        return null
+    }
+
+    // Self-attention with residual
+    let attn_out = module.module_forward(self_attn, input)
+    if attn_out == null {
+        return null
+    }
+
+    // Residual connection
+    var x = tensor_ops.tensor_add(input, attn_out)
+    tensor.tensor_release(attn_out)
+
+    if x == null {
+        return null
+    }
+
+    // Feedforward with residual
+    let ff1 = module.module_forward(linear1, x)
+    if ff1 == null {
+        tensor.tensor_release(x)
+        return null
+    }
+
+    // Activation
+    let activated = if extra.activation == 1 {
+        activation.gelu(ff1)
+    } else {
+        activation.relu(ff1)
+    }
+    tensor.tensor_release(ff1)
+
+    if activated == null {
+        tensor.tensor_release(x)
+        return null
+    }
+
+    let ff2 = module.module_forward(linear2, activated)
+    tensor.tensor_release(activated)
+
+    if ff2 == null {
+        tensor.tensor_release(x)
+        return null
+    }
+
+    // Final residual
+    let output = tensor_ops.tensor_add(x, ff2)
+    tensor.tensor_release(x)
+    tensor.tensor_release(ff2)
+
+    return output
+}
+
+// ============================================
+// TransformerDecoderLayer
+// ============================================
+
+export fn TransformerDecoderLayer(d_model: u32, nhead: u32): *module.Module {
+    return transformer_decoder_layer_create(d_model, nhead, d_model * 4, 0.1, 0, false)
+}
+
+export fn transformer_decoder_layer_create(
+    d_model: u32,
+    nhead: u32,
+    dim_feedforward: u32,
+    dropout: f64,
+    activation_type: u32,
+    norm_first: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "TransformerDecoderLayer", module.MODULE_TRANSFORMER_DECODER)
+
+    // Self-attention
+    let self_attn = MultiHeadAttention(d_model, nhead)
+    if self_attn != null {
+        module.module_add_child(m, "self_attn", self_attn)
+    }
+
+    // Cross-attention
+    let cross_attn = MultiHeadAttention(d_model, nhead)
+    if cross_attn != null {
+        module.module_add_child(m, "multihead_attn", cross_attn)
+    }
+
+    // Feedforward
+    let linear1 = linear.Linear(d_model, dim_feedforward)
+    let linear2 = linear.Linear(dim_feedforward, d_model)
+    if linear1 != null {
+        module.module_add_child(m, "linear1", linear1)
+    }
+    if linear2 != null {
+        module.module_add_child(m, "linear2", linear2)
+    }
+
+    m.forward_fn = null  // Decoder needs memory input
+    return m
+}
+
+// ============================================
+// Positional Encoding
+// ============================================
+
+struct PositionalEncodingData {
+    d_model: u32
+    max_len: u32
+    dropout: f32
+}
+
+export fn PositionalEncoding(d_model: u32, max_len: u32): *module.Module {
+    return positional_encoding_create(d_model, max_len, 0.1)
+}
+
+export fn positional_encoding_create(d_model: u32, max_len: u32, dropout: f64): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "PositionalEncoding", module.MODULE_POSITIONAL_ENCODING)
+
+    let extra = basics.alloc(PositionalEncodingData) as *PositionalEncodingData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.d_model = d_model
+    extra.max_len = max_len
+    extra.dropout = dropout as f32
+    m.extra = extra as *void
+
+    // Pre-compute positional encodings
+    var pe_shape: [2]u64 = [max_len as u64, d_model as u64]
+    let pe = tensor.tensor_zeros(&pe_shape, 2, tensor.DTYPE_F32)
+
+    if pe != null {
+        compute_positional_encodings(pe, d_model, max_len)
+        module.module_register_buffer(m, "pe", pe)
+    }
+
+    m.forward_fn = positional_encoding_forward
+    return m
+}
+
+fn compute_positional_encodings(pe: *tensor.Tensor, d_model: u32, max_len: u32): void {
+    if pe == null or pe.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let data = pe.data as *f32
+    let pi: f64 = 3.14159265358979323846
+
+    var pos: u32 = 0
+    while pos < max_len {
+        var i: u32 = 0
+        while i < d_model {
+            let angle = (pos as f64) / basics.pow(10000.0, (2.0 * (i / 2) as f64) / (d_model as f64))
+
+            let idx = (pos as u64) * (d_model as u64) + (i as u64)
+
+            if i % 2 == 0 {
+                data[idx] = basics.sin(angle) as f32
+            } else {
+                data[idx] = basics.cos(angle) as f32
+            }
+            i = i + 1
+        }
+        pos = pos + 1
+    }
+}
+
+fn positional_encoding_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    if input == null {
+        return null
+    }
+
+    let pe = module.module_get_buffer(m, "pe")
+    if pe == null {
+        return tensor.tensor_clone(input)
+    }
+
+    // Input: (batch, seq_len, d_model)
+    let seq_len = input.shape[1]
+
+    // Add positional encoding
+    let output = tensor.tensor_clone(input)
+    if output == null {
+        return null
+    }
+
+    if input.dtype == tensor.DTYPE_F32 {
+        let in_data = input.data as *f32
+        let out_data = output.data as *f32
+        let pe_data = pe.data as *f32
+
+        let batch = input.shape[0]
+        let d_model = input.shape[2]
+
+        var n: u64 = 0
+        while n < batch {
+            var s: u64 = 0
+            while s < seq_len {
+                var d: u64 = 0
+                while d < d_model {
+                    let in_idx = n * seq_len * d_model + s * d_model + d
+                    let pe_idx = s * d_model + d
+                    out_data[in_idx] = in_data[in_idx] + pe_data[pe_idx]
+                    d = d + 1
+                }
+                s = s + 1
+            }
+            n = n + 1
+        }
+    }
+
+    return output
+}
+
+// ============================================
+// Embedding Layer
+// ============================================
+
+struct EmbeddingData {
+    num_embeddings: u32
+    embedding_dim: u32
+    padding_idx: i32
+}
+
+export fn Embedding(num_embeddings: u32, embedding_dim: u32): *module.Module {
+    return embedding_create(num_embeddings, embedding_dim, -1)
+}
+
+export fn embedding_create(num_embeddings: u32, embedding_dim: u32, padding_idx: i32): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "Embedding", module.MODULE_EMBEDDING)
+
+    let extra = basics.alloc(EmbeddingData) as *EmbeddingData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.num_embeddings = num_embeddings
+    extra.embedding_dim = embedding_dim
+    extra.padding_idx = padding_idx
+    m.extra = extra as *void
+
+    // Create embedding weight
+    var weight_shape: [2]u64 = [num_embeddings as u64, embedding_dim as u64]
+    let weight = tensor.tensor_randn(&weight_shape, 2, tensor.DTYPE_F32)
+    if weight != null {
+        module.module_register_parameter(m, "weight", weight)
+
+        // Zero out padding index if specified
+        if padding_idx >= 0 {
+            zero_embedding_row(weight, padding_idx as u32, embedding_dim)
+        }
+    }
+
+    m.forward_fn = embedding_forward
+    return m
+}
+
+fn zero_embedding_row(weight: *tensor.Tensor, idx: u32, dim: u32): void {
+    if weight == null or weight.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let data = weight.data as *f32
+    let offset = (idx as u64) * (dim as u64)
+
+    var i: u32 = 0
+    while i < dim {
+        data[offset + (i as u64)] = 0.0
+        i = i + 1
+    }
+}
+
+fn embedding_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *EmbeddingData
+
+    if input == null {
+        return null
+    }
+
+    let weight = module.module_get_parameter(m, "weight")
+    if weight == null {
+        return null
+    }
+
+    // Input contains indices, output has embeddings
+    // Input: (...) -> Output: (..., embedding_dim)
+    let numel = tensor.tensor_numel(input)
+
+    // Create output shape: input_shape + (embedding_dim,)
+    var out_shape: [8]u64 = undefined
+    var i: u32 = 0
+    while i < input.ndim {
+        out_shape[i] = input.shape[i]
+        i = i + 1
+    }
+    out_shape[input.ndim] = extra.embedding_dim as u64
+
+    let output = tensor.tensor_empty(&out_shape, input.ndim + 1, tensor.DTYPE_F32)
+    if output == null {
+        return null
+    }
+
+    // Lookup embeddings
+    let w_data = weight.data as *f32
+    let out_data = output.data as *f32
+
+    // Input is expected to be integer type
+    // For simplicity, treat as f32 indices
+    let in_data = input.data as *f32
+
+    var idx: u64 = 0
+    while idx < numel {
+        let embed_idx = (in_data[idx] as u32) % extra.num_embeddings
+        let w_offset = (embed_idx as u64) * (extra.embedding_dim as u64)
+        let o_offset = idx * (extra.embedding_dim as u64)
+
+        var d: u32 = 0
+        while d < extra.embedding_dim {
+            out_data[o_offset + (d as u64)] = w_data[w_offset + (d as u64)]
+            d = d + 1
+        }
+        idx = idx + 1
+    }
+
+    return output
+}

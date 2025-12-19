@@ -1,0 +1,244 @@
+// HomeOS Neural Network Linear Layer
+// Fully connected layer implementation
+
+const basics = @import("basics")
+const tensor = @import("ml/tensor")
+const tensor_ops = @import("ml/tensor_ops")
+const autograd = @import("ml/autograd")
+const module = @import("ml/nn/module")
+
+// Linear layer extra data
+struct LinearData {
+    in_features: u32
+    out_features: u32
+    use_bias: bool
+}
+
+// Create linear layer
+export fn linear_create(in_features: u32, out_features: u32, use_bias: bool): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "Linear", module.MODULE_LINEAR)
+
+    // Allocate extra data
+    let extra = basics.alloc(LinearData) as *LinearData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.in_features = in_features
+    extra.out_features = out_features
+    extra.use_bias = use_bias
+    m.extra = extra as *void
+
+    // Create weight parameter: (out_features, in_features)
+    var weight_shape: [2]u64 = [out_features as u64, in_features as u64]
+    let weight = tensor.tensor_empty(&weight_shape, 2, tensor.DTYPE_F32)
+    if weight == null {
+        basics.free(extra)
+        basics.free(m)
+        return null
+    }
+
+    // Kaiming initialization for ReLU
+    let k = 1.0 / basics.sqrt(in_features as f64)
+    init_uniform(weight, -k, k)
+
+    module.module_register_parameter(m, "weight", weight)
+
+    // Create bias parameter if needed
+    if use_bias {
+        var bias_shape: [1]u64 = [out_features as u64]
+        let bias = tensor.tensor_empty(&bias_shape, 1, tensor.DTYPE_F32)
+        if bias != null {
+            init_uniform(bias, -k, k)
+            module.module_register_parameter(m, "bias", bias)
+        }
+    }
+
+    // Set forward function
+    m.forward_fn = linear_forward
+
+    return m
+}
+
+// Initialize tensor with uniform distribution
+fn init_uniform(t: *tensor.Tensor, low: f64, high: f64): void {
+    let numel = tensor.tensor_numel(t)
+    let range = high - low
+
+    if t.dtype == tensor.DTYPE_F32 {
+        let data = t.data as *f32
+        var i: u64 = 0
+        while i < numel {
+            // Simple random in [low, high]
+            let r = tensor.rand_f64()
+            data[i] = (low + r * range) as f32
+            i = i + 1
+        }
+    }
+}
+
+// Forward pass: output = input @ weight.T + bias
+fn linear_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *LinearData
+
+    // Get weight parameter
+    let weight = module.module_get_parameter(m, "weight")
+    if weight == null {
+        return null
+    }
+
+    // Input shape: (batch, in_features) or (in_features,)
+    // Weight shape: (out_features, in_features)
+    // Output shape: (batch, out_features) or (out_features,)
+
+    var output: *tensor.Tensor = null
+
+    if input.ndim == 1 {
+        // Single sample: (in_features,)
+        // Need to expand to (1, in_features), matmul, then squeeze
+
+        var expanded_shape: [2]u64 = [1, input.shape[0]]
+        let expanded = tensor.tensor_view(input, &expanded_shape, 2)
+        if expanded == null {
+            return null
+        }
+
+        // Transpose weight to (in_features, out_features)
+        let weight_t = tensor.tensor_transpose(weight, 0, 1)
+        if weight_t == null {
+            tensor.tensor_release(expanded)
+            return null
+        }
+
+        // Matmul: (1, in) @ (in, out) = (1, out)
+        output = autograd.autograd_matmul(expanded, weight_t)
+
+        tensor.tensor_release(weight_t)
+        tensor.tensor_release(expanded)
+
+        if output != null {
+            // Squeeze to (out_features,)
+            let squeezed = tensor.tensor_squeeze(output, 0)
+            tensor.tensor_release(output)
+            output = squeezed
+        }
+    } else if input.ndim == 2 {
+        // Batch: (batch, in_features)
+
+        // Transpose weight to (in_features, out_features)
+        let weight_t = tensor.tensor_transpose(weight, 0, 1)
+        if weight_t == null {
+            return null
+        }
+
+        // Matmul: (batch, in) @ (in, out) = (batch, out)
+        output = autograd.autograd_matmul(input, weight_t)
+
+        tensor.tensor_release(weight_t)
+    } else {
+        // Unsupported input shape
+        return null
+    }
+
+    // Add bias if present
+    if output != null and extra.use_bias {
+        let bias = module.module_get_parameter(m, "bias")
+        if bias != null {
+            // Broadcasting: (batch, out) + (out,)
+            output = linear_add_bias(output, bias)
+        }
+    }
+
+    return output
+}
+
+// Add bias with broadcasting
+fn linear_add_bias(input: *tensor.Tensor, bias: *tensor.Tensor): *tensor.Tensor {
+    // For now, simple element-wise add for 1D output
+    // Full broadcasting would be more complex
+
+    let numel = tensor.tensor_numel(input)
+    let bias_size = tensor.tensor_numel(bias)
+
+    let result = tensor.tensor_clone(input)
+    if result == null {
+        return input  // Return original if clone fails
+    }
+
+    if input.dtype == tensor.DTYPE_F32 {
+        let ri = input.data as *f32
+        let rb = bias.data as *f32
+        let ro = result.data as *f32
+
+        if input.ndim == 1 {
+            // (out_features,) + (out_features,)
+            var i: u64 = 0
+            while i < numel {
+                ro[i] = ri[i] + rb[i]
+                i = i + 1
+            }
+        } else if input.ndim == 2 {
+            // (batch, out_features) + (out_features,)
+            let batch = input.shape[0]
+            let features = input.shape[1]
+
+            var b: u64 = 0
+            while b < batch {
+                var f: u64 = 0
+                while f < features {
+                    ro[b * features + f] = ri[b * features + f] + rb[f]
+                    f = f + 1
+                }
+                b = b + 1
+            }
+        }
+    }
+
+    tensor.tensor_release(input)
+    return result
+}
+
+// Get input features
+export fn linear_in_features(m: *module.Module): u32 {
+    let extra = m.extra as *LinearData
+    return extra.in_features
+}
+
+// Get output features
+export fn linear_out_features(m: *module.Module): u32 {
+    let extra = m.extra as *LinearData
+    return extra.out_features
+}
+
+// Reset parameters
+export fn linear_reset_parameters(m: *module.Module): void {
+    let extra = m.extra as *LinearData
+    let k = 1.0 / basics.sqrt(extra.in_features as f64)
+
+    let weight = module.module_get_parameter(m, "weight")
+    if weight != null {
+        init_uniform(weight, -k, k)
+    }
+
+    if extra.use_bias {
+        let bias = module.module_get_parameter(m, "bias")
+        if bias != null {
+            init_uniform(bias, -k, k)
+        }
+    }
+}
+
+// Create shorthand
+export fn Linear(in_features: u32, out_features: u32): *module.Module {
+    return linear_create(in_features, out_features, true)
+}
+
+// Create without bias
+export fn Linear_no_bias(in_features: u32, out_features: u32): *module.Module {
+    return linear_create(in_features, out_features, false)
+}

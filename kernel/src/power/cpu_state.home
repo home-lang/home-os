@@ -1,0 +1,841 @@
+// HomeOS CPU State Save/Restore
+// Cross-platform CPU state preservation for suspend/hibernate
+
+const basics = @import("basics")
+const kernel = @import("kernel")
+
+// Architecture detection
+const ARCH_X86_64: u32 = 0
+const ARCH_ARM64: u32 = 1
+
+// Maximum CPUs supported
+const MAX_CPUS: u32 = 256
+
+// FPU/SIMD state sizes
+const FXSAVE_SIZE: u32 = 512      // x86 legacy FPU
+const XSAVE_SIZE: u32 = 2688      // x86 AVX-512 max
+const FPSIMD_SIZE: u32 = 528      // ARM64 FPSIMD
+
+// x86_64 CPU State Structure
+struct X86CPUState {
+    // General purpose registers
+    rax: u64
+    rbx: u64
+    rcx: u64
+    rdx: u64
+    rsi: u64
+    rdi: u64
+    rbp: u64
+    rsp: u64
+    r8: u64
+    r9: u64
+    r10: u64
+    r11: u64
+    r12: u64
+    r13: u64
+    r14: u64
+    r15: u64
+
+    // Instruction pointer and flags
+    rip: u64
+    rflags: u64
+
+    // Control registers
+    cr0: u64
+    cr2: u64
+    cr3: u64
+    cr4: u64
+
+    // Segment registers
+    cs: u16
+    ds: u16
+    es: u16
+    fs: u16
+    gs: u16
+    ss: u16
+    _seg_pad: u16
+
+    // Task register and LDT
+    tr: u16
+    ldtr: u16
+    _tr_pad: u32
+
+    // Descriptor table registers
+    gdt_base: u64
+    gdt_limit: u16
+    _gdt_pad: u16
+    _gdt_pad2: u32
+    idt_base: u64
+    idt_limit: u16
+    _idt_pad: u16
+    _idt_pad2: u32
+
+    // Model Specific Registers
+    efer: u64          // Extended Feature Enable Register
+    star: u64          // SYSCALL CS/SS
+    lstar: u64         // SYSCALL RIP (64-bit)
+    cstar: u64         // SYSCALL RIP (compat)
+    sfmask: u64        // SYSCALL RFLAGS mask
+    kernel_gs_base: u64
+    gs_base: u64
+    fs_base: u64
+
+    // Performance monitoring (basic set)
+    perf_global_ctrl: u64
+    pat: u64           // Page Attribute Table
+
+    // FPU/SSE/AVX state
+    fpu_state: [XSAVE_SIZE]u8
+
+    // Debug registers
+    dr0: u64
+    dr1: u64
+    dr2: u64
+    dr3: u64
+    dr6: u64
+    dr7: u64
+
+    // State validity flags
+    valid: u32
+    xsave_features: u32   // Which XSAVE features are present
+}
+
+// ARM64 CPU State Structure
+struct ARM64CPUState {
+    // General purpose registers (X0-X30)
+    x: [31]u64
+
+    // Stack pointers
+    sp_el0: u64
+    sp_el1: u64
+
+    // Exception link registers
+    elr_el1: u64
+
+    // Saved Program Status Registers
+    spsr_el1: u64
+
+    // System registers - MMU
+    sctlr_el1: u64     // System Control Register
+    tcr_el1: u64       // Translation Control Register
+    ttbr0_el1: u64     // Translation Table Base Register 0
+    ttbr1_el1: u64     // Translation Table Base Register 1
+    mair_el1: u64      // Memory Attribute Indirection Register
+
+    // System registers - Exception handling
+    vbar_el1: u64      // Vector Base Address Register
+
+    // System registers - Misc
+    cpacr_el1: u64     // Coprocessor Access Control Register
+    contextidr_el1: u64
+    tpidr_el0: u64     // Thread ID (user)
+    tpidr_el1: u64     // Thread ID (kernel)
+    tpidrro_el0: u64   // Thread ID (read-only user)
+
+    // Timer registers
+    cntv_cval_el0: u64
+    cntv_ctl_el0: u64
+    cntp_cval_el0: u64
+    cntp_ctl_el0: u64
+    cntfrq_el0: u64
+
+    // Performance monitoring
+    pmcr_el0: u64
+    pmuserenr_el0: u64
+
+    // FPU/SIMD state (V0-V31, 128-bit each)
+    v: [32][16]u8
+    fpcr: u64          // FP Control Register
+    fpsr: u64          // FP Status Register
+
+    // State validity
+    valid: u32
+    features: u32      // CPU feature flags present
+}
+
+// Generic CPU state wrapper
+struct CPUState {
+    arch: u32
+    cpu_id: u32
+    state: union {
+        x86: X86CPUState
+        arm64: ARM64CPUState
+    }
+}
+
+// Per-CPU state storage
+var cpu_states: [MAX_CPUS]CPUState
+var cpu_count: u32 = 0
+var current_arch: u32 = ARCH_X86_64
+
+// MSR indices for x86_64
+const MSR_EFER: u32 = 0xC0000080
+const MSR_STAR: u32 = 0xC0000081
+const MSR_LSTAR: u32 = 0xC0000082
+const MSR_CSTAR: u32 = 0xC0000083
+const MSR_SFMASK: u32 = 0xC0000084
+const MSR_FS_BASE: u32 = 0xC0000100
+const MSR_GS_BASE: u32 = 0xC0000101
+const MSR_KERNEL_GS_BASE: u32 = 0xC0000102
+const MSR_PERF_GLOBAL_CTRL: u32 = 0x38F
+const MSR_PAT: u32 = 0x277
+
+// Initialize CPU state subsystem
+export fn cpu_state_init(): void {
+    cpu_count = kernel.get_cpu_count()
+    if cpu_count > MAX_CPUS {
+        cpu_count = MAX_CPUS
+    }
+
+    // Detect architecture
+    current_arch = detect_architecture()
+
+    // Initialize all CPU states
+    var i: u32 = 0
+    while i < cpu_count {
+        cpu_states[i].arch = current_arch
+        cpu_states[i].cpu_id = i
+        if current_arch == ARCH_X86_64 {
+            cpu_states[i].state.x86.valid = 0
+        } else {
+            cpu_states[i].state.arm64.valid = 0
+        }
+        i = i + 1
+    }
+}
+
+// Detect current architecture
+fn detect_architecture(): u32 {
+    // Check CPUID on x86 or MIDR on ARM
+    // For now, use compile-time detection
+    #if defined(__x86_64__)
+        return ARCH_X86_64
+    #elif defined(__aarch64__)
+        return ARCH_ARM64
+    #else
+        return ARCH_X86_64  // Default
+    #endif
+}
+
+// ============================================
+// x86_64 State Save/Restore
+// ============================================
+
+// Read MSR
+fn x86_rdmsr(msr: u32): u64 {
+    var low: u32
+    var high: u32
+    asm volatile (
+        "rdmsr"
+        : "=a" (low), "=d" (high)
+        : "c" (msr)
+    )
+    return (high as u64 << 32) | (low as u64)
+}
+
+// Write MSR
+fn x86_wrmsr(msr: u32, value: u64): void {
+    let low = (value & 0xFFFFFFFF) as u32
+    let high = (value >> 32) as u32
+    asm volatile (
+        "wrmsr"
+        :
+        : "c" (msr), "a" (low), "d" (high)
+    )
+}
+
+// Save x86_64 CPU state
+export fn x86_save_cpu_state(state: *X86CPUState): void {
+    // Save general purpose registers
+    asm volatile (
+        "movq %%rax, %0\n"
+        "movq %%rbx, %1\n"
+        "movq %%rcx, %2\n"
+        "movq %%rdx, %3\n"
+        "movq %%rsi, %4\n"
+        "movq %%rdi, %5\n"
+        "movq %%rbp, %6\n"
+        "movq %%rsp, %7\n"
+        : "=m" (state.rax), "=m" (state.rbx), "=m" (state.rcx), "=m" (state.rdx),
+          "=m" (state.rsi), "=m" (state.rdi), "=m" (state.rbp), "=m" (state.rsp)
+    )
+
+    asm volatile (
+        "movq %%r8, %0\n"
+        "movq %%r9, %1\n"
+        "movq %%r10, %2\n"
+        "movq %%r11, %3\n"
+        "movq %%r12, %4\n"
+        "movq %%r13, %5\n"
+        "movq %%r14, %6\n"
+        "movq %%r15, %7\n"
+        : "=m" (state.r8), "=m" (state.r9), "=m" (state.r10), "=m" (state.r11),
+          "=m" (state.r12), "=m" (state.r13), "=m" (state.r14), "=m" (state.r15)
+    )
+
+    // Save flags
+    asm volatile (
+        "pushfq\n"
+        "popq %0\n"
+        : "=m" (state.rflags)
+    )
+
+    // Save control registers
+    asm volatile (
+        "movq %%cr0, %%rax\n"
+        "movq %%rax, %0\n"
+        "movq %%cr2, %%rax\n"
+        "movq %%rax, %1\n"
+        "movq %%cr3, %%rax\n"
+        "movq %%rax, %2\n"
+        "movq %%cr4, %%rax\n"
+        "movq %%rax, %3\n"
+        : "=m" (state.cr0), "=m" (state.cr2), "=m" (state.cr3), "=m" (state.cr4)
+        :
+        : "rax"
+    )
+
+    // Save segment registers
+    asm volatile (
+        "movw %%cs, %0\n"
+        "movw %%ds, %1\n"
+        "movw %%es, %2\n"
+        "movw %%fs, %3\n"
+        "movw %%gs, %4\n"
+        "movw %%ss, %5\n"
+        : "=m" (state.cs), "=m" (state.ds), "=m" (state.es),
+          "=m" (state.fs), "=m" (state.gs), "=m" (state.ss)
+    )
+
+    // Save GDT
+    asm volatile (
+        "sgdt %0\n"
+        : "=m" (state.gdt_limit)
+    )
+    // GDT base is at offset 2 in the GDTR structure
+    state.gdt_base = *((&state.gdt_limit + 2) as *u64)
+
+    // Save IDT
+    asm volatile (
+        "sidt %0\n"
+        : "=m" (state.idt_limit)
+    )
+    state.idt_base = *((&state.idt_limit + 2) as *u64)
+
+    // Save task register
+    asm volatile (
+        "str %0\n"
+        : "=m" (state.tr)
+    )
+
+    // Save LDT register
+    asm volatile (
+        "sldt %0\n"
+        : "=m" (state.ldtr)
+    )
+
+    // Save MSRs
+    state.efer = x86_rdmsr(MSR_EFER)
+    state.star = x86_rdmsr(MSR_STAR)
+    state.lstar = x86_rdmsr(MSR_LSTAR)
+    state.cstar = x86_rdmsr(MSR_CSTAR)
+    state.sfmask = x86_rdmsr(MSR_SFMASK)
+    state.fs_base = x86_rdmsr(MSR_FS_BASE)
+    state.gs_base = x86_rdmsr(MSR_GS_BASE)
+    state.kernel_gs_base = x86_rdmsr(MSR_KERNEL_GS_BASE)
+    state.pat = x86_rdmsr(MSR_PAT)
+
+    // Save FPU/SSE/AVX state using FXSAVE or XSAVE
+    let fpu_ptr = &state.fpu_state as *void
+    asm volatile (
+        "fxsave64 (%0)\n"
+        :
+        : "r" (fpu_ptr)
+        : "memory"
+    )
+
+    // Save debug registers
+    asm volatile (
+        "movq %%dr0, %%rax\n"
+        "movq %%rax, %0\n"
+        "movq %%dr1, %%rax\n"
+        "movq %%rax, %1\n"
+        "movq %%dr2, %%rax\n"
+        "movq %%rax, %2\n"
+        "movq %%dr3, %%rax\n"
+        "movq %%rax, %3\n"
+        "movq %%dr6, %%rax\n"
+        "movq %%rax, %4\n"
+        "movq %%dr7, %%rax\n"
+        "movq %%rax, %5\n"
+        : "=m" (state.dr0), "=m" (state.dr1), "=m" (state.dr2),
+          "=m" (state.dr3), "=m" (state.dr6), "=m" (state.dr7)
+        :
+        : "rax"
+    )
+
+    state.valid = 1
+}
+
+// Restore x86_64 CPU state
+export fn x86_restore_cpu_state(state: *X86CPUState): void {
+    if state.valid == 0 {
+        return
+    }
+
+    // Restore debug registers first (before enabling debugging)
+    asm volatile (
+        "movq %0, %%rax\n"
+        "movq %%rax, %%dr0\n"
+        "movq %1, %%rax\n"
+        "movq %%rax, %%dr1\n"
+        "movq %2, %%rax\n"
+        "movq %%rax, %%dr2\n"
+        "movq %3, %%rax\n"
+        "movq %%rax, %%dr3\n"
+        "movq %4, %%rax\n"
+        "movq %%rax, %%dr6\n"
+        "movq %5, %%rax\n"
+        "movq %%rax, %%dr7\n"
+        :
+        : "m" (state.dr0), "m" (state.dr1), "m" (state.dr2),
+          "m" (state.dr3), "m" (state.dr6), "m" (state.dr7)
+        : "rax"
+    )
+
+    // Restore MSRs
+    x86_wrmsr(MSR_EFER, state.efer)
+    x86_wrmsr(MSR_STAR, state.star)
+    x86_wrmsr(MSR_LSTAR, state.lstar)
+    x86_wrmsr(MSR_CSTAR, state.cstar)
+    x86_wrmsr(MSR_SFMASK, state.sfmask)
+    x86_wrmsr(MSR_FS_BASE, state.fs_base)
+    x86_wrmsr(MSR_GS_BASE, state.gs_base)
+    x86_wrmsr(MSR_KERNEL_GS_BASE, state.kernel_gs_base)
+    x86_wrmsr(MSR_PAT, state.pat)
+
+    // Restore GDT
+    var gdtr: [10]u8
+    *((&gdtr as *u16)) = state.gdt_limit
+    *((&gdtr + 2) as *u64) = state.gdt_base
+    asm volatile (
+        "lgdt %0\n"
+        :
+        : "m" (gdtr)
+    )
+
+    // Restore IDT
+    var idtr: [10]u8
+    *((&idtr as *u16)) = state.idt_limit
+    *((&idtr + 2) as *u64) = state.idt_base
+    asm volatile (
+        "lidt %0\n"
+        :
+        : "m" (idtr)
+    )
+
+    // Restore control registers (CR3 last to update page tables)
+    asm volatile (
+        "movq %0, %%rax\n"
+        "movq %%rax, %%cr4\n"
+        "movq %1, %%rax\n"
+        "movq %%rax, %%cr0\n"
+        "movq %2, %%rax\n"
+        "movq %%rax, %%cr3\n"
+        :
+        : "m" (state.cr4), "m" (state.cr0), "m" (state.cr3)
+        : "rax"
+    )
+
+    // Restore FPU/SSE/AVX state
+    let fpu_ptr = &state.fpu_state as *void
+    asm volatile (
+        "fxrstor64 (%0)\n"
+        :
+        : "r" (fpu_ptr)
+        : "memory"
+    )
+
+    // Restore flags
+    asm volatile (
+        "pushq %0\n"
+        "popfq\n"
+        :
+        : "m" (state.rflags)
+    )
+
+    // Restore general purpose registers
+    asm volatile (
+        "movq %0, %%r15\n"
+        "movq %1, %%r14\n"
+        "movq %2, %%r13\n"
+        "movq %3, %%r12\n"
+        "movq %4, %%r11\n"
+        "movq %5, %%r10\n"
+        "movq %6, %%r9\n"
+        "movq %7, %%r8\n"
+        :
+        : "m" (state.r15), "m" (state.r14), "m" (state.r13), "m" (state.r12),
+          "m" (state.r11), "m" (state.r10), "m" (state.r9), "m" (state.r8)
+    )
+
+    asm volatile (
+        "movq %0, %%rsp\n"
+        "movq %1, %%rbp\n"
+        "movq %2, %%rdi\n"
+        "movq %3, %%rsi\n"
+        "movq %4, %%rdx\n"
+        "movq %5, %%rcx\n"
+        "movq %6, %%rbx\n"
+        "movq %7, %%rax\n"
+        :
+        : "m" (state.rsp), "m" (state.rbp), "m" (state.rdi), "m" (state.rsi),
+          "m" (state.rdx), "m" (state.rcx), "m" (state.rbx), "m" (state.rax)
+    )
+}
+
+// ============================================
+// ARM64 State Save/Restore
+// ============================================
+
+// Save ARM64 CPU state
+export fn arm64_save_cpu_state(state: *ARM64CPUState): void {
+    // Save general purpose registers X0-X30
+    asm volatile (
+        "stp x0, x1, [%0, #0]\n"
+        "stp x2, x3, [%0, #16]\n"
+        "stp x4, x5, [%0, #32]\n"
+        "stp x6, x7, [%0, #48]\n"
+        "stp x8, x9, [%0, #64]\n"
+        "stp x10, x11, [%0, #80]\n"
+        "stp x12, x13, [%0, #96]\n"
+        "stp x14, x15, [%0, #112]\n"
+        "stp x16, x17, [%0, #128]\n"
+        "stp x18, x19, [%0, #144]\n"
+        "stp x20, x21, [%0, #160]\n"
+        "stp x22, x23, [%0, #176]\n"
+        "stp x24, x25, [%0, #192]\n"
+        "stp x26, x27, [%0, #208]\n"
+        "stp x28, x29, [%0, #224]\n"
+        "str x30, [%0, #240]\n"
+        :
+        : "r" (&state.x)
+        : "memory"
+    )
+
+    // Save stack pointers
+    asm volatile (
+        "mrs %0, sp_el0\n"
+        "mov %1, sp\n"  // Current SP (EL1)
+        : "=r" (state.sp_el0), "=r" (state.sp_el1)
+    )
+
+    // Save exception registers
+    asm volatile (
+        "mrs %0, elr_el1\n"
+        "mrs %1, spsr_el1\n"
+        : "=r" (state.elr_el1), "=r" (state.spsr_el1)
+    )
+
+    // Save system registers - MMU
+    asm volatile (
+        "mrs %0, sctlr_el1\n"
+        "mrs %1, tcr_el1\n"
+        "mrs %2, ttbr0_el1\n"
+        "mrs %3, ttbr1_el1\n"
+        "mrs %4, mair_el1\n"
+        : "=r" (state.sctlr_el1), "=r" (state.tcr_el1),
+          "=r" (state.ttbr0_el1), "=r" (state.ttbr1_el1),
+          "=r" (state.mair_el1)
+    )
+
+    // Save exception vector
+    asm volatile (
+        "mrs %0, vbar_el1\n"
+        : "=r" (state.vbar_el1)
+    )
+
+    // Save misc system registers
+    asm volatile (
+        "mrs %0, cpacr_el1\n"
+        "mrs %1, contextidr_el1\n"
+        "mrs %2, tpidr_el0\n"
+        "mrs %3, tpidr_el1\n"
+        "mrs %4, tpidrro_el0\n"
+        : "=r" (state.cpacr_el1), "=r" (state.contextidr_el1),
+          "=r" (state.tpidr_el0), "=r" (state.tpidr_el1),
+          "=r" (state.tpidrro_el0)
+    )
+
+    // Save timer registers
+    asm volatile (
+        "mrs %0, cntv_cval_el0\n"
+        "mrs %1, cntv_ctl_el0\n"
+        "mrs %2, cntp_cval_el0\n"
+        "mrs %3, cntp_ctl_el0\n"
+        "mrs %4, cntfrq_el0\n"
+        : "=r" (state.cntv_cval_el0), "=r" (state.cntv_ctl_el0),
+          "=r" (state.cntp_cval_el0), "=r" (state.cntp_ctl_el0),
+          "=r" (state.cntfrq_el0)
+    )
+
+    // Save FPU/SIMD state
+    asm volatile (
+        "stp q0, q1, [%0, #0]\n"
+        "stp q2, q3, [%0, #32]\n"
+        "stp q4, q5, [%0, #64]\n"
+        "stp q6, q7, [%0, #96]\n"
+        "stp q8, q9, [%0, #128]\n"
+        "stp q10, q11, [%0, #160]\n"
+        "stp q12, q13, [%0, #192]\n"
+        "stp q14, q15, [%0, #224]\n"
+        "stp q16, q17, [%0, #256]\n"
+        "stp q18, q19, [%0, #288]\n"
+        "stp q20, q21, [%0, #320]\n"
+        "stp q22, q23, [%0, #352]\n"
+        "stp q24, q25, [%0, #384]\n"
+        "stp q26, q27, [%0, #416]\n"
+        "stp q28, q29, [%0, #448]\n"
+        "stp q30, q31, [%0, #480]\n"
+        :
+        : "r" (&state.v)
+        : "memory"
+    )
+
+    asm volatile (
+        "mrs %0, fpcr\n"
+        "mrs %1, fpsr\n"
+        : "=r" (state.fpcr), "=r" (state.fpsr)
+    )
+
+    state.valid = 1
+}
+
+// Restore ARM64 CPU state
+export fn arm64_restore_cpu_state(state: *ARM64CPUState): void {
+    if state.valid == 0 {
+        return
+    }
+
+    // Restore FPU/SIMD control registers first
+    asm volatile (
+        "msr fpcr, %0\n"
+        "msr fpsr, %1\n"
+        :
+        : "r" (state.fpcr), "r" (state.fpsr)
+    )
+
+    // Restore FPU/SIMD data
+    asm volatile (
+        "ldp q0, q1, [%0, #0]\n"
+        "ldp q2, q3, [%0, #32]\n"
+        "ldp q4, q5, [%0, #64]\n"
+        "ldp q6, q7, [%0, #96]\n"
+        "ldp q8, q9, [%0, #128]\n"
+        "ldp q10, q11, [%0, #160]\n"
+        "ldp q12, q13, [%0, #192]\n"
+        "ldp q14, q15, [%0, #224]\n"
+        "ldp q16, q17, [%0, #256]\n"
+        "ldp q18, q19, [%0, #288]\n"
+        "ldp q20, q21, [%0, #320]\n"
+        "ldp q22, q23, [%0, #352]\n"
+        "ldp q24, q25, [%0, #384]\n"
+        "ldp q26, q27, [%0, #416]\n"
+        "ldp q28, q29, [%0, #448]\n"
+        "ldp q30, q31, [%0, #480]\n"
+        :
+        : "r" (&state.v)
+        : "memory"
+    )
+
+    // Restore timer registers
+    asm volatile (
+        "msr cntv_ctl_el0, %0\n"
+        "msr cntv_cval_el0, %1\n"
+        "msr cntp_ctl_el0, %2\n"
+        "msr cntp_cval_el0, %3\n"
+        :
+        : "r" (state.cntv_ctl_el0), "r" (state.cntv_cval_el0),
+          "r" (state.cntp_ctl_el0), "r" (state.cntp_cval_el0)
+    )
+
+    // Restore misc system registers
+    asm volatile (
+        "msr cpacr_el1, %0\n"
+        "msr contextidr_el1, %1\n"
+        "msr tpidr_el0, %2\n"
+        "msr tpidr_el1, %3\n"
+        "msr tpidrro_el0, %4\n"
+        :
+        : "r" (state.cpacr_el1), "r" (state.contextidr_el1),
+          "r" (state.tpidr_el0), "r" (state.tpidr_el1),
+          "r" (state.tpidrro_el0)
+    )
+
+    // Restore exception vector
+    asm volatile (
+        "msr vbar_el1, %0\n"
+        :
+        : "r" (state.vbar_el1)
+    )
+
+    // Restore MMU registers (SCTLR last to re-enable MMU)
+    asm volatile (
+        "msr mair_el1, %0\n"
+        "msr tcr_el1, %1\n"
+        "msr ttbr0_el1, %2\n"
+        "msr ttbr1_el1, %3\n"
+        "isb\n"
+        "msr sctlr_el1, %4\n"
+        "isb\n"
+        :
+        : "r" (state.mair_el1), "r" (state.tcr_el1),
+          "r" (state.ttbr0_el1), "r" (state.ttbr1_el1),
+          "r" (state.sctlr_el1)
+    )
+
+    // Restore exception registers
+    asm volatile (
+        "msr elr_el1, %0\n"
+        "msr spsr_el1, %1\n"
+        :
+        : "r" (state.elr_el1), "r" (state.spsr_el1)
+    )
+
+    // Restore stack pointers
+    asm volatile (
+        "msr sp_el0, %0\n"
+        "mov sp, %1\n"
+        :
+        : "r" (state.sp_el0), "r" (state.sp_el1)
+    )
+
+    // Restore general purpose registers
+    asm volatile (
+        "ldp x0, x1, [%0, #0]\n"
+        "ldp x2, x3, [%0, #16]\n"
+        "ldp x4, x5, [%0, #32]\n"
+        "ldp x6, x7, [%0, #48]\n"
+        "ldp x8, x9, [%0, #64]\n"
+        "ldp x10, x11, [%0, #80]\n"
+        "ldp x12, x13, [%0, #96]\n"
+        "ldp x14, x15, [%0, #112]\n"
+        "ldp x16, x17, [%0, #128]\n"
+        "ldp x18, x19, [%0, #144]\n"
+        "ldp x20, x21, [%0, #160]\n"
+        "ldp x22, x23, [%0, #176]\n"
+        "ldp x24, x25, [%0, #192]\n"
+        "ldp x26, x27, [%0, #208]\n"
+        "ldp x28, x29, [%0, #224]\n"
+        "ldr x30, [%0, #240]\n"
+        :
+        : "r" (&state.x)
+        : "memory"
+    )
+}
+
+// ============================================
+// High-level API
+// ============================================
+
+// Save current CPU state
+export fn save_cpu_state(cpu_id: u32): bool {
+    if cpu_id >= cpu_count {
+        return false
+    }
+
+    let state = &cpu_states[cpu_id]
+
+    if current_arch == ARCH_X86_64 {
+        x86_save_cpu_state(&state.state.x86)
+    } else {
+        arm64_save_cpu_state(&state.state.arm64)
+    }
+
+    return true
+}
+
+// Restore CPU state
+export fn restore_cpu_state(cpu_id: u32): bool {
+    if cpu_id >= cpu_count {
+        return false
+    }
+
+    let state = &cpu_states[cpu_id]
+
+    if current_arch == ARCH_X86_64 {
+        x86_restore_cpu_state(&state.state.x86)
+    } else {
+        arm64_restore_cpu_state(&state.state.arm64)
+    }
+
+    return true
+}
+
+// Save all CPU states
+export fn save_all_cpu_states(): bool {
+    var i: u32 = 0
+    while i < cpu_count {
+        if !save_cpu_state(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Restore all CPU states
+export fn restore_all_cpu_states(): bool {
+    var i: u32 = 0
+    while i < cpu_count {
+        if !restore_cpu_state(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Get CPU state pointer
+export fn get_cpu_state(cpu_id: u32): *CPUState {
+    if cpu_id >= cpu_count {
+        return null
+    }
+    return &cpu_states[cpu_id]
+}
+
+// Check if CPU state is valid
+export fn is_cpu_state_valid(cpu_id: u32): bool {
+    if cpu_id >= cpu_count {
+        return false
+    }
+
+    if current_arch == ARCH_X86_64 {
+        return cpu_states[cpu_id].state.x86.valid == 1
+    } else {
+        return cpu_states[cpu_id].state.arm64.valid == 1
+    }
+}
+
+// Invalidate CPU state
+export fn invalidate_cpu_state(cpu_id: u32): void {
+    if cpu_id >= cpu_count {
+        return
+    }
+
+    if current_arch == ARCH_X86_64 {
+        cpu_states[cpu_id].state.x86.valid = 0
+    } else {
+        cpu_states[cpu_id].state.arm64.valid = 0
+    }
+}
+
+// Get current architecture
+export fn get_current_arch(): u32 {
+    return current_arch
+}
+
+// Get CPU count
+export fn get_saved_cpu_count(): u32 {
+    return cpu_count
+}

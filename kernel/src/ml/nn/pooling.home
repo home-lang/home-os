@@ -1,0 +1,770 @@
+// HomeOS Neural Network Pooling Layers
+// MaxPool2d, AvgPool2d, AdaptivePool implementations
+
+const basics = @import("basics")
+const tensor = @import("ml/tensor")
+const module = @import("ml/nn/module")
+
+// ============================================
+// MaxPool2d
+// ============================================
+
+struct MaxPool2dData {
+    kernel_h: u32
+    kernel_w: u32
+    stride_h: u32
+    stride_w: u32
+    padding_h: u32
+    padding_w: u32
+    dilation_h: u32
+    dilation_w: u32
+    ceil_mode: bool
+    return_indices: bool
+}
+
+export fn MaxPool2d(kernel_size: u32): *module.Module {
+    return maxpool2d_create(kernel_size, kernel_size, kernel_size, kernel_size, 0, 0, 1, 1, false, false)
+}
+
+export fn MaxPool2d_stride(kernel_size: u32, stride: u32): *module.Module {
+    return maxpool2d_create(kernel_size, kernel_size, stride, stride, 0, 0, 1, 1, false, false)
+}
+
+export fn maxpool2d_create(
+    kernel_h: u32,
+    kernel_w: u32,
+    stride_h: u32,
+    stride_w: u32,
+    padding_h: u32,
+    padding_w: u32,
+    dilation_h: u32,
+    dilation_w: u32,
+    ceil_mode: bool,
+    return_indices: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "MaxPool2d", module.MODULE_MAXPOOL2D)
+
+    let extra = basics.alloc(MaxPool2dData) as *MaxPool2dData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.kernel_h = kernel_h
+    extra.kernel_w = kernel_w
+    extra.stride_h = stride_h
+    extra.stride_w = stride_w
+    extra.padding_h = padding_h
+    extra.padding_w = padding_w
+    extra.dilation_h = dilation_h
+    extra.dilation_w = dilation_w
+    extra.ceil_mode = ceil_mode
+    extra.return_indices = return_indices
+    m.extra = extra as *void
+
+    m.forward_fn = maxpool2d_forward
+    return m
+}
+
+fn maxpool2d_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *MaxPool2dData
+
+    // Input shape: (N, C, H, W) or (C, H, W)
+    if input == null or (input.ndim != 3 and input.ndim != 4) {
+        return null
+    }
+
+    var batched = input
+    var need_squeeze = false
+
+    if input.ndim == 3 {
+        var new_shape: [4]u64 = [1, input.shape[0], input.shape[1], input.shape[2]]
+        batched = tensor.tensor_view(input, &new_shape, 4)
+        need_squeeze = true
+    }
+
+    let batch = batched.shape[0]
+    let channels = batched.shape[1]
+    let in_h = batched.shape[2]
+    let in_w = batched.shape[3]
+
+    let out_h = pool_output_size(in_h as u32, extra.kernel_h, extra.stride_h,
+                                  extra.padding_h, extra.dilation_h, extra.ceil_mode)
+    let out_w = pool_output_size(in_w as u32, extra.kernel_w, extra.stride_w,
+                                  extra.padding_w, extra.dilation_w, extra.ceil_mode)
+
+    var out_shape: [4]u64 = [batch, channels, out_h as u64, out_w as u64]
+    let output = tensor.tensor_empty(&out_shape, 4, tensor.DTYPE_F32)
+    if output == null {
+        if need_squeeze {
+            tensor.tensor_release(batched)
+        }
+        return null
+    }
+
+    maxpool2d_compute(batched, output, extra)
+
+    if need_squeeze {
+        tensor.tensor_release(batched)
+        var squeezed_shape: [3]u64 = [output.shape[1], output.shape[2], output.shape[3]]
+        let result = tensor.tensor_view(output, &squeezed_shape, 3)
+        tensor.tensor_release(output)
+        return result
+    }
+
+    return output
+}
+
+fn pool_output_size(input: u32, kernel: u32, stride: u32, padding: u32, dilation: u32, ceil_mode: bool): u32 {
+    let effective_kernel = dilation * (kernel - 1) + 1
+    let numerator = input + 2 * padding - effective_kernel
+
+    if ceil_mode {
+        return (numerator + stride - 1) / stride + 1
+    } else {
+        return numerator / stride + 1
+    }
+}
+
+fn maxpool2d_compute(input: *tensor.Tensor, output: *tensor.Tensor, extra: *MaxPool2dData): void {
+    if input.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let in_data = input.data as *f32
+    let out_data = output.data as *f32
+
+    let batch = input.shape[0]
+    let channels = input.shape[1]
+    let in_h = input.shape[2]
+    let in_w = input.shape[3]
+
+    let out_h = output.shape[2]
+    let out_w = output.shape[3]
+
+    let kh = extra.kernel_h as u64
+    let kw = extra.kernel_w as u64
+    let sh = extra.stride_h as u64
+    let sw = extra.stride_w as u64
+    let ph = extra.padding_h as i64
+    let pw = extra.padding_w as i64
+    let dh = extra.dilation_h as u64
+    let dw = extra.dilation_w as u64
+
+    let neg_inf: f32 = -3.402823e38
+
+    var n: u64 = 0
+    while n < batch {
+        var c: u64 = 0
+        while c < channels {
+            var oh: u64 = 0
+            while oh < out_h {
+                var ow: u64 = 0
+                while ow < out_w {
+                    var max_val: f32 = neg_inf
+
+                    var fh: u64 = 0
+                    while fh < kh {
+                        var fw: u64 = 0
+                        while fw < kw {
+                            let ih = (oh * sh + fh * dh) as i64 - ph
+                            let iw = (ow * sw + fw * dw) as i64 - pw
+
+                            if ih >= 0 and ih < (in_h as i64) and iw >= 0 and iw < (in_w as i64) {
+                                let idx = n * channels * in_h * in_w + c * in_h * in_w +
+                                          (ih as u64) * in_w + (iw as u64)
+                                if in_data[idx] > max_val {
+                                    max_val = in_data[idx]
+                                }
+                            }
+                            fw = fw + 1
+                        }
+                        fh = fh + 1
+                    }
+
+                    let out_idx = n * channels * out_h * out_w + c * out_h * out_w + oh * out_w + ow
+                    out_data[out_idx] = max_val
+                    ow = ow + 1
+                }
+                oh = oh + 1
+            }
+            c = c + 1
+        }
+        n = n + 1
+    }
+}
+
+// ============================================
+// AvgPool2d
+// ============================================
+
+struct AvgPool2dData {
+    kernel_h: u32
+    kernel_w: u32
+    stride_h: u32
+    stride_w: u32
+    padding_h: u32
+    padding_w: u32
+    ceil_mode: bool
+    count_include_pad: bool
+}
+
+export fn AvgPool2d(kernel_size: u32): *module.Module {
+    return avgpool2d_create(kernel_size, kernel_size, kernel_size, kernel_size, 0, 0, false, true)
+}
+
+export fn AvgPool2d_stride(kernel_size: u32, stride: u32): *module.Module {
+    return avgpool2d_create(kernel_size, kernel_size, stride, stride, 0, 0, false, true)
+}
+
+export fn avgpool2d_create(
+    kernel_h: u32,
+    kernel_w: u32,
+    stride_h: u32,
+    stride_w: u32,
+    padding_h: u32,
+    padding_w: u32,
+    ceil_mode: bool,
+    count_include_pad: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "AvgPool2d", module.MODULE_AVGPOOL2D)
+
+    let extra = basics.alloc(AvgPool2dData) as *AvgPool2dData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.kernel_h = kernel_h
+    extra.kernel_w = kernel_w
+    extra.stride_h = stride_h
+    extra.stride_w = stride_w
+    extra.padding_h = padding_h
+    extra.padding_w = padding_w
+    extra.ceil_mode = ceil_mode
+    extra.count_include_pad = count_include_pad
+    m.extra = extra as *void
+
+    m.forward_fn = avgpool2d_forward
+    return m
+}
+
+fn avgpool2d_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *AvgPool2dData
+
+    if input == null or (input.ndim != 3 and input.ndim != 4) {
+        return null
+    }
+
+    var batched = input
+    var need_squeeze = false
+
+    if input.ndim == 3 {
+        var new_shape: [4]u64 = [1, input.shape[0], input.shape[1], input.shape[2]]
+        batched = tensor.tensor_view(input, &new_shape, 4)
+        need_squeeze = true
+    }
+
+    let batch = batched.shape[0]
+    let channels = batched.shape[1]
+    let in_h = batched.shape[2]
+    let in_w = batched.shape[3]
+
+    let out_h = pool_output_size(in_h as u32, extra.kernel_h, extra.stride_h,
+                                  extra.padding_h, 1, extra.ceil_mode)
+    let out_w = pool_output_size(in_w as u32, extra.kernel_w, extra.stride_w,
+                                  extra.padding_w, 1, extra.ceil_mode)
+
+    var out_shape: [4]u64 = [batch, channels, out_h as u64, out_w as u64]
+    let output = tensor.tensor_zeros(&out_shape, 4, tensor.DTYPE_F32)
+    if output == null {
+        if need_squeeze {
+            tensor.tensor_release(batched)
+        }
+        return null
+    }
+
+    avgpool2d_compute(batched, output, extra)
+
+    if need_squeeze {
+        tensor.tensor_release(batched)
+        var squeezed_shape: [3]u64 = [output.shape[1], output.shape[2], output.shape[3]]
+        let result = tensor.tensor_view(output, &squeezed_shape, 3)
+        tensor.tensor_release(output)
+        return result
+    }
+
+    return output
+}
+
+fn avgpool2d_compute(input: *tensor.Tensor, output: *tensor.Tensor, extra: *AvgPool2dData): void {
+    if input.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let in_data = input.data as *f32
+    let out_data = output.data as *f32
+
+    let batch = input.shape[0]
+    let channels = input.shape[1]
+    let in_h = input.shape[2]
+    let in_w = input.shape[3]
+
+    let out_h = output.shape[2]
+    let out_w = output.shape[3]
+
+    let kh = extra.kernel_h as u64
+    let kw = extra.kernel_w as u64
+    let sh = extra.stride_h as u64
+    let sw = extra.stride_w as u64
+    let ph = extra.padding_h as i64
+    let pw = extra.padding_w as i64
+
+    var n: u64 = 0
+    while n < batch {
+        var c: u64 = 0
+        while c < channels {
+            var oh: u64 = 0
+            while oh < out_h {
+                var ow: u64 = 0
+                while ow < out_w {
+                    var sum: f32 = 0.0
+                    var count: u32 = 0
+
+                    var fh: u64 = 0
+                    while fh < kh {
+                        var fw: u64 = 0
+                        while fw < kw {
+                            let ih = (oh * sh + fh) as i64 - ph
+                            let iw = (ow * sw + fw) as i64 - pw
+
+                            if ih >= 0 and ih < (in_h as i64) and iw >= 0 and iw < (in_w as i64) {
+                                let idx = n * channels * in_h * in_w + c * in_h * in_w +
+                                          (ih as u64) * in_w + (iw as u64)
+                                sum = sum + in_data[idx]
+                                count = count + 1
+                            } else if extra.count_include_pad {
+                                count = count + 1
+                            }
+                            fw = fw + 1
+                        }
+                        fh = fh + 1
+                    }
+
+                    let out_idx = n * channels * out_h * out_w + c * out_h * out_w + oh * out_w + ow
+                    if count > 0 {
+                        out_data[out_idx] = sum / (count as f32)
+                    } else {
+                        out_data[out_idx] = 0.0
+                    }
+                    ow = ow + 1
+                }
+                oh = oh + 1
+            }
+            c = c + 1
+        }
+        n = n + 1
+    }
+}
+
+// ============================================
+// AdaptiveAvgPool2d
+// ============================================
+
+struct AdaptiveAvgPool2dData {
+    output_h: u32
+    output_w: u32
+}
+
+export fn AdaptiveAvgPool2d(output_size: u32): *module.Module {
+    return adaptive_avgpool2d_create(output_size, output_size)
+}
+
+export fn adaptive_avgpool2d_create(output_h: u32, output_w: u32): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "AdaptiveAvgPool2d", module.MODULE_ADAPTIVE_AVGPOOL2D)
+
+    let extra = basics.alloc(AdaptiveAvgPool2dData) as *AdaptiveAvgPool2dData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.output_h = output_h
+    extra.output_w = output_w
+    m.extra = extra as *void
+
+    m.forward_fn = adaptive_avgpool2d_forward
+    return m
+}
+
+fn adaptive_avgpool2d_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *AdaptiveAvgPool2dData
+
+    if input == null or (input.ndim != 3 and input.ndim != 4) {
+        return null
+    }
+
+    var batched = input
+    var need_squeeze = false
+
+    if input.ndim == 3 {
+        var new_shape: [4]u64 = [1, input.shape[0], input.shape[1], input.shape[2]]
+        batched = tensor.tensor_view(input, &new_shape, 4)
+        need_squeeze = true
+    }
+
+    let batch = batched.shape[0]
+    let channels = batched.shape[1]
+    let in_h = batched.shape[2]
+    let in_w = batched.shape[3]
+
+    var out_shape: [4]u64 = [batch, channels, extra.output_h as u64, extra.output_w as u64]
+    let output = tensor.tensor_zeros(&out_shape, 4, tensor.DTYPE_F32)
+
+    if output != null {
+        adaptive_avgpool2d_compute(batched, output, extra.output_h, extra.output_w)
+    }
+
+    if need_squeeze {
+        tensor.tensor_release(batched)
+        if output != null {
+            var squeezed_shape: [3]u64 = [output.shape[1], output.shape[2], output.shape[3]]
+            let result = tensor.tensor_view(output, &squeezed_shape, 3)
+            tensor.tensor_release(output)
+            return result
+        }
+    }
+
+    return output
+}
+
+fn adaptive_avgpool2d_compute(input: *tensor.Tensor, output: *tensor.Tensor, out_h: u32, out_w: u32): void {
+    if input.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let in_data = input.data as *f32
+    let out_data = output.data as *f32
+
+    let batch = input.shape[0]
+    let channels = input.shape[1]
+    let in_h = input.shape[2]
+    let in_w = input.shape[3]
+
+    var n: u64 = 0
+    while n < batch {
+        var c: u64 = 0
+        while c < channels {
+            var oh: u32 = 0
+            while oh < out_h {
+                // Calculate input region for this output
+                let h_start = (oh * (in_h as u32)) / out_h
+                let h_end = ((oh + 1) * (in_h as u32)) / out_h
+
+                var ow: u32 = 0
+                while ow < out_w {
+                    let w_start = (ow * (in_w as u32)) / out_w
+                    let w_end = ((ow + 1) * (in_w as u32)) / out_w
+
+                    var sum: f32 = 0.0
+                    var count: u32 = 0
+
+                    var ih: u32 = h_start
+                    while ih < h_end {
+                        var iw: u32 = w_start
+                        while iw < w_end {
+                            let idx = n * channels * in_h * in_w + c * in_h * in_w +
+                                      (ih as u64) * in_w + (iw as u64)
+                            sum = sum + in_data[idx]
+                            count = count + 1
+                            iw = iw + 1
+                        }
+                        ih = ih + 1
+                    }
+
+                    let out_idx = n * channels * (out_h as u64) * (out_w as u64) +
+                                  c * (out_h as u64) * (out_w as u64) +
+                                  (oh as u64) * (out_w as u64) + (ow as u64)
+                    if count > 0 {
+                        out_data[out_idx] = sum / (count as f32)
+                    }
+                    ow = ow + 1
+                }
+                oh = oh + 1
+            }
+            c = c + 1
+        }
+        n = n + 1
+    }
+}
+
+// ============================================
+// AdaptiveMaxPool2d
+// ============================================
+
+export fn AdaptiveMaxPool2d(output_size: u32): *module.Module {
+    return adaptive_maxpool2d_create(output_size, output_size)
+}
+
+export fn adaptive_maxpool2d_create(output_h: u32, output_w: u32): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "AdaptiveMaxPool2d", module.MODULE_ADAPTIVE_MAXPOOL2D)
+
+    let extra = basics.alloc(AdaptiveAvgPool2dData) as *AdaptiveAvgPool2dData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.output_h = output_h
+    extra.output_w = output_w
+    m.extra = extra as *void
+
+    m.forward_fn = adaptive_maxpool2d_forward
+    return m
+}
+
+fn adaptive_maxpool2d_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *AdaptiveAvgPool2dData
+
+    if input == null or (input.ndim != 3 and input.ndim != 4) {
+        return null
+    }
+
+    var batched = input
+    var need_squeeze = false
+
+    if input.ndim == 3 {
+        var new_shape: [4]u64 = [1, input.shape[0], input.shape[1], input.shape[2]]
+        batched = tensor.tensor_view(input, &new_shape, 4)
+        need_squeeze = true
+    }
+
+    let batch = batched.shape[0]
+    let channels = batched.shape[1]
+
+    var out_shape: [4]u64 = [batch, channels, extra.output_h as u64, extra.output_w as u64]
+    let output = tensor.tensor_empty(&out_shape, 4, tensor.DTYPE_F32)
+
+    if output != null {
+        adaptive_maxpool2d_compute(batched, output, extra.output_h, extra.output_w)
+    }
+
+    if need_squeeze {
+        tensor.tensor_release(batched)
+        if output != null {
+            var squeezed_shape: [3]u64 = [output.shape[1], output.shape[2], output.shape[3]]
+            let result = tensor.tensor_view(output, &squeezed_shape, 3)
+            tensor.tensor_release(output)
+            return result
+        }
+    }
+
+    return output
+}
+
+fn adaptive_maxpool2d_compute(input: *tensor.Tensor, output: *tensor.Tensor, out_h: u32, out_w: u32): void {
+    if input.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let in_data = input.data as *f32
+    let out_data = output.data as *f32
+
+    let batch = input.shape[0]
+    let channels = input.shape[1]
+    let in_h = input.shape[2]
+    let in_w = input.shape[3]
+
+    let neg_inf: f32 = -3.402823e38
+
+    var n: u64 = 0
+    while n < batch {
+        var c: u64 = 0
+        while c < channels {
+            var oh: u32 = 0
+            while oh < out_h {
+                let h_start = (oh * (in_h as u32)) / out_h
+                let h_end = ((oh + 1) * (in_h as u32)) / out_h
+
+                var ow: u32 = 0
+                while ow < out_w {
+                    let w_start = (ow * (in_w as u32)) / out_w
+                    let w_end = ((ow + 1) * (in_w as u32)) / out_w
+
+                    var max_val: f32 = neg_inf
+
+                    var ih: u32 = h_start
+                    while ih < h_end {
+                        var iw: u32 = w_start
+                        while iw < w_end {
+                            let idx = n * channels * in_h * in_w + c * in_h * in_w +
+                                      (ih as u64) * in_w + (iw as u64)
+                            if in_data[idx] > max_val {
+                                max_val = in_data[idx]
+                            }
+                            iw = iw + 1
+                        }
+                        ih = ih + 1
+                    }
+
+                    let out_idx = n * channels * (out_h as u64) * (out_w as u64) +
+                                  c * (out_h as u64) * (out_w as u64) +
+                                  (oh as u64) * (out_w as u64) + (ow as u64)
+                    out_data[out_idx] = max_val
+                    ow = ow + 1
+                }
+                oh = oh + 1
+            }
+            c = c + 1
+        }
+        n = n + 1
+    }
+}
+
+// ============================================
+// Global Average Pooling
+// ============================================
+
+// Global average pooling (output size 1x1)
+export fn GlobalAvgPool2d(): *module.Module {
+    return AdaptiveAvgPool2d(1)
+}
+
+// Global max pooling (output size 1x1)
+export fn GlobalMaxPool2d(): *module.Module {
+    return AdaptiveMaxPool2d(1)
+}
+
+// ============================================
+// MaxPool1d
+// ============================================
+
+export fn MaxPool1d(kernel_size: u32): *module.Module {
+    return maxpool1d_create(kernel_size, kernel_size, 0, 1, false)
+}
+
+export fn maxpool1d_create(
+    kernel_size: u32,
+    stride: u32,
+    padding: u32,
+    dilation: u32,
+    ceil_mode: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "MaxPool1d", module.MODULE_MAXPOOL1D)
+
+    // Store parameters in MaxPool2dData (reuse structure)
+    let extra = basics.alloc(MaxPool2dData) as *MaxPool2dData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.kernel_h = kernel_size
+    extra.kernel_w = 1
+    extra.stride_h = stride
+    extra.stride_w = 1
+    extra.padding_h = padding
+    extra.padding_w = 0
+    extra.dilation_h = dilation
+    extra.dilation_w = 1
+    extra.ceil_mode = ceil_mode
+    extra.return_indices = false
+    m.extra = extra as *void
+
+    m.forward_fn = maxpool1d_forward
+    return m
+}
+
+fn maxpool1d_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *MaxPool2dData
+
+    // Input: (N, C, L) or (C, L)
+    if input == null or (input.ndim != 2 and input.ndim != 3) {
+        return null
+    }
+
+    var batched = input
+    var need_squeeze = false
+
+    if input.ndim == 2 {
+        var new_shape: [3]u64 = [1, input.shape[0], input.shape[1]]
+        batched = tensor.tensor_view(input, &new_shape, 3)
+        need_squeeze = true
+    }
+
+    let batch = batched.shape[0]
+    let channels = batched.shape[1]
+    let in_len = batched.shape[2]
+
+    let out_len = pool_output_size(in_len as u32, extra.kernel_h, extra.stride_h,
+                                    extra.padding_h, extra.dilation_h, extra.ceil_mode)
+
+    var out_shape: [3]u64 = [batch, channels, out_len as u64]
+    let output = tensor.tensor_empty(&out_shape, 3, tensor.DTYPE_F32)
+
+    if output != null and batched.dtype == tensor.DTYPE_F32 {
+        let in_data = batched.data as *f32
+        let out_data = output.data as *f32
+        let neg_inf: f32 = -3.402823e38
+
+        let k = extra.kernel_h as u64
+        let s = extra.stride_h as u64
+        let p = extra.padding_h as i64
+        let d = extra.dilation_h as u64
+
+        var n: u64 = 0
+        while n < batch {
+            var c: u64 = 0
+            while c < channels {
+                var ol: u64 = 0
+                while ol < (out_len as u64) {
+                    var max_val: f32 = neg_inf
+
+                    var fk: u64 = 0
+                    while fk < k {
+                        let il = (ol * s + fk * d) as i64 - p
+                        if il >= 0 and il < (in_len as i64) {
+                            let idx = n * channels * in_len + c * in_len + (il as u64)
+                            if in_data[idx] > max_val {
+                                max_val = in_data[idx]
+                            }
+                        }
+                        fk = fk + 1
+                    }
+
+                    let out_idx = n * channels * (out_len as u64) + c * (out_len as u64) + ol
+                    out_data[out_idx] = max_val
+                    ol = ol + 1
+                }
+                c = c + 1
+            }
+            n = n + 1
+        }
+    }
+
+    if need_squeeze {
+        tensor.tensor_release(batched)
+    }
+
+    return output
+}

@@ -1,0 +1,663 @@
+// HomeOS OCI Image Format Support
+// OCI (Open Container Initiative) image specification implementation
+
+const basics = @import("basics")
+
+// Media types
+const MEDIA_TYPE_MANIFEST_V1: [64]u8 = "application/vnd.oci.image.manifest.v1+json\0"
+const MEDIA_TYPE_INDEX_V1: [64]u8 = "application/vnd.oci.image.index.v1+json\0"
+const MEDIA_TYPE_CONFIG_V1: [64]u8 = "application/vnd.oci.image.config.v1+json\0"
+const MEDIA_TYPE_LAYER_TAR: [64]u8 = "application/vnd.oci.image.layer.v1.tar\0"
+const MEDIA_TYPE_LAYER_TAR_GZIP: [64]u8 = "application/vnd.oci.image.layer.v1.tar+gzip\0"
+const MEDIA_TYPE_LAYER_TAR_ZSTD: [64]u8 = "application/vnd.oci.image.layer.v1.tar+zstd\0"
+
+// Maximum limits
+const MAX_LAYERS: u32 = 128
+const MAX_ENV_VARS: u32 = 64
+const MAX_EXPOSED_PORTS: u32 = 32
+const MAX_VOLUMES: u32 = 32
+const MAX_LABELS: u32 = 64
+const MAX_HISTORY: u32 = 128
+
+// Digest algorithms
+const DIGEST_SHA256: u32 = 0
+const DIGEST_SHA512: u32 = 1
+
+// Descriptor (reference to content)
+struct OciDescriptor {
+    media_type: [64]u8
+    digest: [128]u8      // algorithm:hash
+    size: u64
+    urls: [4][256]u8     // Optional download URLs
+    url_count: u32
+    annotations: [32][2][128]u8  // key-value pairs
+    annotation_count: u32
+}
+
+// Image manifest
+struct OciManifest {
+    schema_version: u32
+    media_type: [64]u8
+    config: OciDescriptor
+    layers: [MAX_LAYERS]OciDescriptor
+    layer_count: u32
+    annotations: [32][2][128]u8
+    annotation_count: u32
+}
+
+// Image index (multi-platform)
+struct OciIndex {
+    schema_version: u32
+    media_type: [64]u8
+    manifests: [32]OciDescriptor
+    manifest_count: u32
+    annotations: [32][2][128]u8
+    annotation_count: u32
+}
+
+// Platform specification
+struct OciPlatform {
+    architecture: [32]u8   // amd64, arm64, etc.
+    os: [32]u8             // linux, etc.
+    os_version: [64]u8
+    os_features: [8][32]u8
+    os_feature_count: u32
+    variant: [32]u8        // v8, v7, etc.
+}
+
+// Container configuration
+struct OciContainerConfig {
+    user: [64]u8
+    exposed_ports: [MAX_EXPOSED_PORTS][16]u8
+    exposed_port_count: u32
+    env: [MAX_ENV_VARS][256]u8
+    env_count: u32
+    entrypoint: [8][256]u8
+    entrypoint_count: u32
+    cmd: [8][256]u8
+    cmd_count: u32
+    volumes: [MAX_VOLUMES][256]u8
+    volume_count: u32
+    working_dir: [256]u8
+    labels: [MAX_LABELS][2][128]u8
+    label_count: u32
+    stop_signal: [16]u8
+}
+
+// Rootfs configuration
+struct OciRootfs {
+    type_name: [32]u8      // "layers"
+    diff_ids: [MAX_LAYERS][128]u8
+    diff_id_count: u32
+}
+
+// History entry
+struct OciHistoryEntry {
+    created: [32]u8        // RFC3339 timestamp
+    author: [128]u8
+    created_by: [512]u8
+    comment: [256]u8
+    empty_layer: bool
+}
+
+// Full image configuration
+struct OciImageConfig {
+    created: [32]u8
+    author: [128]u8
+    architecture: [32]u8
+    os: [32]u8
+    config: OciContainerConfig
+    rootfs: OciRootfs
+    history: [MAX_HISTORY]OciHistoryEntry
+    history_count: u32
+}
+
+// ============================================
+// Parsing Functions
+// ============================================
+
+// Simple JSON parser state
+struct JsonParser {
+    data: *u8
+    pos: u32
+    len: u32
+}
+
+// Skip whitespace
+fn json_skip_ws(p: *JsonParser): void {
+    while p.pos < p.len {
+        let c = p.data[p.pos]
+        if c != ' ' and c != '\t' and c != '\n' and c != '\r' {
+            break
+        }
+        p.pos = p.pos + 1
+    }
+}
+
+// Expect and consume character
+fn json_expect(p: *JsonParser, c: u8): bool {
+    json_skip_ws(p)
+    if p.pos < p.len and p.data[p.pos] == c {
+        p.pos = p.pos + 1
+        return true
+    }
+    return false
+}
+
+// Parse string value
+fn json_parse_string(p: *JsonParser, out: *u8, max_len: u32): bool {
+    json_skip_ws(p)
+    if !json_expect(p, '"') {
+        return false
+    }
+
+    var len: u32 = 0
+    while p.pos < p.len and len < max_len - 1 {
+        let c = p.data[p.pos]
+        if c == '"' {
+            p.pos = p.pos + 1
+            out[len] = 0
+            return true
+        }
+        if c == '\\' {
+            p.pos = p.pos + 1
+            if p.pos >= p.len {
+                return false
+            }
+            let escaped = p.data[p.pos]
+            if escaped == 'n' { out[len] = '\n' }
+            else if escaped == 't' { out[len] = '\t' }
+            else if escaped == 'r' { out[len] = '\r' }
+            else { out[len] = escaped }
+        } else {
+            out[len] = c
+        }
+        len = len + 1
+        p.pos = p.pos + 1
+    }
+
+    return false
+}
+
+// Parse integer value
+fn json_parse_int(p: *JsonParser): i64 {
+    json_skip_ws(p)
+    var result: i64 = 0
+    var negative = false
+
+    if p.pos < p.len and p.data[p.pos] == '-' {
+        negative = true
+        p.pos = p.pos + 1
+    }
+
+    while p.pos < p.len {
+        let c = p.data[p.pos]
+        if c >= '0' and c <= '9' {
+            result = result * 10 + ((c - '0') as i64)
+            p.pos = p.pos + 1
+        } else {
+            break
+        }
+    }
+
+    return if negative { -result } else { result }
+}
+
+// Skip JSON value (for unrecognized fields)
+fn json_skip_value(p: *JsonParser): void {
+    json_skip_ws(p)
+    if p.pos >= p.len {
+        return
+    }
+
+    let c = p.data[p.pos]
+
+    if c == '"' {
+        // String
+        p.pos = p.pos + 1
+        while p.pos < p.len {
+            if p.data[p.pos] == '"' {
+                p.pos = p.pos + 1
+                break
+            }
+            if p.data[p.pos] == '\\' {
+                p.pos = p.pos + 1
+            }
+            p.pos = p.pos + 1
+        }
+    } else if c == '{' {
+        // Object
+        p.pos = p.pos + 1
+        var depth: u32 = 1
+        while p.pos < p.len and depth > 0 {
+            if p.data[p.pos] == '{' { depth = depth + 1 }
+            else if p.data[p.pos] == '}' { depth = depth - 1 }
+            else if p.data[p.pos] == '"' {
+                p.pos = p.pos + 1
+                while p.pos < p.len and p.data[p.pos] != '"' {
+                    if p.data[p.pos] == '\\' { p.pos = p.pos + 1 }
+                    p.pos = p.pos + 1
+                }
+            }
+            p.pos = p.pos + 1
+        }
+    } else if c == '[' {
+        // Array
+        p.pos = p.pos + 1
+        var depth: u32 = 1
+        while p.pos < p.len and depth > 0 {
+            if p.data[p.pos] == '[' { depth = depth + 1 }
+            else if p.data[p.pos] == ']' { depth = depth - 1 }
+            else if p.data[p.pos] == '"' {
+                p.pos = p.pos + 1
+                while p.pos < p.len and p.data[p.pos] != '"' {
+                    if p.data[p.pos] == '\\' { p.pos = p.pos + 1 }
+                    p.pos = p.pos + 1
+                }
+            }
+            p.pos = p.pos + 1
+        }
+    } else {
+        // Number, true, false, null
+        while p.pos < p.len {
+            let ch = p.data[p.pos]
+            if ch == ',' or ch == '}' or ch == ']' {
+                break
+            }
+            p.pos = p.pos + 1
+        }
+    }
+}
+
+// ============================================
+// OCI Parsing
+// ============================================
+
+// Parse descriptor
+fn oci_parse_descriptor(p: *JsonParser, desc: *OciDescriptor): bool {
+    if !json_expect(p, '{') {
+        return false
+    }
+
+    basics.memset(desc, 0, @sizeOf(OciDescriptor))
+
+    while true {
+        json_skip_ws(p)
+        if p.pos < p.len and p.data[p.pos] == '}' {
+            p.pos = p.pos + 1
+            break
+        }
+
+        var key: [64]u8
+        if !json_parse_string(p, &key, 64) {
+            return false
+        }
+
+        if !json_expect(p, ':') {
+            return false
+        }
+
+        if basics.strcmp(&key, "mediaType") == 0 {
+            json_parse_string(p, &desc.media_type, 64)
+        } else if basics.strcmp(&key, "digest") == 0 {
+            json_parse_string(p, &desc.digest, 128)
+        } else if basics.strcmp(&key, "size") == 0 {
+            desc.size = json_parse_int(p) as u64
+        } else {
+            json_skip_value(p)
+        }
+
+        // Skip comma
+        json_skip_ws(p)
+        if p.pos < p.len and p.data[p.pos] == ',' {
+            p.pos = p.pos + 1
+        }
+    }
+
+    return true
+}
+
+// Parse manifest
+export fn oci_parse_manifest(data: *u8, len: u32, manifest: *OciManifest): bool {
+    var p = JsonParser { data: data, pos: 0, len: len }
+
+    basics.memset(manifest, 0, @sizeOf(OciManifest))
+
+    if !json_expect(&p, '{') {
+        return false
+    }
+
+    while true {
+        json_skip_ws(&p)
+        if p.pos < p.len and p.data[p.pos] == '}' {
+            break
+        }
+
+        var key: [64]u8
+        if !json_parse_string(&p, &key, 64) {
+            return false
+        }
+
+        if !json_expect(&p, ':') {
+            return false
+        }
+
+        if basics.strcmp(&key, "schemaVersion") == 0 {
+            manifest.schema_version = json_parse_int(&p) as u32
+        } else if basics.strcmp(&key, "mediaType") == 0 {
+            json_parse_string(&p, &manifest.media_type, 64)
+        } else if basics.strcmp(&key, "config") == 0 {
+            oci_parse_descriptor(&p, &manifest.config)
+        } else if basics.strcmp(&key, "layers") == 0 {
+            if !json_expect(&p, '[') {
+                return false
+            }
+            while true {
+                json_skip_ws(&p)
+                if p.pos < p.len and p.data[p.pos] == ']' {
+                    p.pos = p.pos + 1
+                    break
+                }
+                if manifest.layer_count < MAX_LAYERS {
+                    oci_parse_descriptor(&p, &manifest.layers[manifest.layer_count])
+                    manifest.layer_count = manifest.layer_count + 1
+                } else {
+                    json_skip_value(&p)
+                }
+                json_skip_ws(&p)
+                if p.pos < p.len and p.data[p.pos] == ',' {
+                    p.pos = p.pos + 1
+                }
+            }
+        } else {
+            json_skip_value(&p)
+        }
+
+        json_skip_ws(&p)
+        if p.pos < p.len and p.data[p.pos] == ',' {
+            p.pos = p.pos + 1
+        }
+    }
+
+    return true
+}
+
+// ============================================
+// Digest Validation
+// ============================================
+
+// SHA256 state (simplified)
+struct Sha256State {
+    state: [8]u32
+    count: u64
+    buffer: [64]u8
+}
+
+// Initialize SHA256
+fn sha256_init(ctx: *Sha256State): void {
+    ctx.state[0] = 0x6a09e667
+    ctx.state[1] = 0xbb67ae85
+    ctx.state[2] = 0x3c6ef372
+    ctx.state[3] = 0xa54ff53a
+    ctx.state[4] = 0x510e527f
+    ctx.state[5] = 0x9b05688c
+    ctx.state[6] = 0x1f83d9ab
+    ctx.state[7] = 0x5be0cd19
+    ctx.count = 0
+}
+
+// SHA256 constants
+const K: [64]u32 = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+]
+
+fn rotr(x: u32, n: u32): u32 {
+    return (x >> n) | (x << (32 - n))
+}
+
+// Process one block
+fn sha256_transform(ctx: *Sha256State, block: *u8): void {
+    var w: [64]u32
+
+    // Prepare message schedule
+    var i: u32 = 0
+    while i < 16 {
+        w[i] = ((block[i*4] as u32) << 24) |
+               ((block[i*4+1] as u32) << 16) |
+               ((block[i*4+2] as u32) << 8) |
+               (block[i*4+3] as u32)
+        i = i + 1
+    }
+
+    while i < 64 {
+        let s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >> 3)
+        let s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >> 10)
+        w[i] = w[i-16] + s0 + w[i-7] + s1
+        i = i + 1
+    }
+
+    var a = ctx.state[0]
+    var b = ctx.state[1]
+    var c = ctx.state[2]
+    var d = ctx.state[3]
+    var e = ctx.state[4]
+    var f = ctx.state[5]
+    var g = ctx.state[6]
+    var h = ctx.state[7]
+
+    i = 0
+    while i < 64 {
+        let S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
+        let ch = (e & f) ^ ((~e) & g)
+        let temp1 = h + S1 + ch + K[i] + w[i]
+        let S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
+        let maj = (a & b) ^ (a & c) ^ (b & c)
+        let temp2 = S0 + maj
+
+        h = g
+        g = f
+        f = e
+        e = d + temp1
+        d = c
+        c = b
+        b = a
+        a = temp1 + temp2
+
+        i = i + 1
+    }
+
+    ctx.state[0] = ctx.state[0] + a
+    ctx.state[1] = ctx.state[1] + b
+    ctx.state[2] = ctx.state[2] + c
+    ctx.state[3] = ctx.state[3] + d
+    ctx.state[4] = ctx.state[4] + e
+    ctx.state[5] = ctx.state[5] + f
+    ctx.state[6] = ctx.state[6] + g
+    ctx.state[7] = ctx.state[7] + h
+}
+
+// Compute SHA256 hash
+export fn oci_sha256(data: *u8, len: u64, out: *u8): void {
+    var ctx: Sha256State
+    sha256_init(&ctx)
+
+    // Process full blocks
+    var pos: u64 = 0
+    while pos + 64 <= len {
+        sha256_transform(&ctx, data + pos)
+        pos = pos + 64
+    }
+
+    // Prepare final block(s)
+    var final_block: [128]u8
+    basics.memset(&final_block, 0, 128)
+
+    let remaining = len - pos
+    basics.memcpy(&final_block, data + pos, remaining)
+    final_block[remaining] = 0x80
+
+    // Length in bits
+    let bit_len = len * 8
+
+    if remaining >= 56 {
+        // Need two blocks
+        sha256_transform(&ctx, &final_block)
+        basics.memset(&final_block, 0, 64)
+    }
+
+    // Store length
+    final_block[56] = ((bit_len >> 56) & 0xFF) as u8
+    final_block[57] = ((bit_len >> 48) & 0xFF) as u8
+    final_block[58] = ((bit_len >> 40) & 0xFF) as u8
+    final_block[59] = ((bit_len >> 32) & 0xFF) as u8
+    final_block[60] = ((bit_len >> 24) & 0xFF) as u8
+    final_block[61] = ((bit_len >> 16) & 0xFF) as u8
+    final_block[62] = ((bit_len >> 8) & 0xFF) as u8
+    final_block[63] = (bit_len & 0xFF) as u8
+
+    sha256_transform(&ctx, &final_block)
+
+    // Output hash
+    var i: u32 = 0
+    while i < 8 {
+        out[i*4] = ((ctx.state[i] >> 24) & 0xFF) as u8
+        out[i*4+1] = ((ctx.state[i] >> 16) & 0xFF) as u8
+        out[i*4+2] = ((ctx.state[i] >> 8) & 0xFF) as u8
+        out[i*4+3] = (ctx.state[i] & 0xFF) as u8
+        i = i + 1
+    }
+}
+
+// Convert hash to hex string
+fn hash_to_hex(hash: *u8, len: u32, out: *u8): void {
+    const HEX: [16]u8 = ['0', '1', '2', '3', '4', '5', '6', '7',
+                         '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
+    var i: u32 = 0
+    while i < len {
+        out[i*2] = HEX[(hash[i] >> 4) & 0xF]
+        out[i*2+1] = HEX[hash[i] & 0xF]
+        i = i + 1
+    }
+    out[len*2] = 0
+}
+
+// Validate digest
+export fn oci_validate_digest(data: *u8, len: u64, expected_digest: *u8): bool {
+    // Parse expected digest (sha256:xxxx...)
+    if basics.strncmp(expected_digest, "sha256:", 7) != 0 {
+        return false
+    }
+
+    var computed_hash: [32]u8
+    oci_sha256(data, len, &computed_hash)
+
+    var computed_hex: [65]u8
+    hash_to_hex(&computed_hash, 32, &computed_hex)
+
+    return basics.strcmp(&computed_hex, expected_digest + 7) == 0
+}
+
+// ============================================
+// Layer Management
+// ============================================
+
+// Layer info
+struct OciLayer {
+    digest: [128]u8
+    diff_id: [128]u8
+    size: u64
+    media_type: [64]u8
+    extracted: bool
+    path: [256]u8
+}
+
+// Image layers
+var layers: [MAX_LAYERS]OciLayer
+var layer_count: u32 = 0
+
+// Add layer from manifest
+export fn oci_add_layer(desc: *OciDescriptor): u32 {
+    if layer_count >= MAX_LAYERS {
+        return 0xFFFFFFFF
+    }
+
+    let l = &layers[layer_count]
+    basics.memset(l, 0, @sizeOf(OciLayer))
+
+    basics.memcpy(&l.digest, &desc.digest, 128)
+    basics.memcpy(&l.media_type, &desc.media_type, 64)
+    l.size = desc.size
+    l.extracted = false
+
+    layer_count = layer_count + 1
+    return layer_count - 1
+}
+
+// Get layer by index
+export fn oci_get_layer(idx: u32): *OciLayer {
+    if idx < layer_count {
+        return &layers[idx]
+    }
+    return null
+}
+
+// Compute chain ID for content addressing
+export fn oci_compute_chain_id(parent_chain_id: *u8, diff_id: *u8, out: *u8): void {
+    if parent_chain_id == null or parent_chain_id[0] == 0 {
+        // First layer: chain_id = diff_id
+        basics.strcpy(out, diff_id)
+    } else {
+        // chain_id = sha256(parent_chain_id + " " + diff_id)
+        var combined: [512]u8
+        basics.strcpy(&combined, parent_chain_id)
+        basics.strcat(&combined, " ")
+        basics.strcat(&combined, diff_id)
+
+        var hash: [32]u8
+        oci_sha256(&combined, basics.strlen(&combined), &hash)
+
+        basics.strcpy(out, "sha256:")
+        hash_to_hex(&hash, 32, out + 7)
+    }
+}
+
+// Print manifest info
+export fn oci_print_manifest(m: *OciManifest): void {
+    basics.print("OCI Manifest:\n")
+    basics.print("  Schema Version: ")
+    basics.print_int(m.schema_version as i32)
+    basics.print("\n  Media Type: ")
+    basics.print(&m.media_type)
+    basics.print("\n  Config Digest: ")
+    basics.print(&m.config.digest)
+    basics.print("\n  Layers: ")
+    basics.print_int(m.layer_count as i32)
+    basics.print("\n")
+
+    var i: u32 = 0
+    while i < m.layer_count {
+        basics.print("    [")
+        basics.print_int(i as i32)
+        basics.print("] ")
+        basics.print(&m.layers[i].digest)
+        basics.print(" (")
+        basics.print_int(m.layers[i].size as i32)
+        basics.print(" bytes)\n")
+        i = i + 1
+    }
+}

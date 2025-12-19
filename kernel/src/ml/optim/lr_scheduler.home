@@ -1,0 +1,680 @@
+// HomeOS Learning Rate Schedulers
+// StepLR, MultiStepLR, ExponentialLR, CosineAnnealingLR, etc.
+
+const basics = @import("basics")
+const optimizer = @import("ml/optim/optimizer")
+
+// ============================================
+// Scheduler Base
+// ============================================
+
+struct LRScheduler {
+    opt: *optimizer.Optimizer
+    base_lrs: [16]f64
+    num_groups: u32
+    last_epoch: i64
+    scheduler_type: u32
+    state: *void
+}
+
+const SCHED_STEP: u32 = 1
+const SCHED_MULTISTEP: u32 = 2
+const SCHED_EXPONENTIAL: u32 = 3
+const SCHED_COSINE: u32 = 4
+const SCHED_COSINE_WARM_RESTARTS: u32 = 5
+const SCHED_LINEAR: u32 = 6
+const SCHED_POLYNOMIAL: u32 = 7
+const SCHED_ONE_CYCLE: u32 = 8
+
+fn scheduler_init(sched: *LRScheduler, opt: *optimizer.Optimizer, sched_type: u32): void {
+    sched.opt = opt
+    sched.scheduler_type = sched_type
+    sched.last_epoch = -1
+    sched.state = null
+
+    // Store base learning rates
+    sched.num_groups = opt.num_groups
+    var g: u32 = 0
+    while g < opt.num_groups and g < 16 {
+        sched.base_lrs[g] = opt.param_groups[g].lr
+        g = g + 1
+    }
+}
+
+// Step the scheduler (call at end of epoch)
+export fn scheduler_step(sched: *LRScheduler): void {
+    if sched == null {
+        return
+    }
+
+    sched.last_epoch = sched.last_epoch + 1
+
+    switch sched.scheduler_type {
+        SCHED_STEP => step_lr_update(sched),
+        SCHED_MULTISTEP => multistep_lr_update(sched),
+        SCHED_EXPONENTIAL => exponential_lr_update(sched),
+        SCHED_COSINE => cosine_annealing_update(sched),
+        SCHED_COSINE_WARM_RESTARTS => cosine_warm_restarts_update(sched),
+        SCHED_LINEAR => linear_lr_update(sched),
+        SCHED_POLYNOMIAL => polynomial_lr_update(sched),
+        SCHED_ONE_CYCLE => one_cycle_update(sched),
+        else => {}
+    }
+}
+
+// Get current learning rate
+export fn scheduler_get_lr(sched: *LRScheduler): f64 {
+    if sched == null or sched.opt == null {
+        return 0.0
+    }
+    return optimizer.optimizer_get_lr(sched.opt)
+}
+
+// ============================================
+// StepLR
+// ============================================
+
+struct StepLRState {
+    step_size: u32
+    gamma: f64
+}
+
+export fn StepLR(opt: *optimizer.Optimizer, step_size: u32): *LRScheduler {
+    return step_lr_create(opt, step_size, 0.1)
+}
+
+export fn step_lr_create(opt: *optimizer.Optimizer, step_size: u32, gamma: f64): *LRScheduler {
+    let sched = basics.alloc(LRScheduler) as *LRScheduler
+    if sched == null {
+        return null
+    }
+
+    scheduler_init(sched, opt, SCHED_STEP)
+
+    let state = basics.alloc(StepLRState) as *StepLRState
+    if state == null {
+        basics.free(sched)
+        return null
+    }
+    state.step_size = step_size
+    state.gamma = gamma
+    sched.state = state as *void
+
+    return sched
+}
+
+fn step_lr_update(sched: *LRScheduler): void {
+    let state = sched.state as *StepLRState
+    let epoch = sched.last_epoch
+
+    if epoch > 0 and epoch % (state.step_size as i64) == 0 {
+        var g: u32 = 0
+        while g < sched.num_groups {
+            let new_lr = sched.opt.param_groups[g].lr * state.gamma
+            sched.opt.param_groups[g].lr = new_lr
+            g = g + 1
+        }
+    }
+}
+
+// ============================================
+// MultiStepLR
+// ============================================
+
+struct MultiStepLRState {
+    milestones: [32]u32
+    num_milestones: u32
+    gamma: f64
+}
+
+export fn MultiStepLR(opt: *optimizer.Optimizer, milestones: *u32, num: u32): *LRScheduler {
+    return multistep_lr_create(opt, milestones, num, 0.1)
+}
+
+export fn multistep_lr_create(opt: *optimizer.Optimizer, milestones: *u32, num: u32, gamma: f64): *LRScheduler {
+    let sched = basics.alloc(LRScheduler) as *LRScheduler
+    if sched == null {
+        return null
+    }
+
+    scheduler_init(sched, opt, SCHED_MULTISTEP)
+
+    let state = basics.alloc(MultiStepLRState) as *MultiStepLRState
+    if state == null {
+        basics.free(sched)
+        return null
+    }
+
+    state.gamma = gamma
+    state.num_milestones = if num > 32 { 32 } else { num }
+
+    var i: u32 = 0
+    while i < state.num_milestones {
+        state.milestones[i] = milestones[i]
+        i = i + 1
+    }
+
+    sched.state = state as *void
+    return sched
+}
+
+fn multistep_lr_update(sched: *LRScheduler): void {
+    let state = sched.state as *MultiStepLRState
+    let epoch = sched.last_epoch as u32
+
+    // Check if we hit a milestone
+    var i: u32 = 0
+    while i < state.num_milestones {
+        if state.milestones[i] == epoch {
+            var g: u32 = 0
+            while g < sched.num_groups {
+                sched.opt.param_groups[g].lr = sched.opt.param_groups[g].lr * state.gamma
+                g = g + 1
+            }
+            return
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// ExponentialLR
+// ============================================
+
+struct ExponentialLRState {
+    gamma: f64
+}
+
+export fn ExponentialLR(opt: *optimizer.Optimizer, gamma: f64): *LRScheduler {
+    let sched = basics.alloc(LRScheduler) as *LRScheduler
+    if sched == null {
+        return null
+    }
+
+    scheduler_init(sched, opt, SCHED_EXPONENTIAL)
+
+    let state = basics.alloc(ExponentialLRState) as *ExponentialLRState
+    if state == null {
+        basics.free(sched)
+        return null
+    }
+    state.gamma = gamma
+    sched.state = state as *void
+
+    return sched
+}
+
+fn exponential_lr_update(sched: *LRScheduler): void {
+    let state = sched.state as *ExponentialLRState
+
+    var g: u32 = 0
+    while g < sched.num_groups {
+        sched.opt.param_groups[g].lr = sched.opt.param_groups[g].lr * state.gamma
+        g = g + 1
+    }
+}
+
+// ============================================
+// CosineAnnealingLR
+// ============================================
+
+struct CosineAnnealingState {
+    T_max: u32
+    eta_min: f64
+}
+
+export fn CosineAnnealingLR(opt: *optimizer.Optimizer, T_max: u32): *LRScheduler {
+    return cosine_annealing_create(opt, T_max, 0.0)
+}
+
+export fn cosine_annealing_create(opt: *optimizer.Optimizer, T_max: u32, eta_min: f64): *LRScheduler {
+    let sched = basics.alloc(LRScheduler) as *LRScheduler
+    if sched == null {
+        return null
+    }
+
+    scheduler_init(sched, opt, SCHED_COSINE)
+
+    let state = basics.alloc(CosineAnnealingState) as *CosineAnnealingState
+    if state == null {
+        basics.free(sched)
+        return null
+    }
+    state.T_max = T_max
+    state.eta_min = eta_min
+    sched.state = state as *void
+
+    return sched
+}
+
+fn cosine_annealing_update(sched: *LRScheduler): void {
+    let state = sched.state as *CosineAnnealingState
+    let epoch = sched.last_epoch
+
+    let pi: f64 = 3.14159265358979323846
+
+    var g: u32 = 0
+    while g < sched.num_groups {
+        let base_lr = sched.base_lrs[g]
+        // lr = eta_min + (base_lr - eta_min) * (1 + cos(pi * epoch / T_max)) / 2
+        let cos_term = basics.cos(pi * (epoch as f64) / (state.T_max as f64))
+        let new_lr = state.eta_min + (base_lr - state.eta_min) * (1.0 + cos_term) / 2.0
+        sched.opt.param_groups[g].lr = new_lr
+        g = g + 1
+    }
+}
+
+// ============================================
+// CosineAnnealingWarmRestarts
+// ============================================
+
+struct CosineWarmRestartsState {
+    T_0: u32
+    T_mult: u32
+    eta_min: f64
+    T_i: u32
+    T_cur: i64
+}
+
+export fn CosineAnnealingWarmRestarts(opt: *optimizer.Optimizer, T_0: u32): *LRScheduler {
+    return cosine_warm_restarts_create(opt, T_0, 1, 0.0)
+}
+
+export fn cosine_warm_restarts_create(opt: *optimizer.Optimizer, T_0: u32, T_mult: u32, eta_min: f64): *LRScheduler {
+    let sched = basics.alloc(LRScheduler) as *LRScheduler
+    if sched == null {
+        return null
+    }
+
+    scheduler_init(sched, opt, SCHED_COSINE_WARM_RESTARTS)
+
+    let state = basics.alloc(CosineWarmRestartsState) as *CosineWarmRestartsState
+    if state == null {
+        basics.free(sched)
+        return null
+    }
+    state.T_0 = T_0
+    state.T_mult = T_mult
+    state.eta_min = eta_min
+    state.T_i = T_0
+    state.T_cur = 0
+    sched.state = state as *void
+
+    return sched
+}
+
+fn cosine_warm_restarts_update(sched: *LRScheduler): void {
+    let state = sched.state as *CosineWarmRestartsState
+
+    let pi: f64 = 3.14159265358979323846
+
+    // Check for restart
+    if state.T_cur >= (state.T_i as i64) {
+        state.T_cur = 0
+        state.T_i = state.T_i * state.T_mult
+    }
+
+    var g: u32 = 0
+    while g < sched.num_groups {
+        let base_lr = sched.base_lrs[g]
+        let cos_term = basics.cos(pi * (state.T_cur as f64) / (state.T_i as f64))
+        let new_lr = state.eta_min + (base_lr - state.eta_min) * (1.0 + cos_term) / 2.0
+        sched.opt.param_groups[g].lr = new_lr
+        g = g + 1
+    }
+
+    state.T_cur = state.T_cur + 1
+}
+
+// ============================================
+// LinearLR (Linear warmup/decay)
+// ============================================
+
+struct LinearLRState {
+    start_factor: f64
+    end_factor: f64
+    total_iters: u32
+}
+
+export fn LinearLR(opt: *optimizer.Optimizer, total_iters: u32): *LRScheduler {
+    return linear_lr_create(opt, 1.0 / 3.0, 1.0, total_iters)
+}
+
+export fn linear_lr_create(opt: *optimizer.Optimizer, start_factor: f64,
+                            end_factor: f64, total_iters: u32): *LRScheduler {
+    let sched = basics.alloc(LRScheduler) as *LRScheduler
+    if sched == null {
+        return null
+    }
+
+    scheduler_init(sched, opt, SCHED_LINEAR)
+
+    let state = basics.alloc(LinearLRState) as *LinearLRState
+    if state == null {
+        basics.free(sched)
+        return null
+    }
+    state.start_factor = start_factor
+    state.end_factor = end_factor
+    state.total_iters = total_iters
+    sched.state = state as *void
+
+    // Apply initial factor
+    var g: u32 = 0
+    while g < sched.num_groups {
+        sched.opt.param_groups[g].lr = sched.base_lrs[g] * start_factor
+        g = g + 1
+    }
+
+    return sched
+}
+
+fn linear_lr_update(sched: *LRScheduler): void {
+    let state = sched.state as *LinearLRState
+    let epoch = sched.last_epoch
+
+    if epoch >= (state.total_iters as i64) {
+        return  // Keep at end_factor
+    }
+
+    let progress = (epoch as f64) / (state.total_iters as f64)
+    let factor = state.start_factor + (state.end_factor - state.start_factor) * progress
+
+    var g: u32 = 0
+    while g < sched.num_groups {
+        sched.opt.param_groups[g].lr = sched.base_lrs[g] * factor
+        g = g + 1
+    }
+}
+
+// ============================================
+// PolynomialLR
+// ============================================
+
+struct PolynomialLRState {
+    total_iters: u32
+    power: f64
+    lr_end: f64
+}
+
+export fn PolynomialLR(opt: *optimizer.Optimizer, total_iters: u32): *LRScheduler {
+    return polynomial_lr_create(opt, total_iters, 1.0, 0.0)
+}
+
+export fn polynomial_lr_create(opt: *optimizer.Optimizer, total_iters: u32,
+                                power: f64, lr_end: f64): *LRScheduler {
+    let sched = basics.alloc(LRScheduler) as *LRScheduler
+    if sched == null {
+        return null
+    }
+
+    scheduler_init(sched, opt, SCHED_POLYNOMIAL)
+
+    let state = basics.alloc(PolynomialLRState) as *PolynomialLRState
+    if state == null {
+        basics.free(sched)
+        return null
+    }
+    state.total_iters = total_iters
+    state.power = power
+    state.lr_end = lr_end
+    sched.state = state as *void
+
+    return sched
+}
+
+fn polynomial_lr_update(sched: *LRScheduler): void {
+    let state = sched.state as *PolynomialLRState
+    let epoch = sched.last_epoch
+
+    if epoch >= (state.total_iters as i64) {
+        var g: u32 = 0
+        while g < sched.num_groups {
+            sched.opt.param_groups[g].lr = state.lr_end
+            g = g + 1
+        }
+        return
+    }
+
+    let decay_steps = state.total_iters
+    let pct_remaining = 1.0 - (epoch as f64) / (decay_steps as f64)
+
+    var g: u32 = 0
+    while g < sched.num_groups {
+        let base_lr = sched.base_lrs[g]
+        let decay = basics.pow(pct_remaining, state.power)
+        let new_lr = (base_lr - state.lr_end) * decay + state.lr_end
+        sched.opt.param_groups[g].lr = new_lr
+        g = g + 1
+    }
+}
+
+// ============================================
+// OneCycleLR
+// ============================================
+
+struct OneCycleLRState {
+    max_lr: f64
+    total_steps: u32
+    pct_start: f64
+    anneal_strategy: u32  // 0 = cos, 1 = linear
+    div_factor: f64
+    final_div_factor: f64
+    current_step: u32
+}
+
+const ANNEAL_COS: u32 = 0
+const ANNEAL_LINEAR: u32 = 1
+
+export fn OneCycleLR(opt: *optimizer.Optimizer, max_lr: f64, total_steps: u32): *LRScheduler {
+    return one_cycle_create(opt, max_lr, total_steps, 0.3, ANNEAL_COS, 25.0, 10000.0)
+}
+
+export fn one_cycle_create(opt: *optimizer.Optimizer, max_lr: f64, total_steps: u32,
+                            pct_start: f64, anneal_strategy: u32,
+                            div_factor: f64, final_div_factor: f64): *LRScheduler {
+    let sched = basics.alloc(LRScheduler) as *LRScheduler
+    if sched == null {
+        return null
+    }
+
+    scheduler_init(sched, opt, SCHED_ONE_CYCLE)
+
+    let state = basics.alloc(OneCycleLRState) as *OneCycleLRState
+    if state == null {
+        basics.free(sched)
+        return null
+    }
+    state.max_lr = max_lr
+    state.total_steps = total_steps
+    state.pct_start = pct_start
+    state.anneal_strategy = anneal_strategy
+    state.div_factor = div_factor
+    state.final_div_factor = final_div_factor
+    state.current_step = 0
+    sched.state = state as *void
+
+    // Set initial LR
+    let initial_lr = max_lr / div_factor
+    var g: u32 = 0
+    while g < sched.num_groups {
+        sched.opt.param_groups[g].lr = initial_lr
+        g = g + 1
+    }
+
+    return sched
+}
+
+fn one_cycle_update(sched: *LRScheduler): void {
+    let state = sched.state as *OneCycleLRState
+
+    state.current_step = state.current_step + 1
+    let step = state.current_step
+
+    let warmup_steps = (state.pct_start * (state.total_steps as f64)) as u32
+    let initial_lr = state.max_lr / state.div_factor
+    let min_lr = initial_lr / state.final_div_factor
+
+    let pi: f64 = 3.14159265358979323846
+    var new_lr: f64 = 0.0
+
+    if step <= warmup_steps {
+        // Warmup phase: initial_lr -> max_lr
+        let pct = (step as f64) / (warmup_steps as f64)
+        if state.anneal_strategy == ANNEAL_COS {
+            new_lr = initial_lr + (state.max_lr - initial_lr) * (1.0 - basics.cos(pi * pct)) / 2.0
+        } else {
+            new_lr = initial_lr + (state.max_lr - initial_lr) * pct
+        }
+    } else {
+        // Annealing phase: max_lr -> min_lr
+        let pct = ((step - warmup_steps) as f64) / ((state.total_steps - warmup_steps) as f64)
+        if state.anneal_strategy == ANNEAL_COS {
+            new_lr = min_lr + (state.max_lr - min_lr) * (1.0 + basics.cos(pi * pct)) / 2.0
+        } else {
+            new_lr = state.max_lr - (state.max_lr - min_lr) * pct
+        }
+    }
+
+    var g: u32 = 0
+    while g < sched.num_groups {
+        sched.opt.param_groups[g].lr = new_lr
+        g = g + 1
+    }
+}
+
+// ============================================
+// ReduceLROnPlateau
+// ============================================
+
+struct ReduceLROnPlateauState {
+    mode: u32          // 0 = min, 1 = max
+    factor: f64
+    patience: u32
+    threshold: f64
+    threshold_mode: u32  // 0 = rel, 1 = abs
+    cooldown: u32
+    min_lr: f64
+    best: f64
+    num_bad_epochs: u32
+    cooldown_counter: u32
+}
+
+const MODE_MIN: u32 = 0
+const MODE_MAX: u32 = 1
+const THRESH_REL: u32 = 0
+const THRESH_ABS: u32 = 1
+
+export fn ReduceLROnPlateau(opt: *optimizer.Optimizer): *LRScheduler {
+    return reduce_lr_on_plateau_create(opt, MODE_MIN, 0.1, 10, 1e-4, THRESH_REL, 0, 0.0)
+}
+
+export fn reduce_lr_on_plateau_create(
+    opt: *optimizer.Optimizer,
+    mode: u32,
+    factor: f64,
+    patience: u32,
+    threshold: f64,
+    threshold_mode: u32,
+    cooldown: u32,
+    min_lr: f64
+): *LRScheduler {
+    let sched = basics.alloc(LRScheduler) as *LRScheduler
+    if sched == null {
+        return null
+    }
+
+    scheduler_init(sched, opt, 0)  // No automatic stepping
+
+    let state = basics.alloc(ReduceLROnPlateauState) as *ReduceLROnPlateauState
+    if state == null {
+        basics.free(sched)
+        return null
+    }
+    state.mode = mode
+    state.factor = factor
+    state.patience = patience
+    state.threshold = threshold
+    state.threshold_mode = threshold_mode
+    state.cooldown = cooldown
+    state.min_lr = min_lr
+    state.best = if mode == MODE_MIN { 1e30 } else { -1e30 }
+    state.num_bad_epochs = 0
+    state.cooldown_counter = 0
+    sched.state = state as *void
+
+    return sched
+}
+
+// Call this with the metric value to monitor
+export fn reduce_lr_on_plateau_step(sched: *LRScheduler, metric: f64): void {
+    if sched == null or sched.state == null {
+        return
+    }
+
+    let state = sched.state as *ReduceLROnPlateauState
+
+    // Check if in cooldown
+    if state.cooldown_counter > 0 {
+        state.cooldown_counter = state.cooldown_counter - 1
+        state.num_bad_epochs = 0
+        return
+    }
+
+    // Check if metric improved
+    var is_better = false
+
+    if state.mode == MODE_MIN {
+        if state.threshold_mode == THRESH_REL {
+            is_better = metric < state.best * (1.0 - state.threshold)
+        } else {
+            is_better = metric < state.best - state.threshold
+        }
+    } else {
+        if state.threshold_mode == THRESH_REL {
+            is_better = metric > state.best * (1.0 + state.threshold)
+        } else {
+            is_better = metric > state.best + state.threshold
+        }
+    }
+
+    if is_better {
+        state.best = metric
+        state.num_bad_epochs = 0
+    } else {
+        state.num_bad_epochs = state.num_bad_epochs + 1
+    }
+
+    // Reduce LR if patience exceeded
+    if state.num_bad_epochs > state.patience {
+        var g: u32 = 0
+        while g < sched.num_groups {
+            let old_lr = sched.opt.param_groups[g].lr
+            let new_lr = old_lr * state.factor
+            if new_lr > state.min_lr {
+                sched.opt.param_groups[g].lr = new_lr
+            } else {
+                sched.opt.param_groups[g].lr = state.min_lr
+            }
+            g = g + 1
+        }
+        state.cooldown_counter = state.cooldown
+        state.num_bad_epochs = 0
+    }
+}
+
+// ============================================
+// Free scheduler resources
+// ============================================
+
+export fn scheduler_free(sched: *LRScheduler): void {
+    if sched == null {
+        return
+    }
+
+    if sched.state != null {
+        basics.free(sched.state)
+    }
+
+    basics.free(sched)
+}

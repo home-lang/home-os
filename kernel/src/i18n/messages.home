@@ -1,0 +1,759 @@
+// HomeOS Message Catalog System
+// Binary message catalogs for internationalization
+
+const basics = @import("basics")
+
+// Message catalog magic number
+const MSG_MAGIC: [4]u8 = ['H', 'M', 'S', 'G']
+
+// Catalog version
+const MSG_VERSION: u16 = 1
+
+// Maximum limits
+const MAX_CATALOGS: u32 = 64
+const MAX_MESSAGES_PER_CATALOG: u32 = 4096
+const HASH_TABLE_SIZE: u32 = 1024
+const MAX_DOMAINS: u32 = 32
+
+// Plural categories (CLDR)
+const PLURAL_ZERO: u8 = 0
+const PLURAL_ONE: u8 = 1
+const PLURAL_TWO: u8 = 2
+const PLURAL_FEW: u8 = 3
+const PLURAL_MANY: u8 = 4
+const PLURAL_OTHER: u8 = 5
+const PLURAL_COUNT: u8 = 6
+
+// Message flags
+const MSG_HAS_PLURAL: u8 = 1
+const MSG_HAS_CONTEXT: u8 = 2
+const MSG_FORMATTED: u8 = 4
+
+// Binary catalog header
+struct CatalogHeader {
+    magic: [4]u8
+    version: u16
+    flags: u16
+    locale_code: [16]u8
+    domain: [32]u8
+    message_count: u32
+    hash_table_offset: u32
+    string_pool_offset: u32
+    string_pool_size: u32
+    plural_rules_offset: u32
+}
+
+// Hash table entry
+struct HashEntry {
+    key_hash: u32
+    string_offset: u32    // Offset into string pool
+    plural_offset: u32    // Offset for plural forms (0 if none)
+    flags: u8
+    plural_count: u8
+    _pad: u16
+}
+
+// In-memory message entry
+struct MessageEntry {
+    key: [128]u8
+    context: [64]u8
+    value: *u8
+    plurals: [PLURAL_COUNT]*u8
+    flags: u8
+    has_plurals: bool
+}
+
+// Message catalog
+struct MessageCatalog {
+    locale_code: [16]u8
+    domain: [32]u8
+
+    // Hash table for O(1) lookup
+    hash_table: [HASH_TABLE_SIZE]HashEntry
+    hash_count: u32
+
+    // String pool
+    string_pool: *u8
+    string_pool_size: u32
+
+    // Plural rules function pointer
+    plural_fn: fn(u64) -> u8
+
+    // Loaded flag
+    loaded: bool
+}
+
+// Catalog registry
+struct CatalogRegistry {
+    catalogs: [MAX_CATALOGS]*MessageCatalog
+    catalog_count: u32
+    current_locale: [16]u8
+    fallback_locale: [16]u8
+    current_domain: [32]u8
+}
+
+var registry: CatalogRegistry
+
+// DJB2 hash function for message keys
+fn hash_key(key: *u8): u32 {
+    var hash: u32 = 5381
+    var i: u32 = 0
+    while key[i] != 0 {
+        hash = ((hash << 5) + hash) + (key[i] as u32)
+        i = i + 1
+    }
+    return hash
+}
+
+// Hash with context
+fn hash_key_with_context(key: *u8, context: *u8): u32 {
+    var hash = hash_key(key)
+    if context != null and context[0] != 0 {
+        // Mix in context hash
+        let ctx_hash = hash_key(context)
+        hash = hash ^ (ctx_hash << 16) ^ (ctx_hash >> 16)
+    }
+    return hash
+}
+
+// ============================================
+// Plural Rules
+// ============================================
+
+// English plural rule (most Germanic languages)
+fn plural_english(n: u64): u8 {
+    if n == 1 {
+        return PLURAL_ONE
+    }
+    return PLURAL_OTHER
+}
+
+// Russian/Slavic plural rule
+fn plural_russian(n: u64): u8 {
+    let n10 = n % 10
+    let n100 = n % 100
+
+    if n10 == 1 and n100 != 11 {
+        return PLURAL_ONE
+    }
+    if n10 >= 2 and n10 <= 4 and (n100 < 10 or n100 >= 20) {
+        return PLURAL_FEW
+    }
+    return PLURAL_MANY
+}
+
+// Arabic plural rule
+fn plural_arabic(n: u64): u8 {
+    if n == 0 {
+        return PLURAL_ZERO
+    }
+    if n == 1 {
+        return PLURAL_ONE
+    }
+    if n == 2 {
+        return PLURAL_TWO
+    }
+    let n100 = n % 100
+    if n100 >= 3 and n100 <= 10 {
+        return PLURAL_FEW
+    }
+    if n100 >= 11 {
+        return PLURAL_MANY
+    }
+    return PLURAL_OTHER
+}
+
+// Japanese/Chinese/Korean - no plural forms
+fn plural_none(n: u64): u8 {
+    return PLURAL_OTHER
+}
+
+// French plural rule
+fn plural_french(n: u64): u8 {
+    if n == 0 or n == 1 {
+        return PLURAL_ONE
+    }
+    return PLURAL_OTHER
+}
+
+// Polish plural rule
+fn plural_polish(n: u64): u8 {
+    if n == 1 {
+        return PLURAL_ONE
+    }
+    let n10 = n % 10
+    let n100 = n % 100
+    if n10 >= 2 and n10 <= 4 and (n100 < 10 or n100 >= 20) {
+        return PLURAL_FEW
+    }
+    return PLURAL_MANY
+}
+
+// Get plural function for locale
+fn get_plural_fn(locale: *u8): fn(u64) -> u8 {
+    // Check language code (first 2 chars)
+    if locale[0] == 'e' and locale[1] == 'n' {
+        return plural_english
+    }
+    if locale[0] == 'd' and locale[1] == 'e' {
+        return plural_english  // German uses same rule
+    }
+    if locale[0] == 'f' and locale[1] == 'r' {
+        return plural_french
+    }
+    if locale[0] == 'r' and locale[1] == 'u' {
+        return plural_russian
+    }
+    if locale[0] == 'a' and locale[1] == 'r' {
+        return plural_arabic
+    }
+    if locale[0] == 'j' and locale[1] == 'a' {
+        return plural_none
+    }
+    if locale[0] == 'z' and locale[1] == 'h' {
+        return plural_none
+    }
+    if locale[0] == 'k' and locale[1] == 'o' {
+        return plural_none
+    }
+    if locale[0] == 'p' and locale[1] == 'l' {
+        return plural_polish
+    }
+
+    // Default to English-style
+    return plural_english
+}
+
+// ============================================
+// Catalog Management
+// ============================================
+
+// Initialize message system
+export fn msg_init(): void {
+    registry.catalog_count = 0
+    basics.memset(&registry.current_locale, 0, 16)
+    basics.memset(&registry.fallback_locale, 0, 16)
+    basics.memset(&registry.current_domain, 0, 32)
+
+    // Set default locale and domain
+    basics.strcpy(&registry.current_locale, "en_US")
+    basics.strcpy(&registry.fallback_locale, "en_US")
+    basics.strcpy(&registry.current_domain, "messages")
+
+    var i: u32 = 0
+    while i < MAX_CATALOGS {
+        registry.catalogs[i] = null
+        i = i + 1
+    }
+}
+
+// Create empty catalog
+export fn msg_catalog_create(locale: *u8, domain: *u8): *MessageCatalog {
+    if registry.catalog_count >= MAX_CATALOGS {
+        return null
+    }
+
+    let cat = basics.alloc(MessageCatalog) as *MessageCatalog
+    if cat == null {
+        return null
+    }
+
+    // Initialize
+    basics.memset(cat, 0, @sizeOf(MessageCatalog))
+
+    // Copy locale and domain
+    let loc_len = basics.strlen(locale)
+    if loc_len > 15 { loc_len = 15 }
+    basics.memcpy(&cat.locale_code, locale, loc_len)
+
+    let dom_len = basics.strlen(domain)
+    if dom_len > 31 { dom_len = 31 }
+    basics.memcpy(&cat.domain, domain, dom_len)
+
+    // Set plural function
+    cat.plural_fn = get_plural_fn(locale)
+    cat.loaded = true
+
+    // Register catalog
+    registry.catalogs[registry.catalog_count] = cat
+    registry.catalog_count = registry.catalog_count + 1
+
+    return cat
+}
+
+// Find catalog by locale and domain
+fn find_catalog(locale: *u8, domain: *u8): *MessageCatalog {
+    var i: u32 = 0
+    while i < registry.catalog_count {
+        let cat = registry.catalogs[i]
+        if cat != null and cat.loaded {
+            if basics.strcmp(&cat.locale_code, locale) == 0 and
+               basics.strcmp(&cat.domain, domain) == 0 {
+                return cat
+            }
+        }
+        i = i + 1
+    }
+    return null
+}
+
+// Load catalog from binary data
+export fn msg_catalog_load(data: *u8, size: u32): *MessageCatalog {
+    if size < @sizeOf(CatalogHeader) {
+        return null
+    }
+
+    let header = data as *CatalogHeader
+
+    // Verify magic
+    if header.magic[0] != MSG_MAGIC[0] or header.magic[1] != MSG_MAGIC[1] or
+       header.magic[2] != MSG_MAGIC[2] or header.magic[3] != MSG_MAGIC[3] {
+        return null
+    }
+
+    // Verify version
+    if header.version != MSG_VERSION {
+        return null
+    }
+
+    // Create catalog
+    let cat = msg_catalog_create(&header.locale_code, &header.domain)
+    if cat == null {
+        return null
+    }
+
+    // Load hash table
+    if header.hash_table_offset > 0 and header.message_count > 0 {
+        let hash_data = (data + header.hash_table_offset) as *HashEntry
+        var i: u32 = 0
+        while i < header.message_count and i < HASH_TABLE_SIZE {
+            basics.memcpy(&cat.hash_table[i], &hash_data[i], @sizeOf(HashEntry))
+            i = i + 1
+        }
+        cat.hash_count = header.message_count
+    }
+
+    // Load string pool
+    if header.string_pool_size > 0 {
+        cat.string_pool = basics.alloc(header.string_pool_size) as *u8
+        if cat.string_pool != null {
+            basics.memcpy(cat.string_pool, data + header.string_pool_offset, header.string_pool_size)
+            cat.string_pool_size = header.string_pool_size
+        }
+    }
+
+    return cat
+}
+
+// Add message to catalog
+export fn msg_catalog_add(cat: *MessageCatalog, key: *u8, value: *u8): bool {
+    if cat == null or cat.hash_count >= HASH_TABLE_SIZE {
+        return false
+    }
+
+    let hash = hash_key(key) % HASH_TABLE_SIZE
+
+    // Linear probing for collision
+    var idx = hash
+    var attempts: u32 = 0
+    while attempts < HASH_TABLE_SIZE {
+        if cat.hash_table[idx].key_hash == 0 {
+            // Found empty slot
+            cat.hash_table[idx].key_hash = hash_key(key)
+
+            // Store value in string pool
+            let val_len = basics.strlen(value) + 1
+            let new_pool_size = cat.string_pool_size + val_len
+            let new_pool = basics.realloc(cat.string_pool, new_pool_size) as *u8
+            if new_pool == null {
+                return false
+            }
+
+            basics.memcpy(new_pool + cat.string_pool_size, value, val_len)
+            cat.hash_table[idx].string_offset = cat.string_pool_size
+            cat.string_pool = new_pool
+            cat.string_pool_size = new_pool_size
+            cat.hash_count = cat.hash_count + 1
+
+            return true
+        }
+        idx = (idx + 1) % HASH_TABLE_SIZE
+        attempts = attempts + 1
+    }
+
+    return false
+}
+
+// Add message with plural forms
+export fn msg_catalog_add_plural(
+    cat: *MessageCatalog,
+    key: *u8,
+    singular: *u8,
+    plural: *u8
+): bool {
+    if cat == null or cat.hash_count >= HASH_TABLE_SIZE {
+        return false
+    }
+
+    let hash = hash_key(key) % HASH_TABLE_SIZE
+
+    var idx = hash
+    var attempts: u32 = 0
+    while attempts < HASH_TABLE_SIZE {
+        if cat.hash_table[idx].key_hash == 0 {
+            cat.hash_table[idx].key_hash = hash_key(key)
+            cat.hash_table[idx].flags = MSG_HAS_PLURAL
+            cat.hash_table[idx].plural_count = 2
+
+            // Store singular
+            let sing_len = basics.strlen(singular) + 1
+            let plur_len = basics.strlen(plural) + 1
+            let total_len = sing_len + plur_len
+
+            let new_pool_size = cat.string_pool_size + total_len
+            let new_pool = basics.realloc(cat.string_pool, new_pool_size) as *u8
+            if new_pool == null {
+                return false
+            }
+
+            basics.memcpy(new_pool + cat.string_pool_size, singular, sing_len)
+            cat.hash_table[idx].string_offset = cat.string_pool_size
+
+            basics.memcpy(new_pool + cat.string_pool_size + sing_len, plural, plur_len)
+            cat.hash_table[idx].plural_offset = cat.string_pool_size + sing_len
+
+            cat.string_pool = new_pool
+            cat.string_pool_size = new_pool_size
+            cat.hash_count = cat.hash_count + 1
+
+            return true
+        }
+        idx = (idx + 1) % HASH_TABLE_SIZE
+        attempts = attempts + 1
+    }
+
+    return false
+}
+
+// Free catalog
+export fn msg_catalog_free(cat: *MessageCatalog): void {
+    if cat == null {
+        return
+    }
+
+    // Remove from registry
+    var i: u32 = 0
+    while i < registry.catalog_count {
+        if registry.catalogs[i] == cat {
+            // Shift remaining catalogs
+            var j = i
+            while j < registry.catalog_count - 1 {
+                registry.catalogs[j] = registry.catalogs[j + 1]
+                j = j + 1
+            }
+            registry.catalogs[registry.catalog_count - 1] = null
+            registry.catalog_count = registry.catalog_count - 1
+            break
+        }
+        i = i + 1
+    }
+
+    // Free string pool
+    if cat.string_pool != null {
+        basics.free(cat.string_pool)
+    }
+
+    basics.free(cat)
+}
+
+// ============================================
+// Message Lookup
+// ============================================
+
+// Set current locale
+export fn msg_set_locale(locale: *u8): void {
+    let len = basics.strlen(locale)
+    if len > 15 { len = 15 }
+    basics.memset(&registry.current_locale, 0, 16)
+    basics.memcpy(&registry.current_locale, locale, len)
+}
+
+// Set fallback locale
+export fn msg_set_fallback(locale: *u8): void {
+    let len = basics.strlen(locale)
+    if len > 15 { len = 15 }
+    basics.memset(&registry.fallback_locale, 0, 16)
+    basics.memcpy(&registry.fallback_locale, locale, len)
+}
+
+// Set current domain
+export fn msg_set_domain(domain: *u8): void {
+    let len = basics.strlen(domain)
+    if len > 31 { len = 31 }
+    basics.memset(&registry.current_domain, 0, 32)
+    basics.memcpy(&registry.current_domain, domain, len)
+}
+
+// Get current locale
+export fn msg_get_locale(): *u8 {
+    return &registry.current_locale
+}
+
+// Get current domain
+export fn msg_get_domain(): *u8 {
+    return &registry.current_domain
+}
+
+// Lookup message in catalog
+fn lookup_in_catalog(cat: *MessageCatalog, key: *u8): *u8 {
+    if cat == null or cat.string_pool == null {
+        return null
+    }
+
+    let target_hash = hash_key(key)
+    let start_idx = target_hash % HASH_TABLE_SIZE
+
+    var idx = start_idx
+    var attempts: u32 = 0
+    while attempts < HASH_TABLE_SIZE {
+        let entry = &cat.hash_table[idx]
+        if entry.key_hash == target_hash {
+            return cat.string_pool + entry.string_offset
+        }
+        if entry.key_hash == 0 {
+            break  // Empty slot, key not found
+        }
+        idx = (idx + 1) % HASH_TABLE_SIZE
+        attempts = attempts + 1
+    }
+
+    return null
+}
+
+// Lookup plural in catalog
+fn lookup_plural_in_catalog(cat: *MessageCatalog, key: *u8, n: u64): *u8 {
+    if cat == null or cat.string_pool == null {
+        return null
+    }
+
+    let target_hash = hash_key(key)
+    let start_idx = target_hash % HASH_TABLE_SIZE
+
+    var idx = start_idx
+    var attempts: u32 = 0
+    while attempts < HASH_TABLE_SIZE {
+        let entry = &cat.hash_table[idx]
+        if entry.key_hash == target_hash {
+            if (entry.flags & MSG_HAS_PLURAL) != 0 {
+                let plural_idx = cat.plural_fn(n)
+                if plural_idx == PLURAL_ONE {
+                    return cat.string_pool + entry.string_offset
+                } else {
+                    return cat.string_pool + entry.plural_offset
+                }
+            } else {
+                return cat.string_pool + entry.string_offset
+            }
+        }
+        if entry.key_hash == 0 {
+            break
+        }
+        idx = (idx + 1) % HASH_TABLE_SIZE
+        attempts = attempts + 1
+    }
+
+    return null
+}
+
+// Get translated message (main API)
+export fn gettext(key: *u8): *u8 {
+    return dgettext(&registry.current_domain, key)
+}
+
+// Get translated message from specific domain
+export fn dgettext(domain: *u8, key: *u8): *u8 {
+    // Try current locale
+    let cat = find_catalog(&registry.current_locale, domain)
+    if cat != null {
+        let result = lookup_in_catalog(cat, key)
+        if result != null {
+            return result
+        }
+    }
+
+    // Try fallback locale
+    if basics.strcmp(&registry.current_locale, &registry.fallback_locale) != 0 {
+        let fallback_cat = find_catalog(&registry.fallback_locale, domain)
+        if fallback_cat != null {
+            let result = lookup_in_catalog(fallback_cat, key)
+            if result != null {
+                return result
+            }
+        }
+    }
+
+    // Return key as fallback
+    return key
+}
+
+// Get translated plural message
+export fn ngettext(singular: *u8, plural: *u8, n: u64): *u8 {
+    return dngettext(&registry.current_domain, singular, plural, n)
+}
+
+// Get translated plural from specific domain
+export fn dngettext(domain: *u8, singular: *u8, plural: *u8, n: u64): *u8 {
+    // Try current locale
+    let cat = find_catalog(&registry.current_locale, domain)
+    if cat != null {
+        let result = lookup_plural_in_catalog(cat, singular, n)
+        if result != null {
+            return result
+        }
+    }
+
+    // Try fallback locale
+    if basics.strcmp(&registry.current_locale, &registry.fallback_locale) != 0 {
+        let fallback_cat = find_catalog(&registry.fallback_locale, domain)
+        if fallback_cat != null {
+            let result = lookup_plural_in_catalog(fallback_cat, singular, n)
+            if result != null {
+                return result
+            }
+        }
+    }
+
+    // Return original based on n
+    if n == 1 {
+        return singular
+    }
+    return plural
+}
+
+// Get translated message with context
+export fn pgettext(context: *u8, key: *u8): *u8 {
+    // Build context|key string
+    var full_key: [256]u8
+    let ctx_len = basics.strlen(context)
+    let key_len = basics.strlen(key)
+
+    if ctx_len + key_len + 2 > 256 {
+        return key
+    }
+
+    basics.memcpy(&full_key, context, ctx_len)
+    full_key[ctx_len] = '|'
+    basics.memcpy(&full_key + ctx_len + 1, key, key_len + 1)
+
+    let result = gettext(&full_key)
+
+    // If we got back the full key, the translation wasn't found
+    if result == &full_key {
+        return key
+    }
+
+    return result
+}
+
+// ============================================
+// Formatting
+// ============================================
+
+// Format message with arguments (printf-style)
+export fn format_message(format: *u8, buffer: *u8, max_len: u32, args: ...): u32 {
+    return basics.vsnprintf(buffer, max_len, format, args)
+}
+
+// Format number according to locale
+export fn format_number_locale(value: i64, buffer: *u8, max_len: u32): u32 {
+    // Get current locale for number formatting
+    // For now, simple implementation
+    return basics.snprintf(buffer, max_len, "%lld", value)
+}
+
+// ============================================
+// Catalog Serialization
+// ============================================
+
+// Save catalog to binary format
+export fn msg_catalog_save(cat: *MessageCatalog, buffer: *u8, max_size: u32): u32 {
+    if cat == null or buffer == null {
+        return 0
+    }
+
+    let header_size = @sizeOf(CatalogHeader) as u32
+    let hash_size = cat.hash_count * @sizeOf(HashEntry) as u32
+    let total_size = header_size + hash_size + cat.string_pool_size
+
+    if total_size > max_size {
+        return 0
+    }
+
+    // Write header
+    let header = buffer as *CatalogHeader
+    header.magic[0] = MSG_MAGIC[0]
+    header.magic[1] = MSG_MAGIC[1]
+    header.magic[2] = MSG_MAGIC[2]
+    header.magic[3] = MSG_MAGIC[3]
+    header.version = MSG_VERSION
+    header.flags = 0
+    basics.memcpy(&header.locale_code, &cat.locale_code, 16)
+    basics.memcpy(&header.domain, &cat.domain, 32)
+    header.message_count = cat.hash_count
+    header.hash_table_offset = header_size
+    header.string_pool_offset = header_size + hash_size
+    header.string_pool_size = cat.string_pool_size
+    header.plural_rules_offset = 0
+
+    // Write hash table
+    var i: u32 = 0
+    var write_pos = header_size
+    while i < cat.hash_count {
+        basics.memcpy(buffer + write_pos, &cat.hash_table[i], @sizeOf(HashEntry))
+        write_pos = write_pos + @sizeOf(HashEntry) as u32
+        i = i + 1
+    }
+
+    // Write string pool
+    basics.memcpy(buffer + write_pos, cat.string_pool, cat.string_pool_size)
+
+    return total_size
+}
+
+// ============================================
+// Convenience Macros (as functions)
+// ============================================
+
+// Shorthand for gettext
+export fn _(key: *u8): *u8 {
+    return gettext(key)
+}
+
+// Shorthand for ngettext
+export fn _n(singular: *u8, plural: *u8, n: u64): *u8 {
+    return ngettext(singular, plural, n)
+}
+
+// Shorthand for pgettext
+export fn _p(context: *u8, key: *u8): *u8 {
+    return pgettext(context, key)
+}
+
+// List all loaded catalogs
+export fn msg_list_catalogs(): void {
+    basics.print("Loaded message catalogs:\n")
+    var i: u32 = 0
+    while i < registry.catalog_count {
+        let cat = registry.catalogs[i]
+        if cat != null {
+            basics.print("  - ")
+            basics.print(&cat.locale_code)
+            basics.print(" / ")
+            basics.print(&cat.domain)
+            basics.print(" (")
+            basics.print_int(cat.hash_count as i32)
+            basics.print(" messages)\n")
+        }
+        i = i + 1
+    }
+}

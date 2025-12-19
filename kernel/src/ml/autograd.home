@@ -1,0 +1,664 @@
+// HomeOS Autograd Engine
+// Automatic differentiation for neural network training
+
+const basics = @import("basics")
+const tensor = @import("ml/tensor")
+const tensor_ops = @import("ml/tensor_ops")
+
+// Import tensor types
+const Tensor = tensor.Tensor
+
+// Operation types
+const OP_NONE: u32 = 0
+const OP_ADD: u32 = 1
+const OP_SUB: u32 = 2
+const OP_MUL: u32 = 3
+const OP_DIV: u32 = 4
+const OP_NEG: u32 = 5
+const OP_MATMUL: u32 = 6
+const OP_RELU: u32 = 7
+const OP_SIGMOID: u32 = 8
+const OP_TANH: u32 = 9
+const OP_SOFTMAX: u32 = 10
+const OP_LOG_SOFTMAX: u32 = 11
+const OP_EXP: u32 = 12
+const OP_LOG: u32 = 13
+const OP_POW: u32 = 14
+const OP_SUM: u32 = 15
+const OP_MEAN: u32 = 16
+const OP_RESHAPE: u32 = 17
+const OP_TRANSPOSE: u32 = 18
+const OP_CONV2D: u32 = 19
+const OP_MAXPOOL2D: u32 = 20
+const OP_BATCHNORM: u32 = 21
+const OP_DROPOUT: u32 = 22
+const OP_LINEAR: u32 = 23
+const OP_CROSS_ENTROPY: u32 = 24
+const OP_MSE: u32 = 25
+
+// Maximum graph size
+const MAX_GRAPH_NODES: u32 = 65536
+const MAX_INPUTS_PER_NODE: u32 = 4
+const MAX_SAVED_TENSORS: u32 = 4
+
+// Gradient function node
+struct GradFn {
+    // Operation info
+    op_type: u32
+    op_name: [32]u8
+
+    // Inputs to this operation
+    inputs: [MAX_INPUTS_PER_NODE]*Tensor
+    input_count: u32
+
+    // Tensors saved for backward pass
+    saved_tensors: [MAX_SAVED_TENSORS]*Tensor
+    saved_count: u32
+
+    // Extra data for backward (e.g., kernel size for conv)
+    extra_data: [64]u8
+
+    // Links to previous nodes in graph
+    next_functions: [MAX_INPUTS_PER_NODE]*GradFn
+    next_count: u32
+
+    // Reference counting
+    ref_count: u32
+
+    // Output tensor (weak reference)
+    output: *Tensor
+}
+
+// Computation graph
+struct ComputationGraph {
+    nodes: [MAX_GRAPH_NODES]*GradFn
+    node_count: u32
+    retain_graph: bool
+
+    // Current outputs being tracked
+    outputs: [256]*Tensor
+    output_count: u32
+}
+
+// Global graph context
+var current_graph: ComputationGraph
+var grad_enabled: bool = true
+
+// ============================================
+// Graph Management
+// ============================================
+
+// Initialize autograd
+export fn autograd_init(): void {
+    basics.memset(&current_graph, 0, @sizeOf(ComputationGraph))
+    current_graph.node_count = 0
+    current_graph.retain_graph = false
+    grad_enabled = true
+}
+
+// Enable/disable gradient computation
+export fn autograd_set_grad_enabled(enabled: bool): void {
+    grad_enabled = enabled
+}
+
+// Check if gradients are enabled
+export fn autograd_is_grad_enabled(): bool {
+    return grad_enabled
+}
+
+// Create a new gradient function node
+fn grad_fn_create(op_type: u32): *GradFn {
+    if current_graph.node_count >= MAX_GRAPH_NODES {
+        return null
+    }
+
+    let node = basics.alloc(GradFn) as *GradFn
+    if node == null {
+        return null
+    }
+
+    basics.memset(node, 0, @sizeOf(GradFn))
+    node.op_type = op_type
+    node.ref_count = 1
+
+    // Add to graph
+    current_graph.nodes[current_graph.node_count] = node
+    current_graph.node_count = current_graph.node_count + 1
+
+    return node
+}
+
+// Increment reference count
+fn grad_fn_retain(node: *GradFn): void {
+    if node != null {
+        node.ref_count = node.ref_count + 1
+    }
+}
+
+// Decrement reference count and free if zero
+fn grad_fn_release(node: *GradFn): void {
+    if node == null {
+        return
+    }
+
+    node.ref_count = node.ref_count - 1
+    if node.ref_count == 0 {
+        // Release saved tensors
+        var i: u32 = 0
+        while i < node.saved_count {
+            tensor.tensor_release(node.saved_tensors[i])
+            i = i + 1
+        }
+
+        // Release next functions
+        i = 0
+        while i < node.next_count {
+            grad_fn_release(node.next_functions[i])
+            i = i + 1
+        }
+
+        basics.free(node)
+    }
+}
+
+// Save tensor for backward
+fn grad_fn_save_for_backward(node: *GradFn, t: *Tensor): void {
+    if node.saved_count < MAX_SAVED_TENSORS {
+        tensor.tensor_retain(t)
+        node.saved_tensors[node.saved_count] = t
+        node.saved_count = node.saved_count + 1
+    }
+}
+
+// Link to previous node
+fn grad_fn_link(node: *GradFn, prev: *GradFn): void {
+    if node.next_count < MAX_INPUTS_PER_NODE and prev != null {
+        grad_fn_retain(prev)
+        node.next_functions[node.next_count] = prev
+        node.next_count = node.next_count + 1
+    }
+}
+
+// ============================================
+// Forward Operations with Gradient Tracking
+// ============================================
+
+// Add with gradient tracking
+export fn autograd_add(a: *Tensor, b: *Tensor): *Tensor {
+    let result = tensor_ops.tensor_add(a, b)
+    if result == null {
+        return null
+    }
+
+    if grad_enabled and (a.requires_grad or b.requires_grad) {
+        result.requires_grad = true
+        result.is_leaf = false
+
+        let grad_fn = grad_fn_create(OP_ADD)
+        if grad_fn != null {
+            grad_fn.inputs[0] = a
+            grad_fn.inputs[1] = b
+            grad_fn.input_count = 2
+            grad_fn.output = result
+            result.grad_fn = grad_fn as *tensor.GradFn
+
+            // Link to input grad functions
+            if a.grad_fn != null {
+                grad_fn_link(grad_fn, a.grad_fn as *GradFn)
+            }
+            if b.grad_fn != null {
+                grad_fn_link(grad_fn, b.grad_fn as *GradFn)
+            }
+        }
+    }
+
+    return result
+}
+
+// Multiply with gradient tracking
+export fn autograd_mul(a: *Tensor, b: *Tensor): *Tensor {
+    let result = tensor_ops.tensor_mul(a, b)
+    if result == null {
+        return null
+    }
+
+    if grad_enabled and (a.requires_grad or b.requires_grad) {
+        result.requires_grad = true
+        result.is_leaf = false
+
+        let grad_fn = grad_fn_create(OP_MUL)
+        if grad_fn != null {
+            grad_fn.inputs[0] = a
+            grad_fn.inputs[1] = b
+            grad_fn.input_count = 2
+            grad_fn.output = result
+
+            // Save inputs for backward
+            grad_fn_save_for_backward(grad_fn, a)
+            grad_fn_save_for_backward(grad_fn, b)
+
+            result.grad_fn = grad_fn as *tensor.GradFn
+
+            if a.grad_fn != null {
+                grad_fn_link(grad_fn, a.grad_fn as *GradFn)
+            }
+            if b.grad_fn != null {
+                grad_fn_link(grad_fn, b.grad_fn as *GradFn)
+            }
+        }
+    }
+
+    return result
+}
+
+// Matrix multiply with gradient tracking
+export fn autograd_matmul(a: *Tensor, b: *Tensor): *Tensor {
+    let result = tensor_ops.tensor_matmul(a, b)
+    if result == null {
+        return null
+    }
+
+    if grad_enabled and (a.requires_grad or b.requires_grad) {
+        result.requires_grad = true
+        result.is_leaf = false
+
+        let grad_fn = grad_fn_create(OP_MATMUL)
+        if grad_fn != null {
+            grad_fn.inputs[0] = a
+            grad_fn.inputs[1] = b
+            grad_fn.input_count = 2
+            grad_fn.output = result
+
+            // Save both inputs for backward
+            grad_fn_save_for_backward(grad_fn, a)
+            grad_fn_save_for_backward(grad_fn, b)
+
+            result.grad_fn = grad_fn as *tensor.GradFn
+
+            if a.grad_fn != null {
+                grad_fn_link(grad_fn, a.grad_fn as *GradFn)
+            }
+            if b.grad_fn != null {
+                grad_fn_link(grad_fn, b.grad_fn as *GradFn)
+            }
+        }
+    }
+
+    return result
+}
+
+// ReLU with gradient tracking
+export fn autograd_relu(a: *Tensor): *Tensor {
+    let result = tensor_ops.tensor_relu(a)
+    if result == null {
+        return null
+    }
+
+    if grad_enabled and a.requires_grad {
+        result.requires_grad = true
+        result.is_leaf = false
+
+        let grad_fn = grad_fn_create(OP_RELU)
+        if grad_fn != null {
+            grad_fn.inputs[0] = a
+            grad_fn.input_count = 1
+            grad_fn.output = result
+
+            // Save input for backward
+            grad_fn_save_for_backward(grad_fn, a)
+
+            result.grad_fn = grad_fn as *tensor.GradFn
+
+            if a.grad_fn != null {
+                grad_fn_link(grad_fn, a.grad_fn as *GradFn)
+            }
+        }
+    }
+
+    return result
+}
+
+// Sigmoid with gradient tracking
+export fn autograd_sigmoid(a: *Tensor): *Tensor {
+    let result = tensor_ops.tensor_sigmoid(a)
+    if result == null {
+        return null
+    }
+
+    if grad_enabled and a.requires_grad {
+        result.requires_grad = true
+        result.is_leaf = false
+
+        let grad_fn = grad_fn_create(OP_SIGMOID)
+        if grad_fn != null {
+            grad_fn.inputs[0] = a
+            grad_fn.input_count = 1
+            grad_fn.output = result
+
+            // Save output for backward (sigmoid gradient uses output)
+            grad_fn_save_for_backward(grad_fn, result)
+
+            result.grad_fn = grad_fn as *tensor.GradFn
+
+            if a.grad_fn != null {
+                grad_fn_link(grad_fn, a.grad_fn as *GradFn)
+            }
+        }
+    }
+
+    return result
+}
+
+// Tanh with gradient tracking
+export fn autograd_tanh(a: *Tensor): *Tensor {
+    let result = tensor_ops.tensor_tanh(a)
+    if result == null {
+        return null
+    }
+
+    if grad_enabled and a.requires_grad {
+        result.requires_grad = true
+        result.is_leaf = false
+
+        let grad_fn = grad_fn_create(OP_TANH)
+        if grad_fn != null {
+            grad_fn.inputs[0] = a
+            grad_fn.input_count = 1
+            grad_fn.output = result
+
+            // Save output for backward (tanh gradient uses output)
+            grad_fn_save_for_backward(grad_fn, result)
+
+            result.grad_fn = grad_fn as *tensor.GradFn
+
+            if a.grad_fn != null {
+                grad_fn_link(grad_fn, a.grad_fn as *GradFn)
+            }
+        }
+    }
+
+    return result
+}
+
+// ============================================
+// Backward Pass
+// ============================================
+
+// Backward pass from a loss tensor
+export fn autograd_backward(loss: *Tensor, retain_graph: bool): void {
+    if loss == null or !loss.requires_grad {
+        return
+    }
+
+    current_graph.retain_graph = retain_graph
+
+    // Initialize gradient with ones (for scalar loss)
+    var ones_shape: [1]u64 = [1]
+    let grad_output = tensor.tensor_ones(&ones_shape, 1, loss.dtype)
+    if grad_output == null {
+        return
+    }
+
+    // Start backward from loss
+    backward_node(loss.grad_fn as *GradFn, grad_output)
+
+    // Clean up
+    tensor.tensor_release(grad_output)
+
+    // Clear graph if not retaining
+    if !retain_graph {
+        clear_graph()
+    }
+}
+
+// Recursive backward through a node
+fn backward_node(node: *GradFn, grad_output: *Tensor): void {
+    if node == null {
+        return
+    }
+
+    // Compute gradients based on operation type
+    var input_grads: [MAX_INPUTS_PER_NODE]*Tensor
+
+    if node.op_type == OP_ADD {
+        // d/da (a + b) = 1, d/db (a + b) = 1
+        input_grads[0] = tensor.tensor_clone(grad_output)
+        input_grads[1] = tensor.tensor_clone(grad_output)
+    }
+    else if node.op_type == OP_MUL {
+        // d/da (a * b) = b, d/db (a * b) = a
+        let a = node.saved_tensors[0]
+        let b = node.saved_tensors[1]
+        input_grads[0] = tensor_ops.tensor_mul(grad_output, b)
+        input_grads[1] = tensor_ops.tensor_mul(grad_output, a)
+    }
+    else if node.op_type == OP_MATMUL {
+        // d/dA (A @ B) = grad @ B^T
+        // d/dB (A @ B) = A^T @ grad
+        let a = node.saved_tensors[0]
+        let b = node.saved_tensors[1]
+
+        // B transposed
+        let b_t = tensor.tensor_transpose(b, 0, 1)
+        input_grads[0] = tensor_ops.tensor_matmul(grad_output, b_t)
+        tensor.tensor_release(b_t)
+
+        // A transposed
+        let a_t = tensor.tensor_transpose(a, 0, 1)
+        input_grads[1] = tensor_ops.tensor_matmul(a_t, grad_output)
+        tensor.tensor_release(a_t)
+    }
+    else if node.op_type == OP_RELU {
+        // d/dx ReLU(x) = 1 if x > 0, else 0
+        let x = node.saved_tensors[0]
+        input_grads[0] = backward_relu(grad_output, x)
+    }
+    else if node.op_type == OP_SIGMOID {
+        // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))
+        let y = node.saved_tensors[0]  // Saved output
+        input_grads[0] = backward_sigmoid(grad_output, y)
+    }
+    else if node.op_type == OP_TANH {
+        // d/dx tanh(x) = 1 - tanh(x)^2
+        let y = node.saved_tensors[0]  // Saved output
+        input_grads[0] = backward_tanh(grad_output, y)
+    }
+
+    // Propagate gradients to inputs
+    var i: u32 = 0
+    while i < node.input_count {
+        let input = node.inputs[i]
+        if input != null and input.requires_grad {
+            // Accumulate gradient
+            tensor.tensor_accumulate_grad(input, input_grads[i])
+
+            // Continue backward if not a leaf
+            if !input.is_leaf and input.grad_fn != null {
+                backward_node(input.grad_fn as *GradFn, input_grads[i])
+            }
+        }
+
+        // Release computed gradient
+        if input_grads[i] != null {
+            tensor.tensor_release(input_grads[i])
+        }
+
+        i = i + 1
+    }
+}
+
+// ReLU backward
+fn backward_relu(grad_output: *Tensor, x: *Tensor): *Tensor {
+    let result = tensor.tensor_clone(grad_output)
+    if result == null {
+        return null
+    }
+
+    let numel = tensor.tensor_numel(x)
+    if x.dtype == tensor.DTYPE_F32 {
+        let rx = x.data as *f32
+        let rg = result.data as *f32
+        var i: u64 = 0
+        while i < numel {
+            if rx[i] <= 0.0 {
+                rg[i] = 0.0
+            }
+            i = i + 1
+        }
+    }
+
+    return result
+}
+
+// Sigmoid backward
+fn backward_sigmoid(grad_output: *Tensor, y: *Tensor): *Tensor {
+    // grad * y * (1 - y)
+    let numel = tensor.tensor_numel(y)
+    let result = tensor.tensor_empty(&y.shape, y.ndim, y.dtype)
+    if result == null {
+        return null
+    }
+
+    if y.dtype == tensor.DTYPE_F32 {
+        let ry = y.data as *f32
+        let rg = grad_output.data as *f32
+        let rr = result.data as *f32
+        var i: u64 = 0
+        while i < numel {
+            rr[i] = rg[i] * ry[i] * (1.0 - ry[i])
+            i = i + 1
+        }
+    }
+
+    return result
+}
+
+// Tanh backward
+fn backward_tanh(grad_output: *Tensor, y: *Tensor): *Tensor {
+    // grad * (1 - y^2)
+    let numel = tensor.tensor_numel(y)
+    let result = tensor.tensor_empty(&y.shape, y.ndim, y.dtype)
+    if result == null {
+        return null
+    }
+
+    if y.dtype == tensor.DTYPE_F32 {
+        let ry = y.data as *f32
+        let rg = grad_output.data as *f32
+        let rr = result.data as *f32
+        var i: u64 = 0
+        while i < numel {
+            rr[i] = rg[i] * (1.0 - ry[i] * ry[i])
+            i = i + 1
+        }
+    }
+
+    return result
+}
+
+// ============================================
+// Gradient Management
+// ============================================
+
+// Zero all gradients in parameters
+export fn autograd_zero_grad(params: **Tensor, count: u32): void {
+    var i: u32 = 0
+    while i < count {
+        tensor.tensor_zero_grad(params[i])
+        i = i + 1
+    }
+}
+
+// Clear computation graph
+fn clear_graph(): void {
+    // Release all nodes
+    var i: u32 = 0
+    while i < current_graph.node_count {
+        let node = current_graph.nodes[i]
+        if node != null {
+            grad_fn_release(node)
+            current_graph.nodes[i] = null
+        }
+        i = i + 1
+    }
+    current_graph.node_count = 0
+}
+
+// Get gradient of a tensor
+export fn autograd_get_grad(t: *Tensor): *Tensor {
+    if t != null {
+        return t.grad
+    }
+    return null
+}
+
+// ============================================
+// No-Grad Context
+// ============================================
+
+// Temporarily disable gradients
+struct NoGradGuard {
+    prev_enabled: bool
+}
+
+export fn no_grad_enter(): NoGradGuard {
+    let guard = NoGradGuard {
+        prev_enabled: grad_enabled
+    }
+    grad_enabled = false
+    return guard
+}
+
+export fn no_grad_exit(guard: *NoGradGuard): void {
+    grad_enabled = guard.prev_enabled
+}
+
+// ============================================
+// Utility Functions
+// ============================================
+
+// Print computation graph (for debugging)
+export fn autograd_print_graph(): void {
+    basics.print("Computation Graph:\n")
+    basics.print("  Nodes: ")
+    basics.print_int(current_graph.node_count as i32)
+    basics.print("\n")
+
+    var i: u32 = 0
+    while i < current_graph.node_count {
+        let node = current_graph.nodes[i]
+        if node != null {
+            basics.print("  Node ")
+            basics.print_int(i as i32)
+            basics.print(": op=")
+            basics.print_int(node.op_type as i32)
+            basics.print(", inputs=")
+            basics.print_int(node.input_count as i32)
+            basics.print(", saved=")
+            basics.print_int(node.saved_count as i32)
+            basics.print("\n")
+        }
+        i = i + 1
+    }
+}
+
+// Check if tensor requires gradient
+export fn autograd_requires_grad(t: *Tensor): bool {
+    return t != null and t.requires_grad
+}
+
+// Detach tensor from computation graph
+export fn autograd_detach(t: *Tensor): *Tensor {
+    return tensor.tensor_detach(t)
+}
+
+// Clone tensor and computation graph attachment
+export fn autograd_clone(t: *Tensor): *Tensor {
+    let cloned = tensor.tensor_clone(t)
+    if cloned != null and t.requires_grad {
+        cloned.requires_grad = true
+        // Don't copy grad_fn - this is a new leaf
+        cloned.is_leaf = true
+    }
+    return cloned
+}

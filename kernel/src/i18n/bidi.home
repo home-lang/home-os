@@ -1,0 +1,693 @@
+// HomeOS Bidirectional Text Algorithm (UAX #9)
+// RTL/LTR text handling for Arabic, Hebrew, etc.
+
+const basics = @import("basics")
+
+// ============================================
+// Bidi Character Classes (Unicode Bidirectional Categories)
+// ============================================
+
+// Strong types
+const BIDI_L: u8 = 0     // Left-to-Right
+const BIDI_R: u8 = 1     // Right-to-Left
+const BIDI_AL: u8 = 2    // Arabic Letter
+
+// Weak types
+const BIDI_EN: u8 = 3    // European Number
+const BIDI_ES: u8 = 4    // European Separator
+const BIDI_ET: u8 = 5    // European Terminator
+const BIDI_AN: u8 = 6    // Arabic Number
+const BIDI_CS: u8 = 7    // Common Separator
+const BIDI_NSM: u8 = 8   // Non-Spacing Mark
+const BIDI_BN: u8 = 9    // Boundary Neutral
+
+// Neutral types
+const BIDI_B: u8 = 10    // Paragraph Separator
+const BIDI_S: u8 = 11    // Segment Separator
+const BIDI_WS: u8 = 12   // Whitespace
+const BIDI_ON: u8 = 13   // Other Neutral
+
+// Explicit formatting
+const BIDI_LRE: u8 = 14  // Left-to-Right Embedding
+const BIDI_LRO: u8 = 15  // Left-to-Right Override
+const BIDI_RLE: u8 = 16  // Right-to-Left Embedding
+const BIDI_RLO: u8 = 17  // Right-to-Left Override
+const BIDI_PDF: u8 = 18  // Pop Directional Format
+const BIDI_LRI: u8 = 19  // Left-to-Right Isolate
+const BIDI_RLI: u8 = 20  // Right-to-Left Isolate
+const BIDI_FSI: u8 = 21  // First Strong Isolate
+const BIDI_PDI: u8 = 22  // Pop Directional Isolate
+
+// ============================================
+// Bidi Run and Paragraph
+// ============================================
+
+const MAX_BIDI_DEPTH: u32 = 125
+const MAX_BIDI_RUNS: u32 = 256
+
+struct BidiRun {
+    start: u32
+    length: u32
+    level: u8
+    resolved_type: u8
+}
+
+struct BidiContext {
+    // Input
+    text: *u32           // UTF-32 codepoints
+    text_len: u32
+
+    // Per-character data
+    types: [4096]u8      // Original bidi types
+    levels: [4096]u8     // Resolved embedding levels
+    resolved: [4096]u8   // Resolved types after rules
+
+    // Runs
+    runs: [MAX_BIDI_RUNS]BidiRun
+    num_runs: u32
+
+    // Paragraph direction
+    paragraph_level: u8
+
+    // Stack for explicit embeddings
+    stack_level: [MAX_BIDI_DEPTH]u8
+    stack_override: [MAX_BIDI_DEPTH]u8
+    stack_isolate: [MAX_BIDI_DEPTH]bool
+    stack_depth: u32
+
+    // Isolate tracking
+    overflow_isolate_count: u32
+    overflow_embedding_count: u32
+    valid_isolate_count: u32
+}
+
+// ============================================
+// Unicode Character Classification
+// ============================================
+
+// Get bidi class for a Unicode codepoint
+export fn bidi_get_class(codepoint: u32): u8 {
+    // Arabic block (U+0600-U+06FF)
+    if codepoint >= 0x0600 and codepoint <= 0x06FF {
+        // Arabic letters
+        if codepoint >= 0x0621 and codepoint <= 0x064A {
+            return BIDI_AL
+        }
+        // Arabic-Indic digits
+        if codepoint >= 0x0660 and codepoint <= 0x0669 {
+            return BIDI_AN
+        }
+        // Arabic combining marks
+        if codepoint >= 0x064B and codepoint <= 0x0652 {
+            return BIDI_NSM
+        }
+        return BIDI_AL  // Most Arabic is AL
+    }
+
+    // Hebrew block (U+0590-U+05FF)
+    if codepoint >= 0x0590 and codepoint <= 0x05FF {
+        // Hebrew letters
+        if codepoint >= 0x05D0 and codepoint <= 0x05EA {
+            return BIDI_R
+        }
+        // Hebrew combining marks
+        if codepoint >= 0x0591 and codepoint <= 0x05BD {
+            return BIDI_NSM
+        }
+        return BIDI_R
+    }
+
+    // ASCII letters
+    if (codepoint >= 'A' and codepoint <= 'Z') or (codepoint >= 'a' and codepoint <= 'z') {
+        return BIDI_L
+    }
+
+    // European digits
+    if codepoint >= '0' and codepoint <= '9' {
+        return BIDI_EN
+    }
+
+    // Common separators
+    if codepoint == '/' or codepoint == ':' {
+        return BIDI_CS
+    }
+
+    // European separators
+    if codepoint == '+' or codepoint == '-' {
+        return BIDI_ES
+    }
+
+    // European terminators
+    if codepoint == '#' or codepoint == '$' or codepoint == '%' {
+        return BIDI_ET
+    }
+
+    // Whitespace
+    if codepoint == ' ' or codepoint == '\t' {
+        return BIDI_WS
+    }
+
+    // Paragraph separator
+    if codepoint == '\n' or codepoint == '\r' or codepoint == 0x2029 {
+        return BIDI_B
+    }
+
+    // Explicit formatting characters
+    if codepoint == 0x202A { return BIDI_LRE }
+    if codepoint == 0x202B { return BIDI_RLE }
+    if codepoint == 0x202C { return BIDI_PDF }
+    if codepoint == 0x202D { return BIDI_LRO }
+    if codepoint == 0x202E { return BIDI_RLO }
+    if codepoint == 0x2066 { return BIDI_LRI }
+    if codepoint == 0x2067 { return BIDI_RLI }
+    if codepoint == 0x2068 { return BIDI_FSI }
+    if codepoint == 0x2069 { return BIDI_PDI }
+
+    // Latin Extended
+    if codepoint >= 0x0080 and codepoint <= 0x024F {
+        return BIDI_L
+    }
+
+    // Default: Other Neutral
+    return BIDI_ON
+}
+
+// ============================================
+// Bidi Algorithm Implementation (Simplified UAX #9)
+// ============================================
+
+// Initialize bidi context
+export fn bidi_init(ctx: *BidiContext, text: *u32, len: u32): void {
+    ctx.text = text
+    ctx.text_len = if len > 4096 { 4096 } else { len }
+    ctx.num_runs = 0
+    ctx.stack_depth = 0
+    ctx.overflow_isolate_count = 0
+    ctx.overflow_embedding_count = 0
+    ctx.valid_isolate_count = 0
+
+    // Classify characters
+    var i: u32 = 0
+    while i < ctx.text_len {
+        ctx.types[i] = bidi_get_class(text[i])
+        ctx.resolved[i] = ctx.types[i]
+        ctx.levels[i] = 0
+        i = i + 1
+    }
+}
+
+// P2: Determine paragraph level
+export fn bidi_determine_paragraph_level(ctx: *BidiContext): void {
+    // Find first strong character
+    var i: u32 = 0
+    while i < ctx.text_len {
+        let t = ctx.types[i]
+        if t == BIDI_L {
+            ctx.paragraph_level = 0  // LTR
+            return
+        } else if t == BIDI_R or t == BIDI_AL {
+            ctx.paragraph_level = 1  // RTL
+            return
+        }
+        i = i + 1
+    }
+
+    // Default to LTR
+    ctx.paragraph_level = 0
+}
+
+// X1-X8: Process explicit embeddings
+export fn bidi_process_explicit(ctx: *BidiContext): void {
+    ctx.stack_depth = 0
+
+    // Push initial level
+    ctx.stack_level[0] = ctx.paragraph_level
+    ctx.stack_override[0] = BIDI_ON
+    ctx.stack_isolate[0] = false
+    ctx.stack_depth = 1
+
+    var i: u32 = 0
+    while i < ctx.text_len {
+        let t = ctx.types[i]
+
+        // Handle explicit embedding/override/isolate
+        if t == BIDI_RLE or t == BIDI_LRE or t == BIDI_RLO or t == BIDI_LRO or
+           t == BIDI_RLI or t == BIDI_LRI or t == BIDI_FSI {
+
+            let is_rtl = (t == BIDI_RLE or t == BIDI_RLO or t == BIDI_RLI)
+            let is_override = (t == BIDI_LRO or t == BIDI_RLO)
+            let is_isolate = (t == BIDI_LRI or t == BIDI_RLI or t == BIDI_FSI)
+
+            // Calculate new level
+            let cur_level = ctx.stack_level[ctx.stack_depth - 1]
+            var new_level: u8 = 0
+
+            if is_rtl {
+                new_level = (cur_level | 1) + 1  // Next odd
+            } else {
+                new_level = (cur_level + 2) & ~1  // Next even
+            }
+
+            if new_level <= MAX_BIDI_DEPTH as u8 and ctx.overflow_isolate_count == 0 and
+               ctx.overflow_embedding_count == 0 {
+
+                if is_isolate {
+                    ctx.valid_isolate_count = ctx.valid_isolate_count + 1
+                }
+
+                // Push to stack
+                if ctx.stack_depth < MAX_BIDI_DEPTH {
+                    ctx.stack_level[ctx.stack_depth] = new_level
+                    ctx.stack_override[ctx.stack_depth] = if is_override {
+                        if is_rtl { BIDI_R } else { BIDI_L }
+                    } else {
+                        BIDI_ON
+                    }
+                    ctx.stack_isolate[ctx.stack_depth] = is_isolate
+                    ctx.stack_depth = ctx.stack_depth + 1
+                }
+            } else if is_isolate {
+                ctx.overflow_isolate_count = ctx.overflow_isolate_count + 1
+            } else if ctx.overflow_isolate_count == 0 {
+                ctx.overflow_embedding_count = ctx.overflow_embedding_count + 1
+            }
+
+            ctx.levels[i] = cur_level
+            ctx.resolved[i] = BIDI_BN
+        } else if t == BIDI_PDI {
+            if ctx.overflow_isolate_count > 0 {
+                ctx.overflow_isolate_count = ctx.overflow_isolate_count - 1
+            } else if ctx.valid_isolate_count > 0 {
+                ctx.overflow_embedding_count = 0
+
+                // Pop until we find an isolate
+                while ctx.stack_depth > 0 and not ctx.stack_isolate[ctx.stack_depth - 1] {
+                    ctx.stack_depth = ctx.stack_depth - 1
+                }
+                if ctx.stack_depth > 0 {
+                    ctx.stack_depth = ctx.stack_depth - 1
+                }
+                ctx.valid_isolate_count = ctx.valid_isolate_count - 1
+            }
+
+            ctx.levels[i] = ctx.stack_level[ctx.stack_depth - 1]
+            ctx.resolved[i] = BIDI_BN
+        } else if t == BIDI_PDF {
+            if ctx.overflow_isolate_count > 0 {
+                // Ignore
+            } else if ctx.overflow_embedding_count > 0 {
+                ctx.overflow_embedding_count = ctx.overflow_embedding_count - 1
+            } else if ctx.stack_depth > 1 and not ctx.stack_isolate[ctx.stack_depth - 1] {
+                ctx.stack_depth = ctx.stack_depth - 1
+            }
+
+            ctx.levels[i] = ctx.stack_level[ctx.stack_depth - 1]
+            ctx.resolved[i] = BIDI_BN
+        } else if t == BIDI_B {
+            ctx.levels[i] = ctx.paragraph_level
+        } else {
+            // Regular character
+            let level = ctx.stack_level[ctx.stack_depth - 1]
+            ctx.levels[i] = level
+
+            // Apply override if any
+            let override_type = ctx.stack_override[ctx.stack_depth - 1]
+            if override_type != BIDI_ON {
+                ctx.resolved[i] = override_type
+            }
+        }
+
+        i = i + 1
+    }
+}
+
+// W1-W7: Resolve weak types
+export fn bidi_resolve_weak(ctx: *BidiContext): void {
+    var prev_strong: u8 = ctx.paragraph_level % 2 == 0 ? BIDI_L : BIDI_R
+
+    var i: u32 = 0
+    while i < ctx.text_len {
+        let t = ctx.resolved[i]
+
+        // W1: NSM gets type of previous
+        if t == BIDI_NSM {
+            if i > 0 {
+                ctx.resolved[i] = ctx.resolved[i - 1]
+            } else {
+                ctx.resolved[i] = ctx.paragraph_level % 2 == 0 ? BIDI_L : BIDI_R
+            }
+        }
+
+        // W2: EN after AL becomes AN
+        if t == BIDI_EN and prev_strong == BIDI_AL {
+            ctx.resolved[i] = BIDI_AN
+        }
+
+        // W3: AL becomes R
+        if t == BIDI_AL {
+            ctx.resolved[i] = BIDI_R
+        }
+
+        // Track strong types for W2
+        let resolved = ctx.resolved[i]
+        if resolved == BIDI_L or resolved == BIDI_R or resolved == BIDI_AL {
+            prev_strong = resolved
+        }
+
+        i = i + 1
+    }
+
+    // W4: Single ES/CS between same types
+    i = 1
+    while i < ctx.text_len - 1 {
+        let prev = ctx.resolved[i - 1]
+        let curr = ctx.resolved[i]
+        let next = ctx.resolved[i + 1]
+
+        if curr == BIDI_ES and prev == BIDI_EN and next == BIDI_EN {
+            ctx.resolved[i] = BIDI_EN
+        }
+        if curr == BIDI_CS {
+            if (prev == BIDI_EN and next == BIDI_EN) or (prev == BIDI_AN and next == BIDI_AN) {
+                ctx.resolved[i] = prev
+            }
+        }
+        i = i + 1
+    }
+
+    // W5: ET adjacent to EN becomes EN
+    i = 0
+    while i < ctx.text_len {
+        if ctx.resolved[i] == BIDI_ET {
+            // Look for adjacent EN
+            var j: u32 = i
+            while j > 0 and ctx.resolved[j - 1] == BIDI_ET {
+                j = j - 1
+            }
+
+            var found_en = false
+            if j > 0 and ctx.resolved[j - 1] == BIDI_EN {
+                found_en = true
+            }
+
+            var k: u32 = i
+            while k < ctx.text_len and ctx.resolved[k] == BIDI_ET {
+                k = k + 1
+            }
+            if k < ctx.text_len and ctx.resolved[k] == BIDI_EN {
+                found_en = true
+            }
+
+            if found_en {
+                var m: u32 = j
+                while m < k {
+                    ctx.resolved[m] = BIDI_EN
+                    m = m + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // W6: ES, ET, CS become ON
+    i = 0
+    while i < ctx.text_len {
+        let t = ctx.resolved[i]
+        if t == BIDI_ES or t == BIDI_ET or t == BIDI_CS {
+            ctx.resolved[i] = BIDI_ON
+        }
+        i = i + 1
+    }
+
+    // W7: EN after L becomes L
+    prev_strong = ctx.paragraph_level % 2 == 0 ? BIDI_L : BIDI_R
+    i = 0
+    while i < ctx.text_len {
+        let t = ctx.resolved[i]
+        if t == BIDI_EN and prev_strong == BIDI_L {
+            ctx.resolved[i] = BIDI_L
+        }
+        if t == BIDI_L or t == BIDI_R {
+            prev_strong = t
+        }
+        i = i + 1
+    }
+}
+
+// N1-N2: Resolve neutral types
+export fn bidi_resolve_neutral(ctx: *BidiContext): void {
+    var i: u32 = 0
+    while i < ctx.text_len {
+        let t = ctx.resolved[i]
+
+        if t == BIDI_ON or t == BIDI_WS or t == BIDI_S or t == BIDI_B {
+            // Find surrounding strong types
+            var prev_strong: u8 = BIDI_ON
+            var next_strong: u8 = BIDI_ON
+
+            // Look back
+            var j: i64 = (i as i64) - 1
+            while j >= 0 {
+                let pt = ctx.resolved[j as u32]
+                if pt == BIDI_L or pt == BIDI_R or pt == BIDI_EN or pt == BIDI_AN {
+                    prev_strong = if pt == BIDI_AN { BIDI_R } else { pt }
+                    break
+                }
+                j = j - 1
+            }
+            if prev_strong == BIDI_ON {
+                prev_strong = if ctx.paragraph_level % 2 == 0 { BIDI_L } else { BIDI_R }
+            }
+
+            // Look forward
+            var k: u32 = i + 1
+            while k < ctx.text_len {
+                let nt = ctx.resolved[k]
+                if nt == BIDI_L or nt == BIDI_R or nt == BIDI_EN or nt == BIDI_AN {
+                    next_strong = if nt == BIDI_AN { BIDI_R } else { nt }
+                    break
+                }
+                k = k + 1
+            }
+            if next_strong == BIDI_ON {
+                next_strong = if ctx.paragraph_level % 2 == 0 { BIDI_L } else { BIDI_R }
+            }
+
+            // N1: NI between same directions
+            if prev_strong == next_strong {
+                ctx.resolved[i] = prev_strong
+            } else {
+                // N2: Use embedding level direction
+                ctx.resolved[i] = if ctx.levels[i] % 2 == 0 { BIDI_L } else { BIDI_R }
+            }
+        }
+
+        i = i + 1
+    }
+}
+
+// I1-I2: Resolve implicit levels
+export fn bidi_resolve_implicit(ctx: *BidiContext): void {
+    var i: u32 = 0
+    while i < ctx.text_len {
+        let t = ctx.resolved[i]
+        let level = ctx.levels[i]
+
+        // I1: If level is even
+        if level % 2 == 0 {
+            if t == BIDI_R {
+                ctx.levels[i] = level + 1
+            } else if t == BIDI_AN or t == BIDI_EN {
+                ctx.levels[i] = level + 2
+            }
+        } else {
+            // I2: If level is odd
+            if t == BIDI_L or t == BIDI_EN or t == BIDI_AN {
+                ctx.levels[i] = level + 1
+            }
+        }
+
+        i = i + 1
+    }
+}
+
+// Build runs from resolved levels
+export fn bidi_build_runs(ctx: *BidiContext): void {
+    if ctx.text_len == 0 {
+        ctx.num_runs = 0
+        return
+    }
+
+    ctx.num_runs = 0
+    var run_start: u32 = 0
+    var run_level: u8 = ctx.levels[0]
+
+    var i: u32 = 1
+    while i < ctx.text_len {
+        if ctx.levels[i] != run_level {
+            // End current run
+            if ctx.num_runs < MAX_BIDI_RUNS {
+                ctx.runs[ctx.num_runs].start = run_start
+                ctx.runs[ctx.num_runs].length = i - run_start
+                ctx.runs[ctx.num_runs].level = run_level
+                ctx.runs[ctx.num_runs].resolved_type = ctx.resolved[run_start]
+                ctx.num_runs = ctx.num_runs + 1
+            }
+
+            run_start = i
+            run_level = ctx.levels[i]
+        }
+        i = i + 1
+    }
+
+    // Last run
+    if ctx.num_runs < MAX_BIDI_RUNS {
+        ctx.runs[ctx.num_runs].start = run_start
+        ctx.runs[ctx.num_runs].length = ctx.text_len - run_start
+        ctx.runs[ctx.num_runs].level = run_level
+        ctx.runs[ctx.num_runs].resolved_type = ctx.resolved[run_start]
+        ctx.num_runs = ctx.num_runs + 1
+    }
+}
+
+// L2: Reorder runs for display
+export fn bidi_reorder_runs(ctx: *BidiContext): void {
+    // Find max level
+    var max_level: u8 = 0
+    var i: u32 = 0
+    while i < ctx.num_runs {
+        if ctx.runs[i].level > max_level {
+            max_level = ctx.runs[i].level
+        }
+        i = i + 1
+    }
+
+    // Reverse subsequences of runs at each level
+    var level: u8 = max_level
+    while level > 0 {
+        i = 0
+        while i < ctx.num_runs {
+            if ctx.runs[i].level >= level {
+                // Find end of subsequence
+                var j: u32 = i + 1
+                while j < ctx.num_runs and ctx.runs[j].level >= level {
+                    j = j + 1
+                }
+
+                // Reverse runs i..j-1
+                bidi_reverse_runs(ctx, i, j - 1)
+
+                i = j
+            } else {
+                i = i + 1
+            }
+        }
+        level = level - 1
+    }
+}
+
+fn bidi_reverse_runs(ctx: *BidiContext, start: u32, end: u32): void {
+    var i: u32 = start
+    var j: u32 = end
+
+    while i < j {
+        // Swap runs[i] and runs[j]
+        let temp = ctx.runs[i]
+        ctx.runs[i] = ctx.runs[j]
+        ctx.runs[j] = temp
+        i = i + 1
+        j = j - 1
+    }
+}
+
+// ============================================
+// High-Level API
+// ============================================
+
+// Process text and return reordered indices
+export fn bidi_process(text: *u32, len: u32, visual_order: *u32): void {
+    var ctx: BidiContext = undefined
+
+    bidi_init(&ctx, text, len)
+    bidi_determine_paragraph_level(&ctx)
+    bidi_process_explicit(&ctx)
+    bidi_resolve_weak(&ctx)
+    bidi_resolve_neutral(&ctx)
+    bidi_resolve_implicit(&ctx)
+    bidi_build_runs(&ctx)
+    bidi_reorder_runs(&ctx)
+
+    // Build visual order from runs
+    var pos: u32 = 0
+    var r: u32 = 0
+    while r < ctx.num_runs {
+        let run = &ctx.runs[r]
+
+        // If run level is odd, reverse the characters within
+        if run.level % 2 == 1 {
+            var i: u32 = 0
+            while i < run.length {
+                visual_order[pos + i] = run.start + run.length - 1 - i
+                i = i + 1
+            }
+        } else {
+            var i: u32 = 0
+            while i < run.length {
+                visual_order[pos + i] = run.start + i
+                i = i + 1
+            }
+        }
+
+        pos = pos + run.length
+        r = r + 1
+    }
+}
+
+// Check if text contains RTL characters
+export fn bidi_has_rtl(text: *u32, len: u32): bool {
+    var i: u32 = 0
+    while i < len {
+        let cls = bidi_get_class(text[i])
+        if cls == BIDI_R or cls == BIDI_AL {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Get base direction of text
+export fn bidi_get_base_direction(text: *u32, len: u32): u8 {
+    var i: u32 = 0
+    while i < len {
+        let cls = bidi_get_class(text[i])
+        if cls == BIDI_L {
+            return 0  // LTR
+        } else if cls == BIDI_R or cls == BIDI_AL {
+            return 1  // RTL
+        }
+        i = i + 1
+    }
+    return 0  // Default LTR
+}
+
+// Mirror character for RTL display (e.g., '(' -> ')')
+export fn bidi_get_mirror(codepoint: u32): u32 {
+    switch codepoint {
+        '(' => return ')',
+        ')' => return '(',
+        '[' => return ']',
+        ']' => return '[',
+        '{' => return '}',
+        '}' => return '{',
+        '<' => return '>',
+        '>' => return '<',
+        0xAB => return 0xBB,  // «»
+        0xBB => return 0xAB,
+        0x2039 => return 0x203A,  // ‹›
+        0x203A => return 0x2039,
+        0x2045 => return 0x2046,  // ⁅⁆
+        0x2046 => return 0x2045,
+        else => return codepoint
+    }
+}

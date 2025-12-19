@@ -1,0 +1,750 @@
+// HomeOS Neural Network Normalization Layers
+// BatchNorm, LayerNorm, GroupNorm, InstanceNorm implementations
+
+const basics = @import("basics")
+const tensor = @import("ml/tensor")
+const module = @import("ml/nn/module")
+
+// ============================================
+// BatchNorm2d
+// ============================================
+
+struct BatchNormData {
+    num_features: u32
+    eps: f32
+    momentum: f32
+    affine: bool
+    track_running_stats: bool
+}
+
+export fn BatchNorm2d(num_features: u32): *module.Module {
+    return batchnorm2d_create(num_features, 1e-5, 0.1, true, true)
+}
+
+export fn batchnorm2d_create(
+    num_features: u32,
+    eps: f64,
+    momentum: f64,
+    affine: bool,
+    track_running_stats: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "BatchNorm2d", module.MODULE_BATCHNORM2D)
+
+    let extra = basics.alloc(BatchNormData) as *BatchNormData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.num_features = num_features
+    extra.eps = eps as f32
+    extra.momentum = momentum as f32
+    extra.affine = affine
+    extra.track_running_stats = track_running_stats
+    m.extra = extra as *void
+
+    var feature_shape: [1]u64 = [num_features as u64]
+
+    // Learnable parameters
+    if affine {
+        let gamma = tensor.tensor_ones(&feature_shape, 1, tensor.DTYPE_F32)
+        if gamma != null {
+            module.module_register_parameter(m, "weight", gamma)
+        }
+
+        let beta = tensor.tensor_zeros(&feature_shape, 1, tensor.DTYPE_F32)
+        if beta != null {
+            module.module_register_parameter(m, "bias", beta)
+        }
+    }
+
+    // Running statistics (buffers, not parameters)
+    if track_running_stats {
+        let running_mean = tensor.tensor_zeros(&feature_shape, 1, tensor.DTYPE_F32)
+        if running_mean != null {
+            module.module_register_buffer(m, "running_mean", running_mean)
+        }
+
+        let running_var = tensor.tensor_ones(&feature_shape, 1, tensor.DTYPE_F32)
+        if running_var != null {
+            module.module_register_buffer(m, "running_var", running_var)
+        }
+    }
+
+    m.forward_fn = batchnorm2d_forward
+    return m
+}
+
+fn batchnorm2d_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *BatchNormData
+
+    // Input shape: (N, C, H, W)
+    if input == null or input.ndim != 4 {
+        return null
+    }
+
+    let batch = input.shape[0]
+    let channels = input.shape[1]
+    let height = input.shape[2]
+    let width = input.shape[3]
+
+    // Create output
+    let output = tensor.tensor_clone(input)
+    if output == null {
+        return null
+    }
+
+    if input.dtype != tensor.DTYPE_F32 {
+        return output
+    }
+
+    let in_data = input.data as *f32
+    let out_data = output.data as *f32
+
+    // Get parameters and buffers
+    let weight = module.module_get_parameter(m, "weight")
+    let bias = module.module_get_parameter(m, "bias")
+    let running_mean = module.module_get_buffer(m, "running_mean")
+    let running_var = module.module_get_buffer(m, "running_var")
+
+    let w_data = if weight != null { weight.data as *f32 } else { null }
+    let b_data = if bias != null { bias.data as *f32 } else { null }
+
+    let eps = extra.eps as f64
+
+    // In eval mode, use running statistics
+    // In training mode, compute batch statistics (simplified: always use batch stats for now)
+    let spatial_size = height * width
+
+    var c: u64 = 0
+    while c < channels {
+        // Compute mean and variance for this channel across batch and spatial
+        var mean: f64 = 0.0
+        var var_sum: f64 = 0.0
+        let count = batch * spatial_size
+
+        // First pass: mean
+        var n: u64 = 0
+        while n < batch {
+            var h: u64 = 0
+            while h < height {
+                var w: u64 = 0
+                while w < width {
+                    let idx = n * channels * height * width + c * height * width + h * width + w
+                    mean = mean + (in_data[idx] as f64)
+                    w = w + 1
+                }
+                h = h + 1
+            }
+            n = n + 1
+        }
+        mean = mean / (count as f64)
+
+        // Second pass: variance
+        n = 0
+        while n < batch {
+            var h: u64 = 0
+            while h < height {
+                var w: u64 = 0
+                while w < width {
+                    let idx = n * channels * height * width + c * height * width + h * width + w
+                    let diff = (in_data[idx] as f64) - mean
+                    var_sum = var_sum + diff * diff
+                    w = w + 1
+                }
+                h = h + 1
+            }
+            n = n + 1
+        }
+        let variance = var_sum / (count as f64)
+
+        // Normalize
+        let std_inv = 1.0 / basics.sqrt(variance + eps)
+        let gamma = if w_data != null { w_data[c] as f64 } else { 1.0 }
+        let beta_val = if b_data != null { b_data[c] as f64 } else { 0.0 }
+
+        n = 0
+        while n < batch {
+            var h: u64 = 0
+            while h < height {
+                var w: u64 = 0
+                while w < width {
+                    let idx = n * channels * height * width + c * height * width + h * width + w
+                    let normalized = ((in_data[idx] as f64) - mean) * std_inv
+                    out_data[idx] = (gamma * normalized + beta_val) as f32
+                    w = w + 1
+                }
+                h = h + 1
+            }
+            n = n + 1
+        }
+
+        c = c + 1
+    }
+
+    return output
+}
+
+// ============================================
+// BatchNorm1d
+// ============================================
+
+export fn BatchNorm1d(num_features: u32): *module.Module {
+    return batchnorm1d_create(num_features, 1e-5, 0.1, true, true)
+}
+
+export fn batchnorm1d_create(
+    num_features: u32,
+    eps: f64,
+    momentum: f64,
+    affine: bool,
+    track_running_stats: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "BatchNorm1d", module.MODULE_BATCHNORM1D)
+
+    let extra = basics.alloc(BatchNormData) as *BatchNormData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.num_features = num_features
+    extra.eps = eps as f32
+    extra.momentum = momentum as f32
+    extra.affine = affine
+    extra.track_running_stats = track_running_stats
+    m.extra = extra as *void
+
+    var feature_shape: [1]u64 = [num_features as u64]
+
+    if affine {
+        let gamma = tensor.tensor_ones(&feature_shape, 1, tensor.DTYPE_F32)
+        if gamma != null {
+            module.module_register_parameter(m, "weight", gamma)
+        }
+
+        let beta = tensor.tensor_zeros(&feature_shape, 1, tensor.DTYPE_F32)
+        if beta != null {
+            module.module_register_parameter(m, "bias", beta)
+        }
+    }
+
+    m.forward_fn = batchnorm1d_forward
+    return m
+}
+
+fn batchnorm1d_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *BatchNormData
+
+    // Input shape: (N, C) or (N, C, L)
+    if input == null or (input.ndim != 2 and input.ndim != 3) {
+        return null
+    }
+
+    let output = tensor.tensor_clone(input)
+    if output == null {
+        return null
+    }
+
+    if input.dtype != tensor.DTYPE_F32 {
+        return output
+    }
+
+    let in_data = input.data as *f32
+    let out_data = output.data as *f32
+
+    let weight = module.module_get_parameter(m, "weight")
+    let bias = module.module_get_parameter(m, "bias")
+
+    let w_data = if weight != null { weight.data as *f32 } else { null }
+    let b_data = if bias != null { bias.data as *f32 } else { null }
+
+    let eps = extra.eps as f64
+
+    let batch = input.shape[0]
+    let channels = input.shape[1]
+    let length = if input.ndim == 3 { input.shape[2] } else { 1 }
+
+    var c: u64 = 0
+    while c < channels {
+        // Compute mean
+        var mean: f64 = 0.0
+        let count = batch * length
+
+        var n: u64 = 0
+        while n < batch {
+            var l: u64 = 0
+            while l < length {
+                let idx = if input.ndim == 3 {
+                    n * channels * length + c * length + l
+                } else {
+                    n * channels + c
+                }
+                mean = mean + (in_data[idx] as f64)
+                l = l + 1
+            }
+            n = n + 1
+        }
+        mean = mean / (count as f64)
+
+        // Compute variance
+        var var_sum: f64 = 0.0
+        n = 0
+        while n < batch {
+            var l: u64 = 0
+            while l < length {
+                let idx = if input.ndim == 3 {
+                    n * channels * length + c * length + l
+                } else {
+                    n * channels + c
+                }
+                let diff = (in_data[idx] as f64) - mean
+                var_sum = var_sum + diff * diff
+                l = l + 1
+            }
+            n = n + 1
+        }
+        let variance = var_sum / (count as f64)
+
+        // Normalize
+        let std_inv = 1.0 / basics.sqrt(variance + eps)
+        let gamma = if w_data != null { w_data[c] as f64 } else { 1.0 }
+        let beta_val = if b_data != null { b_data[c] as f64 } else { 0.0 }
+
+        n = 0
+        while n < batch {
+            var l: u64 = 0
+            while l < length {
+                let idx = if input.ndim == 3 {
+                    n * channels * length + c * length + l
+                } else {
+                    n * channels + c
+                }
+                let normalized = ((in_data[idx] as f64) - mean) * std_inv
+                out_data[idx] = (gamma * normalized + beta_val) as f32
+                l = l + 1
+            }
+            n = n + 1
+        }
+
+        c = c + 1
+    }
+
+    return output
+}
+
+// ============================================
+// LayerNorm
+// ============================================
+
+struct LayerNormData {
+    normalized_shape: [4]u64
+    normalized_dims: u32
+    eps: f32
+    elementwise_affine: bool
+}
+
+export fn LayerNorm(normalized_shape: u64): *module.Module {
+    var shape: [1]u64 = [normalized_shape]
+    return layernorm_create(&shape, 1, 1e-5, true)
+}
+
+export fn layernorm_create(
+    normalized_shape: *u64,
+    num_dims: u32,
+    eps: f64,
+    elementwise_affine: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "LayerNorm", module.MODULE_LAYERNORM)
+
+    let extra = basics.alloc(LayerNormData) as *LayerNormData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+
+    var i: u32 = 0
+    while i < num_dims and i < 4 {
+        extra.normalized_shape[i] = normalized_shape[i]
+        i = i + 1
+    }
+    extra.normalized_dims = num_dims
+    extra.eps = eps as f32
+    extra.elementwise_affine = elementwise_affine
+    m.extra = extra as *void
+
+    // Calculate total size for parameters
+    var total_size: u64 = 1
+    i = 0
+    while i < num_dims {
+        total_size = total_size * normalized_shape[i]
+        i = i + 1
+    }
+
+    if elementwise_affine {
+        var param_shape: [1]u64 = [total_size]
+
+        let gamma = tensor.tensor_ones(&param_shape, 1, tensor.DTYPE_F32)
+        if gamma != null {
+            module.module_register_parameter(m, "weight", gamma)
+        }
+
+        let beta = tensor.tensor_zeros(&param_shape, 1, tensor.DTYPE_F32)
+        if beta != null {
+            module.module_register_parameter(m, "bias", beta)
+        }
+    }
+
+    m.forward_fn = layernorm_forward
+    return m
+}
+
+fn layernorm_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *LayerNormData
+
+    if input == null {
+        return null
+    }
+
+    let output = tensor.tensor_clone(input)
+    if output == null {
+        return null
+    }
+
+    if input.dtype != tensor.DTYPE_F32 {
+        return output
+    }
+
+    let in_data = input.data as *f32
+    let out_data = output.data as *f32
+
+    let weight = module.module_get_parameter(m, "weight")
+    let bias = module.module_get_parameter(m, "bias")
+
+    let w_data = if weight != null { weight.data as *f32 } else { null }
+    let b_data = if bias != null { bias.data as *f32 } else { null }
+
+    let eps = extra.eps as f64
+
+    // Calculate normalized size
+    var normalized_size: u64 = 1
+    var i: u32 = 0
+    while i < extra.normalized_dims {
+        normalized_size = normalized_size * extra.normalized_shape[i]
+        i = i + 1
+    }
+
+    let total_size = tensor.tensor_numel(input)
+    let num_instances = total_size / normalized_size
+
+    // Normalize each instance
+    var inst: u64 = 0
+    while inst < num_instances {
+        let offset = inst * normalized_size
+
+        // Compute mean
+        var mean: f64 = 0.0
+        var j: u64 = 0
+        while j < normalized_size {
+            mean = mean + (in_data[offset + j] as f64)
+            j = j + 1
+        }
+        mean = mean / (normalized_size as f64)
+
+        // Compute variance
+        var var_sum: f64 = 0.0
+        j = 0
+        while j < normalized_size {
+            let diff = (in_data[offset + j] as f64) - mean
+            var_sum = var_sum + diff * diff
+            j = j + 1
+        }
+        let variance = var_sum / (normalized_size as f64)
+
+        // Normalize
+        let std_inv = 1.0 / basics.sqrt(variance + eps)
+
+        j = 0
+        while j < normalized_size {
+            let normalized = ((in_data[offset + j] as f64) - mean) * std_inv
+            let gamma = if w_data != null { w_data[j] as f64 } else { 1.0 }
+            let beta_val = if b_data != null { b_data[j] as f64 } else { 0.0 }
+            out_data[offset + j] = (gamma * normalized + beta_val) as f32
+            j = j + 1
+        }
+
+        inst = inst + 1
+    }
+
+    return output
+}
+
+// ============================================
+// GroupNorm
+// ============================================
+
+struct GroupNormData {
+    num_groups: u32
+    num_channels: u32
+    eps: f32
+    affine: bool
+}
+
+export fn GroupNorm(num_groups: u32, num_channels: u32): *module.Module {
+    return groupnorm_create(num_groups, num_channels, 1e-5, true)
+}
+
+export fn groupnorm_create(
+    num_groups: u32,
+    num_channels: u32,
+    eps: f64,
+    affine: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "GroupNorm", module.MODULE_GROUPNORM)
+
+    let extra = basics.alloc(GroupNormData) as *GroupNormData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.num_groups = num_groups
+    extra.num_channels = num_channels
+    extra.eps = eps as f32
+    extra.affine = affine
+    m.extra = extra as *void
+
+    if affine {
+        var param_shape: [1]u64 = [num_channels as u64]
+
+        let gamma = tensor.tensor_ones(&param_shape, 1, tensor.DTYPE_F32)
+        if gamma != null {
+            module.module_register_parameter(m, "weight", gamma)
+        }
+
+        let beta = tensor.tensor_zeros(&param_shape, 1, tensor.DTYPE_F32)
+        if beta != null {
+            module.module_register_parameter(m, "bias", beta)
+        }
+    }
+
+    m.forward_fn = groupnorm_forward
+    return m
+}
+
+fn groupnorm_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *GroupNormData
+
+    // Input: (N, C, ...) where C must be divisible by num_groups
+    if input == null or input.ndim < 2 {
+        return null
+    }
+
+    let output = tensor.tensor_clone(input)
+    if output == null {
+        return null
+    }
+
+    if input.dtype != tensor.DTYPE_F32 {
+        return output
+    }
+
+    let in_data = input.data as *f32
+    let out_data = output.data as *f32
+
+    let weight = module.module_get_parameter(m, "weight")
+    let bias = module.module_get_parameter(m, "bias")
+
+    let w_data = if weight != null { weight.data as *f32 } else { null }
+    let b_data = if bias != null { bias.data as *f32 } else { null }
+
+    let eps = extra.eps as f64
+
+    let batch = input.shape[0]
+    let channels = input.shape[1]
+    let channels_per_group = channels / (extra.num_groups as u64)
+
+    // Calculate spatial size
+    var spatial_size: u64 = 1
+    var d: u32 = 2
+    while d < input.ndim {
+        spatial_size = spatial_size * input.shape[d]
+        d = d + 1
+    }
+
+    let group_size = channels_per_group * spatial_size
+
+    var n: u64 = 0
+    while n < batch {
+        var g: u32 = 0
+        while g < extra.num_groups {
+            let group_offset = n * channels * spatial_size + (g as u64) * group_size
+
+            // Compute mean
+            var mean: f64 = 0.0
+            var i: u64 = 0
+            while i < group_size {
+                mean = mean + (in_data[group_offset + i] as f64)
+                i = i + 1
+            }
+            mean = mean / (group_size as f64)
+
+            // Compute variance
+            var var_sum: f64 = 0.0
+            i = 0
+            while i < group_size {
+                let diff = (in_data[group_offset + i] as f64) - mean
+                var_sum = var_sum + diff * diff
+                i = i + 1
+            }
+            let variance = var_sum / (group_size as f64)
+
+            // Normalize
+            let std_inv = 1.0 / basics.sqrt(variance + eps)
+
+            var c: u64 = 0
+            while c < channels_per_group {
+                let channel_idx = (g as u64) * channels_per_group + c
+                let gamma = if w_data != null { w_data[channel_idx] as f64 } else { 1.0 }
+                let beta_val = if b_data != null { b_data[channel_idx] as f64 } else { 0.0 }
+
+                var s: u64 = 0
+                while s < spatial_size {
+                    let idx = group_offset + c * spatial_size + s
+                    let normalized = ((in_data[idx] as f64) - mean) * std_inv
+                    out_data[idx] = (gamma * normalized + beta_val) as f32
+                    s = s + 1
+                }
+                c = c + 1
+            }
+
+            g = g + 1
+        }
+        n = n + 1
+    }
+
+    return output
+}
+
+// ============================================
+// InstanceNorm2d
+// ============================================
+
+export fn InstanceNorm2d(num_features: u32): *module.Module {
+    // Instance norm is group norm with num_groups = num_channels
+    return groupnorm_create(num_features, num_features, 1e-5, true)
+}
+
+// ============================================
+// RMSNorm (Root Mean Square Layer Normalization)
+// ============================================
+
+struct RMSNormData {
+    normalized_shape: u64
+    eps: f32
+}
+
+export fn RMSNorm(normalized_shape: u64): *module.Module {
+    return rmsnorm_create(normalized_shape, 1e-6)
+}
+
+export fn rmsnorm_create(normalized_shape: u64, eps: f64): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "RMSNorm", module.MODULE_RMSNORM)
+
+    let extra = basics.alloc(RMSNormData) as *RMSNormData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.normalized_shape = normalized_shape
+    extra.eps = eps as f32
+    m.extra = extra as *void
+
+    var param_shape: [1]u64 = [normalized_shape]
+    let weight = tensor.tensor_ones(&param_shape, 1, tensor.DTYPE_F32)
+    if weight != null {
+        module.module_register_parameter(m, "weight", weight)
+    }
+
+    m.forward_fn = rmsnorm_forward
+    return m
+}
+
+fn rmsnorm_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *RMSNormData
+
+    if input == null {
+        return null
+    }
+
+    let output = tensor.tensor_clone(input)
+    if output == null {
+        return null
+    }
+
+    if input.dtype != tensor.DTYPE_F32 {
+        return output
+    }
+
+    let in_data = input.data as *f32
+    let out_data = output.data as *f32
+
+    let weight = module.module_get_parameter(m, "weight")
+    let w_data = if weight != null { weight.data as *f32 } else { null }
+
+    let eps = extra.eps as f64
+    let normalized_size = extra.normalized_shape
+
+    let total_size = tensor.tensor_numel(input)
+    let num_instances = total_size / normalized_size
+
+    var inst: u64 = 0
+    while inst < num_instances {
+        let offset = inst * normalized_size
+
+        // Compute RMS (root mean square)
+        var sq_sum: f64 = 0.0
+        var j: u64 = 0
+        while j < normalized_size {
+            let val = in_data[offset + j] as f64
+            sq_sum = sq_sum + val * val
+            j = j + 1
+        }
+        let rms = basics.sqrt(sq_sum / (normalized_size as f64) + eps)
+
+        // Normalize
+        j = 0
+        while j < normalized_size {
+            let normalized = (in_data[offset + j] as f64) / rms
+            let gamma = if w_data != null { w_data[j] as f64 } else { 1.0 }
+            out_data[offset + j] = (gamma * normalized) as f32
+            j = j + 1
+        }
+
+        inst = inst + 1
+    }
+
+    return output
+}

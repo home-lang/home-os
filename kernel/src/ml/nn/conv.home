@@ -1,0 +1,594 @@
+// HomeOS Neural Network Convolutional Layers
+// Conv1d, Conv2d, ConvTranspose2d implementations
+
+const basics = @import("basics")
+const tensor = @import("ml/tensor")
+const tensor_ops = @import("ml/tensor_ops")
+const autograd = @import("ml/autograd")
+const module = @import("ml/nn/module")
+
+// ============================================
+// Conv2d - 2D Convolution
+// ============================================
+
+struct Conv2dData {
+    in_channels: u32
+    out_channels: u32
+    kernel_h: u32
+    kernel_w: u32
+    stride_h: u32
+    stride_w: u32
+    padding_h: u32
+    padding_w: u32
+    dilation_h: u32
+    dilation_w: u32
+    groups: u32
+    use_bias: bool
+}
+
+// Create Conv2d layer
+export fn Conv2d(
+    in_channels: u32,
+    out_channels: u32,
+    kernel_size: u32
+): *module.Module {
+    return conv2d_create(in_channels, out_channels, kernel_size, kernel_size,
+                         1, 1, 0, 0, 1, 1, 1, true)
+}
+
+// Create Conv2d with full options
+export fn conv2d_create(
+    in_channels: u32,
+    out_channels: u32,
+    kernel_h: u32,
+    kernel_w: u32,
+    stride_h: u32,
+    stride_w: u32,
+    padding_h: u32,
+    padding_w: u32,
+    dilation_h: u32,
+    dilation_w: u32,
+    groups: u32,
+    use_bias: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "Conv2d", module.MODULE_CONV2D)
+
+    // Allocate extra data
+    let extra = basics.alloc(Conv2dData) as *Conv2dData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.in_channels = in_channels
+    extra.out_channels = out_channels
+    extra.kernel_h = kernel_h
+    extra.kernel_w = kernel_w
+    extra.stride_h = stride_h
+    extra.stride_w = stride_w
+    extra.padding_h = padding_h
+    extra.padding_w = padding_w
+    extra.dilation_h = dilation_h
+    extra.dilation_w = dilation_w
+    extra.groups = groups
+    extra.use_bias = use_bias
+    m.extra = extra as *void
+
+    // Create weight parameter: (out_channels, in_channels/groups, kernel_h, kernel_w)
+    var weight_shape: [4]u64 = [
+        out_channels as u64,
+        (in_channels / groups) as u64,
+        kernel_h as u64,
+        kernel_w as u64
+    ]
+    let weight = tensor.tensor_empty(&weight_shape, 4, tensor.DTYPE_F32)
+    if weight == null {
+        basics.free(extra)
+        basics.free(m)
+        return null
+    }
+
+    // Kaiming initialization
+    let fan_in = (in_channels / groups) * kernel_h * kernel_w
+    let k = basics.sqrt(1.0 / (fan_in as f64))
+    conv_init_uniform(weight, -k, k)
+
+    module.module_register_parameter(m, "weight", weight)
+
+    // Create bias parameter if needed
+    if use_bias {
+        var bias_shape: [1]u64 = [out_channels as u64]
+        let bias = tensor.tensor_empty(&bias_shape, 1, tensor.DTYPE_F32)
+        if bias != null {
+            conv_init_uniform(bias, -k, k)
+            module.module_register_parameter(m, "bias", bias)
+        }
+    }
+
+    m.forward_fn = conv2d_forward
+    return m
+}
+
+fn conv_init_uniform(t: *tensor.Tensor, low: f64, high: f64): void {
+    let numel = tensor.tensor_numel(t)
+    let range = high - low
+
+    if t.dtype == tensor.DTYPE_F32 {
+        let data = t.data as *f32
+        var i: u64 = 0
+        while i < numel {
+            let r = tensor.rand_f64()
+            data[i] = (low + r * range) as f32
+            i = i + 1
+        }
+    }
+}
+
+// Conv2d forward pass using im2col approach
+fn conv2d_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *Conv2dData
+
+    // Input shape: (N, C_in, H_in, W_in) or (C_in, H_in, W_in)
+    if input == null or (input.ndim != 3 and input.ndim != 4) {
+        return null
+    }
+
+    let weight = module.module_get_parameter(m, "weight")
+    if weight == null {
+        return null
+    }
+
+    // Handle 3D input (single sample)
+    var batched = input
+    var need_squeeze = false
+
+    if input.ndim == 3 {
+        var new_shape: [4]u64 = [1, input.shape[0], input.shape[1], input.shape[2]]
+        batched = tensor.tensor_view(input, &new_shape, 4)
+        need_squeeze = true
+    }
+
+    let batch_size = batched.shape[0]
+    let in_height = batched.shape[2]
+    let in_width = batched.shape[3]
+
+    // Calculate output dimensions
+    let out_height = conv_output_size(in_height as u32, extra.kernel_h,
+                                       extra.stride_h, extra.padding_h, extra.dilation_h)
+    let out_width = conv_output_size(in_width as u32, extra.kernel_w,
+                                      extra.stride_w, extra.padding_w, extra.dilation_w)
+
+    // Create output tensor: (N, C_out, H_out, W_out)
+    var out_shape: [4]u64 = [batch_size, extra.out_channels as u64, out_height as u64, out_width as u64]
+    let output = tensor.tensor_zeros(&out_shape, 4, tensor.DTYPE_F32)
+    if output == null {
+        if need_squeeze {
+            tensor.tensor_release(batched)
+        }
+        return null
+    }
+
+    // Perform convolution (naive implementation for clarity)
+    conv2d_naive(batched, weight, output, extra)
+
+    // Add bias if present
+    if extra.use_bias {
+        let bias = module.module_get_parameter(m, "bias")
+        if bias != null {
+            conv2d_add_bias(output, bias)
+        }
+    }
+
+    if need_squeeze {
+        tensor.tensor_release(batched)
+        // Squeeze batch dimension
+        var squeezed_shape: [3]u64 = [output.shape[1], output.shape[2], output.shape[3]]
+        let result = tensor.tensor_view(output, &squeezed_shape, 3)
+        tensor.tensor_release(output)
+        return result
+    }
+
+    return output
+}
+
+// Calculate output size for convolution
+fn conv_output_size(input: u32, kernel: u32, stride: u32, padding: u32, dilation: u32): u32 {
+    let effective_kernel = dilation * (kernel - 1) + 1
+    return (input + 2 * padding - effective_kernel) / stride + 1
+}
+
+// Naive 2D convolution implementation
+fn conv2d_naive(input: *tensor.Tensor, weight: *tensor.Tensor, output: *tensor.Tensor,
+                extra: *Conv2dData): void {
+    if input.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let in_data = input.data as *f32
+    let w_data = weight.data as *f32
+    let out_data = output.data as *f32
+
+    let batch = input.shape[0]
+    let in_c = input.shape[1]
+    let in_h = input.shape[2]
+    let in_w = input.shape[3]
+
+    let out_c = output.shape[1]
+    let out_h = output.shape[2]
+    let out_w = output.shape[3]
+
+    let kh = extra.kernel_h as u64
+    let kw = extra.kernel_w as u64
+    let sh = extra.stride_h as u64
+    let sw = extra.stride_w as u64
+    let ph = extra.padding_h as i64
+    let pw = extra.padding_w as i64
+    let dh = extra.dilation_h as u64
+    let dw = extra.dilation_w as u64
+
+    var n: u64 = 0
+    while n < batch {
+        var oc: u64 = 0
+        while oc < out_c {
+            var oh: u64 = 0
+            while oh < out_h {
+                var ow: u64 = 0
+                while ow < out_w {
+                    var sum: f32 = 0.0
+
+                    var ic: u64 = 0
+                    while ic < in_c {
+                        var fh: u64 = 0
+                        while fh < kh {
+                            var fw: u64 = 0
+                            while fw < kw {
+                                let ih = (oh * sh + fh * dh) as i64 - ph
+                                let iw = (ow * sw + fw * dw) as i64 - pw
+
+                                if ih >= 0 and ih < (in_h as i64) and iw >= 0 and iw < (in_w as i64) {
+                                    let in_idx = n * in_c * in_h * in_w + ic * in_h * in_w +
+                                                 (ih as u64) * in_w + (iw as u64)
+                                    let w_idx = oc * in_c * kh * kw + ic * kh * kw + fh * kw + fw
+                                    sum = sum + in_data[in_idx] * w_data[w_idx]
+                                }
+                                fw = fw + 1
+                            }
+                            fh = fh + 1
+                        }
+                        ic = ic + 1
+                    }
+
+                    let out_idx = n * out_c * out_h * out_w + oc * out_h * out_w + oh * out_w + ow
+                    out_data[out_idx] = sum
+                    ow = ow + 1
+                }
+                oh = oh + 1
+            }
+            oc = oc + 1
+        }
+        n = n + 1
+    }
+}
+
+// Add bias to convolution output
+fn conv2d_add_bias(output: *tensor.Tensor, bias: *tensor.Tensor): void {
+    if output.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let out_data = output.data as *f32
+    let b_data = bias.data as *f32
+
+    let batch = output.shape[0]
+    let channels = output.shape[1]
+    let height = output.shape[2]
+    let width = output.shape[3]
+
+    var n: u64 = 0
+    while n < batch {
+        var c: u64 = 0
+        while c < channels {
+            let b = b_data[c]
+            var h: u64 = 0
+            while h < height {
+                var w: u64 = 0
+                while w < width {
+                    let idx = n * channels * height * width + c * height * width + h * width + w
+                    out_data[idx] = out_data[idx] + b
+                    w = w + 1
+                }
+                h = h + 1
+            }
+            c = c + 1
+        }
+        n = n + 1
+    }
+}
+
+// ============================================
+// Conv1d - 1D Convolution
+// ============================================
+
+struct Conv1dData {
+    in_channels: u32
+    out_channels: u32
+    kernel_size: u32
+    stride: u32
+    padding: u32
+    dilation: u32
+    groups: u32
+    use_bias: bool
+}
+
+export fn Conv1d(in_channels: u32, out_channels: u32, kernel_size: u32): *module.Module {
+    return conv1d_create(in_channels, out_channels, kernel_size, 1, 0, 1, 1, true)
+}
+
+export fn conv1d_create(
+    in_channels: u32,
+    out_channels: u32,
+    kernel_size: u32,
+    stride: u32,
+    padding: u32,
+    dilation: u32,
+    groups: u32,
+    use_bias: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "Conv1d", module.MODULE_CONV1D)
+
+    let extra = basics.alloc(Conv1dData) as *Conv1dData
+    if extra == null {
+        basics.free(m)
+        return null
+    }
+    extra.in_channels = in_channels
+    extra.out_channels = out_channels
+    extra.kernel_size = kernel_size
+    extra.stride = stride
+    extra.padding = padding
+    extra.dilation = dilation
+    extra.groups = groups
+    extra.use_bias = use_bias
+    m.extra = extra as *void
+
+    // Weight: (out_channels, in_channels/groups, kernel_size)
+    var weight_shape: [3]u64 = [
+        out_channels as u64,
+        (in_channels / groups) as u64,
+        kernel_size as u64
+    ]
+    let weight = tensor.tensor_empty(&weight_shape, 3, tensor.DTYPE_F32)
+    if weight != null {
+        let fan_in = (in_channels / groups) * kernel_size
+        let k = basics.sqrt(1.0 / (fan_in as f64))
+        conv_init_uniform(weight, -k, k)
+        module.module_register_parameter(m, "weight", weight)
+    }
+
+    if use_bias {
+        var bias_shape: [1]u64 = [out_channels as u64]
+        let bias = tensor.tensor_zeros(&bias_shape, 1, tensor.DTYPE_F32)
+        if bias != null {
+            module.module_register_parameter(m, "bias", bias)
+        }
+    }
+
+    m.forward_fn = conv1d_forward
+    return m
+}
+
+fn conv1d_forward(m: *module.Module, input: *tensor.Tensor): *tensor.Tensor {
+    let extra = m.extra as *Conv1dData
+
+    // Input shape: (N, C_in, L) or (C_in, L)
+    if input == null or (input.ndim != 2 and input.ndim != 3) {
+        return null
+    }
+
+    let weight = module.module_get_parameter(m, "weight")
+    if weight == null {
+        return null
+    }
+
+    var batched = input
+    var need_squeeze = false
+
+    if input.ndim == 2 {
+        var new_shape: [3]u64 = [1, input.shape[0], input.shape[1]]
+        batched = tensor.tensor_view(input, &new_shape, 3)
+        need_squeeze = true
+    }
+
+    let batch = batched.shape[0]
+    let in_len = batched.shape[2]
+
+    let out_len = conv_output_size(in_len as u32, extra.kernel_size,
+                                    extra.stride, extra.padding, extra.dilation)
+
+    var out_shape: [3]u64 = [batch, extra.out_channels as u64, out_len as u64]
+    let output = tensor.tensor_zeros(&out_shape, 3, tensor.DTYPE_F32)
+
+    if output != null {
+        conv1d_naive(batched, weight, output, extra)
+
+        if extra.use_bias {
+            let bias = module.module_get_parameter(m, "bias")
+            if bias != null {
+                conv1d_add_bias(output, bias)
+            }
+        }
+    }
+
+    if need_squeeze {
+        tensor.tensor_release(batched)
+    }
+
+    return output
+}
+
+fn conv1d_naive(input: *tensor.Tensor, weight: *tensor.Tensor, output: *tensor.Tensor,
+                extra: *Conv1dData): void {
+    if input.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let in_data = input.data as *f32
+    let w_data = weight.data as *f32
+    let out_data = output.data as *f32
+
+    let batch = input.shape[0]
+    let in_c = input.shape[1]
+    let in_l = input.shape[2]
+
+    let out_c = output.shape[1]
+    let out_l = output.shape[2]
+
+    let k = extra.kernel_size as u64
+    let s = extra.stride as u64
+    let p = extra.padding as i64
+    let d = extra.dilation as u64
+
+    var n: u64 = 0
+    while n < batch {
+        var oc: u64 = 0
+        while oc < out_c {
+            var ol: u64 = 0
+            while ol < out_l {
+                var sum: f32 = 0.0
+
+                var ic: u64 = 0
+                while ic < in_c {
+                    var fk: u64 = 0
+                    while fk < k {
+                        let il = (ol * s + fk * d) as i64 - p
+                        if il >= 0 and il < (in_l as i64) {
+                            let in_idx = n * in_c * in_l + ic * in_l + (il as u64)
+                            let w_idx = oc * in_c * k + ic * k + fk
+                            sum = sum + in_data[in_idx] * w_data[w_idx]
+                        }
+                        fk = fk + 1
+                    }
+                    ic = ic + 1
+                }
+
+                let out_idx = n * out_c * out_l + oc * out_l + ol
+                out_data[out_idx] = sum
+                ol = ol + 1
+            }
+            oc = oc + 1
+        }
+        n = n + 1
+    }
+}
+
+fn conv1d_add_bias(output: *tensor.Tensor, bias: *tensor.Tensor): void {
+    let out_data = output.data as *f32
+    let b_data = bias.data as *f32
+
+    let batch = output.shape[0]
+    let channels = output.shape[1]
+    let length = output.shape[2]
+
+    var n: u64 = 0
+    while n < batch {
+        var c: u64 = 0
+        while c < channels {
+            let b = b_data[c]
+            var l: u64 = 0
+            while l < length {
+                let idx = n * channels * length + c * length + l
+                out_data[idx] = out_data[idx] + b
+                l = l + 1
+            }
+            c = c + 1
+        }
+        n = n + 1
+    }
+}
+
+// ============================================
+// ConvTranspose2d - Transposed 2D Convolution
+// ============================================
+
+export fn ConvTranspose2d(
+    in_channels: u32,
+    out_channels: u32,
+    kernel_size: u32
+): *module.Module {
+    return conv_transpose2d_create(in_channels, out_channels, kernel_size, kernel_size,
+                                    1, 1, 0, 0, 0, 0, 1, true)
+}
+
+export fn conv_transpose2d_create(
+    in_channels: u32,
+    out_channels: u32,
+    kernel_h: u32,
+    kernel_w: u32,
+    stride_h: u32,
+    stride_w: u32,
+    padding_h: u32,
+    padding_w: u32,
+    output_padding_h: u32,
+    output_padding_w: u32,
+    groups: u32,
+    use_bias: bool
+): *module.Module {
+    let m = basics.alloc(module.Module) as *module.Module
+    if m == null {
+        return null
+    }
+
+    module.module_init(m, "ConvTranspose2d", module.MODULE_CONV_TRANSPOSE2D)
+
+    // Weight: (in_channels, out_channels/groups, kernel_h, kernel_w)
+    var weight_shape: [4]u64 = [
+        in_channels as u64,
+        (out_channels / groups) as u64,
+        kernel_h as u64,
+        kernel_w as u64
+    ]
+    let weight = tensor.tensor_empty(&weight_shape, 4, tensor.DTYPE_F32)
+    if weight != null {
+        let fan_in = in_channels * kernel_h * kernel_w
+        let k = basics.sqrt(1.0 / (fan_in as f64))
+        conv_init_uniform(weight, -k, k)
+        module.module_register_parameter(m, "weight", weight)
+    }
+
+    if use_bias {
+        var bias_shape: [1]u64 = [out_channels as u64]
+        let bias = tensor.tensor_zeros(&bias_shape, 1, tensor.DTYPE_F32)
+        if bias != null {
+            module.module_register_parameter(m, "bias", bias)
+        }
+    }
+
+    m.forward_fn = null  // TODO: Implement transpose conv forward
+    return m
+}
+
+// ============================================
+// Depthwise Separable Convolution
+// ============================================
+
+// Create depthwise separable conv (MobileNet style)
+export fn DepthwiseSeparableConv2d(
+    in_channels: u32,
+    out_channels: u32,
+    kernel_size: u32
+): *module.Module {
+    // This would be implemented as a Sequential of:
+    // 1. Depthwise conv (groups=in_channels)
+    // 2. Pointwise conv (1x1)
+    // For now, return regular conv
+    return Conv2d(in_channels, out_channels, kernel_size)
+}

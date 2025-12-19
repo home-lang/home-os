@@ -1,0 +1,646 @@
+// HomeOS Suspend-to-RAM (S3) Implementation
+// Cross-platform suspend/resume for power management
+
+const basics = @import("basics")
+const cpu_state = @import("power/cpu_state")
+const device_pm = @import("power/device_pm")
+const kernel = @import("kernel")
+
+// Suspend states
+const SUSPEND_IDLE: u32 = 0
+const SUSPEND_PREPARE: u32 = 1
+const SUSPEND_DEVICES: u32 = 2
+const SUSPEND_PLATFORM: u32 = 3
+const SUSPEND_CORE: u32 = 4
+const SUSPEND_COMPLETE: u32 = 5
+
+// Resume states
+const RESUME_CORE: u32 = 10
+const RESUME_PLATFORM: u32 = 11
+const RESUME_DEVICES: u32 = 12
+const RESUME_COMPLETE: u32 = 13
+
+// Error codes
+const SUSPEND_OK: i32 = 0
+const SUSPEND_ERR_DEVICES: i32 = -1
+const SUSPEND_ERR_PLATFORM: i32 = -2
+const SUSPEND_ERR_ABORT: i32 = -3
+const SUSPEND_ERR_CPU: i32 = -4
+const SUSPEND_ERR_MEMORY: i32 = -5
+
+// Suspend/resume callbacks
+struct SuspendOps {
+    // Called before suspend begins
+    prepare: fn() -> i32
+    // Called after resume completes
+    complete: fn() -> void
+
+    // Platform-specific suspend entry
+    enter: fn(state: u32) -> i32
+    // Platform-specific wake
+    wake: fn() -> void
+
+    // Check if platform supports suspend
+    valid: fn(state: u32) -> bool
+}
+
+// Suspend statistics
+struct SuspendStats {
+    suspend_count: u64
+    resume_count: u64
+    failed_count: u64
+    last_suspend_time_us: u64
+    last_resume_time_us: u64
+    total_suspend_time_us: u64
+    last_error: i32
+    last_failed_device: [64]u8
+}
+
+// Suspend context
+struct SuspendContext {
+    state: u32
+    target_state: u32
+    abort_requested: bool
+    irqs_disabled: bool
+    cpu_state_saved: bool
+    devices_suspended: bool
+
+    // Resume entry point for bootloader
+    resume_entry: u64
+    resume_stack: u64
+    resume_cr3: u64    // x86: page table, ARM: ttbr1
+
+    // Platform operations
+    ops: *SuspendOps
+}
+
+var suspend_ctx: SuspendContext
+var suspend_stats: SuspendStats
+
+// Platform operations (set by architecture-specific code)
+var platform_ops: SuspendOps
+
+// ============================================
+// Platform Registration
+// ============================================
+
+// Register platform suspend operations
+export fn suspend_register_ops(ops: *SuspendOps): void {
+    suspend_ctx.ops = ops
+}
+
+// x86_64 ACPI platform operations
+fn acpi_prepare(): i32 {
+    // Prepare ACPI for S3
+    // - Set up GPE wake sources
+    // - Configure SCI
+    return SUSPEND_OK
+}
+
+fn acpi_complete(): void {
+    // ACPI post-resume cleanup
+}
+
+fn acpi_enter_s3(): i32 {
+    // Write to PM1a/PM1b control registers
+    // This triggers the actual suspend
+
+    // PM1_CNT.SLP_TYP = S3 type
+    // PM1_CNT.SLP_EN = 1
+
+    let pm1a_cnt = kernel.acpi_get_pm1a_cnt()
+    let s3_type = kernel.acpi_get_s3_type()
+
+    // Write sleep type
+    let val = kernel.io_read16(pm1a_cnt)
+    let new_val = (val & 0xC3FF) | (s3_type << 10) | 0x2000  // SLP_EN
+    kernel.io_write16(pm1a_cnt, new_val)
+
+    // CPU halts here...
+    // On wake, we return from this function
+
+    return SUSPEND_OK
+}
+
+fn acpi_wake(): void {
+    // Clear SLP_EN and SLP_TYP
+    let pm1a_cnt = kernel.acpi_get_pm1a_cnt()
+    let val = kernel.io_read16(pm1a_cnt)
+    kernel.io_write16(pm1a_cnt, val & 0xC3FF)
+}
+
+fn acpi_valid(state: u32): bool {
+    // Check if ACPI supports this sleep state
+    return state == 3  // S3 only for now
+}
+
+// ARM64 PSCI platform operations
+fn psci_prepare(): i32 {
+    return SUSPEND_OK
+}
+
+fn psci_complete(): void {
+}
+
+fn psci_enter_suspend(state: u32): i32 {
+    // PSCI CPU_SUSPEND call
+    let power_state: u32 = 0x01000000  // Power down, platform-specific
+
+    // Prepare entry point for resume
+    let entry = suspend_ctx.resume_entry
+    let context = 0 as u64
+
+    // SMC call to EL3
+    var result: i64
+    asm volatile (
+        "mov x0, #0xC4000001\n"  // PSCI_CPU_SUSPEND (64-bit)
+        "mov x1, %[state]\n"
+        "mov x2, %[entry]\n"
+        "mov x3, %[ctx]\n"
+        "smc #0\n"
+        "mov %[result], x0\n"
+        : [result] "=r" (result)
+        : [state] "r" (power_state as u64),
+          [entry] "r" (entry),
+          [ctx] "r" (context)
+        : "x0", "x1", "x2", "x3"
+    )
+
+    return result as i32
+}
+
+fn psci_wake(): void {
+    // Nothing special needed
+}
+
+fn psci_valid(state: u32): bool {
+    return state == 3  // S3 equivalent
+}
+
+// ============================================
+// Suspend Flow
+// ============================================
+
+// Initialize suspend subsystem
+export fn suspend_init(): void {
+    basics.memset(&suspend_ctx, 0, @sizeOf(SuspendContext))
+    basics.memset(&suspend_stats, 0, @sizeOf(SuspendStats))
+
+    suspend_ctx.state = SUSPEND_IDLE
+
+    // Set platform ops based on architecture
+    if cpu_state.get_current_arch() == cpu_state.ARCH_X86_64 {
+        platform_ops.prepare = acpi_prepare
+        platform_ops.complete = acpi_complete
+        platform_ops.enter = acpi_enter_s3
+        platform_ops.wake = acpi_wake
+        platform_ops.valid = acpi_valid
+    } else {
+        platform_ops.prepare = psci_prepare
+        platform_ops.complete = psci_complete
+        platform_ops.enter = psci_enter_suspend
+        platform_ops.wake = psci_wake
+        platform_ops.valid = psci_valid
+    }
+
+    suspend_ctx.ops = &platform_ops
+}
+
+// Check if suspend is supported
+export fn suspend_valid(state: u32): bool {
+    if suspend_ctx.ops == null {
+        return false
+    }
+    return suspend_ctx.ops.valid(state)
+}
+
+// Request abort of in-progress suspend
+export fn suspend_abort(): void {
+    suspend_ctx.abort_requested = true
+}
+
+// Main suspend-to-RAM entry point
+export fn pm_suspend_to_ram(): i32 {
+    if suspend_ctx.state != SUSPEND_IDLE {
+        return SUSPEND_ERR_ABORT  // Already suspending
+    }
+
+    if !suspend_valid(3) {
+        return SUSPEND_ERR_PLATFORM
+    }
+
+    let start_time = kernel.get_time_us()
+    suspend_ctx.abort_requested = false
+    var result: i32 = SUSPEND_OK
+
+    // Phase 1: Prepare
+    suspend_ctx.state = SUSPEND_PREPARE
+    basics.print("suspend: Preparing for suspend...\n")
+
+    if suspend_ctx.ops.prepare != null {
+        result = suspend_ctx.ops.prepare()
+        if result != SUSPEND_OK {
+            goto_suspend_abort()
+            return result
+        }
+    }
+
+    // Sync filesystems
+    result = sync_filesystems()
+    if result != SUSPEND_OK {
+        goto_suspend_abort()
+        return result
+    }
+
+    // Phase 2: Suspend devices
+    suspend_ctx.state = SUSPEND_DEVICES
+    basics.print("suspend: Suspending devices...\n")
+
+    result = suspend_devices()
+    if result != SUSPEND_OK {
+        goto_resume_devices()
+        return result
+    }
+    suspend_ctx.devices_suspended = true
+
+    // Check for abort
+    if suspend_ctx.abort_requested {
+        goto_resume_devices()
+        return SUSPEND_ERR_ABORT
+    }
+
+    // Phase 3: Disable interrupts and save CPU state
+    suspend_ctx.state = SUSPEND_PLATFORM
+    basics.print("suspend: Saving CPU state...\n")
+
+    // Disable interrupts
+    disable_interrupts()
+    suspend_ctx.irqs_disabled = true
+
+    // Save CPU state for all CPUs
+    result = save_all_cpu_states()
+    if result != SUSPEND_OK {
+        goto_resume_irqs()
+        return result
+    }
+    suspend_ctx.cpu_state_saved = true
+
+    // Phase 4: Enter platform suspend
+    suspend_ctx.state = SUSPEND_CORE
+    basics.print("suspend: Entering sleep state...\n")
+
+    // Set up resume point
+    suspend_ctx.resume_entry = &resume_entry as u64
+
+    // ====== SUSPEND HAPPENS HERE ======
+    result = suspend_ctx.ops.enter(3)
+    // ====== RESUME CONTINUES HERE ======
+
+    // If we get here, we've resumed
+
+    // Phase 5: Resume
+    resume_from_suspend()
+
+    let end_time = kernel.get_time_us()
+    suspend_stats.suspend_count = suspend_stats.suspend_count + 1
+    suspend_stats.last_suspend_time_us = end_time - start_time
+    suspend_stats.total_suspend_time_us = suspend_stats.total_suspend_time_us + (end_time - start_time)
+
+    return SUSPEND_OK
+}
+
+// Sync all filesystems before suspend
+fn sync_filesystems(): i32 {
+    basics.print("suspend: Syncing filesystems...\n")
+    // kernel.vfs_sync_all()
+    return SUSPEND_OK
+}
+
+// Suspend all devices
+fn suspend_devices(): i32 {
+    basics.print("suspend: Suspending devices (prepare)...\n")
+
+    // Prepare phase - devices can still use hardware
+    var result = device_pm.device_pm_prepare_all()
+    if result != 0 {
+        basics.print("suspend: Device prepare failed\n")
+        return SUSPEND_ERR_DEVICES
+    }
+
+    // Suspend phase - with IRQs enabled
+    basics.print("suspend: Suspending devices (suspend)...\n")
+    result = device_pm.device_pm_suspend_all()
+    if result != 0 {
+        basics.print("suspend: Device suspend failed\n")
+        return SUSPEND_ERR_DEVICES
+    }
+
+    // Late suspend phase
+    basics.print("suspend: Suspending devices (late)...\n")
+    result = device_pm.device_pm_suspend_late_all()
+    if result != 0 {
+        basics.print("suspend: Device late suspend failed\n")
+        return SUSPEND_ERR_DEVICES
+    }
+
+    // NoIRQ suspend phase - IRQs will be disabled after this
+    basics.print("suspend: Suspending devices (noirq)...\n")
+    result = device_pm.device_pm_suspend_noirq_all()
+    if result != 0 {
+        basics.print("suspend: Device noirq suspend failed\n")
+        return SUSPEND_ERR_DEVICES
+    }
+
+    return SUSPEND_OK
+}
+
+// Resume all devices
+fn resume_devices(): void {
+    basics.print("resume: Resuming devices (noirq)...\n")
+    device_pm.device_pm_resume_noirq_all()
+
+    basics.print("resume: Resuming devices (early)...\n")
+    device_pm.device_pm_resume_early_all()
+
+    basics.print("resume: Resuming devices (resume)...\n")
+    device_pm.device_pm_resume_all()
+
+    basics.print("resume: Resuming devices (complete)...\n")
+    device_pm.device_pm_complete_all()
+}
+
+// Disable all interrupts
+fn disable_interrupts(): void {
+    if cpu_state.get_current_arch() == cpu_state.ARCH_X86_64 {
+        asm volatile ("cli")
+    } else {
+        asm volatile ("msr daifset, #0xf")
+    }
+}
+
+// Enable interrupts
+fn enable_interrupts(): void {
+    if cpu_state.get_current_arch() == cpu_state.ARCH_X86_64 {
+        asm volatile ("sti")
+    } else {
+        asm volatile ("msr daifclr, #0xf")
+    }
+}
+
+// Save state for all CPUs
+fn save_all_cpu_states(): i32 {
+    // For now, just save boot CPU
+    // Multi-CPU support would need IPI to other CPUs
+    if !cpu_state.save_cpu_state(0) {
+        return SUSPEND_ERR_CPU
+    }
+    return SUSPEND_OK
+}
+
+// Restore state for all CPUs
+fn restore_all_cpu_states(): void {
+    cpu_state.restore_cpu_state(0)
+}
+
+// Resume entry point (called by hardware/firmware on wake)
+export fn resume_entry(): void {
+    // This is the first code executed on resume
+    // Must be very careful here - minimal state available
+
+    // Restore CPU state
+    restore_all_cpu_states()
+
+    // Continue resume in main path
+}
+
+// Complete resume sequence
+fn resume_from_suspend(): void {
+    suspend_ctx.state = RESUME_CORE
+    basics.print("resume: Waking up...\n")
+
+    // Platform wake
+    suspend_ctx.state = RESUME_PLATFORM
+    if suspend_ctx.ops.wake != null {
+        suspend_ctx.ops.wake()
+    }
+
+    // Restore CPU state already done
+
+    // Re-enable interrupts
+    if suspend_ctx.irqs_disabled {
+        enable_interrupts()
+        suspend_ctx.irqs_disabled = false
+    }
+
+    // Resume devices
+    suspend_ctx.state = RESUME_DEVICES
+    if suspend_ctx.devices_suspended {
+        resume_devices()
+        suspend_ctx.devices_suspended = false
+    }
+
+    // Platform complete
+    if suspend_ctx.ops.complete != null {
+        suspend_ctx.ops.complete()
+    }
+
+    suspend_ctx.state = RESUME_COMPLETE
+    suspend_stats.resume_count = suspend_stats.resume_count + 1
+
+    basics.print("resume: System resumed successfully\n")
+    suspend_ctx.state = SUSPEND_IDLE
+}
+
+// Error handling gotos (using functions since Home may not have goto)
+fn goto_suspend_abort(): void {
+    suspend_stats.failed_count = suspend_stats.failed_count + 1
+    suspend_ctx.state = SUSPEND_IDLE
+}
+
+fn goto_resume_devices(): void {
+    if suspend_ctx.devices_suspended {
+        resume_devices()
+        suspend_ctx.devices_suspended = false
+    }
+    suspend_stats.failed_count = suspend_stats.failed_count + 1
+    suspend_ctx.state = SUSPEND_IDLE
+}
+
+fn goto_resume_irqs(): void {
+    if suspend_ctx.irqs_disabled {
+        enable_interrupts()
+        suspend_ctx.irqs_disabled = false
+    }
+    if suspend_ctx.devices_suspended {
+        resume_devices()
+        suspend_ctx.devices_suspended = false
+    }
+    suspend_stats.failed_count = suspend_stats.failed_count + 1
+    suspend_ctx.state = SUSPEND_IDLE
+}
+
+// ============================================
+// Wakeup Source Management
+// ============================================
+
+// Wakeup source types
+const WAKE_POWER_BUTTON: u32 = 1
+const WAKE_LID_OPEN: u32 = 2
+const WAKE_RTC_ALARM: u32 = 4
+const WAKE_USB_DEVICE: u32 = 8
+const WAKE_NETWORK: u32 = 16
+const WAKE_KEYBOARD: u32 = 32
+const WAKE_MOUSE: u32 = 64
+
+// Wakeup source configuration
+struct WakeupSource {
+    name: [32]u8
+    type_mask: u32
+    enabled: bool
+    gpe_number: u32      // For ACPI GPE
+    irq_number: u32      // For ARM GIC
+    event_count: u64
+}
+
+const MAX_WAKEUP_SOURCES: u32 = 32
+var wakeup_sources: [MAX_WAKEUP_SOURCES]WakeupSource
+var wakeup_count: u32 = 0
+var enabled_wakeup_mask: u32 = 0
+
+// Register a wakeup source
+export fn wakeup_register(name: *u8, type_mask: u32): u32 {
+    if wakeup_count >= MAX_WAKEUP_SOURCES {
+        return 0xFFFFFFFF
+    }
+
+    let idx = wakeup_count
+    let src = &wakeup_sources[idx]
+
+    basics.memset(src, 0, @sizeOf(WakeupSource))
+
+    let name_len = basics.strlen(name)
+    if name_len > 31 { name_len = 31 }
+    basics.memcpy(&src.name, name, name_len)
+
+    src.type_mask = type_mask
+    src.enabled = false
+    src.event_count = 0
+
+    wakeup_count = wakeup_count + 1
+    return idx
+}
+
+// Enable wakeup source
+export fn wakeup_enable(source_id: u32): bool {
+    if source_id >= wakeup_count {
+        return false
+    }
+
+    wakeup_sources[source_id].enabled = true
+    enabled_wakeup_mask = enabled_wakeup_mask | wakeup_sources[source_id].type_mask
+
+    // Configure hardware for this wake source
+    configure_wake_hardware(source_id)
+
+    return true
+}
+
+// Disable wakeup source
+export fn wakeup_disable(source_id: u32): bool {
+    if source_id >= wakeup_count {
+        return false
+    }
+
+    wakeup_sources[source_id].enabled = false
+
+    // Recalculate mask
+    enabled_wakeup_mask = 0
+    var i: u32 = 0
+    while i < wakeup_count {
+        if wakeup_sources[i].enabled {
+            enabled_wakeup_mask = enabled_wakeup_mask | wakeup_sources[i].type_mask
+        }
+        i = i + 1
+    }
+
+    return true
+}
+
+// Configure hardware for wake source
+fn configure_wake_hardware(source_id: u32): void {
+    let src = &wakeup_sources[source_id]
+
+    if cpu_state.get_current_arch() == cpu_state.ARCH_X86_64 {
+        // Enable ACPI GPE for this source
+        if src.gpe_number != 0 {
+            // kernel.acpi_enable_gpe(src.gpe_number)
+        }
+    } else {
+        // Configure GIC wakeup IRQ
+        if src.irq_number != 0 {
+            // kernel.gic_set_wakeup_irq(src.irq_number, true)
+        }
+    }
+}
+
+// Set RTC wake timer
+export fn wakeup_set_timer(seconds: u32): bool {
+    if seconds == 0 {
+        return false
+    }
+
+    // Set RTC alarm
+    // kernel.rtc_set_alarm(seconds)
+
+    // Enable RTC as wake source
+    var i: u32 = 0
+    while i < wakeup_count {
+        if (wakeup_sources[i].type_mask & WAKE_RTC_ALARM) != 0 {
+            wakeup_enable(i)
+            return true
+        }
+        i = i + 1
+    }
+
+    return false
+}
+
+// ============================================
+// Statistics and Debugging
+// ============================================
+
+// Get suspend statistics
+export fn suspend_get_stats(): *SuspendStats {
+    return &suspend_stats
+}
+
+// Print suspend stats
+export fn suspend_print_stats(): void {
+    basics.print("Suspend Statistics:\n")
+    basics.print("  Suspend count: ")
+    basics.print_int(suspend_stats.suspend_count as i32)
+    basics.print("\n  Resume count: ")
+    basics.print_int(suspend_stats.resume_count as i32)
+    basics.print("\n  Failed count: ")
+    basics.print_int(suspend_stats.failed_count as i32)
+    basics.print("\n  Last suspend time (us): ")
+    basics.print_int(suspend_stats.last_suspend_time_us as i32)
+    basics.print("\n")
+}
+
+// Get current suspend state
+export fn suspend_get_state(): u32 {
+    return suspend_ctx.state
+}
+
+// Check if system is currently suspended
+export fn suspend_is_active(): bool {
+    return suspend_ctx.state != SUSPEND_IDLE
+}
+
+// Debug: Force resume (for testing)
+export fn suspend_force_resume(): void {
+    if suspend_ctx.state != SUSPEND_IDLE {
+        resume_from_suspend()
+    }
+}

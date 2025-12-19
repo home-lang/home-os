@@ -1,0 +1,619 @@
+// HomeOS Hibernate (S4) Implementation
+// Suspend-to-disk with memory serialization
+
+const basics = @import("basics")
+const cpu_state = @import("power/cpu_state")
+const device_pm = @import("power/device_pm")
+const suspend = @import("power/suspend")
+const kernel = @import("kernel")
+
+// Hibernate image magic number
+const HIBERNATE_MAGIC: [8]u8 = ['H', 'O', 'M', 'E', 'H', 'I', 'B', '\0']
+const HIBERNATE_VERSION: u32 = 1
+
+// Hibernate states
+const HIB_IDLE: u32 = 0
+const HIB_SNAPSHOT: u32 = 1
+const HIB_WRITE: u32 = 2
+const HIB_POWEROFF: u32 = 3
+const HIB_RESUME: u32 = 4
+
+// Page flags for hibernate
+const PAGE_KERNEL: u32 = 1
+const PAGE_FREE: u32 = 2
+const PAGE_RESERVED: u32 = 4
+const PAGE_NOSAVE: u32 = 8
+
+// Compression types
+const COMPRESS_NONE: u32 = 0
+const COMPRESS_LZ4: u32 = 1
+const COMPRESS_ZSTD: u32 = 2
+
+// Hibernate image header (4KB aligned)
+struct HibernateHeader {
+    magic: [8]u8
+    version: u32
+    flags: u32
+
+    // Architecture
+    arch: u32              // 0=x86_64, 1=ARM64
+    _pad1: u32
+
+    // Memory state
+    total_pages: u64
+    kernel_start: u64
+    kernel_end: u64
+
+    // Resume info
+    resume_entry: u64
+    resume_cr3: u64        // Page table (x86) / TTBR1 (ARM)
+    resume_stack: u64
+
+    // CPU state location
+    cpu_state_offset: u64
+    cpu_state_size: u64
+    num_cpus: u32
+    boot_cpu: u32
+
+    // Page mapping
+    pfn_map_offset: u64
+    pfn_map_entries: u64
+
+    // Compression
+    compression: u32
+    _pad2: u32
+    uncompressed_size: u64
+    compressed_size: u64
+
+    // Integrity
+    checksum: u64          // CRC64 of image data
+
+    // Timestamps
+    hibernate_time: u64
+    _reserved: [3944]u8    // Pad to 4096 bytes
+}
+
+// Page entry for hibernate image
+struct PageEntry {
+    pfn: u64               // Physical frame number
+    flags: u32
+    _pad: u32
+}
+
+// Hibernate context
+struct HibernateContext {
+    state: u32
+    header: HibernateHeader
+
+    // Swap device
+    swap_device: u32
+    swap_offset: u64
+    swap_size: u64
+
+    // Memory snapshot
+    page_count: u64
+    pages_written: u64
+
+    // Statistics
+    start_time: u64
+    snapshot_time: u64
+    write_time: u64
+}
+
+var hib_ctx: HibernateContext
+
+// ============================================
+// Hibernate Initialization
+// ============================================
+
+// Initialize hibernate subsystem
+export fn hibernate_init(): void {
+    basics.memset(&hib_ctx, 0, @sizeOf(HibernateContext))
+    hib_ctx.state = HIB_IDLE
+}
+
+// Set swap device for hibernate
+export fn hibernate_set_swap(device: u32, offset: u64, size: u64): bool {
+    if size < kernel.get_total_memory() {
+        // Swap too small for hibernate
+        return false
+    }
+
+    hib_ctx.swap_device = device
+    hib_ctx.swap_offset = offset
+    hib_ctx.swap_size = size
+    return true
+}
+
+// Check if hibernate is supported
+export fn hibernate_supported(): bool {
+    // Need swap device configured
+    if hib_ctx.swap_size == 0 {
+        return false
+    }
+
+    // Need enough swap space
+    let mem_size = kernel.get_total_memory()
+    if hib_ctx.swap_size < mem_size {
+        return false
+    }
+
+    return true
+}
+
+// ============================================
+// Memory Snapshot
+// ============================================
+
+// Count pages to save
+fn count_saveable_pages(): u64 {
+    var count: u64 = 0
+    let total_pfns = kernel.get_total_pages()
+
+    var pfn: u64 = 0
+    while pfn < total_pfns {
+        let flags = kernel.get_page_flags(pfn)
+
+        // Skip free and nosave pages
+        if (flags & PAGE_FREE) == 0 and (flags & PAGE_NOSAVE) == 0 {
+            count = count + 1
+        }
+        pfn = pfn + 1
+    }
+
+    return count
+}
+
+// Create memory snapshot
+fn create_snapshot(): bool {
+    hib_ctx.state = HIB_SNAPSHOT
+    basics.print("hibernate: Creating memory snapshot...\n")
+
+    // Count pages
+    hib_ctx.page_count = count_saveable_pages()
+    basics.print("hibernate: ")
+    basics.print_int(hib_ctx.page_count as i32)
+    basics.print(" pages to save\n")
+
+    // Initialize header
+    basics.memset(&hib_ctx.header, 0, @sizeOf(HibernateHeader))
+    basics.memcpy(&hib_ctx.header.magic, &HIBERNATE_MAGIC, 8)
+    hib_ctx.header.version = HIBERNATE_VERSION
+
+    if cpu_state.get_current_arch() == cpu_state.ARCH_X86_64 {
+        hib_ctx.header.arch = 0
+    } else {
+        hib_ctx.header.arch = 1
+    }
+
+    hib_ctx.header.total_pages = hib_ctx.page_count
+    hib_ctx.header.kernel_start = kernel.get_kernel_start()
+    hib_ctx.header.kernel_end = kernel.get_kernel_end()
+
+    // Set resume info
+    hib_ctx.header.resume_entry = &hibernate_resume_entry as u64
+    hib_ctx.header.resume_stack = kernel.get_current_stack()
+
+    if cpu_state.get_current_arch() == cpu_state.ARCH_X86_64 {
+        // Get CR3
+        var cr3: u64
+        asm volatile ("mov %%cr3, %0" : "=r" (cr3))
+        hib_ctx.header.resume_cr3 = cr3
+    } else {
+        // Get TTBR1_EL1
+        var ttbr1: u64
+        asm volatile ("mrs %0, ttbr1_el1" : "=r" (ttbr1))
+        hib_ctx.header.resume_cr3 = ttbr1
+    }
+
+    hib_ctx.header.num_cpus = cpu_state.get_saved_cpu_count()
+    hib_ctx.header.boot_cpu = 0
+    hib_ctx.header.compression = COMPRESS_NONE
+    hib_ctx.header.hibernate_time = kernel.get_time_us()
+
+    hib_ctx.snapshot_time = kernel.get_time_us() - hib_ctx.start_time
+
+    return true
+}
+
+// ============================================
+// Image Writing
+// ============================================
+
+// Write hibernate image to swap
+fn write_hibernate_image(): bool {
+    hib_ctx.state = HIB_WRITE
+    basics.print("hibernate: Writing image to disk...\n")
+
+    let write_start = kernel.get_time_us()
+
+    // Calculate offsets
+    let header_size: u64 = 4096  // Header is 4KB
+    let cpu_state_size = cpu_state.get_saved_cpu_count() as u64 * @sizeOf(cpu_state.CPUState) as u64
+    let pfn_map_size = hib_ctx.page_count * @sizeOf(PageEntry) as u64
+    let page_data_offset = header_size + cpu_state_size + pfn_map_size
+
+    // Round up to page boundary
+    let aligned_offset = (page_data_offset + 4095) & ~4095
+
+    hib_ctx.header.cpu_state_offset = header_size
+    hib_ctx.header.cpu_state_size = cpu_state_size
+    hib_ctx.header.pfn_map_offset = header_size + cpu_state_size
+    hib_ctx.header.pfn_map_entries = hib_ctx.page_count
+
+    // Write header
+    if !write_to_swap(0, &hib_ctx.header as *void, 4096) {
+        return false
+    }
+
+    // Write CPU states
+    var cpu_offset = header_size
+    var cpu_id: u32 = 0
+    while cpu_id < hib_ctx.header.num_cpus {
+        let state = cpu_state.get_cpu_state(cpu_id)
+        if state != null {
+            if !write_to_swap(cpu_offset, state as *void, @sizeOf(cpu_state.CPUState)) {
+                return false
+            }
+            cpu_offset = cpu_offset + @sizeOf(cpu_state.CPUState) as u64
+        }
+        cpu_id = cpu_id + 1
+    }
+
+    // Write page mapping and data
+    let total_pfns = kernel.get_total_pages()
+    var pfn_map_pos = hib_ctx.header.pfn_map_offset
+    var page_data_pos = aligned_offset
+    hib_ctx.pages_written = 0
+
+    var pfn: u64 = 0
+    while pfn < total_pfns {
+        let flags = kernel.get_page_flags(pfn)
+
+        if (flags & PAGE_FREE) == 0 and (flags & PAGE_NOSAVE) == 0 {
+            // Write page entry
+            var entry: PageEntry
+            entry.pfn = pfn
+            entry.flags = flags
+            entry._pad = 0
+
+            if !write_to_swap(pfn_map_pos, &entry as *void, @sizeOf(PageEntry)) {
+                return false
+            }
+            pfn_map_pos = pfn_map_pos + @sizeOf(PageEntry) as u64
+
+            // Write page data
+            let page_addr = kernel.pfn_to_virt(pfn)
+            if !write_to_swap(page_data_pos, page_addr as *void, 4096) {
+                return false
+            }
+            page_data_pos = page_data_pos + 4096
+
+            hib_ctx.pages_written = hib_ctx.pages_written + 1
+
+            // Progress indicator
+            if (hib_ctx.pages_written % 1000) == 0 {
+                basics.print(".")
+            }
+        }
+
+        pfn = pfn + 1
+    }
+
+    basics.print("\n")
+
+    // Calculate checksum
+    hib_ctx.header.uncompressed_size = page_data_pos
+    hib_ctx.header.compressed_size = page_data_pos  // No compression for now
+    hib_ctx.header.checksum = calculate_image_checksum()
+
+    // Rewrite header with final values
+    if !write_to_swap(0, &hib_ctx.header as *void, 4096) {
+        return false
+    }
+
+    hib_ctx.write_time = kernel.get_time_us() - write_start
+
+    basics.print("hibernate: Wrote ")
+    basics.print_int(hib_ctx.pages_written as i32)
+    basics.print(" pages in ")
+    basics.print_int((hib_ctx.write_time / 1000) as i32)
+    basics.print(" ms\n")
+
+    return true
+}
+
+// Write data to swap device
+fn write_to_swap(offset: u64, data: *void, size: u64): bool {
+    let swap_offset = hib_ctx.swap_offset + offset
+    return kernel.block_write(hib_ctx.swap_device, swap_offset, data, size) == size as i64
+}
+
+// Read data from swap device
+fn read_from_swap(offset: u64, data: *void, size: u64): bool {
+    let swap_offset = hib_ctx.swap_offset + offset
+    return kernel.block_read(hib_ctx.swap_device, swap_offset, data, size) == size as i64
+}
+
+// Calculate CRC64 checksum
+fn calculate_image_checksum(): u64 {
+    // Simplified checksum - in production would CRC64 entire image
+    var checksum: u64 = 0
+    checksum = checksum ^ hib_ctx.header.total_pages
+    checksum = checksum ^ hib_ctx.header.kernel_start
+    checksum = checksum ^ hib_ctx.header.kernel_end
+    checksum = checksum ^ hib_ctx.header.resume_entry
+    checksum = checksum ^ hib_ctx.pages_written
+    return checksum
+}
+
+// ============================================
+// Main Hibernate Entry
+// ============================================
+
+// Main hibernate entry point
+export fn pm_hibernate(): i32 {
+    if hib_ctx.state != HIB_IDLE {
+        return -1  // Already hibernating
+    }
+
+    if !hibernate_supported() {
+        basics.print("hibernate: Not supported (no swap configured)\n")
+        return -2
+    }
+
+    hib_ctx.start_time = kernel.get_time_us()
+    basics.print("hibernate: Starting hibernate sequence...\n")
+
+    // Sync filesystems
+    basics.print("hibernate: Syncing filesystems...\n")
+    kernel.vfs_sync_all()
+
+    // Suspend devices
+    basics.print("hibernate: Suspending devices...\n")
+    if device_pm.device_pm_suspend_all() != 0 {
+        basics.print("hibernate: Device suspend failed\n")
+        hib_ctx.state = HIB_IDLE
+        return -3
+    }
+
+    // Disable interrupts
+    suspend.disable_interrupts()
+
+    // Save CPU state
+    basics.print("hibernate: Saving CPU state...\n")
+    if !cpu_state.save_all_cpu_states() {
+        basics.print("hibernate: CPU state save failed\n")
+        suspend.enable_interrupts()
+        device_pm.device_pm_resume_all()
+        hib_ctx.state = HIB_IDLE
+        return -4
+    }
+
+    // Create memory snapshot
+    if !create_snapshot() {
+        basics.print("hibernate: Snapshot creation failed\n")
+        suspend.enable_interrupts()
+        device_pm.device_pm_resume_all()
+        hib_ctx.state = HIB_IDLE
+        return -5
+    }
+
+    // Write image to disk
+    if !write_hibernate_image() {
+        basics.print("hibernate: Image write failed\n")
+        suspend.enable_interrupts()
+        device_pm.device_pm_resume_all()
+        hib_ctx.state = HIB_IDLE
+        return -6
+    }
+
+    // Power off
+    hib_ctx.state = HIB_POWEROFF
+    basics.print("hibernate: Powering off...\n")
+
+    if cpu_state.get_current_arch() == cpu_state.ARCH_X86_64 {
+        // ACPI S5 (soft off) or S4 (hibernate)
+        kernel.acpi_enter_sleep(4)
+    } else {
+        // PSCI SYSTEM_OFF
+        asm volatile (
+            "mov x0, #0x84000008\n"  // PSCI_SYSTEM_OFF
+            "smc #0\n"
+        )
+    }
+
+    // Should not reach here
+    return 0
+}
+
+// ============================================
+// Resume Path
+// ============================================
+
+// Check for hibernate image on boot
+export fn hibernate_check_image(): bool {
+    var header: HibernateHeader
+
+    if !read_from_swap(0, &header as *void, 4096) {
+        return false
+    }
+
+    // Verify magic
+    if basics.memcmp(&header.magic, &HIBERNATE_MAGIC, 8) != 0 {
+        return false
+    }
+
+    // Verify version
+    if header.version != HIBERNATE_VERSION {
+        return false
+    }
+
+    // Verify architecture
+    let current_arch = if cpu_state.get_current_arch() == cpu_state.ARCH_X86_64 { 0 } else { 1 }
+    if header.arch != current_arch {
+        return false
+    }
+
+    basics.print("hibernate: Valid hibernate image found\n")
+    return true
+}
+
+// Resume from hibernate
+export fn hibernate_resume(): bool {
+    basics.print("hibernate: Resuming from hibernate image...\n")
+
+    // Read header
+    if !read_from_swap(0, &hib_ctx.header as *void, 4096) {
+        basics.print("hibernate: Failed to read header\n")
+        return false
+    }
+
+    hib_ctx.state = HIB_RESUME
+
+    // Verify checksum
+    let expected_checksum = hib_ctx.header.checksum
+    // Would verify full image checksum here
+
+    // Read CPU states
+    var cpu_offset = hib_ctx.header.cpu_state_offset
+    var cpu_id: u32 = 0
+    while cpu_id < hib_ctx.header.num_cpus {
+        let state = cpu_state.get_cpu_state(cpu_id)
+        if state != null {
+            if !read_from_swap(cpu_offset, state as *void, @sizeOf(cpu_state.CPUState)) {
+                return false
+            }
+            cpu_offset = cpu_offset + @sizeOf(cpu_state.CPUState) as u64
+        }
+        cpu_id = cpu_id + 1
+    }
+
+    // Read page mapping and restore pages
+    basics.print("hibernate: Restoring ")
+    basics.print_int(hib_ctx.header.pfn_map_entries as i32)
+    basics.print(" pages...\n")
+
+    var pfn_map_pos = hib_ctx.header.pfn_map_offset
+    let page_data_start = ((hib_ctx.header.pfn_map_offset +
+                           hib_ctx.header.pfn_map_entries * @sizeOf(PageEntry) as u64) + 4095) & ~4095
+    var page_data_pos = page_data_start
+
+    var i: u64 = 0
+    while i < hib_ctx.header.pfn_map_entries {
+        var entry: PageEntry
+
+        if !read_from_swap(pfn_map_pos, &entry as *void, @sizeOf(PageEntry)) {
+            return false
+        }
+        pfn_map_pos = pfn_map_pos + @sizeOf(PageEntry) as u64
+
+        // Restore page data
+        let page_addr = kernel.pfn_to_virt(entry.pfn)
+        if !read_from_swap(page_data_pos, page_addr as *void, 4096) {
+            return false
+        }
+        page_data_pos = page_data_pos + 4096
+
+        if (i % 1000) == 0 {
+            basics.print(".")
+        }
+
+        i = i + 1
+    }
+
+    basics.print("\n")
+
+    // Invalidate hibernate image
+    invalidate_hibernate_image()
+
+    // Restore CPU state and jump to resume entry
+    basics.print("hibernate: Jumping to resume entry...\n")
+
+    // Restore page tables first
+    if cpu_state.get_current_arch() == cpu_state.ARCH_X86_64 {
+        asm volatile (
+            "mov %0, %%cr3\n"
+            :
+            : "r" (hib_ctx.header.resume_cr3)
+        )
+    } else {
+        asm volatile (
+            "msr ttbr1_el1, %0\n"
+            "isb\n"
+            :
+            : "r" (hib_ctx.header.resume_cr3)
+        )
+    }
+
+    // Restore CPU state
+    cpu_state.restore_all_cpu_states()
+
+    // Jump to resume entry
+    let resume_fn = hib_ctx.header.resume_entry as fn() -> void
+    resume_fn()
+
+    // Should not reach here
+    return true
+}
+
+// Resume entry point (called after state restore)
+export fn hibernate_resume_entry(): void {
+    basics.print("hibernate: Resumed successfully!\n")
+
+    // Resume devices
+    device_pm.device_pm_resume_all()
+
+    // Enable interrupts
+    suspend.enable_interrupts()
+
+    hib_ctx.state = HIB_IDLE
+
+    // Continue normal operation
+}
+
+// Invalidate hibernate image (prevent accidental resume)
+fn invalidate_hibernate_image(): void {
+    var zero_magic: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+    write_to_swap(0, &zero_magic as *void, 8)
+}
+
+// ============================================
+// Statistics
+// ============================================
+
+// Get hibernate statistics
+export fn hibernate_get_stats(pages: *u64, snapshot_ms: *u64, write_ms: *u64): void {
+    *pages = hib_ctx.pages_written
+    *snapshot_ms = hib_ctx.snapshot_time / 1000
+    *write_ms = hib_ctx.write_time / 1000
+}
+
+// Print hibernate status
+export fn hibernate_print_status(): void {
+    basics.print("Hibernate Status:\n")
+    basics.print("  State: ")
+    if hib_ctx.state == HIB_IDLE { basics.print("idle") }
+    else if hib_ctx.state == HIB_SNAPSHOT { basics.print("snapshot") }
+    else if hib_ctx.state == HIB_WRITE { basics.print("write") }
+    else if hib_ctx.state == HIB_POWEROFF { basics.print("poweroff") }
+    else if hib_ctx.state == HIB_RESUME { basics.print("resume") }
+    basics.print("\n")
+
+    basics.print("  Swap device: ")
+    basics.print_int(hib_ctx.swap_device as i32)
+    basics.print("\n  Swap size: ")
+    basics.print_int((hib_ctx.swap_size / 1048576) as i32)
+    basics.print(" MB\n")
+
+    if hib_ctx.pages_written > 0 {
+        basics.print("  Last hibernate:\n")
+        basics.print("    Pages: ")
+        basics.print_int(hib_ctx.pages_written as i32)
+        basics.print("\n    Snapshot time: ")
+        basics.print_int((hib_ctx.snapshot_time / 1000) as i32)
+        basics.print(" ms\n    Write time: ")
+        basics.print_int((hib_ctx.write_time / 1000) as i32)
+        basics.print(" ms\n")
+    }
+}

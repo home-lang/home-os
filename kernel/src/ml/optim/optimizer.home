@@ -1,0 +1,887 @@
+// HomeOS Neural Network Optimizers
+// SGD, Adam, AdamW, RMSprop implementations
+
+const basics = @import("basics")
+const tensor = @import("ml/tensor")
+const module = @import("ml/nn/module")
+
+// ============================================
+// Optimizer Base
+// ============================================
+
+const MAX_PARAM_GROUPS: u32 = 16
+const MAX_PARAMS_PER_GROUP: u32 = 256
+
+struct ParamGroup {
+    params: [MAX_PARAMS_PER_GROUP]*tensor.Tensor
+    num_params: u32
+    lr: f64
+    weight_decay: f64
+    // Additional per-group options can be added
+}
+
+struct Optimizer {
+    param_groups: [MAX_PARAM_GROUPS]ParamGroup
+    num_groups: u32
+    step_count: u64
+    optimizer_type: u32
+    state: *void  // Optimizer-specific state
+}
+
+const OPT_SGD: u32 = 1
+const OPT_ADAM: u32 = 2
+const OPT_ADAMW: u32 = 3
+const OPT_RMSPROP: u32 = 4
+const OPT_ADAGRAD: u32 = 5
+
+// Initialize optimizer base
+fn optimizer_init(opt: *Optimizer, opt_type: u32): void {
+    opt.num_groups = 0
+    opt.step_count = 0
+    opt.optimizer_type = opt_type
+    opt.state = null
+
+    var i: u32 = 0
+    while i < MAX_PARAM_GROUPS {
+        opt.param_groups[i].num_params = 0
+        opt.param_groups[i].lr = 0.001
+        opt.param_groups[i].weight_decay = 0.0
+        i = i + 1
+    }
+}
+
+// Add parameters from a module
+export fn optimizer_add_params(opt: *Optimizer, mod: *module.Module, lr: f64): void {
+    if opt == null or mod == null or opt.num_groups >= MAX_PARAM_GROUPS {
+        return
+    }
+
+    let group = &opt.param_groups[opt.num_groups]
+    group.lr = lr
+    group.num_params = 0
+
+    // Collect parameters from module
+    var i: u32 = 0
+    while i < mod.num_params and group.num_params < MAX_PARAMS_PER_GROUP {
+        let param = mod.params[i].tensor
+        if param != null and param.requires_grad {
+            group.params[group.num_params] = param
+            group.num_params = group.num_params + 1
+        }
+        i = i + 1
+    }
+
+    // Recursively add from children
+    i = 0
+    while i < mod.num_children {
+        let child = mod.children[i].module
+        if child != null {
+            optimizer_add_params_recursive(group, child)
+        }
+        i = i + 1
+    }
+
+    opt.num_groups = opt.num_groups + 1
+}
+
+fn optimizer_add_params_recursive(group: *ParamGroup, mod: *module.Module): void {
+    var i: u32 = 0
+    while i < mod.num_params and group.num_params < MAX_PARAMS_PER_GROUP {
+        let param = mod.params[i].tensor
+        if param != null and param.requires_grad {
+            group.params[group.num_params] = param
+            group.num_params = group.num_params + 1
+        }
+        i = i + 1
+    }
+
+    i = 0
+    while i < mod.num_children {
+        let child = mod.children[i].module
+        if child != null {
+            optimizer_add_params_recursive(group, child)
+        }
+        i = i + 1
+    }
+}
+
+// Zero all gradients
+export fn optimizer_zero_grad(opt: *Optimizer): void {
+    if opt == null {
+        return
+    }
+
+    var g: u32 = 0
+    while g < opt.num_groups {
+        let group = &opt.param_groups[g]
+        var p: u32 = 0
+        while p < group.num_params {
+            let param = group.params[p]
+            if param != null and param.grad != null {
+                tensor.tensor_zero_(param.grad)
+            }
+            p = p + 1
+        }
+        g = g + 1
+    }
+}
+
+// ============================================
+// SGD (Stochastic Gradient Descent)
+// ============================================
+
+struct SGDState {
+    momentum: f64
+    dampening: f64
+    nesterov: bool
+    // Momentum buffers for each parameter
+    momentum_buffers: [MAX_PARAM_GROUPS][MAX_PARAMS_PER_GROUP]*tensor.Tensor
+}
+
+export fn SGD(lr: f64): *Optimizer {
+    return sgd_create(lr, 0.0, 0.0, 0.0, false)
+}
+
+export fn SGD_momentum(lr: f64, momentum: f64): *Optimizer {
+    return sgd_create(lr, momentum, 0.0, 0.0, false)
+}
+
+export fn sgd_create(lr: f64, momentum: f64, dampening: f64, weight_decay: f64, nesterov: bool): *Optimizer {
+    let opt = basics.alloc(Optimizer) as *Optimizer
+    if opt == null {
+        return null
+    }
+
+    optimizer_init(opt, OPT_SGD)
+    opt.param_groups[0].lr = lr
+    opt.param_groups[0].weight_decay = weight_decay
+
+    let state = basics.alloc(SGDState) as *SGDState
+    if state == null {
+        basics.free(opt)
+        return null
+    }
+    state.momentum = momentum
+    state.dampening = dampening
+    state.nesterov = nesterov
+
+    // Initialize momentum buffers to null
+    var g: u32 = 0
+    while g < MAX_PARAM_GROUPS {
+        var p: u32 = 0
+        while p < MAX_PARAMS_PER_GROUP {
+            state.momentum_buffers[g][p] = null
+            p = p + 1
+        }
+        g = g + 1
+    }
+
+    opt.state = state as *void
+    return opt
+}
+
+export fn sgd_step(opt: *Optimizer): void {
+    if opt == null or opt.optimizer_type != OPT_SGD {
+        return
+    }
+
+    let state = opt.state as *SGDState
+
+    var g: u32 = 0
+    while g < opt.num_groups {
+        let group = &opt.param_groups[g]
+        let lr = group.lr
+        let weight_decay = group.weight_decay
+
+        var p: u32 = 0
+        while p < group.num_params {
+            let param = group.params[p]
+            if param == null or param.grad == null {
+                p = p + 1
+                continue
+            }
+
+            let grad = param.grad
+
+            // Apply weight decay
+            if weight_decay != 0.0 {
+                // grad = grad + weight_decay * param
+                tensor_add_scaled(grad, param, weight_decay)
+            }
+
+            if state.momentum != 0.0 {
+                // Get or create momentum buffer
+                var buf = state.momentum_buffers[g][p]
+                if buf == null {
+                    buf = tensor.tensor_clone(grad)
+                    state.momentum_buffers[g][p] = buf
+                } else {
+                    // buf = momentum * buf + (1 - dampening) * grad
+                    tensor_scale(buf, state.momentum)
+                    tensor_add_scaled(buf, grad, 1.0 - state.dampening)
+                }
+
+                if state.nesterov {
+                    // grad = grad + momentum * buf
+                    tensor_add_scaled(grad, buf, state.momentum)
+                } else {
+                    // Use momentum buffer as gradient
+                    // param = param - lr * buf
+                    tensor_add_scaled(param, buf, -lr)
+                    p = p + 1
+                    continue
+                }
+            }
+
+            // param = param - lr * grad
+            tensor_add_scaled(param, grad, -lr)
+            p = p + 1
+        }
+        g = g + 1
+    }
+
+    opt.step_count = opt.step_count + 1
+}
+
+// ============================================
+// Adam Optimizer
+// ============================================
+
+struct AdamState {
+    betas: [2]f64
+    eps: f64
+    amsgrad: bool
+    // First moment (m)
+    m: [MAX_PARAM_GROUPS][MAX_PARAMS_PER_GROUP]*tensor.Tensor
+    // Second moment (v)
+    v: [MAX_PARAM_GROUPS][MAX_PARAMS_PER_GROUP]*tensor.Tensor
+    // Max second moment for AMSGrad
+    v_max: [MAX_PARAM_GROUPS][MAX_PARAMS_PER_GROUP]*tensor.Tensor
+}
+
+export fn Adam(lr: f64): *Optimizer {
+    return adam_create(lr, 0.9, 0.999, 1e-8, 0.0, false)
+}
+
+export fn adam_create(lr: f64, beta1: f64, beta2: f64, eps: f64, weight_decay: f64, amsgrad: bool): *Optimizer {
+    let opt = basics.alloc(Optimizer) as *Optimizer
+    if opt == null {
+        return null
+    }
+
+    optimizer_init(opt, OPT_ADAM)
+    opt.param_groups[0].lr = lr
+    opt.param_groups[0].weight_decay = weight_decay
+
+    let state = basics.alloc(AdamState) as *AdamState
+    if state == null {
+        basics.free(opt)
+        return null
+    }
+    state.betas[0] = beta1
+    state.betas[1] = beta2
+    state.eps = eps
+    state.amsgrad = amsgrad
+
+    // Initialize moment buffers to null
+    var g: u32 = 0
+    while g < MAX_PARAM_GROUPS {
+        var p: u32 = 0
+        while p < MAX_PARAMS_PER_GROUP {
+            state.m[g][p] = null
+            state.v[g][p] = null
+            state.v_max[g][p] = null
+            p = p + 1
+        }
+        g = g + 1
+    }
+
+    opt.state = state as *void
+    return opt
+}
+
+export fn adam_step(opt: *Optimizer): void {
+    if opt == null or opt.optimizer_type != OPT_ADAM {
+        return
+    }
+
+    let state = opt.state as *AdamState
+    let step = opt.step_count + 1
+
+    let beta1 = state.betas[0]
+    let beta2 = state.betas[1]
+
+    // Bias correction
+    let bias_correction1 = 1.0 - basics.pow(beta1, step as f64)
+    let bias_correction2 = 1.0 - basics.pow(beta2, step as f64)
+
+    var g: u32 = 0
+    while g < opt.num_groups {
+        let group = &opt.param_groups[g]
+        let lr = group.lr
+        let weight_decay = group.weight_decay
+
+        var p: u32 = 0
+        while p < group.num_params {
+            let param = group.params[p]
+            if param == null or param.grad == null {
+                p = p + 1
+                continue
+            }
+
+            let grad = param.grad
+
+            // L2 regularization (Adam, not AdamW)
+            if weight_decay != 0.0 {
+                tensor_add_scaled(grad, param, weight_decay)
+            }
+
+            // Initialize moment buffers if needed
+            if state.m[g][p] == null {
+                state.m[g][p] = tensor.tensor_zeros_like(param)
+                state.v[g][p] = tensor.tensor_zeros_like(param)
+                if state.amsgrad {
+                    state.v_max[g][p] = tensor.tensor_zeros_like(param)
+                }
+            }
+
+            let m = state.m[g][p]
+            let v = state.v[g][p]
+
+            // m = beta1 * m + (1 - beta1) * grad
+            tensor_scale(m, beta1)
+            tensor_add_scaled(m, grad, 1.0 - beta1)
+
+            // v = beta2 * v + (1 - beta2) * grad^2
+            tensor_scale(v, beta2)
+            tensor_add_squared_scaled(v, grad, 1.0 - beta2)
+
+            var denom: *tensor.Tensor = null
+
+            if state.amsgrad {
+                let v_max = state.v_max[g][p]
+                tensor_max_(v_max, v)
+                denom = v_max
+            } else {
+                denom = v
+            }
+
+            // Compute step size
+            let step_size = lr / bias_correction1
+
+            // param = param - step_size * m / (sqrt(v / bias_correction2) + eps)
+            adam_update_param(param, m, denom, step_size, bias_correction2, state.eps)
+
+            p = p + 1
+        }
+        g = g + 1
+    }
+
+    opt.step_count = opt.step_count + 1
+}
+
+fn adam_update_param(param: *tensor.Tensor, m: *tensor.Tensor, v: *tensor.Tensor,
+                      step_size: f64, bias_correction2: f64, eps: f64): void {
+    if param.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let p_data = param.data as *f32
+    let m_data = m.data as *f32
+    let v_data = v.data as *f32
+
+    let numel = tensor.tensor_numel(param)
+    let bc2_sqrt = basics.sqrt(bias_correction2)
+
+    var i: u64 = 0
+    while i < numel {
+        let denom = basics.sqrt(v_data[i] as f64) / bc2_sqrt + eps
+        p_data[i] = p_data[i] - (step_size * (m_data[i] as f64) / denom) as f32
+        i = i + 1
+    }
+}
+
+// ============================================
+// AdamW Optimizer (Decoupled Weight Decay)
+// ============================================
+
+export fn AdamW(lr: f64): *Optimizer {
+    return adamw_create(lr, 0.9, 0.999, 1e-8, 0.01)
+}
+
+export fn adamw_create(lr: f64, beta1: f64, beta2: f64, eps: f64, weight_decay: f64): *Optimizer {
+    let opt = basics.alloc(Optimizer) as *Optimizer
+    if opt == null {
+        return null
+    }
+
+    optimizer_init(opt, OPT_ADAMW)
+    opt.param_groups[0].lr = lr
+    opt.param_groups[0].weight_decay = weight_decay
+
+    let state = basics.alloc(AdamState) as *AdamState
+    if state == null {
+        basics.free(opt)
+        return null
+    }
+    state.betas[0] = beta1
+    state.betas[1] = beta2
+    state.eps = eps
+    state.amsgrad = false
+
+    var g: u32 = 0
+    while g < MAX_PARAM_GROUPS {
+        var p: u32 = 0
+        while p < MAX_PARAMS_PER_GROUP {
+            state.m[g][p] = null
+            state.v[g][p] = null
+            state.v_max[g][p] = null
+            p = p + 1
+        }
+        g = g + 1
+    }
+
+    opt.state = state as *void
+    return opt
+}
+
+export fn adamw_step(opt: *Optimizer): void {
+    if opt == null or opt.optimizer_type != OPT_ADAMW {
+        return
+    }
+
+    let state = opt.state as *AdamState
+    let step = opt.step_count + 1
+
+    let beta1 = state.betas[0]
+    let beta2 = state.betas[1]
+
+    let bias_correction1 = 1.0 - basics.pow(beta1, step as f64)
+    let bias_correction2 = 1.0 - basics.pow(beta2, step as f64)
+
+    var g: u32 = 0
+    while g < opt.num_groups {
+        let group = &opt.param_groups[g]
+        let lr = group.lr
+        let weight_decay = group.weight_decay
+
+        var p: u32 = 0
+        while p < group.num_params {
+            let param = group.params[p]
+            if param == null or param.grad == null {
+                p = p + 1
+                continue
+            }
+
+            let grad = param.grad
+
+            // Decoupled weight decay (AdamW style)
+            if weight_decay != 0.0 {
+                // param = param - lr * weight_decay * param
+                tensor_add_scaled(param, param, -lr * weight_decay)
+            }
+
+            // Initialize moment buffers
+            if state.m[g][p] == null {
+                state.m[g][p] = tensor.tensor_zeros_like(param)
+                state.v[g][p] = tensor.tensor_zeros_like(param)
+            }
+
+            let m = state.m[g][p]
+            let v = state.v[g][p]
+
+            // Update moments
+            tensor_scale(m, beta1)
+            tensor_add_scaled(m, grad, 1.0 - beta1)
+
+            tensor_scale(v, beta2)
+            tensor_add_squared_scaled(v, grad, 1.0 - beta2)
+
+            let step_size = lr / bias_correction1
+            adam_update_param(param, m, v, step_size, bias_correction2, state.eps)
+
+            p = p + 1
+        }
+        g = g + 1
+    }
+
+    opt.step_count = opt.step_count + 1
+}
+
+// ============================================
+// RMSprop Optimizer
+// ============================================
+
+struct RMSpropState {
+    alpha: f64
+    eps: f64
+    momentum: f64
+    centered: bool
+    // Square average
+    square_avg: [MAX_PARAM_GROUPS][MAX_PARAMS_PER_GROUP]*tensor.Tensor
+    // Momentum buffer
+    momentum_buffer: [MAX_PARAM_GROUPS][MAX_PARAMS_PER_GROUP]*tensor.Tensor
+    // Gradient average (for centered)
+    grad_avg: [MAX_PARAM_GROUPS][MAX_PARAMS_PER_GROUP]*tensor.Tensor
+}
+
+export fn RMSprop(lr: f64): *Optimizer {
+    return rmsprop_create(lr, 0.99, 1e-8, 0.0, 0.0, false)
+}
+
+export fn rmsprop_create(lr: f64, alpha: f64, eps: f64, weight_decay: f64,
+                          momentum: f64, centered: bool): *Optimizer {
+    let opt = basics.alloc(Optimizer) as *Optimizer
+    if opt == null {
+        return null
+    }
+
+    optimizer_init(opt, OPT_RMSPROP)
+    opt.param_groups[0].lr = lr
+    opt.param_groups[0].weight_decay = weight_decay
+
+    let state = basics.alloc(RMSpropState) as *RMSpropState
+    if state == null {
+        basics.free(opt)
+        return null
+    }
+    state.alpha = alpha
+    state.eps = eps
+    state.momentum = momentum
+    state.centered = centered
+
+    var g: u32 = 0
+    while g < MAX_PARAM_GROUPS {
+        var p: u32 = 0
+        while p < MAX_PARAMS_PER_GROUP {
+            state.square_avg[g][p] = null
+            state.momentum_buffer[g][p] = null
+            state.grad_avg[g][p] = null
+            p = p + 1
+        }
+        g = g + 1
+    }
+
+    opt.state = state as *void
+    return opt
+}
+
+export fn rmsprop_step(opt: *Optimizer): void {
+    if opt == null or opt.optimizer_type != OPT_RMSPROP {
+        return
+    }
+
+    let state = opt.state as *RMSpropState
+
+    var g: u32 = 0
+    while g < opt.num_groups {
+        let group = &opt.param_groups[g]
+        let lr = group.lr
+        let weight_decay = group.weight_decay
+
+        var p: u32 = 0
+        while p < group.num_params {
+            let param = group.params[p]
+            if param == null or param.grad == null {
+                p = p + 1
+                continue
+            }
+
+            let grad = param.grad
+
+            if weight_decay != 0.0 {
+                tensor_add_scaled(grad, param, weight_decay)
+            }
+
+            // Initialize state
+            if state.square_avg[g][p] == null {
+                state.square_avg[g][p] = tensor.tensor_zeros_like(param)
+                if state.momentum > 0.0 {
+                    state.momentum_buffer[g][p] = tensor.tensor_zeros_like(param)
+                }
+                if state.centered {
+                    state.grad_avg[g][p] = tensor.tensor_zeros_like(param)
+                }
+            }
+
+            let square_avg = state.square_avg[g][p]
+
+            // square_avg = alpha * square_avg + (1 - alpha) * grad^2
+            tensor_scale(square_avg, state.alpha)
+            tensor_add_squared_scaled(square_avg, grad, 1.0 - state.alpha)
+
+            var avg: *tensor.Tensor = null
+
+            if state.centered {
+                let grad_avg = state.grad_avg[g][p]
+                // grad_avg = alpha * grad_avg + (1 - alpha) * grad
+                tensor_scale(grad_avg, state.alpha)
+                tensor_add_scaled(grad_avg, grad, 1.0 - state.alpha)
+
+                // avg = square_avg - grad_avg^2
+                avg = tensor.tensor_clone(square_avg)
+                tensor_sub_squared(avg, grad_avg)
+            } else {
+                avg = square_avg
+            }
+
+            if state.momentum > 0.0 {
+                let buf = state.momentum_buffer[g][p]
+                // buf = momentum * buf + grad / sqrt(avg + eps)
+                tensor_scale(buf, state.momentum)
+                rmsprop_add_normalized(buf, grad, avg, state.eps)
+                // param = param - lr * buf
+                tensor_add_scaled(param, buf, -lr)
+            } else {
+                // param = param - lr * grad / sqrt(avg + eps)
+                rmsprop_update(param, grad, avg, lr, state.eps)
+            }
+
+            if state.centered and avg != square_avg {
+                tensor.tensor_release(avg)
+            }
+
+            p = p + 1
+        }
+        g = g + 1
+    }
+
+    opt.step_count = opt.step_count + 1
+}
+
+fn rmsprop_add_normalized(dst: *tensor.Tensor, grad: *tensor.Tensor,
+                           avg: *tensor.Tensor, eps: f64): void {
+    if dst.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let d_data = dst.data as *f32
+    let g_data = grad.data as *f32
+    let a_data = avg.data as *f32
+
+    let numel = tensor.tensor_numel(dst)
+
+    var i: u64 = 0
+    while i < numel {
+        d_data[i] = d_data[i] + (g_data[i] / basics.sqrt((a_data[i] as f64) + eps)) as f32
+        i = i + 1
+    }
+}
+
+fn rmsprop_update(param: *tensor.Tensor, grad: *tensor.Tensor,
+                   avg: *tensor.Tensor, lr: f64, eps: f64): void {
+    if param.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let p_data = param.data as *f32
+    let g_data = grad.data as *f32
+    let a_data = avg.data as *f32
+
+    let numel = tensor.tensor_numel(param)
+
+    var i: u64 = 0
+    while i < numel {
+        p_data[i] = p_data[i] - (lr * (g_data[i] as f64) / basics.sqrt((a_data[i] as f64) + eps)) as f32
+        i = i + 1
+    }
+}
+
+// ============================================
+// Utility Functions
+// ============================================
+
+// dst = dst + scale * src
+fn tensor_add_scaled(dst: *tensor.Tensor, src: *tensor.Tensor, scale: f64): void {
+    if dst == null or src == null or dst.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let d_data = dst.data as *f32
+    let s_data = src.data as *f32
+    let numel = tensor.tensor_numel(dst)
+
+    var i: u64 = 0
+    while i < numel {
+        d_data[i] = d_data[i] + (scale * (s_data[i] as f64)) as f32
+        i = i + 1
+    }
+}
+
+// dst = dst * scale
+fn tensor_scale(dst: *tensor.Tensor, scale: f64): void {
+    if dst == null or dst.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let data = dst.data as *f32
+    let numel = tensor.tensor_numel(dst)
+
+    var i: u64 = 0
+    while i < numel {
+        data[i] = (scale * (data[i] as f64)) as f32
+        i = i + 1
+    }
+}
+
+// dst = dst + scale * src^2
+fn tensor_add_squared_scaled(dst: *tensor.Tensor, src: *tensor.Tensor, scale: f64): void {
+    if dst == null or src == null or dst.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let d_data = dst.data as *f32
+    let s_data = src.data as *f32
+    let numel = tensor.tensor_numel(dst)
+
+    var i: u64 = 0
+    while i < numel {
+        let val = s_data[i] as f64
+        d_data[i] = d_data[i] + (scale * val * val) as f32
+        i = i + 1
+    }
+}
+
+// dst = dst - src^2
+fn tensor_sub_squared(dst: *tensor.Tensor, src: *tensor.Tensor): void {
+    if dst == null or src == null or dst.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let d_data = dst.data as *f32
+    let s_data = src.data as *f32
+    let numel = tensor.tensor_numel(dst)
+
+    var i: u64 = 0
+    while i < numel {
+        let val = s_data[i]
+        d_data[i] = d_data[i] - val * val
+        i = i + 1
+    }
+}
+
+// dst = max(dst, src)
+fn tensor_max_(dst: *tensor.Tensor, src: *tensor.Tensor): void {
+    if dst == null or src == null or dst.dtype != tensor.DTYPE_F32 {
+        return
+    }
+
+    let d_data = dst.data as *f32
+    let s_data = src.data as *f32
+    let numel = tensor.tensor_numel(dst)
+
+    var i: u64 = 0
+    while i < numel {
+        if s_data[i] > d_data[i] {
+            d_data[i] = s_data[i]
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// Optimizer Step (Unified Interface)
+// ============================================
+
+export fn optimizer_step(opt: *Optimizer): void {
+    if opt == null {
+        return
+    }
+
+    switch opt.optimizer_type {
+        OPT_SGD => sgd_step(opt),
+        OPT_ADAM => adam_step(opt),
+        OPT_ADAMW => adamw_step(opt),
+        OPT_RMSPROP => rmsprop_step(opt),
+        else => {}
+    }
+}
+
+// Get/set learning rate
+export fn optimizer_get_lr(opt: *Optimizer): f64 {
+    if opt == null or opt.num_groups == 0 {
+        return 0.0
+    }
+    return opt.param_groups[0].lr
+}
+
+export fn optimizer_set_lr(opt: *Optimizer, lr: f64): void {
+    if opt == null {
+        return
+    }
+
+    var g: u32 = 0
+    while g < opt.num_groups {
+        opt.param_groups[g].lr = lr
+        g = g + 1
+    }
+}
+
+// Free optimizer resources
+export fn optimizer_free(opt: *Optimizer): void {
+    if opt == null {
+        return
+    }
+
+    // Free state-specific resources
+    if opt.state != null {
+        if opt.optimizer_type == OPT_SGD {
+            let state = opt.state as *SGDState
+            // Free momentum buffers
+            var g: u32 = 0
+            while g < MAX_PARAM_GROUPS {
+                var p: u32 = 0
+                while p < MAX_PARAMS_PER_GROUP {
+                    if state.momentum_buffers[g][p] != null {
+                        tensor.tensor_release(state.momentum_buffers[g][p])
+                    }
+                    p = p + 1
+                }
+                g = g + 1
+            }
+            basics.free(state)
+        } else if opt.optimizer_type == OPT_ADAM or opt.optimizer_type == OPT_ADAMW {
+            let state = opt.state as *AdamState
+            var g: u32 = 0
+            while g < MAX_PARAM_GROUPS {
+                var p: u32 = 0
+                while p < MAX_PARAMS_PER_GROUP {
+                    if state.m[g][p] != null {
+                        tensor.tensor_release(state.m[g][p])
+                    }
+                    if state.v[g][p] != null {
+                        tensor.tensor_release(state.v[g][p])
+                    }
+                    if state.v_max[g][p] != null {
+                        tensor.tensor_release(state.v_max[g][p])
+                    }
+                    p = p + 1
+                }
+                g = g + 1
+            }
+            basics.free(state)
+        } else if opt.optimizer_type == OPT_RMSPROP {
+            let state = opt.state as *RMSpropState
+            var g: u32 = 0
+            while g < MAX_PARAM_GROUPS {
+                var p: u32 = 0
+                while p < MAX_PARAMS_PER_GROUP {
+                    if state.square_avg[g][p] != null {
+                        tensor.tensor_release(state.square_avg[g][p])
+                    }
+                    if state.momentum_buffer[g][p] != null {
+                        tensor.tensor_release(state.momentum_buffer[g][p])
+                    }
+                    if state.grad_avg[g][p] != null {
+                        tensor.tensor_release(state.grad_avg[g][p])
+                    }
+                    p = p + 1
+                }
+                g = g + 1
+            }
+            basics.free(state)
+        }
+    }
+
+    basics.free(opt)
+}

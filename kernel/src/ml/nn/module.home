@@ -1,0 +1,574 @@
+// HomeOS Neural Network Module Base
+// Base class for all neural network layers
+
+const basics = @import("basics")
+const tensor = @import("ml/tensor")
+const autograd = @import("ml/autograd")
+
+// Module types
+const MODULE_LINEAR: u32 = 1
+const MODULE_CONV2D: u32 = 2
+const MODULE_BATCHNORM: u32 = 3
+const MODULE_LAYERNORM: u32 = 4
+const MODULE_DROPOUT: u32 = 5
+const MODULE_RELU: u32 = 6
+const MODULE_SIGMOID: u32 = 7
+const MODULE_TANH: u32 = 8
+const MODULE_SOFTMAX: u32 = 9
+const MODULE_MAXPOOL2D: u32 = 10
+const MODULE_AVGPOOL2D: u32 = 11
+const MODULE_LSTM: u32 = 12
+const MODULE_GRU: u32 = 13
+const MODULE_ATTENTION: u32 = 14
+const MODULE_SEQUENTIAL: u32 = 15
+const MODULE_CUSTOM: u32 = 100
+
+// Maximum limits
+const MAX_PARAMETERS: u32 = 256
+const MAX_BUFFERS: u32 = 64
+const MAX_CHILDREN: u32 = 128
+
+// Parameter entry
+struct Parameter {
+    name: [64]u8
+    data: *tensor.Tensor
+    requires_grad: bool
+}
+
+// Buffer entry (non-trainable state)
+struct Buffer {
+    name: [64]u8
+    data: *tensor.Tensor
+    persistent: bool  // Save in state dict
+}
+
+// Child module entry
+struct ChildModule {
+    name: [64]u8
+    module: *Module
+}
+
+// Base module structure
+struct Module {
+    // Identity
+    id: u64
+    name: [64]u8
+    module_type: u32
+
+    // Parameters (trainable)
+    parameters: [MAX_PARAMETERS]Parameter
+    param_count: u32
+
+    // Buffers (non-trainable state like running mean)
+    buffers: [MAX_BUFFERS]Buffer
+    buffer_count: u32
+
+    // Child modules
+    children: [MAX_CHILDREN]ChildModule
+    child_count: u32
+
+    // Mode
+    training: bool
+
+    // Forward function pointer (virtual dispatch)
+    forward_fn: fn(*Module, *tensor.Tensor) -> *tensor.Tensor
+
+    // Extra data for specific module types
+    extra: *void
+}
+
+// Global module ID counter
+var next_module_id: u64 = 1
+
+// ============================================
+// Module Lifecycle
+// ============================================
+
+// Initialize a new module
+export fn module_init(m: *Module, name: *u8, module_type: u32): void {
+    basics.memset(m, 0, @sizeOf(Module))
+
+    m.id = next_module_id
+    next_module_id = next_module_id + 1
+
+    let name_len = basics.strlen(name)
+    if name_len > 63 { name_len = 63 }
+    basics.memcpy(&m.name, name, name_len)
+
+    m.module_type = module_type
+    m.param_count = 0
+    m.buffer_count = 0
+    m.child_count = 0
+    m.training = true
+    m.forward_fn = null
+    m.extra = null
+}
+
+// Free module resources
+export fn module_free(m: *Module): void {
+    if m == null {
+        return
+    }
+
+    // Free parameters
+    var i: u32 = 0
+    while i < m.param_count {
+        if m.parameters[i].data != null {
+            tensor.tensor_release(m.parameters[i].data)
+        }
+        i = i + 1
+    }
+
+    // Free buffers
+    i = 0
+    while i < m.buffer_count {
+        if m.buffers[i].data != null {
+            tensor.tensor_release(m.buffers[i].data)
+        }
+        i = i + 1
+    }
+
+    // Free children (recursively)
+    i = 0
+    while i < m.child_count {
+        if m.children[i].module != null {
+            module_free(m.children[i].module)
+            basics.free(m.children[i].module)
+        }
+        i = i + 1
+    }
+
+    // Free extra data
+    if m.extra != null {
+        basics.free(m.extra)
+    }
+}
+
+// ============================================
+// Parameter Management
+// ============================================
+
+// Register a parameter
+export fn module_register_parameter(m: *Module, name: *u8, param: *tensor.Tensor): bool {
+    if m.param_count >= MAX_PARAMETERS {
+        return false
+    }
+
+    let p = &m.parameters[m.param_count]
+
+    let name_len = basics.strlen(name)
+    if name_len > 63 { name_len = 63 }
+    basics.memcpy(&p.name, name, name_len)
+
+    tensor.tensor_retain(param)
+    p.data = param
+    p.requires_grad = true
+
+    // Ensure parameter requires gradient
+    tensor.tensor_set_requires_grad(param, true)
+
+    m.param_count = m.param_count + 1
+    return true
+}
+
+// Get parameter by name
+export fn module_get_parameter(m: *Module, name: *u8): *tensor.Tensor {
+    var i: u32 = 0
+    while i < m.param_count {
+        if basics.strcmp(&m.parameters[i].name, name) == 0 {
+            return m.parameters[i].data
+        }
+        i = i + 1
+    }
+    return null
+}
+
+// Get all parameters (fills array, returns count)
+export fn module_parameters(m: *Module, out: **tensor.Tensor, max_count: u32): u32 {
+    var count: u32 = 0
+
+    // Own parameters
+    var i: u32 = 0
+    while i < m.param_count and count < max_count {
+        out[count] = m.parameters[i].data
+        count = count + 1
+        i = i + 1
+    }
+
+    // Children's parameters (recursive)
+    i = 0
+    while i < m.child_count and count < max_count {
+        let child = m.children[i].module
+        if child != null {
+            count = count + module_parameters(child, out + count, max_count - count)
+        }
+        i = i + 1
+    }
+
+    return count
+}
+
+// Count total parameters
+export fn module_num_parameters(m: *Module): u64 {
+    var total: u64 = 0
+
+    // Own parameters
+    var i: u32 = 0
+    while i < m.param_count {
+        total = total + tensor.tensor_numel(m.parameters[i].data)
+        i = i + 1
+    }
+
+    // Children's parameters
+    i = 0
+    while i < m.child_count {
+        if m.children[i].module != null {
+            total = total + module_num_parameters(m.children[i].module)
+        }
+        i = i + 1
+    }
+
+    return total
+}
+
+// ============================================
+// Buffer Management
+// ============================================
+
+// Register a buffer
+export fn module_register_buffer(m: *Module, name: *u8, buf: *tensor.Tensor, persistent: bool): bool {
+    if m.buffer_count >= MAX_BUFFERS {
+        return false
+    }
+
+    let b = &m.buffers[m.buffer_count]
+
+    let name_len = basics.strlen(name)
+    if name_len > 63 { name_len = 63 }
+    basics.memcpy(&b.name, name, name_len)
+
+    tensor.tensor_retain(buf)
+    b.data = buf
+    b.persistent = persistent
+
+    m.buffer_count = m.buffer_count + 1
+    return true
+}
+
+// Get buffer by name
+export fn module_get_buffer(m: *Module, name: *u8): *tensor.Tensor {
+    var i: u32 = 0
+    while i < m.buffer_count {
+        if basics.strcmp(&m.buffers[i].name, name) == 0 {
+            return m.buffers[i].data
+        }
+        i = i + 1
+    }
+    return null
+}
+
+// ============================================
+// Child Module Management
+// ============================================
+
+// Add child module
+export fn module_add_child(m: *Module, name: *u8, child: *Module): bool {
+    if m.child_count >= MAX_CHILDREN {
+        return false
+    }
+
+    let c = &m.children[m.child_count]
+
+    let name_len = basics.strlen(name)
+    if name_len > 63 { name_len = 63 }
+    basics.memcpy(&c.name, name, name_len)
+
+    c.module = child
+
+    m.child_count = m.child_count + 1
+    return true
+}
+
+// Get child by name
+export fn module_get_child(m: *Module, name: *u8): *Module {
+    var i: u32 = 0
+    while i < m.child_count {
+        if basics.strcmp(&m.children[i].name, name) == 0 {
+            return m.children[i].module
+        }
+        i = i + 1
+    }
+    return null
+}
+
+// Get child by index
+export fn module_get_child_idx(m: *Module, idx: u32): *Module {
+    if idx < m.child_count {
+        return m.children[idx].module
+    }
+    return null
+}
+
+// ============================================
+// Training Mode
+// ============================================
+
+// Set training mode (recursive)
+export fn module_train(m: *Module, mode: bool): void {
+    m.training = mode
+
+    // Propagate to children
+    var i: u32 = 0
+    while i < m.child_count {
+        if m.children[i].module != null {
+            module_train(m.children[i].module, mode)
+        }
+        i = i + 1
+    }
+}
+
+// Set evaluation mode
+export fn module_eval(m: *Module): void {
+    module_train(m, false)
+}
+
+// Check if in training mode
+export fn module_is_training(m: *Module): bool {
+    return m.training
+}
+
+// ============================================
+// Forward Pass
+// ============================================
+
+// Forward pass (calls virtual forward function)
+export fn module_forward(m: *Module, input: *tensor.Tensor): *tensor.Tensor {
+    if m.forward_fn != null {
+        return m.forward_fn(m, input)
+    }
+    return null
+}
+
+// Shorthand for forward (call syntax)
+export fn module_call(m: *Module, input: *tensor.Tensor): *tensor.Tensor {
+    return module_forward(m, input)
+}
+
+// ============================================
+// Gradient Management
+// ============================================
+
+// Zero all gradients
+export fn module_zero_grad(m: *Module): void {
+    // Zero own parameters
+    var i: u32 = 0
+    while i < m.param_count {
+        tensor.tensor_zero_grad(m.parameters[i].data)
+        i = i + 1
+    }
+
+    // Zero children
+    i = 0
+    while i < m.child_count {
+        if m.children[i].module != null {
+            module_zero_grad(m.children[i].module)
+        }
+        i = i + 1
+    }
+}
+
+// ============================================
+// State Dictionary
+// ============================================
+
+// State dict entry
+struct StateDictEntry {
+    key: [128]u8
+    tensor: *tensor.Tensor
+}
+
+// State dictionary
+struct StateDict {
+    entries: [1024]StateDictEntry
+    count: u32
+}
+
+// Build state dict key with prefix
+fn build_key(prefix: *u8, name: *u8, out: *u8): void {
+    if prefix[0] != 0 {
+        basics.strcpy(out, prefix)
+        basics.strcat(out, ".")
+        basics.strcat(out, name)
+    } else {
+        basics.strcpy(out, name)
+    }
+}
+
+// Get state dict (for saving)
+export fn module_state_dict(m: *Module, prefix: *u8, dict: *StateDict): void {
+    var key: [128]u8
+
+    // Add parameters
+    var i: u32 = 0
+    while i < m.param_count and dict.count < 1024 {
+        build_key(prefix, &m.parameters[i].name, &key)
+
+        basics.memcpy(&dict.entries[dict.count].key, &key, 128)
+        tensor.tensor_retain(m.parameters[i].data)
+        dict.entries[dict.count].tensor = m.parameters[i].data
+        dict.count = dict.count + 1
+
+        i = i + 1
+    }
+
+    // Add persistent buffers
+    i = 0
+    while i < m.buffer_count and dict.count < 1024 {
+        if m.buffers[i].persistent {
+            build_key(prefix, &m.buffers[i].name, &key)
+
+            basics.memcpy(&dict.entries[dict.count].key, &key, 128)
+            tensor.tensor_retain(m.buffers[i].data)
+            dict.entries[dict.count].tensor = m.buffers[i].data
+            dict.count = dict.count + 1
+        }
+        i = i + 1
+    }
+
+    // Add children's state
+    i = 0
+    while i < m.child_count {
+        if m.children[i].module != null {
+            build_key(prefix, &m.children[i].name, &key)
+            module_state_dict(m.children[i].module, &key, dict)
+        }
+        i = i + 1
+    }
+}
+
+// Load state dict (for loading)
+export fn module_load_state_dict(m: *Module, prefix: *u8, dict: *StateDict): bool {
+    var key: [128]u8
+
+    // Load parameters
+    var i: u32 = 0
+    while i < m.param_count {
+        build_key(prefix, &m.parameters[i].name, &key)
+
+        // Find in dict
+        var j: u32 = 0
+        while j < dict.count {
+            if basics.strcmp(&dict.entries[j].key, &key) == 0 {
+                // Copy data
+                let src = dict.entries[j].tensor
+                let dst = m.parameters[i].data
+
+                if tensor.tensor_numel(src) == tensor.tensor_numel(dst) {
+                    basics.memcpy(dst.data, src.data, src.data_size)
+                }
+                break
+            }
+            j = j + 1
+        }
+
+        i = i + 1
+    }
+
+    // Load buffers
+    i = 0
+    while i < m.buffer_count {
+        if m.buffers[i].persistent {
+            build_key(prefix, &m.buffers[i].name, &key)
+
+            var j: u32 = 0
+            while j < dict.count {
+                if basics.strcmp(&dict.entries[j].key, &key) == 0 {
+                    let src = dict.entries[j].tensor
+                    let dst = m.buffers[i].data
+
+                    if tensor.tensor_numel(src) == tensor.tensor_numel(dst) {
+                        basics.memcpy(dst.data, src.data, src.data_size)
+                    }
+                    break
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+
+    // Load children
+    i = 0
+    while i < m.child_count {
+        if m.children[i].module != null {
+            build_key(prefix, &m.children[i].name, &key)
+            module_load_state_dict(m.children[i].module, &key, dict)
+        }
+        i = i + 1
+    }
+
+    return true
+}
+
+// Free state dict
+export fn state_dict_free(dict: *StateDict): void {
+    var i: u32 = 0
+    while i < dict.count {
+        if dict.entries[i].tensor != null {
+            tensor.tensor_release(dict.entries[i].tensor)
+        }
+        i = i + 1
+    }
+    dict.count = 0
+}
+
+// ============================================
+// Utility Functions
+// ============================================
+
+// Print module summary
+export fn module_print(m: *Module, indent: u32): void {
+    var spaces: [32]u8
+    var i: u32 = 0
+    while i < indent and i < 31 {
+        spaces[i] = ' '
+        i = i + 1
+    }
+    spaces[i] = 0
+
+    basics.print(&spaces)
+    basics.print(&m.name)
+    basics.print(" (")
+
+    // Print type name
+    if m.module_type == MODULE_LINEAR { basics.print("Linear") }
+    else if m.module_type == MODULE_CONV2D { basics.print("Conv2d") }
+    else if m.module_type == MODULE_BATCHNORM { basics.print("BatchNorm") }
+    else if m.module_type == MODULE_RELU { basics.print("ReLU") }
+    else if m.module_type == MODULE_SEQUENTIAL { basics.print("Sequential") }
+    else { basics.print("Module") }
+
+    basics.print("): ")
+    basics.print_int(module_num_parameters(m) as i32)
+    basics.print(" parameters\n")
+
+    // Print children
+    i = 0
+    while i < m.child_count {
+        module_print(m.children[i].module, indent + 2)
+        i = i + 1
+    }
+}
+
+// Apply function to all modules
+export fn module_apply(m: *Module, fn: fn(*Module) -> void): void {
+    fn(m)
+
+    var i: u32 = 0
+    while i < m.child_count {
+        if m.children[i].module != null {
+            module_apply(m.children[i].module, fn)
+        }
+        i = i + 1
+    }
+}
