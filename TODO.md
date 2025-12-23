@@ -2691,11 +2691,40 @@ Build a next-generation operating system that prioritizes:
 ## Phase 18: Edge Computing & IoT Features (Weeks 79-82) - COMPLETED
 
 ### 18.1 IoT Device Support
-- [x] GPIO-based sensors (`kernel/src/iot/sensors.home`)
-- [x] I2C/SPI device drivers for common sensors (DHT22, BMP280, HC-SR04, PIR)
-- [ ] Low-power modes for battery operation
-- [ ] Wake-on-interrupt support
-- [x] Real-time scheduling (`kernel/src/sched/rt_classes.home`)
+- [x] GPIO-based sensors - `kernel/src/iot/gpio_sensors.home`
+  - [x] DHT11/DHT22 temperature+humidity sensors
+  - [x] PIR motion sensors with cooldown
+  - [x] HC-SR04 ultrasonic distance
+  - [x] Digital sensors (reed switch, tilt, flame)
+- [x] I2C/SPI device drivers - `kernel/src/iot/i2c_sensors.home`, `spi_sensors.home`
+  - [x] BME280/BMP280 environmental sensor
+  - [x] MPU6050 6-axis IMU
+  - [x] BH1750 ambient light sensor
+  - [x] ADS1115 16-bit ADC
+  - [x] SHT31 temperature+humidity
+  - [x] VL53L0X time-of-flight distance
+  - [x] MAX31855 thermocouple
+  - [x] MCP3008 10-bit ADC
+  - [x] ADXL345 accelerometer
+  - [x] NRF24L01 2.4GHz transceiver
+- [x] Low-power modes for battery operation - `kernel/src/power/low_power.home`
+  - [x] Power domain control with reference counting
+  - [x] Light sleep, deep sleep, hibernate modes
+  - [x] Battery level monitoring
+  - [x] Power policies with configurable timeouts
+- [x] Wake-on-interrupt support - `kernel/src/power/wake_interrupt.home`
+  - [x] GPIO wake sources
+  - [x] RTC alarm wake
+  - [x] Wake-on-LAN support
+  - [x] Power button wake
+  - [x] Motion/accelerometer wake
+  - [x] Wake event logging and statistics
+- [x] Real-time kernel patches (PREEMPT_RT-like) - `kernel/src/sched/preempt_rt.home`
+  - [x] RT-mutex with priority inheritance
+  - [x] Threaded IRQ handlers
+  - [x] High-resolution timers
+  - [x] SCHED_DEADLINE support
+  - [x] Latency tracking and histograms
 
 ### 18.2 Edge Computing Features
 - [x] Container runtime (`kernel/src/container/runtime.home`, `oci.home`)

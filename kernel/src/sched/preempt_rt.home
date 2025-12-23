@@ -1,0 +1,891 @@
+// home-os Real-Time Kernel Patches (PREEMPT_RT-like)
+// Provides deterministic low-latency scheduling for real-time applications
+
+import "../core/foundation.home" as foundation
+
+// ============================================================================
+// PREEMPT_RT Configuration
+// ============================================================================
+
+// Preemption modes
+const PREEMPT_NONE: u8 = 0               // No kernel preemption
+const PREEMPT_VOLUNTARY: u8 = 1          // Explicit preemption points
+const PREEMPT_FULL: u8 = 2               // Full kernel preemption
+const PREEMPT_RT: u8 = 3                 // Real-time preemption (PREEMPT_RT)
+
+// Real-time priorities (higher = more urgent)
+const RT_PRIO_MIN: u8 = 1
+const RT_PRIO_MAX: u8 = 99
+const RT_PRIO_FIFO_DEFAULT: u8 = 50
+const RT_PRIO_RR_DEFAULT: u8 = 50
+
+// Scheduling policies
+const SCHED_NORMAL: u8 = 0               // CFS (fair scheduling)
+const SCHED_FIFO: u8 = 1                 // Real-time FIFO
+const SCHED_RR: u8 = 2                   // Real-time round-robin
+const SCHED_BATCH: u8 = 3                // Batch processing
+const SCHED_IDLE: u8 = 4                 // Idle priority
+const SCHED_DEADLINE: u8 = 5             // EDF (Earliest Deadline First)
+
+// Lock types
+const LOCK_SPIN: u8 = 0                  // Traditional spinlock
+const LOCK_MUTEX_RT: u8 = 1              // RT-mutex (sleepable in RT)
+const LOCK_RWLOCK_RT: u8 = 2             // RT read-write lock
+const LOCK_SEQLOCK_RT: u8 = 3            // RT sequence lock
+
+// IRQ threading modes
+const IRQ_HARDIRQ: u8 = 0                // Traditional hard IRQ
+const IRQ_THREADED: u8 = 1               // Threaded IRQ handler
+const IRQ_SOFTIRQ_THREAD: u8 = 2         // Softirq in thread context
+
+// Timer modes
+const TIMER_SOFTIRQ: u8 = 0              // Traditional timer softirq
+const TIMER_HRTIMER: u8 = 1              // High-resolution timer
+const TIMER_DEADLINE: u8 = 2             // Deadline timer
+
+const MAX_RT_TASKS: u32 = 256
+const MAX_RT_MUTEXES: u32 = 512
+const MAX_THREADED_IRQS: u32 = 64
+const LATENCY_HISTOGRAM_BUCKETS: u32 = 100
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// Real-time task parameters
+struct RtTaskParams {
+    policy: u8,                          // SCHED_FIFO, SCHED_RR, SCHED_DEADLINE
+    priority: u8,                        // 1-99 for RT, nice for normal
+    runtime_ns: u64,                     // For SCHED_DEADLINE
+    deadline_ns: u64,                    // For SCHED_DEADLINE
+    period_ns: u64,                      // For SCHED_DEADLINE
+    cpu_affinity: u64,                   // CPU mask
+    flags: u32
+}
+
+// Real-time task state
+struct RtTask {
+    task_id: u32,
+    params: RtTaskParams,
+    state: u8,                           // Running, ready, blocked
+    blocked_on: u64,                     // Mutex/resource blocking
+
+    // Timing statistics
+    exec_time_ns: u64,                   // Total execution time
+    wait_time_ns: u64,                   // Total wait time
+    max_latency_ns: u64,                 // Maximum scheduling latency
+    min_latency_ns: u64,                 // Minimum scheduling latency
+    avg_latency_ns: u64,                 // Average latency
+    latency_samples: u64,
+
+    // Deadline tracking
+    deadline_misses: u32,
+    deadlines_met: u32,
+    last_deadline: u64,
+
+    active: u8
+}
+
+// RT-mutex (priority inheritance mutex)
+struct RtMutex {
+    owner: u32,                          // Owning task ID
+    original_priority: u8,               // Owner's original priority
+    boosted_priority: u8,                // Boosted priority
+    waiters: [u32; 16],                  // Waiting task IDs
+    waiter_count: u8,
+    lock_count: u32,                     // For recursive locking
+    flags: u8,
+    active: u8
+}
+
+// Threaded IRQ handler
+struct ThreadedIrq {
+    irq_num: u32,
+    thread_id: u32,                      // Kernel thread handling IRQ
+    priority: u8,                        // Thread priority
+    handler: u64,                        // IRQ handler function
+    thread_fn: u64,                      // Thread function
+    dev_id: u64,                         // Device identifier
+    flags: u32,
+    irq_count: u64,
+    thread_count: u64,
+    max_latency_ns: u64,
+    active: u8
+}
+
+// High-resolution timer
+struct HrTimer {
+    expires_ns: u64,                     // Expiration time (nanoseconds)
+    interval_ns: u64,                    // For periodic timers
+    callback: u64,                       // Timer callback function
+    data: u64,                           // Callback data
+    mode: u8,                            // One-shot or periodic
+    state: u8,                           // Pending, expired, cancelled
+    cpu: u8,                             // CPU affinity
+    active: u8
+}
+
+// Latency histogram
+struct LatencyHistogram {
+    buckets: [u64; 100],                 // 0-99us buckets
+    overflow: u64,                       // >99us count
+    min_ns: u64,
+    max_ns: u64,
+    total_ns: u64,
+    samples: u64
+}
+
+// PREEMPT_RT configuration
+struct PreemptRtConfig {
+    mode: u8,                            // Current preemption mode
+    irq_threading: u8,                   // Enable threaded IRQs
+    softirq_threading: u8,               // Enable threaded softirqs
+    timer_hrtimer: u8,                   // Use high-res timers
+    rcu_preempt: u8,                     // Preemptible RCU
+    spinlock_rt: u8,                     // Convert spinlocks to RT-mutex
+
+    // Latency targets
+    target_latency_us: u32,              // Target max latency
+    max_acceptable_latency_us: u32,      // Maximum acceptable
+
+    // Debug options
+    latency_tracing: u8,
+    lock_debugging: u8,
+    deadline_debugging: u8
+}
+
+// RT scheduler state
+struct RtSchedulerState {
+    initialized: u8,
+    config: PreemptRtConfig,
+
+    // Run queues per priority
+    rt_runqueue: [u64; 100],             // Bitmask of runnable tasks per priority
+    rt_task_count: u32,
+
+    // Statistics
+    context_switches: u64,
+    preemptions: u64,
+    priority_inversions: u64,
+    deadline_misses: u64,
+
+    // Latency tracking
+    scheduling_latency: LatencyHistogram,
+    irq_latency: LatencyHistogram,
+    timer_latency: LatencyHistogram
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+var rt_tasks: [RtTask; 256]
+var rt_task_count: u32 = 0
+var rt_mutexes: [RtMutex; 512]
+var rt_mutex_count: u32 = 0
+var threaded_irqs: [ThreadedIrq; 64]
+var threaded_irq_count: u32 = 0
+var hr_timers: [HrTimer; 128]
+var hr_timer_count: u32 = 0
+var rt_state: RtSchedulerState
+
+// Current preemption count (per-CPU in real implementation)
+var preempt_count: u32 = 0
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+export fn preempt_rt_init(): u32 {
+    if rt_state.initialized == 1 {
+        return 1
+    }
+
+    // Initialize RT tasks
+    var i: u32 = 0
+    while i < MAX_RT_TASKS {
+        rt_tasks[i].active = 0
+        i = i + 1
+    }
+
+    // Initialize mutexes
+    i = 0
+    while i < MAX_RT_MUTEXES {
+        rt_mutexes[i].active = 0
+        i = i + 1
+    }
+
+    // Initialize threaded IRQs
+    i = 0
+    while i < MAX_THREADED_IRQS {
+        threaded_irqs[i].active = 0
+        i = i + 1
+    }
+
+    // Initialize HR timers
+    i = 0
+    while i < 128 {
+        hr_timers[i].active = 0
+        i = i + 1
+    }
+
+    // Set default configuration
+    rt_state.config.mode = PREEMPT_RT
+    rt_state.config.irq_threading = 1
+    rt_state.config.softirq_threading = 1
+    rt_state.config.timer_hrtimer = 1
+    rt_state.config.rcu_preempt = 1
+    rt_state.config.spinlock_rt = 1
+    rt_state.config.target_latency_us = 50
+    rt_state.config.max_acceptable_latency_us = 100
+    rt_state.config.latency_tracing = 1
+    rt_state.config.lock_debugging = 0
+    rt_state.config.deadline_debugging = 0
+
+    // Initialize statistics
+    rt_state.context_switches = 0
+    rt_state.preemptions = 0
+    rt_state.priority_inversions = 0
+    rt_state.deadline_misses = 0
+
+    // Initialize latency histograms
+    init_latency_histogram(&rt_state.scheduling_latency)
+    init_latency_histogram(&rt_state.irq_latency)
+    init_latency_histogram(&rt_state.timer_latency)
+
+    rt_task_count = 0
+    rt_mutex_count = 0
+    threaded_irq_count = 0
+    hr_timer_count = 0
+
+    rt_state.initialized = 1
+
+    foundation.serial_write_string("[PREEMPT_RT] Real-time kernel patches initialized\n")
+    return 1
+}
+
+// Initialize latency histogram
+fn init_latency_histogram(hist: u64) {
+    var h: LatencyHistogram = @intToPtr(hist, LatencyHistogram)
+
+    var i: u32 = 0
+    while i < LATENCY_HISTOGRAM_BUCKETS {
+        h.buckets[i] = 0
+        i = i + 1
+    }
+
+    h.overflow = 0
+    h.min_ns = 0xFFFFFFFFFFFFFFFF
+    h.max_ns = 0
+    h.total_ns = 0
+    h.samples = 0
+}
+
+// ============================================================================
+// RT Task Management
+// ============================================================================
+
+// Create real-time task
+export fn rt_task_create(task_id: u32, policy: u8, priority: u8): u32 {
+    if rt_task_count >= MAX_RT_TASKS {
+        return 0xFFFFFFFF
+    }
+
+    if priority < RT_PRIO_MIN || priority > RT_PRIO_MAX {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = rt_task_count
+
+    rt_tasks[idx].task_id = task_id
+    rt_tasks[idx].params.policy = policy
+    rt_tasks[idx].params.priority = priority
+    rt_tasks[idx].params.runtime_ns = 0
+    rt_tasks[idx].params.deadline_ns = 0
+    rt_tasks[idx].params.period_ns = 0
+    rt_tasks[idx].params.cpu_affinity = 0xFFFFFFFFFFFFFFFF  // All CPUs
+    rt_tasks[idx].params.flags = 0
+    rt_tasks[idx].state = 0
+    rt_tasks[idx].blocked_on = 0
+    rt_tasks[idx].exec_time_ns = 0
+    rt_tasks[idx].wait_time_ns = 0
+    rt_tasks[idx].max_latency_ns = 0
+    rt_tasks[idx].min_latency_ns = 0xFFFFFFFFFFFFFFFF
+    rt_tasks[idx].avg_latency_ns = 0
+    rt_tasks[idx].latency_samples = 0
+    rt_tasks[idx].deadline_misses = 0
+    rt_tasks[idx].deadlines_met = 0
+    rt_tasks[idx].last_deadline = 0
+    rt_tasks[idx].active = 1
+
+    rt_task_count = rt_task_count + 1
+
+    foundation.serial_write_string("[PREEMPT_RT] RT task created: ")
+    foundation.serial_write_hex(task_id)
+    foundation.serial_write_string(" prio=")
+    foundation.serial_write_hex(priority)
+    foundation.serial_write_string("\n")
+
+    return idx
+}
+
+// Set SCHED_DEADLINE parameters
+export fn rt_task_set_deadline(handle: u32, runtime_ns: u64, deadline_ns: u64, period_ns: u64): u32 {
+    if handle >= rt_task_count { return 0 }
+    if rt_tasks[handle].active == 0 { return 0 }
+
+    // Validate parameters (runtime <= deadline <= period)
+    if runtime_ns > deadline_ns || deadline_ns > period_ns {
+        return 0
+    }
+
+    rt_tasks[handle].params.policy = SCHED_DEADLINE
+    rt_tasks[handle].params.runtime_ns = runtime_ns
+    rt_tasks[handle].params.deadline_ns = deadline_ns
+    rt_tasks[handle].params.period_ns = period_ns
+
+    return 1
+}
+
+// Set task CPU affinity
+export fn rt_task_set_affinity(handle: u32, cpu_mask: u64) {
+    if handle >= rt_task_count { return }
+    if rt_tasks[handle].active == 0 { return }
+
+    rt_tasks[handle].params.cpu_affinity = cpu_mask
+}
+
+// Record task scheduling latency
+export fn rt_task_record_latency(handle: u32, latency_ns: u64) {
+    if handle >= rt_task_count { return }
+    if rt_tasks[handle].active == 0 { return }
+
+    // Update task statistics
+    if latency_ns < rt_tasks[handle].min_latency_ns {
+        rt_tasks[handle].min_latency_ns = latency_ns
+    }
+    if latency_ns > rt_tasks[handle].max_latency_ns {
+        rt_tasks[handle].max_latency_ns = latency_ns
+    }
+
+    rt_tasks[handle].latency_samples = rt_tasks[handle].latency_samples + 1
+    var total: u64 = rt_tasks[handle].avg_latency_ns * (rt_tasks[handle].latency_samples - 1)
+    rt_tasks[handle].avg_latency_ns = (total + latency_ns) / rt_tasks[handle].latency_samples
+
+    // Update global histogram
+    record_latency(&rt_state.scheduling_latency, latency_ns)
+}
+
+// Record latency in histogram
+fn record_latency(hist: u64, latency_ns: u64) {
+    var h: LatencyHistogram = @intToPtr(hist, LatencyHistogram)
+
+    var bucket: u32 = latency_ns / 1000  // Convert to microseconds
+
+    if bucket < LATENCY_HISTOGRAM_BUCKETS {
+        h.buckets[bucket] = h.buckets[bucket] + 1
+    } else {
+        h.overflow = h.overflow + 1
+    }
+
+    if latency_ns < h.min_ns {
+        h.min_ns = latency_ns
+    }
+    if latency_ns > h.max_ns {
+        h.max_ns = latency_ns
+    }
+
+    h.total_ns = h.total_ns + latency_ns
+    h.samples = h.samples + 1
+}
+
+// ============================================================================
+// RT-Mutex (Priority Inheritance)
+// ============================================================================
+
+// Create RT-mutex
+export fn rt_mutex_create(): u32 {
+    if rt_mutex_count >= MAX_RT_MUTEXES {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = rt_mutex_count
+
+    rt_mutexes[idx].owner = 0xFFFFFFFF
+    rt_mutexes[idx].original_priority = 0
+    rt_mutexes[idx].boosted_priority = 0
+    rt_mutexes[idx].waiter_count = 0
+    rt_mutexes[idx].lock_count = 0
+    rt_mutexes[idx].flags = 0
+    rt_mutexes[idx].active = 1
+
+    var i: u32 = 0
+    while i < 16 {
+        rt_mutexes[idx].waiters[i] = 0xFFFFFFFF
+        i = i + 1
+    }
+
+    rt_mutex_count = rt_mutex_count + 1
+
+    return idx
+}
+
+// Lock RT-mutex with priority inheritance
+export fn rt_mutex_lock(handle: u32, task_id: u32, task_priority: u8): u32 {
+    if handle >= rt_mutex_count { return 0 }
+    if rt_mutexes[handle].active == 0 { return 0 }
+
+    // Check if mutex is free
+    if rt_mutexes[handle].owner == 0xFFFFFFFF {
+        // Acquire mutex
+        rt_mutexes[handle].owner = task_id
+        rt_mutexes[handle].original_priority = task_priority
+        rt_mutexes[handle].boosted_priority = task_priority
+        rt_mutexes[handle].lock_count = 1
+        return 1
+    }
+
+    // Check for recursive lock
+    if rt_mutexes[handle].owner == task_id {
+        rt_mutexes[handle].lock_count = rt_mutexes[handle].lock_count + 1
+        return 1
+    }
+
+    // Mutex is held by another task - implement priority inheritance
+    if task_priority > rt_mutexes[handle].boosted_priority {
+        // Boost owner's priority
+        rt_mutexes[handle].boosted_priority = task_priority
+        rt_state.priority_inversions = rt_state.priority_inversions + 1
+
+        // Would boost the actual task priority here
+        boost_task_priority(rt_mutexes[handle].owner, task_priority)
+    }
+
+    // Add to waiters list
+    if rt_mutexes[handle].waiter_count < 16 {
+        rt_mutexes[handle].waiters[rt_mutexes[handle].waiter_count] = task_id
+        rt_mutexes[handle].waiter_count = rt_mutexes[handle].waiter_count + 1
+    }
+
+    // Would block the task here
+    return 0  // Blocked
+}
+
+// Unlock RT-mutex
+export fn rt_mutex_unlock(handle: u32, task_id: u32): u32 {
+    if handle >= rt_mutex_count { return 0 }
+    if rt_mutexes[handle].active == 0 { return 0 }
+    if rt_mutexes[handle].owner != task_id { return 0 }
+
+    // Handle recursive unlock
+    rt_mutexes[handle].lock_count = rt_mutexes[handle].lock_count - 1
+    if rt_mutexes[handle].lock_count > 0 {
+        return 1
+    }
+
+    // Restore original priority if boosted
+    if rt_mutexes[handle].boosted_priority != rt_mutexes[handle].original_priority {
+        restore_task_priority(task_id, rt_mutexes[handle].original_priority)
+    }
+
+    // Wake highest priority waiter
+    if rt_mutexes[handle].waiter_count > 0 {
+        var highest_prio_idx: u32 = 0
+        var highest_prio: u8 = 0
+
+        // Find highest priority waiter
+        var i: u32 = 0
+        while i < rt_mutexes[handle].waiter_count {
+            var waiter_id: u32 = rt_mutexes[handle].waiters[i]
+            var waiter_prio: u8 = get_task_priority(waiter_id)
+
+            if waiter_prio > highest_prio {
+                highest_prio = waiter_prio
+                highest_prio_idx = i
+            }
+            i = i + 1
+        }
+
+        // Transfer ownership to highest priority waiter
+        var new_owner: u32 = rt_mutexes[handle].waiters[highest_prio_idx]
+        rt_mutexes[handle].owner = new_owner
+        rt_mutexes[handle].original_priority = highest_prio
+        rt_mutexes[handle].boosted_priority = highest_prio
+        rt_mutexes[handle].lock_count = 1
+
+        // Remove from waiters
+        remove_waiter(handle, highest_prio_idx)
+
+        // Wake the new owner
+        wake_task(new_owner)
+    } else {
+        // No waiters, mark as free
+        rt_mutexes[handle].owner = 0xFFFFFFFF
+    }
+
+    return 1
+}
+
+// Remove waiter from list
+fn remove_waiter(mutex: u32, idx: u32) {
+    var i: u32 = idx
+    while i < rt_mutexes[mutex].waiter_count - 1 {
+        rt_mutexes[mutex].waiters[i] = rt_mutexes[mutex].waiters[i + 1]
+        i = i + 1
+    }
+    rt_mutexes[mutex].waiter_count = rt_mutexes[mutex].waiter_count - 1
+}
+
+// Priority boost helper
+fn boost_task_priority(task_id: u32, priority: u8) {
+    // Would update task's priority in scheduler
+}
+
+// Priority restore helper
+fn restore_task_priority(task_id: u32, priority: u8) {
+    // Would restore task's priority in scheduler
+}
+
+// Get task priority helper
+fn get_task_priority(task_id: u32): u8 {
+    var i: u32 = 0
+    while i < rt_task_count {
+        if rt_tasks[i].task_id == task_id && rt_tasks[i].active == 1 {
+            return rt_tasks[i].params.priority
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Wake task helper
+fn wake_task(task_id: u32) {
+    // Would wake the blocked task
+}
+
+// ============================================================================
+// Threaded IRQ Support
+// ============================================================================
+
+// Register threaded IRQ handler
+export fn request_threaded_irq(irq: u32, handler: u64, thread_fn: u64, flags: u32, dev_id: u64): u32 {
+    if threaded_irq_count >= MAX_THREADED_IRQS {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = threaded_irq_count
+
+    threaded_irqs[idx].irq_num = irq
+    threaded_irqs[idx].thread_id = 0xFFFFFFFF  // Will be assigned on first IRQ
+    threaded_irqs[idx].priority = RT_PRIO_MAX - 10  // High priority for IRQ threads
+    threaded_irqs[idx].handler = handler
+    threaded_irqs[idx].thread_fn = thread_fn
+    threaded_irqs[idx].dev_id = dev_id
+    threaded_irqs[idx].flags = flags
+    threaded_irqs[idx].irq_count = 0
+    threaded_irqs[idx].thread_count = 0
+    threaded_irqs[idx].max_latency_ns = 0
+    threaded_irqs[idx].active = 1
+
+    threaded_irq_count = threaded_irq_count + 1
+
+    foundation.serial_write_string("[PREEMPT_RT] Threaded IRQ registered: ")
+    foundation.serial_write_hex(irq)
+    foundation.serial_write_string("\n")
+
+    return idx
+}
+
+// Handle IRQ (called from interrupt context)
+export fn threaded_irq_handle(irq: u32): u32 {
+    var start_time: u64 = get_timestamp_ns()
+
+    // Find handler
+    var i: u32 = 0
+    while i < threaded_irq_count {
+        if threaded_irqs[i].irq_num == irq && threaded_irqs[i].active == 1 {
+            threaded_irqs[i].irq_count = threaded_irqs[i].irq_count + 1
+
+            // Call quick handler (must be fast)
+            if threaded_irqs[i].handler != 0 {
+                // Would call handler here
+                // If handler returns IRQ_WAKE_THREAD, wake the IRQ thread
+            }
+
+            // Wake IRQ thread for deferred processing
+            if threaded_irqs[i].thread_fn != 0 {
+                wake_irq_thread(i)
+            }
+
+            // Record latency
+            var latency: u64 = get_timestamp_ns() - start_time
+            if latency > threaded_irqs[i].max_latency_ns {
+                threaded_irqs[i].max_latency_ns = latency
+            }
+            record_latency(&rt_state.irq_latency, latency)
+
+            return 1
+        }
+        i = i + 1
+    }
+
+    return 0
+}
+
+// Wake IRQ thread
+fn wake_irq_thread(idx: u32) {
+    // Would wake the kernel thread associated with this IRQ
+    threaded_irqs[idx].thread_count = threaded_irqs[idx].thread_count + 1
+}
+
+// ============================================================================
+// High-Resolution Timers
+// ============================================================================
+
+// Create high-resolution timer
+export fn hrtimer_create(expires_ns: u64, callback: u64, data: u64, periodic: u8): u32 {
+    if hr_timer_count >= 128 {
+        return 0xFFFFFFFF
+    }
+
+    var idx: u32 = hr_timer_count
+
+    hr_timers[idx].expires_ns = expires_ns
+    hr_timers[idx].interval_ns = if periodic == 1 { expires_ns } else { 0 }
+    hr_timers[idx].callback = callback
+    hr_timers[idx].data = data
+    hr_timers[idx].mode = periodic
+    hr_timers[idx].state = 1  // Pending
+    hr_timers[idx].cpu = 0xFF  // Any CPU
+    hr_timers[idx].active = 1
+
+    hr_timer_count = hr_timer_count + 1
+
+    return idx
+}
+
+// Start high-resolution timer
+export fn hrtimer_start(handle: u32, expires_ns: u64): u32 {
+    if handle >= hr_timer_count { return 0 }
+    if hr_timers[handle].active == 0 { return 0 }
+
+    hr_timers[handle].expires_ns = get_timestamp_ns() + expires_ns
+    hr_timers[handle].state = 1  // Pending
+
+    // Would add to timer queue here
+
+    return 1
+}
+
+// Cancel high-resolution timer
+export fn hrtimer_cancel(handle: u32): u32 {
+    if handle >= hr_timer_count { return 0 }
+
+    hr_timers[handle].state = 3  // Cancelled
+    return 1
+}
+
+// Process expired timers (called from timer interrupt)
+export fn hrtimer_run_queues() {
+    var now: u64 = get_timestamp_ns()
+
+    var i: u32 = 0
+    while i < hr_timer_count {
+        if hr_timers[i].active == 1 && hr_timers[i].state == 1 {
+            if now >= hr_timers[i].expires_ns {
+                var start: u64 = get_timestamp_ns()
+
+                // Timer expired
+                hr_timers[i].state = 2  // Expired
+
+                // Call callback
+                if hr_timers[i].callback != 0 {
+                    // Would call callback here
+                }
+
+                // Handle periodic timer
+                if hr_timers[i].mode == 1 && hr_timers[i].interval_ns > 0 {
+                    hr_timers[i].expires_ns = now + hr_timers[i].interval_ns
+                    hr_timers[i].state = 1  // Pending again
+                }
+
+                // Record timer latency
+                var latency: u64 = get_timestamp_ns() - start
+                record_latency(&rt_state.timer_latency, latency)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// Preemption Control
+// ============================================================================
+
+// Disable preemption
+export fn preempt_disable() {
+    preempt_count = preempt_count + 1
+}
+
+// Enable preemption
+export fn preempt_enable() {
+    if preempt_count > 0 {
+        preempt_count = preempt_count - 1
+    }
+
+    // Check if we need to reschedule
+    if preempt_count == 0 {
+        check_preempt_pending()
+    }
+}
+
+// Check if preemption is needed
+fn check_preempt_pending() {
+    // Would check if higher priority task is ready and reschedule
+}
+
+// Get preemption count
+export fn preempt_count_get(): u32 {
+    return preempt_count
+}
+
+// Check if preemptible
+export fn preemptible(): u8 {
+    return if preempt_count == 0 && rt_state.config.mode >= PREEMPT_FULL { 1 } else { 0 }
+}
+
+// ============================================================================
+// Deadline Scheduling Support
+// ============================================================================
+
+// Check and record deadline status
+export fn rt_check_deadline(handle: u32): u8 {
+    if handle >= rt_task_count { return 0 }
+    if rt_tasks[handle].active == 0 { return 0 }
+    if rt_tasks[handle].params.policy != SCHED_DEADLINE { return 1 }
+
+    var now: u64 = get_timestamp_ns()
+    var deadline: u64 = rt_tasks[handle].last_deadline + rt_tasks[handle].params.deadline_ns
+
+    if now > deadline {
+        // Deadline missed
+        rt_tasks[handle].deadline_misses = rt_tasks[handle].deadline_misses + 1
+        rt_state.deadline_misses = rt_state.deadline_misses + 1
+        return 0
+    } else {
+        rt_tasks[handle].deadlines_met = rt_tasks[handle].deadlines_met + 1
+        return 1
+    }
+}
+
+// Start new deadline period
+export fn rt_start_deadline_period(handle: u32) {
+    if handle >= rt_task_count { return }
+    if rt_tasks[handle].active == 0 { return }
+
+    rt_tasks[handle].last_deadline = get_timestamp_ns()
+}
+
+// ============================================================================
+// Statistics and Debugging
+// ============================================================================
+
+// Get scheduling latency histogram
+export fn rt_get_latency_histogram(): u64 {
+    return @ptrFromInt(rt_state.scheduling_latency)
+}
+
+// Get IRQ latency histogram
+export fn rt_get_irq_latency_histogram(): u64 {
+    return @ptrFromInt(rt_state.irq_latency)
+}
+
+// Get maximum scheduling latency
+export fn rt_get_max_latency(): u64 {
+    return rt_state.scheduling_latency.max_ns
+}
+
+// Get average scheduling latency
+export fn rt_get_avg_latency(): u64 {
+    if rt_state.scheduling_latency.samples == 0 { return 0 }
+    return rt_state.scheduling_latency.total_ns / rt_state.scheduling_latency.samples
+}
+
+// Reset latency statistics
+export fn rt_reset_latency_stats() {
+    init_latency_histogram(&rt_state.scheduling_latency)
+    init_latency_histogram(&rt_state.irq_latency)
+    init_latency_histogram(&rt_state.timer_latency)
+}
+
+// Print RT statistics
+export fn rt_print_stats() {
+    foundation.serial_write_string("\n[PREEMPT_RT] Statistics:\n")
+    foundation.serial_write_string("  Context switches: ")
+    foundation.serial_write_hex(rt_state.context_switches)
+    foundation.serial_write_string("\n  Preemptions: ")
+    foundation.serial_write_hex(rt_state.preemptions)
+    foundation.serial_write_string("\n  Priority inversions: ")
+    foundation.serial_write_hex(rt_state.priority_inversions)
+    foundation.serial_write_string("\n  Deadline misses: ")
+    foundation.serial_write_hex(rt_state.deadline_misses)
+    foundation.serial_write_string("\n  Max latency: ")
+    foundation.serial_write_hex(rt_state.scheduling_latency.max_ns / 1000)
+    foundation.serial_write_string(" us\n")
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+// Get current timestamp in nanoseconds
+fn get_timestamp_ns(): u64 {
+    // Would use high-resolution hardware timer (TSC, ARM cycle counter, etc.)
+    return foundation.timer_get_ticks() * 1000  // Approximate
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+// Set preemption mode
+export fn rt_set_preempt_mode(mode: u8) {
+    rt_state.config.mode = mode
+}
+
+// Set target latency
+export fn rt_set_target_latency(latency_us: u32) {
+    rt_state.config.target_latency_us = latency_us
+}
+
+// Enable/disable IRQ threading
+export fn rt_set_irq_threading(enabled: u8) {
+    rt_state.config.irq_threading = enabled
+}
+
+// ============================================================================
+// Cleanup
+// ============================================================================
+
+// Destroy RT task
+export fn rt_task_destroy(handle: u32) {
+    if handle >= rt_task_count { return }
+    rt_tasks[handle].active = 0
+}
+
+// Destroy RT mutex
+export fn rt_mutex_destroy(handle: u32) {
+    if handle >= rt_mutex_count { return }
+    rt_mutexes[handle].active = 0
+}
+
+// Shutdown PREEMPT_RT
+export fn preempt_rt_shutdown() {
+    if rt_state.initialized == 0 { return }
+
+    // Print final statistics
+    rt_print_stats()
+
+    rt_state.initialized = 0
+    foundation.serial_write_string("[PREEMPT_RT] Shutdown complete\n")
+}
