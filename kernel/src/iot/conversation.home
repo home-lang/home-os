@@ -1,0 +1,974 @@
+// Conversation Context and Multi-Turn Dialog Management
+// Enables follow-up questions and contextual understanding
+// Part of HomeOS Voice Assistant subsystem
+
+const basics = @import("basics");
+const memory = @import("memory");
+
+// ============================================================================
+// Conversation Constants
+// ============================================================================
+
+const MAX_CONTEXT_SLOTS: u32 = 16;        // Maximum context variables
+const MAX_HISTORY_TURNS: u32 = 10;        // Number of conversation turns to remember
+const MAX_ENTITY_VALUE_LEN: u32 = 128;    // Maximum entity value length
+const CONTEXT_TIMEOUT_MS: u64 = 300000;   // 5 minutes context timeout
+const MAX_PENDING_SLOTS: u32 = 8;         // Maximum slots to fill in a form
+
+// ============================================================================
+// Entity and Slot Types
+// ============================================================================
+
+pub const EntityType = enum {
+    // Home automation
+    Room,
+    Device,
+    DeviceType,
+    DeviceState,
+    BrightnessLevel,
+    Temperature,
+    Color,
+    Scene,
+
+    // Time
+    Time,
+    Date,
+    Duration,
+    TimeRelative,
+
+    // Media
+    MediaTitle,
+    Artist,
+    Playlist,
+    MediaType,
+
+    // Misc
+    Number,
+    Percentage,
+    Person,
+    Query,
+
+    Unknown,
+};
+
+pub const SlotValue = struct {
+    entity_type: EntityType,
+    value: [MAX_ENTITY_VALUE_LEN]u8,
+    value_len: u32,
+    confidence: f32,
+    timestamp_ms: u64,
+    resolved: bool,       // True if value has been resolved/confirmed
+
+    pub fn is_empty(self: *const SlotValue) bool {
+        return self.value_len == 0;
+    }
+
+    pub fn get_value(self: *const SlotValue) []const u8 {
+        return self.value[0..self.value_len];
+    }
+
+    pub fn set_value(self: *SlotValue, val: []const u8) void {
+        const len = if (val.len > MAX_ENTITY_VALUE_LEN) MAX_ENTITY_VALUE_LEN else val.len;
+        for (i in 0..len) {
+            self.value[i] = val[i];
+        }
+        self.value_len = @intCast(u32, len);
+    }
+};
+
+// ============================================================================
+// Dialog State Tracking
+// ============================================================================
+
+pub const DialogState = enum {
+    Idle,               // No active dialog
+    Listening,          // Waiting for user input
+    Processing,         // Processing user input
+    Confirming,         // Asking for confirmation
+    SlotFilling,        // Collecting required information
+    Executing,          // Executing the action
+    ReportingResult,    // Reporting action result
+    Error,              // Error state
+};
+
+pub const IntentContext = struct {
+    intent_name: [64]u8,
+    intent_name_len: u32,
+    confidence: f32,
+
+    // Filled slots
+    slots: [MAX_CONTEXT_SLOTS]SlotValue,
+    slot_names: [MAX_CONTEXT_SLOTS][32]u8,
+    slot_name_lens: [MAX_CONTEXT_SLOTS]u32,
+    num_slots: u32,
+
+    // Required slots that are still missing
+    pending_slots: [MAX_PENDING_SLOTS][32]u8,
+    pending_slot_lens: [MAX_PENDING_SLOTS]u32,
+    pending_slot_types: [MAX_PENDING_SLOTS]EntityType,
+    num_pending: u32,
+
+    // Timestamp
+    created_ms: u64,
+    last_updated_ms: u64,
+
+    pub fn get_slot(self: *const IntentContext, name: []const u8) ?*const SlotValue {
+        for (i in 0..self.num_slots) {
+            const slot_name = self.slot_names[i][0..self.slot_name_lens[i]];
+            if (strings_equal(slot_name, name)) {
+                return &self.slots[i];
+            }
+        }
+        return null;
+    }
+
+    pub fn set_slot(self: *IntentContext, name: []const u8, value: *const SlotValue) void {
+        // Check if slot already exists
+        for (i in 0..self.num_slots) {
+            const slot_name = self.slot_names[i][0..self.slot_name_lens[i]];
+            if (strings_equal(slot_name, name)) {
+                self.slots[i] = value.*;
+                return;
+            }
+        }
+
+        // Add new slot
+        if (self.num_slots < MAX_CONTEXT_SLOTS) {
+            const idx = self.num_slots;
+            self.slots[idx] = value.*;
+            const name_len = if (name.len > 32) 32 else name.len;
+            for (j in 0..name_len) {
+                self.slot_names[idx][j] = name[j];
+            }
+            self.slot_name_lens[idx] = @intCast(u32, name_len);
+            self.num_slots += 1;
+        }
+    }
+
+    pub fn add_pending_slot(self: *IntentContext, name: []const u8, entity_type: EntityType) void {
+        if (self.num_pending < MAX_PENDING_SLOTS) {
+            const idx = self.num_pending;
+            const name_len = if (name.len > 32) 32 else name.len;
+            for (j in 0..name_len) {
+                self.pending_slots[idx][j] = name[j];
+            }
+            self.pending_slot_lens[idx] = @intCast(u32, name_len);
+            self.pending_slot_types[idx] = entity_type;
+            self.num_pending += 1;
+        }
+    }
+
+    pub fn remove_pending_slot(self: *IntentContext, name: []const u8) void {
+        for (i in 0..self.num_pending) {
+            const slot_name = self.pending_slots[i][0..self.pending_slot_lens[i]];
+            if (strings_equal(slot_name, name)) {
+                // Shift remaining slots
+                for (j in i..self.num_pending - 1) {
+                    self.pending_slots[j] = self.pending_slots[j + 1];
+                    self.pending_slot_lens[j] = self.pending_slot_lens[j + 1];
+                    self.pending_slot_types[j] = self.pending_slot_types[j + 1];
+                }
+                self.num_pending -= 1;
+                return;
+            }
+        }
+    }
+
+    pub fn has_all_required_slots(self: *const IntentContext) bool {
+        return self.num_pending == 0;
+    }
+};
+
+// ============================================================================
+// Conversation Turn
+// ============================================================================
+
+pub const TurnRole = enum {
+    User,
+    Assistant,
+    System,
+};
+
+pub const ConversationTurn = struct {
+    role: TurnRole,
+
+    // Raw text
+    text: [512]u8,
+    text_len: u32,
+
+    // Parsed intent (for user turns)
+    intent: ?IntentContext,
+
+    // Response type (for assistant turns)
+    response_type: ResponseType,
+
+    timestamp_ms: u64,
+
+    pub fn get_text(self: *const ConversationTurn) []const u8 {
+        return self.text[0..self.text_len];
+    }
+
+    pub fn set_text(self: *ConversationTurn, txt: []const u8) void {
+        const len = if (txt.len > 512) 512 else txt.len;
+        for (i in 0..len) {
+            self.text[i] = txt[i];
+        }
+        self.text_len = @intCast(u32, len);
+    }
+};
+
+pub const ResponseType = enum {
+    Answer,           // Direct answer to question
+    Confirmation,     // Confirming an action
+    Clarification,    // Asking for clarification
+    SlotPrompt,       // Asking for missing slot
+    ActionResult,     // Result of executed action
+    Error,            // Error message
+    Greeting,         // Greeting response
+    Farewell,         // Goodbye response
+};
+
+// ============================================================================
+// Conversation Context Manager
+// ============================================================================
+
+pub const ConversationContext = struct {
+    // Current dialog state
+    state: DialogState,
+
+    // Current intent being processed
+    current_intent: ?IntentContext,
+
+    // Context variables (for reference resolution)
+    context_slots: [MAX_CONTEXT_SLOTS]SlotValue,
+    context_slot_names: [MAX_CONTEXT_SLOTS][32]u8,
+    context_slot_name_lens: [MAX_CONTEXT_SLOTS]u32,
+    num_context_slots: u32,
+
+    // Conversation history
+    history: [MAX_HISTORY_TURNS]ConversationTurn,
+    history_count: u32,
+    history_start: u32,  // Circular buffer start
+
+    // Last mentioned entities (for pronoun resolution)
+    last_room: SlotValue,
+    last_device: SlotValue,
+    last_person: SlotValue,
+    last_time: SlotValue,
+
+    // Session info
+    session_id: u64,
+    session_start_ms: u64,
+    last_interaction_ms: u64,
+
+    // User info (if identified)
+    user_id: ?u32,
+    user_name: [64]u8,
+    user_name_len: u32,
+};
+
+pub fn conversation_context_init() *ConversationContext {
+    const ctx = memory.allocate(ConversationContext) orelse return null;
+
+    ctx.state = .Idle;
+    ctx.current_intent = null;
+    ctx.num_context_slots = 0;
+    ctx.history_count = 0;
+    ctx.history_start = 0;
+    ctx.session_id = generate_session_id();
+    ctx.session_start_ms = get_current_time_ms();
+    ctx.last_interaction_ms = ctx.session_start_ms;
+    ctx.user_id = null;
+    ctx.user_name_len = 0;
+
+    // Initialize last mentioned entities as empty
+    ctx.last_room = SlotValue{ .entity_type = .Room, .value_len = 0, .confidence = 0, .timestamp_ms = 0, .resolved = false, .value = undefined };
+    ctx.last_device = SlotValue{ .entity_type = .Device, .value_len = 0, .confidence = 0, .timestamp_ms = 0, .resolved = false, .value = undefined };
+    ctx.last_person = SlotValue{ .entity_type = .Person, .value_len = 0, .confidence = 0, .timestamp_ms = 0, .resolved = false, .value = undefined };
+    ctx.last_time = SlotValue{ .entity_type = .Time, .value_len = 0, .confidence = 0, .timestamp_ms = 0, .resolved = false, .value = undefined };
+
+    return ctx;
+}
+
+pub fn conversation_add_turn(ctx: *ConversationContext, role: TurnRole, text: []const u8, intent: ?*const IntentContext) void {
+    const idx = (ctx.history_start + ctx.history_count) % MAX_HISTORY_TURNS;
+
+    ctx.history[idx].role = role;
+    ctx.history[idx].set_text(text);
+    ctx.history[idx].timestamp_ms = get_current_time_ms();
+
+    if (intent) |i| {
+        ctx.history[idx].intent = i.*;
+    } else {
+        ctx.history[idx].intent = null;
+    }
+
+    if (ctx.history_count < MAX_HISTORY_TURNS) {
+        ctx.history_count += 1;
+    } else {
+        ctx.history_start = (ctx.history_start + 1) % MAX_HISTORY_TURNS;
+    }
+
+    ctx.last_interaction_ms = ctx.history[idx].timestamp_ms;
+}
+
+pub fn conversation_get_last_turn(ctx: *const ConversationContext, role: ?TurnRole) ?*const ConversationTurn {
+    if (ctx.history_count == 0) return null;
+
+    // Search backwards through history
+    var i: u32 = ctx.history_count;
+    while (i > 0) {
+        i -= 1;
+        const idx = (ctx.history_start + i) % MAX_HISTORY_TURNS;
+
+        if (role) |r| {
+            if (ctx.history[idx].role == r) {
+                return &ctx.history[idx];
+            }
+        } else {
+            return &ctx.history[idx];
+        }
+    }
+
+    return null;
+}
+
+// ============================================================================
+// Reference Resolution
+// ============================================================================
+
+pub const ReferenceType = enum {
+    Pronoun,          // it, they, that
+    Demonstrative,    // this, that, these
+    Definite,         // the light, the room
+    Ellipsis,         // (missing entity)
+    Anaphora,         // the same, another
+};
+
+pub const ResolvedReference = struct {
+    original_text: [64]u8,
+    original_len: u32,
+    resolved_value: SlotValue,
+    reference_type: ReferenceType,
+    confidence: f32,
+};
+
+pub fn resolve_references(ctx: *ConversationContext, intent: *IntentContext) void {
+    // Check for pronouns and demonstratives in slot values
+    for (i in 0..intent.num_slots) {
+        const value = intent.slots[i].get_value();
+
+        // Check for pronoun references
+        if (is_pronoun(value)) {
+            resolve_pronoun(ctx, &intent.slots[i], value);
+        }
+
+        // Check for demonstrative references
+        if (is_demonstrative(value)) {
+            resolve_demonstrative(ctx, &intent.slots[i], value);
+        }
+    }
+
+    // Handle ellipsis (missing required slots that can be inferred)
+    resolve_ellipsis(ctx, intent);
+}
+
+fn is_pronoun(text: []const u8) bool {
+    const pronouns = [_][]const u8{ "it", "they", "them", "that", "this", "there" };
+
+    const lower = to_lowercase_temp(text);
+
+    for (pronouns) |p| {
+        if (strings_equal(lower, p)) return true;
+    }
+
+    return false;
+}
+
+fn is_demonstrative(text: []const u8) bool {
+    const demonstratives = [_][]const u8{ "this one", "that one", "the same", "another" };
+
+    const lower = to_lowercase_temp(text);
+
+    for (demonstratives) |d| {
+        if (strings_equal(lower, d)) return true;
+    }
+
+    return false;
+}
+
+fn resolve_pronoun(ctx: *ConversationContext, slot: *SlotValue, pronoun: []const u8) void {
+    const lower = to_lowercase_temp(pronoun);
+
+    // "it" typically refers to the last device
+    if (strings_equal(lower, "it") or strings_equal(lower, "that")) {
+        if (slot.entity_type == .Device or slot.entity_type == .Unknown) {
+            if (!ctx.last_device.is_empty()) {
+                slot.* = ctx.last_device;
+                slot.resolved = true;
+                return;
+            }
+        }
+    }
+
+    // "there" refers to the last room
+    if (strings_equal(lower, "there")) {
+        if (slot.entity_type == .Room or slot.entity_type == .Unknown) {
+            if (!ctx.last_room.is_empty()) {
+                slot.* = ctx.last_room;
+                slot.resolved = true;
+                return;
+            }
+        }
+    }
+
+    // "they"/"them" could be multiple devices or people
+    if (strings_equal(lower, "they") or strings_equal(lower, "them")) {
+        // Try to find a plural reference from context
+        // For now, default to last device
+        if (!ctx.last_device.is_empty()) {
+            slot.* = ctx.last_device;
+            slot.resolved = true;
+        }
+    }
+}
+
+fn resolve_demonstrative(ctx: *ConversationContext, slot: *SlotValue, text: []const u8) void {
+    const lower = to_lowercase_temp(text);
+
+    // "the same" - repeat the last entity of this type
+    if (strings_contains(lower, "same")) {
+        const last = get_last_entity_of_type(ctx, slot.entity_type);
+        if (last) |l| {
+            slot.* = l.*;
+            slot.resolved = true;
+        }
+    }
+
+    // "another" - we note this but can't fully resolve without more context
+    if (strings_contains(lower, "another")) {
+        // Keep the entity type but mark as needing disambiguation
+        slot.resolved = false;
+    }
+}
+
+fn resolve_ellipsis(ctx: *ConversationContext, intent: *IntentContext) void {
+    // Check if this is a follow-up command that's missing context
+    // e.g., "turn it off" after "turn on the living room light"
+
+    // Look for missing room when we have a device type
+    if (intent.get_slot("room") == null and intent.get_slot("device_type") != null) {
+        if (!ctx.last_room.is_empty()) {
+            var room_slot = ctx.last_room;
+            room_slot.resolved = true;
+            intent.set_slot("room", &room_slot);
+        }
+    }
+
+    // Look for missing device when we have an action
+    if (intent.get_slot("device") == null and intent.num_pending > 0) {
+        if (!ctx.last_device.is_empty()) {
+            var device_slot = ctx.last_device;
+            device_slot.resolved = true;
+            intent.set_slot("device", &device_slot);
+            intent.remove_pending_slot("device");
+        }
+    }
+}
+
+fn get_last_entity_of_type(ctx: *const ConversationContext, entity_type: EntityType) ?*const SlotValue {
+    switch (entity_type) {
+        .Room => return if (ctx.last_room.is_empty()) null else &ctx.last_room,
+        .Device, .DeviceType => return if (ctx.last_device.is_empty()) null else &ctx.last_device,
+        .Person => return if (ctx.last_person.is_empty()) null else &ctx.last_person,
+        .Time, .Date => return if (ctx.last_time.is_empty()) null else &ctx.last_time,
+        else => return null,
+    }
+}
+
+// ============================================================================
+// Context Updates
+// ============================================================================
+
+pub fn update_context_from_intent(ctx: *ConversationContext, intent: *const IntentContext) void {
+    const now = get_current_time_ms();
+
+    // Update last mentioned entities
+    for (i in 0..intent.num_slots) {
+        const slot = &intent.slots[i];
+
+        switch (slot.entity_type) {
+            .Room => {
+                ctx.last_room = slot.*;
+                ctx.last_room.timestamp_ms = now;
+            },
+            .Device, .DeviceType => {
+                ctx.last_device = slot.*;
+                ctx.last_device.timestamp_ms = now;
+            },
+            .Person => {
+                ctx.last_person = slot.*;
+                ctx.last_person.timestamp_ms = now;
+            },
+            .Time, .Date => {
+                ctx.last_time = slot.*;
+                ctx.last_time.timestamp_ms = now;
+            },
+            else => {},
+        }
+    }
+
+    // Store slots in context for later reference
+    for (i in 0..intent.num_slots) {
+        const name = intent.slot_names[i][0..intent.slot_name_lens[i]];
+        set_context_slot(ctx, name, &intent.slots[i]);
+    }
+}
+
+pub fn set_context_slot(ctx: *ConversationContext, name: []const u8, value: *const SlotValue) void {
+    // Check if slot already exists
+    for (i in 0..ctx.num_context_slots) {
+        const slot_name = ctx.context_slot_names[i][0..ctx.context_slot_name_lens[i]];
+        if (strings_equal(slot_name, name)) {
+            ctx.context_slots[i] = value.*;
+            return;
+        }
+    }
+
+    // Add new slot
+    if (ctx.num_context_slots < MAX_CONTEXT_SLOTS) {
+        const idx = ctx.num_context_slots;
+        ctx.context_slots[idx] = value.*;
+        const name_len = if (name.len > 32) 32 else name.len;
+        for (j in 0..name_len) {
+            ctx.context_slot_names[idx][j] = name[j];
+        }
+        ctx.context_slot_name_lens[idx] = @intCast(u32, name_len);
+        ctx.num_context_slots += 1;
+    }
+}
+
+pub fn get_context_slot(ctx: *const ConversationContext, name: []const u8) ?*const SlotValue {
+    for (i in 0..ctx.num_context_slots) {
+        const slot_name = ctx.context_slot_names[i][0..ctx.context_slot_name_lens[i]];
+        if (strings_equal(slot_name, name)) {
+            return &ctx.context_slots[i];
+        }
+    }
+    return null;
+}
+
+pub fn clear_stale_context(ctx: *ConversationContext) void {
+    const now = get_current_time_ms();
+
+    // Clear entities older than timeout
+    if (now - ctx.last_room.timestamp_ms > CONTEXT_TIMEOUT_MS) {
+        ctx.last_room.value_len = 0;
+    }
+    if (now - ctx.last_device.timestamp_ms > CONTEXT_TIMEOUT_MS) {
+        ctx.last_device.value_len = 0;
+    }
+    if (now - ctx.last_person.timestamp_ms > CONTEXT_TIMEOUT_MS) {
+        ctx.last_person.value_len = 0;
+    }
+    if (now - ctx.last_time.timestamp_ms > CONTEXT_TIMEOUT_MS) {
+        ctx.last_time.value_len = 0;
+    }
+}
+
+// ============================================================================
+// Dialog Flow Management
+// ============================================================================
+
+pub const DialogAction = enum {
+    Continue,         // Continue with current dialog
+    PromptForSlot,    // Ask user for missing slot
+    Confirm,          // Ask for confirmation
+    Execute,          // Execute the action
+    Clarify,          // Ask for clarification
+    Reset,            // Reset dialog state
+    Complete,         // Dialog complete
+};
+
+pub const DialogResult = struct {
+    action: DialogAction,
+    prompt: [256]u8,
+    prompt_len: u32,
+    slot_name: [32]u8,
+    slot_name_len: u32,
+
+    pub fn get_prompt(self: *const DialogResult) []const u8 {
+        return self.prompt[0..self.prompt_len];
+    }
+
+    pub fn set_prompt(self: *DialogResult, text: []const u8) void {
+        const len = if (text.len > 256) 256 else text.len;
+        for (i in 0..len) {
+            self.prompt[i] = text[i];
+        }
+        self.prompt_len = @intCast(u32, len);
+    }
+};
+
+pub fn process_dialog_turn(ctx: *ConversationContext, intent: *IntentContext) DialogResult {
+    var result = DialogResult{
+        .action = .Continue,
+        .prompt = undefined,
+        .prompt_len = 0,
+        .slot_name = undefined,
+        .slot_name_len = 0,
+    };
+
+    // Resolve references using context
+    resolve_references(ctx, intent);
+
+    // Update context with new information
+    update_context_from_intent(ctx, intent);
+
+    // Check if we have all required slots
+    if (!intent.has_all_required_slots()) {
+        // Need to prompt for missing slot
+        result.action = .PromptForSlot;
+
+        const pending_name = intent.pending_slots[0][0..intent.pending_slot_lens[0]];
+        const pending_type = intent.pending_slot_types[0];
+
+        // Copy slot name
+        for (i in 0..intent.pending_slot_lens[0]) {
+            result.slot_name[i] = pending_name[i];
+        }
+        result.slot_name_len = intent.pending_slot_lens[0];
+
+        // Generate prompt
+        generate_slot_prompt(&result, pending_name, pending_type);
+
+        ctx.state = .SlotFilling;
+        ctx.current_intent = intent.*;
+
+        return result;
+    }
+
+    // Check if confirmation is needed
+    if (needs_confirmation(intent)) {
+        result.action = .Confirm;
+        generate_confirmation_prompt(&result, intent);
+        ctx.state = .Confirming;
+        ctx.current_intent = intent.*;
+        return result;
+    }
+
+    // Ready to execute
+    result.action = .Execute;
+    ctx.state = .Executing;
+    ctx.current_intent = intent.*;
+
+    return result;
+}
+
+pub fn process_slot_response(ctx: *ConversationContext, response_text: []const u8, extracted_value: *const SlotValue) DialogResult {
+    var result = DialogResult{
+        .action = .Continue,
+        .prompt = undefined,
+        .prompt_len = 0,
+        .slot_name = undefined,
+        .slot_name_len = 0,
+    };
+
+    if (ctx.current_intent) |*intent| {
+        // Fill the pending slot
+        if (intent.num_pending > 0) {
+            const slot_name = intent.pending_slots[0][0..intent.pending_slot_lens[0]];
+            intent.set_slot(slot_name, extracted_value);
+            intent.remove_pending_slot(slot_name);
+        }
+
+        // Check if more slots needed
+        if (!intent.has_all_required_slots()) {
+            result.action = .PromptForSlot;
+
+            const pending_name = intent.pending_slots[0][0..intent.pending_slot_lens[0]];
+            const pending_type = intent.pending_slot_types[0];
+
+            for (i in 0..intent.pending_slot_lens[0]) {
+                result.slot_name[i] = pending_name[i];
+            }
+            result.slot_name_len = intent.pending_slot_lens[0];
+
+            generate_slot_prompt(&result, pending_name, pending_type);
+            return result;
+        }
+
+        // All slots filled
+        if (needs_confirmation(intent)) {
+            result.action = .Confirm;
+            generate_confirmation_prompt(&result, intent);
+            ctx.state = .Confirming;
+        } else {
+            result.action = .Execute;
+            ctx.state = .Executing;
+        }
+    }
+
+    return result;
+}
+
+pub fn process_confirmation_response(ctx: *ConversationContext, confirmed: bool) DialogResult {
+    var result = DialogResult{
+        .action = .Continue,
+        .prompt = undefined,
+        .prompt_len = 0,
+        .slot_name = undefined,
+        .slot_name_len = 0,
+    };
+
+    if (confirmed) {
+        result.action = .Execute;
+        ctx.state = .Executing;
+    } else {
+        result.action = .Reset;
+        result.set_prompt("Okay, cancelled.");
+        ctx.state = .Idle;
+        ctx.current_intent = null;
+    }
+
+    return result;
+}
+
+pub fn complete_dialog(ctx: *ConversationContext, success: bool, result_message: []const u8) void {
+    // Add result to history
+    conversation_add_turn(ctx, .Assistant, result_message, null);
+
+    // Reset state
+    ctx.state = .Idle;
+    ctx.current_intent = null;
+}
+
+fn needs_confirmation(intent: *const IntentContext) bool {
+    const intent_name = intent.intent_name[0..intent.intent_name_len];
+
+    // Dangerous actions that need confirmation
+    const confirm_intents = [_][]const u8{
+        "delete",
+        "remove",
+        "lock_all",
+        "unlock_all",
+        "arm_security",
+        "disarm_security",
+        "emergency",
+        "factory_reset",
+    };
+
+    for (confirm_intents) |ci| {
+        if (strings_contains(intent_name, ci)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn generate_slot_prompt(result: *DialogResult, slot_name: []const u8, slot_type: EntityType) void {
+    // Generate natural language prompt for missing slot
+    switch (slot_type) {
+        .Room => result.set_prompt("Which room?"),
+        .Device => result.set_prompt("Which device?"),
+        .DeviceType => result.set_prompt("What type of device?"),
+        .DeviceState => result.set_prompt("On or off?"),
+        .BrightnessLevel => result.set_prompt("What brightness level?"),
+        .Temperature => result.set_prompt("What temperature?"),
+        .Color => result.set_prompt("What color?"),
+        .Scene => result.set_prompt("Which scene?"),
+        .Time => result.set_prompt("What time?"),
+        .Date => result.set_prompt("What date?"),
+        .Duration => result.set_prompt("For how long?"),
+        .MediaTitle => result.set_prompt("What would you like to play?"),
+        .Artist => result.set_prompt("Which artist?"),
+        .Playlist => result.set_prompt("Which playlist?"),
+        .Person => result.set_prompt("Who?"),
+        else => {
+            // Generic prompt using slot name
+            var prompt: [256]u8 = undefined;
+            var idx: u32 = 0;
+            const prefix = "What ";
+            for (prefix) |c| {
+                prompt[idx] = c;
+                idx += 1;
+            }
+            for (slot_name) |c| {
+                prompt[idx] = c;
+                idx += 1;
+            }
+            prompt[idx] = '?';
+            idx += 1;
+            result.prompt = prompt;
+            result.prompt_len = idx;
+        },
+    }
+}
+
+fn generate_confirmation_prompt(result: *DialogResult, intent: *const IntentContext) void {
+    const intent_name = intent.intent_name[0..intent.intent_name_len];
+
+    if (strings_contains(intent_name, "delete") or strings_contains(intent_name, "remove")) {
+        result.set_prompt("Are you sure you want to delete this? This cannot be undone.");
+    } else if (strings_contains(intent_name, "arm")) {
+        result.set_prompt("Ready to arm the security system. Confirm?");
+    } else if (strings_contains(intent_name, "disarm")) {
+        result.set_prompt("Disarm the security system?");
+    } else if (strings_contains(intent_name, "lock_all")) {
+        result.set_prompt("Lock all doors?");
+    } else if (strings_contains(intent_name, "unlock_all")) {
+        result.set_prompt("Unlock all doors? Make sure you're home.");
+    } else {
+        result.set_prompt("Are you sure?");
+    }
+}
+
+// ============================================================================
+// Follow-up Detection
+// ============================================================================
+
+pub fn is_follow_up(ctx: *const ConversationContext, text: []const u8) bool {
+    // Check if this appears to be a follow-up to previous turn
+
+    // Very short responses are likely follow-ups
+    if (text.len < 20) {
+        // Check for affirmative/negative
+        const lower = to_lowercase_temp(text);
+        const affirmatives = [_][]const u8{ "yes", "yeah", "yep", "sure", "ok", "okay", "do it", "go ahead" };
+        const negatives = [_][]const u8{ "no", "nope", "cancel", "nevermind", "stop" };
+
+        for (affirmatives) |a| {
+            if (strings_contains(lower, a)) return true;
+        }
+        for (negatives) |n| {
+            if (strings_contains(lower, n)) return true;
+        }
+    }
+
+    // Check for pronouns without full context
+    if (strings_contains(text, " it ") or strings_contains(text, " them ")) {
+        if (ctx.history_count > 0) return true;
+    }
+
+    // Check for implicit references
+    const implicit_patterns = [_][]const u8{
+        "also",
+        "and also",
+        "too",
+        "as well",
+        "same",
+        "that one",
+        "this one",
+    };
+
+    const lower = to_lowercase_temp(text);
+    for (implicit_patterns) |p| {
+        if (strings_contains(lower, p)) return true;
+    }
+
+    return false;
+}
+
+pub fn get_follow_up_type(text: []const u8) FollowUpType {
+    const lower = to_lowercase_temp(text);
+
+    // Affirmative responses
+    const affirmatives = [_][]const u8{ "yes", "yeah", "yep", "sure", "ok", "okay", "do it", "go ahead", "confirm" };
+    for (affirmatives) |a| {
+        if (strings_contains(lower, a)) return .Affirmative;
+    }
+
+    // Negative responses
+    const negatives = [_][]const u8{ "no", "nope", "cancel", "nevermind", "stop", "don't" };
+    for (negatives) |n| {
+        if (strings_contains(lower, n)) return .Negative;
+    }
+
+    // Corrections
+    if (strings_contains(lower, "not ") or strings_contains(lower, "i meant ") or strings_contains(lower, "actually ")) {
+        return .Correction;
+    }
+
+    // Additions
+    if (strings_contains(lower, "also ") or strings_contains(lower, "and ")) {
+        return .Addition;
+    }
+
+    return .Continuation;
+}
+
+pub const FollowUpType = enum {
+    Affirmative,      // Yes, confirm
+    Negative,         // No, cancel
+    Correction,       // Fix previous input
+    Addition,         // Add to previous command
+    Continuation,     // Continue previous topic
+};
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn strings_equal(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (i in 0..a.len) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
+fn strings_contains(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    if (needle.len == 0) return true;
+
+    for (i in 0..haystack.len - needle.len + 1) {
+        var found = true;
+        for (j in 0..needle.len) {
+            if (haystack[i + j] != needle[j]) {
+                found = false;
+                break;
+            }
+        }
+        if (found) return true;
+    }
+
+    return false;
+}
+
+var temp_lowercase_buffer: [512]u8 = undefined;
+
+fn to_lowercase_temp(text: []const u8) []const u8 {
+    const len = if (text.len > 512) 512 else text.len;
+
+    for (i in 0..len) {
+        const c = text[i];
+        if (c >= 'A' and c <= 'Z') {
+            temp_lowercase_buffer[i] = c + 32;
+        } else {
+            temp_lowercase_buffer[i] = c;
+        }
+    }
+
+    return temp_lowercase_buffer[0..len];
+}
+
+fn get_current_time_ms() u64 {
+    // Get current time in milliseconds
+    // In real implementation, this would use the system timer
+    return @as(u64, 0); // Placeholder
+}
+
+fn generate_session_id() u64 {
+    // Generate unique session ID
+    // In real implementation, this would use random or time-based generation
+    return @as(u64, 0); // Placeholder
+}
+
+// ============================================================================
+// Module Initialization
+// ============================================================================
+
+pub fn init() bool {
+    return true;
+}

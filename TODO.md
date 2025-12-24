@@ -2,7 +2,31 @@
 
 > A modern, performant, minimal operating system built from scratch using Home (language), Craft (UI), and Pantry (package manager)
 
-## 🎉 Recent Progress (December 19, 2025)
+## 🎉 Recent Progress (December 24, 2025)
+
+### Voice Assistant Enhancements (COMPLETED Dec 24, 2025)
+- ✅ **Audio Processing** - `kernel/src/iot/audio_processing.home`
+  - Noise reduction with spectral subtraction and Wiener filter
+  - Voice activity detection (VAD) with adaptive threshold
+  - Acoustic echo cancellation (NLMS adaptive filter)
+  - Beamforming for microphone arrays (delay-and-sum, MVDR)
+  - Automatic gain control (AGC)
+- ✅ **Conversation Context** - `kernel/src/iot/conversation.home`
+  - Multi-turn dialog state tracking
+  - Pronoun and reference resolution
+  - Slot filling for incomplete commands
+  - Follow-up detection and handling
+- ✅ **Speaker Verification** - `kernel/src/iot/speaker_verification.home`
+  - MFCC feature extraction with deltas
+  - x-vector style speaker embeddings
+  - Enrollment with 3-10 utterances
+  - Verification and identification
+  - Liveness detection (anti-spoofing)
+- ✅ **Multi-Language Support** - `kernel/src/iot/voice_languages.home`
+  - Language packs with localized commands
+  - Entity synonyms per language
+  - Response templates
+  - Built-in English and Spanish
 
 ### Phase 18 Edge Computing & IoT (COMPLETED Dec 19, 2025)
 - ✅ **IoT Protocols** - `kernel/src/iot/`
@@ -2750,6 +2774,35 @@ Build a next-generation operating system that prioritizes:
   - [x] Text-to-speech response framework
   - [x] Configurable voice parameters (pitch, speed, volume)
   - [x] Privacy mode (no cloud, no recording storage)
+  - [x] Audio processing - `kernel/src/iot/audio_processing.home`
+    - [x] Noise reduction (spectral subtraction, Wiener filter)
+    - [x] Voice activity detection (VAD)
+    - [x] Acoustic echo cancellation (AEC with NLMS)
+    - [x] Beamforming (delay-and-sum, MVDR)
+    - [x] Automatic gain control (AGC)
+    - [x] Full audio pipeline with configurable stages
+  - [x] Conversation context - `kernel/src/iot/conversation.home`
+    - [x] Multi-turn dialog support
+    - [x] Pronoun resolution (it, they, there)
+    - [x] Context slot tracking
+    - [x] Slot filling dialogs
+    - [x] Follow-up detection
+    - [x] Confirmation flows for dangerous actions
+  - [x] Speaker verification - `kernel/src/iot/speaker_verification.home`
+    - [x] MFCC feature extraction with delta/delta-delta
+    - [x] x-vector style speaker embeddings
+    - [x] Speaker enrollment (3-10 utterances)
+    - [x] Verification with adaptive thresholds
+    - [x] Speaker identification (1-of-N)
+    - [x] Liveness detection (anti-spoofing)
+    - [x] PIN fallback authentication
+  - [x] Multi-language support - `kernel/src/iot/voice_languages.home`
+    - [x] Language packs (English, Spanish, + more)
+    - [x] Localized wake words
+    - [x] Entity synonyms per language
+    - [x] Response templates with placeholders
+    - [x] Number word parsing
+    - [x] Filler word removal
 
 ### 18.4 Industrial Applications
 - [x] CAN bus support (`kernel/src/industrial/can_bus.home`)

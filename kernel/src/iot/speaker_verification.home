@@ -1,0 +1,1224 @@
+// Speaker Verification for Voice Assistant
+// Voice-based user identification and authentication
+// Part of HomeOS Voice Assistant subsystem
+
+const basics = @import("basics");
+const memory = @import("memory");
+const math = @import("math");
+const crypto = @import("crypto");
+
+// ============================================================================
+// Speaker Verification Constants
+// ============================================================================
+
+const EMBEDDING_DIM: u32 = 192;           // d-vector dimension
+const NUM_MFCC: u32 = 40;                 // MFCC coefficients
+const NUM_FILTER_BANKS: u32 = 64;         // Mel filter banks
+const FRAME_SIZE: u32 = 400;              // 25ms at 16kHz
+const FRAME_SHIFT: u32 = 160;             // 10ms hop
+const FFT_SIZE: u32 = 512;                // FFT size
+const SAMPLE_RATE: u32 = 16000;
+const MAX_ENROLLED_SPEAKERS: u32 = 16;    // Maximum enrolled speakers
+const MIN_ENROLLMENT_UTTERANCES: u32 = 3; // Minimum utterances for enrollment
+const MAX_ENROLLMENT_UTTERANCES: u32 = 10; // Maximum utterances for enrollment
+
+// ============================================================================
+// Feature Types
+// ============================================================================
+
+pub const MfccFrame = struct {
+    coefficients: [NUM_MFCC]f32,
+    delta: [NUM_MFCC]f32,
+    delta_delta: [NUM_MFCC]f32,
+    energy: f32,
+    timestamp_ms: u64,
+};
+
+pub const SpeakerEmbedding = struct {
+    vector: [EMBEDDING_DIM]f32,
+    normalized: bool,
+
+    pub fn normalize(self: *SpeakerEmbedding) void {
+        var norm: f32 = 0.0;
+        for (i in 0..EMBEDDING_DIM) {
+            norm += self.vector[i] * self.vector[i];
+        }
+        norm = math.sqrt(norm);
+
+        if (norm > 1e-8) {
+            for (i in 0..EMBEDDING_DIM) {
+                self.vector[i] /= norm;
+            }
+        }
+        self.normalized = true;
+    }
+
+    pub fn cosine_similarity(self: *const SpeakerEmbedding, other: *const SpeakerEmbedding) f32 {
+        var dot: f32 = 0.0;
+        var norm_a: f32 = 0.0;
+        var norm_b: f32 = 0.0;
+
+        for (i in 0..EMBEDDING_DIM) {
+            dot += self.vector[i] * other.vector[i];
+            norm_a += self.vector[i] * self.vector[i];
+            norm_b += other.vector[i] * other.vector[i];
+        }
+
+        const denom = math.sqrt(norm_a) * math.sqrt(norm_b);
+        if (denom < 1e-8) return 0.0;
+
+        return dot / denom;
+    }
+};
+
+// ============================================================================
+// Speaker Profile
+// ============================================================================
+
+pub const SpeakerProfile = struct {
+    // Identity
+    speaker_id: u32,
+    name: [64]u8,
+    name_len: u32,
+
+    // Enrollment
+    enrolled: bool,
+    enrollment_embeddings: [MAX_ENROLLMENT_UTTERANCES]SpeakerEmbedding,
+    num_enrollments: u32,
+
+    // Centroid (average embedding)
+    centroid: SpeakerEmbedding,
+
+    // Statistics
+    intra_speaker_variance: f32,
+    last_verification_ms: u64,
+    total_verifications: u32,
+    successful_verifications: u32,
+
+    // Security
+    pin_hash: [32]u8,      // For fallback authentication
+    has_pin: bool,
+    failed_attempts: u32,
+    locked_until_ms: u64,
+
+    pub fn get_name(self: *const SpeakerProfile) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    pub fn set_name(self: *SpeakerProfile, n: []const u8) void {
+        const len = if (n.len > 64) 64 else n.len;
+        for (i in 0..len) {
+            self.name[i] = n[i];
+        }
+        self.name_len = @intCast(u32, len);
+    }
+
+    pub fn compute_centroid(self: *SpeakerProfile) void {
+        if (self.num_enrollments == 0) return;
+
+        // Average all enrollment embeddings
+        for (i in 0..EMBEDDING_DIM) {
+            self.centroid.vector[i] = 0.0;
+        }
+
+        for (e in 0..self.num_enrollments) {
+            for (i in 0..EMBEDDING_DIM) {
+                self.centroid.vector[i] += self.enrollment_embeddings[e].vector[i];
+            }
+        }
+
+        const n = @intToFloat(f32, self.num_enrollments);
+        for (i in 0..EMBEDDING_DIM) {
+            self.centroid.vector[i] /= n;
+        }
+
+        self.centroid.normalize();
+
+        // Compute intra-speaker variance
+        self.intra_speaker_variance = 0.0;
+        for (e in 0..self.num_enrollments) {
+            const sim = self.centroid.cosine_similarity(&self.enrollment_embeddings[e]);
+            const dist = 1.0 - sim;
+            self.intra_speaker_variance += dist * dist;
+        }
+        self.intra_speaker_variance /= n;
+    }
+};
+
+// ============================================================================
+// Verification Result
+// ============================================================================
+
+pub const VerificationResult = struct {
+    verified: bool,
+    speaker_id: u32,
+    speaker_name: [64]u8,
+    speaker_name_len: u32,
+    confidence: f32,
+    threshold_used: f32,
+    processing_time_ms: u32,
+
+    pub fn get_speaker_name(self: *const VerificationResult) []const u8 {
+        return self.speaker_name[0..self.speaker_name_len];
+    }
+};
+
+pub const IdentificationResult = struct {
+    identified: bool,
+    speaker_id: u32,
+    speaker_name: [64]u8,
+    speaker_name_len: u32,
+    confidence: f32,
+
+    // Top candidates
+    candidates: [3]struct {
+        speaker_id: u32,
+        confidence: f32,
+    },
+    num_candidates: u32,
+
+    pub fn get_speaker_name(self: *const IdentificationResult) []const u8 {
+        return self.speaker_name[0..self.speaker_name_len];
+    }
+};
+
+// ============================================================================
+// MFCC Feature Extraction
+// ============================================================================
+
+pub const MfccExtractor = struct {
+    // Mel filter bank
+    filter_bank: [NUM_FILTER_BANKS][FFT_SIZE / 2 + 1]f32,
+
+    // DCT matrix for MFCC
+    dct_matrix: [NUM_MFCC][NUM_FILTER_BANKS]f32,
+
+    // FFT twiddle factors
+    fft_twiddle_real: [FFT_SIZE / 2]f32,
+    fft_twiddle_imag: [FFT_SIZE / 2]f32,
+
+    // Window function
+    hamming_window: [FRAME_SIZE]f32,
+
+    // Previous frames for delta computation
+    prev_frames: [5][NUM_MFCC]f32,
+    prev_frame_idx: u32,
+
+    // Pre-emphasis
+    preemphasis_coef: f32,
+    prev_sample: f32,
+};
+
+pub fn mfcc_extractor_init() *MfccExtractor {
+    const extractor = memory.allocate(MfccExtractor) orelse return null;
+
+    // Initialize Hamming window
+    const pi: f32 = 3.14159265358979323846;
+    for (n in 0..FRAME_SIZE) {
+        extractor.hamming_window[n] = 0.54 - 0.46 * math.cos(2.0 * pi * @intToFloat(f32, n) / @intToFloat(f32, FRAME_SIZE - 1));
+    }
+
+    // Initialize mel filter bank
+    compute_mel_filter_bank(extractor);
+
+    // Initialize DCT matrix
+    compute_dct_matrix(extractor);
+
+    // Initialize FFT twiddle factors
+    for (k in 0..FFT_SIZE / 2) {
+        const angle = -2.0 * pi * @intToFloat(f32, k) / @intToFloat(f32, FFT_SIZE);
+        extractor.fft_twiddle_real[k] = math.cos(angle);
+        extractor.fft_twiddle_imag[k] = math.sin(angle);
+    }
+
+    extractor.preemphasis_coef = 0.97;
+    extractor.prev_sample = 0.0;
+    extractor.prev_frame_idx = 0;
+
+    // Initialize previous frames
+    for (f in 0..5) {
+        for (c in 0..NUM_MFCC) {
+            extractor.prev_frames[f][c] = 0.0;
+        }
+    }
+
+    return extractor;
+}
+
+fn compute_mel_filter_bank(extractor: *MfccExtractor) void {
+    // Convert Hz to Mel scale
+    const hz_to_mel = fn(hz: f32) f32 {
+        return 2595.0 * math.log10(1.0 + hz / 700.0);
+    };
+
+    const mel_to_hz = fn(mel: f32) f32 {
+        return 700.0 * (math.pow(10.0, mel / 2595.0) - 1.0);
+    };
+
+    const low_freq: f32 = 80.0;
+    const high_freq: f32 = 7600.0;
+
+    const low_mel = hz_to_mel(low_freq);
+    const high_mel = hz_to_mel(high_freq);
+    const mel_step = (high_mel - low_mel) / @intToFloat(f32, NUM_FILTER_BANKS + 1);
+
+    // Compute filter center frequencies
+    var center_freqs: [NUM_FILTER_BANKS + 2]f32 = undefined;
+    for (i in 0..NUM_FILTER_BANKS + 2) {
+        const mel = low_mel + @intToFloat(f32, i) * mel_step;
+        center_freqs[i] = mel_to_hz(mel);
+    }
+
+    // Compute filter bank weights
+    const freq_resolution = @intToFloat(f32, SAMPLE_RATE) / @intToFloat(f32, FFT_SIZE);
+
+    for (filt in 0..NUM_FILTER_BANKS) {
+        for (bin in 0..FFT_SIZE / 2 + 1) {
+            const freq = @intToFloat(f32, bin) * freq_resolution;
+
+            if (freq >= center_freqs[filt] and freq < center_freqs[filt + 1]) {
+                // Rising edge
+                extractor.filter_bank[filt][bin] = (freq - center_freqs[filt]) / (center_freqs[filt + 1] - center_freqs[filt]);
+            } else if (freq >= center_freqs[filt + 1] and freq < center_freqs[filt + 2]) {
+                // Falling edge
+                extractor.filter_bank[filt][bin] = (center_freqs[filt + 2] - freq) / (center_freqs[filt + 2] - center_freqs[filt + 1]);
+            } else {
+                extractor.filter_bank[filt][bin] = 0.0;
+            }
+        }
+    }
+}
+
+fn compute_dct_matrix(extractor: *MfccExtractor) void {
+    const pi: f32 = 3.14159265358979323846;
+
+    for (k in 0..NUM_MFCC) {
+        for (n in 0..NUM_FILTER_BANKS) {
+            extractor.dct_matrix[k][n] = math.cos(pi * @intToFloat(f32, k) * (@intToFloat(f32, n) + 0.5) / @intToFloat(f32, NUM_FILTER_BANKS));
+        }
+    }
+
+    // Apply normalization
+    const sqrt_1_over_n = math.sqrt(1.0 / @intToFloat(f32, NUM_FILTER_BANKS));
+    const sqrt_2_over_n = math.sqrt(2.0 / @intToFloat(f32, NUM_FILTER_BANKS));
+
+    for (n in 0..NUM_FILTER_BANKS) {
+        extractor.dct_matrix[0][n] *= sqrt_1_over_n;
+    }
+
+    for (k in 1..NUM_MFCC) {
+        for (n in 0..NUM_FILTER_BANKS) {
+            extractor.dct_matrix[k][n] *= sqrt_2_over_n;
+        }
+    }
+}
+
+pub fn mfcc_extract_frame(extractor: *MfccExtractor, samples: *const [FRAME_SIZE]i16) MfccFrame {
+    var result = MfccFrame{
+        .coefficients = undefined,
+        .delta = undefined,
+        .delta_delta = undefined,
+        .energy = 0.0,
+        .timestamp_ms = 0,
+    };
+
+    // Pre-emphasis and windowing
+    var frame: [FFT_SIZE]f32 = undefined;
+    for (n in 0..FRAME_SIZE) {
+        const sample = @intToFloat(f32, samples[n]) / 32768.0;
+        const preemph = sample - extractor.preemphasis_coef * extractor.prev_sample;
+        extractor.prev_sample = sample;
+
+        frame[n] = preemph * extractor.hamming_window[n];
+        result.energy += frame[n] * frame[n];
+    }
+
+    // Zero pad
+    for (n in FRAME_SIZE..FFT_SIZE) {
+        frame[n] = 0.0;
+    }
+
+    result.energy = math.log(result.energy + 1e-10);
+
+    // FFT
+    var spectrum_real: [FFT_SIZE]f32 = undefined;
+    var spectrum_imag: [FFT_SIZE]f32 = undefined;
+    fft_compute(extractor, &frame, &spectrum_real, &spectrum_imag);
+
+    // Power spectrum
+    var power_spectrum: [FFT_SIZE / 2 + 1]f32 = undefined;
+    for (k in 0..FFT_SIZE / 2 + 1) {
+        power_spectrum[k] = spectrum_real[k] * spectrum_real[k] + spectrum_imag[k] * spectrum_imag[k];
+    }
+
+    // Apply mel filter bank
+    var mel_energies: [NUM_FILTER_BANKS]f32 = undefined;
+    for (filt in 0..NUM_FILTER_BANKS) {
+        mel_energies[filt] = 0.0;
+        for (bin in 0..FFT_SIZE / 2 + 1) {
+            mel_energies[filt] += extractor.filter_bank[filt][bin] * power_spectrum[bin];
+        }
+        mel_energies[filt] = math.log(mel_energies[filt] + 1e-10);
+    }
+
+    // DCT to get MFCCs
+    for (k in 0..NUM_MFCC) {
+        result.coefficients[k] = 0.0;
+        for (n in 0..NUM_FILTER_BANKS) {
+            result.coefficients[k] += extractor.dct_matrix[k][n] * mel_energies[n];
+        }
+    }
+
+    // Store for delta computation
+    extractor.prev_frames[extractor.prev_frame_idx] = result.coefficients;
+
+    // Compute deltas (using 2-frame context)
+    compute_deltas(extractor, &result);
+
+    extractor.prev_frame_idx = (extractor.prev_frame_idx + 1) % 5;
+
+    return result;
+}
+
+fn fft_compute(extractor: *const MfccExtractor, input: *const [FFT_SIZE]f32, out_real: *[FFT_SIZE]f32, out_imag: *[FFT_SIZE]f32) void {
+    // Bit-reversal permutation
+    for (i in 0..FFT_SIZE) {
+        const j = bit_reverse(i, 9); // log2(512) = 9
+        out_real[j] = input[i];
+        out_imag[j] = 0.0;
+    }
+
+    // FFT butterflies
+    var len: u32 = 2;
+    while (len <= FFT_SIZE) {
+        const half_len = len / 2;
+        const table_step = FFT_SIZE / len;
+
+        var i: u32 = 0;
+        while (i < FFT_SIZE) {
+            for (j in 0..half_len) {
+                const twiddle_idx = j * table_step;
+                const wr = extractor.fft_twiddle_real[twiddle_idx % (FFT_SIZE / 2)];
+                const wi = extractor.fft_twiddle_imag[twiddle_idx % (FFT_SIZE / 2)];
+
+                const idx1 = i + j;
+                const idx2 = i + j + half_len;
+
+                const tr = wr * out_real[idx2] - wi * out_imag[idx2];
+                const ti = wr * out_imag[idx2] + wi * out_real[idx2];
+
+                out_real[idx2] = out_real[idx1] - tr;
+                out_imag[idx2] = out_imag[idx1] - ti;
+                out_real[idx1] = out_real[idx1] + tr;
+                out_imag[idx1] = out_imag[idx1] + ti;
+            }
+            i += len;
+        }
+        len *= 2;
+    }
+}
+
+fn bit_reverse(x: u32, bits: u32) u32 {
+    var result: u32 = 0;
+    var val = x;
+    for (i in 0..bits) {
+        result = (result << 1) | (val & 1);
+        val >>= 1;
+    }
+    return result;
+}
+
+fn compute_deltas(extractor: *const MfccExtractor, frame: *MfccFrame) void {
+    // Delta: difference between adjacent frames
+    // Delta-delta: difference of deltas
+
+    const curr_idx = extractor.prev_frame_idx;
+    const prev_idx1 = (curr_idx + 4) % 5;
+    const prev_idx2 = (curr_idx + 3) % 5;
+
+    for (c in 0..NUM_MFCC) {
+        // Delta (simple first-order difference)
+        frame.delta[c] = frame.coefficients[c] - extractor.prev_frames[prev_idx1][c];
+
+        // Delta-delta
+        const prev_delta = extractor.prev_frames[prev_idx1][c] - extractor.prev_frames[prev_idx2][c];
+        frame.delta_delta[c] = frame.delta[c] - prev_delta;
+    }
+}
+
+// ============================================================================
+// Speaker Embedding Network (x-vector style)
+// ============================================================================
+
+pub const EmbeddingNetwork = struct {
+    // Frame-level layers (TDNN)
+    tdnn1_weights: [512][NUM_MFCC * 3 * 5]f32,  // Context: 5 frames, 3 features per frame
+    tdnn1_bias: [512]f32,
+
+    tdnn2_weights: [512][512 * 3]f32,           // Context: 3 frames
+    tdnn2_bias: [512]f32,
+
+    tdnn3_weights: [512][512 * 3]f32,
+    tdnn3_bias: [512]f32,
+
+    // Statistics pooling (done in code, no weights)
+
+    // Segment-level layers
+    segment1_weights: [512][1024]f32,           // Mean + std concatenated
+    segment1_bias: [512]f32,
+
+    segment2_weights: [EMBEDDING_DIM][512]f32,
+    segment2_bias: [EMBEDDING_DIM]f32,
+
+    // Batch normalization parameters
+    bn_mean: [EMBEDDING_DIM]f32,
+    bn_var: [EMBEDDING_DIM]f32,
+    bn_gamma: [EMBEDDING_DIM]f32,
+    bn_beta: [EMBEDDING_DIM]f32,
+};
+
+pub fn embedding_network_init() *EmbeddingNetwork {
+    const network = memory.allocate(EmbeddingNetwork) orelse return null;
+
+    // Initialize weights (would be loaded from model file in practice)
+    // Using Xavier initialization for demonstration
+    init_layer_weights(&network.tdnn1_weights, 512, NUM_MFCC * 3 * 5);
+    init_layer_weights(&network.tdnn2_weights, 512, 512 * 3);
+    init_layer_weights(&network.tdnn3_weights, 512, 512 * 3);
+    init_layer_weights(&network.segment1_weights, 512, 1024);
+    init_layer_weights(&network.segment2_weights, EMBEDDING_DIM, 512);
+
+    // Initialize biases to zero
+    for (i in 0..512) {
+        network.tdnn1_bias[i] = 0.0;
+        network.tdnn2_bias[i] = 0.0;
+        network.tdnn3_bias[i] = 0.0;
+        network.segment1_bias[i] = 0.0;
+    }
+    for (i in 0..EMBEDDING_DIM) {
+        network.segment2_bias[i] = 0.0;
+        network.bn_mean[i] = 0.0;
+        network.bn_var[i] = 1.0;
+        network.bn_gamma[i] = 1.0;
+        network.bn_beta[i] = 0.0;
+    }
+
+    return network;
+}
+
+fn init_layer_weights(weights: anytype, out_dim: u32, in_dim: u32) void {
+    // Xavier initialization
+    const scale = math.sqrt(2.0 / @intToFloat(f32, in_dim + out_dim));
+
+    // Simple pseudo-random initialization
+    var seed: u32 = 12345;
+    for (i in 0..out_dim) {
+        for (j in 0..in_dim) {
+            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+            const rand = (@intToFloat(f32, seed) / @intToFloat(f32, 0x7FFFFFFF)) * 2.0 - 1.0;
+            weights[i][j] = rand * scale;
+        }
+    }
+}
+
+pub fn compute_embedding(network: *const EmbeddingNetwork, mfcc_frames: []const MfccFrame, num_frames: u32) SpeakerEmbedding {
+    var result = SpeakerEmbedding{
+        .vector = undefined,
+        .normalized = false,
+    };
+
+    if (num_frames < 5) {
+        // Not enough frames
+        for (i in 0..EMBEDDING_DIM) {
+            result.vector[i] = 0.0;
+        }
+        return result;
+    }
+
+    // Frame-level processing (simplified - actual implementation would use proper TDNN)
+    var frame_embeddings: [256][512]f32 = undefined;
+    const max_frames = if (num_frames > 256) 256 else num_frames;
+
+    for (f in 0..max_frames) {
+        var input: [NUM_MFCC * 3]f32 = undefined;
+
+        // Concatenate static, delta, delta-delta
+        for (c in 0..NUM_MFCC) {
+            input[c] = mfcc_frames[f].coefficients[c];
+            input[c + NUM_MFCC] = mfcc_frames[f].delta[c];
+            input[c + NUM_MFCC * 2] = mfcc_frames[f].delta_delta[c];
+        }
+
+        // Simple fully connected layer (simplified from TDNN)
+        for (o in 0..512) {
+            var sum: f32 = network.tdnn1_bias[o];
+            for (i in 0..NUM_MFCC * 3) {
+                sum += network.tdnn1_weights[o][i] * input[i];
+            }
+            frame_embeddings[f][o] = relu(sum);
+        }
+    }
+
+    // Statistics pooling: compute mean and standard deviation
+    var mean: [512]f32 = undefined;
+    var std: [512]f32 = undefined;
+
+    for (i in 0..512) {
+        mean[i] = 0.0;
+        for (f in 0..max_frames) {
+            mean[i] += frame_embeddings[f][i];
+        }
+        mean[i] /= @intToFloat(f32, max_frames);
+    }
+
+    for (i in 0..512) {
+        std[i] = 0.0;
+        for (f in 0..max_frames) {
+            const diff = frame_embeddings[f][i] - mean[i];
+            std[i] += diff * diff;
+        }
+        std[i] = math.sqrt(std[i] / @intToFloat(f32, max_frames) + 1e-10);
+    }
+
+    // Segment-level layers
+    var segment_input: [1024]f32 = undefined;
+    for (i in 0..512) {
+        segment_input[i] = mean[i];
+        segment_input[i + 512] = std[i];
+    }
+
+    // First segment layer
+    var segment1_out: [512]f32 = undefined;
+    for (o in 0..512) {
+        var sum: f32 = network.segment1_bias[o];
+        for (i in 0..1024) {
+            sum += network.segment1_weights[o][i] * segment_input[i];
+        }
+        segment1_out[o] = relu(sum);
+    }
+
+    // Second segment layer (output embedding)
+    for (o in 0..EMBEDDING_DIM) {
+        var sum: f32 = network.segment2_bias[o];
+        for (i in 0..512) {
+            sum += network.segment2_weights[o][i] * segment1_out[i];
+        }
+        result.vector[o] = sum;
+    }
+
+    // Batch normalization
+    for (i in 0..EMBEDDING_DIM) {
+        result.vector[i] = (result.vector[i] - network.bn_mean[i]) / math.sqrt(network.bn_var[i] + 1e-5);
+        result.vector[i] = result.vector[i] * network.bn_gamma[i] + network.bn_beta[i];
+    }
+
+    result.normalize();
+
+    return result;
+}
+
+fn relu(x: f32) f32 {
+    return if (x > 0.0) x else 0.0;
+}
+
+// ============================================================================
+// Speaker Verification System
+// ============================================================================
+
+pub const SpeakerVerificationConfig = struct {
+    // Thresholds
+    verification_threshold: f32,    // Cosine similarity threshold for verification
+    identification_threshold: f32,  // Threshold for identification
+
+    // Adaptive thresholds
+    use_adaptive_threshold: bool,
+    min_threshold: f32,
+    max_threshold: f32,
+
+    // Security
+    max_failed_attempts: u32,
+    lockout_duration_ms: u64,
+    require_liveness: bool,
+
+    // Enrollment
+    min_enrollment_duration_s: f32,
+    enrollment_quality_threshold: f32,
+
+    pub fn default() SpeakerVerificationConfig {
+        return SpeakerVerificationConfig{
+            .verification_threshold = 0.5,
+            .identification_threshold = 0.6,
+            .use_adaptive_threshold = true,
+            .min_threshold = 0.3,
+            .max_threshold = 0.8,
+            .max_failed_attempts = 5,
+            .lockout_duration_ms = 300000, // 5 minutes
+            .require_liveness = true,
+            .min_enrollment_duration_s = 3.0,
+            .enrollment_quality_threshold = 0.7,
+        };
+    }
+};
+
+pub const SpeakerVerificationSystem = struct {
+    config: SpeakerVerificationConfig,
+
+    // Components
+    mfcc_extractor: *MfccExtractor,
+    embedding_network: *EmbeddingNetwork,
+
+    // Enrolled speakers
+    speakers: [MAX_ENROLLED_SPEAKERS]SpeakerProfile,
+    num_speakers: u32,
+    next_speaker_id: u32,
+
+    // Liveness detection
+    liveness_enabled: bool,
+};
+
+pub fn speaker_verification_init(config: SpeakerVerificationConfig) *SpeakerVerificationSystem {
+    const system = memory.allocate(SpeakerVerificationSystem) orelse return null;
+
+    system.config = config;
+    system.num_speakers = 0;
+    system.next_speaker_id = 1;
+    system.liveness_enabled = config.require_liveness;
+
+    // Initialize components
+    system.mfcc_extractor = mfcc_extractor_init();
+    if (system.mfcc_extractor == null) {
+        memory.free(system);
+        return null;
+    }
+
+    system.embedding_network = embedding_network_init();
+    if (system.embedding_network == null) {
+        memory.free(system.mfcc_extractor);
+        memory.free(system);
+        return null;
+    }
+
+    // Initialize speaker slots
+    for (i in 0..MAX_ENROLLED_SPEAKERS) {
+        system.speakers[i].enrolled = false;
+        system.speakers[i].speaker_id = 0;
+    }
+
+    return system;
+}
+
+// ============================================================================
+// Enrollment
+// ============================================================================
+
+pub const EnrollmentState = struct {
+    speaker_slot: u32,
+    utterances_collected: u32,
+    embeddings: [MAX_ENROLLMENT_UTTERANCES]SpeakerEmbedding,
+    quality_scores: [MAX_ENROLLMENT_UTTERANCES]f32,
+    in_progress: bool,
+};
+
+pub fn start_enrollment(system: *SpeakerVerificationSystem, name: []const u8) ?*EnrollmentState {
+    // Find empty slot
+    var slot: ?u32 = null;
+    for (i in 0..MAX_ENROLLED_SPEAKERS) {
+        if (!system.speakers[i].enrolled) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot == null) return null;
+
+    const state = memory.allocate(EnrollmentState) orelse return null;
+
+    state.speaker_slot = slot.?;
+    state.utterances_collected = 0;
+    state.in_progress = true;
+
+    // Initialize speaker profile
+    system.speakers[slot.?].speaker_id = system.next_speaker_id;
+    system.next_speaker_id += 1;
+    system.speakers[slot.?].set_name(name);
+    system.speakers[slot.?].num_enrollments = 0;
+    system.speakers[slot.?].has_pin = false;
+    system.speakers[slot.?].failed_attempts = 0;
+
+    return state;
+}
+
+pub fn add_enrollment_utterance(
+    system: *SpeakerVerificationSystem,
+    state: *EnrollmentState,
+    audio_samples: []const i16,
+    num_samples: u32
+) EnrollmentStatus {
+    if (!state.in_progress) return .NotInProgress;
+
+    if (state.utterances_collected >= MAX_ENROLLMENT_UTTERANCES) {
+        return .MaxUtterancesReached;
+    }
+
+    // Extract MFCC features
+    const num_frames = (num_samples - FRAME_SIZE) / FRAME_SHIFT + 1;
+    if (num_frames < 30) return .AudioTooShort;
+
+    var mfcc_frames = memory.allocate_slice(MfccFrame, num_frames) orelse return .MemoryError;
+    defer memory.free_slice(mfcc_frames);
+
+    for (f in 0..num_frames) {
+        const start = f * FRAME_SHIFT;
+        var frame_samples: [FRAME_SIZE]i16 = undefined;
+        for (i in 0..FRAME_SIZE) {
+            frame_samples[i] = audio_samples[start + i];
+        }
+        mfcc_frames[f] = mfcc_extract_frame(system.mfcc_extractor, &frame_samples);
+    }
+
+    // Compute embedding
+    const embedding = compute_embedding(system.embedding_network, mfcc_frames, @intCast(u32, num_frames));
+
+    // Check quality (energy, SNR approximation)
+    var avg_energy: f32 = 0.0;
+    for (f in 0..num_frames) {
+        avg_energy += mfcc_frames[f].energy;
+    }
+    avg_energy /= @intToFloat(f32, num_frames);
+
+    const quality = if (avg_energy > -20.0) 1.0 else if (avg_energy > -40.0) 0.7 else 0.3;
+
+    if (quality < system.config.enrollment_quality_threshold) {
+        return .PoorQuality;
+    }
+
+    // Store embedding
+    state.embeddings[state.utterances_collected] = embedding;
+    state.quality_scores[state.utterances_collected] = quality;
+    state.utterances_collected += 1;
+
+    if (state.utterances_collected >= MIN_ENROLLMENT_UTTERANCES) {
+        return .ReadyToComplete;
+    }
+
+    return .NeedMoreUtterances;
+}
+
+pub const EnrollmentStatus = enum {
+    NeedMoreUtterances,
+    ReadyToComplete,
+    MaxUtterancesReached,
+    AudioTooShort,
+    PoorQuality,
+    NotInProgress,
+    MemoryError,
+};
+
+pub fn complete_enrollment(system: *SpeakerVerificationSystem, state: *EnrollmentState) bool {
+    if (!state.in_progress) return false;
+    if (state.utterances_collected < MIN_ENROLLMENT_UTTERANCES) return false;
+
+    const slot = state.speaker_slot;
+
+    // Copy embeddings to speaker profile
+    for (i in 0..state.utterances_collected) {
+        system.speakers[slot].enrollment_embeddings[i] = state.embeddings[i];
+    }
+    system.speakers[slot].num_enrollments = state.utterances_collected;
+
+    // Compute centroid
+    system.speakers[slot].compute_centroid();
+
+    // Mark as enrolled
+    system.speakers[slot].enrolled = true;
+    system.num_speakers += 1;
+
+    state.in_progress = false;
+
+    return true;
+}
+
+pub fn cancel_enrollment(state: *EnrollmentState) void {
+    state.in_progress = false;
+}
+
+// ============================================================================
+// Verification and Identification
+// ============================================================================
+
+pub fn verify_speaker(
+    system: *SpeakerVerificationSystem,
+    claimed_speaker_id: u32,
+    audio_samples: []const i16,
+    num_samples: u32
+) VerificationResult {
+    var result = VerificationResult{
+        .verified = false,
+        .speaker_id = 0,
+        .speaker_name = undefined,
+        .speaker_name_len = 0,
+        .confidence = 0.0,
+        .threshold_used = system.config.verification_threshold,
+        .processing_time_ms = 0,
+    };
+
+    // Find speaker profile
+    var speaker: ?*SpeakerProfile = null;
+    for (i in 0..MAX_ENROLLED_SPEAKERS) {
+        if (system.speakers[i].enrolled and system.speakers[i].speaker_id == claimed_speaker_id) {
+            speaker = &system.speakers[i];
+            break;
+        }
+    }
+
+    if (speaker == null) return result;
+
+    // Check if locked out
+    if (speaker.?.failed_attempts >= system.config.max_failed_attempts) {
+        const now = get_current_time_ms();
+        if (now < speaker.?.locked_until_ms) {
+            return result; // Still locked
+        }
+        // Lockout expired
+        speaker.?.failed_attempts = 0;
+    }
+
+    // Extract features and compute embedding
+    const embedding = extract_and_embed(system, audio_samples, num_samples);
+
+    // Compute similarity with speaker's centroid
+    const similarity = embedding.cosine_similarity(&speaker.?.centroid);
+
+    // Adaptive threshold based on speaker's variance
+    var threshold = system.config.verification_threshold;
+    if (system.config.use_adaptive_threshold) {
+        // Increase threshold for speakers with high variance
+        threshold = system.config.verification_threshold + speaker.?.intra_speaker_variance;
+        if (threshold > system.config.max_threshold) threshold = system.config.max_threshold;
+        if (threshold < system.config.min_threshold) threshold = system.config.min_threshold;
+    }
+
+    result.threshold_used = threshold;
+    result.confidence = similarity;
+    result.speaker_id = claimed_speaker_id;
+
+    if (similarity >= threshold) {
+        result.verified = true;
+        for (i in 0..speaker.?.name_len) {
+            result.speaker_name[i] = speaker.?.name[i];
+        }
+        result.speaker_name_len = speaker.?.name_len;
+
+        // Reset failed attempts on success
+        speaker.?.failed_attempts = 0;
+        speaker.?.successful_verifications += 1;
+    } else {
+        // Failed verification
+        speaker.?.failed_attempts += 1;
+        if (speaker.?.failed_attempts >= system.config.max_failed_attempts) {
+            speaker.?.locked_until_ms = get_current_time_ms() + system.config.lockout_duration_ms;
+        }
+    }
+
+    speaker.?.total_verifications += 1;
+    speaker.?.last_verification_ms = get_current_time_ms();
+
+    return result;
+}
+
+pub fn identify_speaker(
+    system: *SpeakerVerificationSystem,
+    audio_samples: []const i16,
+    num_samples: u32
+) IdentificationResult {
+    var result = IdentificationResult{
+        .identified = false,
+        .speaker_id = 0,
+        .speaker_name = undefined,
+        .speaker_name_len = 0,
+        .confidence = 0.0,
+        .candidates = undefined,
+        .num_candidates = 0,
+    };
+
+    if (system.num_speakers == 0) return result;
+
+    // Extract features and compute embedding
+    const embedding = extract_and_embed(system, audio_samples, num_samples);
+
+    // Compare against all enrolled speakers
+    var scores: [MAX_ENROLLED_SPEAKERS]struct {
+        speaker_id: u32,
+        similarity: f32,
+        slot: u32,
+    } = undefined;
+    var num_scores: u32 = 0;
+
+    for (i in 0..MAX_ENROLLED_SPEAKERS) {
+        if (system.speakers[i].enrolled) {
+            const sim = embedding.cosine_similarity(&system.speakers[i].centroid);
+            scores[num_scores] = .{
+                .speaker_id = system.speakers[i].speaker_id,
+                .similarity = sim,
+                .slot = i,
+            };
+            num_scores += 1;
+        }
+    }
+
+    // Sort by similarity (simple bubble sort for small array)
+    for (i in 0..num_scores) {
+        for (j in i + 1..num_scores) {
+            if (scores[j].similarity > scores[i].similarity) {
+                const temp = scores[i];
+                scores[i] = scores[j];
+                scores[j] = temp;
+            }
+        }
+    }
+
+    // Fill candidates
+    const max_candidates = if (num_scores > 3) 3 else num_scores;
+    for (i in 0..max_candidates) {
+        result.candidates[i] = .{
+            .speaker_id = scores[i].speaker_id,
+            .confidence = scores[i].similarity,
+        };
+    }
+    result.num_candidates = @intCast(u32, max_candidates);
+
+    // Check if best match exceeds threshold
+    if (num_scores > 0 and scores[0].similarity >= system.config.identification_threshold) {
+        result.identified = true;
+        result.speaker_id = scores[0].speaker_id;
+        result.confidence = scores[0].similarity;
+
+        const speaker = &system.speakers[scores[0].slot];
+        for (i in 0..speaker.name_len) {
+            result.speaker_name[i] = speaker.name[i];
+        }
+        result.speaker_name_len = speaker.name_len;
+    }
+
+    return result;
+}
+
+fn extract_and_embed(system: *SpeakerVerificationSystem, audio_samples: []const i16, num_samples: u32) SpeakerEmbedding {
+    const num_frames = (num_samples - FRAME_SIZE) / FRAME_SHIFT + 1;
+
+    var mfcc_frames = memory.allocate_slice(MfccFrame, num_frames) orelse {
+        // Return zero embedding on error
+        var zero = SpeakerEmbedding{ .vector = undefined, .normalized = false };
+        for (i in 0..EMBEDDING_DIM) zero.vector[i] = 0.0;
+        return zero;
+    };
+    defer memory.free_slice(mfcc_frames);
+
+    for (f in 0..num_frames) {
+        const start = f * FRAME_SHIFT;
+        var frame_samples: [FRAME_SIZE]i16 = undefined;
+        for (i in 0..FRAME_SIZE) {
+            if (start + i < num_samples) {
+                frame_samples[i] = audio_samples[start + i];
+            } else {
+                frame_samples[i] = 0;
+            }
+        }
+        mfcc_frames[f] = mfcc_extract_frame(system.mfcc_extractor, &frame_samples);
+    }
+
+    return compute_embedding(system.embedding_network, mfcc_frames, @intCast(u32, num_frames));
+}
+
+// ============================================================================
+// Liveness Detection
+// ============================================================================
+
+pub const LivenessResult = struct {
+    is_live: bool,
+    confidence: f32,
+    checks_passed: u32,
+    checks_total: u32,
+};
+
+pub fn check_liveness(system: *SpeakerVerificationSystem, audio_samples: []const i16, num_samples: u32) LivenessResult {
+    var result = LivenessResult{
+        .is_live = false,
+        .confidence = 0.0,
+        .checks_passed = 0,
+        .checks_total = 4,
+    };
+
+    // Check 1: Audio energy variance (replay attacks often have consistent energy)
+    const energy_check = check_energy_variance(audio_samples, num_samples);
+    if (energy_check) result.checks_passed += 1;
+
+    // Check 2: Spectral flux (live speech has more variation)
+    const flux_check = check_spectral_flux(audio_samples, num_samples);
+    if (flux_check) result.checks_passed += 1;
+
+    // Check 3: Pop detection (plosives indicate live speech close to mic)
+    const pop_check = check_plosive_detection(audio_samples, num_samples);
+    if (pop_check) result.checks_passed += 1;
+
+    // Check 4: Fundamental frequency variation
+    const f0_check = check_f0_variation(audio_samples, num_samples);
+    if (f0_check) result.checks_passed += 1;
+
+    result.confidence = @intToFloat(f32, result.checks_passed) / @intToFloat(f32, result.checks_total);
+    result.is_live = result.checks_passed >= 3;
+
+    return result;
+}
+
+fn check_energy_variance(samples: []const i16, num_samples: u32) bool {
+    const frame_len: u32 = 160;
+    const num_frames = num_samples / frame_len;
+    if (num_frames < 10) return false;
+
+    var energies: [256]f32 = undefined;
+    const max_frames = if (num_frames > 256) 256 else num_frames;
+
+    for (f in 0..max_frames) {
+        var energy: f32 = 0.0;
+        for (i in 0..frame_len) {
+            const s = @intToFloat(f32, samples[f * frame_len + i]) / 32768.0;
+            energy += s * s;
+        }
+        energies[f] = energy / @intToFloat(f32, frame_len);
+    }
+
+    // Compute variance
+    var mean: f32 = 0.0;
+    for (f in 0..max_frames) {
+        mean += energies[f];
+    }
+    mean /= @intToFloat(f32, max_frames);
+
+    var variance: f32 = 0.0;
+    for (f in 0..max_frames) {
+        const diff = energies[f] - mean;
+        variance += diff * diff;
+    }
+    variance /= @intToFloat(f32, max_frames);
+
+    // Live speech should have significant energy variance
+    return variance > 0.001;
+}
+
+fn check_spectral_flux(samples: []const i16, num_samples: u32) bool {
+    // Simplified spectral flux calculation
+    // Real implementation would use full FFT
+
+    const frame_len: u32 = 256;
+    const num_frames = num_samples / frame_len;
+    if (num_frames < 5) return false;
+
+    var prev_energy: f32 = 0.0;
+    var total_flux: f32 = 0.0;
+
+    for (f in 0..num_frames) {
+        var energy: f32 = 0.0;
+        for (i in 0..frame_len) {
+            const s = @intToFloat(f32, samples[f * frame_len + i]) / 32768.0;
+            energy += s * s;
+        }
+
+        if (f > 0) {
+            const flux = (energy - prev_energy);
+            total_flux += if (flux > 0) flux else -flux;
+        }
+        prev_energy = energy;
+    }
+
+    const avg_flux = total_flux / @intToFloat(f32, num_frames - 1);
+
+    // Live speech should have noticeable spectral changes
+    return avg_flux > 0.0001;
+}
+
+fn check_plosive_detection(samples: []const i16, num_samples: u32) bool {
+    // Look for sudden energy bursts characteristic of plosives (p, t, k, b, d, g)
+    const frame_len: u32 = 80; // 5ms
+    var prev_energy: f32 = 0.0;
+    var plosive_count: u32 = 0;
+
+    const num_frames = num_samples / frame_len;
+    for (f in 0..num_frames) {
+        var energy: f32 = 0.0;
+        for (i in 0..frame_len) {
+            const s = @intToFloat(f32, samples[f * frame_len + i]) / 32768.0;
+            energy += s * s;
+        }
+
+        if (f > 0 and prev_energy > 0.00001) {
+            const ratio = energy / prev_energy;
+            if (ratio > 10.0) { // Sudden 10x increase
+                plosive_count += 1;
+            }
+        }
+        prev_energy = energy;
+    }
+
+    // Natural speech typically has some plosives
+    return plosive_count >= 1;
+}
+
+fn check_f0_variation(samples: []const i16, num_samples: u32) bool {
+    // Very simplified pitch tracking
+    // Real implementation would use autocorrelation or YIN algorithm
+
+    // For now, just check zero-crossing rate variation
+    const frame_len: u32 = 320; // 20ms
+    const num_frames = num_samples / frame_len;
+    if (num_frames < 5) return false;
+
+    var zcrs: [128]f32 = undefined;
+    const max_frames = if (num_frames > 128) 128 else num_frames;
+
+    for (f in 0..max_frames) {
+        var crossings: u32 = 0;
+        for (i in 1..frame_len) {
+            const curr = samples[f * frame_len + i];
+            const prev = samples[f * frame_len + i - 1];
+            if ((curr >= 0 and prev < 0) or (curr < 0 and prev >= 0)) {
+                crossings += 1;
+            }
+        }
+        zcrs[f] = @intToFloat(f32, crossings);
+    }
+
+    // Compute variance of ZCR
+    var mean: f32 = 0.0;
+    for (f in 0..max_frames) {
+        mean += zcrs[f];
+    }
+    mean /= @intToFloat(f32, max_frames);
+
+    var variance: f32 = 0.0;
+    for (f in 0..max_frames) {
+        const diff = zcrs[f] - mean;
+        variance += diff * diff;
+    }
+    variance /= @intToFloat(f32, max_frames);
+
+    // Live speech has varying pitch/ZCR
+    return variance > 10.0;
+}
+
+// ============================================================================
+// Utility
+// ============================================================================
+
+fn get_current_time_ms() u64 {
+    // Would use system timer in real implementation
+    return 0;
+}
+
+// ============================================================================
+// Module Initialization
+// ============================================================================
+
+pub fn init() bool {
+    return true;
+}

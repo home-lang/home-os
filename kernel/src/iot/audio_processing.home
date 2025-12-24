@@ -1,0 +1,1140 @@
+// Audio Processing for Voice Assistant
+// Provides noise reduction, echo cancellation, and beamforming
+// Part of HomeOS IoT/Edge subsystem
+
+const basics = @import("basics");
+const memory = @import("memory");
+const math = @import("math");
+
+// ============================================================================
+// Audio Processing Constants
+// ============================================================================
+
+const SAMPLE_RATE: u32 = 16000;          // 16 kHz for speech
+const FRAME_SIZE: u32 = 512;              // 32ms frames
+const FFT_SIZE: u32 = 1024;               // FFT size for spectral processing
+const NUM_BANDS: u32 = 24;                // Mel-scale filter banks
+const NOISE_ESTIMATION_FRAMES: u32 = 20; // Frames for noise floor estimation
+const MAX_CHANNELS: u32 = 8;              // Maximum microphone array channels
+
+// ============================================================================
+// Audio Buffer Types
+// ============================================================================
+
+pub const AudioSample = i16;
+pub const AudioFloat = f32;
+
+pub const AudioFrame = struct {
+    samples: [FRAME_SIZE]AudioSample,
+    timestamp_us: u64,
+    channel: u8,
+    flags: FrameFlags,
+};
+
+pub const FrameFlags = packed struct(u8) {
+    voice_detected: bool,
+    clipping: bool,
+    silence: bool,
+    processed: bool,
+    reserved: u4,
+};
+
+pub const FloatFrame = struct {
+    samples: [FRAME_SIZE]AudioFloat,
+    timestamp_us: u64,
+};
+
+pub const ComplexSample = struct {
+    real: AudioFloat,
+    imag: AudioFloat,
+
+    pub fn magnitude(self: *const ComplexSample) AudioFloat {
+        return math.sqrt(self.real * self.real + self.imag * self.imag);
+    }
+
+    pub fn phase(self: *const ComplexSample) AudioFloat {
+        return math.atan2(self.imag, self.real);
+    }
+
+    pub fn multiply(self: *const ComplexSample, other: *const ComplexSample) ComplexSample {
+        return ComplexSample{
+            .real = self.real * other.real - self.imag * other.imag,
+            .imag = self.real * other.imag + self.imag * other.real,
+        };
+    }
+
+    pub fn conjugate(self: *const ComplexSample) ComplexSample {
+        return ComplexSample{
+            .real = self.real,
+            .imag = -self.imag,
+        };
+    }
+};
+
+pub const Spectrum = struct {
+    bins: [FFT_SIZE / 2 + 1]ComplexSample,
+    magnitude: [FFT_SIZE / 2 + 1]AudioFloat,
+    phase: [FFT_SIZE / 2 + 1]AudioFloat,
+};
+
+// ============================================================================
+// Noise Reduction (Spectral Subtraction)
+// ============================================================================
+
+pub const NoiseReductionConfig = struct {
+    // Noise estimation
+    noise_floor_db: AudioFloat,           // -60 dB default
+    noise_estimation_alpha: AudioFloat,   // Smoothing factor (0.98)
+
+    // Spectral subtraction
+    oversubtraction_factor: AudioFloat,   // 1.0 - 4.0, higher = more aggressive
+    spectral_floor: AudioFloat,           // Minimum gain (0.1 = -20 dB)
+
+    // Wiener filter
+    use_wiener: bool,                     // Use Wiener filter instead
+    wiener_alpha: AudioFloat,             // Wiener smoothing
+
+    // Voice activity detection
+    vad_threshold_db: AudioFloat,         // -40 dB default
+    vad_hangover_frames: u32,             // Frames to keep after voice stops
+
+    pub fn default() NoiseReductionConfig {
+        return NoiseReductionConfig{
+            .noise_floor_db = -60.0,
+            .noise_estimation_alpha = 0.98,
+            .oversubtraction_factor = 2.0,
+            .spectral_floor = 0.1,
+            .use_wiener = true,
+            .wiener_alpha = 0.95,
+            .vad_threshold_db = -40.0,
+            .vad_hangover_frames = 10,
+        };
+    }
+};
+
+pub const NoiseReductionState = struct {
+    config: NoiseReductionConfig,
+
+    // Noise estimation
+    noise_spectrum: [FFT_SIZE / 2 + 1]AudioFloat,
+    noise_initialized: bool,
+    noise_estimation_count: u32,
+
+    // Voice activity detection
+    vad_active: bool,
+    vad_hangover_counter: u32,
+    frame_energy_history: [32]AudioFloat,
+    history_index: u32,
+
+    // Processing state
+    prev_gain: [FFT_SIZE / 2 + 1]AudioFloat,
+    overlap_buffer: [FRAME_SIZE]AudioFloat,
+
+    // FFT twiddle factors (precomputed)
+    fft_twiddle_real: [FFT_SIZE / 2]AudioFloat,
+    fft_twiddle_imag: [FFT_SIZE / 2]AudioFloat,
+
+    // Window function
+    analysis_window: [FFT_SIZE]AudioFloat,
+    synthesis_window: [FFT_SIZE]AudioFloat,
+};
+
+pub fn noise_reduction_init(config: NoiseReductionConfig) *NoiseReductionState {
+    const state = memory.allocate(NoiseReductionState) orelse return null;
+
+    state.config = config;
+    state.noise_initialized = false;
+    state.noise_estimation_count = 0;
+    state.vad_active = false;
+    state.vad_hangover_counter = 0;
+    state.history_index = 0;
+
+    // Initialize noise spectrum to floor
+    const floor_linear = db_to_linear(config.noise_floor_db);
+    for (i in 0..FFT_SIZE / 2 + 1) {
+        state.noise_spectrum[i] = floor_linear;
+        state.prev_gain[i] = 1.0;
+    }
+
+    // Initialize overlap buffer
+    for (i in 0..FRAME_SIZE) {
+        state.overlap_buffer[i] = 0.0;
+    }
+
+    // Initialize energy history
+    for (i in 0..32) {
+        state.frame_energy_history[i] = 0.0;
+    }
+
+    // Precompute FFT twiddle factors
+    compute_fft_twiddles(state);
+
+    // Compute Hann windows for overlap-add
+    compute_windows(state);
+
+    return state;
+}
+
+fn compute_fft_twiddles(state: *NoiseReductionState) void {
+    const pi: AudioFloat = 3.14159265358979323846;
+
+    for (k in 0..FFT_SIZE / 2) {
+        const angle = -2.0 * pi * @intToFloat(AudioFloat, k) / @intToFloat(AudioFloat, FFT_SIZE);
+        state.fft_twiddle_real[k] = math.cos(angle);
+        state.fft_twiddle_imag[k] = math.sin(angle);
+    }
+}
+
+fn compute_windows(state: *NoiseReductionState) void {
+    const pi: AudioFloat = 3.14159265358979323846;
+
+    // Hann window for analysis and synthesis (square root for perfect reconstruction)
+    for (n in 0..FFT_SIZE) {
+        const hann = 0.5 * (1.0 - math.cos(2.0 * pi * @intToFloat(AudioFloat, n) / @intToFloat(AudioFloat, FFT_SIZE - 1)));
+        state.analysis_window[n] = math.sqrt(hann);
+        state.synthesis_window[n] = math.sqrt(hann);
+    }
+}
+
+pub fn noise_reduction_process(state: *NoiseReductionState, input: *const FloatFrame, output: *FloatFrame) void {
+    var padded_input: [FFT_SIZE]AudioFloat = undefined;
+    var spectrum: Spectrum = undefined;
+
+    // Zero-pad and apply analysis window
+    for (n in 0..FRAME_SIZE) {
+        padded_input[n] = input.samples[n] * state.analysis_window[n];
+    }
+    for (n in FRAME_SIZE..FFT_SIZE) {
+        padded_input[n] = 0.0;
+    }
+
+    // Compute FFT
+    fft_forward(state, &padded_input, &spectrum);
+
+    // Compute magnitude spectrum
+    for (k in 0..FFT_SIZE / 2 + 1) {
+        spectrum.magnitude[k] = spectrum.bins[k].magnitude();
+        spectrum.phase[k] = spectrum.bins[k].phase();
+    }
+
+    // Voice activity detection
+    const frame_energy = compute_frame_energy(&spectrum);
+    const is_speech = detect_voice_activity(state, frame_energy);
+
+    // Update noise estimate during non-speech
+    if (!is_speech and !state.vad_active) {
+        update_noise_estimate(state, &spectrum);
+    }
+
+    // Apply noise reduction
+    var gain: [FFT_SIZE / 2 + 1]AudioFloat = undefined;
+
+    if (state.config.use_wiener) {
+        // Wiener filter
+        compute_wiener_gain(state, &spectrum, &gain);
+    } else {
+        // Spectral subtraction
+        compute_spectral_subtraction_gain(state, &spectrum, &gain);
+    }
+
+    // Smooth gain over time
+    for (k in 0..FFT_SIZE / 2 + 1) {
+        gain[k] = 0.3 * state.prev_gain[k] + 0.7 * gain[k];
+        state.prev_gain[k] = gain[k];
+    }
+
+    // Apply gain to spectrum
+    for (k in 0..FFT_SIZE / 2 + 1) {
+        spectrum.bins[k].real *= gain[k];
+        spectrum.bins[k].imag *= gain[k];
+    }
+
+    // Inverse FFT
+    var time_domain: [FFT_SIZE]AudioFloat = undefined;
+    fft_inverse(state, &spectrum, &time_domain);
+
+    // Apply synthesis window and overlap-add
+    for (n in 0..FRAME_SIZE) {
+        output.samples[n] = time_domain[n] * state.synthesis_window[n] + state.overlap_buffer[n];
+        state.overlap_buffer[n] = time_domain[n + FRAME_SIZE / 2] * state.synthesis_window[n + FRAME_SIZE / 2];
+    }
+
+    output.timestamp_us = input.timestamp_us;
+}
+
+fn compute_frame_energy(spectrum: *const Spectrum) AudioFloat {
+    var energy: AudioFloat = 0.0;
+
+    for (k in 0..FFT_SIZE / 2 + 1) {
+        energy += spectrum.magnitude[k] * spectrum.magnitude[k];
+    }
+
+    return 10.0 * math.log10(energy + 1e-10);
+}
+
+fn detect_voice_activity(state: *NoiseReductionState, energy_db: AudioFloat) bool {
+    // Update energy history
+    state.frame_energy_history[state.history_index] = energy_db;
+    state.history_index = (state.history_index + 1) % 32;
+
+    // Compute adaptive threshold
+    var min_energy: AudioFloat = 1000.0;
+    for (i in 0..32) {
+        if (state.frame_energy_history[i] < min_energy) {
+            min_energy = state.frame_energy_history[i];
+        }
+    }
+
+    const threshold = min_energy + (-state.config.vad_threshold_db);
+
+    if (energy_db > threshold) {
+        state.vad_active = true;
+        state.vad_hangover_counter = state.config.vad_hangover_frames;
+        return true;
+    } else if (state.vad_hangover_counter > 0) {
+        state.vad_hangover_counter -= 1;
+        return true;
+    } else {
+        state.vad_active = false;
+        return false;
+    }
+}
+
+fn update_noise_estimate(state: *NoiseReductionState, spectrum: *const Spectrum) void {
+    if (!state.noise_initialized and state.noise_estimation_count < NOISE_ESTIMATION_FRAMES) {
+        // Initial estimation: average first N frames
+        const alpha = 1.0 / @intToFloat(AudioFloat, state.noise_estimation_count + 1);
+
+        for (k in 0..FFT_SIZE / 2 + 1) {
+            state.noise_spectrum[k] = (1.0 - alpha) * state.noise_spectrum[k] +
+                                       alpha * spectrum.magnitude[k] * spectrum.magnitude[k];
+        }
+
+        state.noise_estimation_count += 1;
+
+        if (state.noise_estimation_count >= NOISE_ESTIMATION_FRAMES) {
+            state.noise_initialized = true;
+        }
+    } else {
+        // Continuous adaptation during silence
+        const alpha = state.config.noise_estimation_alpha;
+
+        for (k in 0..FFT_SIZE / 2 + 1) {
+            const power = spectrum.magnitude[k] * spectrum.magnitude[k];
+            state.noise_spectrum[k] = alpha * state.noise_spectrum[k] + (1.0 - alpha) * power;
+        }
+    }
+}
+
+fn compute_wiener_gain(state: *const NoiseReductionState, spectrum: *const Spectrum, gain: *[FFT_SIZE / 2 + 1]AudioFloat) void {
+    for (k in 0..FFT_SIZE / 2 + 1) {
+        const signal_power = spectrum.magnitude[k] * spectrum.magnitude[k];
+        const noise_power = state.noise_spectrum[k];
+
+        // SNR estimation
+        const snr = (signal_power - noise_power) / (noise_power + 1e-10);
+        const snr_clamped = if (snr < 0.0) 0.0 else snr;
+
+        // Wiener gain: SNR / (1 + SNR)
+        var g = snr_clamped / (1.0 + snr_clamped);
+
+        // Apply spectral floor
+        if (g < state.config.spectral_floor) {
+            g = state.config.spectral_floor;
+        }
+
+        gain[k] = g;
+    }
+}
+
+fn compute_spectral_subtraction_gain(state: *const NoiseReductionState, spectrum: *const Spectrum, gain: *[FFT_SIZE / 2 + 1]AudioFloat) void {
+    for (k in 0..FFT_SIZE / 2 + 1) {
+        const signal_mag = spectrum.magnitude[k];
+        const noise_mag = math.sqrt(state.noise_spectrum[k]);
+
+        // Spectral subtraction with oversubtraction
+        var enhanced_mag = signal_mag - state.config.oversubtraction_factor * noise_mag;
+
+        // Apply spectral floor
+        const floor_mag = state.config.spectral_floor * signal_mag;
+        if (enhanced_mag < floor_mag) {
+            enhanced_mag = floor_mag;
+        }
+
+        gain[k] = enhanced_mag / (signal_mag + 1e-10);
+    }
+}
+
+fn fft_forward(state: *const NoiseReductionState, input: *const [FFT_SIZE]AudioFloat, output: *Spectrum) void {
+    // Cooley-Tukey radix-2 FFT
+    var temp_real: [FFT_SIZE]AudioFloat = undefined;
+    var temp_imag: [FFT_SIZE]AudioFloat = undefined;
+
+    // Bit-reversal permutation
+    for (i in 0..FFT_SIZE) {
+        const j = bit_reverse(i, 10); // log2(1024) = 10
+        temp_real[j] = input[i];
+        temp_imag[j] = 0.0;
+    }
+
+    // FFT butterflies
+    var len: u32 = 2;
+    while (len <= FFT_SIZE) {
+        const half_len = len / 2;
+        const table_step = FFT_SIZE / len;
+
+        var i: u32 = 0;
+        while (i < FFT_SIZE) {
+            for (j in 0..half_len) {
+                const twiddle_idx = j * table_step;
+                const wr = state.fft_twiddle_real[twiddle_idx % (FFT_SIZE / 2)];
+                const wi = state.fft_twiddle_imag[twiddle_idx % (FFT_SIZE / 2)];
+
+                const idx1 = i + j;
+                const idx2 = i + j + half_len;
+
+                const tr = wr * temp_real[idx2] - wi * temp_imag[idx2];
+                const ti = wr * temp_imag[idx2] + wi * temp_real[idx2];
+
+                temp_real[idx2] = temp_real[idx1] - tr;
+                temp_imag[idx2] = temp_imag[idx1] - ti;
+                temp_real[idx1] = temp_real[idx1] + tr;
+                temp_imag[idx1] = temp_imag[idx1] + ti;
+            }
+            i += len;
+        }
+        len *= 2;
+    }
+
+    // Copy to output (only positive frequencies)
+    for (k in 0..FFT_SIZE / 2 + 1) {
+        output.bins[k] = ComplexSample{
+            .real = temp_real[k],
+            .imag = temp_imag[k],
+        };
+    }
+}
+
+fn fft_inverse(state: *const NoiseReductionState, input: *const Spectrum, output: *[FFT_SIZE]AudioFloat) void {
+    var temp_real: [FFT_SIZE]AudioFloat = undefined;
+    var temp_imag: [FFT_SIZE]AudioFloat = undefined;
+
+    // Reconstruct full spectrum (conjugate symmetry)
+    for (k in 0..FFT_SIZE / 2 + 1) {
+        temp_real[k] = input.bins[k].real;
+        temp_imag[k] = -input.bins[k].imag; // Conjugate for IFFT
+    }
+    for (k in FFT_SIZE / 2 + 1..FFT_SIZE) {
+        temp_real[k] = input.bins[FFT_SIZE - k].real;
+        temp_imag[k] = input.bins[FFT_SIZE - k].imag;
+    }
+
+    // Same butterfly structure as forward FFT
+    // (Using conjugate input and conjugate twiddles = IFFT)
+    var result_real: [FFT_SIZE]AudioFloat = undefined;
+    var result_imag: [FFT_SIZE]AudioFloat = undefined;
+
+    // Bit-reversal
+    for (i in 0..FFT_SIZE) {
+        const j = bit_reverse(i, 10);
+        result_real[j] = temp_real[i];
+        result_imag[j] = temp_imag[i];
+    }
+
+    // FFT butterflies (same as forward)
+    var len: u32 = 2;
+    while (len <= FFT_SIZE) {
+        const half_len = len / 2;
+        const table_step = FFT_SIZE / len;
+
+        var i: u32 = 0;
+        while (i < FFT_SIZE) {
+            for (j in 0..half_len) {
+                const twiddle_idx = j * table_step;
+                const wr = state.fft_twiddle_real[twiddle_idx % (FFT_SIZE / 2)];
+                const wi = -state.fft_twiddle_imag[twiddle_idx % (FFT_SIZE / 2)]; // Conjugate
+
+                const idx1 = i + j;
+                const idx2 = i + j + half_len;
+
+                const tr = wr * result_real[idx2] - wi * result_imag[idx2];
+                const ti = wr * result_imag[idx2] + wi * result_real[idx2];
+
+                result_real[idx2] = result_real[idx1] - tr;
+                result_imag[idx2] = result_imag[idx1] - ti;
+                result_real[idx1] = result_real[idx1] + tr;
+                result_imag[idx1] = result_imag[idx1] + ti;
+            }
+            i += len;
+        }
+        len *= 2;
+    }
+
+    // Scale and output real part
+    const scale = 1.0 / @intToFloat(AudioFloat, FFT_SIZE);
+    for (n in 0..FFT_SIZE) {
+        output[n] = result_real[n] * scale;
+    }
+}
+
+fn bit_reverse(x: u32, bits: u32) u32 {
+    var result: u32 = 0;
+    var val = x;
+
+    for (i in 0..bits) {
+        result = (result << 1) | (val & 1);
+        val >>= 1;
+    }
+
+    return result;
+}
+
+fn db_to_linear(db: AudioFloat) AudioFloat {
+    return math.pow(10.0, db / 20.0);
+}
+
+fn linear_to_db(linear: AudioFloat) AudioFloat {
+    return 20.0 * math.log10(linear + 1e-10);
+}
+
+// ============================================================================
+// Acoustic Echo Cancellation (AEC)
+// ============================================================================
+
+pub const AecConfig = struct {
+    filter_length: u32,           // Adaptive filter length (samples)
+    step_size: AudioFloat,        // NLMS step size (0.1 - 1.0)
+    regularization: AudioFloat,   // Regularization constant
+
+    // Double-talk detection
+    dtd_threshold: AudioFloat,    // Near-end/far-end ratio threshold
+    dtd_hangover: u32,            // Frames to freeze adaptation
+
+    // Nonlinear processing
+    nlp_enabled: bool,            // Enable residual echo suppression
+    nlp_aggressiveness: AudioFloat, // 0.0 - 1.0
+
+    pub fn default() AecConfig {
+        return AecConfig{
+            .filter_length = 2048,      // 128ms at 16kHz
+            .step_size = 0.5,
+            .regularization = 0.001,
+            .dtd_threshold = 0.7,
+            .dtd_hangover = 20,
+            .nlp_enabled = true,
+            .nlp_aggressiveness = 0.5,
+        };
+    }
+};
+
+pub const AecState = struct {
+    config: AecConfig,
+
+    // Adaptive filter coefficients
+    filter: []AudioFloat,
+    filter_length: u32,
+
+    // Far-end (reference) buffer
+    far_end_buffer: []AudioFloat,
+    buffer_index: u32,
+
+    // Filter state
+    error_buffer: [FRAME_SIZE]AudioFloat,
+
+    // Double-talk detection
+    dtd_active: bool,
+    dtd_hangover_counter: u32,
+    far_end_energy: AudioFloat,
+    near_end_energy: AudioFloat,
+
+    // ERLE tracking
+    echo_energy: AudioFloat,
+    residual_energy: AudioFloat,
+};
+
+pub fn aec_init(config: AecConfig) *AecState {
+    const state = memory.allocate(AecState) orelse return null;
+
+    state.config = config;
+    state.filter_length = config.filter_length;
+
+    // Allocate filter coefficients
+    state.filter = memory.allocate_slice(AudioFloat, config.filter_length) orelse {
+        memory.free(state);
+        return null;
+    };
+
+    // Allocate far-end buffer
+    state.far_end_buffer = memory.allocate_slice(AudioFloat, config.filter_length) orelse {
+        memory.free_slice(state.filter);
+        memory.free(state);
+        return null;
+    };
+
+    // Initialize filter to zeros
+    for (i in 0..config.filter_length) {
+        state.filter[i] = 0.0;
+        state.far_end_buffer[i] = 0.0;
+    }
+
+    state.buffer_index = 0;
+    state.dtd_active = false;
+    state.dtd_hangover_counter = 0;
+    state.far_end_energy = 0.0;
+    state.near_end_energy = 0.0;
+    state.echo_energy = 0.0;
+    state.residual_energy = 0.0;
+
+    return state;
+}
+
+pub fn aec_process(state: *AecState, near_end: *const FloatFrame, far_end: *const FloatFrame, output: *FloatFrame) void {
+    // Process each sample in the frame
+    for (n in 0..FRAME_SIZE) {
+        // Update far-end buffer
+        state.far_end_buffer[state.buffer_index] = far_end.samples[n];
+
+        // Compute filter output (echo estimate)
+        var echo_estimate: AudioFloat = 0.0;
+        for (k in 0..state.filter_length) {
+            const buf_idx = (state.buffer_index + state.filter_length - k) % state.filter_length;
+            echo_estimate += state.filter[k] * state.far_end_buffer[buf_idx];
+        }
+
+        // Compute error signal
+        const error = near_end.samples[n] - echo_estimate;
+        state.error_buffer[n] = error;
+        output.samples[n] = error;
+
+        // Update energy estimates
+        state.far_end_energy = 0.99 * state.far_end_energy + 0.01 * far_end.samples[n] * far_end.samples[n];
+        state.near_end_energy = 0.99 * state.near_end_energy + 0.01 * near_end.samples[n] * near_end.samples[n];
+        state.echo_energy = 0.99 * state.echo_energy + 0.01 * echo_estimate * echo_estimate;
+        state.residual_energy = 0.99 * state.residual_energy + 0.01 * error * error;
+
+        // Double-talk detection
+        const dtd = detect_double_talk(state);
+
+        // NLMS adaptation (only if no double-talk)
+        if (!dtd) {
+            // Compute far-end power
+            var far_end_power: AudioFloat = 0.0;
+            for (k in 0..state.filter_length) {
+                const buf_idx = (state.buffer_index + state.filter_length - k) % state.filter_length;
+                far_end_power += state.far_end_buffer[buf_idx] * state.far_end_buffer[buf_idx];
+            }
+
+            // Normalized step size
+            const mu = state.config.step_size / (far_end_power + state.config.regularization);
+
+            // Update filter coefficients
+            for (k in 0..state.filter_length) {
+                const buf_idx = (state.buffer_index + state.filter_length - k) % state.filter_length;
+                state.filter[k] += mu * error * state.far_end_buffer[buf_idx];
+            }
+        }
+
+        // Advance buffer index
+        state.buffer_index = (state.buffer_index + 1) % state.filter_length;
+    }
+
+    // Apply nonlinear processing for residual echo suppression
+    if (state.config.nlp_enabled) {
+        apply_nlp(state, output);
+    }
+
+    output.timestamp_us = near_end.timestamp_us;
+}
+
+fn detect_double_talk(state: *AecState) bool {
+    // Geigel double-talk detector
+    // Compare near-end to far-end level
+
+    if (state.far_end_energy < 1e-10) {
+        return true; // No far-end, assume near-end speech
+    }
+
+    const ratio = state.near_end_energy / (state.echo_energy + 1e-10);
+
+    if (ratio > state.config.dtd_threshold) {
+        state.dtd_active = true;
+        state.dtd_hangover_counter = state.config.dtd_hangover;
+        return true;
+    } else if (state.dtd_hangover_counter > 0) {
+        state.dtd_hangover_counter -= 1;
+        return true;
+    } else {
+        state.dtd_active = false;
+        return false;
+    }
+}
+
+fn apply_nlp(state: *const AecState, frame: *FloatFrame) void {
+    // Compute ERLE (Echo Return Loss Enhancement)
+    const erle = state.echo_energy / (state.residual_energy + 1e-10);
+
+    // If ERLE is low, apply additional suppression
+    if (erle < 6.0) { // Less than 6 dB ERLE
+        const suppression = 1.0 - state.config.nlp_aggressiveness * (1.0 - erle / 6.0);
+
+        for (n in 0..FRAME_SIZE) {
+            frame.samples[n] *= suppression;
+        }
+    }
+}
+
+pub fn aec_get_erle(state: *const AecState) AudioFloat {
+    // Echo Return Loss Enhancement in dB
+    return 10.0 * math.log10(state.echo_energy / (state.residual_energy + 1e-10) + 1e-10);
+}
+
+// ============================================================================
+// Beamforming (Delay-and-Sum with MVDR option)
+// ============================================================================
+
+pub const BeamformerConfig = struct {
+    num_channels: u32,            // Number of microphones
+    mic_spacing_mm: AudioFloat,   // Microphone spacing in mm
+    sample_rate: u32,             // Sample rate
+
+    // Steering
+    steering_angle: AudioFloat,   // Beam direction in degrees (0 = front)
+
+    // Algorithm
+    algorithm: BeamformerAlgorithm,
+
+    // MVDR parameters
+    mvdr_diagonal_loading: AudioFloat,
+
+    pub fn default() BeamformerConfig {
+        return BeamformerConfig{
+            .num_channels = 2,
+            .mic_spacing_mm = 60.0,
+            .sample_rate = SAMPLE_RATE,
+            .steering_angle = 0.0,
+            .algorithm = .DelayAndSum,
+            .mvdr_diagonal_loading = 0.01,
+        };
+    }
+};
+
+pub const BeamformerAlgorithm = enum {
+    DelayAndSum,    // Simple, robust
+    MVDR,           // Minimum Variance Distortionless Response
+    LCMV,           // Linearly Constrained Minimum Variance
+};
+
+pub const BeamformerState = struct {
+    config: BeamformerConfig,
+
+    // Delay lines for each channel
+    delay_buffers: [MAX_CHANNELS][256]AudioFloat,
+    delay_samples: [MAX_CHANNELS]u32,
+    buffer_indices: [MAX_CHANNELS]u32,
+
+    // MVDR covariance matrix (for MVDR algorithm)
+    covariance_matrix: [MAX_CHANNELS][MAX_CHANNELS]ComplexSample,
+
+    // Output buffer
+    output_buffer: [FRAME_SIZE]AudioFloat,
+};
+
+pub fn beamformer_init(config: BeamformerConfig) *BeamformerState {
+    const state = memory.allocate(BeamformerState) orelse return null;
+
+    state.config = config;
+
+    // Calculate delays for steering
+    compute_steering_delays(state);
+
+    // Initialize delay buffers
+    for (ch in 0..MAX_CHANNELS) {
+        state.buffer_indices[ch] = 0;
+        for (i in 0..256) {
+            state.delay_buffers[ch][i] = 0.0;
+        }
+    }
+
+    // Initialize covariance matrix to identity
+    for (i in 0..MAX_CHANNELS) {
+        for (j in 0..MAX_CHANNELS) {
+            if (i == j) {
+                state.covariance_matrix[i][j] = ComplexSample{ .real = 1.0, .imag = 0.0 };
+            } else {
+                state.covariance_matrix[i][j] = ComplexSample{ .real = 0.0, .imag = 0.0 };
+            }
+        }
+    }
+
+    return state;
+}
+
+fn compute_steering_delays(state: *BeamformerState) void {
+    const speed_of_sound: AudioFloat = 343000.0; // mm/s
+    const pi: AudioFloat = 3.14159265358979323846;
+    const angle_rad = state.config.steering_angle * pi / 180.0;
+
+    // Array center is reference
+    const num_mics = state.config.num_channels;
+    const center_idx = @intToFloat(AudioFloat, num_mics - 1) / 2.0;
+
+    for (ch in 0..num_mics) {
+        // Position relative to center
+        const pos = (@intToFloat(AudioFloat, ch) - center_idx) * state.config.mic_spacing_mm;
+
+        // Path difference
+        const path_diff = pos * math.sin(angle_rad);
+
+        // Delay in samples (negative = advance, use as positive delay for farther mics)
+        const delay_sec = path_diff / speed_of_sound;
+        const delay_samples = delay_sec * @intToFloat(AudioFloat, state.config.sample_rate);
+
+        // Round to integer samples (fractional delay would need interpolation)
+        if (delay_samples >= 0) {
+            state.delay_samples[ch] = @floatToInt(u32, delay_samples + 0.5);
+        } else {
+            state.delay_samples[ch] = 0;
+        }
+
+        // Clamp to buffer size
+        if (state.delay_samples[ch] >= 256) {
+            state.delay_samples[ch] = 255;
+        }
+    }
+
+    // Normalize delays (subtract minimum so at least one channel has zero delay)
+    var min_delay: u32 = 255;
+    for (ch in 0..num_mics) {
+        if (state.delay_samples[ch] < min_delay) {
+            min_delay = state.delay_samples[ch];
+        }
+    }
+    for (ch in 0..num_mics) {
+        state.delay_samples[ch] -= min_delay;
+    }
+}
+
+pub fn beamformer_set_steering(state: *BeamformerState, angle_degrees: AudioFloat) void {
+    state.config.steering_angle = angle_degrees;
+    compute_steering_delays(state);
+}
+
+pub fn beamformer_process(state: *BeamformerState, inputs: *const [MAX_CHANNELS]FloatFrame, output: *FloatFrame) void {
+    const num_channels = state.config.num_channels;
+
+    switch (state.config.algorithm) {
+        .DelayAndSum => {
+            beamformer_delay_and_sum(state, inputs, output);
+        },
+        .MVDR => {
+            beamformer_mvdr(state, inputs, output);
+        },
+        .LCMV => {
+            // Fall back to delay-and-sum for now
+            beamformer_delay_and_sum(state, inputs, output);
+        },
+    }
+
+    output.timestamp_us = inputs[0].timestamp_us;
+}
+
+fn beamformer_delay_and_sum(state: *BeamformerState, inputs: *const [MAX_CHANNELS]FloatFrame, output: *FloatFrame) void {
+    const num_channels = state.config.num_channels;
+    const normalization = 1.0 / @intToFloat(AudioFloat, num_channels);
+
+    for (n in 0..FRAME_SIZE) {
+        var sum: AudioFloat = 0.0;
+
+        for (ch in 0..num_channels) {
+            // Add sample to delay buffer
+            state.delay_buffers[ch][state.buffer_indices[ch]] = inputs[ch].samples[n];
+
+            // Get delayed sample
+            const delay = state.delay_samples[ch];
+            const delayed_idx = (state.buffer_indices[ch] + 256 - delay) % 256;
+            sum += state.delay_buffers[ch][delayed_idx];
+
+            // Advance buffer index
+            state.buffer_indices[ch] = (state.buffer_indices[ch] + 1) % 256;
+        }
+
+        output.samples[n] = sum * normalization;
+    }
+}
+
+fn beamformer_mvdr(state: *BeamformerState, inputs: *const [MAX_CHANNELS]FloatFrame, output: *FloatFrame) void {
+    // MVDR (Capon) beamformer
+    // w = R^-1 * a / (a^H * R^-1 * a)
+    // For real-time, we use block processing with covariance estimation
+
+    // First pass: delay-and-sum for basic output
+    beamformer_delay_and_sum(state, inputs, output);
+
+    // Update covariance estimate (simplified: frame-based)
+    // In production, this would use proper frequency-domain processing
+    update_covariance_matrix(state, inputs);
+}
+
+fn update_covariance_matrix(state: *BeamformerState, inputs: *const [MAX_CHANNELS]FloatFrame) void {
+    const num_channels = state.config.num_channels;
+    const alpha: AudioFloat = 0.99; // Smoothing factor
+
+    // Compute sample covariance for this frame
+    for (i in 0..num_channels) {
+        for (j in 0..num_channels) {
+            var cov_real: AudioFloat = 0.0;
+
+            for (n in 0..FRAME_SIZE) {
+                cov_real += inputs[i].samples[n] * inputs[j].samples[n];
+            }
+
+            cov_real /= @intToFloat(AudioFloat, FRAME_SIZE);
+
+            // Exponential smoothing
+            state.covariance_matrix[i][j].real =
+                alpha * state.covariance_matrix[i][j].real + (1.0 - alpha) * cov_real;
+        }
+    }
+
+    // Add diagonal loading for stability
+    for (i in 0..num_channels) {
+        state.covariance_matrix[i][i].real += state.config.mvdr_diagonal_loading;
+    }
+}
+
+// ============================================================================
+// Automatic Gain Control (AGC)
+// ============================================================================
+
+pub const AgcConfig = struct {
+    target_level_db: AudioFloat,    // Target output level
+    max_gain_db: AudioFloat,        // Maximum gain
+    min_gain_db: AudioFloat,        // Minimum gain (can be negative)
+    attack_time_ms: AudioFloat,     // How fast to reduce gain
+    release_time_ms: AudioFloat,    // How fast to increase gain
+
+    pub fn default() AgcConfig {
+        return AgcConfig{
+            .target_level_db = -18.0,
+            .max_gain_db = 30.0,
+            .min_gain_db = -6.0,
+            .attack_time_ms = 10.0,
+            .release_time_ms = 100.0,
+        };
+    }
+};
+
+pub const AgcState = struct {
+    config: AgcConfig,
+    current_gain_db: AudioFloat,
+    envelope: AudioFloat,
+    attack_coef: AudioFloat,
+    release_coef: AudioFloat,
+};
+
+pub fn agc_init(config: AgcConfig) *AgcState {
+    const state = memory.allocate(AgcState) orelse return null;
+
+    state.config = config;
+    state.current_gain_db = 0.0;
+    state.envelope = 0.0;
+
+    // Compute time constants
+    const sample_rate_f = @intToFloat(AudioFloat, SAMPLE_RATE);
+    state.attack_coef = 1.0 - math.exp(-1000.0 / (config.attack_time_ms * sample_rate_f));
+    state.release_coef = 1.0 - math.exp(-1000.0 / (config.release_time_ms * sample_rate_f));
+
+    return state;
+}
+
+pub fn agc_process(state: *AgcState, input: *const FloatFrame, output: *FloatFrame) void {
+    for (n in 0..FRAME_SIZE) {
+        const abs_sample = if (input.samples[n] >= 0) input.samples[n] else -input.samples[n];
+
+        // Envelope follower
+        if (abs_sample > state.envelope) {
+            state.envelope += state.attack_coef * (abs_sample - state.envelope);
+        } else {
+            state.envelope += state.release_coef * (abs_sample - state.envelope);
+        }
+
+        // Compute desired gain
+        const envelope_db = linear_to_db(state.envelope + 1e-10);
+        var desired_gain_db = state.config.target_level_db - envelope_db;
+
+        // Clamp gain
+        if (desired_gain_db > state.config.max_gain_db) {
+            desired_gain_db = state.config.max_gain_db;
+        }
+        if (desired_gain_db < state.config.min_gain_db) {
+            desired_gain_db = state.config.min_gain_db;
+        }
+
+        // Smooth gain changes
+        const gain_diff = desired_gain_db - state.current_gain_db;
+        if (gain_diff < 0) {
+            // Attack (gain reduction)
+            state.current_gain_db += state.attack_coef * gain_diff;
+        } else {
+            // Release (gain increase)
+            state.current_gain_db += state.release_coef * gain_diff;
+        }
+
+        // Apply gain
+        const gain_linear = db_to_linear(state.current_gain_db);
+        output.samples[n] = input.samples[n] * gain_linear;
+    }
+
+    output.timestamp_us = input.timestamp_us;
+}
+
+// ============================================================================
+// Complete Audio Pipeline
+// ============================================================================
+
+pub const AudioPipelineConfig = struct {
+    enable_noise_reduction: bool,
+    enable_aec: bool,
+    enable_beamforming: bool,
+    enable_agc: bool,
+
+    noise_config: NoiseReductionConfig,
+    aec_config: AecConfig,
+    beam_config: BeamformerConfig,
+    agc_config: AgcConfig,
+
+    pub fn default() AudioPipelineConfig {
+        return AudioPipelineConfig{
+            .enable_noise_reduction = true,
+            .enable_aec = true,
+            .enable_beamforming = false, // Disabled by default (single mic)
+            .enable_agc = true,
+            .noise_config = NoiseReductionConfig.default(),
+            .aec_config = AecConfig.default(),
+            .beam_config = BeamformerConfig.default(),
+            .agc_config = AgcConfig.default(),
+        };
+    }
+};
+
+pub const AudioPipeline = struct {
+    config: AudioPipelineConfig,
+
+    noise_state: ?*NoiseReductionState,
+    aec_state: ?*AecState,
+    beam_state: ?*BeamformerState,
+    agc_state: ?*AgcState,
+
+    // Intermediate buffers
+    temp_frame1: FloatFrame,
+    temp_frame2: FloatFrame,
+};
+
+pub fn audio_pipeline_init(config: AudioPipelineConfig) *AudioPipeline {
+    const pipeline = memory.allocate(AudioPipeline) orelse return null;
+
+    pipeline.config = config;
+
+    // Initialize enabled stages
+    if (config.enable_noise_reduction) {
+        pipeline.noise_state = noise_reduction_init(config.noise_config);
+    } else {
+        pipeline.noise_state = null;
+    }
+
+    if (config.enable_aec) {
+        pipeline.aec_state = aec_init(config.aec_config);
+    } else {
+        pipeline.aec_state = null;
+    }
+
+    if (config.enable_beamforming) {
+        pipeline.beam_state = beamformer_init(config.beam_config);
+    } else {
+        pipeline.beam_state = null;
+    }
+
+    if (config.enable_agc) {
+        pipeline.agc_state = agc_init(config.agc_config);
+    } else {
+        pipeline.agc_state = null;
+    }
+
+    return pipeline;
+}
+
+pub fn audio_pipeline_process(
+    pipeline: *AudioPipeline,
+    mic_input: *const FloatFrame,
+    speaker_reference: ?*const FloatFrame,
+    output: *FloatFrame
+) void {
+    var current_input = mic_input;
+    var current_output = &pipeline.temp_frame1;
+
+    // Stage 1: AEC (if enabled and reference available)
+    if (pipeline.aec_state) |aec| {
+        if (speaker_reference) |ref| {
+            aec_process(aec, current_input, ref, current_output);
+            current_input = current_output;
+            current_output = &pipeline.temp_frame2;
+        }
+    }
+
+    // Stage 2: Noise reduction
+    if (pipeline.noise_state) |nr| {
+        noise_reduction_process(nr, current_input, current_output);
+        current_input = current_output;
+        current_output = if (current_output == &pipeline.temp_frame1) &pipeline.temp_frame2 else &pipeline.temp_frame1;
+    }
+
+    // Stage 3: AGC
+    if (pipeline.agc_state) |agc| {
+        agc_process(agc, current_input, current_output);
+        current_input = current_output;
+    }
+
+    // Copy to output
+    for (n in 0..FRAME_SIZE) {
+        output.samples[n] = current_input.samples[n];
+    }
+    output.timestamp_us = mic_input.timestamp_us;
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+pub fn convert_i16_to_float(input: *const AudioFrame, output: *FloatFrame) void {
+    const scale: AudioFloat = 1.0 / 32768.0;
+
+    for (n in 0..FRAME_SIZE) {
+        output.samples[n] = @intToFloat(AudioFloat, input.samples[n]) * scale;
+    }
+    output.timestamp_us = input.timestamp_us;
+}
+
+pub fn convert_float_to_i16(input: *const FloatFrame, output: *AudioFrame) void {
+    for (n in 0..FRAME_SIZE) {
+        var sample = input.samples[n] * 32767.0;
+
+        // Clamp to prevent overflow
+        if (sample > 32767.0) sample = 32767.0;
+        if (sample < -32768.0) sample = -32768.0;
+
+        output.samples[n] = @floatToInt(AudioSample, sample);
+    }
+    output.timestamp_us = input.timestamp_us;
+}
+
+// ============================================================================
+// Module Initialization
+// ============================================================================
+
+pub fn init() bool {
+    // Module initialization
+    // In a real system, this might allocate fixed buffers or
+    // initialize hardware codecs
+
+    return true;
+}
