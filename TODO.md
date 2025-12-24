@@ -27,6 +27,17 @@
   - Entity synonyms per language
   - Response templates
   - Built-in English and Spanish
+- ✅ **Ambient Sound Detection** - `kernel/src/iot/ambient_sound.home`
+  - Safety sounds: smoke alarm, CO alarm, glass breaking, gunshot
+  - Home sounds: doorbell, knock, door open/close
+  - Human sounds: baby crying, coughing, scream
+  - Animal sounds: dog barking, cat meowing
+  - Mel spectrogram classification with neural network
+- ✅ **Voice Routines/Shortcuts** - `kernel/src/iot/voice_routines.home`
+  - Multi-action voice macros ("Good Morning" → lights, coffee, weather)
+  - 10 default routines: Good Morning, Good Night, Leaving/Arriving Home, etc.
+  - Trigger types: voice, time, sunrise/sunset, device state, location
+  - 20+ action types with conditions and rate limiting
 
 ### Phase 18 Edge Computing & IoT (COMPLETED Dec 19, 2025)
 - ✅ **IoT Protocols** - `kernel/src/iot/`
@@ -2803,6 +2814,25 @@ Build a next-generation operating system that prioritizes:
     - [x] Response templates with placeholders
     - [x] Number word parsing
     - [x] Filler word removal
+  - [x] Ambient sound detection - `kernel/src/iot/ambient_sound.home`
+    - [x] Safety sounds (smoke alarm, CO alarm, glass breaking, gunshot)
+    - [x] Home sounds (doorbell, knock, door open/close)
+    - [x] Human sounds (baby crying, coughing, scream)
+    - [x] Animal sounds (dog barking, cat meowing)
+    - [x] Appliance sounds (microwave, washer, dryer, phone)
+    - [x] Mel spectrogram feature extraction
+    - [x] Pattern-based and neural network classification
+    - [x] Priority-based alert system
+    - [x] Configurable detection callbacks
+  - [x] Voice routines/shortcuts - `kernel/src/iot/voice_routines.home`
+    - [x] Multi-action voice macros
+    - [x] Trigger types: voice, time, sunrise/sunset, device state, location
+    - [x] Condition system (time range, day of week, mode, presence)
+    - [x] 20+ action types (device control, media, notifications, security)
+    - [x] Default routines: Good Morning, Good Night, Leaving Home, I'm Home
+    - [x] Party Mode, Movie Time, Relax Mode, Work Mode
+    - [x] Execution context with variables
+    - [x] Rate limiting and cooldowns
 
 ### 18.4 Industrial Applications
 - [x] CAN bus support (`kernel/src/industrial/can_bus.home`)

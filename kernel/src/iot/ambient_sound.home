@@ -1,0 +1,1287 @@
+// Ambient Sound Detection for Smart Home
+// Detects safety-critical and notable sounds: doorbell, smoke alarm,
+// glass breaking, baby crying, dog barking, etc.
+// Part of HomeOS Voice Assistant subsystem
+
+const basics = @import("basics");
+const memory = @import("memory");
+const math = @import("math");
+
+// ============================================================================
+// Sound Detection Constants
+// ============================================================================
+
+const SAMPLE_RATE: u32 = 16000;
+const FRAME_SIZE: u32 = 512;              // 32ms frames
+const FFT_SIZE: u32 = 512;
+const NUM_MEL_BINS: u32 = 40;             // Mel spectrogram bins
+const CONTEXT_FRAMES: u32 = 32;           // ~1 second context window
+const MAX_SOUND_CLASSES: u32 = 32;
+const MAX_DETECTION_CALLBACKS: u32 = 16;
+const DETECTION_COOLDOWN_MS: u64 = 2000;  // Minimum time between same detections
+
+// ============================================================================
+// Sound Classes
+// ============================================================================
+
+pub const SoundClass = enum(u8) {
+    // Safety/Emergency
+    SmokeAlarm = 0,
+    COAlarm = 1,
+    FireAlarm = 2,
+    SecurityAlarm = 3,
+    GlassBreaking = 4,
+    Gunshot = 5,
+
+    // Home sounds
+    Doorbell = 6,
+    Knock = 7,
+    DoorOpen = 8,
+    DoorClose = 9,
+    WindowOpen = 10,
+
+    // Human sounds
+    BabyCrying = 11,
+    Coughing = 12,
+    Snoring = 13,
+    Scream = 14,
+    Speech = 15,
+    Laughter = 16,
+
+    // Animal sounds
+    DogBarking = 17,
+    DogWhining = 18,
+    CatMeowing = 19,
+
+    // Appliance sounds
+    WaterRunning = 20,
+    ApplianceBeep = 21,
+    MicrowaveBeep = 22,
+    WashingMachineDone = 23,
+    DryerDone = 24,
+    PhoneRinging = 25,
+    TimerAlarm = 26,
+
+    // Vehicle sounds
+    CarHorn = 27,
+    CarAlarm = 28,
+    Siren = 29,
+
+    // Other
+    Silence = 30,
+    Unknown = 31,
+
+    pub fn get_name(self: SoundClass) []const u8 {
+        return switch (self) {
+            .SmokeAlarm => "Smoke Alarm",
+            .COAlarm => "CO Alarm",
+            .FireAlarm => "Fire Alarm",
+            .SecurityAlarm => "Security Alarm",
+            .GlassBreaking => "Glass Breaking",
+            .Gunshot => "Gunshot",
+            .Doorbell => "Doorbell",
+            .Knock => "Knock",
+            .DoorOpen => "Door Opening",
+            .DoorClose => "Door Closing",
+            .WindowOpen => "Window Opening",
+            .BabyCrying => "Baby Crying",
+            .Coughing => "Coughing",
+            .Snoring => "Snoring",
+            .Scream => "Scream",
+            .Speech => "Speech",
+            .Laughter => "Laughter",
+            .DogBarking => "Dog Barking",
+            .DogWhining => "Dog Whining",
+            .CatMeowing => "Cat Meowing",
+            .WaterRunning => "Water Running",
+            .ApplianceBeep => "Appliance Beep",
+            .MicrowaveBeep => "Microwave",
+            .WashingMachineDone => "Washing Machine",
+            .DryerDone => "Dryer",
+            .PhoneRinging => "Phone Ringing",
+            .TimerAlarm => "Timer",
+            .CarHorn => "Car Horn",
+            .CarAlarm => "Car Alarm",
+            .Siren => "Siren",
+            .Silence => "Silence",
+            .Unknown => "Unknown",
+        };
+    }
+
+    pub fn get_priority(self: SoundClass) SoundPriority {
+        return switch (self) {
+            .SmokeAlarm, .COAlarm, .FireAlarm, .GlassBreaking, .Gunshot, .Scream => .Critical,
+            .SecurityAlarm, .BabyCrying, .CarAlarm, .Siren => .High,
+            .Doorbell, .Knock, .DogBarking, .PhoneRinging => .Medium,
+            .DogWhining, .CatMeowing, .Coughing, .ApplianceBeep => .Low,
+            else => .Info,
+        };
+    }
+
+    pub fn is_safety_critical(self: SoundClass) bool {
+        return switch (self) {
+            .SmokeAlarm, .COAlarm, .FireAlarm, .GlassBreaking, .Gunshot, .SecurityAlarm, .Scream => true,
+            else => false,
+        };
+    }
+};
+
+pub const SoundPriority = enum(u8) {
+    Critical = 0,   // Immediate action required
+    High = 1,       // Urgent notification
+    Medium = 2,     // Standard notification
+    Low = 3,        // Informational
+    Info = 4,       // Background logging only
+};
+
+// ============================================================================
+// Detection Result
+// ============================================================================
+
+pub const SoundDetection = struct {
+    sound_class: SoundClass,
+    confidence: f32,              // 0.0 - 1.0
+    timestamp_ms: u64,
+    duration_ms: u32,             // Estimated sound duration
+    priority: SoundPriority,
+
+    // Location (if multi-room)
+    room_id: ?u32,
+    room_name: [32]u8,
+    room_name_len: u32,
+
+    // Audio characteristics
+    peak_frequency_hz: u32,
+    energy_db: f32,
+
+    pub fn get_room_name(self: *const SoundDetection) []const u8 {
+        return self.room_name[0..self.room_name_len];
+    }
+};
+
+// ============================================================================
+// Mel Spectrogram Features
+// ============================================================================
+
+pub const MelSpectrogram = struct {
+    bins: [NUM_MEL_BINS]f32,
+    energy: f32,
+    timestamp_ms: u64,
+};
+
+pub const SpectrogramContext = struct {
+    frames: [CONTEXT_FRAMES]MelSpectrogram,
+    frame_count: u32,
+    write_index: u32,
+
+    pub fn add_frame(self: *SpectrogramContext, frame: *const MelSpectrogram) void {
+        self.frames[self.write_index] = frame.*;
+        self.write_index = (self.write_index + 1) % CONTEXT_FRAMES;
+        if (self.frame_count < CONTEXT_FRAMES) {
+            self.frame_count += 1;
+        }
+    }
+
+    pub fn get_frame(self: *const SpectrogramContext, offset: u32) ?*const MelSpectrogram {
+        if (offset >= self.frame_count) return null;
+        const idx = (self.write_index + CONTEXT_FRAMES - 1 - offset) % CONTEXT_FRAMES;
+        return &self.frames[idx];
+    }
+};
+
+// ============================================================================
+// Sound Pattern Definitions
+// ============================================================================
+
+pub const SoundPattern = struct {
+    sound_class: SoundClass,
+
+    // Frequency characteristics
+    min_freq_hz: u32,
+    max_freq_hz: u32,
+    peak_freq_hz: u32,
+    freq_tolerance_hz: u32,
+
+    // Temporal characteristics
+    min_duration_ms: u32,
+    max_duration_ms: u32,
+    is_periodic: bool,
+    period_ms: u32,              // For periodic sounds like alarms
+    period_tolerance_ms: u32,
+
+    // Energy characteristics
+    min_energy_db: f32,
+    relative_energy: f32,        // Compared to background
+
+    // Spectral shape (simplified)
+    is_harmonic: bool,           // Has clear harmonics
+    is_broadband: bool,          // Wide frequency spread
+    is_impulsive: bool,          // Sharp onset
+
+    // Detection threshold
+    confidence_threshold: f32,
+};
+
+// Pre-defined patterns for common sounds
+const SOUND_PATTERNS = [_]SoundPattern{
+    // Smoke Alarm - High pitched beeping, ~3kHz, periodic
+    SoundPattern{
+        .sound_class = .SmokeAlarm,
+        .min_freq_hz = 2500,
+        .max_freq_hz = 4000,
+        .peak_freq_hz = 3200,
+        .freq_tolerance_hz = 300,
+        .min_duration_ms = 100,
+        .max_duration_ms = 500,
+        .is_periodic = true,
+        .period_ms = 1000,
+        .period_tolerance_ms = 200,
+        .min_energy_db = -30.0,
+        .relative_energy = 20.0,
+        .is_harmonic = true,
+        .is_broadband = false,
+        .is_impulsive = true,
+        .confidence_threshold = 0.7,
+    },
+    // CO Alarm - Different pattern, often 4 beeps
+    SoundPattern{
+        .sound_class = .COAlarm,
+        .min_freq_hz = 2000,
+        .max_freq_hz = 3500,
+        .peak_freq_hz = 2800,
+        .freq_tolerance_hz = 300,
+        .min_duration_ms = 100,
+        .max_duration_ms = 300,
+        .is_periodic = true,
+        .period_ms = 500,
+        .period_tolerance_ms = 100,
+        .min_energy_db = -30.0,
+        .relative_energy = 20.0,
+        .is_harmonic = true,
+        .is_broadband = false,
+        .is_impulsive = true,
+        .confidence_threshold = 0.7,
+    },
+    // Glass Breaking - Broadband impulsive
+    SoundPattern{
+        .sound_class = .GlassBreaking,
+        .min_freq_hz = 1000,
+        .max_freq_hz = 8000,
+        .peak_freq_hz = 4000,
+        .freq_tolerance_hz = 2000,
+        .min_duration_ms = 50,
+        .max_duration_ms = 2000,
+        .is_periodic = false,
+        .period_ms = 0,
+        .period_tolerance_ms = 0,
+        .min_energy_db = -20.0,
+        .relative_energy = 30.0,
+        .is_harmonic = false,
+        .is_broadband = true,
+        .is_impulsive = true,
+        .confidence_threshold = 0.6,
+    },
+    // Doorbell - Musical tones, varies by doorbell
+    SoundPattern{
+        .sound_class = .Doorbell,
+        .min_freq_hz = 500,
+        .max_freq_hz = 2000,
+        .peak_freq_hz = 1000,
+        .freq_tolerance_hz = 500,
+        .min_duration_ms = 500,
+        .max_duration_ms = 3000,
+        .is_periodic = false,
+        .period_ms = 0,
+        .period_tolerance_ms = 0,
+        .min_energy_db = -40.0,
+        .relative_energy = 15.0,
+        .is_harmonic = true,
+        .is_broadband = false,
+        .is_impulsive = false,
+        .confidence_threshold = 0.6,
+    },
+    // Baby Crying - 300-600Hz fundamental, harmonics
+    SoundPattern{
+        .sound_class = .BabyCrying,
+        .min_freq_hz = 250,
+        .max_freq_hz = 1500,
+        .peak_freq_hz = 450,
+        .freq_tolerance_hz = 150,
+        .min_duration_ms = 500,
+        .max_duration_ms = 10000,
+        .is_periodic = false,
+        .period_ms = 0,
+        .period_tolerance_ms = 0,
+        .min_energy_db = -35.0,
+        .relative_energy = 15.0,
+        .is_harmonic = true,
+        .is_broadband = false,
+        .is_impulsive = false,
+        .confidence_threshold = 0.65,
+    },
+    // Dog Barking - 400-1000Hz, impulsive
+    SoundPattern{
+        .sound_class = .DogBarking,
+        .min_freq_hz = 300,
+        .max_freq_hz = 2000,
+        .peak_freq_hz = 700,
+        .freq_tolerance_hz = 300,
+        .min_duration_ms = 100,
+        .max_duration_ms = 500,
+        .is_periodic = false,
+        .period_ms = 0,
+        .period_tolerance_ms = 0,
+        .min_energy_db = -35.0,
+        .relative_energy = 20.0,
+        .is_harmonic = true,
+        .is_broadband = false,
+        .is_impulsive = true,
+        .confidence_threshold = 0.6,
+    },
+    // Knock - Low frequency impulsive
+    SoundPattern{
+        .sound_class = .Knock,
+        .min_freq_hz = 100,
+        .max_freq_hz = 1000,
+        .peak_freq_hz = 400,
+        .freq_tolerance_hz = 200,
+        .min_duration_ms = 50,
+        .max_duration_ms = 200,
+        .is_periodic = false,
+        .period_ms = 0,
+        .period_tolerance_ms = 0,
+        .min_energy_db = -40.0,
+        .relative_energy = 15.0,
+        .is_harmonic = false,
+        .is_broadband = true,
+        .is_impulsive = true,
+        .confidence_threshold = 0.5,
+    },
+    // Siren - Sweeping frequency
+    SoundPattern{
+        .sound_class = .Siren,
+        .min_freq_hz = 500,
+        .max_freq_hz = 2000,
+        .peak_freq_hz = 1000,
+        .freq_tolerance_hz = 500,
+        .min_duration_ms = 1000,
+        .max_duration_ms = 10000,
+        .is_periodic = true,
+        .period_ms = 2000,
+        .period_tolerance_ms = 500,
+        .min_energy_db = -30.0,
+        .relative_energy = 25.0,
+        .is_harmonic = true,
+        .is_broadband = false,
+        .is_impulsive = false,
+        .confidence_threshold = 0.7,
+    },
+};
+
+// ============================================================================
+// Neural Network Classifier
+// ============================================================================
+
+pub const SoundClassifier = struct {
+    // Mel filterbank
+    mel_filterbank: [NUM_MEL_BINS][FFT_SIZE / 2 + 1]f32,
+
+    // FFT
+    fft_real: [FFT_SIZE]f32,
+    fft_imag: [FFT_SIZE]f32,
+    window: [FRAME_SIZE]f32,
+
+    // Simple CNN-like classifier (simplified for embedded)
+    // Layer 1: Temporal convolution over spectrogram
+    conv1_weights: [32][NUM_MEL_BINS][5]f32,    // 32 filters, 5-frame kernel
+    conv1_bias: [32]f32,
+
+    // Layer 2: Feature extraction
+    conv2_weights: [64][32][3]f32,              // 64 filters, 3-frame kernel
+    conv2_bias: [64]f32,
+
+    // Dense layer for classification
+    dense_weights: [MAX_SOUND_CLASSES][64]f32,
+    dense_bias: [MAX_SOUND_CLASSES]f32,
+
+    // Running statistics for normalization
+    mel_mean: [NUM_MEL_BINS]f32,
+    mel_std: [NUM_MEL_BINS]f32,
+    stats_count: u64,
+};
+
+pub fn classifier_init() *SoundClassifier {
+    const classifier = memory.allocate(SoundClassifier) orelse return null;
+
+    // Initialize mel filterbank
+    compute_mel_filterbank(classifier);
+
+    // Initialize Hann window
+    const pi: f32 = 3.14159265358979323846;
+    for (n in 0..FRAME_SIZE) {
+        classifier.window[n] = 0.5 * (1.0 - math.cos(2.0 * pi * @intToFloat(f32, n) / @intToFloat(f32, FRAME_SIZE - 1)));
+    }
+
+    // Initialize weights (would be loaded from trained model)
+    init_random_weights(classifier);
+
+    // Initialize normalization stats
+    for (i in 0..NUM_MEL_BINS) {
+        classifier.mel_mean[i] = 0.0;
+        classifier.mel_std[i] = 1.0;
+    }
+    classifier.stats_count = 0;
+
+    return classifier;
+}
+
+fn compute_mel_filterbank(classifier: *SoundClassifier) void {
+    const hz_to_mel = fn(hz: f32) f32 {
+        return 2595.0 * math.log10(1.0 + hz / 700.0);
+    };
+
+    const mel_to_hz = fn(mel: f32) f32 {
+        return 700.0 * (math.pow(10.0, mel / 2595.0) - 1.0);
+    };
+
+    const low_freq: f32 = 80.0;
+    const high_freq: f32 = 7600.0;
+    const low_mel = hz_to_mel(low_freq);
+    const high_mel = hz_to_mel(high_freq);
+    const mel_step = (high_mel - low_mel) / @intToFloat(f32, NUM_MEL_BINS + 1);
+
+    var center_freqs: [NUM_MEL_BINS + 2]f32 = undefined;
+    for (i in 0..NUM_MEL_BINS + 2) {
+        center_freqs[i] = mel_to_hz(low_mel + @intToFloat(f32, i) * mel_step);
+    }
+
+    const freq_resolution = @intToFloat(f32, SAMPLE_RATE) / @intToFloat(f32, FFT_SIZE);
+
+    for (filt in 0..NUM_MEL_BINS) {
+        for (bin in 0..FFT_SIZE / 2 + 1) {
+            const freq = @intToFloat(f32, bin) * freq_resolution;
+
+            if (freq >= center_freqs[filt] and freq < center_freqs[filt + 1]) {
+                classifier.mel_filterbank[filt][bin] = (freq - center_freqs[filt]) / (center_freqs[filt + 1] - center_freqs[filt]);
+            } else if (freq >= center_freqs[filt + 1] and freq < center_freqs[filt + 2]) {
+                classifier.mel_filterbank[filt][bin] = (center_freqs[filt + 2] - freq) / (center_freqs[filt + 2] - center_freqs[filt + 1]);
+            } else {
+                classifier.mel_filterbank[filt][bin] = 0.0;
+            }
+        }
+    }
+}
+
+fn init_random_weights(classifier: *SoundClassifier) void {
+    var seed: u32 = 42;
+
+    // Conv1
+    for (f in 0..32) {
+        for (m in 0..NUM_MEL_BINS) {
+            for (k in 0..5) {
+                seed = lcg_next(seed);
+                classifier.conv1_weights[f][m][k] = (seed_to_float(seed) - 0.5) * 0.1;
+            }
+        }
+        classifier.conv1_bias[f] = 0.0;
+    }
+
+    // Conv2
+    for (f in 0..64) {
+        for (c in 0..32) {
+            for (k in 0..3) {
+                seed = lcg_next(seed);
+                classifier.conv2_weights[f][c][k] = (seed_to_float(seed) - 0.5) * 0.1;
+            }
+        }
+        classifier.conv2_bias[f] = 0.0;
+    }
+
+    // Dense
+    for (c in 0..MAX_SOUND_CLASSES) {
+        for (f in 0..64) {
+            seed = lcg_next(seed);
+            classifier.dense_weights[c][f] = (seed_to_float(seed) - 0.5) * 0.1;
+        }
+        classifier.dense_bias[c] = 0.0;
+    }
+}
+
+fn lcg_next(seed: u32) u32 {
+    return (seed *% 1103515245 +% 12345) & 0x7FFFFFFF;
+}
+
+fn seed_to_float(seed: u32) f32 {
+    return @intToFloat(f32, seed) / @intToFloat(f32, 0x7FFFFFFF);
+}
+
+pub fn extract_mel_spectrogram(classifier: *SoundClassifier, samples: *const [FRAME_SIZE]i16) MelSpectrogram {
+    var result = MelSpectrogram{
+        .bins = undefined,
+        .energy = 0.0,
+        .timestamp_ms = 0,
+    };
+
+    // Apply window and compute energy
+    var windowed: [FFT_SIZE]f32 = undefined;
+    for (n in 0..FRAME_SIZE) {
+        const s = @intToFloat(f32, samples[n]) / 32768.0;
+        windowed[n] = s * classifier.window[n];
+        result.energy += s * s;
+    }
+    for (n in FRAME_SIZE..FFT_SIZE) {
+        windowed[n] = 0.0;
+    }
+    result.energy = 10.0 * math.log10(result.energy / @intToFloat(f32, FRAME_SIZE) + 1e-10);
+
+    // FFT
+    fft_compute(&windowed, &classifier.fft_real, &classifier.fft_imag);
+
+    // Power spectrum
+    var power_spectrum: [FFT_SIZE / 2 + 1]f32 = undefined;
+    for (k in 0..FFT_SIZE / 2 + 1) {
+        power_spectrum[k] = classifier.fft_real[k] * classifier.fft_real[k] +
+                           classifier.fft_imag[k] * classifier.fft_imag[k];
+    }
+
+    // Apply mel filterbank
+    for (m in 0..NUM_MEL_BINS) {
+        var sum: f32 = 0.0;
+        for (k in 0..FFT_SIZE / 2 + 1) {
+            sum += classifier.mel_filterbank[m][k] * power_spectrum[k];
+        }
+        result.bins[m] = math.log(sum + 1e-10);
+    }
+
+    // Update running statistics
+    update_normalization_stats(classifier, &result);
+
+    // Normalize
+    for (m in 0..NUM_MEL_BINS) {
+        result.bins[m] = (result.bins[m] - classifier.mel_mean[m]) / (classifier.mel_std[m] + 1e-6);
+    }
+
+    return result;
+}
+
+fn update_normalization_stats(classifier: *SoundClassifier, frame: *const MelSpectrogram) void {
+    classifier.stats_count += 1;
+    const n = @intToFloat(f32, classifier.stats_count);
+
+    for (m in 0..NUM_MEL_BINS) {
+        const delta = frame.bins[m] - classifier.mel_mean[m];
+        classifier.mel_mean[m] += delta / n;
+        classifier.mel_std[m] = math.sqrt(classifier.mel_std[m] * classifier.mel_std[m] + delta * delta / n);
+    }
+}
+
+fn fft_compute(input: *const [FFT_SIZE]f32, out_real: *[FFT_SIZE]f32, out_imag: *[FFT_SIZE]f32) void {
+    // Bit-reversal
+    for (i in 0..FFT_SIZE) {
+        const j = bit_reverse(i, 9);
+        out_real[j] = input[i];
+        out_imag[j] = 0.0;
+    }
+
+    // Butterflies
+    const pi: f32 = 3.14159265358979323846;
+    var len: u32 = 2;
+    while (len <= FFT_SIZE) {
+        const half = len / 2;
+        const angle_step = -2.0 * pi / @intToFloat(f32, len);
+
+        var i: u32 = 0;
+        while (i < FFT_SIZE) {
+            for (j in 0..half) {
+                const angle = angle_step * @intToFloat(f32, j);
+                const wr = math.cos(angle);
+                const wi = math.sin(angle);
+
+                const idx1 = i + j;
+                const idx2 = i + j + half;
+
+                const tr = wr * out_real[idx2] - wi * out_imag[idx2];
+                const ti = wr * out_imag[idx2] + wi * out_real[idx2];
+
+                out_real[idx2] = out_real[idx1] - tr;
+                out_imag[idx2] = out_imag[idx1] - ti;
+                out_real[idx1] = out_real[idx1] + tr;
+                out_imag[idx1] = out_imag[idx1] + ti;
+            }
+            i += len;
+        }
+        len *= 2;
+    }
+}
+
+fn bit_reverse(x: u32, bits: u32) u32 {
+    var result: u32 = 0;
+    var val = x;
+    for (i in 0..bits) {
+        result = (result << 1) | (val & 1);
+        val >>= 1;
+    }
+    return result;
+}
+
+pub fn classify_sound(classifier: *const SoundClassifier, context: *const SpectrogramContext) [MAX_SOUND_CLASSES]f32 {
+    var scores: [MAX_SOUND_CLASSES]f32 = undefined;
+    for (i in 0..MAX_SOUND_CLASSES) {
+        scores[i] = 0.0;
+    }
+
+    if (context.frame_count < 5) return scores;
+
+    // Simplified classification using temporal features
+    // In production, this would be a proper CNN forward pass
+
+    // Extract temporal features
+    var temporal_features: [64]f32 = undefined;
+    extract_temporal_features(context, &temporal_features);
+
+    // Dense layer (simplified)
+    for (c in 0..MAX_SOUND_CLASSES) {
+        var sum: f32 = classifier.dense_bias[c];
+        for (f in 0..64) {
+            sum += classifier.dense_weights[c][f] * temporal_features[f];
+        }
+        scores[c] = sum;
+    }
+
+    // Softmax
+    var max_score: f32 = scores[0];
+    for (c in 1..MAX_SOUND_CLASSES) {
+        if (scores[c] > max_score) max_score = scores[c];
+    }
+
+    var sum_exp: f32 = 0.0;
+    for (c in 0..MAX_SOUND_CLASSES) {
+        scores[c] = math.exp(scores[c] - max_score);
+        sum_exp += scores[c];
+    }
+
+    for (c in 0..MAX_SOUND_CLASSES) {
+        scores[c] /= sum_exp;
+    }
+
+    return scores;
+}
+
+fn extract_temporal_features(context: *const SpectrogramContext, features: *[64]f32) void {
+    // Statistical features over time
+    var mean: [NUM_MEL_BINS]f32 = undefined;
+    var std: [NUM_MEL_BINS]f32 = undefined;
+    var delta_mean: [NUM_MEL_BINS]f32 = undefined;
+
+    for (m in 0..NUM_MEL_BINS) {
+        mean[m] = 0.0;
+        std[m] = 0.0;
+        delta_mean[m] = 0.0;
+    }
+
+    // Compute mean
+    const n = context.frame_count;
+    for (t in 0..n) {
+        if (context.get_frame(t)) |frame| {
+            for (m in 0..NUM_MEL_BINS) {
+                mean[m] += frame.bins[m];
+            }
+        }
+    }
+    for (m in 0..NUM_MEL_BINS) {
+        mean[m] /= @intToFloat(f32, n);
+    }
+
+    // Compute std and delta
+    for (t in 0..n) {
+        if (context.get_frame(t)) |frame| {
+            for (m in 0..NUM_MEL_BINS) {
+                const diff = frame.bins[m] - mean[m];
+                std[m] += diff * diff;
+            }
+
+            if (t > 0) {
+                if (context.get_frame(t - 1)) |prev| {
+                    for (m in 0..NUM_MEL_BINS) {
+                        delta_mean[m] += frame.bins[m] - prev.bins[m];
+                    }
+                }
+            }
+        }
+    }
+
+    for (m in 0..NUM_MEL_BINS) {
+        std[m] = math.sqrt(std[m] / @intToFloat(f32, n));
+        if (n > 1) delta_mean[m] /= @intToFloat(f32, n - 1);
+    }
+
+    // Pack into feature vector (simplified)
+    for (i in 0..32) {
+        const m = i * NUM_MEL_BINS / 32;
+        features[i] = mean[m];
+        features[i + 32] = std[m];
+    }
+}
+
+// ============================================================================
+// Pattern-Based Detection
+// ============================================================================
+
+pub fn detect_by_pattern(context: *const SpectrogramContext, pattern: *const SoundPattern) f32 {
+    if (context.frame_count < 3) return 0.0;
+
+    var confidence: f32 = 0.0;
+    var matches: u32 = 0;
+    var checks: u32 = 0;
+
+    // Check frequency characteristics
+    const peak_bin = find_peak_frequency_bin(context);
+    const peak_hz = bin_to_hz(peak_bin);
+
+    if (peak_hz >= pattern.min_freq_hz and peak_hz <= pattern.max_freq_hz) {
+        matches += 1;
+        // Bonus for being close to expected peak
+        const freq_diff = if (peak_hz > pattern.peak_freq_hz)
+            peak_hz - pattern.peak_freq_hz
+        else
+            pattern.peak_freq_hz - peak_hz;
+
+        if (freq_diff <= pattern.freq_tolerance_hz) {
+            matches += 1;
+        }
+    }
+    checks += 2;
+
+    // Check energy
+    const avg_energy = get_average_energy(context);
+    if (avg_energy >= pattern.min_energy_db) {
+        matches += 1;
+    }
+    checks += 1;
+
+    // Check spectral spread (broadband vs narrowband)
+    const spectral_spread = compute_spectral_spread(context);
+    if (pattern.is_broadband and spectral_spread > 0.5) {
+        matches += 1;
+    } else if (!pattern.is_broadband and spectral_spread < 0.3) {
+        matches += 1;
+    }
+    checks += 1;
+
+    // Check impulsiveness
+    const onset_strength = compute_onset_strength(context);
+    if (pattern.is_impulsive and onset_strength > 0.5) {
+        matches += 1;
+    } else if (!pattern.is_impulsive and onset_strength < 0.3) {
+        matches += 1;
+    }
+    checks += 1;
+
+    // Check periodicity
+    if (pattern.is_periodic) {
+        const period = detect_periodicity(context);
+        const period_diff = if (period > pattern.period_ms)
+            period - pattern.period_ms
+        else
+            pattern.period_ms - period;
+
+        if (period_diff <= pattern.period_tolerance_ms) {
+            matches += 2;
+        }
+        checks += 2;
+    }
+
+    confidence = @intToFloat(f32, matches) / @intToFloat(f32, checks);
+
+    return confidence;
+}
+
+fn find_peak_frequency_bin(context: *const SpectrogramContext) u32 {
+    var max_energy: f32 = -1000.0;
+    var peak_bin: u32 = 0;
+
+    for (t in 0..context.frame_count) {
+        if (context.get_frame(t)) |frame| {
+            for (m in 0..NUM_MEL_BINS) {
+                if (frame.bins[m] > max_energy) {
+                    max_energy = frame.bins[m];
+                    peak_bin = m;
+                }
+            }
+        }
+    }
+
+    return peak_bin;
+}
+
+fn bin_to_hz(bin: u32) u32 {
+    // Approximate mel bin to Hz conversion
+    const mel = 80.0 + @intToFloat(f32, bin) * (7600.0 - 80.0) / @intToFloat(f32, NUM_MEL_BINS);
+    return @floatToInt(u32, 700.0 * (math.pow(10.0, mel / 2595.0) - 1.0));
+}
+
+fn get_average_energy(context: *const SpectrogramContext) f32 {
+    var sum: f32 = 0.0;
+    for (t in 0..context.frame_count) {
+        if (context.get_frame(t)) |frame| {
+            sum += frame.energy;
+        }
+    }
+    return sum / @intToFloat(f32, context.frame_count);
+}
+
+fn compute_spectral_spread(context: *const SpectrogramContext) f32 {
+    // Ratio of energy above vs below median frequency
+    var low_energy: f32 = 0.0;
+    var high_energy: f32 = 0.0;
+
+    for (t in 0..context.frame_count) {
+        if (context.get_frame(t)) |frame| {
+            for (m in 0..NUM_MEL_BINS / 2) {
+                low_energy += math.exp(frame.bins[m]);
+            }
+            for (m in NUM_MEL_BINS / 2..NUM_MEL_BINS) {
+                high_energy += math.exp(frame.bins[m]);
+            }
+        }
+    }
+
+    const total = low_energy + high_energy;
+    if (total < 1e-10) return 0.5;
+
+    // Return how spread the energy is (0.5 = perfectly spread)
+    const ratio = high_energy / total;
+    return if (ratio > 0.5) ratio else 1.0 - ratio;
+}
+
+fn compute_onset_strength(context: *const SpectrogramContext) f32 {
+    if (context.frame_count < 2) return 0.0;
+
+    var max_onset: f32 = 0.0;
+
+    for (t in 1..context.frame_count) {
+        const curr = context.get_frame(t) orelse continue;
+        const prev = context.get_frame(t - 1) orelse continue;
+
+        var onset: f32 = 0.0;
+        for (m in 0..NUM_MEL_BINS) {
+            const diff = curr.bins[m] - prev.bins[m];
+            if (diff > 0) onset += diff;
+        }
+
+        if (onset > max_onset) max_onset = onset;
+    }
+
+    // Normalize
+    return if (max_onset > 10.0) 1.0 else max_onset / 10.0;
+}
+
+fn detect_periodicity(context: *const SpectrogramContext) u32 {
+    if (context.frame_count < 10) return 0;
+
+    // Simple autocorrelation on energy
+    var energies: [CONTEXT_FRAMES]f32 = undefined;
+    for (t in 0..context.frame_count) {
+        if (context.get_frame(t)) |frame| {
+            energies[t] = frame.energy;
+        }
+    }
+
+    var best_lag: u32 = 0;
+    var best_corr: f32 = 0.0;
+
+    // Check lags from 100ms to 2000ms (3 to 64 frames at 32ms/frame)
+    for (lag in 3..32) {
+        if (lag >= context.frame_count) break;
+
+        var corr: f32 = 0.0;
+        var count: u32 = 0;
+
+        for (t in 0..context.frame_count - lag) {
+            corr += energies[t] * energies[t + lag];
+            count += 1;
+        }
+
+        if (count > 0) {
+            corr /= @intToFloat(f32, count);
+            if (corr > best_corr) {
+                best_corr = corr;
+                best_lag = lag;
+            }
+        }
+    }
+
+    // Convert lag to milliseconds (32ms per frame)
+    return best_lag * 32;
+}
+
+// ============================================================================
+// Ambient Sound Detector
+// ============================================================================
+
+pub const DetectionCallback = fn(detection: *const SoundDetection, user_data: ?*anyopaque) void;
+
+pub const SoundDetectorConfig = struct {
+    // Detection settings
+    enabled_classes: [MAX_SOUND_CLASSES]bool,
+    confidence_thresholds: [MAX_SOUND_CLASSES]f32,
+
+    // Cooldown to prevent repeated detections
+    cooldown_ms: u64,
+
+    // Minimum priority to trigger callback
+    min_priority: SoundPriority,
+
+    // Location
+    room_id: u32,
+    room_name: [32]u8,
+    room_name_len: u32,
+
+    pub fn default() SoundDetectorConfig {
+        var config = SoundDetectorConfig{
+            .enabled_classes = undefined,
+            .confidence_thresholds = undefined,
+            .cooldown_ms = DETECTION_COOLDOWN_MS,
+            .min_priority = .Medium,
+            .room_id = 0,
+            .room_name = undefined,
+            .room_name_len = 0,
+        };
+
+        // Enable safety-critical sounds by default
+        for (i in 0..MAX_SOUND_CLASSES) {
+            const sc = @intToEnum(SoundClass, @intCast(u8, i));
+            config.enabled_classes[i] = sc.is_safety_critical() or
+                                         sc == .Doorbell or
+                                         sc == .BabyCrying or
+                                         sc == .DogBarking;
+            config.confidence_thresholds[i] = 0.6;
+        }
+
+        return config;
+    }
+};
+
+pub const AmbientSoundDetector = struct {
+    config: SoundDetectorConfig,
+
+    // Components
+    classifier: *SoundClassifier,
+    context: SpectrogramContext,
+
+    // Detection state
+    last_detection_time: [MAX_SOUND_CLASSES]u64,
+    detection_counts: [MAX_SOUND_CLASSES]u32,
+
+    // Callbacks
+    callbacks: [MAX_DETECTION_CALLBACKS]?DetectionCallback,
+    callback_user_data: [MAX_DETECTION_CALLBACKS]?*anyopaque,
+    num_callbacks: u32,
+
+    // Statistics
+    total_frames_processed: u64,
+    total_detections: u64,
+};
+
+pub fn detector_init(config: SoundDetectorConfig) *AmbientSoundDetector {
+    const detector = memory.allocate(AmbientSoundDetector) orelse return null;
+
+    detector.config = config;
+    detector.context.frame_count = 0;
+    detector.context.write_index = 0;
+    detector.num_callbacks = 0;
+    detector.total_frames_processed = 0;
+    detector.total_detections = 0;
+
+    // Initialize classifier
+    detector.classifier = classifier_init();
+    if (detector.classifier == null) {
+        memory.free(detector);
+        return null;
+    }
+
+    // Initialize detection state
+    for (i in 0..MAX_SOUND_CLASSES) {
+        detector.last_detection_time[i] = 0;
+        detector.detection_counts[i] = 0;
+    }
+
+    for (i in 0..MAX_DETECTION_CALLBACKS) {
+        detector.callbacks[i] = null;
+        detector.callback_user_data[i] = null;
+    }
+
+    return detector;
+}
+
+pub fn detector_register_callback(detector: *AmbientSoundDetector, callback: DetectionCallback, user_data: ?*anyopaque) bool {
+    if (detector.num_callbacks >= MAX_DETECTION_CALLBACKS) return false;
+
+    detector.callbacks[detector.num_callbacks] = callback;
+    detector.callback_user_data[detector.num_callbacks] = user_data;
+    detector.num_callbacks += 1;
+
+    return true;
+}
+
+pub fn detector_process_frame(detector: *AmbientSoundDetector, samples: *const [FRAME_SIZE]i16, timestamp_ms: u64) ?SoundDetection {
+    // Extract mel spectrogram
+    var mel = extract_mel_spectrogram(detector.classifier, samples);
+    mel.timestamp_ms = timestamp_ms;
+
+    // Add to context
+    detector.context.add_frame(&mel);
+    detector.total_frames_processed += 1;
+
+    // Need enough context for detection
+    if (detector.context.frame_count < 5) return null;
+
+    // Run classification
+    const nn_scores = classify_sound(detector.classifier, &detector.context);
+
+    // Also run pattern-based detection for known patterns
+    var pattern_scores: [MAX_SOUND_CLASSES]f32 = undefined;
+    for (i in 0..MAX_SOUND_CLASSES) {
+        pattern_scores[i] = 0.0;
+    }
+
+    for (pattern in SOUND_PATTERNS) {
+        const class_idx = @enumToInt(pattern.sound_class);
+        pattern_scores[class_idx] = detect_by_pattern(&detector.context, &pattern);
+    }
+
+    // Combine scores (weighted average)
+    var combined_scores: [MAX_SOUND_CLASSES]f32 = undefined;
+    for (i in 0..MAX_SOUND_CLASSES) {
+        combined_scores[i] = 0.6 * nn_scores[i] + 0.4 * pattern_scores[i];
+    }
+
+    // Find best detection
+    var best_class: u32 = 0;
+    var best_score: f32 = 0.0;
+
+    for (i in 0..MAX_SOUND_CLASSES) {
+        if (!detector.config.enabled_classes[i]) continue;
+
+        if (combined_scores[i] > best_score and
+            combined_scores[i] >= detector.config.confidence_thresholds[i]) {
+            best_score = combined_scores[i];
+            best_class = i;
+        }
+    }
+
+    // Check if we have a valid detection
+    if (best_score < 0.5) return null;
+
+    const sound_class = @intToEnum(SoundClass, @intCast(u8, best_class));
+
+    // Check cooldown
+    if (timestamp_ms - detector.last_detection_time[best_class] < detector.config.cooldown_ms) {
+        return null;
+    }
+
+    // Check priority
+    if (@enumToInt(sound_class.get_priority()) > @enumToInt(detector.config.min_priority)) {
+        return null;
+    }
+
+    // Create detection
+    var detection = SoundDetection{
+        .sound_class = sound_class,
+        .confidence = best_score,
+        .timestamp_ms = timestamp_ms,
+        .duration_ms = detector.context.frame_count * 32,
+        .priority = sound_class.get_priority(),
+        .room_id = detector.config.room_id,
+        .room_name = detector.config.room_name,
+        .room_name_len = detector.config.room_name_len,
+        .peak_frequency_hz = bin_to_hz(find_peak_frequency_bin(&detector.context)),
+        .energy_db = mel.energy,
+    };
+
+    // Update state
+    detector.last_detection_time[best_class] = timestamp_ms;
+    detector.detection_counts[best_class] += 1;
+    detector.total_detections += 1;
+
+    // Fire callbacks
+    for (i in 0..detector.num_callbacks) {
+        if (detector.callbacks[i]) |cb| {
+            cb(&detection, detector.callback_user_data[i]);
+        }
+    }
+
+    return detection;
+}
+
+pub fn detector_enable_class(detector: *AmbientSoundDetector, sound_class: SoundClass, enabled: bool) void {
+    detector.config.enabled_classes[@enumToInt(sound_class)] = enabled;
+}
+
+pub fn detector_set_threshold(detector: *AmbientSoundDetector, sound_class: SoundClass, threshold: f32) void {
+    detector.config.confidence_thresholds[@enumToInt(sound_class)] = threshold;
+}
+
+pub fn detector_get_stats(detector: *const AmbientSoundDetector) DetectorStats {
+    return DetectorStats{
+        .total_frames = detector.total_frames_processed,
+        .total_detections = detector.total_detections,
+        .detection_counts = detector.detection_counts,
+    };
+}
+
+pub const DetectorStats = struct {
+    total_frames: u64,
+    total_detections: u64,
+    detection_counts: [MAX_SOUND_CLASSES]u32,
+};
+
+// ============================================================================
+// Alert Integration
+// ============================================================================
+
+pub const AlertAction = enum {
+    Notify,           // Send notification
+    Alarm,            // Trigger alarm
+    Call,             // Make phone call
+    Light,            // Flash lights
+    Voice,            // Voice announcement
+    Record,           // Record audio
+    Custom,           // Custom action
+};
+
+pub const SoundAlert = struct {
+    sound_class: SoundClass,
+    actions: [8]AlertAction,
+    num_actions: u32,
+    message: [128]u8,
+    message_len: u32,
+    recipients: [8]u32,      // User IDs to notify
+    num_recipients: u32,
+};
+
+pub const AlertManager = struct {
+    alerts: [MAX_SOUND_CLASSES]SoundAlert,
+    enabled: [MAX_SOUND_CLASSES]bool,
+};
+
+pub fn alert_manager_init() *AlertManager {
+    const manager = memory.allocate(AlertManager) orelse return null;
+
+    // Set up default alerts for safety-critical sounds
+    for (i in 0..MAX_SOUND_CLASSES) {
+        const sc = @intToEnum(SoundClass, @intCast(u8, i));
+
+        manager.alerts[i].sound_class = sc;
+        manager.alerts[i].num_actions = 0;
+        manager.alerts[i].message_len = 0;
+        manager.alerts[i].num_recipients = 0;
+        manager.enabled[i] = false;
+
+        if (sc.is_safety_critical()) {
+            // Safety sounds get full alert treatment
+            manager.alerts[i].actions[0] = .Notify;
+            manager.alerts[i].actions[1] = .Alarm;
+            manager.alerts[i].actions[2] = .Voice;
+            manager.alerts[i].num_actions = 3;
+            manager.enabled[i] = true;
+
+            const name = sc.get_name();
+            const msg = "Alert: ";
+            var idx: u32 = 0;
+            for (c in msg) {
+                manager.alerts[i].message[idx] = c;
+                idx += 1;
+            }
+            for (c in name) {
+                if (idx >= 128) break;
+                manager.alerts[i].message[idx] = c;
+                idx += 1;
+            }
+            const detected = " detected!";
+            for (c in detected) {
+                if (idx >= 128) break;
+                manager.alerts[i].message[idx] = c;
+                idx += 1;
+            }
+            manager.alerts[i].message_len = idx;
+        } else if (sc == .Doorbell or sc == .Knock) {
+            manager.alerts[i].actions[0] = .Notify;
+            manager.alerts[i].actions[1] = .Voice;
+            manager.alerts[i].num_actions = 2;
+            manager.enabled[i] = true;
+
+            const msg = "Someone is at the door";
+            for (j in 0..msg.len) {
+                manager.alerts[i].message[j] = msg[j];
+            }
+            manager.alerts[i].message_len = @intCast(u32, msg.len);
+        } else if (sc == .BabyCrying) {
+            manager.alerts[i].actions[0] = .Notify;
+            manager.alerts[i].num_actions = 1;
+            manager.enabled[i] = true;
+
+            const msg = "Baby is crying";
+            for (j in 0..msg.len) {
+                manager.alerts[i].message[j] = msg[j];
+            }
+            manager.alerts[i].message_len = @intCast(u32, msg.len);
+        }
+    }
+
+    return manager;
+}
+
+pub fn alert_manager_handle_detection(manager: *const AlertManager, detection: *const SoundDetection) void {
+    const idx = @enumToInt(detection.sound_class);
+
+    if (!manager.enabled[idx]) return;
+
+    const alert = &manager.alerts[idx];
+
+    for (i in 0..alert.num_actions) {
+        switch (alert.actions[i]) {
+            .Notify => send_notification(alert, detection),
+            .Alarm => trigger_alarm(detection),
+            .Voice => announce_detection(alert, detection),
+            .Light => flash_lights(detection),
+            .Record => start_recording(detection),
+            else => {},
+        }
+    }
+}
+
+fn send_notification(alert: *const SoundAlert, detection: *const SoundDetection) void {
+    // Would integrate with notification system
+    _ = alert;
+    _ = detection;
+}
+
+fn trigger_alarm(detection: *const SoundDetection) void {
+    // Would trigger home alarm
+    _ = detection;
+}
+
+fn announce_detection(alert: *const SoundAlert, detection: *const SoundDetection) void {
+    // Would use TTS to announce
+    _ = alert;
+    _ = detection;
+}
+
+fn flash_lights(detection: *const SoundDetection) void {
+    // Would flash smart lights
+    _ = detection;
+}
+
+fn start_recording(detection: *const SoundDetection) void {
+    // Would start audio recording
+    _ = detection;
+}
+
+// ============================================================================
+// Module Initialization
+// ============================================================================
+
+pub fn init() bool {
+    return true;
+}

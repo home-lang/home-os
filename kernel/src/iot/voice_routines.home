@@ -1,0 +1,1381 @@
+// Voice Routines and Shortcuts
+// Multi-action voice macros for home automation
+// "Good morning" → lights on, coffee maker start, read weather
+// Part of HomeOS Voice Assistant subsystem
+
+const basics = @import("basics");
+const memory = @import("memory");
+
+// ============================================================================
+// Routine Constants
+// ============================================================================
+
+const MAX_ROUTINES: u32 = 64;
+const MAX_ACTIONS_PER_ROUTINE: u32 = 20;
+const MAX_TRIGGERS_PER_ROUTINE: u32 = 5;
+const MAX_CONDITIONS_PER_ROUTINE: u32 = 8;
+const MAX_ROUTINE_NAME_LEN: u32 = 64;
+const MAX_ACTION_PARAMS: u32 = 8;
+const MAX_PARAM_VALUE_LEN: u32 = 128;
+
+// ============================================================================
+// Trigger Types
+// ============================================================================
+
+pub const TriggerType = enum(u8) {
+    Voice,            // Voice command trigger
+    Time,             // Scheduled time
+    Sunrise,          // At sunrise (with offset)
+    Sunset,           // At sunset (with offset)
+    DeviceState,      // When device changes state
+    Location,         // Geofence enter/exit
+    Sensor,           // Sensor threshold
+    Routine,          // After another routine completes
+    Manual,           // Manual trigger only
+    Startup,          // System startup
+    Shutdown,         // System shutdown
+};
+
+pub const VoiceTrigger = struct {
+    phrases: [5][64]u8,       // Trigger phrases
+    phrase_lens: [5]u32,
+    num_phrases: u32,
+    require_wake_word: bool,
+    require_speaker_id: bool,  // Require speaker verification
+    allowed_speakers: [8]u32,  // Speaker IDs allowed to trigger
+    num_allowed_speakers: u32,
+
+    pub fn add_phrase(self: *VoiceTrigger, phrase: []const u8) bool {
+        if (self.num_phrases >= 5) return false;
+        const len = if (phrase.len > 64) 64 else phrase.len;
+        for (i in 0..len) {
+            self.phrases[self.num_phrases][i] = phrase[i];
+        }
+        self.phrase_lens[self.num_phrases] = @intCast(u32, len);
+        self.num_phrases += 1;
+        return true;
+    }
+
+    pub fn get_phrase(self: *const VoiceTrigger, idx: u32) []const u8 {
+        if (idx >= self.num_phrases) return "";
+        return self.phrases[idx][0..self.phrase_lens[idx]];
+    }
+};
+
+pub const TimeTrigger = struct {
+    hour: u8,            // 0-23
+    minute: u8,          // 0-59
+    days_of_week: u8,    // Bitmask: bit 0 = Sunday, bit 6 = Saturday
+    repeat: bool,        // Repeat daily/weekly
+
+    pub fn is_active_on_day(self: *const TimeTrigger, day: u8) bool {
+        return (self.days_of_week & (@as(u8, 1) << day)) != 0;
+    }
+};
+
+pub const SunTrigger = struct {
+    is_sunrise: bool,
+    offset_minutes: i16,  // Positive = after, negative = before
+    days_of_week: u8,
+};
+
+pub const DeviceTrigger = struct {
+    device_id: [64]u8,
+    device_id_len: u32,
+    state: [32]u8,
+    state_len: u32,
+    comparison: Comparison,
+
+    pub const Comparison = enum {
+        Equals,
+        NotEquals,
+        GreaterThan,
+        LessThan,
+        Changes,
+    };
+};
+
+pub const LocationTrigger = struct {
+    user_id: u32,
+    zone_name: [32]u8,
+    zone_name_len: u32,
+    event: LocationEvent,
+
+    pub const LocationEvent = enum {
+        Enter,
+        Exit,
+        EnterOrExit,
+    };
+};
+
+pub const SensorTrigger = struct {
+    sensor_id: [64]u8,
+    sensor_id_len: u32,
+    threshold: f32,
+    comparison: DeviceTrigger.Comparison,
+    for_duration_ms: u32,  // Must be true for this long
+};
+
+pub const Trigger = struct {
+    trigger_type: TriggerType,
+    enabled: bool,
+
+    data: TriggerData,
+
+    pub const TriggerData = union {
+        voice: VoiceTrigger,
+        time: TimeTrigger,
+        sun: SunTrigger,
+        device: DeviceTrigger,
+        location: LocationTrigger,
+        sensor: SensorTrigger,
+        routine_id: u32,
+        none: void,
+    };
+};
+
+// ============================================================================
+// Condition Types
+// ============================================================================
+
+pub const ConditionType = enum(u8) {
+    TimeRange,        // Between times
+    DayOfWeek,        // Specific days
+    DeviceState,      // Device in state
+    SensorValue,      // Sensor in range
+    UserPresent,      // User home/away
+    ModeActive,       // Home mode (home, away, sleep, vacation)
+    SunPosition,      // Before/after sunrise/sunset
+    RandomChance,     // Probability-based
+    VariableValue,    // Custom variable check
+};
+
+pub const TimeRangeCondition = struct {
+    start_hour: u8,
+    start_minute: u8,
+    end_hour: u8,
+    end_minute: u8,
+};
+
+pub const DeviceStateCondition = struct {
+    device_id: [64]u8,
+    device_id_len: u32,
+    expected_state: [32]u8,
+    expected_state_len: u32,
+    negate: bool,      // True = device NOT in this state
+};
+
+pub const SensorCondition = struct {
+    sensor_id: [64]u8,
+    sensor_id_len: u32,
+    min_value: f32,
+    max_value: f32,
+};
+
+pub const UserPresenceCondition = struct {
+    user_id: u32,
+    require_present: bool,  // True = must be home, false = must be away
+};
+
+pub const ModeCondition = struct {
+    mode: HomeMode,
+    negate: bool,
+
+    pub const HomeMode = enum {
+        Home,
+        Away,
+        Sleep,
+        Vacation,
+        Guest,
+    };
+};
+
+pub const Condition = struct {
+    condition_type: ConditionType,
+    enabled: bool,
+
+    data: ConditionData,
+
+    pub const ConditionData = union {
+        time_range: TimeRangeCondition,
+        days_of_week: u8,
+        device_state: DeviceStateCondition,
+        sensor: SensorCondition,
+        user_presence: UserPresenceCondition,
+        mode: ModeCondition,
+        random_chance: f32,   // 0.0 - 1.0
+        none: void,
+    };
+};
+
+// ============================================================================
+// Action Types
+// ============================================================================
+
+pub const ActionType = enum(u8) {
+    // Device control
+    DeviceOn,
+    DeviceOff,
+    DeviceToggle,
+    DeviceSetState,
+    DeviceSetLevel,
+    DeviceSetColor,
+
+    // Scene control
+    ActivateScene,
+
+    // Thermostat
+    SetTemperature,
+    SetThermostatMode,
+
+    // Lock
+    Lock,
+    Unlock,
+
+    // Media
+    MediaPlay,
+    MediaPause,
+    MediaStop,
+    MediaNext,
+    MediaPrevious,
+    MediaSetVolume,
+
+    // Notification
+    SendNotification,
+    Announce,          // TTS announcement
+    PlaySound,
+
+    // Delay
+    Delay,
+    WaitForCondition,
+
+    // Variables
+    SetVariable,
+    IncrementVariable,
+
+    // Control flow
+    IfCondition,
+    EndIf,
+    RunRoutine,        // Call another routine
+    StopRoutine,       // Stop current routine
+
+    // System
+    SetMode,           // Set home mode
+    ArmSecurity,
+    DisarmSecurity,
+
+    // Custom
+    Webhook,           // HTTP request
+    Custom,            // Custom action handler
+};
+
+pub const ActionParameter = struct {
+    name: [32]u8,
+    name_len: u32,
+    value: [MAX_PARAM_VALUE_LEN]u8,
+    value_len: u32,
+
+    pub fn get_name(self: *const ActionParameter) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    pub fn get_value(self: *const ActionParameter) []const u8 {
+        return self.value[0..self.value_len];
+    }
+
+    pub fn set(self: *ActionParameter, n: []const u8, v: []const u8) void {
+        const nlen = if (n.len > 32) 32 else n.len;
+        for (i in 0..nlen) {
+            self.name[i] = n[i];
+        }
+        self.name_len = @intCast(u32, nlen);
+
+        const vlen = if (v.len > MAX_PARAM_VALUE_LEN) MAX_PARAM_VALUE_LEN else v.len;
+        for (i in 0..vlen) {
+            self.value[i] = v[i];
+        }
+        self.value_len = @intCast(u32, vlen);
+    }
+};
+
+pub const Action = struct {
+    action_type: ActionType,
+    enabled: bool,
+
+    // Target device/entity
+    target_id: [64]u8,
+    target_id_len: u32,
+
+    // Parameters
+    params: [MAX_ACTION_PARAMS]ActionParameter,
+    num_params: u32,
+
+    // Execution options
+    delay_ms: u32,                // Delay before executing
+    timeout_ms: u32,              // Timeout for action completion
+    continue_on_error: bool,      // Continue routine if this action fails
+
+    pub fn get_target_id(self: *const Action) []const u8 {
+        return self.target_id[0..self.target_id_len];
+    }
+
+    pub fn set_target_id(self: *Action, id: []const u8) void {
+        const len = if (id.len > 64) 64 else id.len;
+        for (i in 0..len) {
+            self.target_id[i] = id[i];
+        }
+        self.target_id_len = @intCast(u32, len);
+    }
+
+    pub fn add_param(self: *Action, name: []const u8, value: []const u8) bool {
+        if (self.num_params >= MAX_ACTION_PARAMS) return false;
+        self.params[self.num_params].set(name, value);
+        self.num_params += 1;
+        return true;
+    }
+
+    pub fn get_param(self: *const Action, name: []const u8) ?[]const u8 {
+        for (i in 0..self.num_params) {
+            if (strings_equal(self.params[i].get_name(), name)) {
+                return self.params[i].get_value();
+            }
+        }
+        return null;
+    }
+};
+
+// ============================================================================
+// Routine Definition
+// ============================================================================
+
+pub const Routine = struct {
+    // Identity
+    id: u32,
+    name: [MAX_ROUTINE_NAME_LEN]u8,
+    name_len: u32,
+    description: [256]u8,
+    description_len: u32,
+
+    // Enabled state
+    enabled: bool,
+
+    // Triggers
+    triggers: [MAX_TRIGGERS_PER_ROUTINE]Trigger,
+    num_triggers: u32,
+    trigger_mode: TriggerMode,
+
+    // Conditions
+    conditions: [MAX_CONDITIONS_PER_ROUTINE]Condition,
+    num_conditions: u32,
+    condition_mode: ConditionMode,
+
+    // Actions
+    actions: [MAX_ACTIONS_PER_ROUTINE]Action,
+    num_actions: u32,
+
+    // Execution options
+    allow_concurrent: bool,        // Allow multiple instances
+    max_executions_per_hour: u32,  // Rate limiting
+    cooldown_ms: u64,              // Minimum time between executions
+
+    // Statistics
+    last_triggered_ms: u64,
+    last_completed_ms: u64,
+    total_executions: u32,
+    total_failures: u32,
+
+    // Owner
+    created_by: u32,               // User ID
+    created_at_ms: u64,
+    modified_at_ms: u64,
+
+    pub const TriggerMode = enum {
+        Any,    // Any trigger fires the routine
+        All,    // All triggers must be active
+    };
+
+    pub const ConditionMode = enum {
+        All,    // All conditions must be true
+        Any,    // Any condition must be true
+    };
+
+    pub fn get_name(self: *const Routine) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    pub fn set_name(self: *Routine, n: []const u8) void {
+        const len = if (n.len > MAX_ROUTINE_NAME_LEN) MAX_ROUTINE_NAME_LEN else n.len;
+        for (i in 0..len) {
+            self.name[i] = n[i];
+        }
+        self.name_len = @intCast(u32, len);
+    }
+
+    pub fn add_voice_trigger(self: *Routine, phrases: []const []const u8) bool {
+        if (self.num_triggers >= MAX_TRIGGERS_PER_ROUTINE) return false;
+
+        var trigger = &self.triggers[self.num_triggers];
+        trigger.trigger_type = .Voice;
+        trigger.enabled = true;
+        trigger.data = .{ .voice = VoiceTrigger{
+            .phrases = undefined,
+            .phrase_lens = undefined,
+            .num_phrases = 0,
+            .require_wake_word = true,
+            .require_speaker_id = false,
+            .allowed_speakers = undefined,
+            .num_allowed_speakers = 0,
+        }};
+
+        for (phrase in phrases) {
+            _ = trigger.data.voice.add_phrase(phrase);
+        }
+
+        self.num_triggers += 1;
+        return true;
+    }
+
+    pub fn add_time_trigger(self: *Routine, hour: u8, minute: u8, days: u8) bool {
+        if (self.num_triggers >= MAX_TRIGGERS_PER_ROUTINE) return false;
+
+        var trigger = &self.triggers[self.num_triggers];
+        trigger.trigger_type = .Time;
+        trigger.enabled = true;
+        trigger.data = .{ .time = TimeTrigger{
+            .hour = hour,
+            .minute = minute,
+            .days_of_week = days,
+            .repeat = true,
+        }};
+
+        self.num_triggers += 1;
+        return true;
+    }
+
+    pub fn add_action(self: *Routine, action: Action) bool {
+        if (self.num_actions >= MAX_ACTIONS_PER_ROUTINE) return false;
+        self.actions[self.num_actions] = action;
+        self.num_actions += 1;
+        return true;
+    }
+};
+
+// ============================================================================
+// Execution State
+// ============================================================================
+
+pub const ExecutionState = enum {
+    Pending,
+    Running,
+    WaitingForDelay,
+    WaitingForCondition,
+    Completed,
+    Failed,
+    Cancelled,
+};
+
+pub const ExecutionContext = struct {
+    routine_id: u32,
+    execution_id: u64,
+    state: ExecutionState,
+
+    // Current position
+    current_action_idx: u32,
+
+    // Timing
+    started_at_ms: u64,
+    current_action_started_ms: u64,
+    wait_until_ms: u64,
+
+    // Trigger info
+    trigger_type: TriggerType,
+    triggered_by_user: u32,
+    trigger_phrase: [64]u8,
+    trigger_phrase_len: u32,
+
+    // Variables (routine-local)
+    variables: [16]RoutineVariable,
+    num_variables: u32,
+
+    // Results
+    actions_completed: u32,
+    actions_failed: u32,
+    error_message: [256]u8,
+    error_message_len: u32,
+};
+
+pub const RoutineVariable = struct {
+    name: [32]u8,
+    name_len: u32,
+    value: [64]u8,
+    value_len: u32,
+    value_type: ValueType,
+
+    pub const ValueType = enum {
+        String,
+        Integer,
+        Float,
+        Boolean,
+    };
+};
+
+// ============================================================================
+// Routine Manager
+// ============================================================================
+
+pub const RoutineManager = struct {
+    routines: [MAX_ROUTINES]Routine,
+    num_routines: u32,
+    next_routine_id: u32,
+
+    // Active executions
+    executions: [16]ExecutionContext,
+    num_executions: u32,
+    next_execution_id: u64,
+
+    // Global variables
+    global_variables: [32]RoutineVariable,
+    num_global_variables: u32,
+
+    // Phrase index for fast voice lookup
+    phrase_index: [256]PhraseEntry,
+    num_phrases: u32,
+
+    // Scheduled triggers
+    scheduled_triggers: [64]ScheduledTrigger,
+    num_scheduled: u32,
+};
+
+pub const PhraseEntry = struct {
+    phrase: [64]u8,
+    phrase_len: u32,
+    routine_id: u32,
+    trigger_idx: u32,
+};
+
+pub const ScheduledTrigger = struct {
+    routine_id: u32,
+    trigger_idx: u32,
+    next_fire_ms: u64,
+};
+
+pub fn routine_manager_init() *RoutineManager {
+    const manager = memory.allocate(RoutineManager) orelse return null;
+
+    manager.num_routines = 0;
+    manager.next_routine_id = 1;
+    manager.num_executions = 0;
+    manager.next_execution_id = 1;
+    manager.num_global_variables = 0;
+    manager.num_phrases = 0;
+    manager.num_scheduled = 0;
+
+    // Create default routines
+    create_default_routines(manager);
+
+    return manager;
+}
+
+fn create_default_routines(manager: *RoutineManager) void {
+    // Good Morning routine
+    _ = create_routine(manager, "Good Morning", &[_][]const u8{
+        "good morning",
+        "wake up",
+        "start my day",
+    }, &[_]ActionDef{
+        .{ .action_type = .DeviceOn, .target = "bedroom_light", .params = &[_]ParamDef{} },
+        .{ .action_type = .Announce, .target = "", .params = &[_]ParamDef{
+            .{ .name = "message", .value = "Good morning! Here's your daily briefing." },
+        }},
+        .{ .action_type = .Announce, .target = "", .params = &[_]ParamDef{
+            .{ .name = "type", .value = "weather" },
+        }},
+        .{ .action_type = .Announce, .target = "", .params = &[_]ParamDef{
+            .{ .name = "type", .value = "calendar" },
+        }},
+        .{ .action_type = .DeviceOn, .target = "coffee_maker", .params = &[_]ParamDef{} },
+    });
+
+    // Good Night routine
+    _ = create_routine(manager, "Good Night", &[_][]const u8{
+        "good night",
+        "bedtime",
+        "going to bed",
+    }, &[_]ActionDef{
+        .{ .action_type = .Lock, .target = "all_doors", .params = &[_]ParamDef{} },
+        .{ .action_type = .DeviceOff, .target = "all_lights", .params = &[_]ParamDef{} },
+        .{ .action_type = .SetTemperature, .target = "thermostat", .params = &[_]ParamDef{
+            .{ .name = "temperature", .value = "68" },
+        }},
+        .{ .action_type = .ArmSecurity, .target = "", .params = &[_]ParamDef{
+            .{ .name = "mode", .value = "stay" },
+        }},
+        .{ .action_type = .Announce, .target = "", .params = &[_]ParamDef{
+            .{ .name = "message", .value = "Good night! The house is secured." },
+        }},
+    });
+
+    // Leaving Home routine
+    _ = create_routine(manager, "Leaving Home", &[_][]const u8{
+        "leaving home",
+        "goodbye",
+        "i'm leaving",
+    }, &[_]ActionDef{
+        .{ .action_type = .DeviceOff, .target = "all_lights", .params = &[_]ParamDef{} },
+        .{ .action_type = .Lock, .target = "all_doors", .params = &[_]ParamDef{} },
+        .{ .action_type = .SetThermostatMode, .target = "thermostat", .params = &[_]ParamDef{
+            .{ .name = "mode", .value = "away" },
+        }},
+        .{ .action_type = .ArmSecurity, .target = "", .params = &[_]ParamDef{
+            .{ .name = "mode", .value = "away" },
+        }},
+    });
+
+    // I'm Home routine
+    _ = create_routine(manager, "I'm Home", &[_][]const u8{
+        "i'm home",
+        "i'm back",
+        "arrived home",
+    }, &[_]ActionDef{
+        .{ .action_type = .DisarmSecurity, .target = "", .params = &[_]ParamDef{} },
+        .{ .action_type = .DeviceOn, .target = "entryway_light", .params = &[_]ParamDef{} },
+        .{ .action_type = .SetThermostatMode, .target = "thermostat", .params = &[_]ParamDef{
+            .{ .name = "mode", .value = "home" },
+        }},
+        .{ .action_type = .Announce, .target = "", .params = &[_]ParamDef{
+            .{ .name = "message", .value = "Welcome home!" },
+        }},
+    });
+
+    // Movie Time routine
+    _ = create_routine(manager, "Movie Time", &[_][]const u8{
+        "movie time",
+        "watch a movie",
+        "movie mode",
+    }, &[_]ActionDef{
+        .{ .action_type = .DeviceSetLevel, .target = "living_room_lights", .params = &[_]ParamDef{
+            .{ .name = "level", .value = "20" },
+        }},
+        .{ .action_type = .DeviceOn, .target = "tv", .params = &[_]ParamDef{} },
+        .{ .action_type = .ActivateScene, .target = "movie_scene", .params = &[_]ParamDef{} },
+    });
+
+    // Party Mode routine
+    _ = create_routine(manager, "Party Mode", &[_][]const u8{
+        "party mode",
+        "start the party",
+        "let's party",
+    }, &[_]ActionDef{
+        .{ .action_type = .ActivateScene, .target = "party_lights", .params = &[_]ParamDef{} },
+        .{ .action_type = .MediaPlay, .target = "speaker_system", .params = &[_]ParamDef{
+            .{ .name = "playlist", .value = "party" },
+        }},
+        .{ .action_type = .MediaSetVolume, .target = "speaker_system", .params = &[_]ParamDef{
+            .{ .name = "volume", .value = "70" },
+        }},
+    });
+
+    // Relax routine
+    _ = create_routine(manager, "Relax Mode", &[_][]const u8{
+        "relax mode",
+        "time to relax",
+        "chill mode",
+    }, &[_]ActionDef{
+        .{ .action_type = .DeviceSetLevel, .target = "living_room_lights", .params = &[_]ParamDef{
+            .{ .name = "level", .value = "30" },
+        }},
+        .{ .action_type = .DeviceSetColor, .target = "accent_lights", .params = &[_]ParamDef{
+            .{ .name = "color", .value = "warm_white" },
+        }},
+        .{ .action_type = .MediaPlay, .target = "speaker", .params = &[_]ParamDef{
+            .{ .name = "playlist", .value = "relaxing" },
+        }},
+        .{ .action_type = .MediaSetVolume, .target = "speaker", .params = &[_]ParamDef{
+            .{ .name = "volume", .value = "30" },
+        }},
+    });
+
+    // Dinner Time routine
+    _ = create_routine(manager, "Dinner Time", &[_][]const u8{
+        "dinner time",
+        "time for dinner",
+        "let's eat",
+    }, &[_]ActionDef{
+        .{ .action_type = .DeviceOn, .target = "dining_room_light", .params = &[_]ParamDef{} },
+        .{ .action_type = .DeviceSetLevel, .target = "dining_room_light", .params = &[_]ParamDef{
+            .{ .name = "level", .value = "60" },
+        }},
+        .{ .action_type = .MediaPlay, .target = "dining_speaker", .params = &[_]ParamDef{
+            .{ .name = "playlist", .value = "dinner" },
+        }},
+        .{ .action_type = .MediaSetVolume, .target = "dining_speaker", .params = &[_]ParamDef{
+            .{ .name = "volume", .value = "25" },
+        }},
+    });
+
+    // Work Mode routine
+    _ = create_routine(manager, "Work Mode", &[_][]const u8{
+        "work mode",
+        "time to work",
+        "focus mode",
+    }, &[_]ActionDef{
+        .{ .action_type = .DeviceOn, .target = "office_light", .params = &[_]ParamDef{} },
+        .{ .action_type = .DeviceSetLevel, .target = "office_light", .params = &[_]ParamDef{
+            .{ .name = "level", .value = "100" },
+        }},
+        .{ .action_type = .SetMode, .target = "", .params = &[_]ParamDef{
+            .{ .name = "mode", .value = "do_not_disturb" },
+        }},
+    });
+
+    // Emergency routine
+    _ = create_routine(manager, "Emergency", &[_][]const u8{
+        "emergency",
+        "help",
+        "call for help",
+    }, &[_]ActionDef{
+        .{ .action_type = .DeviceOn, .target = "all_lights", .params = &[_]ParamDef{} },
+        .{ .action_type = .Unlock, .target = "front_door", .params = &[_]ParamDef{} },
+        .{ .action_type = .SendNotification, .target = "", .params = &[_]ParamDef{
+            .{ .name = "message", .value = "Emergency triggered at home!" },
+            .{ .name = "priority", .value = "critical" },
+        }},
+        .{ .action_type = .Announce, .target = "", .params = &[_]ParamDef{
+            .{ .name = "message", .value = "Emergency mode activated. Help is on the way." },
+        }},
+    });
+}
+
+const ActionDef = struct {
+    action_type: ActionType,
+    target: []const u8,
+    params: []const ParamDef,
+};
+
+const ParamDef = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+fn create_routine(manager: *RoutineManager, name: []const u8, phrases: []const []const u8, action_defs: []const ActionDef) ?u32 {
+    if (manager.num_routines >= MAX_ROUTINES) return null;
+
+    var routine = &manager.routines[manager.num_routines];
+
+    routine.id = manager.next_routine_id;
+    manager.next_routine_id += 1;
+    routine.set_name(name);
+    routine.enabled = true;
+    routine.num_triggers = 0;
+    routine.num_conditions = 0;
+    routine.num_actions = 0;
+    routine.trigger_mode = .Any;
+    routine.condition_mode = .All;
+    routine.allow_concurrent = false;
+    routine.max_executions_per_hour = 60;
+    routine.cooldown_ms = 5000;
+    routine.total_executions = 0;
+    routine.total_failures = 0;
+
+    // Add voice trigger
+    _ = routine.add_voice_trigger(phrases);
+
+    // Add actions
+    for (def in action_defs) {
+        var action = Action{
+            .action_type = def.action_type,
+            .enabled = true,
+            .target_id = undefined,
+            .target_id_len = 0,
+            .params = undefined,
+            .num_params = 0,
+            .delay_ms = 0,
+            .timeout_ms = 30000,
+            .continue_on_error = true,
+        };
+
+        if (def.target.len > 0) {
+            action.set_target_id(def.target);
+        }
+
+        for (param in def.params) {
+            _ = action.add_param(param.name, param.value);
+        }
+
+        _ = routine.add_action(action);
+    }
+
+    // Index phrases
+    for (i in 0..routine.num_triggers) {
+        if (routine.triggers[i].trigger_type == .Voice) {
+            const voice = &routine.triggers[i].data.voice;
+            for (p in 0..voice.num_phrases) {
+                if (manager.num_phrases < 256) {
+                    const phrase = voice.get_phrase(p);
+                    for (j in 0..phrase.len) {
+                        manager.phrase_index[manager.num_phrases].phrase[j] = phrase[j];
+                    }
+                    manager.phrase_index[manager.num_phrases].phrase_len = @intCast(u32, phrase.len);
+                    manager.phrase_index[manager.num_phrases].routine_id = routine.id;
+                    manager.phrase_index[manager.num_phrases].trigger_idx = i;
+                    manager.num_phrases += 1;
+                }
+            }
+        }
+    }
+
+    manager.num_routines += 1;
+
+    return routine.id;
+}
+
+// ============================================================================
+// Routine Matching
+// ============================================================================
+
+pub fn find_routine_by_voice(manager: *const RoutineManager, text: []const u8) ?*const Routine {
+    const lower = to_lowercase_temp(text);
+
+    // Search phrase index
+    for (i in 0..manager.num_phrases) {
+        const entry = &manager.phrase_index[i];
+        const phrase = entry.phrase[0..entry.phrase_len];
+        const phrase_lower = to_lowercase_temp2(phrase);
+
+        if (strings_contains(lower, phrase_lower)) {
+            // Find routine
+            for (r in 0..manager.num_routines) {
+                if (manager.routines[r].id == entry.routine_id) {
+                    return &manager.routines[r];
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
+pub fn find_routine_by_id(manager: *const RoutineManager, id: u32) ?*const Routine {
+    for (r in 0..manager.num_routines) {
+        if (manager.routines[r].id == id) {
+            return &manager.routines[r];
+        }
+    }
+    return null;
+}
+
+pub fn get_routine_mut(manager: *RoutineManager, id: u32) ?*Routine {
+    for (r in 0..manager.num_routines) {
+        if (manager.routines[r].id == id) {
+            return &manager.routines[r];
+        }
+    }
+    return null;
+}
+
+// ============================================================================
+// Routine Execution
+// ============================================================================
+
+pub fn execute_routine(manager: *RoutineManager, routine_id: u32, trigger_type: TriggerType, user_id: u32, trigger_phrase: []const u8) ?u64 {
+    const routine = find_routine_by_id(manager, routine_id) orelse return null;
+
+    if (!routine.enabled) return null;
+
+    // Check cooldown
+    const now = get_current_time_ms();
+    if (now - routine.last_triggered_ms < routine.cooldown_ms) {
+        return null;
+    }
+
+    // Check conditions
+    if (!check_conditions(manager, routine)) {
+        return null;
+    }
+
+    // Check concurrent executions
+    if (!routine.allow_concurrent) {
+        for (i in 0..manager.num_executions) {
+            if (manager.executions[i].routine_id == routine_id and
+                manager.executions[i].state == .Running) {
+                return null;
+            }
+        }
+    }
+
+    // Create execution context
+    if (manager.num_executions >= 16) {
+        // Find and remove oldest completed execution
+        var oldest_idx: u32 = 0;
+        var oldest_time: u64 = 0xFFFFFFFFFFFFFFFF;
+        for (i in 0..manager.num_executions) {
+            if (manager.executions[i].state == .Completed or
+                manager.executions[i].state == .Failed or
+                manager.executions[i].state == .Cancelled) {
+                if (manager.executions[i].started_at_ms < oldest_time) {
+                    oldest_time = manager.executions[i].started_at_ms;
+                    oldest_idx = i;
+                }
+            }
+        }
+
+        // Shift to remove
+        for (i in oldest_idx..manager.num_executions - 1) {
+            manager.executions[i] = manager.executions[i + 1];
+        }
+        manager.num_executions -= 1;
+    }
+
+    var ctx = &manager.executions[manager.num_executions];
+    ctx.routine_id = routine_id;
+    ctx.execution_id = manager.next_execution_id;
+    manager.next_execution_id += 1;
+    ctx.state = .Running;
+    ctx.current_action_idx = 0;
+    ctx.started_at_ms = now;
+    ctx.current_action_started_ms = now;
+    ctx.wait_until_ms = 0;
+    ctx.trigger_type = trigger_type;
+    ctx.triggered_by_user = user_id;
+    ctx.num_variables = 0;
+    ctx.actions_completed = 0;
+    ctx.actions_failed = 0;
+    ctx.error_message_len = 0;
+
+    // Copy trigger phrase
+    const phrase_len = if (trigger_phrase.len > 64) 64 else trigger_phrase.len;
+    for (i in 0..phrase_len) {
+        ctx.trigger_phrase[i] = trigger_phrase[i];
+    }
+    ctx.trigger_phrase_len = @intCast(u32, phrase_len);
+
+    manager.num_executions += 1;
+
+    // Update routine stats
+    var routine_mut = get_routine_mut(manager, routine_id) orelse return ctx.execution_id;
+    routine_mut.last_triggered_ms = now;
+    routine_mut.total_executions += 1;
+
+    return ctx.execution_id;
+}
+
+fn check_conditions(manager: *const RoutineManager, routine: *const Routine) bool {
+    if (routine.num_conditions == 0) return true;
+
+    var all_true = true;
+    var any_true = false;
+
+    for (i in 0..routine.num_conditions) {
+        const cond = &routine.conditions[i];
+        if (!cond.enabled) continue;
+
+        const result = evaluate_condition(manager, cond);
+
+        if (result) {
+            any_true = true;
+        } else {
+            all_true = false;
+        }
+    }
+
+    return switch (routine.condition_mode) {
+        .All => all_true,
+        .Any => any_true,
+    };
+}
+
+fn evaluate_condition(manager: *const RoutineManager, cond: *const Condition) bool {
+    _ = manager;
+
+    switch (cond.condition_type) {
+        .TimeRange => {
+            const tr = &cond.data.time_range;
+            const now = get_current_time();
+            const current_minutes = @as(u32, now.hour) * 60 + now.minute;
+            const start_minutes = @as(u32, tr.start_hour) * 60 + tr.start_minute;
+            const end_minutes = @as(u32, tr.end_hour) * 60 + tr.end_minute;
+
+            if (start_minutes <= end_minutes) {
+                return current_minutes >= start_minutes and current_minutes <= end_minutes;
+            } else {
+                // Crosses midnight
+                return current_minutes >= start_minutes or current_minutes <= end_minutes;
+            }
+        },
+        .DayOfWeek => {
+            const now = get_current_time();
+            return (cond.data.days_of_week & (@as(u8, 1) << now.day_of_week)) != 0;
+        },
+        .DeviceState => {
+            // Would query device state
+            return true;
+        },
+        .UserPresent => {
+            // Would check user presence
+            return true;
+        },
+        .ModeActive => {
+            // Would check home mode
+            return true;
+        },
+        .RandomChance => {
+            const rand = get_random_float();
+            return rand < cond.data.random_chance;
+        },
+        else => return true,
+    }
+}
+
+pub fn step_execution(manager: *RoutineManager, execution_id: u64) ExecutionState {
+    // Find execution
+    var ctx: ?*ExecutionContext = null;
+    for (i in 0..manager.num_executions) {
+        if (manager.executions[i].execution_id == execution_id) {
+            ctx = &manager.executions[i];
+            break;
+        }
+    }
+
+    if (ctx == null) return .Failed;
+    var exec = ctx.?;
+
+    if (exec.state != .Running and exec.state != .WaitingForDelay) {
+        return exec.state;
+    }
+
+    const now = get_current_time_ms();
+
+    // Check if waiting for delay
+    if (exec.state == .WaitingForDelay) {
+        if (now < exec.wait_until_ms) {
+            return .WaitingForDelay;
+        }
+        exec.state = .Running;
+    }
+
+    // Get routine
+    const routine = find_routine_by_id(manager, exec.routine_id) orelse {
+        exec.state = .Failed;
+        return .Failed;
+    };
+
+    // Check if done
+    if (exec.current_action_idx >= routine.num_actions) {
+        exec.state = .Completed;
+
+        var routine_mut = get_routine_mut(manager, exec.routine_id);
+        if (routine_mut) |r| {
+            r.last_completed_ms = now;
+        }
+
+        return .Completed;
+    }
+
+    // Execute current action
+    const action = &routine.actions[exec.current_action_idx];
+
+    if (action.enabled) {
+        // Handle delay
+        if (action.delay_ms > 0 and exec.current_action_started_ms == now) {
+            exec.wait_until_ms = now + action.delay_ms;
+            exec.state = .WaitingForDelay;
+            return .WaitingForDelay;
+        }
+
+        const result = execute_action(manager, exec, action);
+
+        if (result) {
+            exec.actions_completed += 1;
+        } else {
+            exec.actions_failed += 1;
+
+            if (!action.continue_on_error) {
+                exec.state = .Failed;
+
+                var routine_mut = get_routine_mut(manager, exec.routine_id);
+                if (routine_mut) |r| {
+                    r.total_failures += 1;
+                }
+
+                return .Failed;
+            }
+        }
+    }
+
+    // Move to next action
+    exec.current_action_idx += 1;
+    exec.current_action_started_ms = now;
+
+    if (exec.current_action_idx >= routine.num_actions) {
+        exec.state = .Completed;
+        return .Completed;
+    }
+
+    return .Running;
+}
+
+fn execute_action(manager: *RoutineManager, ctx: *ExecutionContext, action: *const Action) bool {
+    _ = manager;
+    _ = ctx;
+
+    switch (action.action_type) {
+        .DeviceOn => {
+            // Would call device control API
+            return true;
+        },
+        .DeviceOff => {
+            return true;
+        },
+        .DeviceToggle => {
+            return true;
+        },
+        .DeviceSetLevel => {
+            return true;
+        },
+        .DeviceSetColor => {
+            return true;
+        },
+        .ActivateScene => {
+            return true;
+        },
+        .SetTemperature => {
+            return true;
+        },
+        .SetThermostatMode => {
+            return true;
+        },
+        .Lock => {
+            return true;
+        },
+        .Unlock => {
+            return true;
+        },
+        .MediaPlay => {
+            return true;
+        },
+        .MediaPause => {
+            return true;
+        },
+        .MediaStop => {
+            return true;
+        },
+        .MediaSetVolume => {
+            return true;
+        },
+        .SendNotification => {
+            return true;
+        },
+        .Announce => {
+            // Would call TTS
+            return true;
+        },
+        .PlaySound => {
+            return true;
+        },
+        .Delay => {
+            // Handled separately
+            return true;
+        },
+        .SetMode => {
+            return true;
+        },
+        .ArmSecurity => {
+            return true;
+        },
+        .DisarmSecurity => {
+            return true;
+        },
+        .RunRoutine => {
+            // Recursively run another routine
+            if (action.get_param("routine_id")) |id_str| {
+                const id = parse_int(id_str) orelse return false;
+                _ = execute_routine(@fieldParentPtr(RoutineManager, "executions", &manager.executions),
+                                    @intCast(u32, id), .Routine, ctx.triggered_by_user, "");
+            }
+            return true;
+        },
+        else => return true,
+    }
+}
+
+pub fn cancel_execution(manager: *RoutineManager, execution_id: u64) bool {
+    for (i in 0..manager.num_executions) {
+        if (manager.executions[i].execution_id == execution_id) {
+            if (manager.executions[i].state == .Running or
+                manager.executions[i].state == .WaitingForDelay) {
+                manager.executions[i].state = .Cancelled;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// Routine CRUD
+// ============================================================================
+
+pub fn add_routine(manager: *RoutineManager, routine: *const Routine) ?u32 {
+    if (manager.num_routines >= MAX_ROUTINES) return null;
+
+    manager.routines[manager.num_routines] = routine.*;
+    manager.routines[manager.num_routines].id = manager.next_routine_id;
+    manager.next_routine_id += 1;
+
+    const id = manager.routines[manager.num_routines].id;
+
+    // Update phrase index
+    const r = &manager.routines[manager.num_routines];
+    for (i in 0..r.num_triggers) {
+        if (r.triggers[i].trigger_type == .Voice) {
+            const voice = &r.triggers[i].data.voice;
+            for (p in 0..voice.num_phrases) {
+                if (manager.num_phrases < 256) {
+                    const phrase = voice.get_phrase(p);
+                    for (j in 0..phrase.len) {
+                        manager.phrase_index[manager.num_phrases].phrase[j] = phrase[j];
+                    }
+                    manager.phrase_index[manager.num_phrases].phrase_len = @intCast(u32, phrase.len);
+                    manager.phrase_index[manager.num_phrases].routine_id = id;
+                    manager.phrase_index[manager.num_phrases].trigger_idx = i;
+                    manager.num_phrases += 1;
+                }
+            }
+        }
+    }
+
+    manager.num_routines += 1;
+
+    return id;
+}
+
+pub fn delete_routine(manager: *RoutineManager, id: u32) bool {
+    var found_idx: ?u32 = null;
+
+    for (i in 0..manager.num_routines) {
+        if (manager.routines[i].id == id) {
+            found_idx = i;
+            break;
+        }
+    }
+
+    if (found_idx == null) return false;
+    const idx = found_idx.?;
+
+    // Remove from phrase index
+    var new_num_phrases: u32 = 0;
+    for (i in 0..manager.num_phrases) {
+        if (manager.phrase_index[i].routine_id != id) {
+            if (i != new_num_phrases) {
+                manager.phrase_index[new_num_phrases] = manager.phrase_index[i];
+            }
+            new_num_phrases += 1;
+        }
+    }
+    manager.num_phrases = new_num_phrases;
+
+    // Shift routines
+    for (i in idx..manager.num_routines - 1) {
+        manager.routines[i] = manager.routines[i + 1];
+    }
+    manager.num_routines -= 1;
+
+    return true;
+}
+
+pub fn enable_routine(manager: *RoutineManager, id: u32, enabled: bool) bool {
+    if (get_routine_mut(manager, id)) |r| {
+        r.enabled = enabled;
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+fn strings_equal(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (i in 0..a.len) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
+fn strings_contains(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    if (needle.len == 0) return true;
+
+    for (i in 0..haystack.len - needle.len + 1) {
+        var found = true;
+        for (j in 0..needle.len) {
+            if (haystack[i + j] != needle[j]) {
+                found = false;
+                break;
+            }
+        }
+        if (found) return true;
+    }
+    return false;
+}
+
+var temp_lower1: [256]u8 = undefined;
+var temp_lower2: [256]u8 = undefined;
+
+fn to_lowercase_temp(text: []const u8) []const u8 {
+    const len = if (text.len > 256) 256 else text.len;
+    for (i in 0..len) {
+        const c = text[i];
+        temp_lower1[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+    }
+    return temp_lower1[0..len];
+}
+
+fn to_lowercase_temp2(text: []const u8) []const u8 {
+    const len = if (text.len > 256) 256 else text.len;
+    for (i in 0..len) {
+        const c = text[i];
+        temp_lower2[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+    }
+    return temp_lower2[0..len];
+}
+
+fn parse_int(text: []const u8) ?i32 {
+    if (text.len == 0) return null;
+    var result: i32 = 0;
+    for (c in text) {
+        if (c >= '0' and c <= '9') {
+            result = result * 10 + @intCast(i32, c - '0');
+        } else {
+            return null;
+        }
+    }
+    return result;
+}
+
+fn get_current_time_ms() u64 {
+    return 0; // Would use system timer
+}
+
+const TimeInfo = struct {
+    hour: u8,
+    minute: u8,
+    day_of_week: u8,
+};
+
+fn get_current_time() TimeInfo {
+    return TimeInfo{ .hour = 12, .minute = 0, .day_of_week = 1 }; // Placeholder
+}
+
+fn get_random_float() f32 {
+    return 0.5; // Would use RNG
+}
+
+// ============================================================================
+// Module Initialization
+// ============================================================================
+
+pub fn init() bool {
+    return true;
+}
