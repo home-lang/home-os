@@ -2741,7 +2741,15 @@ Build a next-generation operating system that prioritizes:
 - [x] Z-Wave support (`kernel/src/iot/zwave.home`)
 - [x] Home automation framework (`kernel/src/iot/home_automation.home`)
 - [x] Automation rules engine (in home_automation.home)
-- [ ] Voice assistant integration (local, privacy-focused)
+- [x] Voice assistant integration - `kernel/src/iot/voice_assistant.home`
+  - [x] Wake word detection (Home OS, Computer, Assistant, custom)
+  - [x] Local speech recognition framework (privacy-focused)
+  - [x] Natural language understanding with intent parsing
+  - [x] Entity extraction (rooms, devices, numbers, colors, times)
+  - [x] Home automation command execution
+  - [x] Text-to-speech response framework
+  - [x] Configurable voice parameters (pitch, speed, volume)
+  - [x] Privacy mode (no cloud, no recording storage)
 
 ### 18.4 Industrial Applications
 - [x] CAN bus support (`kernel/src/industrial/can_bus.home`)
