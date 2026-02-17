@@ -9,26 +9,26 @@ const Lexer = @import("../../../home/packages/lexer/src/lexer.zig").Lexer;
 const Parser = @import("../../../home/packages/parser/src/parser.zig").Parser;
 const HomeKernelCodegen = @import("../../../home/packages/codegen/src/home_kernel_codegen.zig").HomeKernelCodegen;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    if (args.len < 3) {
-        std.debug.print("Usage: {s} <input.home> <output.s>\n", .{args[0]});
+    // Parse command line arguments
+    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    const program_name = args_iter.next() orelse "compile_home_kernel";
+    const input_file = args_iter.next() orelse {
+        std.debug.print("Usage: {s} <input.home> <output.s>\n", .{program_name});
         std.process.exit(1);
-    }
-
-    const input_file = args[1];
-    const output_file = args[2];
+    };
+    const output_file = args_iter.next() orelse {
+        std.debug.print("Usage: {s} <input.home> <output.s>\n", .{program_name});
+        std.process.exit(1);
+    };
 
     std.debug.print("Compiling Home kernel: {s} → {s}\n", .{ input_file, output_file });
 
     // Read input file
-    const source = try std.fs.cwd().readFileAlloc(allocator, input_file, 1024 * 1024);
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, input_file, allocator, .limited(1024 * 1024));
     defer allocator.free(source);
 
     // Lex
@@ -60,7 +60,7 @@ pub fn main() !void {
     std.debug.print("  Generated {} bytes of assembly\n", .{asm_code.len});
 
     // Write output
-    try std.fs.cwd().writeFile(.{
+    try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = output_file,
         .data = asm_code,
     });

@@ -5,7 +5,7 @@ const std = @import("std");
 const pantry = @import("pantry");
 
 // C-compatible exports for Home FFI
-export fn pantry_init_native() callconv(.C) c_int {
+export fn pantry_init_native() callconv(.c) c_int {
     // Initialize Pantry
     return 0;
 }
@@ -14,7 +14,7 @@ export fn pantry_install_native(
     package_name: [*:0]const u8,
     version: [*:0]const u8,
     _: c_int, // system_wide - unused for now
-) callconv(.C) c_int {
+) callconv(.c) c_int {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -23,8 +23,8 @@ export fn pantry_install_native(
     const pkg_version = std.mem.span(version);
 
     // Create package list
-    var packages = std.ArrayList([]const u8).init(allocator);
-    defer packages.deinit();
+    var packages: std.ArrayList([]const u8) = .empty;
+    defer packages.deinit(allocator);
 
     // Format package with version
     const pkg_with_version = std.fmt.allocPrint(
@@ -34,7 +34,7 @@ export fn pantry_install_native(
     ) catch return 1;
     defer allocator.free(pkg_with_version);
 
-    packages.append(pkg_with_version) catch return 1;
+    packages.append(allocator, pkg_with_version) catch return 1;
 
     // Call Pantry's install command
     const result = pantry.commands.installCommand(allocator, packages.items) catch return 1;
@@ -47,16 +47,16 @@ export fn pantry_install_native(
     return 0;
 }
 
-export fn pantry_remove_native(package_name: [*:0]const u8) callconv(.C) c_int {
+export fn pantry_remove_native(package_name: [*:0]const u8) callconv(.c) c_int {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const pkg_name = std.mem.span(package_name);
 
-    var packages = std.ArrayList([]const u8).init(allocator);
-    defer packages.deinit();
-    packages.append(pkg_name) catch return 1;
+    var packages: std.ArrayList([]const u8) = .empty;
+    defer packages.deinit(allocator);
+    packages.append(allocator, pkg_name) catch return 1;
 
     // Call Pantry's remove command
     const result = pantry.commands.removeCommand(allocator, packages.items) catch return 1;
@@ -65,7 +65,7 @@ export fn pantry_remove_native(package_name: [*:0]const u8) callconv(.C) c_int {
     return @intCast(result.exit_code);
 }
 
-export fn pantry_list_native(buffer: [*]u8, buffer_size: usize) callconv(.C) c_int {
+export fn pantry_list_native(buffer: [*]u8, buffer_size: usize) callconv(.c) c_int {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -83,16 +83,16 @@ export fn pantry_list_native(buffer: [*]u8, buffer_size: usize) callconv(.C) c_i
     return 0;
 }
 
-export fn pantry_update_native(package_name: [*:0]const u8) callconv(.C) c_int {
+export fn pantry_update_native(package_name: [*:0]const u8) callconv(.c) c_int {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const pkg_name = std.mem.span(package_name);
 
-    var packages = std.ArrayList([]const u8).init(allocator);
-    defer packages.deinit();
-    packages.append(pkg_name) catch return 1;
+    var packages: std.ArrayList([]const u8) = .empty;
+    defer packages.deinit(allocator);
+    packages.append(allocator, pkg_name) catch return 1;
 
     // Call Pantry's update command
     const result = pantry.commands.updateCommand(allocator, packages.items, true) catch return 1;
@@ -101,7 +101,7 @@ export fn pantry_update_native(package_name: [*:0]const u8) callconv(.C) c_int {
     return @intCast(result.exit_code);
 }
 
-export fn pantry_bootstrap_native() callconv(.C) c_int {
+export fn pantry_bootstrap_native() callconv(.c) c_int {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -119,7 +119,7 @@ export fn pantry_bootstrap_native() callconv(.C) c_int {
     return @intCast(result.exit_code);
 }
 
-export fn pantry_resolve_deps_native(deps_file: [*:0]const u8) callconv(.C) c_int {
+export fn pantry_resolve_deps_native(deps_file: [*:0]const u8) callconv(.c) c_int {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
