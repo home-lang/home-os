@@ -4,20 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Add zonfig dependency (required by pantry)
-    const zonfig_mod = b.addModule("zonfig", .{
-        .root_source_file = .{ .cwd_relative = "/Users/chrisbreuer/Code/zonfig/src/zonfig.zig" },
-        .target = target,
-    });
+    // Pantry path - defaults to sibling project directory
+    const pantry_path = b.option([]const u8, "pantry-path", "Path to pantry Zig source") orelse
+        b.pathResolve(&.{ "..", "..", "..", "pantry", "packages", "zig", "src", "lib.zig" });
 
-    // Add pantry dependency using cwd_relative for absolute path
+    // Add pantry dependency
     const pantry_mod = b.addModule("pantry", .{
-        .root_source_file = .{ .cwd_relative = "/Users/chrisbreuer/Code/pantry/packages/zig/src/lib.zig" },
+        .root_source_file = .{ .cwd_relative = pantry_path },
         .target = target,
     });
-    
-    // Add zonfig import to pantry module
-    pantry_mod.addImport("zonfig", zonfig_mod);
 
     // Build simple test executable
     const test_exe = b.addExecutable(.{
