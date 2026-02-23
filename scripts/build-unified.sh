@@ -287,23 +287,37 @@ build_x86_64() {
     elif [ -n "$home_entry" ] && [ ! -f "$HOME_COMPILER" ]; then
         # Home source exists but compiler is not available — build with stub kernel
         log_warn "Home compiler not available, building with kernel stub..."
-        if [ -f "src/boot.s" ] && [ -f "src/kernel_stub.s" ]; then
-            zig build-exe \
-                src/boot.s \
-                src/kernel_stub.s \
-                -target x86_64-freestanding \
-                $opt_flag \
-                -T linker.ld \
-                --name home-kernel \
-                -femit-bin="$target_dir/home-kernel.elf" 2>&1 || {
-                log_error "Kernel stub compilation failed"
-                exit 1
-            }
-            log_warn "Built with stub kernel — Home source was not compiled (install Home compiler for full build)"
-        else
-            log_error "Missing boot.s or kernel_stub.s for fallback compilation"
+        if [ ! -f "src/boot.s" ]; then
+            log_error "Missing boot.s for fallback compilation"
             exit 1
         fi
+
+        # Use checked-in stub, or generate a minimal one if missing
+        local stub_file="src/kernel_stub.s"
+        if [ ! -f "$stub_file" ]; then
+            log_info "Generating kernel stub (src/kernel_stub.s not found)..."
+            mkdir -p "$(dirname "$stub_file")"
+            cat > "$stub_file" << 'STUB_EOF'
+.section .text
+.global kernel_main
+kernel_main:
+    hlt
+    jmp kernel_main
+STUB_EOF
+        fi
+
+        zig build-exe \
+            src/boot.s \
+            "$stub_file" \
+            -target x86_64-freestanding \
+            $opt_flag \
+            -T linker.ld \
+            --name home-kernel \
+            -femit-bin="$target_dir/home-kernel.elf" 2>&1 || {
+            log_error "Kernel stub compilation failed"
+            exit 1
+        }
+        log_warn "Built with stub kernel — Home source was not compiled (install Home compiler for full build)"
     elif [ -f "src/kernel.zig" ]; then
         log_info "Compiling kernel with Zig..."
         zig build-exe \
