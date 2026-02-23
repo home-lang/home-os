@@ -89,8 +89,8 @@ kernel_main:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349930568
-.L_else_4349930568:
+    jz .L_else_4380077128
+.L_else_4380077128:
     movq $0, %rax
     pushq %rax
     # Load variable boot_info (not in locals)
@@ -99,17 +99,17 @@ kernel_main:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349931264
+    jz .L_else_4380077824
     # Load variable boot_info (not in locals)
     pushq %rax
     popq %rdi
     call parse_boot_info
-.L_else_4349931264:
+.L_else_4380077824:
     call post_init_integrations
-.L_while_start_4349935984:
+.L_while_start_4380082544:
     movq $1, %rax
     testq %rax, %rax
-    jz .L_while_end_4349935984
+    jz .L_while_end_4380082544
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -119,8 +119,8 @@ kernel_main:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349934048
-.L_else_4349934048:
+    jz .L_else_4380080608
+.L_else_4380080608:
     pushq %rax
     movq $3, %rax
     pushq %rax
@@ -130,10 +130,10 @@ kernel_main:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349935616
-.L_else_4349935616:
-    jmp .L_while_start_4349935984
-.L_while_end_4349935984:
+    jz .L_else_4380082176
+.L_else_4380082176:
+    jmp .L_while_start_4380082544
+.L_while_end_4380082544:
 
 _start_x86_64:
     pushq %rbp
@@ -161,13 +161,13 @@ _start_riscv:
 parse_boot_info:
     pushq %rbp
     movq %rsp, %rbp
-.L_while_start_4349945152:
+.L_while_start_4380091712:
     # Load variable total_size (not in locals)
     pushq %rax
     # Load variable offset (not in locals)
     popq %rcx
     testq %rax, %rax
-    jz .L_while_end_4349945152
+    jz .L_while_end_4380091712
     movq $0, %rax
     pushq %rax
     # Load variable tag_type (not in locals)
@@ -176,8 +176,8 @@ parse_boot_info:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349942304
-.L_else_4349942304:
+    jz .L_else_4380088864
+.L_else_4380088864:
     movq $6, %rax
     pushq %rax
     # Load variable tag_type (not in locals)
@@ -186,9 +186,9 @@ parse_boot_info:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349944104
-    jmp .L_endif_4349944104
-.L_else_4349944104:
+    jz .L_else_4380090664
+    jmp .L_endif_4380090664
+.L_else_4380090664:
     movq $8, %rax
     pushq %rax
     # Load variable tag_type (not in locals)
@@ -197,11 +197,11 @@ parse_boot_info:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349944000
-.L_else_4349944000:
-.L_endif_4349944104:
-    jmp .L_while_start_4349945152
-.L_while_end_4349945152:
+    jz .L_else_4380090560
+.L_else_4380090560:
+.L_endif_4380090664:
+    jmp .L_while_start_4380091712
+.L_while_end_4380091712:
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -224,7 +224,7 @@ exception_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349976096
+    jz .L_else_4380122656
     pushq %rax
     pushq %rax
     movq $0, %rax
@@ -235,11 +235,11 @@ exception_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349954736
+    jz .L_else_4380101296
     movq %rbp, %rsp
     popq %rbp
     ret
-.L_else_4349954736:
+.L_else_4380101296:
     movq $0, %rax
     pushq %rax
     movq -336(%rbp), %rax
@@ -248,22 +248,22 @@ exception_handler:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349959360
-    jmp .L_endif_4349959360
-.L_else_4349959360:
+    jz .L_else_4380105920
+    jmp .L_endif_4380105920
+.L_else_4380105920:
     # Load variable rsp (not in locals)
     pushq %rax
     # Load variable rip (not in locals)
     pushq %rax
-    leaq .L_str_4349239438(%rip), %rax
+    leaq .L_str_4379385998(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call kernel_panic
-.L_endif_4349959360:
-    jmp .L_endif_4349976096
-.L_else_4349976096:
+.L_endif_4380105920:
+    jmp .L_endif_4380122656
+.L_else_4380122656:
     movq -104(%rbp), %rax
     pushq %rax
     # Load variable vector (not in locals)
@@ -272,7 +272,7 @@ exception_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349975992
+    jz .L_else_4380122552
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -282,22 +282,22 @@ exception_handler:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349964032
-    jmp .L_endif_4349964032
-.L_else_4349964032:
+    jz .L_else_4380110592
+    jmp .L_endif_4380110592
+.L_else_4380110592:
     # Load variable rsp (not in locals)
     pushq %rax
     # Load variable rip (not in locals)
     pushq %rax
-    leaq .L_str_4349240011(%rip), %rax
+    leaq .L_str_4379386571(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call kernel_panic
-.L_endif_4349964032:
-    jmp .L_endif_4349975992
-.L_else_4349975992:
+.L_endif_4380110592:
+    jmp .L_endif_4380122552
+.L_else_4380122552:
     movq -72(%rbp), %rax
     pushq %rax
     # Load variable vector (not in locals)
@@ -306,19 +306,19 @@ exception_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349975888
+    jz .L_else_4380122448
     # Load variable rsp (not in locals)
     pushq %rax
     # Load variable rip (not in locals)
     pushq %rax
-    leaq .L_str_4349240113(%rip), %rax
+    leaq .L_str_4379386673(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call kernel_panic
-    jmp .L_endif_4349975888
-.L_else_4349975888:
+    jmp .L_endif_4380122448
+.L_else_4380122448:
     movq -8(%rbp), %rax
     pushq %rax
     # Load variable vector (not in locals)
@@ -327,7 +327,7 @@ exception_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349975784
+    jz .L_else_4380122344
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -337,22 +337,22 @@ exception_handler:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349967392
-    jmp .L_endif_4349967392
-.L_else_4349967392:
+    jz .L_else_4380113952
+    jmp .L_endif_4380113952
+.L_else_4380113952:
     # Load variable rsp (not in locals)
     pushq %rax
     # Load variable rip (not in locals)
     pushq %rax
-    leaq .L_str_4349240354(%rip), %rax
+    leaq .L_str_4379386914(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call kernel_panic
-.L_endif_4349967392:
-    jmp .L_endif_4349975784
-.L_else_4349975784:
+.L_endif_4380113952:
+    jmp .L_endif_4380122344
+.L_else_4380122344:
     movq -56(%rbp), %rax
     pushq %rax
     # Load variable vector (not in locals)
@@ -361,7 +361,7 @@ exception_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349975680
+    jz .L_else_4380122240
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -371,22 +371,22 @@ exception_handler:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349970000
-    jmp .L_endif_4349970000
-.L_else_4349970000:
+    jz .L_else_4380116560
+    jmp .L_endif_4380116560
+.L_else_4380116560:
     # Load variable rsp (not in locals)
     pushq %rax
     # Load variable rip (not in locals)
     pushq %rax
-    leaq .L_str_4349240613(%rip), %rax
+    leaq .L_str_4379387173(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call kernel_panic
-.L_endif_4349970000:
-    jmp .L_endif_4349975680
-.L_else_4349975680:
+.L_endif_4380116560:
+    jmp .L_endif_4380122240
+.L_else_4380122240:
     movq -32(%rbp), %rax
     pushq %rax
     # Load variable vector (not in locals)
@@ -395,7 +395,7 @@ exception_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349975576
+    jz .L_else_4380122136
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -405,26 +405,26 @@ exception_handler:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349973104
-.L_else_4349973104:
-    jmp .L_endif_4349975576
-.L_else_4349975576:
+    jz .L_else_4380119664
+.L_else_4380119664:
+    jmp .L_endif_4380122136
+.L_else_4380122136:
     # Load variable rsp (not in locals)
     pushq %rax
     # Load variable rip (not in locals)
     pushq %rax
-    leaq .L_str_4349241248(%rip), %rax
+    leaq .L_str_4379387808(%rip), %rax
     pushq %rax
     popq %rdi
     popq %rsi
     popq %rdx
     call kernel_panic
-.L_endif_4349975576:
-.L_endif_4349975680:
-.L_endif_4349975784:
-.L_endif_4349975888:
-.L_endif_4349975992:
-.L_endif_4349976096:
+.L_endif_4380122136:
+.L_endif_4380122240:
+.L_endif_4380122344:
+.L_endif_4380122448:
+.L_endif_4380122552:
+.L_endif_4380122656:
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -440,7 +440,7 @@ irq_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349982992
+    jz .L_else_4380129552
     pushq %rax
     movq $0, %rax
     pushq %rax
@@ -450,10 +450,10 @@ irq_handler:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349979960
-.L_else_4349979960:
-    jmp .L_endif_4349982992
-.L_else_4349982992:
+    jz .L_else_4380126520
+.L_else_4380126520:
+    jmp .L_endif_4380129552
+.L_else_4380129552:
     movq -160(%rbp), %rax
     pushq %rax
     # Load variable irq (not in locals)
@@ -462,9 +462,9 @@ irq_handler:
     sete %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349982888
-    jmp .L_endif_4349982888
-.L_else_4349982888:
+    jz .L_else_4380129448
+    jmp .L_endif_4380129448
+.L_else_4380129448:
     movq -272(%rbp), %rax
     pushq %rax
     # Load variable irq (not in locals)
@@ -482,9 +482,9 @@ irq_handler:
     movzbq %al, %rax
     popq %rcx
     testq %rax, %rax
-    jz .L_else_4349982784
-    jmp .L_endif_4349982784
-.L_else_4349982784:
+    jz .L_else_4380129344
+    jmp .L_endif_4380129344
+.L_else_4380129344:
     movq $55, %rax
     pushq %rax
     # Load variable irq (not in locals)
@@ -496,11 +496,11 @@ irq_handler:
     popq %rcx
     popq %rcx
     testq %rax, %rax
-    jz .L_else_4349982680
-.L_else_4349982680:
-.L_endif_4349982784:
-.L_endif_4349982888:
-.L_endif_4349982992:
+    jz .L_else_4380129240
+.L_else_4380129240:
+.L_endif_4380129344:
+.L_endif_4380129448:
+.L_endif_4380129552:
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -516,11 +516,11 @@ syscall_entry:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4349986856
+    jz .L_else_4380133416
     movq %rbp, %rsp
     popq %rbp
     ret
-.L_else_4349986856:
+.L_else_4380133416:
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -536,12 +536,12 @@ kernel_panic:
     pushq %rax
     popq %rdi
     call print_stack_trace
-.L_while_start_4349996952:
+.L_while_start_4380143512:
     movq $1, %rax
     testq %rax, %rax
-    jz .L_while_end_4349996952
-    jmp .L_while_start_4349996952
-.L_while_end_4349996952:
+    jz .L_while_end_4380143512
+    jmp .L_while_start_4380143512
+.L_while_end_4380143512:
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -560,8 +560,8 @@ print_stack_trace:
     setne %al
     movzbq %al, %rax
     testq %rax, %rax
-    jz .L_else_4350002120
-.L_else_4350002120:
+    jz .L_else_4380148680
+.L_else_4380148680:
     movq %rbp, %rsp
     popq %rbp
     ret
@@ -618,15 +618,15 @@ kernel_reboot:
 
 
 .section .rodata
-.L_str_4349239438:
+.L_str_4379385998:
     .asciz "Page fault in kernel mode"
-.L_str_4349240011:
+.L_str_4379386571:
     .asciz "GPF in kernel mode"
-.L_str_4349240113:
+.L_str_4379386673:
     .asciz "Double fault"
-.L_str_4349240354:
+.L_str_4379386914:
     .asciz "Divide error in kernel"
-.L_str_4349240613:
+.L_str_4379387173:
     .asciz "Invalid opcode in kernel"
-.L_str_4349241248:
+.L_str_4379387808:
     .asciz "Unhandled exception"
