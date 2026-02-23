@@ -29,7 +29,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 KERNEL_DIR="$PROJECT_ROOT/kernel"
 BUILD_DIR="$PROJECT_ROOT/build"
-HOME_COMPILER="$HOME/Code/home/zig-out/bin/home"
+# Auto-detect Home compiler location
+if [ -n "$HOME_COMPILER_PATH" ]; then
+    HOME_COMPILER="$HOME_COMPILER_PATH"
+elif [ -f "$HOME/Code/home/zig-out/bin/home" ]; then
+    HOME_COMPILER="$HOME/Code/home/zig-out/bin/home"
+elif [ -f "$HOME/Documents/Projects/home/zig-out/bin/home" ]; then
+    HOME_COMPILER="$HOME/Documents/Projects/home/zig-out/bin/home"
+else
+    HOME_COMPILER="$HOME/Code/home/zig-out/bin/home"
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -253,7 +262,41 @@ build_x86_64() {
     fi
 
     # Check if we have the kernel source files
-    if [ -f "src/kernel.zig" ]; then
+    # Priority: Home language sources first, Zig fallback second
+    if [ -f "src/main.home" ] || [ -f "src/kernel_main.home" ] || [ -f "src/kernel.home" ]; then
+        local home_entry="src/main.home"
+        if [ ! -f "$home_entry" ]; then
+            home_entry="src/kernel_main.home"
+        fi
+        if [ ! -f "$home_entry" ] && [ -f "src/kernel.home" ]; then
+            home_entry="src/kernel.home"
+        fi
+        log_info "Compiling kernel with Home compiler (entry: $home_entry)..."
+        if [ -x "$SCRIPT_DIR/build-standalone.sh" ]; then
+            "$SCRIPT_DIR/build-standalone.sh"
+            if [ -f "$KERNEL_DIR/build/home-kernel.elf" ]; then
+                cp "$KERNEL_DIR/build/home-kernel.elf" "$target_dir/"
+            fi
+        else
+            log_warn "build-standalone.sh not found or not executable, attempting Zig fallback..."
+            # Fallback: use Zig to compile assembly + any generated output
+            if [ -f "src/boot.s" ]; then
+                zig build-exe \
+                    src/boot.s \
+                    -target x86_64-freestanding \
+                    $opt_flag \
+                    -T linker.ld \
+                    --name home-kernel \
+                    -femit-bin="$target_dir/home-kernel.elf" 2>&1 || {
+                    log_error "Kernel compilation failed"
+                    exit 1
+                }
+            else
+                log_error "No boot.s assembly found for fallback compilation"
+                exit 1
+            fi
+        fi
+    elif [ -f "src/kernel.zig" ]; then
         log_info "Compiling kernel with Zig..."
         zig build-exe \
             src/boot.s \
@@ -266,17 +309,8 @@ build_x86_64() {
             log_error "Kernel compilation failed"
             exit 1
         }
-    elif [ -f "src/kernel.home" ]; then
-        log_info "Compiling kernel with Home compiler..."
-        # For now, try using the existing standalone build
-        if [ -x "$SCRIPT_DIR/build-standalone.sh" ]; then
-            "$SCRIPT_DIR/build-standalone.sh"
-            if [ -f "$KERNEL_DIR/build/home-kernel.elf" ]; then
-                cp "$KERNEL_DIR/build/home-kernel.elf" "$target_dir/"
-            fi
-        fi
     else
-        log_error "No kernel source found (kernel.zig or kernel.home)"
+        log_error "No kernel source found (expected main.home, kernel_main.home, kernel.home, or kernel.zig)"
         exit 1
     fi
 

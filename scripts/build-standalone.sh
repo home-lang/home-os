@@ -2,11 +2,37 @@
 # Build home-os kernel using Home language
 set -e
 
-KERNEL_DIR="/Users/chrisbreuer/Code/home-os/kernel"
-HOME_DIR="/Users/chrisbreuer/Code/home"
+# Use environment or auto-detect paths
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+KERNEL_DIR="$PROJECT_DIR/kernel"
 ISO_DIR="$KERNEL_DIR/iso"
 BUILD_DIR="$KERNEL_DIR/build"
+
+# Auto-detect Home compiler location
+if [ -n "$HOME_COMPILER_DIR" ]; then
+    HOME_DIR="$HOME_COMPILER_DIR"
+elif [ -d "$HOME/Code/home" ]; then
+    HOME_DIR="$HOME/Code/home"
+elif [ -d "$HOME/Documents/Projects/home" ]; then
+    HOME_DIR="$HOME/Documents/Projects/home"
+else
+    HOME_DIR="$HOME/Code/home"
+fi
 HOME_COMPILER="$HOME_DIR/zig-out/bin/home"
+
+# Determine the kernel entry point
+KERNEL_ENTRY=""
+if [ -f "$KERNEL_DIR/src/main.home" ]; then
+    KERNEL_ENTRY="src/main.home"
+elif [ -f "$KERNEL_DIR/src/kernel_main.home" ]; then
+    KERNEL_ENTRY="src/kernel_main.home"
+elif [ -f "$KERNEL_DIR/src/kernel.home" ]; then
+    KERNEL_ENTRY="src/kernel.home"
+else
+    echo "Error: No kernel entry point found (main.home, kernel_main.home, or kernel.home)"
+    exit 1
+fi
 
 echo "=== Building home-os Kernel ==="
 echo ""
@@ -25,13 +51,13 @@ mkdir -p "$ISO_DIR/boot/grub"
 
 cd "$KERNEL_DIR"
 
-echo "Step 1: Compiling kernel.home with Home compiler..."
-"$HOME_COMPILER" build src/kernel.home --kernel -o "$BUILD_DIR/kernel_main.s"
+echo "Step 1: Compiling $KERNEL_ENTRY with Home compiler..."
+"$HOME_COMPILER" build "$KERNEL_ENTRY" --kernel -o "$BUILD_DIR/kernel_main.s"
 if [ $? -ne 0 ]; then
-    echo "❌ Home compilation failed!"
+    echo "Home compilation failed!"
     exit 1
 fi
-echo "✅ Home compilation complete!"
+echo "Home compilation complete!"
 echo ""
 
 echo "Generated assembly:"
@@ -50,11 +76,11 @@ zig build-exe \
     -femit-bin="$BUILD_DIR/home-kernel.elf"
 
 if [ $? -ne 0 ]; then
-    echo "❌ Kernel assembly/linking failed!"
+    echo "Kernel assembly/linking failed!"
     exit 1
 fi
 
-echo "✅ Kernel assembled and linked!"
+echo "Kernel assembled and linked!"
 ls -lh "$BUILD_DIR/home-kernel.elf"
 echo ""
 
@@ -77,17 +103,17 @@ fi
 
 $GRUB_MKRESCUE -o "$BUILD_DIR/home-os.iso" "$ISO_DIR" 2>&1 | grep -v "warning:" || true
 
-echo "✅ ISO created: $BUILD_DIR/home-os.iso"
+echo "ISO created: $BUILD_DIR/home-os.iso"
 ls -lh "$BUILD_DIR/home-os.iso"
 echo ""
 
 echo "=== Build Complete! ==="
 echo ""
-echo "🎉 Successfully built kernel with Home compiler!"
+echo "Successfully built kernel with Home compiler!"
 echo ""
 echo "Kernel binary: $BUILD_DIR/home-kernel.elf"
 echo "Bootable ISO:  $BUILD_DIR/home-os.iso"
 echo ""
 echo "To run in QEMU:"
-echo "  cd /Users/chrisbreuer/Code/home-os && ./scripts/run-qemu.sh"
+echo "  cd $PROJECT_DIR && ./scripts/run-qemu.sh"
 echo ""
