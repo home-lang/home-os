@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
         b.pathResolve(&.{ "..", "..", "..", "pantry", "packages", "zig", "src", "lib.zig" });
 
     // Add pantry dependency
-    const pantry_mod = b.addModule("pantry", .{
+    const pantry_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = pantry_path },
         .target = target,
     });
