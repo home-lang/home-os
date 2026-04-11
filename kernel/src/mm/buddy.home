@@ -21,12 +21,19 @@ const ZONE_DMA32: u32 = 1           // 16MB-4GB
 const ZONE_NORMAL: u32 = 2          // 4GB+
 const ZONE_HIGHMEM: u32 = 3         // High memory (if any)
 
+// Magic sentinel stored inside the header of every free block.
+// find_free_block() uses it to decide whether a candidate buddy
+// address actually points at a free block of the expected order in
+// O(1), instead of linearly scanning the free list.
+const FREE_BLOCK_MAGIC: u32 = 0xB0DDF00D
+
 // Free list node
 struct FreeBlock {
   next: *FreeBlock
   prev: *FreeBlock
   order: u32
   zone: u32
+  magic: u32  // FREE_BLOCK_MAGIC while block is free; cleared on alloc.
 }
 
 // Zone statistics
@@ -156,6 +163,7 @@ fn add_to_free_list(addr: u64, order: u32) {
   var block: *FreeBlock = @ptrFromInt(addr)
   block.order = order
   block.zone = get_zone_for_addr(addr)
+  block.magic = FREE_BLOCK_MAGIC
 
   // Add to front of list
   block.next = allocator.free_lists[order]
@@ -188,6 +196,10 @@ fn remove_from_free_list(block: *FreeBlock) {
   }
 
   allocator.free_count[order] = allocator.free_count[order] - 1
+
+  // Clear the magic so the header can no longer be mistaken for a free
+  // block by find_free_block() on a subsequent coalesce attempt.
+  block.magic = 0
 
   // Update zone stats
   var num_pages: u64 = 1 << order
@@ -344,18 +356,24 @@ export fn buddy_free_page(addr: u64) {
   buddy_free(addr, 0)
 }
 
-// Find a free block at given address and order
+// Find a free block at a given address/order in O(1) by inspecting
+// the header magic in place. Previously this walked the entire free
+// list, making coalescing O(free_blocks_at_order).
 fn find_free_block(addr: u64, order: u32): *FreeBlock {
-  var block: *FreeBlock = allocator.free_lists[order]
-
-  while block != 0 {
-    if @ptrFromInt(block) == addr {
-      return block
-    }
-    block = block.next
+  if addr < allocator.base_addr {
+    return 0
   }
-
-  return 0
+  if addr >= allocator.base_addr + allocator.total_memory {
+    return 0
+  }
+  var block: *FreeBlock = @ptrFromInt(addr)
+  if block.magic != FREE_BLOCK_MAGIC {
+    return 0
+  }
+  if block.order != order {
+    return 0
+  }
+  return block
 }
 
 // ============================================================================
@@ -433,9 +451,14 @@ export fn buddy_print_stats() {
 // Zone-Specific Allocation
 // ============================================================================
 
-// Allocate from specific zone
+// Allocate from specific zone.
+// Early-out when the zone has zero free pages at all so callers don't
+// walk free lists that cannot possibly satisfy the request.
 export fn buddy_alloc_zone(order: u32, zone: u32): u64 {
   if zone >= MAX_ZONES {
+    return 0
+  }
+  if allocator.zones[zone].free_pages == 0 {
     return 0
   }
 
@@ -476,11 +499,13 @@ export fn buddy_alloc_dma(order: u32): u64 {
   return buddy_alloc_zone(order, ZONE_DMA)
 }
 
-// Allocate DMA32-safe memory (below 4GB)
+// Allocate DMA32-safe memory (below 4GB).
+// Prefer DMA32 first so we don't exhaust the scarce DMA zone (below
+// 16MB, used by legacy ISA hardware) for requests that only need <4GB.
 export fn buddy_alloc_dma32(order: u32): u64 {
-  var addr: u64 = buddy_alloc_zone(order, ZONE_DMA)
+  var addr: u64 = buddy_alloc_zone(order, ZONE_DMA32)
   if addr != 0 { return addr }
-  return buddy_alloc_zone(order, ZONE_DMA32)
+  return buddy_alloc_zone(order, ZONE_DMA)
 }
 
 // ============================================================================

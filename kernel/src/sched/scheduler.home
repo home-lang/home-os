@@ -45,6 +45,12 @@ struct RunQueueEntry {
   on_rq: u32            // On run queue?
 }
 
+// PID → slot hash table. MAX_PROCESSES is a power of two, so a
+// bit-mask is sufficient. Collisions fall back to linear probe over
+// a short run, which is vastly better than scanning all 256 slots.
+const RQ_HASH_SIZE: u32 = 256
+const RQ_HASH_MASK: u32 = 255
+
 // Per-CPU run queue
 struct CPURunQueue {
   current: u32,         // Current running PID
@@ -53,7 +59,15 @@ struct CPURunQueue {
   min_vruntime: u64,    // Minimum vruntime on this CPU
   load_weight: u32,     // Total load weight
   idle_time: u64,       // Time spent idle
-  rq: [RunQueueEntry; 256]
+  rq: [RunQueueEntry; 256],
+
+  // Slot allocator state. `free_head` points to the first free slot;
+  // free slots form a singly-linked intrusive free list via the `pid`
+  // field re-interpreted as (0x80000000 | next_slot). 0xFFFFFFFF = end.
+  free_head: u32,
+
+  // PID → slot table. Entries store slot index or 0xFFFFFFFF for empty.
+  pid_hash: [u32; 256]
 }
 
 // ============================================================================
@@ -102,12 +116,26 @@ export fn scheduler_init() {
     cpu_rq[i].min_vruntime = 0
     cpu_rq[i].load_weight = 0
     cpu_rq[i].idle_time = 0
+    cpu_rq[i].free_head = 0
     need_resched[i] = 0
 
+    // Build free list: slot j -> slot j+1, last slot -> 0xFFFFFFFF.
     var j: u32 = 0
     while j < MAX_PROCESSES {
       cpu_rq[i].rq[j].pid = 0
       cpu_rq[i].rq[j].on_rq = 0
+      if j + 1 < MAX_PROCESSES {
+        cpu_rq[i].rq[j].vruntime = @as(u64, j + 1)
+      } else {
+        cpu_rq[i].rq[j].vruntime = 0xFFFFFFFFFFFFFFFF
+      }
+      j = j + 1
+    }
+
+    // Clear PID hash.
+    j = 0
+    while j < RQ_HASH_SIZE {
+      cpu_rq[i].pid_hash[j] = 0xFFFFFFFF
       j = j + 1
     }
     i = i + 1
@@ -135,26 +163,86 @@ export fn scheduler_set_num_cpus(num: u32) {
 // RUN QUEUE OPERATIONS
 // ============================================================================
 
+// Simple hash spread for PIDs. We multiply by a prime and fold.
+fn pid_hash(pid: u32): u32 {
+  return ((pid * 2654435761) >> 8) & RQ_HASH_MASK
+}
+
+// O(1) average, O(probe_run) worst-case lookup of a PID on a given CPU.
 fn find_rq_entry(cpu: u32, pid: u32): u32 {
-  var i: u32 = 0
-  while i < MAX_PROCESSES {
-    if cpu_rq[cpu].rq[i].pid == pid {
-      return i
+  if pid == 0 { return 0xFFFFFFFF }
+  var h: u32 = pid_hash(pid)
+  var probes: u32 = 0
+  while probes < RQ_HASH_SIZE {
+    var slot: u32 = cpu_rq[cpu].pid_hash[h]
+    if slot == 0xFFFFFFFF {
+      return 0xFFFFFFFF
     }
-    i = i + 1
+    if slot != 0xFFFFFFFE and cpu_rq[cpu].rq[slot].pid == pid {
+      return slot
+    }
+    h = (h + 1) & RQ_HASH_MASK
+    probes = probes + 1
   }
   return 0xFFFFFFFF
 }
 
-fn find_free_rq_slot(cpu: u32): u32 {
-  var i: u32 = 0
-  while i < MAX_PROCESSES {
-    if cpu_rq[cpu].rq[i].pid == 0 {
-      return i
+// Insert (pid -> slot) into the hash using linear probing.
+fn hash_insert(cpu: u32, pid: u32, slot: u32) {
+  var h: u32 = pid_hash(pid)
+  var probes: u32 = 0
+  while probes < RQ_HASH_SIZE {
+    var cur: u32 = cpu_rq[cpu].pid_hash[h]
+    if cur == 0xFFFFFFFF or cur == 0xFFFFFFFE {
+      cpu_rq[cpu].pid_hash[h] = slot
+      return
     }
-    i = i + 1
+    h = (h + 1) & RQ_HASH_MASK
+    probes = probes + 1
   }
-  return 0xFFFFFFFF
+}
+
+// Remove a PID from the hash. Uses tombstone (0xFFFFFFFE) so probe runs
+// keep working for unrelated keys until rehashing.
+fn hash_remove(cpu: u32, pid: u32) {
+  var h: u32 = pid_hash(pid)
+  var probes: u32 = 0
+  while probes < RQ_HASH_SIZE {
+    var slot: u32 = cpu_rq[cpu].pid_hash[h]
+    if slot == 0xFFFFFFFF { return }
+    if slot != 0xFFFFFFFE and cpu_rq[cpu].rq[slot].pid == pid {
+      cpu_rq[cpu].pid_hash[h] = 0xFFFFFFFE
+      return
+    }
+    h = (h + 1) & RQ_HASH_MASK
+    probes = probes + 1
+  }
+}
+
+// Pop a slot from the per-CPU free list in O(1).
+fn find_free_rq_slot(cpu: u32): u32 {
+  var head: u32 = cpu_rq[cpu].free_head
+  if head >= MAX_PROCESSES {
+    return 0xFFFFFFFF
+  }
+  var next: u64 = cpu_rq[cpu].rq[head].vruntime
+  if next == 0xFFFFFFFFFFFFFFFF {
+    cpu_rq[cpu].free_head = 0xFFFFFFFF
+  } else {
+    cpu_rq[cpu].free_head = @truncate(next, u32)
+  }
+  return head
+}
+
+// Push a slot back onto the per-CPU free list.
+fn free_rq_slot(cpu: u32, slot: u32) {
+  var head: u32 = cpu_rq[cpu].free_head
+  if head == 0xFFFFFFFF {
+    cpu_rq[cpu].rq[slot].vruntime = 0xFFFFFFFFFFFFFFFF
+  } else {
+    cpu_rq[cpu].rq[slot].vruntime = @as(u64, head)
+  }
+  cpu_rq[cpu].free_head = slot
 }
 
 export fn scheduler_enqueue(pid: u32, cpu: u32) {
@@ -163,11 +251,11 @@ export fn scheduler_enqueue(pid: u32, cpu: u32) {
   var slot: u32 = find_rq_entry(cpu, pid)
   if slot == 0xFFFFFFFF {
     slot = find_free_rq_slot(cpu)
-  }
-
-  if slot == 0xFFFFFFFF {
-    foundation.serial_write_string("[Scheduler] Run queue full!\n")
-    return
+    if slot == 0xFFFFFFFF {
+      foundation.serial_write_string("[Scheduler] Run queue full!\n")
+      return
+    }
+    hash_insert(cpu, pid, slot)
   }
 
   // Get process priority from process table
@@ -202,20 +290,29 @@ export fn scheduler_dequeue(pid: u32, cpu: u32) {
 
   cpu_rq[cpu].rq[slot].on_rq = 0
   cpu_rq[cpu].rq[slot].pid = 0
+  hash_remove(cpu, pid)
+  free_rq_slot(cpu, slot)
 }
 
 // ============================================================================
 // CFS SCHEDULER
 // ============================================================================
 
-// Pick next task using CFS algorithm
+// Pick next task using CFS algorithm. Early-outs once we've examined
+// nr_running tasks so an almost-empty runqueue doesn't scan all 256
+// slots every tick.
 fn pick_next_task_cfs(cpu: u32): u32 {
   var best_pid: u32 = 0
   var best_vruntime: u64 = 0xFFFFFFFFFFFFFFFF
 
+  var seen: u32 = 0
+  var target: u32 = cpu_rq[cpu].nr_running
+  if target == 0 { return 0 }
+
   var i: u32 = 0
-  while i < MAX_PROCESSES {
+  while i < MAX_PROCESSES and seen < target {
     if cpu_rq[cpu].rq[i].on_rq == 1 and cpu_rq[cpu].rq[i].pid != 0 {
+      seen = seen + 1
       // Check if this process is ready
       var state: u32 = process.process_get_state(cpu_rq[cpu].rq[i].pid)
       if state == 1 {  // READY
@@ -245,8 +342,10 @@ fn update_curr_vruntime(cpu: u32, delta_ns: u64) {
 
   cpu_rq[cpu].rq[slot].vruntime = cpu_rq[cpu].rq[slot].vruntime + vruntime_delta
 
-  // Update minimum vruntime
-  if cpu_rq[cpu].rq[slot].vruntime < cpu_rq[cpu].min_vruntime {
+  // min_vruntime is a monotonically-increasing floor used to seed new
+  // tasks. It must track the running task's vruntime upward; moving it
+  // down would let newly-forked tasks repeatedly "cut the line".
+  if cpu_rq[cpu].rq[slot].vruntime > cpu_rq[cpu].min_vruntime {
     cpu_rq[cpu].min_vruntime = cpu_rq[cpu].rq[slot].vruntime
   }
 }

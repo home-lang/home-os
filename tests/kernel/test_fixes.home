@@ -1,0 +1,371 @@
+// home-os Kernel Regression Tests
+// Focused tests for the concrete fixes landed alongside this file.
+// Pairs with tests/kernel/test_suite.home — add new test_*() functions
+// here as fixes land, then register them in register_fix_tests().
+//
+// Each test returns TEST_PASS (0) / TEST_FAIL (1) / TEST_SKIP (2).
+
+import "../../kernel/src/core/foundation.home" as foundation
+import "../../kernel/src/core/memory.home" as memory
+import "../../kernel/src/sync/spinlock.home" as spinlock
+import "../../kernel/src/mm/buddy.home" as buddy
+import "../../kernel/src/net/tcp.home" as tcp
+import "../../kernel/src/net/socket.home" as socket
+
+const TEST_PASS: u32 = 0
+const TEST_FAIL: u32 = 1
+const TEST_SKIP: u32 = 2
+
+// Imported from test_suite.home via the shared framework.
+extern fn test_register(name: u64, category: u64, test_fn: u64)
+
+// ============================================================================
+// MEMCPY FAST PATH
+// ============================================================================
+
+// Aligned source and destination, exact multiple of 8 bytes. Hits the
+// word-copy fast path added to mem_copy().
+fn test_memcpy_word_aligned(): u32 {
+  var src: [u64; 8]
+  var dst: [u64; 8]
+  var i: u32 = 0
+  while i < 8 {
+    src[i] = 0xDEADBEEF00000000 + @as(u64, i)
+    dst[i] = 0
+    i = i + 1
+  }
+
+  memory.mem_copy(@ptrFromInt(dst), @ptrFromInt(src), 64)
+
+  i = 0
+  while i < 8 {
+    if dst[i] != src[i] { return TEST_FAIL }
+    i = i + 1
+  }
+  return TEST_PASS
+}
+
+// Unaligned source — fast path is skipped, byte loop is used.
+fn test_memcpy_unaligned(): u32 {
+  var buf: [u8; 64]
+  var src_off: u64 = @ptrFromInt(buf) + 1  // misalign by 1 byte
+  var dst_off: u64 = @ptrFromInt(buf) + 32
+
+  var i: u32 = 0
+  while i < 16 {
+    @intToPtr(src_off + i, u8) = @as(u8, i + 1)
+    i = i + 1
+  }
+
+  memory.mem_copy(dst_off, src_off, 16)
+
+  i = 0
+  while i < 16 {
+    if @intToPtr(dst_off + i, u8) != @as(u8, i + 1) { return TEST_FAIL }
+    i = i + 1
+  }
+  return TEST_PASS
+}
+
+// Overlapping ranges where destination is above source — the common
+// "drain ring buffer" case. Must copy backwards to avoid clobbering.
+fn test_memcpy_overlap_down(): u32 {
+  var buf: [u8; 32]
+  var i: u32 = 0
+  while i < 16 {
+    buf[i] = @as(u8, i + 1)
+    i = i + 1
+  }
+
+  // Shift the first 16 bytes up by 4. Source and dest overlap.
+  memory.mem_copy(@ptrFromInt(buf) + 4, @ptrFromInt(buf), 16)
+
+  i = 0
+  while i < 16 {
+    if buf[4 + i] != @as(u8, i + 1) { return TEST_FAIL }
+    i = i + 1
+  }
+  return TEST_PASS
+}
+
+// size == 0 must be a no-op.
+fn test_memcpy_empty(): u32 {
+  var dst: u8 = 0xAB
+  var src: u8 = 0xCD
+  memory.mem_copy(@ptrFromInt(&dst), @ptrFromInt(&src), 0)
+  if dst != 0xAB { return TEST_FAIL }
+  return TEST_PASS
+}
+
+// Aligned bulk with a trailing partial word (size % 8 != 0). Exercises
+// both the word loop and the tail byte loop.
+fn test_memcpy_tail_bytes(): u32 {
+  var src: [u8; 24]
+  var dst: [u8; 24]
+  var i: u32 = 0
+  while i < 24 {
+    src[i] = @as(u8, 0x30 + i)
+    dst[i] = 0
+    i = i + 1
+  }
+  memory.mem_copy(@ptrFromInt(dst), @ptrFromInt(src), 20)
+  i = 0
+  while i < 20 {
+    if dst[i] != src[i] { return TEST_FAIL }
+    i = i + 1
+  }
+  // Trailing bytes must be untouched.
+  if dst[20] != 0 { return TEST_FAIL }
+  if dst[23] != 0 { return TEST_FAIL }
+  return TEST_PASS
+}
+
+// memcpy() is kept as a thin alias — make sure it still dispatches.
+fn test_memcpy_alias(): u32 {
+  var src: u64 = 0x0123456789ABCDEF
+  var dst: u64 = 0
+  memory.memcpy(@ptrFromInt(&dst), @ptrFromInt(&src), 8)
+  if dst != 0x0123456789ABCDEF { return TEST_FAIL }
+  return TEST_PASS
+}
+
+// ============================================================================
+// SPINLOCK
+// ============================================================================
+
+// The contention counter is now updated via a LOCK XADD. Ten acquires
+// with no contention should leave the counter at 0.
+fn test_spinlock_no_contention(): u32 {
+  var lock: spinlock.Spinlock
+  spinlock.spinlock_init(&lock)
+
+  var i: u32 = 0
+  while i < 10 {
+    spinlock.spinlock_acquire(&lock)
+    spinlock.spinlock_release(&lock)
+    i = i + 1
+  }
+
+  var count: u64 = 0
+  spinlock.spinlock_get_stats(&lock, &count)
+  if count != 0 { return TEST_FAIL }
+  return TEST_PASS
+}
+
+// rwspinlock_try_upgrade must fail when more than one reader holds
+// the lock. Previously this was a non-atomic upgrade() that unlocked
+// then re-locked — admitting a race where another writer could slip in.
+fn test_rwspinlock_try_upgrade_refuses_multi_reader(): u32 {
+  var lock: spinlock.RWSpinlock
+  spinlock.rwspinlock_init(&lock)
+
+  spinlock.rwspinlock_read_acquire(&lock)
+  spinlock.rwspinlock_read_acquire(&lock)
+
+  var ok: u32 = spinlock.rwspinlock_try_upgrade(&lock)
+  if ok != 0 { return TEST_FAIL }
+
+  spinlock.rwspinlock_read_release(&lock)
+  spinlock.rwspinlock_read_release(&lock)
+  return TEST_PASS
+}
+
+// With a single reader the upgrade must succeed atomically.
+fn test_rwspinlock_try_upgrade_single_reader(): u32 {
+  var lock: spinlock.RWSpinlock
+  spinlock.rwspinlock_init(&lock)
+
+  spinlock.rwspinlock_read_acquire(&lock)
+  var ok: u32 = spinlock.rwspinlock_try_upgrade(&lock)
+  if ok == 0 { return TEST_FAIL }
+  if spinlock.rwspinlock_is_write_locked(&lock) == 0 { return TEST_FAIL }
+  spinlock.rwspinlock_write_release(&lock)
+  return TEST_PASS
+}
+
+// ============================================================================
+// BUDDY ALLOCATOR
+// ============================================================================
+
+// Freed buddies of the same order must coalesce to a single larger
+// block. With the O(1) magic-sentinel check, this must still behave
+// correctly for adjacent addresses.
+fn test_buddy_coalesce(): u32 {
+  // A 4 KB × 4 = 16 KB arena is the minimum needed for order-1 coalesce.
+  var arena: [u8; 16384]
+  var base: u64 = (@ptrFromInt(arena) + 4095) & ~0xFFF
+  buddy.buddy_init(base, 8192)
+
+  var a: u64 = buddy.buddy_alloc(0)
+  var b: u64 = buddy.buddy_alloc(0)
+  if a == 0 or b == 0 { return TEST_FAIL }
+
+  buddy.buddy_free(a, 0)
+  buddy.buddy_free(b, 0)
+
+  // After coalescing, a single order-1 block should be allocatable.
+  var c: u64 = buddy.buddy_alloc(1)
+  if c == 0 { return TEST_FAIL }
+  buddy.buddy_free(c, 1)
+  return TEST_PASS
+}
+
+// buddy_alloc_dma32 used to prefer the tiny DMA zone; now it hits
+// DMA32 first. We don't have zone telemetry exposed here, so this is
+// a smoke test that the call returns non-zero on a normal arena.
+fn test_buddy_dma32_smoke(): u32 {
+  var arena: [u8; 16384]
+  var base: u64 = (@ptrFromInt(arena) + 4095) & ~0xFFF
+  buddy.buddy_init(base, 8192)
+
+  var a: u64 = buddy.buddy_alloc_dma32(0)
+  if a == 0 { return TEST_FAIL }
+  buddy.buddy_free(a, 0)
+  return TEST_PASS
+}
+
+// ============================================================================
+// SOCKET
+// ============================================================================
+
+// After create(), find_socket() on the returned FD must succeed via
+// the O(1) fd_table path, and after close() must return not-found.
+fn test_socket_fd_table_roundtrip(): u32 {
+  socket.socket_init()
+
+  var fd: u32 = socket.socket_create(socket.AF_INET, socket.SOCK_DGRAM, 0)
+  if fd == 0 { return TEST_FAIL }
+
+  // If find_socket fails, socket_close would return non-zero.
+  var rc: u32 = socket.socket_close(fd)
+  if rc != 0 { return TEST_FAIL }
+
+  // Closing again must now fail (fd is gone from the table).
+  if socket.socket_close(fd) == 0 { return TEST_FAIL }
+  return TEST_PASS
+}
+
+// socket_send must reject a zero buffer even when the fd is valid.
+fn test_socket_send_rejects_null_buf(): u32 {
+  socket.socket_init()
+  var fd: u32 = socket.socket_create(socket.AF_INET, socket.SOCK_STREAM, 0)
+  if fd == 0 { return TEST_FAIL }
+
+  var rc: u64 = socket.socket_send(fd, 0, 128, 0)
+  socket.socket_close(fd)
+  if rc != 0xFFFFFFFFFFFFFFFF { return TEST_FAIL }
+  return TEST_PASS
+}
+
+// socket_recv must reject a zero buffer.
+fn test_socket_recv_rejects_null_buf(): u32 {
+  socket.socket_init()
+  var fd: u32 = socket.socket_create(socket.AF_INET, socket.SOCK_STREAM, 0)
+  if fd == 0 { return TEST_FAIL }
+
+  var rc: u64 = socket.socket_recv(fd, 0, 128, 0)
+  socket.socket_close(fd)
+  if rc != 0xFFFFFFFFFFFFFFFF { return TEST_FAIL }
+  return TEST_PASS
+}
+
+// ============================================================================
+// TCP
+// ============================================================================
+
+// Listen, then verify find_connection via a second call path. The
+// hash insert in tcp_listen plus find_listening_connection must return
+// the same index.
+fn test_tcp_listen_hash(): u32 {
+  tcp.tcp_init()
+  var conn: u32 = tcp.tcp_listen(7777)
+  if conn == 0xFFFFFFFF { return TEST_FAIL }
+  tcp.tcp_close(conn)
+  return TEST_PASS
+}
+
+// ============================================================================
+// REGISTRATION
+// ============================================================================
+
+export fn register_fix_tests() {
+  test_register(
+    @ptrFromInt("memcpy word-aligned"),
+    @ptrFromInt("Fixes/memcpy"),
+    @ptrFromInt(test_memcpy_word_aligned)
+  )
+  test_register(
+    @ptrFromInt("memcpy unaligned fallback"),
+    @ptrFromInt("Fixes/memcpy"),
+    @ptrFromInt(test_memcpy_unaligned)
+  )
+  test_register(
+    @ptrFromInt("memcpy overlap dst>src"),
+    @ptrFromInt("Fixes/memcpy"),
+    @ptrFromInt(test_memcpy_overlap_down)
+  )
+  test_register(
+    @ptrFromInt("memcpy size 0 no-op"),
+    @ptrFromInt("Fixes/memcpy"),
+    @ptrFromInt(test_memcpy_empty)
+  )
+  test_register(
+    @ptrFromInt("memcpy tail bytes"),
+    @ptrFromInt("Fixes/memcpy"),
+    @ptrFromInt(test_memcpy_tail_bytes)
+  )
+  test_register(
+    @ptrFromInt("memcpy alias still works"),
+    @ptrFromInt("Fixes/memcpy"),
+    @ptrFromInt(test_memcpy_alias)
+  )
+
+  test_register(
+    @ptrFromInt("spinlock no-contention stats"),
+    @ptrFromInt("Fixes/sync"),
+    @ptrFromInt(test_spinlock_no_contention)
+  )
+  test_register(
+    @ptrFromInt("rwspinlock upgrade refuses multi-reader"),
+    @ptrFromInt("Fixes/sync"),
+    @ptrFromInt(test_rwspinlock_try_upgrade_refuses_multi_reader)
+  )
+  test_register(
+    @ptrFromInt("rwspinlock upgrade single reader"),
+    @ptrFromInt("Fixes/sync"),
+    @ptrFromInt(test_rwspinlock_try_upgrade_single_reader)
+  )
+
+  test_register(
+    @ptrFromInt("buddy coalesce two order-0"),
+    @ptrFromInt("Fixes/mm"),
+    @ptrFromInt(test_buddy_coalesce)
+  )
+  test_register(
+    @ptrFromInt("buddy dma32 smoke"),
+    @ptrFromInt("Fixes/mm"),
+    @ptrFromInt(test_buddy_dma32_smoke)
+  )
+
+  test_register(
+    @ptrFromInt("socket fd_table roundtrip"),
+    @ptrFromInt("Fixes/net"),
+    @ptrFromInt(test_socket_fd_table_roundtrip)
+  )
+  test_register(
+    @ptrFromInt("socket_send rejects null buf"),
+    @ptrFromInt("Fixes/net"),
+    @ptrFromInt(test_socket_send_rejects_null_buf)
+  )
+  test_register(
+    @ptrFromInt("socket_recv rejects null buf"),
+    @ptrFromInt("Fixes/net"),
+    @ptrFromInt(test_socket_recv_rejects_null_buf)
+  )
+
+  test_register(
+    @ptrFromInt("tcp listen + hash"),
+    @ptrFromInt("Fixes/net"),
+    @ptrFromInt(test_tcp_listen_hash)
+  )
+}

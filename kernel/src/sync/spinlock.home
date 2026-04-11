@@ -101,6 +101,18 @@ fn atomic_fetch_add(ptr: *volatile u32, value: u32): u32 {
     return result
 }
 
+// Atomic 64-bit add
+fn atomic_fetch_add_64(ptr: *volatile u64, value: u64): u64 {
+    var result: u64 = undefined
+    asm volatile (
+        "lock xaddq %0, %1"
+        : "=r" (result), "+m" (@ptrToInt(ptr, u64))
+        : "0" (value)
+        : "memory"
+    )
+    return result
+}
+
 // Atomic subtract and return old value
 fn atomic_fetch_sub(ptr: *volatile u32, value: u32): u32 {
     return atomic_fetch_add(ptr, @bitCast(-@intCast(value, i32), u32))
@@ -161,38 +173,41 @@ export fn spinlock_init(lock: *Spinlock) {
     lock.contention_count = 0
 }
 
-// Acquire spinlock (spinning)
+// Acquire spinlock (spinning).
+// Uses a test-and-test-and-set loop: reload via plain load while the lock is
+// held so the cacheline stays in Shared state and only the winning CPU
+// transitions it to Modified. Contention stat is updated atomically to avoid
+// torn reads under SMP.
 export fn spinlock_acquire(lock: *Spinlock) {
-    var iterations: u32 = 0
+    var backoff: u32 = 1
+    var counted: u32 = 0
 
     while true {
-        // Try to acquire
+        // Fast path: try to acquire immediately
         var old: u32 = atomic_cmpxchg(&lock.locked, SPINLOCK_UNLOCKED, SPINLOCK_LOCKED)
         if old == SPINLOCK_UNLOCKED {
-            // Acquired successfully
             memory_barrier()
             lock.owner_cpu = get_cpu_id()
             return
         }
 
-        // Count contention
-        if iterations == 0 {
-            lock.contention_count = lock.contention_count + 1
+        // Count contention once per acquire attempt (atomic to avoid loss).
+        if counted == 0 {
+            atomic_fetch_add_64(&lock.contention_count, 1)
+            counted = 1
         }
 
-        // Spin with backoff
-        iterations = iterations + 1
-
-        // Use pause instruction to reduce power and improve performance
-        var i: u32 = 0
-        while i < iterations {
-            cpu_pause()
-            i = i + 1
-        }
-
-        // Cap backoff
-        if iterations > 1000 {
-            iterations = 1000
+        // Test-and-test-and-set: spin on plain load while held.
+        while atomic_load(&lock.locked) != SPINLOCK_UNLOCKED {
+            var i: u32 = 0
+            while i < backoff {
+                cpu_pause()
+                i = i + 1
+            }
+            // Exponential backoff up to 1024 pause iterations.
+            if backoff < 1024 {
+                backoff = backoff << 1
+            }
         }
     }
 }
@@ -423,10 +438,19 @@ export fn rwspinlock_write_release_irq(lock: *RWSpinlock) {
     irq_restore(flags)
 }
 
-// Upgrade read to write lock (releases read, acquires write)
-export fn rwspinlock_upgrade(lock: *RWSpinlock) {
-    rwspinlock_read_release(lock)
-    rwspinlock_write_acquire(lock)
+// Try to atomically upgrade a single-reader hold into a write hold.
+// Succeeds only when the caller is the sole reader (reader count == 1).
+// Returns 1 on success, 0 on failure (caller still holds the read lock).
+// There is intentionally no non-atomic upgrade() because it admits a race
+// where another writer can acquire between release and re-acquire.
+export fn rwspinlock_try_upgrade(lock: *RWSpinlock): u32 {
+    var old: u32 = atomic_cmpxchg(&lock.lock, 1, RWLOCK_WRITER_BIT)
+    if old == 1 {
+        memory_barrier()
+        lock.writer_cpu = get_cpu_id()
+        return 1
+    }
+    return 0
 }
 
 // Downgrade write to read lock
@@ -511,5 +535,5 @@ export fn spinlock_debug_release(lock: *SpinlockDebug) {
 
 // Get spinlock statistics
 export fn spinlock_get_stats(lock: *Spinlock, contention: *u64) {
-    @ptrToInt(contention, u64) = lock.contention_count
+    contention.* = lock.contention_count
 }

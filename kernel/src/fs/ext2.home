@@ -137,55 +137,150 @@ var groups_count: u32 = 0
 var group_descriptors: [Ext2GroupDescriptor; 32]
 var ext2_stats: Ext2Stats
 
-// Block cache (simple 8-block cache)
-var block_cache: [[u8; 4096]; 8]
-var block_cache_tags: [u32; 8]
-var block_cache_valid: [u32; 8]
-var block_cache_next: u32 = 0
+// Block cache — 256 entries × 4KB = 1 MB. LRU replacement, open-addressed
+// hash lookup keyed on block number. Lookups are O(1) average instead of
+// scanning all entries, and the working set is large enough that ordinary
+// directory traversals no longer thrash.
+const EXT2_CACHE_SIZE: u32 = 256
+const EXT2_CACHE_MASK: u32 = 255
+const EXT2_CACHE_EMPTY: u32 = 0xFFFFFFFF
+
+var block_cache: [[u8; 4096]; 256]
+var block_cache_tags: [u32; 256]   // Block number stored in each slot.
+var block_cache_valid: [u32; 256]  // 0 = empty, 1 = valid.
+var block_cache_lru: [u64; 256]    // Last-access tick for LRU eviction.
+var block_cache_index: [u32; 256]  // Hash → slot. EMPTY = unused.
+var block_cache_clock: u64 = 0
 
 // ============================================================================
 // BLOCK CACHE
 // ============================================================================
 
-fn ext2_read_block_cached(block_num: u32, buffer: u64): u32 {
-  // Check cache
+fn ext2_cache_hash(block_num: u32): u32 {
+  return (block_num * 2654435761) & EXT2_CACHE_MASK
+}
+
+// Linear-probe lookup of a block in the hash. Returns slot index or EMPTY.
+fn ext2_cache_lookup(block_num: u32): u32 {
+  var h: u32 = ext2_cache_hash(block_num)
+  var probes: u32 = 0
+  while probes < EXT2_CACHE_SIZE {
+    var slot: u32 = block_cache_index[h]
+    if slot == EXT2_CACHE_EMPTY {
+      return EXT2_CACHE_EMPTY
+    }
+    if block_cache_valid[slot] == 1 and block_cache_tags[slot] == block_num {
+      return slot
+    }
+    h = (h + 1) & EXT2_CACHE_MASK
+    probes = probes + 1
+  }
+  return EXT2_CACHE_EMPTY
+}
+
+// Pick an eviction victim: prefer any empty slot, else the least-recently
+// used valid slot.
+fn ext2_cache_pick_victim(): u32 {
   var i: u32 = 0
-  while i < 8 {
-    if block_cache_valid[i] == 1 and block_cache_tags[i] == block_num {
-      ext2_stats.cache_hits = ext2_stats.cache_hits + 1
-      memory.mem_copy(buffer, @ptrFromInt(block_cache[i]), block_size)
-      return 0
+  var victim: u32 = 0
+  var oldest: u64 = 0xFFFFFFFFFFFFFFFF
+  while i < EXT2_CACHE_SIZE {
+    if block_cache_valid[i] == 0 {
+      return i
+    }
+    if block_cache_lru[i] < oldest {
+      oldest = block_cache_lru[i]
+      victim = i
     }
     i = i + 1
+  }
+  return victim
+}
+
+// Rebuild the hash after eviction. We do a full rehash because tombstones
+// plus linear probing get tricky; 256 buckets is cheap.
+fn ext2_cache_rehash() {
+  var i: u32 = 0
+  while i < EXT2_CACHE_SIZE {
+    block_cache_index[i] = EXT2_CACHE_EMPTY
+    i = i + 1
+  }
+  i = 0
+  while i < EXT2_CACHE_SIZE {
+    if block_cache_valid[i] == 1 {
+      var h: u32 = ext2_cache_hash(block_cache_tags[i])
+      var probes: u32 = 0
+      while probes < EXT2_CACHE_SIZE {
+        if block_cache_index[h] == EXT2_CACHE_EMPTY {
+          block_cache_index[h] = i
+          break
+        }
+        h = (h + 1) & EXT2_CACHE_MASK
+        probes = probes + 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn ext2_read_block_cached(block_num: u32, buffer: u64): u32 {
+  block_cache_clock = block_cache_clock + 1
+
+  var slot: u32 = ext2_cache_lookup(block_num)
+  if slot != EXT2_CACHE_EMPTY {
+    ext2_stats.cache_hits = ext2_stats.cache_hits + 1
+    block_cache_lru[slot] = block_cache_clock
+    memory.mem_copy(buffer, @ptrFromInt(block_cache[slot]), block_size)
+    return 0
   }
 
   ext2_stats.cache_misses = ext2_stats.cache_misses + 1
 
-  // Cache miss - read from disk
   var result: u32 = ext2_read_block_raw(block_num, buffer)
   if result != 0 {
     return result
   }
 
-  // Update cache
-  var cache_idx: u32 = block_cache_next
-  memory.mem_copy(@ptrFromInt(block_cache[cache_idx]), buffer, block_size)
-  block_cache_tags[cache_idx] = block_num
-  block_cache_valid[cache_idx] = 1
-  block_cache_next = (block_cache_next + 1) % 8
+  var victim: u32 = ext2_cache_pick_victim()
+  var was_valid: u32 = block_cache_valid[victim]
+  var old_tag: u32 = block_cache_tags[victim]
+
+  memory.mem_copy(@ptrFromInt(block_cache[victim]), buffer, block_size)
+  block_cache_tags[victim] = block_num
+  block_cache_valid[victim] = 1
+  block_cache_lru[victim] = block_cache_clock
+
+  // If we displaced an entry, rehash so the index stays consistent.
+  // Otherwise just try to insert the new key, falling back to rehash on
+  // a fully-full probe run.
+  if was_valid == 1 and old_tag != block_num {
+    ext2_cache_rehash()
+  } else {
+    var h: u32 = ext2_cache_hash(block_num)
+    var probes: u32 = 0
+    while probes < EXT2_CACHE_SIZE {
+      var cur: u32 = block_cache_index[h]
+      if cur == EXT2_CACHE_EMPTY or cur == victim {
+        block_cache_index[h] = victim
+        return 0
+      }
+      h = (h + 1) & EXT2_CACHE_MASK
+      probes = probes + 1
+    }
+    ext2_cache_rehash()
+  }
 
   return 0
 }
 
+// Batch the sector reads in a single ATA multi-sector transfer. Old
+// code issued one `ata_read_sector` per 512-byte sector, which stalled
+// the CPU waiting on each individual I/O completion.
 fn ext2_read_block_raw(block_num: u32, buffer: u64): u32 {
   var sectors_per_block: u32 = block_size / 512
   var start_sector: u32 = block_num * sectors_per_block
 
-  var i: u32 = 0
-  while i < sectors_per_block {
-    ata.ata_read_sector(0, start_sector + i, buffer + (i * 512))
-    i = i + 1
-  }
+  ata.ata_read_sectors(0, @as(u64, start_sector), sectors_per_block, buffer)
 
   ext2_stats.reads = ext2_stats.reads + 1
   ext2_stats.bytes_read = ext2_stats.bytes_read + block_size
@@ -246,13 +341,16 @@ export fn ext2_init(): u32 {
     i = i + 1
   }
 
-  // Initialize block cache
+  // Initialize block cache: clear all slots and the hash index.
   i = 0
-  while i < 8 {
+  while i < EXT2_CACHE_SIZE {
     block_cache_valid[i] = 0
+    block_cache_tags[i] = 0
+    block_cache_lru[i] = 0
+    block_cache_index[i] = EXT2_CACHE_EMPTY
     i = i + 1
   }
-  block_cache_next = 0
+  block_cache_clock = 0
 
   // Initialize stats
   ext2_stats.reads = 0
