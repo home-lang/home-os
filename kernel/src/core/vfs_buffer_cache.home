@@ -72,7 +72,11 @@ fn cache_lookup(ino: u32, block_num: u32): u32 {
   var hash: u32 = cache_hash(ino, block_num)
   var entry_idx: u32 = cache_hash_table[hash]
 
-  while entry_idx != 0xFFFFFFFF {
+  // Bounded walk: a corrupted hash chain (hash_next cycle or stale
+  // index) would otherwise spin forever inside the cache lookup.
+  // CACHE_ENTRIES is an upper bound on chain length.
+  var iterations: u32 = 0
+  while entry_idx != 0xFFFFFFFF and iterations < CACHE_ENTRIES {
     if cache_entries[entry_idx].ino == ino and cache_entries[entry_idx].block_num == block_num {
       // Found it!
       cache_stats.hits = cache_stats.hits + 1
@@ -82,6 +86,7 @@ fn cache_lookup(ino: u32, block_num: u32): u32 {
       return entry_idx
     }
     entry_idx = cache_entries[entry_idx].hash_next
+    iterations = iterations + 1
   }
 
   cache_stats.misses = cache_stats.misses + 1
@@ -117,12 +122,14 @@ fn cache_evict(): u32 {
     cache_writeback(oldest_idx)
   }
 
-  // Remove from hash chain
+  // Remove from hash chain. Bounded loop so a corrupted chain can't
+  // livelock the evictor.
   var hash: u32 = cache_hash(cache_entries[oldest_idx].ino, cache_entries[oldest_idx].block_num)
   var prev_idx: u32 = 0xFFFFFFFF
   var curr_idx: u32 = cache_hash_table[hash]
 
-  while curr_idx != 0xFFFFFFFF {
+  var iters: u32 = 0
+  while curr_idx != 0xFFFFFFFF and iters < CACHE_ENTRIES {
     if curr_idx == oldest_idx {
       if prev_idx == 0xFFFFFFFF {
         cache_hash_table[hash] = cache_entries[curr_idx].hash_next
@@ -133,6 +140,7 @@ fn cache_evict(): u32 {
     }
     prev_idx = curr_idx
     curr_idx = cache_entries[curr_idx].hash_next
+    iters = iters + 1
   }
 
   // Free the data
@@ -172,9 +180,13 @@ fn cache_alloc(ino: u32, block_num: u32): u32 {
     return 0xFFFFFFFF  // Failed to allocate
   }
 
-  // Allocate data block
+  // Allocate data block. If this fails we MUST mark the entry slot
+  // free again, otherwise evict leaves a half-initialized STATE_FREE
+  // slot with stale metadata that can never be reclaimed.
   var data_addr: u64 = memory.pmm_alloc_page()
   if data_addr == 0 {
+    cache_entries[entry_idx].state = CACHE_STATE_FREE
+    cache_entries[entry_idx].data = 0
     return 0xFFFFFFFF
   }
 
@@ -209,7 +221,7 @@ export fn cache_read_block(ino: u32, block_num: u32, dest: u64): u32 {
   if entry_idx != 0xFFFFFFFF {
     // Cache hit - copy from cache
     memory.memcpy(dest, cache_entries[entry_idx].data, BLOCK_SIZE)
-    cache_entries[entry_idx].ref_count = cache_entries[entry_idx].ref_count - 1
+    cache_put(entry_idx)
     return 0
   }
 
@@ -226,9 +238,19 @@ export fn cache_read_block(ino: u32, block_num: u32, dest: u64): u32 {
 
   // Copy to destination
   memory.memcpy(dest, cache_entries[entry_idx].data, BLOCK_SIZE)
-  cache_entries[entry_idx].ref_count = cache_entries[entry_idx].ref_count - 1
+  cache_put(entry_idx)
 
   return 0
+}
+
+// Release a cache entry reference. Underflow-safe: decrementing a
+// zero ref_count would wrap around to 0xFFFFFFFF and keep the entry
+// pinned forever, so we clamp at 0.
+fn cache_put(entry_idx: u32) {
+  if entry_idx >= CACHE_ENTRIES { return }
+  if cache_entries[entry_idx].ref_count > 0 {
+    cache_entries[entry_idx].ref_count = cache_entries[entry_idx].ref_count - 1
+  }
 }
 
 // ============================================================================
@@ -253,7 +275,7 @@ export fn cache_write_block(ino: u32, block_num: u32, src: u64): u32 {
   memory.memcpy(cache_entries[entry_idx].data, src, BLOCK_SIZE)
   cache_entries[entry_idx].dirty = 1
   cache_entries[entry_idx].state = CACHE_STATE_DIRTY
-  cache_entries[entry_idx].ref_count = cache_entries[entry_idx].ref_count - 1
+  cache_put(entry_idx)
 
   return 0
 }
