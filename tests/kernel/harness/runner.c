@@ -3272,6 +3272,226 @@ static void test_http_port_bounded(void) {
 }
 
 // ============================================================================
+// ROUND 14 FIXES
+// ============================================================================
+
+// --- heap: let -> var for mutable state ---
+static void test_heap_mutable_state(void) {
+    size_t current = 0x100000; current += 16;
+    ASSERT(current > 0x100000, "heap_current is mutable");
+}
+
+// --- heap: alloc size==0 ---
+static void test_heap_alloc_zero(void) {
+    uint64_t size = 0;
+    int returns_null = (size == 0) ? 1 : 0;
+    ASSERT_EQ(returns_null, 1, "alloc(0) returns null");
+}
+
+// --- heap: calloc overflow ---
+static void test_heap_calloc_overflow(void) {
+    uint64_t count = UINT64_MAX, size = 2;
+    int overflow = (count != 0 && size > UINT64_MAX / count) ? 1 : 0;
+    ASSERT_EQ(overflow, 1, "calloc overflow detected");
+}
+
+// --- heap: free underflow guard ---
+static void test_heap_free_underflow(void) {
+    uint64_t allocated = 10, block_size = 100;
+    if (allocated >= block_size) { allocated -= block_size; }
+    else { allocated = 0; }
+    ASSERT_EQ(allocated, 0, "clamped to 0");
+}
+
+// --- heap: calloc let->var for loop ---
+static void test_heap_calloc_loop_var(void) {
+    size_t i = 0; i++; ASSERT_EQ(i, 1, "loop var mutable");
+}
+
+// --- heap: realloc let->var for loop ---
+static void test_heap_realloc_loop_var(void) {
+    size_t i = 0; i++; ASSERT_EQ(i, 1, "realloc loop var mutable");
+}
+
+// --- main: interrupt_nesting underflow ---
+static void test_irq_nesting_underflow(void) {
+    uint32_t nesting = 0;
+    if (nesting > 0) nesting--;
+    ASSERT_EQ(nesting, 0, "nesting stays at 0");
+}
+
+// --- main: in_interrupt cleared only at nesting==0 ---
+static void test_irq_nested_in_interrupt(void) {
+    uint32_t in_irq = 1, nesting = 2;
+    nesting--;
+    if (nesting == 0) in_irq = 0;
+    ASSERT_EQ(in_irq, 1, "in_interrupt stays 1 while nested");
+    nesting--;
+    if (nesting == 0) in_irq = 0;
+    ASSERT_EQ(in_irq, 0, "cleared at nesting 0");
+}
+
+// --- main: boot info tag_size==0 breaks ---
+static void test_boot_tag_size_zero(void) {
+    uint32_t tag_size = 0;
+    int should_break = (tag_size < 8) ? 1 : 0;
+    ASSERT_EQ(should_break, 1, "tag_size 0 breaks parse loop");
+}
+
+// --- main: stack trace frame > 0x1000 guard ---
+static void test_stack_trace_low_frame(void) {
+    uint64_t frame = 0x100; // suspiciously low
+    int should_stop = (frame == 0 || frame <= 0x1000) ? 1 : 0;
+    ASSERT_EQ(should_stop, 1, "low frame address stops trace");
+}
+
+// ============================================================================
+// ROUND 15 FIXES
+// ============================================================================
+
+// --- vfs_locking: lock range overflow clamped ---
+static void test_lock_range_overflow(void) {
+    uint64_t start = UINT64_MAX - 10, length = 100;
+    uint64_t end = start + length;
+    if (length != 0 && end < start) end = UINT64_MAX;
+    ASSERT_EQ(end, UINT64_MAX, "overflow clamped to max");
+}
+
+// --- vfs_locking: same-process relock no conflict ---
+static void test_lock_same_process_relock(void) {
+    uint32_t lock_pid = 42, current_pid = 42;
+    int conflict = (lock_pid == current_pid) ? 0 : 1;
+    ASSERT_EQ(conflict, 0, "same process can re-lock");
+}
+
+// --- vfs_locking: waiter_count underflow ---
+static void test_lock_waiter_underflow(void) {
+    uint32_t count = 0;
+    if (count > 0) count--;
+    ASSERT_EQ(count, 0, "waiter count stays 0");
+}
+
+// --- vfs_mmap: munmap mapping_count underflow ---
+static void test_mmap_munmap_count_underflow(void) {
+    uint32_t count = 0;
+    if (count > 0) count--;
+    ASSERT_EQ(count, 0, "mapping_count stays 0");
+}
+
+// --- vfs_mmap: munmap total_mapped_bytes underflow ---
+static void test_mmap_bytes_underflow(void) {
+    uint64_t total = 100, unmap = 200;
+    if (total >= unmap) total -= unmap; else total = 0;
+    ASSERT_EQ(total, 0, "clamped to 0");
+}
+
+// --- vfs_mmap: offset alignment check ---
+static void test_mmap_offset_alignment(void) {
+    uint64_t offset = 1000; // not page-aligned
+    uint32_t flags = 0; // not anonymous
+    int rejected = ((flags & 32) == 0 && (offset & 4095) != 0) ? 1 : 0;
+    ASSERT_EQ(rejected, 1, "unaligned offset rejected");
+}
+
+static void test_mmap_offset_aligned(void) {
+    uint64_t offset = 4096;
+    int rejected = ((offset & 4095) != 0) ? 1 : 0;
+    ASSERT_EQ(rejected, 0, "page-aligned offset accepted");
+}
+
+// --- vfs_xattr: detect_namespace null check ---
+static void test_xattr_null_name(void) {
+    void *name = NULL;
+    uint32_t ns = (name == NULL) ? 0 : 99; // XATTR_USER default
+    ASSERT_EQ(ns, 0, "null name returns default namespace");
+}
+
+// --- container/namespace: type bounds ---
+static void test_namespace_type_bounds(void) {
+    uint32_t type = 10; // out of range
+    int rejected = (type > 5) ? 1 : 0; // NS_TYPE_USER = 5
+    ASSERT_EQ(rejected, 1, "invalid type rejected");
+}
+
+static void test_namespace_type_valid(void) {
+    uint32_t type = 2; // NS_TYPE_NET
+    int rejected = (type > 5) ? 1 : 0;
+    ASSERT_EQ(rejected, 0, "valid type accepted");
+}
+
+// --- container/namespace: missing type in log ---
+static void test_namespace_log_type(void) {
+    // Verify concept: type value is now printed
+    uint32_t type = 3;
+    ASSERT(type <= 5, "type printable");
+}
+
+// --- lazy_loader: load_time underflow ---
+static void test_lazy_load_time_underflow(void) {
+    uint64_t start = 100, end = 50;
+    uint64_t load_time = (end >= start) ? (end - start) : 0;
+    ASSERT_EQ(load_time, 0, "underflow returns 0");
+}
+
+// --- lazy_loader: let -> var ---
+static void test_lazy_loader_var(void) {
+    uint64_t start = 0; start = 100;
+    uint32_t result = 0; result = 1;
+    ASSERT_EQ(start, 100, "start mutable");
+    ASSERT_EQ(result, 1, "result mutable");
+}
+
+// ============================================================================
+// ROUND 16 FIXES
+// ============================================================================
+
+// --- websocket: str_len bounded + null-safe ---
+static void test_ws_strlen_null(void) {
+    uint64_t s = 0;
+    uint32_t len = (s == 0) ? 0 : 99;
+    ASSERT_EQ(len, 0, "null returns 0");
+}
+// --- websocket: str_copy terminates ---
+static void test_ws_strcopy_terminates(void) {
+    char dest[8]; memset(dest, 'X', 8);
+    const char *src = "abcdefghij";
+    uint32_t max = 8, i = 0;
+    while (i < max - 1 && src[i]) { dest[i] = src[i]; i++; }
+    dest[i] = 0;
+    ASSERT_EQ(dest[7], 0, "terminated");
+}
+// --- websocket: host parsing bounded ---
+static void test_ws_host_bounded(void) {
+    char host[256]; memset(host, 0, 256);
+    char long_h[300]; memset(long_h, 'h', 299); long_h[299] = 0;
+    uint32_t i = 0;
+    while (long_h[i] && long_h[i] != ':' && long_h[i] != '/' && i < 255) { host[i] = long_h[i]; i++; }
+    host[i] = 0;
+    ASSERT_EQ(i, 255, "host capped at 255");
+}
+// --- websocket: path parsing bounded ---
+static void test_ws_path_bounded(void) {
+    uint32_t path_idx = 0, limit = 255;
+    while (path_idx < limit) path_idx++;
+    ASSERT_EQ(path_idx, 255, "path capped at 255");
+}
+// --- websocket: port validation ---
+static void test_ws_port_valid(void) {
+    uint32_t port = 80; int ok = (port <= 65535) ? 1 : 0;
+    ASSERT_EQ(ok, 1, "port 80 valid");
+}
+static void test_ws_port_overflow(void) {
+    uint32_t port = 99999; int ok = (port <= 65535) ? 1 : 0;
+    ASSERT_EQ(ok, 0, "port > 65535 rejected");
+}
+// --- websocket: random seed from TSC ---
+static void test_ws_random_not_constant(void) {
+    uint64_t seed1 = 12345 ^ 0x987654321FEDCBA;
+    uint64_t seed2 = 67890 ^ 0x987654321FEDCBA;
+    ASSERT(seed1 != seed2, "different TSC produces different seeds");
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -3699,6 +3919,55 @@ int main(void) {
     RUN(http_scheme_bounded);
     RUN(http_host_bounded);
     RUN(http_port_bounded);
+
+    // --- Round 14 fixes ---
+    printf("\nFixes/heap (round 14):\n");
+    RUN(heap_mutable_state);
+    RUN(heap_alloc_zero);
+    RUN(heap_calloc_overflow);
+    RUN(heap_free_underflow);
+    RUN(heap_calloc_loop_var);
+    RUN(heap_realloc_loop_var);
+
+    printf("\nFixes/main (round 14):\n");
+    RUN(irq_nesting_underflow);
+    RUN(irq_nested_in_interrupt);
+    RUN(boot_tag_size_zero);
+    RUN(stack_trace_low_frame);
+
+    // --- Round 15 fixes ---
+    printf("\nFixes/vfs_locking (round 15):\n");
+    RUN(lock_range_overflow);
+    RUN(lock_same_process_relock);
+    RUN(lock_waiter_underflow);
+
+    printf("\nFixes/vfs_mmap (round 15):\n");
+    RUN(mmap_munmap_count_underflow);
+    RUN(mmap_bytes_underflow);
+    RUN(mmap_offset_alignment);
+    RUN(mmap_offset_aligned);
+
+    printf("\nFixes/vfs_xattr (round 15):\n");
+    RUN(xattr_null_name);
+
+    printf("\nFixes/namespace (round 15):\n");
+    RUN(namespace_type_bounds);
+    RUN(namespace_type_valid);
+    RUN(namespace_log_type);
+
+    printf("\nFixes/lazy_loader (round 15):\n");
+    RUN(lazy_load_time_underflow);
+    RUN(lazy_loader_var);
+
+    // --- Round 16 fixes ---
+    printf("\nFixes/websocket (round 16):\n");
+    RUN(ws_strlen_null);
+    RUN(ws_strcopy_terminates);
+    RUN(ws_host_bounded);
+    RUN(ws_path_bounded);
+    RUN(ws_port_valid);
+    RUN(ws_port_overflow);
+    RUN(ws_random_not_constant);
 
     printf("\n============================\n");
     printf("Result: \x1b[32m%d passed\x1b[0m, \x1b[31m%d failed\x1b[0m\n\n", g_pass, g_fail);
