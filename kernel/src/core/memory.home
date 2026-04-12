@@ -19,6 +19,7 @@ var pmm_bitmap: [32768]u8  // 1GB / 4096 / 8 = 32768 bytes
 var pmm_total_pages: u32 = 0
 var pmm_used_pages: u32 = 0
 var pmm_initialized: u32 = 0
+var pmm_hint: u32 = 0
 
 export fn pmm_init(memory_size: u64) {
   if pmm_initialized == 1 { return }
@@ -35,6 +36,7 @@ export fn pmm_init(memory_size: u64) {
   
   pmm_initialized = 1
   foundation.serial_write_string("[PMM] Initialized with ")
+  foundation.serial_write_u32(pmm_total_pages)
   foundation.serial_write_string(" pages\n")
 }
 
@@ -57,26 +59,43 @@ fn pmm_test_bit(page: u32): u32 {
 }
 
 export fn pmm_alloc_page(): u64 {
-  var page: u32 = 0
-  
+  // Start scanning from the hint so we skip already-full regions.
+  var page: u32 = pmm_hint
+
   while page < pmm_total_pages {
     if pmm_test_bit(page) == 0 {
       pmm_set_bit(page)
       pmm_used_pages = pmm_used_pages + 1
-      return page * PAGE_SIZE
+      pmm_hint = page + 1
+      return @as(u64, page) * PAGE_SIZE
     }
     page = page + 1
   }
-  
-  return 0  // Out of memory
+
+  // Wrap around and scan from 0 to hint.
+  page = 0
+  while page < pmm_hint {
+    if pmm_test_bit(page) == 0 {
+      pmm_set_bit(page)
+      pmm_used_pages = pmm_used_pages + 1
+      pmm_hint = page + 1
+      return @as(u64, page) * PAGE_SIZE
+    }
+    page = page + 1
+  }
+
+  return 0
 }
 
 export fn pmm_free_page(addr: u64) {
-  var page: u32 = addr / PAGE_SIZE
-  
+  if (addr & (PAGE_SIZE - 1)) != 0 { return }
+  var page: u32 = @truncate(addr / PAGE_SIZE, u32)
+  if page >= pmm_total_pages { return }
+
   if pmm_test_bit(page) == 1 {
     pmm_clear_bit(page)
-    pmm_used_pages = pmm_used_pages - 1
+    if pmm_used_pages > 0 { pmm_used_pages = pmm_used_pages - 1 }
+    if page < pmm_hint { pmm_hint = page }
   }
 }
 
@@ -85,6 +104,7 @@ export fn pmm_get_used_pages(): u32 {
 }
 
 export fn pmm_get_free_pages(): u32 {
+  if pmm_used_pages > pmm_total_pages { return 0 }
   return pmm_total_pages - pmm_used_pages
 }
 
@@ -145,26 +165,29 @@ export fn vmm_map_page(virt: u64, phys: u64, flags: u64): u32 {
   if pdpt == 0 {
     pdpt = pmm_alloc_page()
     if pdpt == 0 { return 1 }
+    memset(pdpt, 0, PAGE_SIZE)
     @ptrToInt(pml4_entry_addr, u64) = pdpt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER
   }
-  
+
   // Get or create PD
   var pdpt_entry_addr: u64 = pdpt + (pdpt_index * 8)
   var pd: u64 = @intToPtr(pdpt_entry_addr, u64) & ~0xFFF
-  
+
   if pd == 0 {
     pd = pmm_alloc_page()
     if pd == 0 { return 1 }
+    memset(pd, 0, PAGE_SIZE)
     @ptrToInt(pdpt_entry_addr, u64) = pd | PAGE_PRESENT | PAGE_WRITE | PAGE_USER
   }
-  
+
   // Get or create PT
   var pd_entry_addr: u64 = pd + (pd_index * 8)
   var pt: u64 = @intToPtr(pd_entry_addr, u64) & ~0xFFF
-  
+
   if pt == 0 {
     pt = pmm_alloc_page()
     if pt == 0 { return 1 }
+    memset(pt, 0, PAGE_SIZE)
     @ptrToInt(pd_entry_addr, u64) = pt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER
   }
   
@@ -264,10 +287,10 @@ export fn heap_init() {
 
 export fn kmalloc(size: u64): u64 {
   if size == 0 { return 0 }
-  
-  // Align to 8 bytes
+  if heap_initialized == 0 { return 0 }
+
   var aligned_size: u64 = (size + 7) & ~7
-  
+
   var current: u64 = heap_head
   
   while current != 0 {
@@ -301,9 +324,10 @@ export fn kmalloc(size: u64): u64 {
 
 export fn kfree(ptr: u64) {
   if ptr == 0 { return }
+  if ptr < HEAP_START + @sizeOf(HeapBlock) or ptr >= HEAP_START + HEAP_SIZE { return }
 
   var block: u64 = ptr - @sizeOf(HeapBlock)
-  @ptrToInt(block + 8, u32) = 0  // Mark as free
+  @ptrToInt(block + 8, u32) = 0
 
   // Coalesce adjacent free blocks
   coalesce_free_blocks()
@@ -523,6 +547,7 @@ export fn krealloc(ptr: u64, new_size: u64): u64 {
 
 // Allocate zeroed memory
 export fn kcalloc(count: u64, size: u64): u64 {
+  if count != 0 and size > 0xFFFFFFFFFFFFFFFF / count { return 0 }
   var total: u64 = count * size
   var ptr: u64 = kmalloc(total)
 
