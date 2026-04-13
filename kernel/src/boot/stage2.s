@@ -397,7 +397,7 @@ setup_page_tables:
     or $0x03, %eax
     mov %eax, pdpt_table
 
-    /* Fill PD with 2MB huge pages (map first 2GB) */
+    /* Fill PD with 2MB huge pages (map first 1GB) */
     mov $pd_table, %edi
     mov $0x00000083, %eax   /* Present + Writable + Huge */
     mov $512, %ecx          /* 512 entries * 2MB = 1GB */
