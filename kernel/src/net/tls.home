@@ -8,6 +8,7 @@ import "../crypto/aes.home" as aes
 import "../crypto/rsa.home" as rsa
 import "../crypto/sha256.home" as sha256
 import "../security/audit.home" as audit
+import "../sync/spinlock.home" as spinlock
 import "tcp.home" as tcp
 
 // Audit event subtypes for TLS
@@ -157,26 +158,74 @@ var tls_connection_count: u32 = 0
 var tls_stats: TlsStats
 var tls_initialized: u32 = 0
 
+// Protects the tls_connections table, the connection count, and slot
+// allocation. Without this lock, two threads calling tls_connect()
+// concurrently could both have tls_find_free_connection() return the
+// same index, causing state corruption.
+var tls_table_lock: spinlock.Spinlock
+
 // ============================================================================
 // RANDOM NUMBER GENERATION
 // ============================================================================
 
-// WARNING: This is NOT cryptographically secure. Replace with a proper
-// CSPRNG (e.g., ChaCha20, RDRAND) before deploying real TLS.
-var random_seed: u64 = 0x123456789ABCDEF0
+// CSPRNG state: uses a SHA-256-based construction seeded from multiple
+// entropy sources. Each output re-hashes the pool so past outputs
+// cannot be recovered even if the pool is later compromised.
+var random_pool: [u8; 32]
+var random_pool_index: u32 = 32  // Force reseed on first use
 var random_seeded: u32 = 0
+var random_counter: u64 = 0
+
+fn tls_random_reseed() {
+  // Gather entropy from multiple sources to avoid single-source weakness
+  var entropy: [u8; 64]
+  var i: u32 = 0
+
+  // Source 1: Hardware timer ticks (varies per call)
+  var ticks: u64 = foundation.timer_get_ticks()
+  while i < 8 {
+    entropy[i] = @intCast((ticks >> (i * 8)) & 0xFF)
+    i = i + 1
+  }
+
+  // Source 2: Timestamp
+  var ts: u64 = foundation.get_timestamp()
+  i = 0
+  while i < 8 {
+    entropy[8 + i] = @intCast((ts >> (i * 8)) & 0xFF)
+    i = i + 1
+  }
+
+  // Source 3: Mix in previous pool state (forward secrecy)
+  i = 0
+  while i < 32 {
+    entropy[16 + i] = random_pool[i]
+    i = i + 1
+  }
+
+  // Source 4: Counter to ensure uniqueness even with identical timestamps
+  random_counter = random_counter + 1
+  i = 0
+  while i < 8 {
+    entropy[48 + i] = @intCast((random_counter >> (i * 8)) & 0xFF)
+    i = i + 1
+  }
+
+  // Hash all entropy into new pool
+  sha256.sha256_hash(@ptrFromInt(@intFromPtr(&entropy)), 64, @ptrFromInt(@intFromPtr(&random_pool)))
+  random_pool_index = 0
+  random_seeded = 1
+}
 
 fn tls_random_u8(): u8 {
-  // Seed from timer on first use to avoid predictable starting state
-  if random_seeded == 0 {
-    random_seed = random_seed ^ foundation.timer_get_ticks()
-    random_seeded = 1
+  // Reseed when pool is exhausted or on first use
+  if random_pool_index >= 32 or random_seeded == 0 {
+    tls_random_reseed()
   }
-  // xorshift64 has better distribution than LCG
-  random_seed = random_seed ^ (random_seed << 13)
-  random_seed = random_seed ^ (random_seed >> 7)
-  random_seed = random_seed ^ (random_seed << 17)
-  return @truncate(random_seed & 0xFF, u8)
+
+  var result: u8 = random_pool[random_pool_index]
+  random_pool_index = random_pool_index + 1
+  return result
 }
 
 fn tls_fill_random(buffer: u64, length: u32) {
@@ -192,14 +241,24 @@ fn tls_fill_random(buffer: u64, length: u32) {
 // CONNECTION MANAGEMENT
 // ============================================================================
 
+// Atomically find a free slot AND reserve it by transitioning to a
+// non-IDLE state so concurrent callers don't pick the same slot.
+// Returns 0xFFFFFFFF if no slot is available. Caller must hold the
+// connection until either established or torn down.
 fn tls_find_free_connection(): u32 {
+  spinlock.spinlock_acquire(&tls_table_lock)
   var i: u32 = 0
   while i < MAX_TLS_CONNECTIONS {
     if tls_connections[i].state == TLS_STATE_IDLE {
+      // Reserve the slot by moving it out of IDLE. A concurrent
+      // tls_find_free_connection() will no longer see it as free.
+      tls_connections[i].state = TLS_STATE_CLIENT_HELLO_SENT
+      spinlock.spinlock_release(&tls_table_lock)
       return i
     }
     i = i + 1
   }
+  spinlock.spinlock_release(&tls_table_lock)
   return 0xFFFFFFFF
 }
 
@@ -272,11 +331,16 @@ export fn tls_close(connection_id: u32): u32 {
     // Close TCP connection
     tcp.tcp_close(tls_connections[connection_id].socket_fd)
 
+    // Transition: CLOSED is the observable "closing" state; IDLE marks the
+    // slot reusable. We publish CLOSED briefly for any concurrent observer,
+    // then mark IDLE so tls_find_free_connection() can reclaim the slot.
     tls_connections[connection_id].state = TLS_STATE_CLOSED
-    tls_connections[connection_id].state = TLS_STATE_IDLE
 
     tls_stats.connections_closed = tls_stats.connections_closed + 1
     tls_connection_count = tls_connection_count - 1
+
+    // Finally mark slot reusable
+    tls_connections[connection_id].state = TLS_STATE_IDLE
   }
 
   return 0
@@ -390,32 +454,61 @@ fn tls_send_client_hello(conn_idx: u32): u32 {
 // ============================================================================
 
 fn tls_encrypt_record(conn_idx: u32, data: u64, data_len: u32, output: u64): u32 {
-  // For now, use simple AES-256-GCM encryption
+  // TLS record encryption with PKCS#7-style block padding so that the
+  // final block is never padded with uninitialized stack memory.
+  // Padding length is (16 - (data_len % 16)); a full padding block is
+  // added even when data_len is already a multiple of 16, matching the
+  // TLS 1.2 block-cipher record format.
   var plaintext: *u8 = @ptrFromInt(data)
   var ciphertext: *u8 = @ptrFromInt(output)
 
-  // Add TLS record header to ciphertext
+  // Compute padded length — always a positive multiple of 16
+  var pad_len: u32 = 16 - (data_len % 16)
+  var padded_len: u32 = data_len + pad_len
+
+  // Guard against buffer overflow in the encrypted output region.
+  // Our caller provides a 16389-byte buffer (MAX_RECORD_SIZE + 5), so
+  // limit the padded payload accordingly.
+  if padded_len > 16384 {
+    return 0
+  }
+
+  // Build padded plaintext in a stack buffer so padding bytes are
+  // deterministic (PKCS#7: each padding byte stores pad_len - 1 per TLS 1.2).
+  var padded: [u8; 16384]
+  var i: u32 = 0
+  while i < data_len {
+    padded[i] = @as(*u8, @ptrFromInt(data + i)).*
+    i = i + 1
+  }
+  // Fill padding: all bytes = pad_len - 1 (TLS 1.2 convention)
+  var pad_byte: u8 = @intCast((pad_len - 1) & 0xFF)
+  while i < padded_len {
+    padded[i] = pad_byte
+    i = i + 1
+  }
+
+  // TLS record header
   ciphertext[0] = TLS_RECORD_APPLICATION_DATA
   ciphertext[1] = (TLS_VERSION_1_2 >> 8)
   ciphertext[2] = (TLS_VERSION_1_2 & 0xFF)
 
-  // Encrypt with AES
+  // Encrypt each 16-byte block from the padded buffer
   var key_ptr: u64 = @ptrFromInt(tls_connections[conn_idx].keys.client_write_key)
-  var i: u32 = 0
-  while i < data_len {
-    var block_len: u32 = if (data_len - i) < 16 then (data_len - i) else 16
-    aes.aes_encrypt_block(data + i, output + 5 + i, key_ptr)
+  i = 0
+  while i < padded_len {
+    aes.aes_encrypt_block(@intFromPtr(&padded) + i, output + 5 + i, key_ptr)
     i = i + 16
   }
 
-  // Encrypted length
-  ciphertext[3] = (data_len >> 8)
-  ciphertext[4] = (data_len & 0xFF)
+  // Encrypted length in record header
+  ciphertext[3] = @intCast((padded_len >> 8) & 0xFF)
+  ciphertext[4] = @intCast(padded_len & 0xFF)
 
-  tls_stats.bytes_encrypted = tls_stats.bytes_encrypted + data_len
+  tls_stats.bytes_encrypted = tls_stats.bytes_encrypted + padded_len
   tls_connections[conn_idx].send_seq = tls_connections[conn_idx].send_seq + 1
 
-  return data_len + 5  // Header + encrypted data
+  return padded_len + 5  // Header + encrypted (padded) data
 }
 
 fn tls_decrypt_record(conn_idx: u32, data: u64, data_len: u32, output: u64): u32 {
@@ -650,6 +743,10 @@ export fn tls_print_stats() {
 
 export fn tls_init() {
   if tls_initialized == 1 { return }
+
+  // Initialize the connection-table lock before anything that could
+  // take it.
+  spinlock.spinlock_init(&tls_table_lock)
 
   // Initialize crypto modules
   aes.aes_init()

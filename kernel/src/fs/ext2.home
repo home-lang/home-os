@@ -470,10 +470,12 @@ fn ext2_get_block_number(inode: *Ext2Inode, logical_block: u32): u32 {
 
     var ind_ptr: *u32 = @ptrFromInt(ind_buffer)
     var offset: u32 = logical_block - EXT2_NDIR_BLOCKS
+    if offset >= block_ptrs_per_block { return 0 }  // Bounds check
     return ind_ptr[offset]
   }
 
   // Double indirect (13)
+  if logical_block < EXT2_NDIR_BLOCKS + block_ptrs_per_block { return 0 }
   logical_block = logical_block - (EXT2_NDIR_BLOCKS + block_ptrs_per_block)
   if logical_block < (block_ptrs_per_block * block_ptrs_per_block) {
     var dind_block: u32 = inode.block[EXT2_DIND_BLOCK]
@@ -605,32 +607,56 @@ export fn ext2_lookup_entry(dir_ino: u32, name: u64): u32 {
     return 0
   }
 
-  // Parse directory entries
+  // Parse directory entries with tight bounds checking on rec_len and
+  // name_len to reject malformed/malicious directory blocks.
   var offset: u32 = 0
   while offset < bytes_read {
     var entry: *Ext2DirEntry = @ptrFromInt(@ptrFromInt(dir_buffer) + offset)
 
+    // rec_len must be at least the fixed-header size AND must not
+    // extend past the end of the directory buffer.
     if entry.rec_len < 8 { break }
+    if (@as(u64, offset) + @as(u64, entry.rec_len)) > @as(u64, bytes_read) { break }
+
+    // name_len must also fit within the record.
+    if (@as(u32, entry.name_len) + 8) > entry.rec_len { break }
 
     if entry.inode == 0 {
       offset = offset + entry.rec_len
       continue
     }
 
-    // Compare names
+    // Compare names. Bound the `name` input by name_len bytes; do NOT
+    // read name_ptr[i] past the record's declared length. Also verify
+    // the caller-supplied name is null-terminated at exactly name_len
+    // by scanning up to that point; a shorter-terminated source is a
+    // mismatch (not an OOB read).
     var name_ptr: *u8 = @ptrFromInt(name)
     var match: u32 = 1
     var i: u32 = 0
+    var src_terminated: u32 = 0
     while i < entry.name_len {
-      if name_ptr[i] != entry.name[i] {
+      var src_ch: u8 = name_ptr[i]
+      if src_ch == 0 {
+        // Input ended before name_len — can't match this entry.
+        src_terminated = 1
+        match = 0
+        break
+      }
+      if src_ch != entry.name[i] {
         match = 0
         break
       }
       i = i + 1
     }
 
-    if match == 1 and name_ptr[entry.name_len] == 0 {
-      return entry.inode
+    // Only check the terminator byte if we didn't already bail out.
+    // If we read name_len bytes successfully, the input must terminate
+    // exactly at name_len for a true match.
+    if match == 1 and src_terminated == 0 {
+      if name_ptr[entry.name_len] == 0 {
+        return entry.inode
+      }
     }
 
     offset = offset + entry.rec_len

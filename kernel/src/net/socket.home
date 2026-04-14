@@ -309,20 +309,26 @@ export fn socket_close(fd: u32): u32 {
     }
   }
 
-  // Free buffers
+  // Free buffers and zero pointers to prevent double-free
   if sockets[idx].recv_buf != 0 {
     memory.kfree(sockets[idx].recv_buf)
+    sockets[idx].recv_buf = 0
   }
   if sockets[idx].send_buf != 0 {
     memory.kfree(sockets[idx].send_buf)
+    sockets[idx].send_buf = 0
   }
 
   // Mark as closed
   var closed_fd: u32 = sockets[idx].fd
   sockets[idx].state = SOCK_STATE_CLOSED
   sockets[idx].fd = 0
+  sockets[idx].recv_buf_len = 0
+  sockets[idx].send_buf_len = 0
   fd_table_remove(closed_fd)
-  socket_count = socket_count - 1
+  if socket_count > 0 {
+    socket_count = socket_count - 1
+  }
 
   return 0
 }
@@ -448,6 +454,7 @@ export fn socket_connect(fd: u32, addr: u64, addrlen: u32): u32 {
     // Allocate local port if not bound
     if sockets[idx].local_port == 0 {
       sockets[idx].local_port = allocate_ephemeral_port()
+      if sockets[idx].local_port == 0 { return 1 }  // No ports available
     }
 
     sockets[idx].state = SOCK_STATE_CONNECTING
@@ -574,6 +581,7 @@ export fn socket_sendto(fd: u32, buf: u64, len: u64, flags: u32, dest_addr: u64,
   // Allocate local port if not bound
   if sockets[idx].local_port == 0 {
     sockets[idx].local_port = allocate_ephemeral_port()
+    if sockets[idx].local_port == 0 { return 0xFFFFFFFFFFFFFFFF }
   }
 
   return udp.udp_send(sockets[idx].local_port, remote_addr, remote_port, buf, @intCast(len))
@@ -657,12 +665,24 @@ export fn socket_setsockopt(fd: u32, level: u32, optname: u32, optval: u64, optl
     } else if optname == SO_RCVBUF {
       if optlen >= 4 {
         var val: *u32 = @ptrFromInt(optval)
-        sockets[idx].recv_buf_size = val.*
+        // Clamp recv buffer size to sane bounds to prevent integer overflow
+        // in later `len > max_len` comparisons and to reject absurd requests.
+        var requested: u32 = val.*
+        const MIN_SOCK_BUF: u32 = 1024
+        const MAX_SOCK_BUF: u32 = 16 * 1024 * 1024  // 16 MB cap
+        if requested < MIN_SOCK_BUF { requested = MIN_SOCK_BUF }
+        if requested > MAX_SOCK_BUF { requested = MAX_SOCK_BUF }
+        sockets[idx].recv_buf_size = requested
       }
     } else if optname == SO_SNDBUF {
       if optlen >= 4 {
         var val: *u32 = @ptrFromInt(optval)
-        sockets[idx].send_buf_size = val.*
+        var requested: u32 = val.*
+        const MIN_SOCK_BUF: u32 = 1024
+        const MAX_SOCK_BUF: u32 = 16 * 1024 * 1024  // 16 MB cap
+        if requested < MIN_SOCK_BUF { requested = MIN_SOCK_BUF }
+        if requested > MAX_SOCK_BUF { requested = MAX_SOCK_BUF }
+        sockets[idx].send_buf_size = requested
       }
     }
   }
@@ -747,13 +767,31 @@ export fn socket_getsockname(fd: u32, addr: u64, addrlen: u64): u32 {
 
 var next_ephemeral_port: u16 = 49152
 
-fn allocate_ephemeral_port(): u16 {
-  var port: u16 = next_ephemeral_port
-  next_ephemeral_port = next_ephemeral_port + 1
-  if next_ephemeral_port >= 65535 {
-    next_ephemeral_port = 49152
+fn is_port_in_use(port: u16): u32 {
+  var i: u32 = 0
+  while i < MAX_SOCKETS {
+    if sockets[i].state != SOCK_STATE_CLOSED and sockets[i].local_port == port {
+      return 1
+    }
+    i = i + 1
   }
-  return port
+  return 0
+}
+
+fn allocate_ephemeral_port(): u16 {
+  var attempts: u32 = 0
+  while attempts < 16384 {  // Range size: 65535 - 49152
+    var port: u16 = next_ephemeral_port
+    next_ephemeral_port = next_ephemeral_port + 1
+    if next_ephemeral_port >= 65535 {
+      next_ephemeral_port = 49152
+    }
+    if is_port_in_use(port) == 0 {
+      return port
+    }
+    attempts = attempts + 1
+  }
+  return 0  // No free port
 }
 
 // Network byte order conversion

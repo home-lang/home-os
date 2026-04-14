@@ -3,6 +3,7 @@
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
+import "../sync/spinlock.home" as spinlock
 
 const TMPFS_MAX_FILES: u32 = 256
 
@@ -16,17 +17,33 @@ struct TmpfsFile {
 var tmpfs_files: [TmpfsFile; 256]
 var tmpfs_file_count: u32 = 0
 
+// Single global lock for the whole tmpfs table and file buffers.
+// This is conservative but correct: create/open/read/write/delete all
+// take it. A per-file lock would scale better; acceptable for a simple
+// RAM-only filesystem with 256-file cap.
+var tmpfs_lock: spinlock.Spinlock
+
 export fn tmpfs_init() {
+  spinlock.spinlock_init(&tmpfs_lock)
   tmpfs_file_count = 0
   foundation.serial_write_string("[TmpFS] Initialized\n")
 }
 
 export fn tmpfs_create(name: u64, size: u32): u32 {
-  if tmpfs_file_count >= TMPFS_MAX_FILES { return 0xFFFFFFFF }
   if name == 0 or size == 0 { return 0xFFFFFFFF }
 
+  // Allocate outside the lock so we don't hold it across a potentially
+  // slow kmalloc.
   var data: u64 = memory.kmalloc(size)
   if data == 0 { return 0xFFFFFFFF }
+
+  spinlock.spinlock_acquire(&tmpfs_lock)
+
+  if tmpfs_file_count >= TMPFS_MAX_FILES {
+    spinlock.spinlock_release(&tmpfs_lock)
+    memory.kfree(data)
+    return 0xFFFFFFFF
+  }
 
   var i: u32 = 0
   while i < 63 {
@@ -36,88 +53,152 @@ export fn tmpfs_create(name: u64, size: u32): u32 {
     i = i + 1
   }
   tmpfs_files[tmpfs_file_count].name[i] = 0
-  
+
   tmpfs_files[tmpfs_file_count].data = data
   tmpfs_files[tmpfs_file_count].size = size
   tmpfs_files[tmpfs_file_count].in_use = 1
-  
+
   var id: u32 = tmpfs_file_count
   tmpfs_file_count = tmpfs_file_count + 1
-  
+
+  spinlock.spinlock_release(&tmpfs_lock)
   return id
 }
 
 export fn tmpfs_open(name: u64): u32 {
+  if name == 0 { return 0xFFFFFFFF }
+
+  // Pre-compute the caller-supplied string length, bounded by 64 bytes
+  // (matches tmpfs_files[i].name capacity). If the input has no null
+  // terminator within 64 bytes we reject it as invalid rather than
+  // over-reading past the caller's buffer.
+  var src_len: u32 = 0
+  while src_len < 64 {
+    var ch: u8 = @as(*u8, @ptrFromInt(name + src_len)).*
+    if ch == 0 { break }
+    src_len = src_len + 1
+  }
+  if src_len == 64 {
+    // No null terminator in first 64 bytes — assume unterminated and
+    // refuse. (A real filename can be at most 63 chars + null here.)
+    return 0xFFFFFFFF
+  }
+
+  spinlock.spinlock_acquire(&tmpfs_lock)
+
   var i: u32 = 0
   while i < tmpfs_file_count {
     if tmpfs_files[i].in_use == 1 {
       var match: u32 = 1
       var j: u32 = 0
       while j < 64 {
-        if tmpfs_files[i].name[j] != @as(*u8, @ptrFromInt(name + j)).* {
+        var stored_ch: u8 = tmpfs_files[i].name[j]
+        var src_ch: u8 = @as(*u8, @ptrFromInt(name + j)).*
+        if stored_ch != src_ch {
           match = 0
           break
         }
-        if tmpfs_files[i].name[j] == 0 { break }
+        if stored_ch == 0 { break }
         j = j + 1
       }
-      
+
       if match == 1 {
+        spinlock.spinlock_release(&tmpfs_lock)
         return i
       }
     }
     i = i + 1
   }
-  
+
+  spinlock.spinlock_release(&tmpfs_lock)
   return 0xFFFFFFFF
 }
 
 export fn tmpfs_read(file_id: u32, offset: u32, buffer: u64, size: u32): u32 {
-  if file_id >= tmpfs_file_count { return 0 }
-  if tmpfs_files[file_id].in_use == 0 { return 0 }
   if buffer == 0 or size == 0 { return 0 }
 
-  if offset >= tmpfs_files[file_id].size { return 0 }
+  spinlock.spinlock_acquire(&tmpfs_lock)
+
+  if file_id >= tmpfs_file_count {
+    spinlock.spinlock_release(&tmpfs_lock)
+    return 0
+  }
+  if tmpfs_files[file_id].in_use == 0 {
+    spinlock.spinlock_release(&tmpfs_lock)
+    return 0
+  }
+  if offset >= tmpfs_files[file_id].size {
+    spinlock.spinlock_release(&tmpfs_lock)
+    return 0
+  }
 
   var to_read: u32 = size
   var avail: u32 = tmpfs_files[file_id].size - offset
   if to_read > avail { to_read = avail }
-  
+
   var i: u32 = 0
   while i < to_read {
     @as(*u8, @ptrFromInt(buffer + i)).* = @as(*u8, @ptrFromInt(tmpfs_files[file_id].data + offset + i)).*
     i = i + 1
   }
-  
+
+  spinlock.spinlock_release(&tmpfs_lock)
   return to_read
 }
 
 export fn tmpfs_write(file_id: u32, offset: u32, buffer: u64, size: u32): u32 {
-  if file_id >= tmpfs_file_count { return 0 }
-  if tmpfs_files[file_id].in_use == 0 { return 0 }
   if buffer == 0 or size == 0 { return 0 }
 
-  if offset >= tmpfs_files[file_id].size { return 0 }
+  spinlock.spinlock_acquire(&tmpfs_lock)
+
+  if file_id >= tmpfs_file_count {
+    spinlock.spinlock_release(&tmpfs_lock)
+    return 0
+  }
+  if tmpfs_files[file_id].in_use == 0 {
+    spinlock.spinlock_release(&tmpfs_lock)
+    return 0
+  }
+  if offset >= tmpfs_files[file_id].size {
+    spinlock.spinlock_release(&tmpfs_lock)
+    return 0
+  }
 
   var to_write: u32 = size
   var avail: u32 = tmpfs_files[file_id].size - offset
   if to_write > avail { to_write = avail }
-  
+
   var i: u32 = 0
   while i < to_write {
     @as(*u8, @ptrFromInt(tmpfs_files[file_id].data + offset + i)).* = @as(*u8, @ptrFromInt(buffer + i)).*
     i = i + 1
   }
-  
+
+  spinlock.spinlock_release(&tmpfs_lock)
   return to_write
 }
 
 export fn tmpfs_delete(file_id: u32) {
-  if file_id >= tmpfs_file_count { return }
-  if tmpfs_files[file_id].in_use == 0 { return }
-  
-  memory.kfree(tmpfs_files[file_id].data)
+  spinlock.spinlock_acquire(&tmpfs_lock)
+
+  if file_id >= tmpfs_file_count {
+    spinlock.spinlock_release(&tmpfs_lock)
+    return
+  }
+  if tmpfs_files[file_id].in_use == 0 {
+    spinlock.spinlock_release(&tmpfs_lock)
+    return
+  }
+
+  // Snapshot the data pointer, then mark the slot free BEFORE the
+  // kfree so a concurrent reader sees in_use==0 as soon as possible.
+  var doomed_data: u64 = tmpfs_files[file_id].data
   tmpfs_files[file_id].data = 0
   tmpfs_files[file_id].size = 0
   tmpfs_files[file_id].in_use = 0
+
+  spinlock.spinlock_release(&tmpfs_lock)
+
+  // Do the (potentially slow) free outside the lock.
+  memory.kfree(doomed_data)
 }

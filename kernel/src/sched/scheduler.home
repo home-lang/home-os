@@ -6,6 +6,7 @@ import "../core/process.home" as process
 import "../core/memory.home" as memory
 import "../drivers/timer.home" as timer
 import "../sys/signal.home" as signal
+import "../sync/spinlock.home" as spinlock
 
 // ============================================================================
 // CONSTANTS
@@ -34,15 +35,27 @@ const MAX_RT_PRIO: u32 = 100
 // DATA STRUCTURES
 // ============================================================================
 
-// Run queue entry
+// Run queue entry.
+//
+// When the slot is free (on_rq == 0 and pid == 0), `next_free` is the
+// next free-slot index in a singly-linked intrusive free list, or
+// 0xFFFFFFFF for the end of the list. When the slot is in use,
+// `next_free` is ignored.
+//
+// Previously we overloaded `vruntime` as both the CFS virtual runtime
+// AND the free-list pointer (u64 → truncated to u32). That created
+// type confusion: a stray read of `vruntime` from a freed slot would
+// return a pointer value, and a stray write to `vruntime` on a free
+// slot would corrupt the free list.
 struct RunQueueEntry {
   pid: u32,
-  vruntime: u64,        // Virtual runtime for CFS
+  vruntime: u64,        // Virtual runtime for CFS (only valid while on_rq == 1)
   priority: u32,        // Static priority
   sched_class: u32,     // Scheduling class
   time_slice: u32,      // Remaining time slice (for RR)
   cpu_affinity: u32,    // CPU affinity mask
-  on_rq: u32            // On run queue?
+  on_rq: u32,           // On run queue?
+  next_free: u32        // Free-list link (used only when on_rq == 0)
 }
 
 // PID → slot hash table. MAX_PROCESSES is a power of two, so a
@@ -62,12 +75,16 @@ struct CPURunQueue {
   rq: [RunQueueEntry; 256],
 
   // Slot allocator state. `free_head` points to the first free slot;
-  // free slots form a singly-linked intrusive free list via the `pid`
-  // field re-interpreted as (0x80000000 | next_slot). 0xFFFFFFFF = end.
+  // slots are linked via the dedicated `next_free` field. 0xFFFFFFFF = end.
   free_head: u32,
 
   // PID → slot table. Entries store slot index or 0xFFFFFFFF for empty.
-  pid_hash: [u32; 256]
+  pid_hash: [u32; 256],
+
+  // Per-CPU lock. Taken by scheduler_enqueue/scheduler_dequeue and any
+  // path that mutates the run queue, hash, or counters. Without this,
+  // two CPUs can double-increment nr_running or corrupt the hash.
+  lock: spinlock.Spinlock
 }
 
 // ============================================================================
@@ -110,6 +127,7 @@ export fn scheduler_init() {
   // Initialize per-CPU run queues
   i = 0
   while i < MAX_CPUS {
+    spinlock.spinlock_init(&cpu_rq[i].lock)
     cpu_rq[i].current = 0
     cpu_rq[i].nr_running = 0
     cpu_rq[i].clock = 0
@@ -119,15 +137,17 @@ export fn scheduler_init() {
     cpu_rq[i].free_head = 0
     need_resched[i] = 0
 
-    // Build free list: slot j -> slot j+1, last slot -> 0xFFFFFFFF.
+    // Build free list using the dedicated next_free field so we never
+    // overload vruntime with pointer data.
     var j: u32 = 0
     while j < MAX_PROCESSES {
       cpu_rq[i].rq[j].pid = 0
       cpu_rq[i].rq[j].on_rq = 0
+      cpu_rq[i].rq[j].vruntime = 0  // Meaningless while slot is free
       if j + 1 < MAX_PROCESSES {
-        cpu_rq[i].rq[j].vruntime = @as(u64, j + 1)
+        cpu_rq[i].rq[j].next_free = j + 1
       } else {
-        cpu_rq[i].rq[j].vruntime = 0xFFFFFFFFFFFFFFFF
+        cpu_rq[i].rq[j].next_free = 0xFFFFFFFF
       }
       j = j + 1
     }
@@ -220,28 +240,24 @@ fn hash_remove(cpu: u32, pid: u32) {
 }
 
 // Pop a slot from the per-CPU free list in O(1).
+// Uses the dedicated `next_free` link so we no longer overload vruntime.
 fn find_free_rq_slot(cpu: u32): u32 {
   var head: u32 = cpu_rq[cpu].free_head
   if head >= MAX_PROCESSES {
     return 0xFFFFFFFF
   }
-  var next: u64 = cpu_rq[cpu].rq[head].vruntime
-  if next == 0xFFFFFFFFFFFFFFFF {
-    cpu_rq[cpu].free_head = 0xFFFFFFFF
-  } else {
-    cpu_rq[cpu].free_head = @truncate(next, u32)
-  }
+  cpu_rq[cpu].free_head = cpu_rq[cpu].rq[head].next_free
+  // Clear next_free so a freshly-allocated slot doesn't carry stale data.
+  cpu_rq[cpu].rq[head].next_free = 0xFFFFFFFF
   return head
 }
 
 // Push a slot back onto the per-CPU free list.
 fn free_rq_slot(cpu: u32, slot: u32) {
-  var head: u32 = cpu_rq[cpu].free_head
-  if head == 0xFFFFFFFF {
-    cpu_rq[cpu].rq[slot].vruntime = 0xFFFFFFFFFFFFFFFF
-  } else {
-    cpu_rq[cpu].rq[slot].vruntime = @as(u64, head)
-  }
+  cpu_rq[cpu].rq[slot].next_free = cpu_rq[cpu].free_head
+  cpu_rq[cpu].rq[slot].on_rq = 0
+  cpu_rq[cpu].rq[slot].pid = 0
+  cpu_rq[cpu].rq[slot].vruntime = 0  // Don't leave stale CFS data
   cpu_rq[cpu].free_head = slot
 }
 
@@ -249,20 +265,24 @@ export fn scheduler_enqueue(pid: u32, cpu_arg: u32) {
   var cpu: u32 = cpu_arg
   if cpu >= nr_cpus { cpu = 0 }
 
+  // Fetch process priority OUTSIDE the run-queue lock since
+  // process.process_get_priority may itself take locks.
+  var prio: u32 = process.process_get_priority(pid)
+  if prio == 0 { prio = DEFAULT_PRIO }
+  if prio >= 40 { prio = 39 }
+
+  spinlock.spinlock_acquire(&cpu_rq[cpu].lock)
+
   var slot: u32 = find_rq_entry(cpu, pid)
   if slot == 0xFFFFFFFF {
     slot = find_free_rq_slot(cpu)
     if slot == 0xFFFFFFFF {
+      spinlock.spinlock_release(&cpu_rq[cpu].lock)
       foundation.serial_write_string("[Scheduler] Run queue full!\n")
       return
     }
     hash_insert(cpu, pid, slot)
   }
-
-  // Get process priority from process table
-  var prio: u32 = process.process_get_priority(pid)
-  if prio == 0 { prio = DEFAULT_PRIO }
-  if prio >= 40 { prio = 39 }
 
   var was_on_rq: u32 = cpu_rq[cpu].rq[slot].on_rq
 
@@ -280,25 +300,53 @@ export fn scheduler_enqueue(pid: u32, cpu_arg: u32) {
     cpu_rq[cpu].nr_running = cpu_rq[cpu].nr_running + 1
     cpu_rq[cpu].load_weight = cpu_rq[cpu].load_weight + nice_to_weight[prio]
   }
+
+  spinlock.spinlock_release(&cpu_rq[cpu].lock)
 }
 
 export fn scheduler_dequeue(pid: u32, cpu_arg: u32) {
   var cpu: u32 = cpu_arg
   if cpu >= nr_cpus { cpu = 0 }
 
+  spinlock.spinlock_acquire(&cpu_rq[cpu].lock)
+
   var slot: u32 = find_rq_entry(cpu, pid)
-  if slot == 0xFFFFFFFF { return }
+  if slot == 0xFFFFFFFF {
+    spinlock.spinlock_release(&cpu_rq[cpu].lock)
+    return
+  }
 
   if cpu_rq[cpu].rq[slot].on_rq == 1 {
     var prio: u32 = cpu_rq[cpu].rq[slot].priority
-    cpu_rq[cpu].load_weight = cpu_rq[cpu].load_weight - nice_to_weight[prio]
-    cpu_rq[cpu].nr_running = cpu_rq[cpu].nr_running - 1
+    if cpu_rq[cpu].load_weight >= nice_to_weight[prio] {
+      cpu_rq[cpu].load_weight = cpu_rq[cpu].load_weight - nice_to_weight[prio]
+    } else {
+      cpu_rq[cpu].load_weight = 0
+    }
+    if cpu_rq[cpu].nr_running > 0 {
+      cpu_rq[cpu].nr_running = cpu_rq[cpu].nr_running - 1
+    }
   }
 
   cpu_rq[cpu].rq[slot].on_rq = 0
   cpu_rq[cpu].rq[slot].pid = 0
   hash_remove(cpu, pid)
   free_rq_slot(cpu, slot)
+
+  spinlock.spinlock_release(&cpu_rq[cpu].lock)
+}
+
+// Wake a blocked process. Called from vfs_locking and elsewhere when
+// a waited-on resource becomes available. This is a minimal wrapper:
+// in a real scheduler it would update process state to READY and
+// potentially send an IPI to re-evaluate run-queue ordering.
+export fn scheduler_wake(pid: u32) {
+  // Mark the process READY via the process module.
+  process.process_set_state(pid, 1)  // 1 = READY per CFS
+  // If the process isn't on any run queue, pick an idle CPU and enqueue it.
+  // For simplicity, always enqueue on CPU 0; a smarter policy would pick
+  // the least-loaded CPU.
+  scheduler_enqueue(pid, 0)
 }
 
 // ============================================================================

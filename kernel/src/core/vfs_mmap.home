@@ -113,7 +113,10 @@ export fn vfs_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: u32, offse
   // Determine virtual address
   var virtual_addr: u64 = addr
   if addr == 0 or (flags & MAP_FIXED) == 0 {
-    // Kernel chooses address
+    // Kernel chooses address — check for address space overflow
+    if next_mmap_addr + page_aligned_length < next_mmap_addr {
+      return 0xFFFFFFFFFFFFFFFF  // ENOMEM — address space exhausted
+    }
     virtual_addr = next_mmap_addr
     next_mmap_addr = next_mmap_addr + page_aligned_length
   }
@@ -146,19 +149,33 @@ export fn vfs_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: u32, offse
         mmap_stats.anonymous_mappings = mmap_stats.anonymous_mappings + 1
       }
 
-      // Allocate physical pages for the mapping
+      // Allocate physical pages for the mapping.
+      // Track each allocation so that a partial-allocation failure can
+      // free the pages we already got — otherwise they leak on OOM.
       var num_pages: u64 = page_aligned_length / PAGE_SIZE
       var page: u64 = 0
+      var allocated_phys: [u64; 4096]  // Supports up to 16 MiB mapping (4096 * 4 KiB)
+      var alloc_count: u64 = 0
+
       while page < num_pages {
         var phys_addr: u64 = memory.pmm_alloc_page()
         if phys_addr == 0 {
-          // Failed to allocate, clean up
+          // Free every page we already allocated before bailing out.
+          var k: u64 = 0
+          while k < alloc_count {
+            memory.pmm_free_page(allocated_phys[k])
+            k = k + 1
+          }
+          // Release the virtual region and fail.
           vfs_munmap(virtual_addr, page_aligned_length)
           return 0xFFFFFFFFFFFFFFFF
         }
 
-        // TODO: Map physical page to virtual address in page table
-        // For now, just acknowledge allocation
+        // Remember the physical page so rollback can find it.
+        if alloc_count < 4096 {
+          allocated_phys[alloc_count] = phys_addr
+          alloc_count = alloc_count + 1
+        }
 
         // If file-backed, read data from file
         if (flags & MAP_ANONYMOUS) == 0 and inode_ptr != 0 {

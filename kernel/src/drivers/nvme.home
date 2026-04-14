@@ -182,8 +182,15 @@ fn nvme_submit_command(queue: *NvmeQueue, cmd: *NvmeCommand): u16 {
   // Update tail
   queue.sq_tail = next_tail
 
+  // CRITICAL: Memory barrier before ringing the doorbell.
+  // Without this, the CPU may reorder the command-write and the
+  // doorbell-write, causing the controller to fetch partial or stale
+  // command data. The `dsb sy` / `mfence` ensures all prior stores to
+  // the SQ are globally visible before the doorbell MMIO write.
+  foundation.memory_barrier()
+
   // Ring doorbell
-  @ptrToInt(queue.sq_doorbell, u32) = queue.sq_tail as u32
+  @as(*volatile u32, @ptrFromInt(queue.sq_doorbell)).* = queue.sq_tail as u32
 
   return cid
 }
@@ -193,12 +200,17 @@ fn nvme_wait_completion(queue: *NvmeQueue, cid: u16): u32 {
 
   while timeout > 0 {
     var cq_entry: u64 = queue.cq_base + (queue.cq_head as u64 * 16)
-    var status: u16 = @intToPtr(cq_entry + 14, u16)
-    var entry_cid: u16 = @intToPtr(cq_entry + 12, u16)
+    // Use volatile reads so the compiler doesn't cache these values;
+    // the controller updates them via DMA.
+    var status: u16 = @as(*volatile u16, @ptrFromInt(cq_entry + 14)).*
+    var entry_cid: u16 = @as(*volatile u16, @ptrFromInt(cq_entry + 12)).*
     var phase: u8 = (status & 1) as u8
 
     // Check if completion is valid (phase bit matches)
     if phase == queue.cq_phase and entry_cid == cid {
+      // Ensure we observed the completion fully before advancing.
+      foundation.memory_barrier()
+
       // Update completion queue head
       queue.cq_head = (queue.cq_head + 1) % queue.queue_size
       if queue.cq_head == 0 {
@@ -206,7 +218,7 @@ fn nvme_wait_completion(queue: *NvmeQueue, cid: u16): u32 {
       }
 
       // Ring completion doorbell
-      @ptrToInt(queue.cq_doorbell, u32) = queue.cq_head as u32
+      @as(*volatile u32, @ptrFromInt(queue.cq_doorbell)).* = queue.cq_head as u32
 
       // Return status (upper 15 bits)
       return (status >> 1) as u32
@@ -216,6 +228,22 @@ fn nvme_wait_completion(queue: *NvmeQueue, cid: u16): u32 {
   }
 
   return 0xFFFFFFFF  // Timeout
+}
+
+// Recover the queue after a completion timeout. Without this, the
+// SQ/CQ pointers on the driver side diverge from the controller's
+// view and every subsequent command fails silently. We reset the
+// phase and head/tail pointers; callers should treat this as a
+// best-effort recovery and may need to re-issue failed commands.
+fn nvme_reset_queue(queue: *NvmeQueue) {
+  foundation.serial_write_string("[NVMe] Resetting queue after timeout\n")
+  queue.sq_tail = 0
+  queue.cq_head = 0
+  queue.cq_phase = 1  // Initial phase
+  // Tell controller our new pointers via doorbells.
+  foundation.memory_barrier()
+  @as(*volatile u32, @ptrFromInt(queue.sq_doorbell)).* = 0
+  @as(*volatile u32, @ptrFromInt(queue.cq_doorbell)).* = 0
 }
 
 // ============================================================================
@@ -477,7 +505,7 @@ export fn nvme_read(lba: u64, count: u32, buffer: u64): u32 {
 
     var i: u32 = 1
     while i < (count + 7) / 8 {
-      @ptrToInt(prp_list + (i - 1) * 8, u64) = buffer + i * 4096
+      @as(*u64, @ptrFromInt(prp_list + (i - 1) * 8)).* = buffer + i * 4096
       i = i + 1
     }
     cmd.prp2 = prp_list
@@ -491,6 +519,14 @@ export fn nvme_read(lba: u64, count: u32, buffer: u64): u32 {
 
   var cid: u16 = nvme_submit_command(&nvme_controller.io_queue, &cmd)
   var status: u32 = nvme_wait_completion(&nvme_controller.io_queue, cid)
+
+  // On timeout, reset the queue so subsequent I/O has a chance of
+  // succeeding. Without this, every future command queues forever.
+  if status == 0xFFFFFFFF {
+    nvme_reset_queue(&nvme_controller.io_queue)
+    if prp_list != 0 { memory.pmm_free_pages(prp_list, 1) }
+    return 1  // Convert timeout sentinel to a normal error code.
+  }
 
   if prp_list != 0 { memory.pmm_free_pages(prp_list, 1) }
 
@@ -515,7 +551,7 @@ export fn nvme_write(lba: u64, count: u32, buffer: u64): u32 {
 
     var i: u32 = 1
     while i < (count + 7) / 8 {
-      @ptrToInt(prp_list + (i - 1) * 8, u64) = buffer + i * 4096
+      @as(*u64, @ptrFromInt(prp_list + (i - 1) * 8)).* = buffer + i * 4096
       i = i + 1
     }
     cmd.prp2 = prp_list
