@@ -3,6 +3,7 @@
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
+import "../sync/spinlock.home" as spinlock
 
 const VMALLOC_START: u64 = 0xFFFF_8000_0000_0000
 const VMALLOC_END: u64 = 0xFFFF_C000_0000_0000
@@ -10,33 +11,153 @@ const VMALLOC_END: u64 = 0xFFFF_C000_0000_0000
 var vmalloc_next: u64 = VMALLOC_START
 var vmalloc_initialized: u32 = 0
 
+// Track live vmalloc allocations so vfree() can validate the address,
+// prevent double-free, and reject arbitrary addresses that weren't
+// returned by vmalloc().
+const VMALLOC_MAX_LIVE: u32 = 1024
+
+struct VmallocRegion {
+  addr: u64,
+  pages: u64,
+  in_use: u32
+}
+
+var vmalloc_regions: [VmallocRegion; 1024]
+var vmalloc_region_count: u32 = 0
+
+// Protects the bump pointer, the region table, and any implicit
+// ordering between alloc and free. All public vmalloc / vfree entry
+// points acquire this lock.
+var vmalloc_lock: spinlock.Spinlock
+
 export fn vmalloc_init() {
+  spinlock.spinlock_init(&vmalloc_lock)
   vmalloc_initialized = 1
+  vmalloc_next = VMALLOC_START
+  vmalloc_region_count = 0
   foundation.serial_write_string("[Vmalloc] Initialized\n")
+}
+
+// Multi-CPU TLB shootdown. On a single-CPU system the per-page
+// invlpg that vmm_map_page() issues is sufficient. On SMP systems
+// each CPU must also invalidate the affected page. We call into the
+// foundation layer which forwards an IPI to all other CPUs.
+fn flush_tlb_range_all_cpus(start: u64, pages: u64) {
+  // Call the foundation hook. On a non-SMP build this is a no-op.
+  foundation.tlb_shootdown_range(start, pages * 4096)
 }
 
 export fn vmalloc(size: u64): u64 {
   if vmalloc_initialized == 0 { return 0 }
-  
+  if size == 0 { return 0 }
+
   var pages: u64 = (size + 4095) / 4096
+  var total_bytes: u64 = pages * 4096
+
+  spinlock.spinlock_acquire(&vmalloc_lock)
+
+  // Refuse requests that would push the bump pointer past the end of
+  // the vmalloc virtual region. Previously the allocator would happily
+  // keep handing out addresses into kernel space it doesn't own.
+  if vmalloc_next > VMALLOC_END {
+    spinlock.spinlock_release(&vmalloc_lock)
+    return 0
+  }
+  if VMALLOC_END - vmalloc_next < total_bytes {
+    spinlock.spinlock_release(&vmalloc_lock)
+    return 0
+  }
+
   var vaddr: u64 = vmalloc_next
-  
+
   var i: u64 = 0
   while i < pages {
     var paddr: u64 = memory.pmm_alloc_page()
-    if paddr == 0 { return 0 }
-    
+    if paddr == 0 {
+      // Roll back pages we already mapped to avoid leaking physical
+      // frames on the OOM failure path.
+      var j: u64 = 0
+      while j < i {
+        var unwind_paddr: u64 = memory.vmm_get_physical(vaddr + (j * 4096))
+        if unwind_paddr != 0 {
+          memory.vmm_unmap_page(vaddr + (j * 4096))
+          memory.pmm_free_page(unwind_paddr)
+        }
+        j = j + 1
+      }
+      // Shootdown for any pages we did map before rolling back.
+      if i > 0 { flush_tlb_range_all_cpus(vaddr, i) }
+      spinlock.spinlock_release(&vmalloc_lock)
+      return 0
+    }
+
     memory.vmm_map_page(vaddr + (i * 4096), paddr, 3)
     i = i + 1
   }
-  
-  vmalloc_next = vmalloc_next + (pages * 4096)
+
+  // After all pages are mapped, broadcast a TLB shootdown so other
+  // CPUs invalidate any stale TLB entries they might have for this
+  // virtual range (e.g. from a previous vfree of overlapping addrs).
+  flush_tlb_range_all_cpus(vaddr, pages)
+
+  vmalloc_next = vmalloc_next + total_bytes
+
+  // Record this allocation so vfree() can validate later. Find a free
+  // slot; if none exists but the table has space, append.
+  var slot: u32 = 0xFFFFFFFF
+  var s: u32 = 0
+  while s < vmalloc_region_count {
+    if vmalloc_regions[s].in_use == 0 {
+      slot = s
+      break
+    }
+    s = s + 1
+  }
+  if slot == 0xFFFFFFFF and vmalloc_region_count < VMALLOC_MAX_LIVE {
+    slot = vmalloc_region_count
+    vmalloc_region_count = vmalloc_region_count + 1
+  }
+  if slot != 0xFFFFFFFF {
+    vmalloc_regions[slot].addr = vaddr
+    vmalloc_regions[slot].pages = pages
+    vmalloc_regions[slot].in_use = 1
+  }
+
+  spinlock.spinlock_release(&vmalloc_lock)
   return vaddr
 }
 
+// Look up a region by its start address. Returns slot index or 0xFFFFFFFF.
+fn find_region(addr: u64): u32 {
+  var i: u32 = 0
+  while i < vmalloc_region_count {
+    if vmalloc_regions[i].in_use == 1 and vmalloc_regions[i].addr == addr {
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
 export fn vfree(addr: u64, size: u64) {
-  var pages: u64 = (size + 4095) / 4096
-  
+  if addr == 0 { return }
+
+  spinlock.spinlock_acquire(&vmalloc_lock)
+
+  // Validate that this address was actually returned by vmalloc().
+  // Silently refusing an invalid or already-freed address prevents
+  // double-free from corrupting the physical page allocator.
+  var slot: u32 = find_region(addr)
+  if slot == 0xFFFFFFFF {
+    foundation.serial_write_string("[Vmalloc] vfree() on unknown addr — ignored\n")
+    spinlock.spinlock_release(&vmalloc_lock)
+    return
+  }
+
+  // Use the recorded page count rather than the caller-supplied size to
+  // guard against size mismatch between alloc and free.
+  var pages: u64 = vmalloc_regions[slot].pages
+
   var i: u64 = 0
   while i < pages {
     var paddr: u64 = memory.vmm_get_physical(addr + (i * 4096))
@@ -46,4 +167,25 @@ export fn vfree(addr: u64, size: u64) {
     }
     i = i + 1
   }
+
+  // Mark slot free so it can be reused, and double-free the same
+  // address again will be rejected by find_region().
+  vmalloc_regions[slot].in_use = 0
+  vmalloc_regions[slot].addr = 0
+  vmalloc_regions[slot].pages = 0
+
+  // If the freed range is at the top of the bump pointer, reclaim the
+  // virtual address range immediately. The general case (free from
+  // the middle) leaves a hole — the simple allocator can't coalesce
+  // those, but at least LIFO patterns reuse memory.
+  var end: u64 = addr + (pages * 4096)
+  if end == vmalloc_next {
+    vmalloc_next = addr
+  }
+
+  // Broadcast a TLB shootdown so no CPU keeps a cached translation
+  // for the now-unmapped virtual range.
+  flush_tlb_range_all_cpus(addr, pages)
+
+  spinlock.spinlock_release(&vmalloc_lock)
 }

@@ -7,6 +7,7 @@ import "../block/io_scheduler.home" as iosched
 import "../drivers/ata.home" as ata
 import "../drivers/nvme.home" as nvme
 import "../mm/slab.home" as slab
+import "../sync/spinlock.home" as spinlock
 
 // ============================================================================
 // CONSTANTS
@@ -94,6 +95,9 @@ var io_request_count: u32 = 0
 
 var block_io_initialized: u32 = 0
 
+// Lock protecting buffer cache, LRU list, and hash table
+var cache_lock: spinlock.Spinlock
+
 // Statistics
 var cache_hits: u64 = 0
 var cache_misses: u64 = 0
@@ -106,6 +110,9 @@ var blocks_written: u64 = 0
 
 export fn block_io_init() {
   if block_io_initialized == 1 { return }
+
+  // Initialize cache lock
+  spinlock.spinlock_init(&cache_lock)
 
   // Initialize hash table
   var i: u32 = 0
@@ -300,13 +307,17 @@ fn move_to_lru_tail(idx: u32) {
 // ============================================================================
 
 export fn bread(dev: u32, block: u64): u64 {
+  spinlock.spinlock_acquire(&cache_lock)
+
   // Check cache first
   var idx: u32 = find_buffer(dev, block)
   if idx != 0xFFFFFFFF {
     cache_hits = cache_hits + 1
     buffer_cache[idx].ref_count = buffer_cache[idx].ref_count + 1
     move_to_lru_tail(idx)
-    return buffer_cache[idx].data
+    var data: u64 = buffer_cache[idx].data
+    spinlock.spinlock_release(&cache_lock)
+    return data
   }
 
   cache_misses = cache_misses + 1
@@ -314,6 +325,7 @@ export fn bread(dev: u32, block: u64): u64 {
   // Allocate new buffer
   idx = alloc_buffer()
   if idx == 0xFFFFFFFF {
+    spinlock.spinlock_release(&cache_lock)
     return 0  // Out of buffers
   }
 
@@ -327,25 +339,36 @@ export fn bread(dev: u32, block: u64): u64 {
   add_to_hash(idx)
   move_to_lru_tail(idx)
 
-  // Read from device
-  if read_block(dev, block, buffer_cache[idx].data) == 0 {
+  // Release lock during I/O (slow operation)
+  var buf_data: u64 = buffer_cache[idx].data
+  spinlock.spinlock_release(&cache_lock)
+
+  // Read from device (outside lock since I/O is slow)
+  if read_block(dev, block, buf_data) == 0 {
+    spinlock.spinlock_acquire(&cache_lock)
     buffer_cache[idx].state = BUF_UPTODATE
     blocks_read = blocks_read + 1
+    spinlock.spinlock_release(&cache_lock)
   } else {
     // Read failed
+    spinlock.spinlock_acquire(&cache_lock)
     buffer_cache[idx].state = 0
+    spinlock.spinlock_release(&cache_lock)
     return 0
   }
 
-  return buffer_cache[idx].data
+  return buf_data
 }
 
 export fn bwrite(dev: u32, block: u64, data: u64): u32 {
+  spinlock.spinlock_acquire(&cache_lock)
+
   var idx: u32 = find_buffer(dev, block)
   if idx == 0xFFFFFFFF {
     // Allocate new buffer
     idx = alloc_buffer()
     if idx == 0xFFFFFFFF {
+      spinlock.spinlock_release(&cache_lock)
       return 1  // Out of buffers
     }
 
@@ -359,6 +382,7 @@ export fn bwrite(dev: u32, block: u64, data: u64): u32 {
   buffer_cache[idx].state = buffer_cache[idx].state | BUF_DIRTY | BUF_UPTODATE
   move_to_lru_tail(idx)
 
+  spinlock.spinlock_release(&cache_lock)
   return 0
 }
 

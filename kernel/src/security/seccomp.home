@@ -68,27 +68,53 @@ export fn seccomp_set_mode_strict(pid: u32): u32 {
 export fn seccomp_set_mode_filter(pid: u32, instructions: u64, count: u32): u32 {
   if pid >= MAX_PROCESSES { return 0 }
   if count > MAX_FILTER_INSTRUCTIONS { return 0 }
-  
-  // Copy BPF instructions
+
+  // TOCTOU-safe install: another CPU may be calling seccomp_check_syscall()
+  // for this PID concurrently. We must never publish a partially-installed
+  // filter with mode=FILTER. Strategy:
+  //   1. Set mode to SECCOMP_MODE_STRICT (or preserve DISABLED) while copying
+  //      so any concurrent check either sees old mode or falls back strictly.
+  //   2. Copy all instructions into the filter slot.
+  //   3. Memory barrier to ensure instruction writes land before the mode flip.
+  //   4. Atomically publish mode=FILTER and instruction_count as the LAST step.
+  //
+  // Since we may not have atomic 128-bit publish, order matters:
+  //   - Writing instruction_count before mode means a reader seeing
+  //     mode=FILTER is guaranteed to see instruction_count.
+
+  // Step 1: Save old mode and temporarily deny by default.
+  // SECCOMP_MODE_STRICT rejects syscalls unless they're on the allowlist,
+  // which is safer than leaving the old mode active during install.
+  var old_mode: u32 = process_filters[pid].mode
+  process_filters[pid].mode = SECCOMP_MODE_STRICT
+
+  // Step 2: Copy BPF instructions into place.
   var i: u32 = 0
   while i < count {
     var inst_ptr: u64 = instructions + (i * 8)
-    process_filters[pid].instructions[i].code = @intToPtr(inst_ptr, u16)
-    process_filters[pid].instructions[i].jt = @intToPtr(inst_ptr + 2, u8)
-    process_filters[pid].instructions[i].jf = @intToPtr(inst_ptr + 3, u8)
-    process_filters[pid].instructions[i].k = @intToPtr(inst_ptr + 4, u32)
+    process_filters[pid].instructions[i].code = @as(*u16, @ptrFromInt(inst_ptr)).*
+    process_filters[pid].instructions[i].jt = @as(*u8, @ptrFromInt(inst_ptr + 2)).*
+    process_filters[pid].instructions[i].jf = @as(*u8, @ptrFromInt(inst_ptr + 3)).*
+    process_filters[pid].instructions[i].k = @as(*volatile u32, @ptrFromInt(inst_ptr + 4)).*
     i = i + 1
   }
-  
+
+  // Step 3: Publish instruction_count FIRST.
   process_filters[pid].instruction_count = count
+
+  // Step 4: Memory barrier so the count and instructions are visible to
+  // other CPUs before we flip mode to FILTER.
+  foundation.memory_barrier()
+
+  // Step 5: Publish the new mode as the final atomic transition.
   process_filters[pid].mode = SECCOMP_MODE_FILTER
-  
+
   foundation.serial_write_string("[Seccomp] PID ")
   foundation.serial_write_hex(pid)
   foundation.serial_write_string(" set to filter mode with ")
   foundation.serial_write_hex(count)
   foundation.serial_write_string(" instructions\n")
-  
+
   return 1
 }
 
@@ -135,37 +161,54 @@ export fn seccomp_check_syscall(pid: u32, syscall_nr: u32): u32 {
 }
 
 fn seccomp_run_filter(pid: u32, syscall_nr: u32): u32 {
-  // Simple BPF interpreter
+  // Simple BPF interpreter. Uses an execution budget so a crafted
+  // filter with a backward jump can't spin the kernel — real BPF
+  // programs are verified acyclic before load, but we don't have
+  // a verifier, so we cap total steps at 4× the program length.
   var accumulator: u32 = syscall_nr
   var pc: u32 = 0
   var count: u32 = process_filters[pid].instruction_count
-  
+  var steps: u32 = 0
+  var max_steps: u32 = count * 4
+  if max_steps < 64 { max_steps = 64 }
+
   while pc < count {
+    if steps >= max_steps {
+      // Runaway filter — kill the process rather than spin.
+      return SECCOMP_RET_KILL_PROCESS
+    }
+    steps = steps + 1
+
     var inst: BPFInstruction = process_filters[pid].instructions[pc]
-    
+
     // BPF_LD | BPF_W | BPF_ABS
     if inst.code == 0x20 {
       accumulator = inst.k
     }
-    
+
     // BPF_JMP | BPF_JEQ | BPF_K
     if inst.code == 0x15 {
-      if accumulator == inst.k {
-        pc = pc + inst.jt
-      } else {
-        pc = pc + inst.jf
-      }
+      // Validate base PC first
+      if pc + 1 >= count { break }
+
+      var jump_offset: u32 = if accumulator == inst.k { @as(u32, inst.jt) } else { @as(u32, inst.jf) }
+      var new_pc: u32 = pc + 1 + jump_offset
+
+      // Check for overflow and bounds
+      if new_pc < pc + 1 { break }  // Overflow
+      if new_pc >= count { break }  // Out of bounds
+      pc = new_pc
       continue
     }
-    
+
     // BPF_RET | BPF_K
     if inst.code == 0x06 {
       return inst.k
     }
-    
+
     pc = pc + 1
   }
-  
+
   return SECCOMP_RET_KILL_PROCESS
 }
 
@@ -529,6 +572,6 @@ export fn seccomp_print_status(pid: u32) {
   foundation.serial_write_string("\n")
 
   foundation.serial_write_string("  Total violations: ")
-  foundation.serial_write_hex(@truncate(seccomp_violations, u32))
+  foundation.serial_write_hex(seccomp_violations)
   foundation.serial_write_string("\n")
 }

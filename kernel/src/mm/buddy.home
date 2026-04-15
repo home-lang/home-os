@@ -21,12 +21,19 @@ const ZONE_DMA32: u32 = 1           // 16MB-4GB
 const ZONE_NORMAL: u32 = 2          // 4GB+
 const ZONE_HIGHMEM: u32 = 3         // High memory (if any)
 
+// Magic sentinel stored inside the header of every free block.
+// find_free_block() uses it to decide whether a candidate buddy
+// address actually points at a free block of the expected order in
+// O(1), instead of linearly scanning the free list.
+const FREE_BLOCK_MAGIC: u32 = 0xB0DDF00D
+
 // Free list node
 struct FreeBlock {
   next: *FreeBlock
   prev: *FreeBlock
   order: u32
   zone: u32
+  magic: u32  // FREE_BLOCK_MAGIC while block is free; cleared on alloc.
 }
 
 // Zone statistics
@@ -73,7 +80,7 @@ export fn buddy_init(base: u64, size: u64): i32 {
 
   foundation.serial_write_string("[BUDDY] Initializing buddy allocator\n")
   foundation.serial_write_string("  Base address: 0x")
-  foundation.serial_write_hex(@truncate(base, u32))
+  foundation.serial_write_hex(base)
   foundation.serial_write_string("\n")
   foundation.serial_write_string("  Size: ")
   foundation.serial_write_u64(size / 1048576)
@@ -135,9 +142,9 @@ export fn buddy_init(base: u64, size: u64): i32 {
   while i <= MAX_ORDER {
     if allocator.free_count[i] > 0 {
       foundation.serial_write_string("  Order ")
-      foundation.serial_write_u32(i)
+      foundation.serial_write_u64(i)
       foundation.serial_write_string(": ")
-      foundation.serial_write_u32(allocator.free_count[i])
+      foundation.serial_write_u64(allocator.free_count[i])
       foundation.serial_write_string(" blocks (")
       foundation.serial_write_u64((PAGE_SIZE << i) / 1024)
       foundation.serial_write_string(" KB each)\n")
@@ -156,6 +163,7 @@ fn add_to_free_list(addr: u64, order: u32) {
   var block: *FreeBlock = @ptrFromInt(addr)
   block.order = order
   block.zone = get_zone_for_addr(addr)
+  block.magic = FREE_BLOCK_MAGIC
 
   // Add to front of list
   block.next = allocator.free_lists[order]
@@ -188,6 +196,10 @@ fn remove_from_free_list(block: *FreeBlock) {
   }
 
   allocator.free_count[order] = allocator.free_count[order] - 1
+
+  // Clear the magic so the header can no longer be mistaken for a free
+  // block by find_free_block() on a subsequent coalesce attempt.
+  block.magic = 0
 
   // Update zone stats
   var num_pages: u64 = 1 << order
@@ -254,7 +266,7 @@ export fn buddy_alloc(order: u32): u64 {
 
   // No free block found
   foundation.serial_write_string("[BUDDY] Error: out of memory for order ")
-  foundation.serial_write_u32(order)
+  foundation.serial_write_u64(order)
   foundation.serial_write_string("\n")
   return 0
 }
@@ -266,6 +278,12 @@ export fn buddy_alloc_page(): u64 {
 
 // Allocate contiguous pages
 export fn buddy_alloc_pages(num_pages: u64): u64 {
+  // Return 0 (null) for zero-page requests. Callers should validate
+  // before calling; a zero-page allocation is always a logic error.
+  if num_pages == 0 {
+    foundation.serial_write_string("[Buddy] WARNING: zero-page allocation requested\n")
+    return 0
+  }
   // Find minimum order that fits
   var order: u32 = 0
   var pages: u64 = 1
@@ -299,14 +317,31 @@ export fn buddy_free(addr: u64, order: u32) {
     return
   }
 
+  // Validate alignment: address must be aligned to 2^order * PAGE_SIZE
+  var alignment: u64 = PAGE_SIZE << order
+  if (addr & (alignment - 1)) != 0 {
+    foundation.serial_write_string("[BUDDY] Error: misaligned free\n")
+    return
+  }
+
   // Try to coalesce with buddy
   var current_addr: u64 = addr
   var current_order: u32 = order
 
+  // Bug fix: Allow coalescing up through MAX_ORDER - 1 (the top order).
+  // Previous `< MAX_ORDER - 1` stopped one level early, leaving permanent
+  // fragmentation at the top. The inner check also rejects a buddy whose
+  // address lies outside the managed range.
   while current_order < MAX_ORDER {
+    // At the top order there is no buddy to merge with.
+    if current_order >= MAX_ORDER - 1 { break }
+
     // Calculate buddy address
     var block_size: u64 = PAGE_SIZE << current_order
     var buddy_addr: u64 = current_addr ^ block_size
+
+    // Validate buddy address is page-aligned
+    if (buddy_addr & (PAGE_SIZE - 1)) != 0 { break }
 
     // Check if buddy is free
     var buddy: *FreeBlock = find_free_block(buddy_addr, current_order)
@@ -327,12 +362,20 @@ export fn buddy_free(addr: u64, order: u32) {
     current_order = current_order + 1
   }
 
-  // Update zone stats
+  // Zone accounting: decrement the original zone by the ORIGINAL order
+  // (since that's what the caller requested to free). The coalesced
+  // block may span into a neighboring zone, but the allocator tracks
+  // "allocated pages" per zone based on what was originally allocated
+  // from that zone. Use the original `addr` — not current_addr — to
+  // determine which zone to decrement.
   var zone: u32 = get_zone_for_addr(addr)
-  var num_pages: u64 = 1 << order
+  var num_pages: u64 = @as(u64, 1) << order
   if allocator.zones[zone].allocated_pages >= num_pages {
     allocator.zones[zone].allocated_pages =
       allocator.zones[zone].allocated_pages - num_pages
+  } else {
+    // Defensive: zero out to avoid underflow instead of wrapping to MAX_U64.
+    allocator.zones[zone].allocated_pages = 0
   }
 
   // Add coalesced block to free list
@@ -344,18 +387,24 @@ export fn buddy_free_page(addr: u64) {
   buddy_free(addr, 0)
 }
 
-// Find a free block at given address and order
+// Find a free block at a given address/order in O(1) by inspecting
+// the header magic in place. Previously this walked the entire free
+// list, making coalescing O(free_blocks_at_order).
 fn find_free_block(addr: u64, order: u32): *FreeBlock {
-  var block: *FreeBlock = allocator.free_lists[order]
-
-  while block != 0 {
-    if @ptrFromInt(block) == addr {
-      return block
-    }
-    block = block.next
+  if addr < allocator.base_addr {
+    return 0
   }
-
-  return 0
+  if addr >= allocator.base_addr + allocator.total_memory {
+    return 0
+  }
+  var block: *FreeBlock = @ptrFromInt(addr)
+  if block.magic != FREE_BLOCK_MAGIC {
+    return 0
+  }
+  if block.order != order {
+    return 0
+  }
+  return block
 }
 
 // ============================================================================
@@ -398,11 +447,11 @@ export fn buddy_print_stats() {
   var order: u32 = 0
   while order <= MAX_ORDER {
     foundation.serial_write_string("  Order ")
-    foundation.serial_write_u32(order)
+    foundation.serial_write_u64(order)
     foundation.serial_write_string(" (")
     foundation.serial_write_u64((PAGE_SIZE << order) / 1024)
     foundation.serial_write_string(" KB): ")
-    foundation.serial_write_u32(allocator.free_count[order])
+    foundation.serial_write_u64(allocator.free_count[order])
     foundation.serial_write_string(" blocks\n")
     order = order + 1
   }
@@ -433,9 +482,14 @@ export fn buddy_print_stats() {
 // Zone-Specific Allocation
 // ============================================================================
 
-// Allocate from specific zone
+// Allocate from specific zone.
+// Early-out when the zone has zero free pages at all so callers don't
+// walk free lists that cannot possibly satisfy the request.
 export fn buddy_alloc_zone(order: u32, zone: u32): u64 {
   if zone >= MAX_ZONES {
+    return 0
+  }
+  if allocator.zones[zone].free_pages == 0 {
     return 0
   }
 
@@ -476,11 +530,13 @@ export fn buddy_alloc_dma(order: u32): u64 {
   return buddy_alloc_zone(order, ZONE_DMA)
 }
 
-// Allocate DMA32-safe memory (below 4GB)
+// Allocate DMA32-safe memory (below 4GB).
+// Prefer DMA32 first so we don't exhaust the scarce DMA zone (below
+// 16MB, used by legacy ISA hardware) for requests that only need <4GB.
 export fn buddy_alloc_dma32(order: u32): u64 {
-  var addr: u64 = buddy_alloc_zone(order, ZONE_DMA)
+  var addr: u64 = buddy_alloc_zone(order, ZONE_DMA32)
   if addr != 0 { return addr }
-  return buddy_alloc_zone(order, ZONE_DMA32)
+  return buddy_alloc_zone(order, ZONE_DMA)
 }
 
 // ============================================================================
@@ -538,6 +594,9 @@ export fn buddy_compact(): u32 {
       var buddy: *FreeBlock = find_free_block(buddy_addr, order)
 
       if buddy != 0 {
+        // `next` may equal `buddy`; re-read before we invalidate it.
+        if next == buddy { next = buddy.next }
+
         // Remove both blocks
         remove_from_free_list(block)
         remove_from_free_list(buddy)
@@ -559,7 +618,7 @@ export fn buddy_compact(): u32 {
   }
 
   foundation.serial_write_string("[BUDDY] Compaction complete: ")
-  foundation.serial_write_u32(moved)
+  foundation.serial_write_u64(moved)
   foundation.serial_write_string(" blocks merged\n")
 
   return moved

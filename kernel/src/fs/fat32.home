@@ -192,10 +192,10 @@ export fn fat32_get_next_cluster(cluster: u32): u32 {
 
   fat32_stats.fat_lookups = fat32_stats.fat_lookups + 1
 
-  // Calculate FAT offset
-  var fat_offset: u32 = cluster * 4
-  var fat_sector: u32 = fat_offset / 512
-  var entry_offset: u32 = fat_offset % 512
+  // Calculate FAT offset (use u64 to avoid overflow for large cluster numbers)
+  var fat_offset: u64 = @as(u64, cluster) * 4
+  var fat_sector: u32 = @truncate(fat_offset / 512, u32)
+  var entry_offset: u32 = @truncate(fat_offset % 512, u32)
 
   // Read FAT sector (cached)
   fat32_read_fat_sector(fat_sector)
@@ -229,7 +229,7 @@ export fn fat32_read_cluster(cluster: u32, buffer: u64): u32 {
 
   if cluster < 2 or cluster >= total_clusters {
     foundation.serial_write_string("[FAT32] Invalid cluster: ")
-    foundation.serial_write_u32(cluster)
+    foundation.serial_write_u64(cluster)
     foundation.serial_write_string("\n")
     return 1
   }
@@ -247,12 +247,17 @@ export fn fat32_read_cluster(cluster: u32, buffer: u64): u32 {
 
   fat32_stats.cache_misses = fat32_stats.cache_misses + 1
 
-  // Read from disk
+  // Read from disk. Propagate ATA errors instead of silently
+  // returning a half-read cluster that would corrupt whatever
+  // parses the buffer next.
   var first_sector: u32 = fat32_cluster_to_sector(cluster)
 
   var sector: u32 = 0
   while sector < boot_sector.sectors_per_cluster {
-    ata.ata_read_sector(0, first_sector + sector, buffer + (sector * 512))
+    var rc: u32 = ata.ata_read_sector(0, first_sector + sector, buffer + (sector * 512))
+    if rc != 0 {
+      return rc
+    }
     sector = sector + 1
   }
 
@@ -335,7 +340,14 @@ export fn fat32_lookup_entry(dir_cluster: u32, name: u64): u32 {
   var current_cluster: u32 = dir_cluster
   var cluster_buffer: [u8; 32768]
 
-  while fat32_is_eoc(current_cluster) == 0 {
+  // Bound the chain walk so a corrupted / circular FAT (e.g. cluster
+  // 10 -> 11 -> 10) can't hang the kernel when looking up a path. A
+  // real filesystem won't have directories spanning millions of
+  // clusters, and anything pathological is malicious.
+  var chain_limit: u32 = 65536
+  while fat32_is_eoc(current_cluster) == 0 and chain_limit > 0 {
+    chain_limit = chain_limit - 1
+
     // Read directory cluster
     if fat32_read_cluster(current_cluster, @ptrFromInt(cluster_buffer)) != 0 {
       return 0
@@ -375,7 +387,13 @@ export fn fat32_lookup_entry(dir_cluster: u32, name: u64): u32 {
     }
 
     // Move to next cluster in chain
-    current_cluster = fat32_get_next_cluster(current_cluster)
+    var next: u32 = fat32_get_next_cluster(current_cluster)
+    // Defensive: detect an immediate self-loop without walking a full
+    // cycle set — cheap and catches the common corruption pattern.
+    if next == current_cluster {
+      return 0
+    }
+    current_cluster = next
   }
 
   return 0
@@ -427,7 +445,7 @@ export fn fat32_list_directory(dir_cluster: u32): u32 {
         if (entry.attr & FAT32_ATTR_DIRECTORY) != 0 {
           foundation.serial_write_string("DIR")
         } else {
-          foundation.serial_write_u32(entry.file_size)
+          foundation.serial_write_u64(entry.file_size)
           foundation.serial_write_string(" bytes")
         }
         foundation.serial_write_string(")\n")
@@ -608,15 +626,15 @@ export fn fat32_init(): u32 {
   total_clusters = data_sectors / boot_sector.sectors_per_cluster
 
   foundation.serial_write_string("[FAT32] Cluster size: ")
-  foundation.serial_write_u32(cluster_size)
+  foundation.serial_write_u64(cluster_size)
   foundation.serial_write_string(" bytes\n")
 
   foundation.serial_write_string("[FAT32] Total clusters: ")
-  foundation.serial_write_u32(total_clusters)
+  foundation.serial_write_u64(total_clusters)
   foundation.serial_write_string("\n")
 
   foundation.serial_write_string("[FAT32] Root cluster: ")
-  foundation.serial_write_u32(boot_sector.root_cluster)
+  foundation.serial_write_u64(boot_sector.root_cluster)
   foundation.serial_write_string("\n")
 
   // Read FSInfo if present
@@ -627,7 +645,7 @@ export fn fat32_init(): u32 {
     fsinfo = fsi_ptr[0]
 
     foundation.serial_write_string("[FAT32] Free clusters: ")
-    foundation.serial_write_u32(fsinfo.free_count)
+    foundation.serial_write_u64(fsinfo.free_count)
     foundation.serial_write_string("\n")
   }
 

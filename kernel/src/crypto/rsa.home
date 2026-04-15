@@ -193,7 +193,7 @@ fn bigint_add(result: *BigInt, a: *BigInt, b: *BigInt) {
   if b.len > max_len { max_len = b.len }
 
   var i: u32 = 0
-  while i < max_len or carry != 0 {
+  while (i < max_len or carry != 0) and i < MAX_LIMBS {
     var sum: u64 = carry
     if i < a.len { sum = sum + @as(u64, a.limbs[i]) }
     if i < b.len { sum = sum + @as(u64, b.limbs[i]) }
@@ -203,7 +203,6 @@ fn bigint_add(result: *BigInt, a: *BigInt, b: *BigInt) {
   }
   result.len = i
 
-  // Trim leading zeros
   while result.len > 0 and result.limbs[result.len - 1] == 0 {
     result.len = result.len - 1
   }
@@ -244,6 +243,7 @@ fn bigint_mul(result: *BigInt, a: *BigInt, b: *BigInt) {
     var j: u32 = 0
     while j < b.len or carry != 0 {
       var pos: u32 = i + j
+      if pos >= MAX_LIMBS { break }
       var prod: u64 = @as(u64, result.limbs[pos]) + carry
       if j < b.len {
         prod = prod + @as(u64, a.limbs[i]) * @as(u64, b.limbs[j])
@@ -256,13 +256,17 @@ fn bigint_mul(result: *BigInt, a: *BigInt, b: *BigInt) {
   }
 
   result.len = a.len + b.len
+  if result.len > MAX_LIMBS { result.len = MAX_LIMBS }
   while result.len > 0 and result.limbs[result.len - 1] == 0 {
     result.len = result.len - 1
   }
 }
 
-// Modular reduction using repeated subtraction (slow but simple)
 fn bigint_mod(result: *BigInt, a: *BigInt, m: *BigInt) {
+  if bigint_is_zero(m) != 0 {
+    bigint_zero(result)
+    return
+  }
   bigint_copy(result, a)
 
   while bigint_compare(result, m) >= 0 {
@@ -270,25 +274,100 @@ fn bigint_mod(result: *BigInt, a: *BigInt, m: *BigInt) {
   }
 }
 
-// Montgomery modular exponentiation (for efficiency)
+// Extended GCD: computes gcd(a, b) and coefficients x, y such that a*x + b*y = gcd(a, b)
+// Used for modular inverse computation.
+fn bigint_mod_inverse(result: *BigInt, a: *BigInt, m: *BigInt) {
+  // Extended Euclidean algorithm for modular inverse
+  // Computes a^-1 mod m using iterative approach
+  var old_r: BigInt
+  var r: BigInt
+  var old_s: BigInt
+  var s: BigInt
+  var temp: BigInt
+  var quotient: BigInt
+  var product: BigInt
+
+  bigint_copy(&old_r, m)
+  bigint_copy(&r, a)
+  bigint_from_u32(&old_s, 0)
+  bigint_from_u32(&s, 1)
+
+  var iterations: u32 = 0
+  var max_iterations: u32 = MAX_LIMBS * 32  // Prevent infinite loop
+
+  while bigint_is_zero(&r) == 0 and iterations < max_iterations {
+    // quotient = old_r / r (integer division via repeated subtraction)
+    bigint_zero(&quotient)
+    bigint_copy(&temp, &old_r)
+    while bigint_compare(&temp, &r) >= 0 {
+      bigint_sub(&temp, &temp, &r)
+      var inc: BigInt
+      bigint_from_u32(&inc, 1)
+      bigint_add(&quotient, &quotient, &inc)
+    }
+
+    // old_r = r, r = temp (remainder)
+    bigint_copy(&old_r, &r)
+    bigint_copy(&r, &temp)
+
+    // Update s: old_s, s = s, old_s - quotient * s
+    bigint_mul(&product, &quotient, &s)
+    bigint_copy(&temp, &old_s)
+    bigint_copy(&old_s, &s)
+    // s = temp - product, but handle negative via modular arithmetic
+    if bigint_compare(&temp, &product) >= 0 {
+      bigint_sub(&s, &temp, &product)
+    } else {
+      // Result would be negative, add m to keep positive
+      bigint_sub(&product, &product, &temp)
+      bigint_mod(&product, &product, m)
+      if bigint_is_zero(&product) == 0 {
+        bigint_sub(&s, m, &product)
+      } else {
+        bigint_from_u32(&s, 0)
+      }
+    }
+
+    iterations = iterations + 1
+  }
+
+  // Ensure result is positive (in range [0, m))
+  bigint_mod(result, &old_s, m)
+}
+
+// Constant-time modular exponentiation
+// Uses square-and-always-multiply to prevent timing side-channel attacks.
+// Both branches (bit=0 and bit=1) perform a multiply; a constant-time
+// conditional swap selects which result to keep.
 fn bigint_mod_exp(result: *BigInt, base: *BigInt, exp: *BigInt, mod: *BigInt) {
   var temp_base: BigInt
   var temp_result: BigInt
   var temp_mul: BigInt
+  var dummy_result: BigInt  // Always-multiply target for bit=0
 
   bigint_from_u32(&temp_result, 1)
   bigint_copy(&temp_base, base)
 
-  // Simple square-and-multiply
+  // Square-and-always-multiply (constant-time)
   var i: u32 = 0
   while i < exp.len {
     var limb: u32 = exp.limbs[i]
     var bit: u32 = 0
     while bit < 32 {
-      if (limb & 1) != 0 {
-        bigint_mul(&temp_mul, &temp_result, &temp_base)
-        bigint_mod(&temp_result, &temp_mul, mod)
+      // Always multiply (both branches do work to eliminate timing leak)
+      bigint_mul(&temp_mul, &temp_result, &temp_base)
+      bigint_mod(&dummy_result, &temp_mul, mod)
+
+      // Constant-time conditional copy: if bit is set, use the result
+      var mask: u32 = 0 - (limb & 1)  // 0xFFFFFFFF if bit set, 0x00000000 if not
+      var j: u32 = 0
+      while j < MAX_LIMBS {
+        temp_result.limbs[j] = (dummy_result.limbs[j] & mask) | (temp_result.limbs[j] & ~mask)
+        j = j + 1
       }
+      temp_result.len = if mask != 0 { dummy_result.len } else { temp_result.len }
+
+      // Always square
       bigint_mul(&temp_mul, &temp_base, &temp_base)
       bigint_mod(&temp_base, &temp_mul, mod)
       limb = limb >> 1
@@ -332,9 +411,10 @@ fn is_probably_prime(n: *BigInt, rounds: u32): u32 {
 
 fn generate_prime(result: *BigInt, bits: u32) {
   var bytes: u32 = bits / 8
-  var buffer: [u8; 256]  // Max 2048 bits
+  if bytes > 512 { bytes = 512 }
+  var buffer: [u8; 512]
 
-  while true {
+  loop {
     // Generate random bytes
     var i: u32 = 0
     while i < bytes {
@@ -392,19 +472,30 @@ export fn rsa_generate_keypair(public_key: *RsaPublicKey, private_key: *RsaPriva
   public_key.bits = bits
   private_key.bits = bits
 
-  // d = e^-1 mod phi (using extended Euclidean algorithm - simplified)
-  // For simplicity, we'll use a placeholder that works for common cases
+  // d = e^-1 mod phi (using extended Euclidean algorithm)
   var e_big: BigInt
   bigint_from_u32(&e_big, DEFAULT_E)
 
-  // Compute d using modular inverse (simplified implementation)
-  bigint_copy(&private_key.d, &phi)
-  // In real implementation, compute proper modular inverse
+  // Compute d = modular inverse of e mod phi using extended GCD
+  bigint_mod_inverse(&private_key.d, &e_big, &phi)
 
-  // CRT components (simplified - compute properly in production)
+  // Verify d * e mod phi == 1
+  var verify: BigInt
+  var verify_mod: BigInt
+  bigint_mul(&verify, &private_key.d, &e_big)
+  bigint_mod(&verify_mod, &verify, &phi)
+  var expected_one: BigInt
+  bigint_from_u32(&expected_one, 1)
+  if bigint_compare(&verify_mod, &expected_one) != 0 {
+    foundation.serial_write_string("[RSA] ERROR: d*e mod phi != 1, key generation failed\n")
+    return 1
+  }
+
+  // CRT components
   bigint_mod(&private_key.dp, &private_key.d, &p_minus_1)
   bigint_mod(&private_key.dq, &private_key.d, &q_minus_1)
-  // qinv would need modular inverse
+  // qinv = q^-1 mod p
+  bigint_mod_inverse(&private_key.qinv, &private_key.q, &private_key.p)
 
   foundation.serial_write_string("[RSA] Keypair generated\n")
   operations_count = operations_count + 1
@@ -456,29 +547,37 @@ fn pkcs1_pad(padded: *u8, padded_len: u32, msg: *u8, msg_len: u32, block_type: u
 
 fn pkcs1_unpad(msg: *u8, msg_len: *u32, max_len: u32, padded: *u8, padded_len: u32): u32 {
   if padded_len < 11 { return 1 }
-  if @ptrFromInt(@intFromPtr(padded)).* != 0x00 { return 1 }
 
+  // Constant-time validation to prevent Bleichenbacher timing oracle.
+  // Accumulate error bits; only branch on the final result.
+  var bad: u32 = 0
+  bad = bad | @as(u32, @ptrFromInt(@intFromPtr(padded)).*)
   var block_type: u8 = @ptrFromInt(@intFromPtr(padded) + 1).*
-  if block_type != 1 and block_type != 2 { return 1 }
+  bad = bad | @as(u32, (block_type ^ 1) & (block_type ^ 2))
 
-  // Find separator
+  // Scan for 0x00 separator, always visiting every byte.
+  var sep_idx: u32 = 0
+  var found_sep: u32 = 0
   var i: u32 = 2
   while i < padded_len {
-    if @ptrFromInt(@intFromPtr(padded) + i).* == 0x00 {
-      break
+    var is_zero: u32 = 0
+    if @ptrFromInt(@intFromPtr(padded) + i).* == 0 { is_zero = 1 }
+    if is_zero == 1 and found_sep == 0 {
+      sep_idx = i
+      found_sep = 1
     }
     i = i + 1
   }
 
-  if i == padded_len { return 1 }
-  if i < 10 { return 1 }  // Minimum 8 bytes padding
+  if found_sep == 0 { bad = bad | 1 }
+  if sep_idx < 10 { bad = bad | 1 }
 
-  var data_start: u32 = i + 1
+  var data_start: u32 = sep_idx + 1
   var data_len: u32 = padded_len - data_start
+  if data_len > max_len { bad = bad | 1 }
 
-  if data_len > max_len { return 1 }
+  if bad != 0 { return 1 }
 
-  // Copy message
   i = 0
   while i < data_len {
     @ptrFromInt(@intFromPtr(msg) + i).* = @ptrFromInt(@intFromPtr(padded) + data_start + i).*

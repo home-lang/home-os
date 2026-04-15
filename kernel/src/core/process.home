@@ -41,6 +41,8 @@ export struct PCB {
   heap_end: u64,
   stack_start: u64,
   stack_end: u64,
+  stack_phys: u64,
+  stack_pages: u32,
   
   // Scheduling
   time_slice: u32,
@@ -97,33 +99,52 @@ export fn process_create(entry_point: u64): u32 {
   pcb.rip = entry_point
   pcb.rflags = 0x202  // IF flag set
   
-  // Allocate stack
+  // Allocate stack. Track the pages we actually got so we can roll
+  // them back on a partial failure instead of leaking them.
   var stack_pages: u32 = STACK_SIZE / 4096
-  var stack_phys: u64 = 0
+  var stack_base_phys: u64 = 0
+  var stack_allocated: u32 = 0
   var j: u32 = 0
-  
+
   while j < stack_pages {
     var page: u64 = memory.pmm_alloc_page()
     if page == 0 {
-      // Cleanup and fail
+      // Roll back all pages we've allocated so far.
+      var k: u32 = 0
+      while k < stack_allocated {
+        memory.pmm_free_page(stack_base_phys + (@as(u64, k) * 4096))
+        k = k + 1
+      }
       return 0
     }
-    if j == 0 { stack_phys = page }
+    if j == 0 { stack_base_phys = page }
+    stack_allocated = stack_allocated + 1
     j = j + 1
   }
-  
+
   pcb.stack_start = 0x0000_7FFF_FFFF_0000
   pcb.stack_end = pcb.stack_start + STACK_SIZE
   pcb.rsp = pcb.stack_end - 16
   pcb.rbp = pcb.rsp
-  
+  pcb.stack_phys = stack_base_phys
+  pcb.stack_pages = stack_allocated
+
   // Allocate heap
   pcb.heap_start = 0x0000_0000_1000_0000
   pcb.heap_end = pcb.heap_start
-  
-  // Create page table (clone kernel mappings)
+
+  // Create page table (clone kernel mappings). On failure we must
+  // release the stack pages too, otherwise a slow OOM eats all
+  // physical memory with orphaned 8KB stack blocks.
   pcb.page_table = memory.pmm_alloc_page()
-  if pcb.page_table == 0 { return 0 }
+  if pcb.page_table == 0 {
+    var k: u32 = 0
+    while k < stack_allocated {
+      memory.pmm_free_page(stack_base_phys + (@as(u64, k) * 4096))
+      k = k + 1
+    }
+    return 0
+  }
   
   // Initialize scheduling
   pcb.time_slice = 10  // 10ms
@@ -138,8 +159,9 @@ export fn process_create(entry_point: u64): u32 {
   next_pid = next_pid + 1
   
   foundation.serial_write_string("[Process] Created PID ")
+  foundation.serial_write_u64(pcb.pid)
   foundation.serial_write_string("\n")
-  
+
   return pcb.pid
 }
 
@@ -148,14 +170,22 @@ export fn process_destroy(pid: u32): u32 {
   
   while i < MAX_PROCESSES {
     if process_table[i].pid == pid and process_table[i].state != PROCESS_UNUSED {
-      // Free memory
+      // Free stack pages
+      var k: u32 = 0
+      while k < process_table[i].stack_pages {
+        memory.pmm_free_page(process_table[i].stack_phys + (@as(u64, k) * 4096))
+        k = k + 1
+      }
+
+      // Free page table
       memory.pmm_free_page(process_table[i].page_table)
-      
+
       // Mark as unused
       process_table[i].state = PROCESS_UNUSED
       process_count = process_count - 1
-      
+
       foundation.serial_write_string("[Process] Destroyed PID ")
+      foundation.serial_write_u64(pid)
       foundation.serial_write_string("\n")
       
       return 0
@@ -182,19 +212,23 @@ export fn scheduler_init() {
 
 export fn scheduler_tick() {
   if process_count == 0 { return }
-  
+
   // Find current process
   var current_idx: u32 = 0
+  var found: u32 = 0
   var i: u32 = 0
-  
+
   while i < MAX_PROCESSES {
-    if process_table[i].pid == current_pid {
+    if process_table[i].pid == current_pid and process_table[i].state != PROCESS_UNUSED {
       current_idx = i
+      found = 1
       break
     }
     i = i + 1
   }
-  
+
+  if found == 0 { return }
+
   // Decrement time slice
   if process_table[current_idx].time_slice > 0 {
     process_table[current_idx].time_slice = process_table[current_idx].time_slice - 1
@@ -377,12 +411,27 @@ export fn process_get_info(pid: u32): u64 {
 // INITIALIZATION
 // ============================================================================
 
+// Convenience aliases used by subsystems (container runtime, OOM killer, etc.)
+export fn process_fork(): u32 {
+  return sys_fork()
+}
+
+export fn process_exec(entry_point: u64, argv: u64, envp: u64): u32 {
+  return sys_exec(entry_point)
+}
+
+export fn process_exit(exit_code: u32) {
+  sys_exit(exit_code)
+}
+
 export fn process_init() {
   // Clear process table
   var i: u32 = 0
   while i < MAX_PROCESSES {
     process_table[i].state = PROCESS_UNUSED
     process_table[i].pid = 0
+    process_table[i].stack_phys = 0
+    process_table[i].stack_pages = 0
     i = i + 1
   }
   

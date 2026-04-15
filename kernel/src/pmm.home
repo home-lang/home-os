@@ -23,6 +23,14 @@ var free_pages: u64 = 0
 var total_memory: u64 = 0
 var usable_memory: u64 = 0
 
+// Hint for alloc_page(): the lowest byte index that *may* still
+// contain a free bit. The allocator starts scanning from here,
+// skipping over the prefix of the bitmap that's fully occupied. This
+// turns the worst-case 131KB linear scan into an O(1) amortized
+// walk during normal steady-state allocation. free_page() resets
+// the hint backwards so freed regions are reused first.
+var next_free_byte_hint: u64 = 0
+
 // ============================================================================
 // MULTIBOOT2 STRUCTURES
 // ============================================================================
@@ -572,8 +580,9 @@ fn is_bit_set(page: u64): bool {
 
 /// Allocate a single physical page frame
 export fn alloc_page(): u64 {
-    // Find first free page
-    let byte_index: u64 = 0
+    // Start from the cached hint so repeated allocations don't rescan
+    // the already-exhausted prefix of the bitmap.
+    let byte_index: u64 = next_free_byte_hint
     loop {
         if byte_index >= BITMAP_SIZE {
             break
@@ -594,6 +603,11 @@ export fn alloc_page(): u64 {
                     let page = (byte_index * 8) + @as(u64, bit_index)
                     free_pages = free_pages - 1
                     used_pages = used_pages + 1
+                    // Advance the hint to the current byte. If we
+                    // just filled the last bit, the next alloc will
+                    // fall through this byte anyway on the != 0xFF
+                    // check and move to the next one.
+                    next_free_byte_hint = byte_index
                     return page << PAGE_SHIFT
                 }
 
@@ -604,7 +618,10 @@ export fn alloc_page(): u64 {
         byte_index = byte_index + 1
     }
 
-    // Out of memory
+    // Out of memory — scan failed from the hint to the end. Reset the
+    // hint so the next call retries from the beginning (in case
+    // free_page() raced with us and produced a hole).
+    next_free_byte_hint = 0
     serial.write("[PMM] ERROR: Out of physical memory!\n")
     return 0
 }
@@ -751,6 +768,12 @@ export fn free_page(phys_addr: u64) {
     if used_pages > 0 {
         used_pages = used_pages - 1
     }
+    // Walk the alloc hint backwards if this page is before it, so the
+    // next alloc_page() prefers reusing the just-freed region.
+    let freed_byte = page / 8
+    if freed_byte < next_free_byte_hint {
+        next_free_byte_hint = freed_byte
+    }
 }
 
 /// Free contiguous physical pages
@@ -773,6 +796,11 @@ export fn free_pages(phys_addr: u64, count: u64) {
         }
 
         i = i + 1
+    }
+    // Roll the alloc hint back to cover the freed range.
+    let freed_byte = page / 8
+    if freed_byte < next_free_byte_hint {
+        next_free_byte_hint = freed_byte
     }
 }
 

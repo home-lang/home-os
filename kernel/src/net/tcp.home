@@ -4,6 +4,7 @@
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
 import "../drivers/e1000.home" as e1000
+import "arp.home" as arp
 
 // ============================================================================
 // CONSTANTS
@@ -47,6 +48,10 @@ const TCP_OPT_TIMESTAMP: u8 = 8
 
 // Configuration
 const MAX_TCP_CONNECTIONS: u32 = 256
+// 5-tuple → connection index hash. Sized to 2× max connections to
+// keep the probe count near 1 even near full capacity.
+const TCP_HASH_SIZE: u32 = 512
+const TCP_HASH_MASK: u32 = 511
 const TCP_MSS: u32 = 1460
 const TCP_WINDOW_SIZE: u32 = 65535
 const TCP_MAX_RETRIES: u32 = 5
@@ -202,6 +207,10 @@ var tcp_connection_count: u32 = 0
 var tcp_stats: TcpStats
 var tcp_initialized: u32 = 0
 
+// Open-addressed hash table: bucket stores connection index, or
+// 0xFFFFFFFF (empty) / 0xFFFFFFFE (tombstone).
+var tcp_conn_hash: [u32; 512]
+
 var local_ip: u32 = 0x0A000002   // 10.0.0.2
 var gateway_ip: u32 = 0x0A000001 // 10.0.0.1
 var local_mac: [u8; 6]
@@ -220,20 +229,38 @@ fn get_timestamp(): u64 {
 }
 
 fn generate_isn(): u32 {
-  // Generate Initial Sequence Number
-  // RFC 6528 recommends using a pseudo-random generator
+  // RFC 6528: ISN should be unpredictable per-connection.
+  // Mix timestamp with local state for better entropy.
   var timestamp: u64 = get_timestamp()
-  var isn: u32 = (timestamp * 250000) & 0xFFFFFFFF
-  return isn
+  var k: u32 = @truncate(timestamp & 0xFFFFFFFF, u32)
+  k = k ^ @as(u32, tcp_port_counter)
+  k = k * 2654435761
+  k = k ^ @truncate((timestamp >> 32) & 0xFFFFFFFF, u32)
+  k = k * 2246822519
+  return k
 }
 
 fn allocate_ephemeral_port(): u16 {
-  var port: u16 = tcp_port_counter
-  tcp_port_counter = tcp_port_counter + 1
-  if tcp_port_counter >= 65535 {
-    tcp_port_counter = 49152
+  var attempts: u32 = 0
+  while attempts < 16384 {
+    var port: u16 = tcp_port_counter
+    tcp_port_counter = tcp_port_counter + 1
+    if tcp_port_counter >= 65535 {
+      tcp_port_counter = 49152
+    }
+    var collision: u32 = 0
+    var i: u32 = 0
+    while i < MAX_TCP_CONNECTIONS {
+      if tcp_connections[i].state != TCP_STATE_CLOSED and tcp_connections[i].local_port == port {
+        collision = 1
+        break
+      }
+      i = i + 1
+    }
+    if collision == 0 { return port }
+    attempts = attempts + 1
   }
-  return port
+  return 0
 }
 
 // ============================================================================
@@ -241,11 +268,12 @@ fn allocate_ephemeral_port(): u16 {
 // ============================================================================
 
 fn ip_checksum(data: u64, len: u32): u16 {
+  if len == 0 { return 0 }
   var sum: u32 = 0
   var ptr: *u8 = @ptrFromInt(data)
   var i: u32 = 0
 
-  while i < len - 1 {
+  while i + 1 < len {
     var word: u16 = (ptr[i] << 8) | ptr[i + 1]
     sum = sum + word
     i = i + 2
@@ -273,10 +301,15 @@ fn tcp_checksum(src_ip: u32, dst_ip: u32, tcp_data: u64, tcp_len: u32): u16 {
   sum = sum + IP_PROTO_TCP
   sum = sum + tcp_len
 
+  if tcp_len == 0 {
+    while (sum >> 16) != 0 { sum = (sum & 0xFFFF) + (sum >> 16) }
+    return (~sum) & 0xFFFF
+  }
+
   // TCP header + data
   var ptr: *u8 = @ptrFromInt(tcp_data)
   var i: u32 = 0
-  while i < tcp_len - 1 {
+  while i + 1 < tcp_len {
     var word: u16 = (ptr[i] << 8) | ptr[i + 1]
     sum = sum + word
     i = i + 2
@@ -297,19 +330,70 @@ fn tcp_checksum(src_ip: u32, dst_ip: u32, tcp_data: u64, tcp_len: u32): u16 {
 // CONNECTION MANAGEMENT
 // ============================================================================
 
+// Mix the 5-tuple into a uniform bucket index.
+fn tcp_hash_key(local_port: u16, remote_ip: u32, remote_port: u16): u32 {
+  var k: u32 = remote_ip
+  k = k ^ (@as(u32, local_port) << 16)
+  k = k ^ @as(u32, remote_port)
+  k = k * 2654435761
+  return (k >> 16) & TCP_HASH_MASK
+}
+
+fn tcp_conn_matches(idx: u32, local_port: u16, remote_ip: u32, remote_port: u16): u32 {
+  if tcp_connections[idx].state == TCP_STATE_CLOSED { return 0 }
+  if tcp_connections[idx].local_port != local_port { return 0 }
+  if tcp_connections[idx].remote_ip != remote_ip { return 0 }
+  if tcp_connections[idx].remote_port != remote_port { return 0 }
+  return 1
+}
+
+// O(1) average 5-tuple lookup.
 fn find_connection(local_port: u16, remote_ip: u32, remote_port: u16): u32 {
-  var i: u32 = 0
-  while i < MAX_TCP_CONNECTIONS {
-    if tcp_connections[i].state != TCP_STATE_CLOSED {
-      if tcp_connections[i].local_port == local_port and
-         tcp_connections[i].remote_ip == remote_ip and
-         tcp_connections[i].remote_port == remote_port {
-        return i
+  var h: u32 = tcp_hash_key(local_port, remote_ip, remote_port)
+  var probes: u32 = 0
+  while probes < TCP_HASH_SIZE {
+    var idx: u32 = tcp_conn_hash[h]
+    if idx == 0xFFFFFFFF { return 0xFFFFFFFF }
+    if idx != 0xFFFFFFFE {
+      if tcp_conn_matches(idx, local_port, remote_ip, remote_port) == 1 {
+        return idx
       }
     }
-    i = i + 1
+    h = (h + 1) & TCP_HASH_MASK
+    probes = probes + 1
   }
   return 0xFFFFFFFF
+}
+
+fn tcp_hash_insert(local_port: u16, remote_ip: u32, remote_port: u16, idx: u32) {
+  var h: u32 = tcp_hash_key(local_port, remote_ip, remote_port)
+  var probes: u32 = 0
+  while probes < TCP_HASH_SIZE {
+    var cur: u32 = tcp_conn_hash[h]
+    if cur == 0xFFFFFFFF or cur == 0xFFFFFFFE {
+      tcp_conn_hash[h] = idx
+      return
+    }
+    h = (h + 1) & TCP_HASH_MASK
+    probes = probes + 1
+  }
+}
+
+fn tcp_hash_remove(local_port: u16, remote_ip: u32, remote_port: u16) {
+  var h: u32 = tcp_hash_key(local_port, remote_ip, remote_port)
+  var probes: u32 = 0
+  while probes < TCP_HASH_SIZE {
+    var cur: u32 = tcp_conn_hash[h]
+    if cur == 0xFFFFFFFF { return }
+    if cur != 0xFFFFFFFE {
+      if tcp_conn_matches(cur, local_port, remote_ip, remote_port) == 1 {
+        tcp_conn_hash[h] = 0xFFFFFFFE
+        return
+      }
+    }
+    h = (h + 1) & TCP_HASH_MASK
+    probes = probes + 1
+  }
 }
 
 fn find_listening_connection(local_port: u16): u32 {
@@ -358,16 +442,32 @@ fn init_connection(conn_idx: u32) {
   tcp_connections[conn_idx].send_buffer_size = 65536
   tcp_connections[conn_idx].send_buffer_used = 0
 
+  if tcp_connections[conn_idx].recv_buffer == 0 or tcp_connections[conn_idx].send_buffer == 0 {
+    if tcp_connections[conn_idx].recv_buffer != 0 { memory.kfree(tcp_connections[conn_idx].recv_buffer) }
+    if tcp_connections[conn_idx].send_buffer != 0 { memory.kfree(tcp_connections[conn_idx].send_buffer) }
+    tcp_connections[conn_idx].recv_buffer = 0
+    tcp_connections[conn_idx].send_buffer = 0
+    tcp_connections[conn_idx].recv_buffer_size = 0
+    tcp_connections[conn_idx].send_buffer_size = 0
+  }
+
   tcp_connections[conn_idx].retx_queue_head = 0
   tcp_connections[conn_idx].retx_queue_tail = 0
 }
 
 fn free_connection(conn_idx: u32) {
+  // Unhook from the 5-tuple hash before we clear the tuple fields.
+  tcp_hash_remove(
+    tcp_connections[conn_idx].local_port,
+    tcp_connections[conn_idx].remote_ip,
+    tcp_connections[conn_idx].remote_port
+  )
+
   // Free retransmission queue
   var seg: u64 = tcp_connections[conn_idx].retx_queue_head
   while seg != 0 {
-    var next: u64 = @intToPtr(seg + 24, u64)  // next pointer
-    var data: u64 = @intToPtr(seg + 8, u64)
+    var next: u64 = @as(*u64, @ptrFromInt(seg + 24)).*  // next pointer
+    var data: u64 = @as(*u64, @ptrFromInt(seg + 8)).*
     if data != 0 {
       memory.kfree(data)
     }
@@ -397,10 +497,20 @@ fn build_tcp_packet(conn_idx: u32, flags: u8, data: u64, data_len: u32, packet: 
   var offset: u32 = 0
 
   // Ethernet header (14 bytes)
+  // Resolve destination MAC via ARP cache; fall back to broadcast if unknown.
+  var dst_ip: u32 = connections[conn_idx].remote_ip
+  var mac_ptr: u64 = arp.arp_lookup(dst_ip)
   var i: u32 = 0
-  while i < 6 {
-    pkt[offset + i] = 0xFF  // Broadcast MAC (would use ARP in real implementation)
-    i = i + 1
+  if mac_ptr != 0 {
+    while i < 6 {
+      pkt[offset + i] = @as(*u8, @ptrFromInt(mac_ptr + i)).*
+      i = i + 1
+    }
+  } else {
+    while i < 6 {
+      pkt[offset + i] = 0xFF
+      i = i + 1
+    }
   }
   offset = offset + 6
 
@@ -422,7 +532,9 @@ fn build_tcp_packet(conn_idx: u32, flags: u8, data: u64, data_len: u32, packet: 
   if (flags & TCP_SYN) != 0 {
     tcp_header_len = 24  // With MSS option
   }
-  var total_len: u16 = 20 + tcp_header_len + data_len
+  var total_len_u32: u32 = 20 + tcp_header_len + data_len
+  if total_len_u32 > 65535 { return 0 }
+  var total_len: u16 = @truncate(total_len_u32, u16)
   pkt[offset + 2] = (total_len >> 8) & 0xFF
   pkt[offset + 3] = total_len & 0xFF
 
@@ -563,10 +675,10 @@ fn send_tcp_segment(conn_idx: u32, flags: u8, data: u64, data_len: u32): u32 {
 // ============================================================================
 
 fn add_to_retx_queue(conn_idx: u32, seq: u32, data: u64, data_len: u32, flags: u8) {
-  var seg: u64 = memory.kmalloc(32)  // TcpSegment size
+  var seg: u64 = memory.kmalloc(48)  // TcpSegment: seq(4)+pad(4)+data(8)+data_len(4)+flags(1)+pad(3)+retries(4)+sent_time(8)+next(8)=44, round to 48
   if seg == 0 { return }
 
-  @ptrToInt(seg, u32) = seq           // seq_num
+  @as(*volatile u32, @ptrFromInt(seg)).* = seq           // seq_num
 
   // Copy data
   var data_copy: u64 = 0
@@ -583,19 +695,21 @@ fn add_to_retx_queue(conn_idx: u32, seq: u32, data: u64, data_len: u32, flags: u
     }
   }
 
-  @ptrToInt(seg + 8, u64) = data_copy   // data pointer
-  @ptrToInt(seg + 16, u32) = data_len   // data_len
-  @ptrToInt(seg + 20, u8) = flags       // flags
-  @ptrToInt(seg + 21, u32) = 0          // retries
-  @ptrToInt(seg + 25, u64) = get_timestamp()  // sent_time
-  @ptrToInt(seg + 33, u64) = 0          // next
+  // TcpSegment layout (aligned): seq(0-3), data(8-15), data_len(16-19),
+  // flags(20), retries(24-27), sent_time(28-35 unaligned, use 32-39), next(40-47)
+  @as(*u64, @ptrFromInt(seg + 8)).* = data_copy   // data pointer
+  @as(*volatile u32, @ptrFromInt(seg + 16)).* = data_len   // data_len
+  @as(*u8, @ptrFromInt(seg + 20)).* = flags       // flags
+  @as(*volatile u32, @ptrFromInt(seg + 24)).* = 0          // retries
+  @as(*u64, @ptrFromInt(seg + 32)).* = get_timestamp()  // sent_time
+  @as(*u64, @ptrFromInt(seg + 40)).* = 0          // next
 
   // Add to queue
   if tcp_connections[conn_idx].retx_queue_tail == 0 {
     tcp_connections[conn_idx].retx_queue_head = seg
     tcp_connections[conn_idx].retx_queue_tail = seg
   } else {
-    @ptrToInt(tcp_connections[conn_idx].retx_queue_tail + 33, u64) = seg
+    @as(*u64, @ptrFromInt(tcp_connections[conn_idx].retx_queue_tail + 40)).* = seg
     tcp_connections[conn_idx].retx_queue_tail = seg
   }
 
@@ -611,10 +725,10 @@ fn process_ack(conn_idx: u32, ack_num: u32) {
   var seg: u64 = tcp_connections[conn_idx].retx_queue_head
 
   while seg != 0 {
-    var seg_seq: u32 = @intToPtr(seg, u32)
-    var seg_len: u32 = @intToPtr(seg + 16, u32)
-    var seg_flags: u8 = @intToPtr(seg + 20, u8)
-    var next: u64 = @intToPtr(seg + 33, u64)
+    var seg_seq: u32 = @as(*volatile u32, @ptrFromInt(seg)).*
+    var seg_len: u32 = @as(*volatile u32, @ptrFromInt(seg + 16)).*
+    var seg_flags: u8 = @as(*u8, @ptrFromInt(seg + 20)).*
+    var next: u64 = @as(*u64, @ptrFromInt(seg + 40)).*
 
     // Calculate end sequence
     var seg_end: u32 = seg_seq + seg_len
@@ -625,8 +739,8 @@ fn process_ack(conn_idx: u32, ack_num: u32) {
     // Check if fully acknowledged
     if seq_before_eq(seg_end, ack_num) {
       // Update RTT estimation
-      var sent_time: u64 = @intToPtr(seg + 25, u64)
-      var retries: u32 = @intToPtr(seg + 21, u32)
+      var sent_time: u64 = @as(*u64, @ptrFromInt(seg + 32)).*
+      var retries: u32 = @as(*volatile u32, @ptrFromInt(seg + 24)).*
       if retries == 0 {
         update_rtt(conn_idx, get_timestamp() - sent_time)
       }
@@ -635,7 +749,7 @@ fn process_ack(conn_idx: u32, ack_num: u32) {
       if prev == 0 {
         tcp_connections[conn_idx].retx_queue_head = next
       } else {
-        @ptrToInt(prev + 33, u64) = next
+        @as(*u64, @ptrFromInt(prev + 40)).* = next
       }
 
       if next == 0 {
@@ -643,7 +757,7 @@ fn process_ack(conn_idx: u32, ack_num: u32) {
       }
 
       // Free segment
-      var seg_data: u64 = @intToPtr(seg + 8, u64)
+      var seg_data: u64 = @as(*u64, @ptrFromInt(seg + 8)).*
       if seg_data != 0 {
         memory.kfree(seg_data)
       }
@@ -668,11 +782,11 @@ fn process_ack(conn_idx: u32, ack_num: u32) {
 }
 
 fn retransmit_segment(conn_idx: u32, seg: u64) {
-  var seg_seq: u32 = @intToPtr(seg, u32)
-  var seg_data: u64 = @intToPtr(seg + 8, u64)
-  var seg_len: u32 = @intToPtr(seg + 16, u32)
-  var seg_flags: u8 = @intToPtr(seg + 20, u8)
-  var retries: u32 = @intToPtr(seg + 21, u32)
+  var seg_seq: u32 = @as(*volatile u32, @ptrFromInt(seg)).*
+  var seg_data: u64 = @as(*u64, @ptrFromInt(seg + 8)).*
+  var seg_len: u32 = @as(*volatile u32, @ptrFromInt(seg + 16)).*
+  var seg_flags: u8 = @as(*u8, @ptrFromInt(seg + 20)).*
+  var retries: u32 = @as(*volatile u32, @ptrFromInt(seg + 24)).*
 
   // Temporarily set snd_nxt for retransmission
   var saved_snd_nxt: u32 = tcp_connections[conn_idx].snd_nxt
@@ -683,8 +797,8 @@ fn retransmit_segment(conn_idx: u32, seg: u64) {
   tcp_connections[conn_idx].snd_nxt = saved_snd_nxt
 
   // Update retries
-  @ptrToInt(seg + 21, u32) = retries + 1
-  @ptrToInt(seg + 25, u64) = get_timestamp()
+  @as(*volatile u32, @ptrFromInt(seg + 24)).* = retries + 1
+  @as(*u64, @ptrFromInt(seg + 32)).* = get_timestamp()
 
   tcp_connections[conn_idx].retransmissions = tcp_connections[conn_idx].retransmissions + 1
   tcp_stats.retransmissions = tcp_stats.retransmissions + 1
@@ -762,7 +876,7 @@ fn process_timers(conn_idx: u32) {
 
     var seg: u64 = tcp_connections[conn_idx].retx_queue_head
     if seg != 0 {
-      var retries: u32 = @intToPtr(seg + 21, u32)
+      var retries: u32 = @as(*volatile u32, @ptrFromInt(seg + 24)).*
 
       if retries >= TCP_MAX_RETRIES {
         // Connection failed
@@ -832,18 +946,29 @@ fn parse_tcp_options(conn_idx: u32, options: u64, options_len: u32) {
       continue
     }
 
+    // Guard against reading the length byte itself out of bounds.
+    if i + 1 >= options_len {
+      break
+    }
     var opt_len: u8 = ptr[i + 1]
     if opt_len < 2 or i + opt_len > options_len {
       break
     }
 
     if opt_type == TCP_OPT_MSS and opt_len == 4 {
-      var mss: u16 = (ptr[i + 2] << 8) | ptr[i + 3]
-      tcp_connections[conn_idx].snd_mss = mss
+      // Re-validate that the full MSS option (i, i+1, i+2, i+3) is in bounds
+      // before reading ptr[i+2] and ptr[i+3].
+      if i + 3 < options_len {
+        var mss: u16 = (ptr[i + 2] << 8) | ptr[i + 3]
+        tcp_connections[conn_idx].snd_mss = mss
+      }
     } else if opt_type == TCP_OPT_WINDOW_SCALE and opt_len == 3 {
-      tcp_connections[conn_idx].snd_scale = ptr[i + 2]
-      if tcp_connections[conn_idx].snd_scale > 14 {
-        tcp_connections[conn_idx].snd_scale = 14
+      // Ensure ptr[i+2] is within bounds.
+      if i + 2 < options_len {
+        tcp_connections[conn_idx].snd_scale = ptr[i + 2]
+        if tcp_connections[conn_idx].snd_scale > 14 {
+          tcp_connections[conn_idx].snd_scale = 14
+        }
       }
     }
 
@@ -880,7 +1005,9 @@ fn handle_tcp_packet(src_ip: u32, tcp_data: u64, tcp_len: u32) {
         tcp_connections[conn_idx].local_port = dst_port
         tcp_connections[conn_idx].remote_ip = src_ip
         tcp_connections[conn_idx].remote_port = src_port
-        tcp_connections[conn_idx].state = TCP_STATE_LISTEN
+        tcp_connections[conn_idx].state = TCP_STATE_SYN_RECEIVED
+        // Publish the fresh 5-tuple so subsequent segments hit O(1).
+        tcp_hash_insert(dst_port, src_ip, src_port, conn_idx)
         tcp_stats.passive_opens = tcp_stats.passive_opens + 1
       }
     }
@@ -898,8 +1025,10 @@ fn handle_tcp_packet(src_ip: u32, tcp_data: u64, tcp_len: u32) {
     parse_tcp_options(conn_idx, tcp_data + 20, data_offset - 20)
   }
 
-  // Update window
-  tcp_connections[conn_idx].snd_wnd = window << tcp_connections[conn_idx].snd_scale
+  // Update window (cap scale to 14 per RFC 7323)
+  var scale: u8 = tcp_connections[conn_idx].snd_scale
+  if scale > 14 { scale = 14 }
+  tcp_connections[conn_idx].snd_wnd = window << scale
 
   // Handle RST
   if (flags & TCP_RST) != 0 {
@@ -1058,6 +1187,13 @@ export fn tcp_init() {
     i = i + 1
   }
 
+  // Clear the 5-tuple hash table.
+  i = 0
+  while i < TCP_HASH_SIZE {
+    tcp_conn_hash[i] = 0xFFFFFFFF
+    i = i + 1
+  }
+
   tcp_connection_count = 0
 
   // Initialize stats
@@ -1087,6 +1223,14 @@ export fn tcp_connect(host: u64, port: u16): u32 {
   tcp_connections[conn_idx].remote_ip = gateway_ip  // Simplified: use gateway
   tcp_connections[conn_idx].remote_port = port
 
+  // Register in the 5-tuple hash so RX path can find this connection O(1).
+  tcp_hash_insert(
+    tcp_connections[conn_idx].local_port,
+    tcp_connections[conn_idx].remote_ip,
+    tcp_connections[conn_idx].remote_port,
+    conn_idx
+  )
+
   // Initialize sequence numbers
   tcp_connections[conn_idx].iss = generate_isn()
   tcp_connections[conn_idx].snd_nxt = tcp_connections[conn_idx].iss
@@ -1101,7 +1245,7 @@ export fn tcp_connect(host: u64, port: u16): u32 {
   tcp_connection_count = tcp_connection_count + 1
 
   foundation.serial_write_string("[TCP] Connecting to port ")
-  foundation.serial_write_u32(port)
+  foundation.serial_write_u64(port)
   foundation.serial_write_string("\n")
 
   return conn_idx
@@ -1122,7 +1266,7 @@ export fn tcp_listen(port: u16): u32 {
   tcp_connection_count = tcp_connection_count + 1
 
   foundation.serial_write_string("[TCP] Listening on port ")
-  foundation.serial_write_u32(port)
+  foundation.serial_write_u64(port)
   foundation.serial_write_string("\n")
 
   return conn_idx
@@ -1163,6 +1307,16 @@ export fn tcp_send(conn_id: u32, data: u64, length: u32): u32 {
     if chunk > tcp_connections[conn_id].snd_mss { chunk = tcp_connections[conn_id].snd_mss }
     if chunk > available { chunk = available }
 
+    // RFC 896 (Nagle): if Nagle is enabled and this segment is smaller
+    // than MSS *and* there is already unacked data in flight, buffer
+    // the write instead of sending a tinygram. The next ACK will drain
+    // in_flight to 0 and this loop will re-enter to transmit.
+    if tcp_connections[conn_id].nagle_enabled != 0 {
+      if chunk < tcp_connections[conn_id].snd_mss and in_flight > 0 {
+        break
+      }
+    }
+
     // Send segment
     var seq: u32 = tcp_connections[conn_id].snd_nxt
     send_tcp_segment(conn_id, TCP_ACK | TCP_PSH, data + sent, chunk)
@@ -1194,21 +1348,16 @@ export fn tcp_receive(conn_id: u32, buffer: u64, max_length: u32): u32 {
   var to_copy: u32 = available
   if to_copy > max_length { to_copy = max_length }
 
-  // Copy from receive buffer
-  var src: *u8 = @ptrFromInt(tcp_connections[conn_id].recv_buffer)
-  var dst: *u8 = @ptrFromInt(buffer)
-  var i: u32 = 0
-  while i < to_copy {
-    dst[i] = src[i]
-    i = i + 1
-  }
+  // Copy out via memory.mem_copy (word-sized) instead of a byte loop.
+  var src_base: u64 = tcp_connections[conn_id].recv_buffer
+  memory.mem_copy(buffer, src_base, to_copy)
 
-  // Move remaining data to front of buffer
+  // Shift remaining buffered bytes down to the front. Skipped when the
+  // buffer drained completely, since mem_copy on a zero-length range
+  // still incurs call overhead.
   var remaining: u32 = available - to_copy
-  i = 0
-  while i < remaining {
-    src[i] = src[to_copy + i]
-    i = i + 1
+  if remaining > 0 {
+    memory.mem_copy(src_base, src_base + @as(u64, to_copy), remaining)
   }
 
   tcp_connections[conn_id].recv_buffer_used = remaining
@@ -1303,7 +1452,7 @@ export fn tcp_get_stats(): *TcpStats {
 export fn tcp_print_stats() {
   foundation.serial_write_string("[TCP Stats]\n")
   foundation.serial_write_string("  Active connections: ")
-  foundation.serial_write_u32(tcp_stats.active_connections)
+  foundation.serial_write_u64(tcp_stats.active_connections)
   foundation.serial_write_string("\n  Active opens: ")
   foundation.serial_write_u64(tcp_stats.active_opens)
   foundation.serial_write_string("\n  Passive opens: ")

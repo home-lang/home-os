@@ -636,15 +636,127 @@ pub const ExtentTree = struct {
         release_buffer(old_root_buffer);
     }
 
-    /// Split internal node
+    /// Split internal node when it becomes full.
+    /// Allocates a new block, moves half the indices to it, and inserts
+    /// the new child pointer. Propagates splits upward if the parent is also full.
     fn split_internal_node(self: *ExtentTree, path: *ExtentPath, level: u8, new_child: u64, logical: u64) !void {
-        _ = self;
-        _ = path;
-        _ = level;
-        _ = new_child;
-        _ = logical;
-        // Similar to split_and_insert but for internal nodes
-        // Recursively split up the tree if needed
+        const node_header = path.entries[level].header;
+        const indices = @as([*]ExtentIndex, @ptrCast(@as([*]u8, @ptrCast(node_header)) + @sizeOf(ExtentHeader)));
+
+        // Allocate new block for the right half
+        const new_block = try self.allocator.alloc_block();
+        const new_buffer = try self.read_block(new_block);
+        const new_header = @as(*ExtentHeader, @ptrCast(new_buffer));
+        const new_indices = @as([*]ExtentIndex, @ptrCast(@as([*]u8, @ptrCast(new_header)) + @sizeOf(ExtentHeader)));
+
+        // Split: move right half of indices to new node
+        const total = node_header.entries;
+        const mid = total / 2;
+        const right_count = total - mid;
+
+        // Initialize new node header
+        new_header.magic = node_header.magic;
+        new_header.entries = @intCast(right_count);
+        new_header.max_entries = node_header.max_entries;
+        new_header.depth = node_header.depth;
+        new_header.generation = node_header.generation + 1;
+
+        // Copy right half to new node
+        var i: usize = 0;
+        while (i < right_count) : (i += 1) {
+            new_indices[i] = indices[mid + i];
+        }
+
+        // Truncate old node
+        node_header.entries = @intCast(mid);
+
+        // Insert new_child into the appropriate half
+        if (logical >= new_indices[0].logical) {
+            // Insert into new (right) node
+            var insert_pos: usize = right_count;
+            i = 0;
+            while (i < right_count) : (i += 1) {
+                if (new_indices[i].logical > @as(u32, @intCast(logical))) {
+                    insert_pos = i;
+                    break;
+                }
+            }
+            // Shift entries right to make room
+            var j: usize = right_count;
+            while (j > insert_pos) : (j -= 1) {
+                new_indices[j] = new_indices[j - 1];
+            }
+            new_indices[insert_pos] = ExtentIndex.init(@intCast(logical), new_child);
+            new_header.entries += 1;
+        } else {
+            // Insert into old (left) node
+            var insert_pos: usize = mid;
+            i = 0;
+            while (i < mid) : (i += 1) {
+                if (indices[i].logical > @as(u32, @intCast(logical))) {
+                    insert_pos = i;
+                    break;
+                }
+            }
+            var j: usize = mid;
+            while (j > insert_pos) : (j -= 1) {
+                indices[j] = indices[j - 1];
+            }
+            indices[insert_pos] = ExtentIndex.init(@intCast(logical), new_child);
+            node_header.entries += 1;
+        }
+
+        // Mark both nodes dirty
+        self.mark_dirty(path.entries[level].block);
+        self.mark_dirty(new_block);
+
+        // Propagate split upward: insert new_block into parent
+        if (level > 0) {
+            const parent_header = path.entries[level - 1].header;
+            if (parent_header.entries >= parent_header.max_entries) {
+                // Parent is full too — recursively split
+                try self.split_internal_node(path, level - 1, new_block, new_indices[0].logical);
+            } else {
+                // Parent has room — insert directly
+                const parent_indices = @as([*]ExtentIndex, @ptrCast(@as([*]u8, @ptrCast(parent_header)) + @sizeOf(ExtentHeader)));
+                const parent_count = parent_header.entries;
+                var insert_pos: usize = parent_count;
+                i = 0;
+                while (i < parent_count) : (i += 1) {
+                    if (parent_indices[i].logical > new_indices[0].logical) {
+                        insert_pos = i;
+                        break;
+                    }
+                }
+                var j: usize = parent_count;
+                while (j > insert_pos) : (j -= 1) {
+                    parent_indices[j] = parent_indices[j - 1];
+                }
+                parent_indices[insert_pos] = ExtentIndex.init(new_indices[0].logical, new_block);
+                parent_header.entries += 1;
+                self.mark_dirty(path.entries[level - 1].block);
+            }
+        } else {
+            // Splitting the root — create a new root
+            const new_root_block = try self.allocator.alloc_block();
+            const new_root_buffer = try self.read_block(new_root_block);
+            const root_header = @as(*ExtentHeader, @ptrCast(new_root_buffer));
+            const root_indices = @as([*]ExtentIndex, @ptrCast(@as([*]u8, @ptrCast(root_header)) + @sizeOf(ExtentHeader)));
+
+            root_header.magic = node_header.magic;
+            root_header.entries = 2;
+            root_header.max_entries = node_header.max_entries;
+            root_header.depth = node_header.depth + 1;
+            root_header.generation = node_header.generation + 1;
+
+            root_indices[0] = ExtentIndex.init(indices[0].logical, path.entries[level].block);
+            root_indices[1] = ExtentIndex.init(new_indices[0].logical, new_block);
+
+            self.root_block = new_root_block;
+            self.mark_dirty(new_root_block);
+        }
+
+        release_buffer(new_buffer);
     }
 
     /// Remove extent from tree

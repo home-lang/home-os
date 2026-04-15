@@ -11,11 +11,12 @@ const MAX_QUEUE_SIZE: u32 = 16384
 const MAX_STACK_SIZE: u32 = 8192
 const MAX_HASH_TABLE_SIZE: u32 = 65536
 const CACHE_LINE_SIZE: u32 = 64
+const MAX_CAS_RETRIES: u32 = 100000
 
 // ABA problem prevention using tagged pointers
 // Upper 16 bits = tag/version, lower 48 bits = pointer
 fn make_tagged_ptr(ptr: u64, tag: u16): u64 {
-  return (tag << 48) | (ptr & 0x0000FFFFFFFFFFFF)
+  return (@as(u64, tag) << 48) | (ptr & 0x0000FFFFFFFFFFFF)
 }
 
 fn get_ptr_from_tagged(tagged: u64): u64 {
@@ -117,6 +118,7 @@ export fn lockfree_queue_init(queue: u64) {
 
   // Allocate dummy node
   var dummy_node: u64 = memory.kmalloc(@sizeOf(QueueNode))
+  if dummy_node == 0 { return }
   var dummy: *QueueNode = @ptrFromInt(dummy_node)
   dummy.data = 0
   dummy.next = 0
@@ -137,13 +139,14 @@ export fn lockfree_queue_enqueue(queue: u64, data: u64): u32 {
 
   // Allocate new node
   var new_node_addr: u64 = memory.kmalloc(@sizeOf(QueueNode))
+  if new_node_addr == 0 { return 1 }
   var new_node: *QueueNode = @ptrFromInt(new_node_addr)
   new_node.data = data
   new_node.next = 0
 
   var retries: u32 = 0
 
-  while 1 {
+  while retries < MAX_CAS_RETRIES {
     var tail_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(q.tail)))
     var tail_ptr: u64 = get_ptr_from_tagged(tail_tagged)
     var tail_tag: u16 = get_tag_from_tagged(tail_tagged)
@@ -178,7 +181,9 @@ export fn lockfree_queue_enqueue(queue: u64, data: u64): u32 {
     }
   }
 
-  return 0
+  // Exceeded retry limit — free the node we allocated
+  memory.kfree(new_node_addr)
+  return 1
 }
 
 // Dequeue element (lock-free)
@@ -186,7 +191,7 @@ export fn lockfree_queue_dequeue(queue: u64, data_out: u64): u32 {
   var q: *LockFreeQueue = @ptrFromInt(queue)
   var retries: u32 = 0
 
-  while 1 {
+  while retries < MAX_CAS_RETRIES {
     var head_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(q.head)))
     var tail_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(q.tail)))
 
@@ -284,12 +289,13 @@ export fn lockfree_stack_push(stack: u64, data: u64): u32 {
 
   // Allocate new node
   var new_node_addr: u64 = memory.kmalloc(@sizeOf(StackNode))
+  if new_node_addr == 0 { return 1 }
   var new_node: *StackNode = @ptrFromInt(new_node_addr)
   new_node.data = data
 
   var retries: u32 = 0
 
-  while 1 {
+  while retries < MAX_CAS_RETRIES {
     var top_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(s.top)))
     var top_tag: u16 = get_tag_from_tagged(top_tagged)
 
@@ -308,7 +314,9 @@ export fn lockfree_stack_push(stack: u64, data: u64): u32 {
     }
   }
 
-  return 0
+  // Exceeded retry limit — free the node we allocated
+  memory.kfree(new_node_addr)
+  return 1
 }
 
 // Pop element (lock-free)
@@ -316,7 +324,7 @@ export fn lockfree_stack_pop(stack: u64, data_out: u64): u32 {
   var s: *LockFreeStack = @ptrFromInt(stack)
   var retries: u32 = 0
 
-  while 1 {
+  while retries < MAX_CAS_RETRIES {
     var top_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(s.top)))
     var top_ptr: u64 = get_ptr_from_tagged(top_tagged)
 
@@ -401,6 +409,7 @@ export fn lockfree_hashtable_init(table: u64, num_buckets: u32) {
   // Allocate buckets
   var buckets_size: u64 = num_buckets * @sizeOf(HashBucket)
   var buckets_addr: u64 = memory.kmalloc(buckets_size)
+  if buckets_addr == 0 { return }
 
   // Initialize all buckets
   var i: u32 = 0
@@ -427,11 +436,13 @@ export fn lockfree_hashtable_insert(table: u64, key: u64, value: u64): u32 {
 
   // Allocate new node
   var new_node_addr: u64 = memory.kmalloc(@sizeOf(HashNode))
+  if new_node_addr == 0 { return 1 }
   var new_node: *HashNode = @ptrFromInt(new_node_addr)
   new_node.key = key
   new_node.value = value
 
-  while 1 {
+  var retries: u32 = 0
+  while retries < MAX_CAS_RETRIES {
     var head_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(bucket.head)))
     var head_ptr: u64 = get_ptr_from_tagged(head_tagged)
     var head_tag: u16 = get_tag_from_tagged(head_tagged)
@@ -461,9 +472,12 @@ export fn lockfree_hashtable_insert(table: u64, key: u64, value: u64): u32 {
       }
       return 0
     }
+    retries = retries + 1
   }
 
-  return 0
+  // Exceeded retry limit — free the node we allocated
+  memory.kfree(new_node_addr)
+  return 1
 }
 
 // Lookup value by key (lock-free)
@@ -497,7 +511,8 @@ export fn lockfree_hashtable_remove(table: u64, key: u64): u32 {
   var bucket_idx: u32 = hash_function(key, ht.num_buckets)
   var bucket: *HashBucket = @ptrFromInt(ht.buckets + (bucket_idx * @sizeOf(HashBucket)))
 
-  while 1 {
+  var retries: u32 = 0
+  while retries < MAX_CAS_RETRIES {
     var head_tagged: u64 = atomic_load_64(@ptrFromInt(@addrOf(bucket.head)))
     var head_ptr: u64 = get_ptr_from_tagged(head_tagged)
     var head_tag: u16 = get_tag_from_tagged(head_tagged)
@@ -545,6 +560,7 @@ export fn lockfree_hashtable_remove(table: u64, key: u64): u32 {
 
       return 1  // Key not found
     }
+    retries = retries + 1
   }
 
   return 1

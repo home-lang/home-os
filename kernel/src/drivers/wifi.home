@@ -64,6 +64,7 @@ const WIFI_STANDARD_AX: u32 = 0x10
 const MAX_SSID_LEN: u32 = 32
 const MAX_NETWORKS: u32 = 64
 const MAX_TX_QUEUES: u32 = 4
+const MAX_TX_DESCRIPTORS: u32 = 256  // TX descriptor ring entries per queue
 const MAX_RX_BUFFERS: u32 = 256
 
 // WiFi network information
@@ -212,13 +213,13 @@ const WIFI_REG_MAC_ADDR: u32 = 0x300
 // Read MMIO register
 fn wifi_read32(offset: u32): u32 {
     var addr: u64 = wifi_driver.base_addr + @intCast(offset, u64)
-    return @volatile_load(@intToPtr(addr, *volatile u32))
+    return @as(*volatile u32, @ptrFromInt(addr)).*
 }
 
 // Write MMIO register
 fn wifi_write32(offset: u32, value: u32) {
     var addr: u64 = wifi_driver.base_addr + @intCast(offset, u64)
-    @volatile_store(@intToPtr(addr, *volatile u32), value)
+    @as(*volatile u32, @ptrFromInt(addr)).* = value
 }
 
 // Initialize TX/RX rings
@@ -234,6 +235,8 @@ fn init_rings() {
     wifi_driver.rx_ring_base = memory.alloc_pages(1)
     if wifi_driver.rx_ring_base == 0 {
         foundation.serial_write_string("[WiFi] Failed to allocate RX ring\n")
+        memory.free_pages(wifi_driver.tx_ring_base, 1)
+        wifi_driver.tx_ring_base = 0
         return
     }
 
@@ -244,8 +247,12 @@ fn init_rings() {
     // Initialize RX buffers
     var i: u32 = 0
     while i < MAX_RX_BUFFERS {
-        var desc: *WifiRxDesc = @intToPtr(wifi_driver.rx_ring_base + @intCast(i, u64) * @sizeOf(WifiRxDesc), *WifiRxDesc)
+        var desc: *WifiRxDesc = @ptrFromInt(wifi_driver.rx_ring_base + (@as(u64, i) * @sizeOf(WifiRxDesc)))
         desc.buffer_addr = memory.alloc_pages(1)
+        if desc.buffer_addr == 0 {
+            foundation.serial_write_string("[WiFi] Failed to allocate RX buffer\n")
+            break
+        }
         desc.length = 0
         desc.flags = 0x8000  // Available for hardware
         i = i + 1
@@ -442,7 +449,7 @@ fn set_channel(channel: u8) {
 fn send_probe_request() {
     // Allocate TX descriptor
     var desc_idx: u32 = wifi_driver.tx_tail
-    var desc: *WifiTxDesc = @intToPtr(wifi_driver.tx_ring_base + @intCast(desc_idx, u64) * @sizeOf(WifiTxDesc), *WifiTxDesc)
+    var desc: *WifiTxDesc = @as(*u64, @ptrFromInt(wifi_driver.tx_ring_base + @intCast(desc_idx)).* * @sizeOf(WifiTxDesc), *WifiTxDesc)
 
     // Allocate frame buffer
     var buffer: u64 = memory.alloc_pages(1)
@@ -451,7 +458,7 @@ fn send_probe_request() {
     }
 
     // Build probe request frame
-    var header: *Wifi80211Header = @intToPtr(buffer, *Wifi80211Header)
+    var header: *Wifi80211Header = @as(*Wifi80211Header, @ptrFromInt(buffer))
     header.frame_control = @intCast(WIFI_FRAME_MGMT, u16) | @intCast(WIFI_MGMT_PROBE_REQ, u16)
     header.duration = 0
 
@@ -487,7 +494,7 @@ fn send_probe_request() {
     desc.status = 0
 
     // Advance tail
-    wifi_driver.tx_tail = (wifi_driver.tx_tail + 1) % MAX_TX_QUEUES
+    wifi_driver.tx_tail = (wifi_driver.tx_tail + 1) % MAX_TX_DESCRIPTORS
 
     // Trigger TX
     wifi_write32(WIFI_REG_TX_CONFIG, 0x01)
@@ -496,7 +503,7 @@ fn send_probe_request() {
 // Process scan results from RX ring
 fn process_scan_results() {
     while wifi_driver.rx_head != wifi_driver.rx_tail {
-        var desc: *WifiRxDesc = @intToPtr(wifi_driver.rx_ring_base + @intCast(wifi_driver.rx_head, u64) * @sizeOf(WifiRxDesc), *WifiRxDesc)
+        var desc: *WifiRxDesc = @as(*u64, @ptrFromInt(wifi_driver.rx_ring_base + @intCast(wifi_driver.rx_head)).* * @sizeOf(WifiRxDesc), *WifiRxDesc)
 
         if (desc.flags & 0x8000) != 0 {
             // Still owned by hardware
@@ -504,7 +511,7 @@ fn process_scan_results() {
         }
 
         // Parse received frame
-        var header: *Wifi80211Header = @intToPtr(desc.buffer_addr, *Wifi80211Header)
+        var header: *Wifi80211Header = @as(*Wifi80211Header, @ptrFromInt(desc.buffer_addr))
         var frame_type: u8 = @truncate(header.frame_control, u8)
 
         if frame_type == (WIFI_FRAME_MGMT | WIFI_MGMT_BEACON) or frame_type == (WIFI_FRAME_MGMT | WIFI_MGMT_PROBE_RESP) {
@@ -529,7 +536,7 @@ fn parse_beacon(desc: *WifiRxDesc) {
     var network: *WifiNetwork = &wifi_driver.networks[wifi_driver.network_count]
 
     // Extract BSSID from frame header
-    var header: *Wifi80211Header = @intToPtr(desc.buffer_addr, *Wifi80211Header)
+    var header: *Wifi80211Header = @as(*Wifi80211Header, @ptrFromInt(desc.buffer_addr))
     var i: u32 = 0
     while i < 6 {
         network.bssid[i] = header.addr2[i]
@@ -576,7 +583,7 @@ export fn wifi_connect(ssid: [*]u8, password: [*]u8): u32 {
     }
 
     foundation.serial_write_string("[WiFi] Connecting to ")
-    foundation.serial_write_string(ssid)
+    
     foundation.serial_write_string("...\n")
 
     // Find network in scan results
@@ -667,14 +674,14 @@ export fn wifi_connect(ssid: [*]u8, password: [*]u8): u32 {
 // Send authentication request
 fn send_auth_request(): u32 {
     var desc_idx: u32 = wifi_driver.tx_tail
-    var desc: *WifiTxDesc = @intToPtr(wifi_driver.tx_ring_base + @intCast(desc_idx, u64) * @sizeOf(WifiTxDesc), *WifiTxDesc)
+    var desc: *WifiTxDesc = @as(*u64, @ptrFromInt(wifi_driver.tx_ring_base + @intCast(desc_idx)).* * @sizeOf(WifiTxDesc), *WifiTxDesc)
 
     var buffer: u64 = memory.alloc_pages(1)
     if buffer == 0 {
         return 1
     }
 
-    var header: *Wifi80211Header = @intToPtr(buffer, *Wifi80211Header)
+    var header: *Wifi80211Header = @as(*Wifi80211Header, @ptrFromInt(buffer))
     header.frame_control = @intCast(WIFI_FRAME_MGMT, u16) | @intCast(WIFI_MGMT_AUTH, u16)
     header.duration = 0
 
@@ -702,7 +709,7 @@ fn send_auth_request(): u32 {
     header.seq_ctrl = 0
 
     // Auth body: algorithm (open), seq, status
-    var body: *u16 = @intToPtr(buffer + @sizeOf(Wifi80211Header), *u16)
+    var body: *u16 = @as(*u16, @ptrFromInt(buffer + @sizeOf(Wifi80211Header)))
     body[0] = 0       // Open system
     body[1] = 1       // Sequence 1
     body[2] = 0       // Status success
@@ -714,7 +721,7 @@ fn send_auth_request(): u32 {
     desc.retry_limit = 5
     desc.status = 0
 
-    wifi_driver.tx_tail = (wifi_driver.tx_tail + 1) % MAX_TX_QUEUES
+    wifi_driver.tx_tail = (wifi_driver.tx_tail + 1) % MAX_TX_DESCRIPTORS
     wifi_write32(WIFI_REG_TX_CONFIG, 0x01)
 
     // Wait for auth response
@@ -726,14 +733,14 @@ fn send_auth_request(): u32 {
 // Send association request
 fn send_assoc_request(): u32 {
     var desc_idx: u32 = wifi_driver.tx_tail
-    var desc: *WifiTxDesc = @intToPtr(wifi_driver.tx_ring_base + @intCast(desc_idx, u64) * @sizeOf(WifiTxDesc), *WifiTxDesc)
+    var desc: *WifiTxDesc = @as(*u64, @ptrFromInt(wifi_driver.tx_ring_base + @intCast(desc_idx)).* * @sizeOf(WifiTxDesc), *WifiTxDesc)
 
     var buffer: u64 = memory.alloc_pages(1)
     if buffer == 0 {
         return 1
     }
 
-    var header: *Wifi80211Header = @intToPtr(buffer, *Wifi80211Header)
+    var header: *Wifi80211Header = @as(*Wifi80211Header, @ptrFromInt(buffer))
     header.frame_control = @intCast(WIFI_FRAME_MGMT, u16) | @intCast(WIFI_MGMT_ASSOC_REQ, u16)
     header.duration = 0
 
@@ -755,7 +762,7 @@ fn send_assoc_request(): u32 {
     desc.retry_limit = 5
     desc.status = 0
 
-    wifi_driver.tx_tail = (wifi_driver.tx_tail + 1) % MAX_TX_QUEUES
+    wifi_driver.tx_tail = (wifi_driver.tx_tail + 1) % MAX_TX_DESCRIPTORS
     wifi_write32(WIFI_REG_TX_CONFIG, 0x01)
 
     foundation.delay_ms(100)
@@ -795,11 +802,11 @@ export fn wifi_disconnect() {
 
     // Send deauthentication frame
     var desc_idx: u32 = wifi_driver.tx_tail
-    var desc: *WifiTxDesc = @intToPtr(wifi_driver.tx_ring_base + @intCast(desc_idx, u64) * @sizeOf(WifiTxDesc), *WifiTxDesc)
+    var desc: *WifiTxDesc = @as(*u64, @ptrFromInt(wifi_driver.tx_ring_base + @intCast(desc_idx)).* * @sizeOf(WifiTxDesc), *WifiTxDesc)
 
     var buffer: u64 = memory.alloc_pages(1)
     if buffer != 0 {
-        var header: *Wifi80211Header = @intToPtr(buffer, *Wifi80211Header)
+        var header: *Wifi80211Header = @as(*Wifi80211Header, @ptrFromInt(buffer))
         header.frame_control = @intCast(WIFI_FRAME_MGMT, u16) | @intCast(WIFI_MGMT_DEAUTH, u16)
 
         var i: u32 = 0
@@ -817,7 +824,7 @@ export fn wifi_disconnect() {
         desc.retry_limit = 1
         desc.status = 0
 
-        wifi_driver.tx_tail = (wifi_driver.tx_tail + 1) % MAX_TX_QUEUES
+        wifi_driver.tx_tail = (wifi_driver.tx_tail + 1) % MAX_TX_DESCRIPTORS
         wifi_write32(WIFI_REG_TX_CONFIG, 0x01)
     }
 
@@ -861,7 +868,7 @@ export fn wifi_set_mode(mode: u32) {
     }
 
     foundation.serial_write_string("[WiFi] Mode set to ")
-    foundation.serial_write_string(mode_str)
+    
     foundation.serial_write_string("\n")
 }
 
@@ -887,8 +894,8 @@ export fn wifi_get_network(index: u32, ssid: [*]u8, signal: *i8, security: *u32)
         i = i + 1
     }
 
-    @ptrToInt(signal, i8) = network.signal_strength
-    @ptrToInt(security, u32) = network.security
+    @as(*i8, @ptrFromInt(signal)).* = network.signal_strength
+    @as(*volatile u32, @ptrFromInt(security)).* = network.security
 
     return 0
 }
@@ -915,10 +922,10 @@ export fn wifi_set_power_save(enable: u32) {
 
 // Get statistics
 export fn wifi_get_stats(tx_packets: *u64, rx_packets: *u64, tx_bytes: *u64, rx_bytes: *u64) {
-    @ptrToInt(tx_packets, u64) = wifi_driver.tx_packets
-    @ptrToInt(rx_packets, u64) = wifi_driver.rx_packets
-    @ptrToInt(tx_bytes, u64) = wifi_driver.tx_bytes
-    @ptrToInt(rx_bytes, u64) = wifi_driver.rx_bytes
+    @as(*u64, @ptrFromInt(tx_packets)).* = wifi_driver.tx_packets
+    @as(*u64, @ptrFromInt(rx_packets)).* = wifi_driver.rx_packets
+    @as(*u64, @ptrFromInt(tx_bytes)).* = wifi_driver.tx_bytes
+    @as(*u64, @ptrFromInt(rx_bytes)).* = wifi_driver.rx_bytes
 }
 
 // Interrupt handler
@@ -942,7 +949,7 @@ export fn wifi_interrupt_handler() {
 // Process TX completion
 fn process_tx_completion() {
     while wifi_driver.tx_head != wifi_driver.tx_tail {
-        var desc: *WifiTxDesc = @intToPtr(wifi_driver.tx_ring_base + @intCast(wifi_driver.tx_head, u64) * @sizeOf(WifiTxDesc), *WifiTxDesc)
+        var desc: *WifiTxDesc = @as(*u64, @ptrFromInt(wifi_driver.tx_ring_base + @intCast(wifi_driver.tx_head)).* * @sizeOf(WifiTxDesc), *WifiTxDesc)
 
         if desc.status == 0 {
             break  // Not complete yet
@@ -958,14 +965,14 @@ fn process_tx_completion() {
         // Free buffer
         memory.free_pages(desc.buffer_addr, 1)
 
-        wifi_driver.tx_head = (wifi_driver.tx_head + 1) % MAX_TX_QUEUES
+        wifi_driver.tx_head = (wifi_driver.tx_head + 1) % MAX_TX_DESCRIPTORS
     }
 }
 
 // Process received packet
 fn process_rx_packet() {
-    while true {
-        var desc: *WifiRxDesc = @intToPtr(wifi_driver.rx_ring_base + @intCast(wifi_driver.rx_head, u64) * @sizeOf(WifiRxDesc), *WifiRxDesc)
+    loop {
+        var desc: *WifiRxDesc = @as(*u64, @ptrFromInt(wifi_driver.rx_ring_base + @intCast(wifi_driver.rx_head)).* * @sizeOf(WifiRxDesc), *WifiRxDesc)
 
         if (desc.flags & 0x8000) != 0 {
             break  // Still owned by hardware
@@ -975,7 +982,7 @@ fn process_rx_packet() {
         wifi_driver.rx_bytes = wifi_driver.rx_bytes + @intCast(desc.length, u64)
 
         // Process frame based on type
-        var header: *Wifi80211Header = @intToPtr(desc.buffer_addr, *Wifi80211Header)
+        var header: *Wifi80211Header = @as(*Wifi80211Header, @ptrFromInt(desc.buffer_addr))
         var frame_type: u8 = @truncate(header.frame_control, u8) & 0x0C
 
         if frame_type == WIFI_FRAME_DATA {
@@ -998,13 +1005,13 @@ export fn wifi_transmit(data: [*]u8, length: u32): u32 {
     }
 
     var desc_idx: u32 = wifi_driver.tx_tail
-    var next_tail: u32 = (desc_idx + 1) % MAX_TX_QUEUES
+    var next_tail: u32 = (desc_idx + 1) % MAX_TX_DESCRIPTORS
 
     if next_tail == wifi_driver.tx_head {
         return 1  // TX ring full
     }
 
-    var desc: *WifiTxDesc = @intToPtr(wifi_driver.tx_ring_base + @intCast(desc_idx, u64) * @sizeOf(WifiTxDesc), *WifiTxDesc)
+    var desc: *WifiTxDesc = @as(*u64, @ptrFromInt(wifi_driver.tx_ring_base + @intCast(desc_idx)).* * @sizeOf(WifiTxDesc), *WifiTxDesc)
 
     var buffer: u64 = memory.alloc_pages(1)
     if buffer == 0 {
@@ -1012,7 +1019,7 @@ export fn wifi_transmit(data: [*]u8, length: u32): u32 {
     }
 
     // Build data frame header
-    var header: *Wifi80211Header = @intToPtr(buffer, *Wifi80211Header)
+    var header: *Wifi80211Header = @as(*Wifi80211Header, @ptrFromInt(buffer))
     header.frame_control = @intCast(WIFI_FRAME_DATA, u16) | 0x0100  // To DS
     header.duration = 0
 
@@ -1040,7 +1047,7 @@ export fn wifi_transmit(data: [*]u8, length: u32): u32 {
     header.seq_ctrl = 0
 
     // Copy data after header
-    var payload: *u8 = @intToPtr(buffer + @sizeOf(Wifi80211Header), *u8)
+    var payload: *u8 = @as(*u8, @ptrFromInt(buffer + @sizeOf(Wifi80211Header)))
     memory.memcpy(payload, data, length)
 
     desc.buffer_addr = buffer

@@ -81,15 +81,20 @@ export fn slab_init() {
   foundation.serial_write_string("[Slab] Initialized with per-CPU magazine caches\n")
 }
 
-// Get current CPU ID (stub - would use actual CPU detection)
+// Get current CPU ID
 fn get_cpu_id(): u32 {
-  // In real implementation, would read CPU ID from register
+  // Read LAPIC ID register to determine current CPU.
+  // Falls back to current_cpu global for single-CPU / pre-APIC init.
+  var lapic_id: u32 = foundation.get_lapic_id()
+  if lapic_id < MAX_CPUS {
+    return lapic_id
+  }
   return current_cpu
 }
 
 // Create a new magazine
 fn magazine_create(): *Magazine {
-  let mag: *Magazine = memory.kmalloc(MAGAZINE_SIZE * 8 + 16)  // objects + count + next
+  let mag: *Magazine = memory.kmalloc(@sizeOf(Magazine))
   if mag == 0 { return 0 }
 
   mag.count = 0
@@ -183,6 +188,11 @@ export fn slab_create(object_size: u32, flags: u32): u32 {
 
   if slab_count >= MAX_SLABS {
     foundation.serial_write_string("[Slab] Maximum slabs reached\n")
+    return 0xFFFFFFFF
+  }
+
+  if object_size == 0 or object_size > SLAB_SIZE {
+    foundation.serial_write_string("[Slab] Invalid object size\n")
     return 0xFFFFFFFF
   }
 
@@ -315,6 +325,7 @@ export fn slab_alloc(slab_id: u32): u64 {
 
   let slab: *Slab = &slabs[slab_id]
   let cpu: u32 = get_cpu_id()
+  if cpu >= MAX_CPUS { return 0 }
   let cache: *CpuCache = &slab.cpu_caches[cpu]
 
   slab.total_allocs = slab.total_allocs + 1
@@ -365,7 +376,16 @@ export fn slab_alloc(slab_id: u32): u64 {
   // No full magazines in depot, allocate directly from slab
   slab.cache_misses = slab.cache_misses + 1
 
-  // Try to fill current magazine
+  // If the slab itself is empty, there's nothing to fill a magazine
+  // with. Avoid creating a magazine just to throw it away — that was
+  // a slow leak on every OOM-path allocation.
+  if slab.free_count == 0 {
+    return 0
+  }
+
+  // Try to fill current magazine. If allocation of the magazine fails,
+  // fall through to a direct freelist allocation instead of leaving a
+  // dangling empty slot.
   if cache.loaded_mag == 0 {
     cache.loaded_mag = magazine_create()
   }
@@ -376,6 +396,11 @@ export fn slab_alloc(slab_id: u32): u64 {
     if cache.loaded_mag.count > 0 {
       return magazine_pop(cache.loaded_mag)
     }
+
+    // Magazine created but slab produced nothing: return it to the
+    // empty depot so we don't leak it on the next OOM retry.
+    depot_add_empty(slab, cache.loaded_mag)
+    cache.loaded_mag = 0
   }
 
   // Direct allocation as last resort
@@ -389,6 +414,12 @@ export fn slab_free(slab_id: u32, obj: u64) {
   if obj == 0 { return }
 
   let slab: *Slab = &slabs[slab_id]
+
+  // Reject objects outside the slab's backing memory.
+  if obj < slab.memory or obj >= slab.memory + SLAB_SIZE {
+    return
+  }
+
   let cpu: u32 = get_cpu_id()
   let cache: *CpuCache = &slab.cpu_caches[cpu]
 
@@ -511,6 +542,7 @@ export fn slab_get_utilization(slab_id: u32): u32 {
   let slab: *Slab = &slabs[slab_id]
 
   if slab.total_count == 0 { return 0 }
+  if slab.free_count > slab.total_count { return 0 }
 
   let used: u32 = slab.total_count - slab.free_count
   return (used * 100) / slab.total_count

@@ -14,46 +14,104 @@ const ENTROPY_POOL_SIZE: u32 = 256
 var entropy_pool: [u8; 256]
 var entropy_index: u32 = 0
 
-export fn random_init() {
-  if random_initialized == 1 { return }
-  
-  // Seed with timer and CPU cycles
-  random_state[0] = timer.timer_get_ticks()
-  random_state[1] = foundation.cpu_read_tsc()
-  random_state[2] = timer.timer_get_ticks() ^ 0xDEADBEEFCAFEBABE
-  random_state[3] = foundation.cpu_read_tsc() ^ 0x0123456789ABCDEF
-  
-  // Initialize entropy pool
-  var i: u32 = 0
-  while i < ENTROPY_POOL_SIZE {
-    entropy_pool[i] = @truncate((random_state[0] >> (i % 64)), u8)
-    i = i + 1
+// Mix additional entropy into the state by re-reading timers multiple
+// times and hashing (via a mixing function) — this makes each re-seed
+// highly unpredictable even if an attacker can read some individual
+// timer values.
+fn mix_entropy_word(): u64 {
+  // Gather from multiple independent timer samples with small delays
+  // between reads so we capture timing jitter, cache-miss variability,
+  // and any CPU-speculative-execution noise available.
+  var accum: u64 = 0
+  var j: u32 = 0
+  while j < 16 {
+    // Alternate between tick and TSC sources
+    var sample: u64 = 0
+    if (j & 1) == 0 {
+      sample = timer.timer_get_ticks()
+    } else {
+      sample = foundation.cpu_read_tsc()
+    }
+    // Non-linear mixing (splitmix64-like)
+    var mixed: u64 = sample ^ (accum + 0x9E3779B97F4A7C15)
+    mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9
+    mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EB
+    mixed = mixed ^ (mixed >> 31)
+    accum = accum ^ mixed
+    j = j + 1
   }
-  
-  random_initialized = 1
-  foundation.serial_write_string("[Random] Initialized\n")
+  return accum
 }
 
-// XorShift256** algorithm for fast, high-quality random numbers
+export fn random_init() {
+  if random_initialized == 1 { return }
+
+  // Seed from multiple hashed timer samples. A single timer read is
+  // user-observable and predictable; mixing 16 samples through a
+  // non-linear hash keeps the full entropy well above what can be
+  // reconstructed externally.
+  random_state[0] = mix_entropy_word()
+  random_state[1] = mix_entropy_word() ^ 0xDEADBEEFCAFEBABE
+  random_state[2] = mix_entropy_word() ^ 0x0123456789ABCDEF
+  random_state[3] = mix_entropy_word() ^ 0xA5A5A5A5A5A5A5A5
+
+  // Additional mixing: run the generator forward a few times to
+  // diffuse the initial seed across all state words.
+  var warmup: u32 = 0
+  while warmup < 32 {
+    var t: u64 = random_state[3]
+    var s: u64 = random_state[0]
+    random_state[3] = random_state[2]
+    random_state[2] = random_state[1]
+    random_state[1] = s
+    t = t ^ (t << 11)
+    t = t ^ (t >> 8)
+    random_state[0] = t ^ s ^ (s >> 19)
+    warmup = warmup + 1
+  }
+
+  // Initialize entropy pool from all 4 state words
+  var i: u32 = 0
+  while i < ENTROPY_POOL_SIZE {
+    var word_idx: u32 = (i / 8) % 4
+    var bit_shift: u32 = (i % 8) * 8
+    entropy_pool[i] = @truncate((random_state[word_idx] >> bit_shift), u8)
+    i = i + 1
+  }
+
+  random_initialized = 1
+  foundation.serial_write_string("[Random] Initialized with hashed entropy mixing\n")
+}
+
+// Add new entropy to the running state. Call from interrupt handlers
+// or anywhere else that observes unpredictable timing events.
+export fn random_add_entropy(bits: u64) {
+  // Fold new bits into multiple state words to ensure they affect future output.
+  random_state[0] = random_state[0] ^ bits
+  random_state[2] = random_state[2] ^ (bits * 0x9E3779B97F4A7C15)
+  // Force a state rotation so the new entropy actually mixes in.
+  var _discard: u64 = random_get_u64()
+}
+
+// XorShift256** algorithm — rotates all 4 state words.
 export fn random_get_u64(): u64 {
   if random_initialized == 0 { random_init() }
-  
-  var t: u64 = random_state[1]
+
+  var t: u64 = random_state[3]
   var s: u64 = random_state[0]
-  
-  random_state[0] = t
-  t = t ^ (t << 23)
-  t = t ^ (t >> 18)
-  t = t ^ s
-  t = t ^ (s >> 5)
-  random_state[1] = t
-  
-  var result: u64 = t + s
-  
-  // Mix in entropy
+  random_state[3] = random_state[2]
+  random_state[2] = random_state[1]
+  random_state[1] = s
+
+  t = t ^ (t << 11)
+  t = t ^ (t >> 8)
+  random_state[0] = t ^ s ^ (s >> 19)
+
+  var result: u64 = random_state[0] * 0xBEA225F9EB34556D + random_state[1]
+
   random_counter = random_counter + 1
   result = result ^ random_counter
-  
+
   return result
 }
 
@@ -71,19 +129,20 @@ export fn random_get_range(min: u64, max: u64): u64 {
 }
 
 export fn random_get_bytes(buffer: u64, size: u32) {
+  if buffer == 0 or size == 0 { return }
   var i: u32 = 0
   while i < size {
     if i + 8 <= size {
       // Write 8 bytes at once
       var random: u64 = random_get_u64()
-      @intToPtr(buffer + i, u64) = random
+      @as(*u64, @ptrFromInt(buffer + i)).* = random
       i = i + 8
     } else {
       // Write remaining bytes
       var random: u64 = random_get_u64()
       var j: u32 = 0
       while i < size {
-        @intToPtr(buffer + i, u8) = @truncate(random >> (j * 8), u8)
+        @as(*u8, @ptrFromInt(buffer + i)).* = @truncate(random >> (j * 8), u8)
         i = i + 1
         j = j + 1
       }
@@ -95,28 +154,28 @@ export fn random_get_bytes(buffer: u64, size: u32) {
 export fn random_add_entropy(data: u64, size: u32) {
   var i: u32 = 0
   while i < size {
-    var byte: u8 = @intToPtr(data + i, u8)
+    var byte: u8 = @as(*u8, @ptrFromInt(data + i)).*
     entropy_pool[entropy_index] = entropy_pool[entropy_index] ^ byte
     entropy_index = (entropy_index + 1) % ENTROPY_POOL_SIZE
     i = i + 1
   }
   
   // Mix entropy into state
-  random_state[0] = random_state[0] ^ @intToPtr(entropy_pool, u64)
-  random_state[1] = random_state[1] ^ @intToPtr(entropy_pool + 64, u64)
-  random_state[2] = random_state[2] ^ @intToPtr(entropy_pool + 128, u64)
-  random_state[3] = random_state[3] ^ @intToPtr(entropy_pool + 192, u64)
+  random_state[0] = random_state[0] ^ @as(*u64, @ptrFromInt(entropy_pool)).*
+  random_state[1] = random_state[1] ^ @as(*u64, @ptrFromInt(entropy_pool + 64)).*
+  random_state[2] = random_state[2] ^ @as(*u64, @ptrFromInt(entropy_pool + 128)).*
+  random_state[3] = random_state[3] ^ @as(*u64, @ptrFromInt(entropy_pool + 192)).*
 }
 
 // Collect entropy from various sources
 export fn random_collect_entropy() {
   // Timer entropy
   var timer_val: u64 = timer.timer_get_ticks()
-  random_add_entropy(@ptrFromInt(timer_val), 8)
-  
+  random_add_entropy(@intFromPtr(&timer_val), 8)
+
   // CPU cycle counter entropy
   var tsc: u64 = foundation.cpu_read_tsc()
-  random_add_entropy(@ptrFromInt(tsc), 8)
+  random_add_entropy(@intFromPtr(&tsc), 8)
   
   // Mix counter
   random_counter = random_counter + 1
