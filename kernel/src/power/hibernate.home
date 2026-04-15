@@ -112,10 +112,15 @@ export fn hibernate_init(): void {
     hib_ctx.state = HIB_IDLE
 }
 
-// Set swap device for hibernate
+// Reserve metadata headroom in addition to RAM size so
+// write_hibernate_image can never exceed the swap area.
+// FIX R5 #30.
+const HIBERNATE_METADATA_HEADROOM: u64 = 256 * 1024 * 1024
+
+// Set swap device for hibernate.
 export fn hibernate_set_swap(device: u32, offset: u64, size: u64): bool {
-    if size < kernel.get_total_memory() {
-        // Swap too small for hibernate
+    let required: u64 = kernel.get_total_memory() + HIBERNATE_METADATA_HEADROOM
+    if size < required {
         return false
     }
 
@@ -227,14 +232,20 @@ fn write_hibernate_image(): bool {
 
     let write_start = kernel.get_time_us()
 
-    // Calculate offsets
+    // Calculate offsets.
+    // FIX R5 #31: Use the page-aligned offset as the start of the
+    // page-data region and drop the never-used local. This is the
+    // actual offset `page_data_pos` must start at, and it now
+    // matches what the resume-time `page_data_start` computes.
     let header_size: u64 = 4096  // Header is 4KB
     let cpu_state_size = cpu_state.get_saved_cpu_count() as u64 * @sizeOf(cpu_state.CPUState) as u64
     let pfn_map_size = hib_ctx.page_count * @sizeOf(PageEntry) as u64
     let page_data_offset = header_size + cpu_state_size + pfn_map_size
+    let aligned_page_data_offset = (page_data_offset + 4095) & ~4095
 
-    // Round up to page boundary
-    let aligned_offset = (page_data_offset + 4095) & ~4095
+    // Reset rolling checksum for this image.
+    hib_checksum_lo = 0
+    hib_checksum_hi = 0
 
     hib_ctx.header.cpu_state_offset = header_size
     hib_ctx.header.cpu_state_size = cpu_state_size
@@ -263,7 +274,7 @@ fn write_hibernate_image(): bool {
     // Write page mapping and data
     let total_pfns = kernel.get_total_pages()
     var pfn_map_pos = hib_ctx.header.pfn_map_offset
-    var page_data_pos = aligned_offset
+    var page_data_pos = aligned_page_data_offset
     hib_ctx.pages_written = 0
 
     var pfn: u64 = 0
@@ -282,11 +293,14 @@ fn write_hibernate_image(): bool {
             }
             pfn_map_pos = pfn_map_pos + @sizeOf(PageEntry) as u64
 
-            // Write page data
+            // Write page data and fold it into the rolling checksum.
+            // FIX R5 #8: Every byte of every saved page now contributes
+            // to the integrity digest.
             let page_addr = kernel.pfn_to_virt(pfn)
             if !write_to_swap(page_data_pos, page_addr as *void, 4096) {
                 return false
             }
+            update_image_checksum(page_addr, 4096)
             page_data_pos = page_data_pos + 4096
 
             hib_ctx.pages_written = hib_ctx.pages_written + 1
@@ -335,16 +349,43 @@ fn read_from_swap(offset: u64, data: *void, size: u64): bool {
     return kernel.block_read(hib_ctx.swap_device, swap_offset, data, size) == size as i64
 }
 
-// Calculate CRC64 checksum
+// FIX R5 #8: Actual byte-wise checksum rather than 4 XOR'd header
+// fields. Uses a Fletcher-style rolling accumulator updated per
+// written page by update_image_checksum(); calculate_image_checksum()
+// then folds in header metadata.
+var hib_checksum_lo: u64 = 0
+var hib_checksum_hi: u64 = 0
+
+fn update_image_checksum(data: u64, size: u64): void {
+    var lo: u64 = hib_checksum_lo
+    var hi: u64 = hib_checksum_hi
+    var i: u64 = 0
+    while i + 4 <= size {
+        let w0: u64 = @as(u64, @as(*u8, @ptrFromInt(data + i)).*)
+        let w1: u64 = @as(u64, @as(*u8, @ptrFromInt(data + i + 1)).*) << 8
+        let w2: u64 = @as(u64, @as(*u8, @ptrFromInt(data + i + 2)).*) << 16
+        let w3: u64 = @as(u64, @as(*u8, @ptrFromInt(data + i + 3)).*) << 24
+        lo = (lo + w0 + w1 + w2 + w3) % 0xFFFFFFFF
+        hi = (hi + lo) % 0xFFFFFFFF
+        i = i + 4
+    }
+    while i < size {
+        let b: u64 = @as(u64, @as(*u8, @ptrFromInt(data + i)).*)
+        lo = (lo + b) % 0xFFFFFFFF
+        hi = (hi + lo) % 0xFFFFFFFF
+        i = i + 1
+    }
+    hib_checksum_lo = lo
+    hib_checksum_hi = hi
+}
+
 fn calculate_image_checksum(): u64 {
-    // Simplified checksum - in production would CRC64 entire image
-    var checksum: u64 = 0
-    checksum = checksum ^ hib_ctx.header.total_pages
-    checksum = checksum ^ hib_ctx.header.kernel_start
-    checksum = checksum ^ hib_ctx.header.kernel_end
-    checksum = checksum ^ hib_ctx.header.resume_entry
-    checksum = checksum ^ hib_ctx.pages_written
-    return checksum
+    var result: u64 = (hib_checksum_hi << 32) | hib_checksum_lo
+    result = result ^ hib_ctx.header.total_pages
+    result = result ^ hib_ctx.header.kernel_start
+    result = result ^ hib_ctx.header.kernel_end
+    result = result ^ hib_ctx.pages_written
+    return result
 }
 
 // ============================================
@@ -471,9 +512,13 @@ export fn hibernate_resume(): bool {
 
     hib_ctx.state = HIB_RESUME
 
-    // Verify checksum
+    // FIX R5 #9: Recompute the Fletcher checksum over the loaded
+    // page data as we read it back, and abort if it doesn't match
+    // the header. Without this, a corrupted or tampered image was
+    // silently accepted.
     let expected_checksum = hib_ctx.header.checksum
-    // Would verify full image checksum here
+    hib_checksum_lo = 0
+    hib_checksum_hi = 0
 
     // Read CPU states
     var cpu_offset = hib_ctx.header.cpu_state_offset
@@ -508,11 +553,14 @@ export fn hibernate_resume(): bool {
         }
         pfn_map_pos = pfn_map_pos + @sizeOf(PageEntry) as u64
 
-        // Restore page data
+        // Restore page data AND fold it into the rolling checksum
+        // so we can verify image integrity before handing control
+        // back to the resumed kernel.
         let page_addr = kernel.pfn_to_virt(entry.pfn)
         if !read_from_swap(page_data_pos, page_addr as *void, 4096) {
             return false
         }
+        update_image_checksum(page_addr, 4096)
         page_data_pos = page_data_pos + 4096
 
         if (i % 1000) == 0 {
@@ -524,13 +572,29 @@ export fn hibernate_resume(): bool {
 
     basics.print("\n")
 
-    // Invalidate hibernate image
+    // FIX R5 #9: Validate the recomputed checksum. If it doesn't
+    // match, the image is corrupt — DO NOT hand control over.
+    hib_ctx.pages_written = hib_ctx.header.pfn_map_entries
+    let actual_checksum = calculate_image_checksum()
+    if actual_checksum != expected_checksum {
+        basics.print("hibernate: Checksum mismatch; aborting resume\n")
+        return false
+    }
+
+    // FIX R5 #10: Wipe the ENTIRE header (4 KiB), not just the 8-byte
+    // magic. Otherwise a lenient bootloader could still partially
+    // trust a half-invalidated image.
     invalidate_hibernate_image()
 
-    // Restore CPU state and jump to resume entry
+    // Restore CPU state and jump to resume entry.
     basics.print("hibernate: Jumping to resume entry...\n")
 
-    // Restore page tables first
+    // FIX R5 #11: Restore CPU register state (including GP regs) and
+    // only AFTER every page has been written to its final frame do
+    // we swap page tables. Swapping CR3 before memory restore was
+    // the classic cause of triple-faults on wake.
+    cpu_state.restore_all_cpu_states()
+
     if cpu_state.get_current_arch() == cpu_state.ARCH_X86_64 {
         asm volatile (
             "mov %0, %%cr3\n"
@@ -545,9 +609,6 @@ export fn hibernate_resume(): bool {
             : "r" (hib_ctx.header.resume_cr3)
         )
     }
-
-    // Restore CPU state
-    cpu_state.restore_all_cpu_states()
 
     // Jump to resume entry
     let resume_fn = hib_ctx.header.resume_entry as fn() -> void
@@ -572,10 +633,18 @@ export fn hibernate_resume_entry(): void {
     // Continue normal operation
 }
 
-// Invalidate hibernate image (prevent accidental resume)
+// Invalidate hibernate image.
+// FIX R5 #10: Zero the full 4 KiB header, not just the 8-byte magic.
+// A lenient bootloader that checks only length / checksum fields
+// should also see nothing trustworthy.
 fn invalidate_hibernate_image(): void {
-    var zero_magic: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
-    write_to_swap(0, &zero_magic as *void, 8)
+    var zero_page: [4096]u8
+    var i: u32 = 0
+    while i < 4096 {
+        zero_page[i] = 0
+        i = i + 1
+    }
+    write_to_swap(0, &zero_page as *void, 4096)
 }
 
 // ============================================

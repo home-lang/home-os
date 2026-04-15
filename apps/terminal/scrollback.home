@@ -2,6 +2,7 @@
 // Efficient scrollback buffer implementation
 
 import "../../kernel/src/core/foundation.home" as foundation
+import "../../kernel/src/sync/spinlock.home" as spinlock
 
 const MAX_SCROLLBACK_LINES: u32 = 10000
 const LINE_WIDTH: u32 = 80
@@ -18,7 +19,12 @@ var scrollback_tail: u32 = 0
 var scrollback_count: u32 = 0
 var scrollback_view_offset: u32 = 0
 
+// FIX R6 #6: Protect head/tail/count against an IRQ-context adder
+// racing with thread-context readers.
+var scrollback_lock: spinlock.Spinlock
+
 export fn scrollback_init() {
+  spinlock.spinlock_init(&scrollback_lock)
   scrollback_head = 0
   scrollback_tail = 0
   scrollback_count = 0
@@ -27,10 +33,9 @@ export fn scrollback_init() {
 }
 
 export fn scrollback_add_line(line: u64, length: u32) {
-  // Add line to circular buffer
+  spinlock.spinlock_acquire(&scrollback_lock)
   var idx: u32 = scrollback_head
-  
-  // Copy line data
+
   var i: u32 = 0
   while i < length and i < LINE_WIDTH {
     scrollback_buffer[idx].data[i] = @as(*u8, @ptrFromInt(line + i)).*
@@ -38,17 +43,15 @@ export fn scrollback_add_line(line: u64, length: u32) {
   }
   scrollback_buffer[idx].length = length
   scrollback_buffer[idx].timestamp = foundation.timer_get_ticks()
-  
-  // Advance head
+
   scrollback_head = (scrollback_head + 1) % MAX_SCROLLBACK_LINES
-  
-  // Update count
+
   if scrollback_count < MAX_SCROLLBACK_LINES {
     scrollback_count = scrollback_count + 1
   } else {
-    // Buffer full, advance tail
     scrollback_tail = (scrollback_tail + 1) % MAX_SCROLLBACK_LINES
   }
+  spinlock.spinlock_release(&scrollback_lock)
 }
 
 export fn scrollback_get_line(index: u32): u64 {
@@ -105,37 +108,48 @@ export fn scrollback_clear() {
 }
 
 export fn scrollback_search(query: u64, query_len: u32): u32 {
-  // Search scrollback buffer for query string
-  // Returns index of first match, or 0xFFFFFFFF if not found
-  
+  // FIX R6 #5: An empty query looped forever (`j <= 0` always true,
+  // inner loop ran zero iters so `j` never advanced). Reject empty
+  // queries up-front.
+  if query_len == 0 { return 0xFFFFFFFF }
+
+  // FIX R6 #10: Compare `j + query_len <= line_len` so we never
+  // underflow `line_len - query_len`; first-char filter skips the
+  // inner loop when the first byte differs.
+  spinlock.spinlock_acquire(&scrollback_lock)
+  var q0: u8 = @as(*u8, @ptrFromInt(query)).*
+
   var i: u32 = 0
   while i < scrollback_count {
-    var line: u64 = scrollback_get_line(i)
-    var line_len: u32 = scrollback_get_line_length(i)
-    
+    var actual_idx: u32 = (scrollback_tail + i) % MAX_SCROLLBACK_LINES
+    var line: u64 = @ptrFromInt(scrollback_buffer[actual_idx].data)
+    var line_len: u32 = scrollback_buffer[actual_idx].length
+
     if line_len >= query_len {
       var j: u32 = 0
-      while j <= line_len - query_len {
-        var match: u32 = 1
-        var k: u32 = 0
-        while k < query_len {
-          if @as(*u8, @ptrFromInt(line + j + k)).* != @as(*u8, @ptrFromInt(query + k)).* {
-            match = 0
-            break
+      while j + query_len <= line_len {
+        if @as(*u8, @ptrFromInt(line + j)).* == q0 {
+          var match: u32 = 1
+          var k: u32 = 1
+          while k < query_len {
+            if @as(*u8, @ptrFromInt(line + j + k)).* != @as(*u8, @ptrFromInt(query + k)).* {
+              match = 0
+              break
+            }
+            k = k + 1
           }
-          k = k + 1
+          if match == 1 {
+            spinlock.spinlock_release(&scrollback_lock)
+            return i
+          }
         }
-        
-        if match == 1 {
-          return i
-        }
-        
         j = j + 1
       }
     }
-    
+
     i = i + 1
   }
-  
+
+  spinlock.spinlock_release(&scrollback_lock)
   return 0xFFFFFFFF
 }

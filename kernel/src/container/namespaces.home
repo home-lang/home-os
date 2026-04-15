@@ -160,6 +160,15 @@ struct NamespaceStats {
 
 var ns_stats: NamespaceStats
 
+// FIX R3 #16: Atomic PID-offset counter for non-overlapping,
+// unpredictable per-namespace PID ranges. Starts at 100_000 so
+// the root namespace (offset 0) is cleanly separated. Each new
+// namespace reserves NS_PID_RESERVATION_SIZE IDs; internally it
+// starts from a random jitter within that range so exact PIDs
+// can't be guessed from the order of namespace creation.
+const NS_PID_RESERVATION_SIZE: u64 = 1000000  // 1M PIDs per namespace
+var ns_pid_offset_counter: u64 = 100000
+
 export fn namespace_init() {
   if namespace_initialized == 1 { return }
 
@@ -275,7 +284,15 @@ export fn namespace_create(types: u32, parent_ns: u32): u32 {
 
   // PID namespace - new PID space if NS_PID
   if (types & NS_PID) != 0 {
-    namespaces[ns_id].pid_offset = ns_id * 100000
+    // FIX R3 #16: Previously pid_offset was deterministic (ns_id * 100000),
+    // so an attacker who learned the namespace creation order could
+    // predict internal PIDs across namespaces. We now reserve a
+    // non-overlapping PID range per namespace using a global atomic
+    // counter, and randomize the starting offset within the reserved
+    // range so exact internal values are unpredictable.
+    var reserved_base: u64 = foundation.atomic_add_u64(@intFromPtr(&ns_pid_offset_counter), NS_PID_RESERVATION_SIZE)
+    var random_jitter: u64 = foundation.cpu_read_tsc() % 1000
+    namespaces[ns_id].pid_offset = reserved_base + random_jitter
     namespaces[ns_id].next_pid = 1
     namespaces[ns_id].init_pid = 0  // Not set yet
     ns_stats.pid_ns_count = ns_stats.pid_ns_count + 1
@@ -546,7 +563,10 @@ export fn namespace_map_uid(ns_id: u32, inside_uid: u32): u32 {
   while i < namespaces[ns_id].uid_mapping_count {
     var m: IdMapping = namespaces[ns_id].uid_mappings[i]
     if m.valid == 1 {
-      if inside_uid >= m.inside_id && inside_uid < m.inside_id + m.count {
+      // Compute the range end as a delta off inside_uid so a mapping
+      // whose inside_id + count overflows u32 doesn't create a false
+      // wrap-around match.
+      if inside_uid >= m.inside_id and m.count > inside_uid - m.inside_id {
         return m.outside_id + (inside_uid - m.inside_id)
       }
     }
@@ -565,7 +585,7 @@ export fn namespace_unmap_uid(ns_id: u32, outside_uid: u32): u32 {
   while i < namespaces[ns_id].uid_mapping_count {
     var m: IdMapping = namespaces[ns_id].uid_mappings[i]
     if m.valid == 1 {
-      if outside_uid >= m.outside_id && outside_uid < m.outside_id + m.count {
+      if outside_uid >= m.outside_id and m.count > outside_uid - m.outside_id {
         return m.inside_id + (outside_uid - m.outside_id)
       }
     }

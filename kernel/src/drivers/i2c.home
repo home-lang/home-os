@@ -242,7 +242,10 @@ export fn i2c_register_device(controller: u32, address: u16, addr_mode: u8): u32
         if address > 0x3FF { return 0xFFFFFFFF }
     }
 
-    // Find empty slot
+    // FIX R7 #9: Treat `i2c_device_count` as a high-water mark of
+    // allocated slots. Bumping it on every register and decrementing
+    // on every unregister would desync when a middle slot was freed
+    // and later reused by another register call.
     var i: u32 = 0
     while i < MAX_I2C_DEVICES {
         if i2c_devices[i].active == 0 {
@@ -251,7 +254,9 @@ export fn i2c_register_device(controller: u32, address: u16, addr_mode: u8): u32
             i2c_devices[i].addr_mode = addr_mode
             i2c_devices[i].speed = i2c_controllers[controller].speed
             i2c_devices[i].active = 1
-            i2c_device_count = i2c_device_count + 1
+            if i + 1 > i2c_device_count {
+                i2c_device_count = i + 1
+            }
             return i
         }
         i = i + 1
@@ -260,13 +265,13 @@ export fn i2c_register_device(controller: u32, address: u16, addr_mode: u8): u32
     return 0xFFFFFFFF
 }
 
-// Unregister a device
+// Unregister a device. FIX R7 #9: does not decrement the high-water
+// mark — the slot stays live for scan loops that iterate up to it.
 export fn i2c_unregister_device(handle: u32) {
     if handle >= MAX_I2C_DEVICES { return }
     if i2c_devices[handle].active == 0 { return }
 
     i2c_devices[handle].active = 0
-    i2c_device_count = i2c_device_count - 1
 }
 
 // Transfer data to/from device
@@ -520,13 +525,29 @@ export fn i2c_write_word(handle: u32, reg_addr: u8, data: u16): u32 {
     return i2c_write(handle, reg_addr, @ptrFromInt(bytes), 2)
 }
 
-// Read word (16-bit)
+// Read word (16-bit, big-endian / MSB-first — common sensor convention).
 export fn i2c_read_word(handle: u32, reg_addr: u8): u16 {
     var bytes: [u8; 2]
     if i2c_read(handle, reg_addr, @ptrFromInt(bytes), 2) == 0 {
         return 0
     }
     return (bytes[0] << 8) | bytes[1]
+}
+
+// FIX R7 #11: Little-endian word variants for LSB-first devices.
+export fn i2c_read_word_le(handle: u32, reg_addr: u8): u16 {
+    var bytes: [u8; 2]
+    if i2c_read(handle, reg_addr, @ptrFromInt(bytes), 2) == 0 {
+        return 0
+    }
+    return (bytes[1] << 8) | bytes[0]
+}
+
+export fn i2c_write_word_le(handle: u32, reg_addr: u8, data: u16): u32 {
+    var bytes: [u8; 2]
+    bytes[0] = data & 0xFF
+    bytes[1] = (data >> 8) & 0xFF
+    return i2c_write(handle, reg_addr, @ptrFromInt(bytes), 2)
 }
 
 // SMBus Quick Command
@@ -560,18 +581,21 @@ export fn i2c_smbus_block_read(handle: u32, command: u8, buffer: u64, max_len: u
         return 0
     }
 
-    // Read length + data
-    var temp: [u8; 33]  // 1 byte length + 32 bytes max
+    // FIX R7 #10: Clamp declared data length against BOTH caller's
+    // max_len AND the bytes we actually received. The previous code
+    // trusted the device-reported length minus a single max_len clamp.
+    var temp: [u8; 33]
     var read_len: u32 = i2c_bcm_read(controller, addr, @ptrFromInt(temp), max_len + 1)
     if read_len == 0 {
         return 0
     }
 
-    // First byte is the length
     var data_len: u8 = temp[0]
     if data_len > max_len { data_len = max_len }
+    if @as(u32, data_len) > read_len - 1 {
+        data_len = @truncate(read_len - 1, u8)
+    }
 
-    // Copy data
     var i: u32 = 0
     while i < data_len {
         @as(*u8, @ptrFromInt(buffer + i)).* = temp[i + 1]
@@ -604,22 +628,21 @@ export fn i2c_smbus_block_write(handle: u32, command: u8, data: u64, length: u8)
     return i2c_bcm_write(controller, addr, @ptrFromInt(buf), length + 2)
 }
 
-// Scan bus for devices
+// FIX R7 #8: Probe with a zero-length write (START + address + STOP,
+// no payload byte). The previous 1-byte write silently poked
+// register 0 of every device on the bus, which can reset or
+// calibrate real sensors.
 export fn i2c_scan(controller: u32, devices: u64, max_devices: u32): u32 {
     if controller >= i2c_controller_count { return 0 }
 
     var found: u32 = 0
-    var addr: u16 = 0x08  // Skip reserved addresses 0x00-0x07
+    var addr: u16 = 0x08
 
-    while addr <= 0x77 {  // Skip reserved 0x78-0x7F
+    while addr <= 0x77 {
         if found >= max_devices { break }
 
-        // Try quick write
-        var dummy: [u8; 1]
-        dummy[0] = 0
-
         if i2c_controllers[controller].controller_type == I2C_CTRL_BCM2835 {
-            var result: u32 = i2c_bcm_write(controller, addr, @ptrFromInt(dummy), 1)
+            var result: u32 = i2c_bcm_write(controller, addr, 0, 0)
             if result > 0 {
                 @as(*u16, @ptrFromInt(devices + (found * 2))).* = addr
                 found = found + 1
@@ -632,15 +655,11 @@ export fn i2c_scan(controller: u32, devices: u64, max_devices: u32): u32 {
     return found
 }
 
-// Check if device is present
 export fn i2c_probe(controller: u32, address: u16): u32 {
     if controller >= i2c_controller_count { return 0 }
 
-    var dummy: [u8; 1]
-    dummy[0] = 0
-
     if i2c_controllers[controller].controller_type == I2C_CTRL_BCM2835 {
-        return if i2c_bcm_write(controller, address, @ptrFromInt(dummy), 1) > 0 { 1 } else { 0 }
+        return if i2c_bcm_write(controller, address, 0, 0) > 0 { 1 } else { 0 }
     }
 
     return 0

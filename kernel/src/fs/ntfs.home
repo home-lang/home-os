@@ -143,7 +143,8 @@ struct NtfsStats {
   mft_reads: u64,
   attr_lookups: u64,
   cache_hits: u64,
-  cache_misses: u64
+  cache_misses: u64,
+  read_errors: u64  // FIX R3 #17: count disk read failures
 }
 
 // ============================================================================
@@ -203,11 +204,21 @@ fn ntfs_cluster_to_sector(cluster: u64): u64 {
   return cluster * boot_sector.sectors_per_cluster
 }
 
+// FIX R3 #17: Propagate sector read errors instead of silently
+// swallowing them. A partial/corrupted cluster must never be
+// presented as a successful read; any failed sector aborts the
+// whole cluster read and returns a non-zero error code so callers
+// can retry or surface the failure.
 fn ntfs_read_cluster(cluster: u64, buffer: u64): u32 {
   var start_sector: u64 = ntfs_cluster_to_sector(cluster)
   var i: u32 = 0
   while i < boot_sector.sectors_per_cluster {
-    ata.ata_read_sector(0, start_sector + i, buffer + (i * 512))
+    var rc: u32 = ata.ata_read_sector(0, start_sector + i, buffer + (i * 512))
+    if rc != 0 {
+      // Count error but do not account bytes as "read".
+      ntfs_stats.read_errors = ntfs_stats.read_errors + 1
+      return rc  // Surface the underlying error code.
+    }
     i = i + 1
   }
 
@@ -252,8 +263,11 @@ fn ntfs_read_mft_record_cached(mft_num: u64, buffer: u64): u32 {
 }
 
 fn ntfs_read_mft_record_raw(mft_num: u64, buffer: u64): u32 {
-  // Calculate MFT record position
+  // Calculate MFT record position. A malformed boot sector with
+  // bytes_per_mft_record == 0 would divide by zero here; bail out.
+  if bytes_per_mft_record == 0 { return 1 }
   var records_per_cluster: u32 = bytes_per_cluster / bytes_per_mft_record
+  if records_per_cluster == 0 { return 1 }
   var cluster: u64 = boot_sector.mft_cluster + (mft_num / records_per_cluster)
   var offset: u32 = (mft_num % records_per_cluster) * bytes_per_mft_record
 
@@ -307,6 +321,11 @@ fn ntfs_find_attribute(mft_record: u64, attr_type: u32, attr_data: u64): u32 {
       return 0
     }
 
+    // attr.length comes from untrusted disk content. A zero length
+    // would loop forever; a huge length would wrap offset past
+    // max_offset silently. Bail on either.
+    if attr.length == 0 { return 1 }
+    if offset > max_offset - attr.length { return 1 }
     offset = offset + attr.length
   }
 

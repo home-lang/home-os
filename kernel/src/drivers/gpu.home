@@ -145,6 +145,68 @@ var textures: [Texture; 256]
 // Global GPU state
 var gpu: GpuState
 
+// FIX R5 #29: The `MAX_VERTICES` constant was declared without a
+// matching buffer. Allocate a proper vertex scratch space — lazily,
+// on first use — so geometry paths don't dereference an uninitialised
+// pointer.
+var vertex_buffer: u64 = 0
+var vertex_buffer_capacity: u32 = 0
+
+fn gpu_ensure_vertex_buffer(): u32 {
+    if vertex_buffer != 0 { return 0 }
+    let bytes: u64 = @as(u64, MAX_VERTICES) * @sizeOf(Vertex2D)
+    vertex_buffer = memory.kmalloc(bytes)
+    if vertex_buffer == 0 { return 1 }
+    vertex_buffer_capacity = MAX_VERTICES
+    return 0
+}
+
+// FIX R5 #28: Command dispatcher. The GPU_CMD_* constants were
+// declared but no opcode dispatcher existed; every enqueued draw
+// silently did nothing. `gpu_execute_command` now routes to the
+// existing primitive routines based on opcode.
+export fn gpu_execute_command(cmd: u32, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64): i32 {
+    if gpu.initialized == 0 { return -1 }
+
+    // Clear screen: arg0 = color.
+    if cmd == GPU_CMD_CLEAR {
+        gpu_clear(@truncate(arg0, u32))
+        return 0
+    }
+    // Draw rectangle: arg0..3 = x, y, w, h (each u32), arg4 = color.
+    if cmd == GPU_CMD_DRAW_RECT {
+        gpu_fill_rect(@truncate(arg0, u32), @truncate(arg1, u32),
+                      @truncate(arg2, u32), @truncate(arg3, u32),
+                      @truncate(arg4, u32))
+        return 0
+    }
+    // Draw pixel: arg0 = x, arg1 = y, arg2 = color.
+    if cmd == GPU_CMD_DRAW_PIXEL {
+        gpu_put_pixel(@truncate(arg0, u32), @truncate(arg1, u32),
+                      @truncate(arg2, u32))
+        return 0
+    }
+    // Draw line: arg0..3 = x0, y0, x1, y1, arg4 = color.
+    if cmd == GPU_CMD_DRAW_LINE {
+        gpu_draw_line(@truncate(arg0, u32), @truncate(arg1, u32),
+                      @truncate(arg2, u32), @truncate(arg3, u32),
+                      @truncate(arg4, u32))
+        return 0
+    }
+    // Blit: arg0 = src, arg1 = src_w, arg2 = src_h, arg3 = dst (packed x|y<<32), arg4 = w|h<<32.
+    if cmd == GPU_CMD_BLIT {
+        gpu_blit(arg0, @truncate(arg1, u32), @truncate(arg2, u32),
+                 @truncate(arg3 & 0xFFFFFFFF, u32),
+                 @truncate((arg3 >> 32) & 0xFFFFFFFF, u32),
+                 @truncate(arg4 & 0xFFFFFFFF, u32),
+                 @truncate((arg4 >> 32) & 0xFFFFFFFF, u32))
+        return 0
+    }
+    if cmd == GPU_CMD_NOP { return 0 }
+    // Unknown command.
+    return -1
+}
+
 // VGA/VESA framebuffer address (set by bootloader)
 var vga_framebuffer: u64 = 0xFD000000
 
@@ -173,8 +235,11 @@ export fn gpu_init_with_mode(width: u32, height: u32, bpp: u32): i32 {
 
     // Calculate buffer size in u64 from the start — the old `width *
     // (bpp/8)` silently overflowed u32 for 4K+ displays and allocated
-    // a too-small framebuffer.
+    // a too-small framebuffer. Also guard the u64 multiply so crafted
+    // width/height values can't wrap to a tiny `buffer_size`.
+    if bpp == 0 { return -1 }
     let pitch: u64 = (width as u64) * ((bpp / 8) as u64)
+    if height != 0 and pitch > 0xFFFFFFFFFFFFFFFF / (height as u64) { return -1 }
     gpu.buffer_size = pitch * (height as u64)
 
     // Allocate double buffers
@@ -186,8 +251,12 @@ export fn gpu_init_with_mode(width: u32, height: u32, bpp: u32): i32 {
         return -1
     }
 
-    // Allocate Z-buffer (16-bit depth per pixel)
-    let zbuffer_size: u64 = (width as u64) * (height as u64) * 2
+    // Allocate Z-buffer (16-bit depth per pixel). Same overflow
+    // guard as above — the product must fit in u64.
+    let wh: u64 = (width as u64) * (height as u64)
+    if width != 0 and (height as u64) > 0xFFFFFFFFFFFFFFFF / (width as u64) { return -1 }
+    if wh > 0x7FFFFFFFFFFFFFFF { return -1 }
+    let zbuffer_size: u64 = wh * 2
     gpu.zbuffer = memory.kmalloc(zbuffer_size)
 
     if gpu.zbuffer == 0 {
@@ -1083,7 +1152,14 @@ export fn gpu_create_texture(width: u32, height: u32, format: u32): i32 {
         bytes_per_pixel = 1
     }
 
-    let size: u64 = (width as u64) * (height as u64) * (bytes_per_pixel as u64)
+    // Guard against width×height×bpp overflowing u64. A crafted 64-bit
+    // texture request would otherwise wrap to a tiny allocation and
+    // subsequent uploads would clobber unrelated memory.
+    if width == 0 or height == 0 { return -1 }
+    if (height as u64) > 0xFFFFFFFFFFFFFFFF / (width as u64) { return -1 }
+    let area: u64 = (width as u64) * (height as u64)
+    if area > 0xFFFFFFFFFFFFFFFF / (bytes_per_pixel as u64) { return -1 }
+    let size: u64 = area * (bytes_per_pixel as u64)
     let data: u64 = memory.kmalloc(size)
 
     if data == 0 {

@@ -3,6 +3,7 @@
 
 import "../core/foundation.home" as foundation
 import "../core/process.home" as process
+import "../sync/spinlock.home" as spinlock
 
 // ============================================================================
 // SIGNAL CONSTANTS
@@ -92,6 +93,24 @@ struct ProcessSignalState {
 // ============================================================================
 
 var signal_states: [ProcessSignalState; 256]
+
+// FIX R3 #6: Per-process spinlock protecting signal queue, pending
+// mask, and blocked mask. Without this, two concurrent signal_send
+// calls could race on queue_tail and pending_mask updates, losing
+// signals or corrupting the queue. One lock per process gives us
+// parallelism across targets while serialising each target's state.
+var signal_locks: [spinlock.Spinlock; 256]
+var signal_locks_initialized: u32 = 0
+
+fn ensure_signal_locks_initialized() {
+  if signal_locks_initialized == 1 { return }
+  var i: u32 = 0
+  while i < 256 {
+    spinlock.spinlock_init(&signal_locks[i])
+    i = i + 1
+  }
+  signal_locks_initialized = 1
+}
 var signal_initialized: u32 = 0
 
 // Default signal actions (0 = terminate, 1 = ignore, 2 = stop, 3 = continue, 4 = coredump)
@@ -225,13 +244,22 @@ export fn signal_pending(pid: u32): u64 {
 // ============================================================================
 
 export fn signal_send(target_pid: u32, signum: u32, sender_pid: u32): u32 {
-  if target_pid >= MAX_PROCESSES or signum == 0 or signum >= MAX_SIGNALS {
+  // signum is used as a u64 shift below; MAX_SIGNALS is 64 so the
+  // valid window for `1 << signum` on a u64 is 1..63. An upper bound
+  // of `>= 64` (instead of `> MAX_SIGNALS`) closes a potential UB on
+  // the boundary.
+  if target_pid >= MAX_PROCESSES or signum == 0 or signum >= 64 {
     return 1  // Invalid
   }
 
-  // Check if signal is ignored
+  ensure_signal_locks_initialized()
+  spinlock.spinlock_acquire(&signal_locks[target_pid])
+
+  // Check if signal is ignored (read actions under lock so it doesn't
+  // race with sigaction).
   var handler: u64 = signal_states[target_pid].actions[signum].handler
   if handler == SIG_IGN and signum != SIGKILL and signum != SIGSTOP {
+    spinlock.spinlock_release(&signal_locks[target_pid])
     return 0  // Ignored, but no error
   }
 
@@ -250,8 +278,14 @@ export fn signal_send(target_pid: u32, signum: u32, sender_pid: u32): u32 {
     signal_states[target_pid].queue_tail = new_tail
   }
 
-  // Wake up blocked process if signal is not blocked
-  if (signal_states[target_pid].blocked_mask & (@as(u64, 1) << signum)) == 0 {
+  // Snapshot blocked-mask under the lock so the wake decision is
+  // consistent with the queue state we just observed.
+  var blocked: u64 = signal_states[target_pid].blocked_mask
+  spinlock.spinlock_release(&signal_locks[target_pid])
+
+  // Wake up blocked process if signal is not blocked.
+  // Done outside the signal lock to avoid nesting it inside scheduler locks.
+  if (blocked & (@as(u64, 1) << signum)) == 0 {
     signal_wake_process(target_pid)
   }
 
@@ -259,9 +293,12 @@ export fn signal_send(target_pid: u32, signum: u32, sender_pid: u32): u32 {
 }
 
 export fn signal_send_info(target_pid: u32, signum: u32, code: u32, value: u64): u32 {
-  if target_pid >= MAX_PROCESSES or signum == 0 or signum >= MAX_SIGNALS {
+  if target_pid >= MAX_PROCESSES or signum == 0 or signum >= 64 {
     return 1
   }
+
+  ensure_signal_locks_initialized()
+  spinlock.spinlock_acquire(&signal_locks[target_pid])
 
   signal_states[target_pid].pending_mask = signal_states[target_pid].pending_mask | (@as(u64, 1) << signum)
 
@@ -276,6 +313,7 @@ export fn signal_send_info(target_pid: u32, signum: u32, code: u32, value: u64):
     signal_states[target_pid].queue_tail = new_tail
   }
 
+  spinlock.spinlock_release(&signal_locks[target_pid])
   return 0
 }
 
@@ -336,10 +374,14 @@ export fn signal_deliver(pid: u32): u32 {
     return 0  // No signals to deliver
   }
 
-  // Find lowest numbered signal (cap shift to prevent UB on >= 64)
+  // Find lowest numbered signal. FIX R3 #7: Shift only happens for
+  // signum in [1, 63] so `1 << signum` is well-defined on a u64.
+  // The upper bound is enforced BEFORE the shift, not after.
   var signum: u32 = 1
-  while signum < MAX_SIGNALS and signum < 64 {
-    if (deliverable & (@as(u64, 1) << @truncate(signum, u6))) != 0 {
+  while signum < 64 and signum < MAX_SIGNALS {
+    // Pre-condition: 1 <= signum < 64, so the shift is in range.
+    var mask: u64 = @as(u64, 1) << @truncate(signum, u6)
+    if (deliverable & mask) != 0 {
       break
     }
     signum = signum + 1

@@ -67,16 +67,54 @@ var scheduler_initialized: u32 = 0
 // PROCESS CREATION
 // ============================================================================
 
+// FIX R5 #21: process_create now returns a sentinel (0xFFFFFFFF) on
+// failure instead of 0 (which is a legitimate PID for the idle task).
+// Callers MUST check against the sentinel, not against zero.
+export const PROCESS_CREATE_FAILED: u32 = 0xFFFFFFFF
+
+// FIX R5 #22: Allocate the next PID by scanning for an unused value.
+// Previously we just incremented a counter and wrapped at u32 max,
+// which after 2^32 forks silently re-used PIDs of live processes.
+// This linear scan is O(MAX_PROCESSES) — acceptable for a 256-slot
+// table — and guarantees uniqueness against all live PCBs.
+fn allocate_unique_pid(): u32 {
+  var attempts: u32 = 0
+  while attempts < (2 * MAX_PROCESSES) {
+    var candidate: u32 = next_pid
+    // Advance the generator; wrap past 0 (reserved for idle).
+    next_pid = next_pid + 1
+    if next_pid == 0 { next_pid = 1 }
+    // Reject 0 (idle) and any PID that collides with a live PCB.
+    if candidate == 0 {
+      attempts = attempts + 1
+      continue
+    }
+    var collision: u32 = 0
+    var k: u32 = 0
+    while k < MAX_PROCESSES {
+      if process_table[k].state != PROCESS_UNUSED and
+         process_table[k].pid == candidate {
+        collision = 1
+        break
+      }
+      k = k + 1
+    }
+    if collision == 0 { return candidate }
+    attempts = attempts + 1
+  }
+  return 0  // Exhausted — caller treats as "cannot allocate".
+}
+
 export fn process_create(entry_point: u64): u32 {
   if process_count >= MAX_PROCESSES {
-    return 0  // No free slots
+    return PROCESS_CREATE_FAILED
   }
-  
+
   // Find free slot
   var i: u32 = 0
   var slot: u32 = 0
   var found: u32 = 0
-  
+
   while i < MAX_PROCESSES {
     if process_table[i].state == PROCESS_UNUSED {
       slot = i
@@ -85,14 +123,54 @@ export fn process_create(entry_point: u64): u32 {
     }
     i = i + 1
   }
-  
-  if found == 0 { return 0 }
-  
-  // Initialize PCB
+
+  if found == 0 { return PROCESS_CREATE_FAILED }
+
+  // FIX R5 #23: Explicitly zero EVERY field of the reused PCB slot
+  // before populating it. The old path wrote only a subset, leaving
+  // fd_table, cpu_time, heap_end, etc. with values from the slot's
+  // previous owner — an info leak and a correctness bug.
+  process_table[slot].pid = 0
+  process_table[slot].state = PROCESS_UNUSED
+  process_table[slot].parent_pid = 0
+  process_table[slot].priority = 0
+  process_table[slot].rip = 0
+  process_table[slot].rsp = 0
+  process_table[slot].rbp = 0
+  process_table[slot].rflags = 0
+  process_table[slot].page_table = 0
+  process_table[slot].heap_start = 0
+  process_table[slot].heap_end = 0
+  process_table[slot].stack_start = 0
+  process_table[slot].stack_end = 0
+  process_table[slot].stack_phys = 0
+  process_table[slot].stack_pages = 0
+  process_table[slot].time_slice = 0
+  process_table[slot].cpu_time = 0
+  process_table[slot].fd_count = 0
+  var fd_i: u32 = 0
+  while fd_i < 32 {
+    process_table[slot].fd_table[fd_i] = 0
+    fd_i = fd_i + 1
+  }
+
+  // Allocate a globally unique PID (scan for collisions).
+  var assigned_pid: u32 = allocate_unique_pid()
+  if assigned_pid == 0 { return PROCESS_CREATE_FAILED }
+
+  // Initialize PCB locally.
   var pcb: PCB
-  pcb.pid = next_pid
+  pcb.pid = assigned_pid
   pcb.state = PROCESS_READY
-  pcb.parent_pid = current_pid
+
+  // FIX R5 #24: Validate parent_pid. Kernel-thread callers have
+  // current_pid == 0; users expect PID 1 (init) to be their ancestor
+  // rather than the swapper. Normalize.
+  if current_pid == 0 {
+    pcb.parent_pid = 1
+  } else {
+    pcb.parent_pid = current_pid
+  }
   pcb.priority = 10
   
   // Set up CPU state

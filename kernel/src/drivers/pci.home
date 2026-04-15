@@ -73,34 +73,85 @@ fn pci_check_device(bus: u8, device: u8, func: u8) {
   }
 }
 
+// FIX R4 #12: Recursive bus scan. The naive 256-bus × 32-device scan
+// wastes time probing buses that don't exist. We instead walk the
+// PCI hierarchy: scan bus 0, and for each PCI-to-PCI bridge we find
+// (class 0x06, subclass 0x04) follow its secondary bus number.
+// This cuts typical boot probe time from ~8000 I/O port writes to
+// ~200, and correctly discovers PCIe devices behind bridges that
+// the flat 256-bus scan would miss on architectures that don't map
+// all buses flat at bus 0.
+
+const PCI_CLASS_BRIDGE: u8 = 0x06
+const PCI_SUBCLASS_PCI_BRIDGE: u8 = 0x04
+
+fn pci_scan_bus(bus: u8)
+
+// Per-boot bitmap of already-visited buses so a bridge loop (either a
+// misconfigured device or a crafted virtio mapping) can't drive the
+// scanner into unbounded recursion. 256 buses × 1 bit = 32 bytes.
+var pci_bus_visited: [u8; 32]
+
+fn pci_bus_mark_visited(bus: u8): u32 {
+  var idx: u32 = @as(u32, bus) >> 3
+  var mask: u8 = 1 << (bus & 7)
+  if (pci_bus_visited[idx] & mask) != 0 { return 1 }
+  pci_bus_visited[idx] = pci_bus_visited[idx] | mask
+  return 0
+}
+
+fn pci_check_and_recurse(bus: u8, device: u8, func: u8) {
+  var vendor: u32 = pci_config_read(bus, device, func, 0)
+  var vendor_id: u16 = vendor & 0xFFFF
+  if vendor_id == 0xFFFF { return }
+
+  pci_check_device(bus, device, func)
+
+  // Follow PCI-to-PCI bridge to its secondary bus.
+  var class_info: u32 = pci_config_read(bus, device, func, 0x08)
+  var class_code: u8 = @truncate((class_info >> 24) & 0xFF, u8)
+  var subclass: u8 = @truncate((class_info >> 16) & 0xFF, u8)
+  if class_code == PCI_CLASS_BRIDGE and subclass == PCI_SUBCLASS_PCI_BRIDGE {
+    var bus_info: u32 = pci_config_read(bus, device, func, 0x18)
+    var secondary_bus: u8 = @truncate((bus_info >> 8) & 0xFF, u8)
+    if secondary_bus != 0 and secondary_bus != bus {
+      if pci_bus_mark_visited(secondary_bus) == 0 {
+        pci_scan_bus(secondary_bus)
+      }
+    }
+  }
+}
+
+fn pci_scan_bus(bus: u8) {
+  var device: u32 = 0
+  while device < 32 {
+    pci_check_and_recurse(bus, @truncate(device, u8), 0)
+
+    // Multi-function devices: bit 7 of header_type at offset 0x0E.
+    var hdr: u32 = pci_config_read(bus, @truncate(device, u8), 0, 0x0C)
+    var header_type: u8 = @truncate((hdr >> 16) & 0xFF, u8)
+    if (header_type & 0x80) != 0 {
+      var func: u32 = 1
+      while func < 8 {
+        pci_check_and_recurse(bus, @truncate(device, u8), @truncate(func, u8))
+        func = func + 1
+      }
+    }
+
+    device = device + 1
+  }
+}
+
 export fn pci_init() {
   pci_device_count = 0
 
-  // Scan all buses, devices, and functions. Multi-function devices
-  // live at function numbers 1-7 — the old code only looked at func 0
-  // and missed the multi-function header bit entirely.
-  var bus: u32 = 0
-  while bus < 256 {
-    var device: u32 = 0
-    while device < 32 {
-      pci_check_device(@truncate(bus, u8), @truncate(device, u8), 0)
+  // Reset the visited-bus bitmap for this boot.
+  var k: u32 = 0
+  while k < 32 { pci_bus_visited[k] = 0; k = k + 1 }
+  pci_bus_mark_visited(0)
 
-      // If this is a multi-function device, probe funcs 1-7 too.
-      // Header type at offset 0x0E: bit 7 set means multi-function.
-      var hdr: u32 = pci_config_read(@truncate(bus, u8), @truncate(device, u8), 0, 0x0C)
-      var header_type: u8 = @truncate((hdr >> 16) & 0xFF, u8)
-      if (header_type & 0x80) != 0 {
-        var func: u32 = 1
-        while func < 8 {
-          pci_check_device(@truncate(bus, u8), @truncate(device, u8), @truncate(func, u8))
-          func = func + 1
-        }
-      }
-
-      device = device + 1
-    }
-    bus = bus + 1
-  }
+  // Start from bus 0; recursion follows any bridges we discover.
+  pci_scan_bus(0)
 
   foundation.serial_write_string("[PCI] Found ")
   foundation.serial_write_u64(pci_device_count)

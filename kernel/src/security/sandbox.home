@@ -118,9 +118,13 @@ struct Sandbox {
   io_write_bytes: u64,
   process_count: u32,
 
-  // Security
+  // Security.
+  // FIX R7 #26: A single u64 only fits 64 capability bits; Linux is
+  // already past 41 and growing. Pair it with a high word so the
+  // total is 128 bits before we have to widen again.
   seccomp_profile: u32,
   capability_mask: u64,
+  capability_mask_high: u64,
 
   // Root filesystem (for mount namespace)
   rootfs_path: [256]u8
@@ -135,8 +139,36 @@ var sandbox_initialized: u32 = 0
 // Initialization
 // ============================================================================
 
+// FIX R7 #25: Re-init now tears down any still-active sandboxes
+// before zeroing the table, so associated PIDs and state don't
+// orphan.
+fn sandbox_teardown(idx: u32) {
+  if sandboxes[idx].active == 0 { return }
+  // Best-effort teardown: kill the owning pid and reset state.
+  // Integrators can extend this with real namespace/cgroup cleanup.
+  if sandboxes[idx].owner_pid != 0 {
+    process.process_kill(sandboxes[idx].owner_pid, 9)
+  }
+  sandboxes[idx].active = 0
+  sandboxes[idx].id = 0
+  sandboxes[idx].owner_pid = 0
+  sandboxes[idx].ns_flags = 0
+  sandboxes[idx].capability_mask = 0
+  sandboxes[idx].capability_mask_high = 0
+  var k: u32 = 0
+  while k < 256 { sandboxes[idx].rootfs_path[k] = 0; k = k + 1 }
+}
+
 export fn sandbox_init() {
-  if sandbox_initialized == 1 { return }
+  if sandbox_initialized == 1 {
+    var j: u32 = 0
+    while j < MAX_SANDBOXES {
+      if sandboxes[j].active == 1 {
+        sandbox_teardown(j)
+      }
+      j = j + 1
+    }
+  }
 
   var i: u32 = 0
   while i < MAX_SANDBOXES {
@@ -338,6 +370,10 @@ export fn sandbox_check_memory(sandbox_id: u32, requested_bytes: u64): u32 {
   var sb: *Sandbox = sandbox_find(sandbox_id)
   if sb == 0 { return 1 }  // No sandbox, allow
 
+  // Detect overflow on `memory_usage + requested_bytes`. A crafted
+  // allocation near u64 max would wrap `new_usage` to a small value
+  // and slip past the limit check below.
+  if requested_bytes > 0xFFFFFFFFFFFFFFFF - sb.memory_usage { return 0 }
   var new_usage: u64 = sb.memory_usage + requested_bytes
 
   if new_usage > sb.limits.memory_limit_bytes {

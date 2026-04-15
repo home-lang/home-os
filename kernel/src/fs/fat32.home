@@ -123,20 +123,73 @@ var fat_cache: [u8; 512]
 var fat_cache_sector: u32 = 0xFFFFFFFF
 var fat_cache_valid: u32 = 0
 
-// Cluster cache (4 clusters)
-var cluster_cache: [[u8; 32768]; 4]  // Max 8 sectors/cluster * 4KB
+// Cluster cache: heap-allocated on first mount rather than reserved
+// statically. FIX R5 #13: The previous `[[u8; 32768]; 4]` was a
+// 128 KiB always-resident array, wasted on every system that doesn't
+// mount a FAT32 volume. `fat32_alloc_cluster_cache()` lazily allocates
+// the four cache slots and `fat32_free_cluster_cache()` releases them
+// on unmount.
+const CLUSTER_CACHE_SLOTS: u32 = 4
+const CLUSTER_CACHE_SLOT_BYTES: u32 = 32768  // Max 8 sectors/cluster × 4 KiB
+
+var cluster_cache_ptrs: [u64; 4]
 var cluster_cache_tags: [u32; 4]
 var cluster_cache_valid: [u32; 4]
 var cluster_cache_next: u32 = 0
+var cluster_cache_ready: u32 = 0
+
+export fn fat32_alloc_cluster_cache(): u32 {
+  if cluster_cache_ready == 1 { return 0 }
+  var i: u32 = 0
+  while i < CLUSTER_CACHE_SLOTS {
+    let p: u64 = memory.kmalloc(CLUSTER_CACHE_SLOT_BYTES)
+    if p == 0 {
+      var j: u32 = 0
+      while j < i {
+        memory.kfree(cluster_cache_ptrs[j])
+        cluster_cache_ptrs[j] = 0
+        j = j + 1
+      }
+      return 1
+    }
+    cluster_cache_ptrs[i] = p
+    cluster_cache_valid[i] = 0
+    cluster_cache_tags[i] = 0
+    i = i + 1
+  }
+  cluster_cache_ready = 1
+  return 0
+}
+
+export fn fat32_free_cluster_cache(): void {
+  if cluster_cache_ready == 0 { return }
+  var i: u32 = 0
+  while i < CLUSTER_CACHE_SLOTS {
+    if cluster_cache_ptrs[i] != 0 {
+      memory.kfree(cluster_cache_ptrs[i])
+      cluster_cache_ptrs[i] = 0
+    }
+    cluster_cache_valid[i] = 0
+    cluster_cache_tags[i] = 0
+    i = i + 1
+  }
+  cluster_cache_ready = 0
+}
 
 // ============================================================================
 // STRING UTILITIES
 // ============================================================================
 
+// FIX R5 #12: Bound the scan so a malformed string from disk can't
+// walk past a sector buffer into uninitialised memory. FAT32 names
+// fit in 255 UTF-16 code units; 4096 provides comfortable slack and
+// refuses to spin forever on unterminated input.
+const FAT32_STR_MAX: u32 = 4096
+
 fn str_len(s: u64): u32 {
   var ptr: *u8 = @ptrFromInt(s)
   var len: u32 = 0
-  while ptr[len] != 0 {
+  while len < FAT32_STR_MAX and ptr[len] != 0 {
     len = len + 1
   }
   return len
@@ -289,10 +342,12 @@ fn fat32_name_to_83(name: u64, out_name: u64) {
     i = i + 1
   }
 
-  // Find dot position
+  // Find dot position. Cap the scan at FAT32_MAX_NAME so an untrusted
+  // unterminated `name_ptr` (e.g. from a corrupted directory entry)
+  // can't walk off the end of the buffer.
   var dot_pos: u32 = 0
   i = 0
-  while name_ptr[i] != 0 {
+  while i < FAT32_STR_MAX and name_ptr[i] != 0 {
     if name_ptr[i] == 46 {  // '.'
       dot_pos = i
       break
@@ -309,11 +364,12 @@ fn fat32_name_to_83(name: u64, out_name: u64) {
     i = i + 1
   }
 
-  // Copy extension part (max 3 chars)
+  // Copy extension part (max 3 chars). Same FAT32_STR_MAX guard so a
+  // name without a final null doesn't overrun its buffer.
   if dot_pos > 0 {
     var ext_idx: u32 = 8
     i = dot_pos + 1
-    while ext_idx < 11 and name_ptr[i] != 0 {
+    while ext_idx < 11 and i < FAT32_STR_MAX and name_ptr[i] != 0 {
       out_ptr[ext_idx] = to_upper(name_ptr[i])
       ext_idx = ext_idx + 1
       i = i + 1
@@ -501,10 +557,14 @@ export fn fat32_read_file(first_cluster: u32, offset: u64, buffer: u64, size: u6
       cluster_offset = offset - current_offset
     }
 
-    // Calculate bytes to copy
-    var to_copy: u32 = cluster_size - cluster_offset
-    if to_copy > (size - bytes_read) {
-      to_copy = size - bytes_read
+    // Calculate bytes to copy. Guard against bytes_read somehow
+    // exceeding size (chain corruption / off-by-one elsewhere) so
+    // `size - bytes_read` can't underflow into a huge positive u32.
+    if bytes_read >= size { break }
+    var remaining: u32 = size - bytes_read
+    var to_copy: u32 = if cluster_size >= cluster_offset { cluster_size - cluster_offset } else { 0 }
+    if to_copy > remaining {
+      to_copy = remaining
     }
 
     // Copy data
@@ -616,12 +676,20 @@ export fn fat32_init(): u32 {
     return 1
   }
 
-  // Calculate important values
+  // Calculate important values. Validate geometry fields from the
+  // boot sector before arithmetic — a malformed FAT32 volume with
+  // sectors_per_cluster == 0 would divide by zero, and crafted
+  // bytes_per_sector * sectors_per_cluster can overflow u32.
+  if boot_sector.bytes_per_sector == 0 { return 1 }
+  if boot_sector.sectors_per_cluster == 0 { return 1 }
   fat_start = boot_sector.reserved_sectors
   data_start = fat_start + (boot_sector.fat_count * boot_sector.sectors_per_fat_32)
-  cluster_size = boot_sector.bytes_per_sector * boot_sector.sectors_per_cluster
+  var cs64: u64 = @as(u64, boot_sector.bytes_per_sector) * @as(u64, boot_sector.sectors_per_cluster)
+  if cs64 > 0xFFFFFFFF { return 1 }
+  cluster_size = @intCast(cs64, u32)
 
   var total_sectors: u32 = if boot_sector.total_sectors_16 != 0 then boot_sector.total_sectors_16 else boot_sector.total_sectors_32
+  if total_sectors < data_start { return 1 }
   var data_sectors: u32 = total_sectors - data_start
   total_clusters = data_sectors / boot_sector.sectors_per_cluster
 

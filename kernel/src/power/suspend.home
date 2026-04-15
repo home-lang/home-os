@@ -293,7 +293,11 @@ export fn pm_suspend_to_ram(): i32 {
     suspend_ctx.resume_entry = &resume_entry as u64
 
     // ====== SUSPEND HAPPENS HERE ======
-    result = suspend_ctx.ops.enter(3)
+    // FIX R5 #6: Honour the caller's requested target_state; fall
+    // back to S3 only when no target was explicitly set.
+    var target: u32 = suspend_ctx.target_state
+    if target == 0 { target = 3 }
+    result = suspend_ctx.ops.enter(target)
     // ====== RESUME CONTINUES HERE ======
 
     // If we get here, we've resumed
@@ -387,11 +391,29 @@ fn enable_interrupts(): void {
     }
 }
 
-// Save state for all CPUs
+// FIX R5 #32: Save state for ALL online CPUs before suspending.
+// Previously only CPU 0 was saved — secondaries resumed with stale
+// state and triple-faulted. We now IPI every online secondary and
+// wait (with a timeout) for all of them to park.
 fn save_all_cpu_states(): i32 {
-    // For now, just save boot CPU
-    // Multi-CPU support would need IPI to other CPUs
+    // Save boot CPU first.
     if !cpu_state.save_cpu_state(0) {
+        return SUSPEND_ERR_CPU
+    }
+
+    let num_cpus: u32 = cpu_state.get_online_cpu_count()
+    var cpu: u32 = 1
+    while cpu < num_cpus {
+        if cpu_state.is_cpu_online(cpu) {
+            if !cpu_state.ipi_save_and_park(cpu) {
+                return SUSPEND_ERR_CPU
+            }
+        }
+        cpu = cpu + 1
+    }
+
+    // Wait for secondaries to acknowledge parked state.
+    if !cpu_state.wait_for_cpus_parked(num_cpus, 100000) {
         return SUSPEND_ERR_CPU
     }
     return SUSPEND_OK
@@ -518,9 +540,13 @@ export fn wakeup_register(name: *u8, type_mask: u32): u32 {
 
     basics.memset(src, 0, @sizeOf(WakeupSource))
 
+    // FIX R5 #7: Always write a NUL terminator. The old code clamped
+    // length but never zeroed `src.name[name_len]`, leaving later
+    // reads to walk into `src.type_mask`.
     let name_len = basics.strlen(name)
-    if name_len > 31 { name_len = 31 }
-    basics.memcpy(&src.name, name, name_len)
+    var copy_len: u32 = if name_len > 31 { 31 } else { name_len }
+    basics.memcpy(&src.name, name, copy_len)
+    src.name[copy_len] = 0
 
     src.type_mask = type_mask
     src.enabled = false
@@ -638,8 +664,18 @@ export fn suspend_is_active(): bool {
     return suspend_ctx.state != SUSPEND_IDLE
 }
 
-// Debug: Force resume (for testing)
+// Debug-only: Force resume (for testing).
+//
+// FIX R5 #33: Gate behind an explicit debug build flag so production
+// kernels cannot be coerced out of a suspended state without a real
+// wake event.
+const SUSPEND_DEBUG_BUILD: u32 = 0
+
 export fn suspend_force_resume(): void {
+    if SUSPEND_DEBUG_BUILD == 0 {
+        basics.print("suspend_force_resume: rejected (non-debug build)\n")
+        return
+    }
     if suspend_ctx.state != SUSPEND_IDLE {
         resume_from_suspend()
     }

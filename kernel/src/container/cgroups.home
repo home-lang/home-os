@@ -619,6 +619,10 @@ export fn cgroup_set_cpu_quota(cg_id: u32, quota_us: i64, period_us: u64): u32 {
   if cg_id >= cgroup_count { return 0 }
   if (cgroups[cg_id].enabled_controllers & CGROUP_CPU) == 0 { return 0 }
 
+  // Reject a zero period — cgroup_cpu_should_throttle() uses it as a
+  // modulus and would divide by zero otherwise.
+  if period_us == 0 { return 0 }
+
   cgroups[cg_id].cpu.cfs_quota_us = quota_us
   cgroups[cg_id].cpu.cfs_period_us = period_us
 
@@ -649,6 +653,9 @@ export fn cgroup_cpu_should_throttle(cg_id: u32): u32 {
   if (cgroups[cg_id].enabled_controllers & CGROUP_CPU) == 0 { return 0 }
 
   if cgroups[cg_id].cpu.cfs_quota_us < 0 { return 0 }  // Unlimited
+  // A zero period means "never configured"; treat as unlimited rather
+  // than dividing by zero on the modulus below.
+  if cgroups[cg_id].cpu.cfs_period_us == 0 { return 0 }
 
   // Check if quota exceeded for current period
   var period_usage: u64 = cgroups[cg_id].cpu.usage_usec % cgroups[cg_id].cpu.cfs_period_us
@@ -730,25 +737,46 @@ export fn cgroup_set_memory_high(cg_id: u32, high_bytes: u64): u32 {
   return 1
 }
 
-// Memory controller: charge memory
+// Memory controller: charge memory.
+//
+// FIX R3 #15: Atomic compare-and-swap to close the TOCTOU race. The
+// old check-then-add let N concurrent callers all observe
+// current + bytes ≤ limit simultaneously and then each add `bytes`,
+// pushing usage up to (N × bytes) beyond the limit. We now loop on
+// CAS: read current, compute new, CAS. If CAS fails, another CPU
+// raced us — re-read and retry.
 export fn cgroup_memory_charge(cg_id: u32, bytes: u64): u32 {
   if cg_id >= cgroup_count { return 0 }
   if (cgroups[cg_id].enabled_controllers & CGROUP_MEMORY) == 0 { return 1 }
 
-  // Check against limit
-  if cgroups[cg_id].memory.current_bytes + bytes > cgroups[cg_id].memory.limit_bytes {
-    cgroups[cg_id].memory.failcnt = cgroups[cg_id].memory.failcnt + 1
-    return 0  // Would exceed limit
+  var limit: u64 = cgroups[cg_id].memory.limit_bytes
+
+  loop {
+    var current: u64 = foundation.atomic_load_u64(@intFromPtr(&cgroups[cg_id].memory.current_bytes))
+    // Check overflow-safely: would current + bytes exceed limit?
+    if limit > 0 and current > limit - bytes {
+      // Increment failcnt atomically and bail.
+      foundation.atomic_add_u64(@intFromPtr(&cgroups[cg_id].memory.failcnt), 1)
+      return 0
+    }
+    var new_value: u64 = current + bytes
+    if foundation.atomic_cas_u64(@intFromPtr(&cgroups[cg_id].memory.current_bytes), current, new_value) == 1 {
+      // Update max usage (best-effort; may race, but the max is
+      // monotonically non-decreasing so this still converges).
+      var prev_max: u64 = foundation.atomic_load_u64(@intFromPtr(&cgroups[cg_id].memory.max_usage_bytes))
+      while new_value > prev_max {
+        if foundation.atomic_cas_u64(@intFromPtr(&cgroups[cg_id].memory.max_usage_bytes), prev_max, new_value) == 1 {
+          break
+        }
+        prev_max = foundation.atomic_load_u64(@intFromPtr(&cgroups[cg_id].memory.max_usage_bytes))
+      }
+      break
+    }
+    // CAS failed — another CPU charged concurrently. Retry.
   }
 
-  cgroups[cg_id].memory.current_bytes = cgroups[cg_id].memory.current_bytes + bytes
-
-  // Update max usage
-  if cgroups[cg_id].memory.current_bytes > cgroups[cg_id].memory.max_usage_bytes {
-    cgroups[cg_id].memory.max_usage_bytes = cgroups[cg_id].memory.current_bytes
-  }
-
-  // Propagate to parent
+  // Propagate to parent (recursive is fine: depth is bounded by
+  // cgroup hierarchy nesting which the kernel caps).
   if cgroups[cg_id].parent != 0xFFFFFFFF {
     return cgroup_memory_charge(cgroups[cg_id].parent, bytes)
   }

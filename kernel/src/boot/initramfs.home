@@ -75,36 +75,52 @@ export fn initramfs_init(base: u64, size: u64) {
   foundation.serial_write_string("\n")
 }
 
-// Detect compression type
+// Detect compression type.
+//
+// FIX R5 #3: The previous code cast the buffer to `*u16` and compared
+// to a host-order constant. On big-endian machines that fails to
+// match gzip headers (which are stored as the byte pair 0x1F 0x8B on
+// disk). Read each byte individually so detection works regardless
+// of host endianness.
 fn detect_compression(addr: u64): u32 {
-  let magic_ptr: *u16 = addr
+  let b0: u8 = @as(*u8, @ptrFromInt(addr)).*
+  let b1: u8 = @as(*u8, @ptrFromInt(addr + 1)).*
 
-  // Check for gzip magic (0x1f8b)
-  if *magic_ptr == 0x8b1f {
+  // gzip: 0x1F 0x8B
+  if b0 == 0x1F and b1 == 0x8B {
     return COMPRESSION_GZIP
   }
 
-  // Check for bzip2 magic ("BZ")
-  if *magic_ptr == 0x5a42 {
+  // bzip2: "BZ" (0x42 0x5A)
+  if b0 == 0x42 and b1 == 0x5A {
     return COMPRESSION_BZIP2
   }
 
-  // Check for CPIO magic
-  let cpio_magic_ptr: *u32 = addr
-  let first_word: u32 = *cpio_magic_ptr
-
-  // "0707" in ASCII
-  if (first_word & 0xFFFFFFFF) == 0x37303730 {
+  // CPIO newc: literal ASCII "0707"
+  let b2: u8 = @as(*u8, @ptrFromInt(addr + 2)).*
+  let b3: u8 = @as(*u8, @ptrFromInt(addr + 3)).*
+  if b0 == '0' and b1 == '7' and b2 == '0' and b3 == '7' {
     return COMPRESSION_NONE
   }
 
   return COMPRESSION_NONE
 }
 
-// Parse hex string from CPIO header
+// Parse hex string from CPIO header.
+//
+// FIX R5 #5, #34: Reject non-hex characters instead of silently
+// treating them as 0 (which corrupted every computed offset). Also
+// switch the C-style `&&` to Home-style `and` for consistency with
+// the rest of the file.
+//
+// Returns 0 on a malformed input; callers should compare against an
+// explicit sentinel or record whether parse_hex_valid last returned true.
+var parse_hex_valid: u32 = 1
+
 fn parse_hex(data: *u8, len: u32): u64 {
   var result: u64 = 0
   var i: u32 = 0
+  parse_hex_valid = 1
 
   loop {
     if i >= len { break }
@@ -114,12 +130,15 @@ fn parse_hex(data: *u8, len: u32): u64 {
 
     result = result << 4
 
-    if ch >= '0' && ch <= '9' {
-      result = result | (ch - '0')
-    } else if ch >= 'a' && ch <= 'f' {
-      result = result | (ch - 'a' + 10)
-    } else if ch >= 'A' && ch <= 'F' {
-      result = result | (ch - 'A' + 10)
+    if ch >= '0' and ch <= '9' {
+      result = result | @as(u64, ch - '0')
+    } else if ch >= 'a' and ch <= 'f' {
+      result = result | @as(u64, ch - 'a' + 10)
+    } else if ch >= 'A' and ch <= 'F' {
+      result = result | @as(u64, ch - 'A' + 10)
+    } else {
+      // Malformed hex digit — flag failure so the caller can abort.
+      parse_hex_valid = 0
     }
 
     i = i + 1
@@ -128,31 +147,67 @@ fn parse_hex(data: *u8, len: u32): u64 {
   return result
 }
 
-// Simple gzip decompression (inflate algorithm)
-// Simplified version - real implementation would be more complete
+// Gzip decompression.
+//
+// FIX R5 #1: The previous "decompress" was a byte-copy that produced
+// garbage when called on actually-compressed data. DEFLATE is a
+// substantial algorithm; rather than ship a broken stub that
+// silently corrupts initramfs data, refuse and return 0 so the
+// caller surfaces the failure. A minimal stored-block fast-path is
+// included for the case where the payload uses DEFLATE with only
+// stored (type=00) blocks (as some mkinitramfs configurations do).
 fn decompress_gzip(src: u64, src_len: u64, dst: u64, dst_capacity: u64): u64 {
-  // Skip gzip header (10 bytes minimum)
+  // Need at least 10-byte gzip header + 2-byte DEFLATE block header.
+  if src_len < 12 { return 0 }
+
+  // Verify gzip magic 0x1f 0x8b.
+  let m0: u8 = @as(*u8, @ptrFromInt(src)).*
+  let m1: u8 = @as(*u8, @ptrFromInt(src + 1)).*
+  if m0 != 0x1F or m1 != 0x8B { return 0 }
+
+  // Skip fixed 10-byte header; a full decoder would also consume
+  // optional fields FNAME / FCOMMENT / FHCRC / FEXTRA based on FLG byte.
+  let flg: u8 = @as(*u8, @ptrFromInt(src + 3)).*
   var src_offset: u64 = 10
-  var dst_offset: u64 = 0
+  // Reject FEXTRA (0x04) / FNAME (0x08) / FCOMMENT (0x10) / FHCRC (0x02)
+  // because we don't skip them. A real implementation would parse them.
+  if (flg & 0x1E) != 0 { return 0 }
 
-  // This is a placeholder for actual inflate implementation
-  // In production, would implement full DEFLATE algorithm
+  // DEFLATE stored-block fast path: block header BFINAL=1, BTYPE=00.
+  // Layout: [1 byte block header] [2 byte LEN] [2 byte NLEN] [LEN bytes raw]
+  // We only accept a single final stored block (the format mkinitramfs
+  // --format=cpio --compressor=stored produces).
+  let block_header: u8 = @as(*u8, @ptrFromInt(src + src_offset)).*
+  if (block_header & 0x07) != 0x01 {
+    // Not BFINAL=1, BTYPE=00 — we cannot decode this.
+    return 0
+  }
+  src_offset = src_offset + 1
 
-  // For now, just copy data (assuming uncompressed)
-  loop {
-    if src_offset >= src_len { break }
-    if dst_offset >= dst_capacity { break }
+  if src_offset + 4 > src_len { return 0 }
+  let len_lo: u8 = @as(*u8, @ptrFromInt(src + src_offset)).*
+  let len_hi: u8 = @as(*u8, @ptrFromInt(src + src_offset + 1)).*
+  let nlen_lo: u8 = @as(*u8, @ptrFromInt(src + src_offset + 2)).*
+  let nlen_hi: u8 = @as(*u8, @ptrFromInt(src + src_offset + 3)).*
+  src_offset = src_offset + 4
 
-    let src_ptr: *u8 = src + src_offset
-    let dst_ptr: *u8 = dst + dst_offset
+  var block_len: u32 = (@as(u32, len_hi) << 8) | @as(u32, len_lo)
+  var block_nlen: u32 = (@as(u32, nlen_hi) << 8) | @as(u32, nlen_lo)
+  // DEFLATE invariant: NLEN is the one's complement of LEN.
+  if (block_len ^ 0xFFFF) != block_nlen { return 0 }
 
-    *dst_ptr = *src_ptr
+  if src_offset + @as(u64, block_len) > src_len { return 0 }
+  if @as(u64, block_len) > dst_capacity { return 0 }
 
-    src_offset = src_offset + 1
-    dst_offset = dst_offset + 1
+  // Copy stored block bytes verbatim.
+  var copied: u64 = 0
+  while copied < @as(u64, block_len) {
+    let s: u8 = @as(*u8, @ptrFromInt(src + src_offset + copied)).*
+    @as(*u8, @ptrFromInt(dst + copied)).* = s
+    copied = copied + 1
   }
 
-  return dst_offset
+  return copied
 }
 
 // Align offset to 4-byte boundary
@@ -221,37 +276,53 @@ export fn initramfs_extract(): u32 {
     let header_ptr: *CpioHeader = data_base + offset
     let header: *CpioHeader = header_ptr
 
-    // Check magic
-    if header.magic[0] != '0' || header.magic[1] != '7' ||
-       header.magic[2] != '0' || header.magic[3] != '7' {
+    // Check magic. FIX R5 #34: use Home's `or` instead of C's `||`.
+    if header.magic[0] != '0' or header.magic[1] != '7' or
+       header.magic[2] != '0' or header.magic[3] != '7' {
       foundation.serial_write_string("[InitramFS] Invalid CPIO magic, stopping\n")
       break
     }
 
-    // Parse header fields
+    // Parse header fields and abort on any malformed hex.
+    // FIX R5 #5: silently accepting bad characters used to scale the
+    // computed offsets by ~16× per bad digit, overrunning the buffer.
     let namesize: u64 = parse_hex(&header.namesize[0], 8)
+    if parse_hex_valid == 0 { break }
     let filesize: u64 = parse_hex(&header.filesize[0], 8)
+    if parse_hex_valid == 0 { break }
     let mode: u64 = parse_hex(&header.mode[0], 8)
+    if parse_hex_valid == 0 { break }
 
     offset = offset + CPIO_HEADER_SIZE
 
-    // Read filename
-    if offset + namesize > data_size { break }
+    // Read filename. All size comparisons use the remaining-budget
+    // form (`field > data_size - offset`) so a hex field crafted to
+    // be near u64 max can't wrap `offset + field` around zero and
+    // sneak past the bounds check.
+    if offset > data_size { break }
+    if namesize > data_size - offset { break }
 
     let filename_ptr: *u8 = data_base + offset
     offset = offset + namesize
     offset = align_4(offset)
 
-    // Check for TRAILER (end marker)
+    // FIX R5 #2: Match the full "TRAILER!!!" sentinel rather than
+    // just the first two characters. The old check accepted any file
+    // whose name began with "TR" (e.g. "TRACE-000", "TRAINING.log")
+    // and prematurely terminated extraction.
     let is_trailer: u32 = 0
     if namesize == 11 {  // "TRAILER!!!" + null
-      let t_ptr: *u8 = filename_ptr
-      if *t_ptr == 'T' {
-        let r_ptr: *u8 = filename_ptr + 1
-        if *r_ptr == 'R' {
-          is_trailer = 1
-        }
+      let expected: [u8; 11] = [
+        'T','R','A','I','L','E','R','!','!','!', 0
+      ]
+      var m: u32 = 0
+      var ok: u32 = 1
+      while m < 11 {
+        let cur: u8 = @as(*u8, @ptrFromInt(@intFromPtr(filename_ptr) + m)).*
+        if cur != expected[m] { ok = 0; break }
+        m = m + 1
       }
+      if ok == 1 { is_trailer = 1 }
     }
 
     if is_trailer == 1 {
@@ -261,7 +332,8 @@ export fn initramfs_extract(): u32 {
 
     // Extract file data
     if filesize > 0 {
-      if offset + filesize > data_size { break }
+      if offset > data_size { break }
+      if filesize > data_size - offset { break }
 
       // Check if directory (mode & 0x4000)
       if (mode & 0x4000) != 0 {
@@ -284,8 +356,10 @@ export fn initramfs_extract(): u32 {
     }
   }
 
-  // Free decompression buffer if used
-  if initramfs_compression == COMPRESSION_GZIP {
+  // FIX R5 #4: Free the decompression buffer for ANY compression,
+  // not just gzip. Previously a bzip2/LZMA path would allocate but
+  // never free, leaking the full decompressed image until reboot.
+  if initramfs_compression != COMPRESSION_NONE and data_base != initramfs_base {
     memory.kfree(data_base)
   }
 

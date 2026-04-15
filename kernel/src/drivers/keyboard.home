@@ -143,21 +143,42 @@ export fn keyboard_init() {
   // Enable keyboard
   keyboard_send_command(0xAE)
   
-  // Reset keyboard
-  keyboard_send_data(CMD_RESET)
-  var response: u8 = keyboard_read_data()
-  
-  if response == 0xFA {
-    // ACK received, wait for self-test result
-    response = keyboard_read_data()
-    if response == 0xAA {
-      foundation.serial_write_string("[Keyboard] Self-test passed\n")
+  // Reset keyboard with retry-on-failure path.
+  //
+  // FIX R4 #28: If the first response isn't ACK (0xFA), the old code
+  // simply skipped the self-test read, leaving the hardware pipeline
+  // with a stray byte that poisoned the next command's response.
+  // We now drain any unexpected byte, retry the reset a few times,
+  // and only declare success once both ACK and self-test-pass are seen.
+  var reset_attempts: u32 = 0
+  var reset_ok: u32 = 0
+  while reset_attempts < 3 and reset_ok == 0 {
+    keyboard_send_data(CMD_RESET)
+    var response: u8 = keyboard_read_data()
+    if response == 0xFA {
+      // ACK received; wait for self-test result (up to 500ms worth of polling).
+      response = keyboard_read_data()
+      if response == 0xAA {
+        foundation.serial_write_string("[Keyboard] Self-test passed\n")
+        reset_ok = 1
+      } else {
+        foundation.serial_write_string("[Keyboard] Self-test failed, retrying\n")
+      }
+    } else {
+      // Drain any stray byte the controller might have queued so it
+      // doesn't confuse the next command.
+      foundation.inb(KEYBOARD_DATA_PORT)
+      foundation.serial_write_string("[Keyboard] Reset NAK, retrying\n")
     }
+    reset_attempts = reset_attempts + 1
   }
-  
-  // Enable scanning
+
+  // Enable scanning (best-effort: tolerate missing ACK).
   keyboard_send_data(CMD_ENABLE)
-  keyboard_read_data()  // Read ACK
+  var enable_resp: u8 = keyboard_read_data()
+  if enable_resp != 0xFA {
+    foundation.serial_write_string("[Keyboard] Enable did not ACK\n")
+  }
   
   // Clear buffer
   buffer_read_pos = 0
@@ -239,29 +260,41 @@ fn keyboard_process_scancode(scancode: u8) {
 // KEYBOARD BUFFER
 // ============================================================================
 
+// FIX R4 #4: Keyboard ring buffer is shared between the IRQ handler
+// (producer) and thread-context getchar (consumer). Disable interrupts
+// around all three-field updates so an IRQ can't preempt the RMW and
+// leave the counter inconsistent with read/write positions.
 fn keyboard_buffer_add(ch: u8) {
+  var flags: u64 = foundation.irq_save()
   if buffer_count >= KEYBOARD_BUFFER_SIZE {
+    foundation.irq_restore(flags)
     return  // Buffer full
   }
-  
+
   keyboard_buffer[buffer_write_pos] = ch
   buffer_write_pos = (buffer_write_pos + 1) % KEYBOARD_BUFFER_SIZE
   buffer_count = buffer_count + 1
+  foundation.irq_restore(flags)
 }
 
 export fn keyboard_getchar(): u8 {
+  var flags: u64 = foundation.irq_save()
   if buffer_count == 0 {
+    foundation.irq_restore(flags)
     return 0  // No character available
   }
-  
+
   var ch: u8 = keyboard_buffer[buffer_read_pos]
   buffer_read_pos = (buffer_read_pos + 1) % KEYBOARD_BUFFER_SIZE
   buffer_count = buffer_count - 1
-  
+  foundation.irq_restore(flags)
+
   return ch
 }
 
 export fn keyboard_has_char(): u32 {
+  // Single 32-bit read is atomic on aligned accesses; this is safe
+  // to read without saving interrupt state.
   return buffer_count > 0
 }
 

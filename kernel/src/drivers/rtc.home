@@ -6,6 +6,13 @@ import "../core/foundation.home" as foundation
 const CMOS_ADDRESS: u16 = 0x70
 const CMOS_DATA: u16 = 0x71
 
+// Status register A: bit 7 = update-in-progress (UIP).
+const CMOS_STATUS_A: u8 = 0x0A
+// Status register B: bit 1 = 24-hour mode, bit 2 = binary mode (clear = BCD).
+const CMOS_STATUS_B: u8 = 0x0B
+// Century register (standard position when BIOS supports it).
+const CMOS_CENTURY: u8 = 0x32
+
 fn cmos_read(reg: u8): u8 {
   foundation.outb(CMOS_ADDRESS, reg)
   return foundation.inb(CMOS_DATA)
@@ -15,45 +22,144 @@ fn bcd_to_binary(bcd: u8): u8 {
   return ((bcd >> 4) * 10) + (bcd & 0x0F)
 }
 
+// FIX R4 #24: Wait for the RTC to finish any in-progress update
+// before reading time registers, so the caller doesn't see a
+// half-updated clock. UIP typically takes <2ms.
+fn rtc_wait_not_updating() {
+  var timeout: u32 = 1000000
+  while timeout > 0 {
+    if (cmos_read(CMOS_STATUS_A) & 0x80) == 0 { return }
+    timeout = timeout - 1
+  }
+}
+
+// FIX R4 #25: Some RTCs run in binary mode; status register B bit 2
+// indicates this. Apply bcd_to_binary conditionally so binary-mode
+// readouts aren't corrupted by the BCD "conversion".
+fn rtc_decode(raw: u8): u8 {
+  var status_b: u8 = cmos_read(CMOS_STATUS_B)
+  if (status_b & 0x04) != 0 {
+    // Binary mode — no conversion needed.
+    return raw
+  }
+  return bcd_to_binary(raw)
+}
+
 export fn rtc_init() {
   foundation.serial_write_string("[RTC] Initialized\n")
 }
 
 export fn rtc_get_second(): u8 {
-  return bcd_to_binary(cmos_read(0x00))
+  rtc_wait_not_updating()
+  return rtc_decode(cmos_read(0x00))
 }
 
 export fn rtc_get_minute(): u8 {
-  return bcd_to_binary(cmos_read(0x02))
+  rtc_wait_not_updating()
+  return rtc_decode(cmos_read(0x02))
 }
 
 export fn rtc_get_hour(): u8 {
-  return bcd_to_binary(cmos_read(0x04))
+  rtc_wait_not_updating()
+  return rtc_decode(cmos_read(0x04))
 }
 
 export fn rtc_get_day(): u8 {
-  return bcd_to_binary(cmos_read(0x07))
+  rtc_wait_not_updating()
+  return rtc_decode(cmos_read(0x07))
 }
 
 export fn rtc_get_month(): u8 {
-  return bcd_to_binary(cmos_read(0x08))
+  rtc_wait_not_updating()
+  return rtc_decode(cmos_read(0x08))
 }
 
+// FIX R4 #26: Use the century register when BIOS supplies one; fall
+// back to the legacy 2000+YY behaviour otherwise so the year isn't
+// stuck in the 21st century forever.
 export fn rtc_get_year(): u16 {
-  var year: u16 = bcd_to_binary(cmos_read(0x09))
-  return 2000 + year
+  rtc_wait_not_updating()
+  var year_raw: u8 = cmos_read(0x09)
+  var year_in_cent: u16 = @as(u16, rtc_decode(year_raw))
+
+  var century_raw: u8 = cmos_read(CMOS_CENTURY)
+  var century: u16 = @as(u16, rtc_decode(century_raw))
+
+  // Plausibility check: valid centuries are 19..30; otherwise use the
+  // legacy fixed 20xx mapping.
+  if century >= 19 and century <= 30 {
+    return century * 100 + year_in_cent
+  }
+  return 2000 + year_in_cent
+}
+
+// FIX R4 #27: Atomic snapshot. The RTC can tick between any two
+// reads, so we read all fields, check UIP wasn't set during the read,
+// and retry if the clock might have ticked. Classic CMOS atomic-read
+// pattern — compare second reading to first; if different, retry.
+fn rtc_read_snapshot(year: *u64, month: *u64, day: *u64, hour: *u64, minute: *u64, second: *u64) {
+  var attempts: u32 = 0
+  loop {
+    rtc_wait_not_updating()
+    var s1: u8 = rtc_decode(cmos_read(0x00))
+    var m1: u8 = rtc_decode(cmos_read(0x02))
+    var h1: u8 = rtc_decode(cmos_read(0x04))
+    var d1: u8 = rtc_decode(cmos_read(0x07))
+    var mo1: u8 = rtc_decode(cmos_read(0x08))
+    var y1: u16 = rtc_get_year()
+
+    // Re-read and compare.
+    rtc_wait_not_updating()
+    var s2: u8 = rtc_decode(cmos_read(0x00))
+    var m2: u8 = rtc_decode(cmos_read(0x02))
+    var h2: u8 = rtc_decode(cmos_read(0x04))
+    var d2: u8 = rtc_decode(cmos_read(0x07))
+    var mo2: u8 = rtc_decode(cmos_read(0x08))
+    var y2: u16 = rtc_get_year()
+
+    if s1 == s2 and m1 == m2 and h1 == h2 and d1 == d2 and mo1 == mo2 and y1 == y2 {
+      year.* = @as(u64, y1)
+      month.* = @as(u64, mo1)
+      day.* = @as(u64, d1)
+      hour.* = @as(u64, h1)
+      minute.* = @as(u64, m1)
+      second.* = @as(u64, s1)
+      return
+    }
+
+    attempts = attempts + 1
+    if attempts > 5 {
+      // Clock is extremely unstable; return the last consistent
+      // single-read value rather than spinning forever.
+      year.* = @as(u64, y2)
+      month.* = @as(u64, mo2)
+      day.* = @as(u64, d2)
+      hour.* = @as(u64, h2)
+      minute.* = @as(u64, m2)
+      second.* = @as(u64, s2)
+      return
+    }
+  }
 }
 
 export fn rtc_get_timestamp(): u64 {
-  var year: u64 = rtc_get_year()
-  var month: u64 = rtc_get_month()
-  var day: u64 = rtc_get_day()
-  var hour: u64 = rtc_get_hour()
-  var minute: u64 = rtc_get_minute()
-  var second: u64 = rtc_get_second()
-  
+  var year: u64 = 0
+  var month: u64 = 0
+  var day: u64 = 0
+  var hour: u64 = 0
+  var minute: u64 = 0
+  var second: u64 = 0
+  rtc_read_snapshot(&year, &month, &day, &hour, &minute, &second)
+
+  // Clamp obviously bogus RTC readings so the month_days[] indexing
+  // and `day - 1` can't walk off the array or underflow.
+  if month < 1 or month > 12 { return 0 }
+  if day < 1 or day > 31 { return 0 }
+  if hour > 23 or minute > 59 or second > 60 { return 0 }
+  if year < 1970 { return 0 }
+
   // Approximate Unix timestamp (seconds since 1970-01-01)
-  // Account for leap years and actual month lengths
+  // Account for leap years and actual month lengths.
   var days: u64 = 0
 
   // Years since 1970
@@ -74,11 +180,17 @@ export fn rtc_get_timestamp(): u64 {
     is_leap = 1
   }
 
+  // FIX R4 #35: Add the leap day once we've passed February rather
+  // than only when `m == 2` (which the loop condition `m < month`
+  // actively excludes). This now correctly accounts for Feb 29 on
+  // any date in March or later of a leap year.
   var m: u64 = 1
   while m < month {
     days = days + month_days[m - 1]
-    if m == 2 and is_leap == 1 { days = days + 1 }
     m = m + 1
+  }
+  if is_leap == 1 and month > 2 {
+    days = days + 1
   }
 
   days = days + (day - 1)

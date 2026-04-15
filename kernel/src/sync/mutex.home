@@ -525,7 +525,15 @@ export fn rwmutex_try_read_lock(rw: *RWMutex): u32 {
     return 0
 }
 
-// Acquire write lock (exclusive)
+// Acquire write lock (exclusive).
+//
+// FIX R3 #1 and R3 #5: The previous implementation allocated a
+// WaitQueueEntry, added it to the queue, slept, and then looped
+// back WITHOUT removing/freeing the entry. That leaked an entry
+// per wait cycle (eventually exhausting the 64-entry pool) and
+// left dangling entries in the writer queue that caused spurious
+// wakeups for future writers. Now we always remove & free the
+// entry on every exit path — woken, state-cleared, or spurious.
 export fn rwmutex_write_lock(rw: *RWMutex) {
     var current_pid: u32 = get_current_pid()
 
@@ -552,6 +560,11 @@ export fn rwmutex_write_lock(rw: *RWMutex) {
         while entry.woken == 0 and rw.state != 0 {
             scheduler.block_current()
         }
+
+        // ALWAYS detach and free the wait entry before looping back.
+        // Both the "woken by signal" and "state became 0" paths reach here.
+        waitqueue_remove(&rw.writer_queue, entry)
+        free_wait_entry(entry)
     }
 }
 
@@ -608,7 +621,13 @@ export fn condvar_init(cv: *CondVar) {
     cv.signal_count = 0
 }
 
-// Wait on condition (must hold mutex)
+// Wait on condition (must hold mutex).
+//
+// FIX R3 #3: Previously, after being woken the entry was left in
+// cv.waiters and never freed. Subsequent condvar_signal /
+// condvar_broadcast calls would try to wake a PID that had already
+// moved on — crashes or invisible wakeups. Both exit paths (true
+// signal or spurious wake) now remove and free the entry.
 export fn condvar_wait(cv: *CondVar, mutex: *Mutex) {
     var current_pid: u32 = get_current_pid()
 
@@ -631,6 +650,11 @@ export fn condvar_wait(cv: *CondVar, mutex: *Mutex) {
     while entry.woken == 0 and cv.signal_count == current_signal {
         scheduler.block_current()
     }
+
+    // Clean up BEFORE reacquiring the mutex so we never hold the
+    // mutex across a potentially slow free call.
+    waitqueue_remove(&cv.waiters, entry)
+    free_wait_entry(entry)
 
     // Reacquire mutex
     mutex_lock(mutex)
@@ -663,6 +687,12 @@ export fn condvar_wait_timeout(cv: *CondVar, mutex: *Mutex, timeout_ms: u32): u3
         }
         scheduler.block_current_timeout(1)
     }
+
+    // FIX R3 #4: Signal-based exit also needs cleanup. The old code
+    // only freed on the timeout branch, leaking the entry on the
+    // common success path.
+    waitqueue_remove(&cv.waiters, entry)
+    free_wait_entry(entry)
 
     mutex_lock(mutex)
     return 1

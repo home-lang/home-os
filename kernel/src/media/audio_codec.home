@@ -54,6 +54,11 @@ export fn audio_codec_init() {
 
 export fn audio_codec_create(codec_type: u32, sample_rate: u32, channels: u32): u32 {
   if audio_decoder_count >= MAX_AUDIO_DECODERS { return 0xFFFFFFFF }
+  // Reject obviously nonsensical parameters up-front. Downstream code
+  // divides by channels / sample_rate, and channels > 8 has no
+  // legitimate use for the codecs listed below.
+  if sample_rate < 8000 or sample_rate > 192000 { return 0xFFFFFFFF }
+  if channels == 0 or channels > 8 { return 0xFFFFFFFF }
 
   var id: u32 = audio_decoder_count
 
@@ -160,13 +165,33 @@ fn mp3_parse_header(data: u64): MP3FrameHeader {
   header.padding = (b2 >> 1) & 0x01
   header.channel_mode = (b3 >> 6) & 0x03
 
-  // Calculate frame size (guard against zero sample_rate)
-  if header.sample_rate == 0 {
+  // Calculate frame size with overflow guards.
+  // FIX R3 #27: The original multiplications `12 * bitrate * 1000` or
+  // `144 * bitrate * 1000` overflow u32 for large-but-legal bitrates
+  // (320 kbps: 144 * 320 * 1000 = 46_080_000 — safe, but arbitrary
+  // attacker-controlled values in malformed headers push past
+  // 4_294_967_295). Bound bitrate to 448 kbps (MPEG-1 max) and use
+  // u64 arithmetic intermediately.
+  if header.sample_rate == 0 or header.sample_rate > 96000 {
     header.frame_size = 0
-  } else if header.layer == 3 {  // Layer 1
-    header.frame_size = (12 * header.bitrate * 1000 / header.sample_rate + header.padding) * 4
-  } else {  // Layer 2 or 3
-    header.frame_size = 144 * header.bitrate * 1000 / header.sample_rate + header.padding
+  } else if header.bitrate == 0 or header.bitrate > 448 {
+    // Invalid or out-of-spec bitrate; reject.
+    header.frame_size = 0
+  } else {
+    var br: u64 = @as(u64, header.bitrate) * 1000
+    var sr: u64 = @as(u64, header.sample_rate)
+    var pad: u64 = @as(u64, header.padding)
+    var computed: u64 = 0
+    if header.layer == 3 {  // Layer 1
+      computed = (12 * br / sr + pad) * 4
+    } else {  // Layer 2 or 3
+      computed = 144 * br / sr + pad
+    }
+    // MPEG frame size realistically caps at ~5 KiB; anything larger
+    // is malformed. Clamp to a sane upper bound to keep downstream
+    // buffers sized correctly.
+    if computed > 8192 { computed = 0 }
+    header.frame_size = @intCast(computed, u32)
   }
 
   return header
@@ -315,10 +340,26 @@ fn flac_parse_streaminfo(data: u64): FLACStreamInfo {
 export fn flac_decode_frame(decoder_id: u32, input: u64, input_size: u32, output: u64): u32 {
   if decoder_id >= audio_decoder_count { return 0 }
 
+  // FIX R3 #25: Validate decoder metadata BEFORE the multiply so we
+  // never divide by zero or produce a zero-sized output buffer.
+  // Malformed files can leave `channels` or `bits_per_sample` at 0,
+  // which previously produced `output_size = 0` (silent buffer
+  // underrun) or a trap via division by zero.
+  var channels: u32 = audio_decoders[decoder_id].channels
+  var bps: u32 = audio_decoders[decoder_id].bits_per_sample
+  if channels == 0 or bps == 0 or (bps % 8) != 0 { return 0 }
+  if channels > 8 { return 0 }       // Sanity: FLAC max is 8 channels
+  if bps > 32 { return 0 }           // Sanity: FLAC max is 32 bits/sample
+
   // FLAC frames can vary in size
   var block_size: u32 = 4096  // Default block size
-  var output_size: u32 = block_size * audio_decoders[decoder_id].channels *
-                         (audio_decoders[decoder_id].bits_per_sample / 8)
+  var bytes_per_sample: u32 = bps / 8
+
+  // Check for multiplication overflow before computing the output size.
+  if block_size > 0xFFFFFFFF / channels { return 0 }
+  var partial: u32 = block_size * channels
+  if partial > 0xFFFFFFFF / bytes_per_sample { return 0 }
+  var output_size: u32 = partial * bytes_per_sample
 
   audio_decoders[decoder_id].samples_decoded = audio_decoders[decoder_id].samples_decoded + block_size
 

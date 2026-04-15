@@ -95,6 +95,33 @@ var dns_rotate: u32 = 0       // Rotate through nameservers
 var dns_current_server: u32 = 0
 
 // ============================================================================
+// 0x20 QUERY RANDOMIZATION (RFC draft-vixie-dnsext-dns0x20-00)
+// ============================================================================
+// Randomize the case of each alphabetic byte in the outgoing QNAME.
+// Servers MUST echo the exact case in the response's question section
+// (case-insensitive compare for name resolution, but the bytes are
+// preserved). Validating that the echoed case matches raises the bar
+// for off-path spoofers from guessing a 16-bit txid to guessing txid
+// plus one case bit per letter.
+var dns_prng_state: u32 = 0xDEADBEEF
+
+fn dns_prng_next(): u32 {
+  // xorshift32 — fine for 0x20 case-bit randomization (not crypto).
+  var x: u32 = dns_prng_state
+  x = x ^ (x << 13)
+  x = x ^ (x >> 17)
+  x = x ^ (x << 5)
+  dns_prng_state = x
+  return x
+}
+
+fn dns_prng_seed(ts: u64) {
+  var s: u32 = @truncate(ts ^ (ts >> 32), u32)
+  if s == 0 { s = 0xDEADBEEF }
+  dns_prng_state = s
+}
+
+// ============================================================================
 // /etc/resolv.conf Parser
 // ============================================================================
 
@@ -290,14 +317,19 @@ fn dns_parse_resolv_line(line: u64) {
         }
       }
 
-      // Check for attempts:N
+      // Check for attempts:N (with the same overflow + digit-limit
+      // protection as ndots/timeout — previously missing, allowing a
+      // crafted resolv.conf to wrap the integer parser).
       if dns_starts_with(ptr, @intFromPtr("attempts:"), 9) == 1 {
         ptr = ptr + 9
         var n: u32 = 0
+        var digits: u32 = 0
         c = @as(*u8, @ptrFromInt(ptr)).*
-        while c >= '0' and c <= '9' {
+        while c >= '0' and c <= '9' and digits < 10 {
+          if n > 429496728 { break }
           n = n * 10 + (c - '0')
           ptr = ptr + 1
+          digits = digits + 1
           c = @as(*u8, @ptrFromInt(ptr)).*
         }
         if n > 0 and n <= 5 {
@@ -500,6 +532,12 @@ export fn dns_init() {
   }
   dns_cache_initialized = 1
 
+  // Seed the 0x20 case-randomization PRNG. We don't have a monotonic
+  // timer bound in this module, so mix dns_query_id (the only module
+  // state that varies at startup) with a fixed golden-ratio constant.
+  // The PRNG advances each query, so even a weak seed diverges fast.
+  dns_prng_state = @as(u32, dns_query_id) * 2654435761 ^ 0xDEADBEEF
+
   // Initialize server list with defaults
   dns_servers[0] = 0x08080808  // 8.8.8.8
   dns_servers[1] = 0x08080404  // 8.8.4.4
@@ -631,7 +669,17 @@ fn dns_encode_hostname(hostname: u64, buffer: u64): u32 {
       // Only emit label bytes while we're still within the 63-byte
       // per-label cap; overflow bytes are silently dropped.
       if label_len < 63 {
-        @as(*u8, @ptrFromInt(dst)).* = c
+        // 0x20 randomization: for alphabetic bytes, flip the case bit
+        // with per-letter randomness. Non-letters pass through.
+        var out_c: u8 = c
+        if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') {
+          if (dns_prng_next() & 1) == 1 {
+            out_c = c ^ 0x20
+          } else {
+            out_c = c & ~@as(u8, 0x20)
+          }
+        }
+        @as(*u8, @ptrFromInt(dst)).* = out_c
         dst = dst + 1
         label_len = label_len + 1
       }
@@ -724,8 +772,41 @@ fn dns_skip_name(buffer: u64, offset: u32): u32 {
   return pos + 1  // Skip null terminator
 }
 
-// Parse DNS response and extract IP address
-fn dns_parse_response(buffer: u64, len: u32, expected_id: u16): u32 {
+// Compare two QNAME sections byte-for-byte. Used to validate 0x20
+// case randomization: the server MUST echo the exact case it saw.
+// Returns 1 on match, 0 on mismatch or out-of-bounds read.
+fn dns_qname_equals(a: u64, a_len: u32, b: u64, b_len: u32): u32 {
+  var ai: u32 = 0
+  var bi: u32 = 0
+  loop {
+    if ai >= a_len or bi >= b_len { return 0 }
+    var la: u8 = @as(*u8, @ptrFromInt(a + ai)).*
+    var lb: u8 = @as(*u8, @ptrFromInt(b + bi)).*
+    if la != lb { return 0 }
+    if la == 0 { return 1 }
+    // Refuse to validate compressed names — the request never uses
+    // compression so the response's question section shouldn't either.
+    if (la & 0xC0) != 0 { return 0 }
+    var ll: u32 = @as(u32, la)
+    ai = ai + 1
+    bi = bi + 1
+    var k: u32 = 0
+    while k < ll {
+      if ai >= a_len or bi >= b_len { return 0 }
+      if @as(*u8, @ptrFromInt(a + ai)).* != @as(*u8, @ptrFromInt(b + bi)).* { return 0 }
+      ai = ai + 1
+      bi = bi + 1
+      k = k + 1
+    }
+  }
+  return 0
+}
+
+// Parse DNS response and extract IP address. `request` + `request_len`
+// are the outgoing query buffer; we use them to validate the server
+// echoed our 0x20-randomized QNAME verbatim. Pass 0/0 to skip the
+// 0x20 check (e.g. for callers that don't yet wire the request in).
+fn dns_parse_response(buffer: u64, len: u32, expected_id: u16, request: u64, request_len: u32): u32 {
   if len < 12 {
     return 0  // Too short
   }
@@ -735,6 +816,16 @@ fn dns_parse_response(buffer: u64, len: u32, expected_id: u16): u32 {
   if id != expected_id {
     foundation.serial_write_string("[DNS] ID mismatch\n")
     return 0
+  }
+
+  // 0x20 validation: the question section starts at offset 12 in both
+  // buffers. If the echoed QNAME bytes differ from what we sent, drop
+  // the response as a likely spoof.
+  if request != 0 and request_len > 12 and len > 12 {
+    if dns_qname_equals(buffer + 12, len - 12, request + 12, request_len - 12) == 0 {
+      foundation.serial_write_string("[DNS] 0x20 case mismatch\n")
+      return 0
+    }
   }
 
   // Check flags
@@ -866,7 +957,7 @@ export fn dns_resolve(hostname: u64): u32 {
     var response_len: u32 = udp.udp_receive(@ptrFromInt(response), 512)
 
     if response_len > 0 {
-      var ip: u32 = dns_parse_response(@ptrFromInt(response), response_len, dns_query_id)
+      var ip: u32 = dns_parse_response(@ptrFromInt(response), response_len, dns_query_id, @ptrFromInt(query), query_len)
       if ip != 0 {
         // Cache the result
         dns_cache_add(hostname, ip, 300)  // Default 5 min TTL
@@ -885,7 +976,7 @@ export fn dns_resolve(hostname: u64): u32 {
   var response_len: u32 = udp.udp_receive(@ptrFromInt(response), 512)
 
   if response_len > 0 {
-    var ip: u32 = dns_parse_response(@ptrFromInt(response), response_len, dns_query_id)
+    var ip: u32 = dns_parse_response(@ptrFromInt(response), response_len, dns_query_id, @ptrFromInt(query), query_len)
     if ip != 0 {
       dns_cache_add(hostname, ip, 300)
       return ip

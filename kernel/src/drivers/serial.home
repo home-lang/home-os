@@ -1,63 +1,112 @@
 // home-os Serial Port Driver (Extended)
-// Full serial port implementation with buffering
+// Full serial port implementation with buffering.
 
 import "../core/foundation.home" as foundation
 
 const SERIAL_BUFFER_SIZE: u32 = 1024
 
+// COM1 — standard x86 serial port.
+const COM1_BASE: u16 = 0x3F8
+const COM1_IRQ: u8 = 4
+const UART_DATA: u16 = 0x3F8
+const UART_IER: u16 = 0x3F9
+const UART_FCR: u16 = 0x3FA
+const UART_LCR: u16 = 0x3FB
+const UART_MCR: u16 = 0x3FC
+const UART_LSR: u16 = 0x3FD
+
 var serial_rx_buffer: [u8; 1024]
 var serial_rx_head: u32 = 0
 var serial_rx_tail: u32 = 0
 
+// FIX R7 #7: Actually configure the UART and install the IRQ handler.
+// Previously `serial_init_extended` only zeroed the ring buffer
+// indices and no interrupts ever fired.
 export fn serial_init_extended() {
   serial_rx_head = 0
   serial_rx_tail = 0
+
+  // Disable UART interrupts during setup.
+  foundation.outb(UART_IER, 0x00)
+
+  // Enable DLAB (bit 7 of LCR) to set the baud divisor.
+  foundation.outb(UART_LCR, 0x80)
+  // 115200 baud = divisor 1 (with standard 1.8432 MHz source / 16).
+  foundation.outb(UART_DATA, 0x01)  // Divisor low
+  foundation.outb(UART_IER,  0x00)  // Divisor high
+
+  // 8 bits, no parity, 1 stop bit — clears DLAB.
+  foundation.outb(UART_LCR, 0x03)
+
+  // Enable and clear FIFO, trigger at 14 bytes.
+  foundation.outb(UART_FCR, 0xC7)
+
+  // DTR + RTS + OUT2 (required for interrupts to reach the 8259 PIC).
+  foundation.outb(UART_MCR, 0x0B)
+
+  // Install the IRQ handler and enable receive-data-available (bit 0).
+  foundation.register_irq_handler(COM1_IRQ, @ptrFromInt(&serial_interrupt_handler))
+  foundation.outb(UART_IER, 0x01)
+
   foundation.serial_write_string("[Serial] Extended driver initialized\n")
 }
 
+// FIX R7 #6: Protect the ring buffer against IRQ-vs-thread races.
+// IRQ handler is already run with interrupts disabled, but an NMI
+// (or test mode where irq_save is meaningful) can still interleave.
 export fn serial_interrupt_handler() {
-  while (foundation.inb(0x3FD) & 0x01) != 0 {
-    var ch: u8 = foundation.inb(0x3F8)
-    
+  var flags: u64 = foundation.irq_save()
+
+  while (foundation.inb(UART_LSR) & 0x01) != 0 {
+    var ch: u8 = foundation.inb(UART_DATA)
+
     var next_head: u32 = (serial_rx_head + 1) % SERIAL_BUFFER_SIZE
     if next_head != serial_rx_tail {
       serial_rx_buffer[serial_rx_head] = ch
       serial_rx_head = next_head
     }
   }
+
+  foundation.irq_restore(flags)
 }
 
 export fn serial_available(): u32 {
-  return (serial_rx_head + SERIAL_BUFFER_SIZE - serial_rx_tail) % SERIAL_BUFFER_SIZE
+  var flags: u64 = foundation.irq_save()
+  var count: u32 = (serial_rx_head + SERIAL_BUFFER_SIZE - serial_rx_tail) % SERIAL_BUFFER_SIZE
+  foundation.irq_restore(flags)
+  return count
 }
 
 export fn serial_read_char(): u8 {
+  var flags: u64 = foundation.irq_save()
   if serial_rx_head == serial_rx_tail {
+    foundation.irq_restore(flags)
     return 0
   }
-  
+
   var ch: u8 = serial_rx_buffer[serial_rx_tail]
   serial_rx_tail = (serial_rx_tail + 1) % SERIAL_BUFFER_SIZE
+  foundation.irq_restore(flags)
   return ch
 }
 
 export fn serial_read_line(buffer: u64, max_len: u32): u32 {
   var i: u32 = 0
-  
+
   while i < max_len - 1 {
-    if serial_rx_head == serial_rx_tail {
+    if serial_available() == 0 {
       break
     }
-    
+
     var ch: u8 = serial_read_char()
     if ch == '\n' or ch == '\r' {
       break
     }
-    
+
     @as(*u8, @ptrFromInt(buffer + i)).* = ch
     i = i + 1
   }
-  
+
   @as(*u8, @ptrFromInt(buffer + i)).* = 0
   return i
 }

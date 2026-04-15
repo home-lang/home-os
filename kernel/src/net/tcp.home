@@ -48,6 +48,10 @@ const TCP_OPT_TIMESTAMP: u8 = 8
 
 // Configuration
 const MAX_TCP_CONNECTIONS: u32 = 256
+// Cap on simultaneous half-open connections. Set at ~75% of the
+// table so a SYN flood can't fill every slot and lock out legitimate
+// passive opens while handshakes complete.
+const TCP_SYN_HALFOPEN_MAX: u32 = 192
 // 5-tuple → connection index hash. Sized to 2× max connections to
 // keep the probe count near 1 even near full capacity.
 const TCP_HASH_SIZE: u32 = 512
@@ -62,6 +66,11 @@ const TCP_TIME_WAIT_TIMEOUT: u32 = 120000  // 2 minutes (2MSL)
 const TCP_KEEPALIVE_IDLE: u32 = 7200000    // 2 hours
 const TCP_KEEPALIVE_INTERVAL: u32 = 75000  // 75 seconds
 const TCP_KEEPALIVE_COUNT: u32 = 9
+
+// Delayed-ACK parameters (RFC 1122 §4.2.3.2). We must send the
+// delayed ACK within 500ms, and every second full-sized segment.
+const TCP_DELAYED_ACK_TIMEOUT: u32 = 200   // ms — conservative
+const TCP_DELAYED_ACK_MAX_SEGS: u32 = 2    // ACK every Nth segment
 
 // Congestion control
 const TCP_INITIAL_CWND: u32 = 10       // Initial congestion window (segments)
@@ -158,6 +167,8 @@ struct TcpConnection {
   time_wait_timer: u64,
   keepalive_timer: u64,
   persist_timer: u64,
+  delayed_ack_timer: u64,  // 0 = no pending ACK; otherwise deadline
+  delayed_ack_segs: u32,   // unACKed segments received since last ACK
 
   // Retransmission queue
   retx_queue_head: u64,
@@ -218,6 +229,11 @@ var local_mac: [u8; 6]
 var ip_id_counter: u16 = 0
 var tcp_port_counter: u16 = 49152  // Ephemeral port range start
 
+// Per-boot secret mixed into the 5-tuple hash so attackers can't
+// pre-compute colliding 5-tuples to DoS the connection table. Seeded
+// from the timestamp at tcp_init() time.
+var tcp_hash_seed: u32 = 0x9E3779B9
+
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
@@ -240,9 +256,14 @@ fn generate_isn(): u32 {
   return k
 }
 
+// Worst case: every active connection occupies a distinct port. With
+// MAX_TCP_CONNECTIONS = 256 there are at most 256 ports in use, so
+// advancing through at most 257 consecutive candidates is guaranteed
+// to produce a free port if one exists. We also short-circuit the
+// collision loop when we've scanned every active entry.
 fn allocate_ephemeral_port(): u16 {
   var attempts: u32 = 0
-  while attempts < 16384 {
+  while attempts < MAX_TCP_CONNECTIONS + 1 {
     var port: u16 = tcp_port_counter
     tcp_port_counter = tcp_port_counter + 1
     if tcp_port_counter >= 65535 {
@@ -268,7 +289,10 @@ fn allocate_ephemeral_port(): u16 {
 // ============================================================================
 
 fn ip_checksum(data: u64, len: u32): u16 {
-  if len == 0 { return 0 }
+  // RFC 1071: the checksum of an empty buffer is 0xFFFF (the ones'
+  // complement of zero), not zero — a literal 0 is a valid checksum
+  // value and would falsely match an unset field in the receiver.
+  if len == 0 { return 0xFFFF }
   var sum: u32 = 0
   var ptr: *u8 = @ptrFromInt(data)
   var i: u32 = 0
@@ -330,12 +354,16 @@ fn tcp_checksum(src_ip: u32, dst_ip: u32, tcp_data: u64, tcp_len: u32): u16 {
 // CONNECTION MANAGEMENT
 // ============================================================================
 
-// Mix the 5-tuple into a uniform bucket index.
+// Mix the 5-tuple into a uniform bucket index. The per-boot seed
+// prevents attackers from crafting 5-tuples that all land in one
+// bucket to force O(n) chain walks (collision DoS).
 fn tcp_hash_key(local_port: u16, remote_ip: u32, remote_port: u16): u32 {
-  var k: u32 = remote_ip
+  var k: u32 = remote_ip ^ tcp_hash_seed
   k = k ^ (@as(u32, local_port) << 16)
   k = k ^ @as(u32, remote_port)
   k = k * 2654435761
+  k = k ^ (k >> 16)
+  k = k * 2246822519
   return (k >> 16) & TCP_HASH_MASK
 }
 
@@ -493,6 +521,9 @@ fn free_connection(conn_idx: u32) {
 // ============================================================================
 
 fn build_tcp_packet(conn_idx: u32, flags: u8, data: u64, data_len: u32, packet: u64): u32 {
+  // Bounds-check the connection index up front so malformed callers
+  // can't walk off the end of the connection tables below.
+  if conn_idx >= MAX_TCP_CONNECTIONS { return 0 }
   var pkt: *u8 = @ptrFromInt(packet)
   var offset: u32 = 0
 
@@ -598,9 +629,15 @@ fn build_tcp_packet(conn_idx: u32, flags: u8, data: u64, data_len: u32, packet: 
   pkt[offset + 12] = data_off
   pkt[offset + 13] = flags
 
-  // Window size
-  var wnd: u16 = tcp_connections[conn_idx].rcv_wnd >> tcp_connections[conn_idx].rcv_scale
-  if wnd > 65535 { wnd = 65535 }
+  // Window size. Clamp the scaled window on the u32 value *before*
+  // narrowing to u16, otherwise the narrowing silently wraps and the
+  // original `if wnd > 65535` check was dead code (u16 can never exceed
+  // that value). Also guard against an out-of-range rcv_scale.
+  var scale: u32 = tcp_connections[conn_idx].rcv_scale
+  if scale > 14 { scale = 14 }
+  var wnd32: u32 = tcp_connections[conn_idx].rcv_wnd >> scale
+  if wnd32 > 65535 { wnd32 = 65535 }
+  var wnd: u16 = @intCast(wnd32)
   pkt[offset + 14] = (wnd >> 8) & 0xFF
   pkt[offset + 15] = wnd & 0xFF
 
@@ -649,6 +686,13 @@ fn build_tcp_packet(conn_idx: u32, flags: u8, data: u64, data_len: u32, packet: 
 }
 
 fn send_tcp_segment(conn_idx: u32, flags: u8, data: u64, data_len: u32): u32 {
+  // Any outbound segment with the ACK flag set piggybacks the pending
+  // delayed ACK, so clear the timer to avoid a redundant bare ACK.
+  if (flags & TCP_ACK) != 0 and tcp_connections[conn_idx].delayed_ack_timer != 0 {
+    tcp_connections[conn_idx].delayed_ack_timer = 0
+    tcp_connections[conn_idx].delayed_ack_segs = 0
+  }
+
   var packet: [u8; 1600]
   var pkt_len: u32 = build_tcp_packet(conn_idx, flags, data, data_len, @ptrFromInt(&packet))
 
@@ -658,11 +702,17 @@ fn send_tcp_segment(conn_idx: u32, flags: u8, data: u64, data_len: u32): u32 {
     tcp_connections[conn_idx].segments_sent = tcp_connections[conn_idx].segments_sent + 1
     tcp_stats.segments_sent = tcp_stats.segments_sent + 1
 
-    // Update snd_nxt for data-carrying segments
+    // Update snd_nxt. Per RFC 793, SYN and FIN each consume exactly one
+    // sequence number and data consumes data_len. The previous code
+    // lumped SYN-or-FIN into a single +1 even when both were set,
+    // under-counting the simultaneous SYN+FIN edge case.
     if data_len > 0 {
       tcp_connections[conn_idx].snd_nxt = tcp_connections[conn_idx].snd_nxt + data_len
     }
-    if (flags & TCP_SYN) != 0 or (flags & TCP_FIN) != 0 {
+    if (flags & TCP_SYN) != 0 {
+      tcp_connections[conn_idx].snd_nxt = tcp_connections[conn_idx].snd_nxt + 1
+    }
+    if (flags & TCP_FIN) != 0 {
       tcp_connections[conn_idx].snd_nxt = tcp_connections[conn_idx].snd_nxt + 1
     }
   }
@@ -680,23 +730,30 @@ fn add_to_retx_queue(conn_idx: u32, seq: u32, data: u64, data_len: u32, flags: u
 
   @as(*volatile u32, @ptrFromInt(seg)).* = seq           // seq_num
 
-  // Copy data
+  // Copy data. If we can't allocate the retransmit buffer, free the
+  // segment header and bail — we must not push a segment with a
+  // null data pointer onto the retx queue because retransmit_segment
+  // would dereference it.
   var data_copy: u64 = 0
   if data_len > 0 {
     data_copy = memory.kmalloc(data_len)
-    if data_copy != 0 {
-      var src: *u8 = @ptrFromInt(data)
-      var dst: *u8 = @ptrFromInt(data_copy)
-      var i: u32 = 0
-      while i < data_len {
-        dst[i] = src[i]
-        i = i + 1
-      }
+    if data_copy == 0 {
+      memory.kfree(seg)
+      return
+    }
+    var src: *u8 = @ptrFromInt(data)
+    var dst: *u8 = @ptrFromInt(data_copy)
+    var i: u32 = 0
+    while i < data_len {
+      dst[i] = src[i]
+      i = i + 1
     }
   }
 
-  // TcpSegment layout (aligned): seq(0-3), data(8-15), data_len(16-19),
-  // flags(20), retries(24-27), sent_time(28-35 unaligned, use 32-39), next(40-47)
+  // TcpSegment layout (8-byte aligned): seq(0-3), data(8-15),
+  // data_len(16-19), flags(20), retries(24-27), sent_time(32-39),
+  // next(40-47). sent_time is placed at 32 (not 28) so the u64 store
+  // is naturally aligned on strict-alignment architectures.
   @as(*u64, @ptrFromInt(seg + 8)).* = data_copy   // data pointer
   @as(*volatile u32, @ptrFromInt(seg + 16)).* = data_len   // data_len
   @as(*u8, @ptrFromInt(seg + 20)).* = flags       // flags
@@ -867,8 +924,42 @@ fn update_cwnd(conn_idx: u32, bytes_acked: u32) {
 // TIMER PROCESSING
 // ============================================================================
 
+// Flush any pending delayed ACK for this connection. Called from
+// process_timers on expiry and inline when a second full-size
+// segment arrives. Callers that already send an ACK-bearing segment
+// (SYN-ACK, FIN-ACK, piggybacked data) should also call this so the
+// delayed-ACK state doesn't trigger a redundant bare ACK later.
+fn flush_delayed_ack(conn_idx: u32) {
+  if tcp_connections[conn_idx].delayed_ack_timer == 0 { return }
+  tcp_connections[conn_idx].delayed_ack_timer = 0
+  tcp_connections[conn_idx].delayed_ack_segs = 0
+  send_tcp_segment(conn_idx, TCP_ACK, 0, 0)
+}
+
+// Record that an ACK is owed for in-order data. Either coalesces into
+// an immediate ACK (every other segment) or arms the 200ms timer.
+fn schedule_delayed_ack(conn_idx: u32) {
+  tcp_connections[conn_idx].delayed_ack_segs =
+    tcp_connections[conn_idx].delayed_ack_segs + 1
+  if tcp_connections[conn_idx].delayed_ack_segs >= TCP_DELAYED_ACK_MAX_SEGS {
+    flush_delayed_ack(conn_idx)
+    return
+  }
+  if tcp_connections[conn_idx].delayed_ack_timer == 0 {
+    tcp_connections[conn_idx].delayed_ack_timer =
+      get_timestamp() + TCP_DELAYED_ACK_TIMEOUT
+  }
+}
+
 fn process_timers(conn_idx: u32) {
   var now: u64 = get_timestamp()
+
+  // Delayed-ACK expiry — send the pending ACK before the remote
+  // retransmits assuming it was lost.
+  if tcp_connections[conn_idx].delayed_ack_timer != 0 and
+     now >= tcp_connections[conn_idx].delayed_ack_timer {
+    flush_delayed_ack(conn_idx)
+  }
 
   // Retransmit timer
   if tcp_connections[conn_idx].retransmit_timer != 0 and
@@ -993,10 +1084,30 @@ fn handle_tcp_packet(src_ip: u32, tcp_data: u64, tcp_len: u32) {
   // Find connection
   var conn_idx: u32 = find_connection(dst_port, src_ip, src_port)
 
-  // Handle SYN to listening socket
+  // Handle SYN to listening socket. Apply a SYN-flood backstop by
+  // counting half-open (SYN_RECEIVED) connections and refusing new
+  // SYNs once they exceed TCP_SYN_HALFOPEN_MAX. Without this a single
+  // attacker can exhaust the connection table with unacknowledged
+  // SYNs. A full syn-cookie implementation would avoid allocating
+  // state at all; this is a minimal mitigation until that lands.
   if conn_idx == 0xFFFFFFFF and (flags & TCP_SYN) != 0 {
     var listen_idx: u32 = find_listening_connection(dst_port)
     if listen_idx != 0xFFFFFFFF {
+      var halfopen: u32 = 0
+      var hi: u32 = 0
+      while hi < MAX_TCP_CONNECTIONS {
+        if tcp_connections[hi].state == TCP_STATE_SYN_RECEIVED {
+          halfopen = halfopen + 1
+        }
+        hi = hi + 1
+      }
+      if halfopen >= TCP_SYN_HALFOPEN_MAX {
+        // Drop the SYN silently — RFC 4987 §3.5 recommends against
+        // replying with RST because that still consumes resources
+        // and leaks listener presence to scanners.
+        return
+      }
+
       // Create new connection for incoming SYN
       conn_idx = allocate_connection()
       if conn_idx != 0xFFFFFFFF {
@@ -1125,13 +1236,17 @@ fn handle_tcp_packet(src_ip: u32, tcp_data: u64, tcp_len: u32) {
       tcp_connections[conn_idx].rcv_wnd = tcp_connections[conn_idx].recv_buffer_size -
                                           tcp_connections[conn_idx].recv_buffer_used
 
-      // Send ACK
-      send_tcp_segment(conn_idx, TCP_ACK, 0, 0)
+      // Coalesce ACKs per RFC 1122 — send one every 2nd segment or
+      // within TCP_DELAYED_ACK_TIMEOUT, whichever comes first.
+      schedule_delayed_ack(conn_idx)
     }
 
-    // Handle FIN
+    // Handle FIN — FIN always forces an immediate ACK and flushes any
+    // pending delayed ACK so the peer sees a coherent ack_num.
     if (flags & TCP_FIN) != 0 {
       tcp_connections[conn_idx].rcv_nxt = tcp_connections[conn_idx].rcv_nxt + 1
+      tcp_connections[conn_idx].delayed_ack_timer = 0
+      tcp_connections[conn_idx].delayed_ack_segs = 0
       send_tcp_segment(conn_idx, TCP_ACK, 0, 0)
       tcp_connections[conn_idx].state = TCP_STATE_CLOSE_WAIT
     }
@@ -1178,6 +1293,13 @@ fn handle_tcp_packet(src_ip: u32, tcp_data: u64, tcp_len: u32) {
 
 export fn tcp_init() {
   if tcp_initialized == 1 { return }
+
+  // Seed the per-boot hash secret from the current timestamp so the
+  // bucket layout differs across boots and isn't predictable from
+  // source IP/port alone.
+  var ts: u64 = get_timestamp()
+  tcp_hash_seed = @truncate(ts ^ (ts >> 32) ^ 0x9E3779B9, u32)
+  if tcp_hash_seed == 0 { tcp_hash_seed = 0x9E3779B9 }
 
   // Initialize connections
   var i: u32 = 0

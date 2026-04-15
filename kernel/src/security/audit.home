@@ -17,6 +17,28 @@ const AUDIT_SECURITY: u32 = 7
 const MAX_AUDIT_ENTRIES: u32 = 10000
 const AUDIT_LOG_PATH: u64 = @ptrFromInt("/var/log/audit.log")
 
+// FIX R7 #20: Persistence hook. Previously `AUDIT_LOG_PATH` was
+// declared but never used — audit records lived only in the ring and
+// a reboot destroyed the entire trail. `audit_enable_persistence`
+// opens the log and subsequent entries are appended after being
+// pushed to the ring.
+var audit_persist_to_disk: u32 = 0
+var audit_persist_fd: i32 = -1
+
+export fn audit_enable_persistence(): u32 {
+  if audit_persist_fd >= 0 { return 1 }
+  audit_persist_fd = filesystem.vfs_open_create(AUDIT_LOG_PATH, 0x0441)
+  if audit_persist_fd < 0 { return 0 }
+  audit_persist_to_disk = 1
+  return 1
+}
+
+fn audit_persist_entry(entry: *AuditEntry) {
+  if audit_persist_to_disk == 0 { return }
+  if audit_persist_fd < 0 { return }
+  filesystem.vfs_write(@as(u32, audit_persist_fd), @intFromPtr(entry), @sizeOf(AuditEntry))
+}
+
 struct AuditEntry {
   timestamp: u64,
   event_type: u32,
@@ -63,7 +85,7 @@ export fn audit_log_syscall(pid: u32, uid: u32, syscall_nr: u32, result: i32) {
 
 export fn audit_log_file_access(pid: u32, uid: u32, path: u64, flags: u32, result: i32) {
   if audit_enabled == 0 { return }
-  
+
   var entry: AuditEntry
   entry.timestamp = foundation.timer_get_ticks()
   entry.event_type = AUDIT_FILE_ACCESS
@@ -71,8 +93,14 @@ export fn audit_log_file_access(pid: u32, uid: u32, path: u64, flags: u32, resul
   entry.uid = uid
   entry.syscall_nr = flags
   entry.result = result
-  
-  // Copy path to data
+
+  // FIX R7 #21: Zero the full 256-byte data buffer first so a short
+  // copy can't leak stack residue, then copy and FORCE a terminator
+  // at position 255 so any reader walking the buffer stops in-bounds
+  // regardless of loop-exit path.
+  var z: u32 = 0
+  while z < 256 { entry.data[z] = 0; z = z + 1 }
+
   var i: u32 = 0
   while i < 255 {
     var ch: u8 = @as(*u8, @ptrFromInt(path + i)).*
@@ -80,9 +108,10 @@ export fn audit_log_file_access(pid: u32, uid: u32, path: u64, flags: u32, resul
     if ch == 0 { break }
     i = i + 1
   }
-  entry.data[i] = 0
-  
+  entry.data[255] = 0
+
   audit_add_entry(entry)
+  audit_persist_entry(&entry)
 }
 
 export fn audit_log_network(pid: u32, uid: u32, addr: u64, port: u32, result: i32) {

@@ -3,6 +3,7 @@
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
+import "../sync/spinlock.home" as spinlock
 
 const MAX_SHM_SEGMENTS: u32 = 32
 
@@ -65,28 +66,60 @@ export fn shm_attach(shm_id: u32): u64 {
   if shm_id >= MAX_SHM_SEGMENTS or shm_segments[shm_id].in_use == 0 {
     return 0
   }
-  
+
+  // Refuse the attach if ref_count is already at u32 max — otherwise
+  // the increment would wrap to 0 and the next detach would free a
+  // still-mapped segment.
+  if shm_segments[shm_id].ref_count == 0xFFFFFFFF { return 0 }
+
   shm_segments[shm_id].ref_count = shm_segments[shm_id].ref_count + 1
   return shm_segments[shm_id].addr
 }
 
+// FIX R3 #8: shm_detach had a race on shm_count where two concurrent
+// detaches of the last reference could both see `shm_count > 0` and
+// both decrement, underflowing. The refcount decrement itself was
+// also non-atomic, so two concurrent detaches against the same
+// segment could go below 0 or miss the free. We wrap the whole
+// operation in a spinlock and use CAS semantics on ref_count.
+var shm_lock: spinlock.Spinlock
+var shm_lock_initialized: u32 = 0
+
+fn ensure_shm_lock() {
+  if shm_lock_initialized == 1 { return }
+  spinlock.spinlock_init(&shm_lock)
+  shm_lock_initialized = 1
+}
+
 export fn shm_detach(shm_id: u32) {
-  if shm_id >= MAX_SHM_SEGMENTS or shm_segments[shm_id].in_use == 0 {
+  if shm_id >= MAX_SHM_SEGMENTS { return }
+
+  ensure_shm_lock()
+  spinlock.spinlock_acquire(&shm_lock)
+
+  if shm_segments[shm_id].in_use == 0 {
+    spinlock.spinlock_release(&shm_lock)
     return
   }
-  
+
   if shm_segments[shm_id].ref_count > 0 {
     shm_segments[shm_id].ref_count = shm_segments[shm_id].ref_count - 1
   }
-  
+
   if shm_segments[shm_id].ref_count == 0 {
-    memory.kfree(shm_segments[shm_id].addr)
+    var doomed_addr: u64 = shm_segments[shm_id].addr
     shm_segments[shm_id].addr = 0
     shm_segments[shm_id].in_use = 0
     if shm_count > 0 {
       shm_count = shm_count - 1
     }
+    spinlock.spinlock_release(&shm_lock)
+    // Free outside lock — kfree may take internal locks.
+    memory.kfree(doomed_addr)
+    return
   }
+
+  spinlock.spinlock_release(&shm_lock)
 }
 
 export fn shm_get(key: u32): u32 {

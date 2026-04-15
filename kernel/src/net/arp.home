@@ -3,6 +3,7 @@
 
 import "../core/foundation.home" as foundation
 import "../drivers/e1000.home" as e1000
+import "../sync/spinlock.home" as spinlock
 
 const ARP_REQUEST: u16 = 1
 const ARP_REPLY: u16 = 2
@@ -34,7 +35,15 @@ const ARP_RATE_LIMIT: u64 = 100    // Min ticks between updates to same IP
 var arp_cache: [ARPEntry; 16]
 var arp_cache_count: u32 = 0
 
+// FIX R4 #6: Protect the cache from concurrent lookup/add races.
+// arp_add_entry rewrites every slot on FIFO eviction, so an
+// unsynchronised lookup can read a MAC mid-shift (MAC bytes from two
+// different IPs). A single cache-wide lock is sufficient for the
+// 16-entry ARP table.
+var arp_lock: spinlock.Spinlock
+
 export fn arp_init() {
+  spinlock.spinlock_init(&arp_lock)
   arp_cache_count = 0
   foundation.serial_write_string("[ARP] Initialized\n")
 }
@@ -96,17 +105,29 @@ export fn arp_request(target_ip: u32): u32 {
 }
 
 export fn arp_lookup(ip: u32): u64 {
+  spinlock.spinlock_acquire(&arp_lock)
   var i: u32 = 0
   while i < arp_cache_count {
     if arp_cache[i].valid == 1 and arp_cache[i].ip == ip {
-      return @ptrFromInt(arp_cache[i].mac)
+      // FIX R4 #16: also drop entries past ARP_ENTRY_TTL.
+      var now: u64 = foundation.get_ticks()
+      if now - arp_cache[i].timestamp > ARP_ENTRY_TTL {
+        arp_cache[i].valid = 0
+        spinlock.spinlock_release(&arp_lock)
+        return 0
+      }
+      var result: u64 = @ptrFromInt(arp_cache[i].mac)
+      spinlock.spinlock_release(&arp_lock)
+      return result
     }
     i = i + 1
   }
+  spinlock.spinlock_release(&arp_lock)
   return 0
 }
 
 export fn arp_add_entry(ip: u32, mac: u64) {
+  spinlock.spinlock_acquire(&arp_lock)
   var now: u64 = foundation.get_ticks()
 
   // Update an existing entry for this IP rather than appending a
@@ -115,7 +136,10 @@ export fn arp_add_entry(ip: u32, mac: u64) {
   while j < arp_cache_count {
     if arp_cache[j].valid == 1 and arp_cache[j].ip == ip {
       // Rate limit: don't update if updated too recently
-      if now - arp_cache[j].timestamp < ARP_RATE_LIMIT { return }
+      if now - arp_cache[j].timestamp < ARP_RATE_LIMIT {
+        spinlock.spinlock_release(&arp_lock)
+        return
+      }
 
       var k: u32 = 0
       while k < 6 {
@@ -123,6 +147,7 @@ export fn arp_add_entry(ip: u32, mac: u64) {
         k = k + 1
       }
       arp_cache[j].timestamp = now
+      spinlock.spinlock_release(&arp_lock)
       return
     }
     j = j + 1
@@ -152,4 +177,6 @@ export fn arp_add_entry(ip: u32, mac: u64) {
     i = i + 1
   }
   arp_cache[slot].valid = 1
+  arp_cache[slot].timestamp = now
+  spinlock.spinlock_release(&arp_lock)
 }

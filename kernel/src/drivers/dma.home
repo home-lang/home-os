@@ -1,5 +1,5 @@
 // home-os DMA Controller
-// Direct Memory Access
+// Direct Memory Access via the legacy ISA 8237 DMAC pair.
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
@@ -21,6 +21,8 @@ export fn dma_init() {
   var i: u32 = 0
   while i < DMA_CHANNELS {
     dma_channels[i].in_use = 0
+    dma_channels[i].buffer = 0
+    dma_channels[i].size = 0
     i = i + 1
   }
   foundation.serial_write_string("[DMA] Initialized\n")
@@ -38,22 +40,47 @@ export fn dma_allocate_channel(): u32 {
   return 0xFFFFFFFF
 }
 
+// FIX R7 #14: Scrub stored pointer/size on free so an allocator
+// consumer can't see stale metadata from the previous owner before
+// setup completes.
 export fn dma_free_channel(channel: u32) {
   if channel < DMA_CHANNELS {
     dma_channels[channel].in_use = 0
+    dma_channels[channel].buffer = 0
+    dma_channels[channel].size = 0
   }
 }
+
+// FIX R7 #12, #13: The ISA 8237 DMA has two chips: slave (channels
+// 0-3) at port base 0x00 and master (channels 4-7) at port base
+// 0xC0 with a 2× address stride. Each channel has its OWN page
+// register — poking port 0x87 for every channel (as the previous
+// driver did) corrupted random memory for channels 1-7.
+const DMA_PAGE_PORTS: [u8; 8] = [
+  0x87,  // ch0
+  0x83,  // ch1
+  0x81,  // ch2
+  0x82,  // ch3
+  0x8F,  // ch4 (cascade — unused)
+  0x8B,  // ch5
+  0x89,  // ch6
+  0x8A   // ch7
+]
 
 export fn dma_setup_transfer(channel: u32, buffer: u64, size: u32, mode: u8) {
   if channel >= DMA_CHANNELS { return }
   if size == 0 { return }
 
-  // ISA DMA is limited to the first 16 MB of physical memory and
-  // transfers must not cross a 64 KB boundary.
+  // ISA DMA is limited to the first 16 MB; transfers must not cross
+  // a 64 KB boundary. The 16-bit `count` register caps each transfer
+  // at 65536 bytes. All arithmetic routes through the remaining-
+  // budget form (`buffer > limit - size`) so `buffer + size` can't
+  // overflow u64 when buffer is near the top of the 16 MB region.
   if buffer >= 0x1000000 { return }
-  if buffer + size > 0x1000000 { return }
+  if size > 0x10000 { return }
+  if buffer > 0x1000000 - @as(u64, size) { return }
   var boundary_end: u64 = (buffer & 0xFFFF0000) + 0x10000
-  if buffer + size > boundary_end { return }
+  if buffer > boundary_end - @as(u64, size) { return }
 
   dma_channels[channel].buffer = buffer
   dma_channels[channel].size = size
@@ -61,32 +88,58 @@ export fn dma_setup_transfer(channel: u32, buffer: u64, size: u32, mode: u8) {
   var page: u8 = @truncate((buffer >> 16) & 0xFF, u8)
   var offset: u16 = @truncate(buffer & 0xFFFF, u16)
   var count: u16 = @truncate(size - 1, u16)
-  
+
+  // Select per-chip ports depending on whether this is a slave
+  // channel (0-3) or a master-controller channel (4-7).
+  var addr_port: u16 = 0
+  var count_port: u16 = 0
+  var mask_port: u16 = 0
+  var flip_port: u16 = 0
+  var mode_port: u16 = 0
+  var chan_on_chip: u32 = channel
+
+  if channel < 4 {
+    addr_port  = 0x00 + @as(u16, @intCast(channel * 2, u16))
+    count_port = 0x01 + @as(u16, @intCast(channel * 2, u16))
+    mask_port  = 0x0A
+    flip_port  = 0x0C
+    mode_port  = 0x0B
+  } else {
+    chan_on_chip = channel - 4
+    addr_port  = 0xC0 + @as(u16, @intCast(chan_on_chip * 4, u16))
+    count_port = 0xC2 + @as(u16, @intCast(chan_on_chip * 4, u16))
+    mask_port  = 0xD4
+    flip_port  = 0xD8
+    mode_port  = 0xD6
+  }
+
   // Mask channel
-  foundation.outb(0x0A, 0x04 | channel)
-  
+  foundation.outb(mask_port, 0x04 | chan_on_chip)
+
   // Clear flip-flop
-  foundation.outb(0x0C, 0)
-  
+  foundation.outb(flip_port, 0)
+
   // Set mode
-  foundation.outb(0x0B, mode | channel)
-  
+  foundation.outb(mode_port, mode | chan_on_chip)
+
   // Set address
-  foundation.outb(0x00 + (channel * 2), offset & 0xFF)
-  foundation.outb(0x00 + (channel * 2), (offset >> 8) & 0xFF)
-  
+  foundation.outb(addr_port, offset & 0xFF)
+  foundation.outb(addr_port, (offset >> 8) & 0xFF)
+
   // Set count
-  foundation.outb(0x01 + (channel * 2), count & 0xFF)
-  foundation.outb(0x01 + (channel * 2), (count >> 8) & 0xFF)
-  
-  // Set page
-  foundation.outb(0x87, page)
-  
+  foundation.outb(count_port, count & 0xFF)
+  foundation.outb(count_port, (count >> 8) & 0xFF)
+
+  // Set per-channel page register.
+  foundation.outb(DMA_PAGE_PORTS[channel], page)
+
   // Unmask channel
-  foundation.outb(0x0A, channel)
+  foundation.outb(mask_port, chan_on_chip)
 }
 
 export fn dma_start_transfer(channel: u32) {
   if channel >= DMA_CHANNELS { return }
-  foundation.outb(0x0A, channel)
+  var mask_port: u16 = if channel < 4 { 0x0A } else { 0xD4 }
+  var chan_on_chip: u32 = if channel < 4 { channel } else { channel - 4 }
+  foundation.outb(mask_port, chan_on_chip)
 }

@@ -6,34 +6,91 @@ import "random.home" as random
 
 const STACK_CANARY_ENABLED: u32 = 1
 const STACK_GUARD_PAGE_ENABLED: u32 = 1
+const MAX_PROCESSES: u32 = 256
 
-// Stack canary value (randomized at boot)
+// Stack canary — global fallback used before per-process init.
 var stack_canary: u64 = 0
 var stack_protection_initialized: u32 = 0
+
+// FIX R4 #23: Per-process canaries. A leaked canary in one process
+// no longer compromises all others. Each process gets its own 64-bit
+// canary on spawn; stack_protection_get_canary(pid) returns the
+// appropriate value.
+var per_process_canary: [u64; 256]
+var per_process_valid: [u32; 256]
 
 // Statistics
 var canary_violations: u64 = 0
 var stack_overflows: u64 = 0
 
+// FIX R4 #22: Retry the RNG until we get a non-degenerate value.
+// Previously, a random value of 0 or 0xFFFFFFFFFFFFFFFF fell back to
+// the hardcoded 0xDEADBEEFCAFEBABE — completely predictable and a
+// known attacker target. Now we keep rolling the CSPRNG until the
+// value is acceptable (extremely rare to need more than one attempt).
+fn generate_safe_canary(): u64 {
+  var attempts: u32 = 0
+  loop {
+    var candidate: u64 = random.random_get_u64()
+    // Require at least one byte to be non-zero (catches \0 byte
+    // terminator leaks via strcpy) AND avoid the degenerate all-0s
+    // and all-1s values.
+    if candidate != 0 and candidate != 0xFFFFFFFFFFFFFFFF {
+      return candidate
+    }
+    attempts = attempts + 1
+    if attempts > 16 {
+      // Extremely unlikely; mix timer entropy into the next try.
+      random.random_add_entropy(foundation.cpu_read_tsc())
+    }
+    if attempts > 64 {
+      // Last-resort: combine multiple samples (still random, still
+      // non-predictable — not the old static constant).
+      return random.random_get_u64() ^ (random.random_get_u64() << 1) ^ 0x1
+    }
+  }
+}
+
 export fn stack_protection_init() {
   if stack_protection_initialized == 1 { return }
-  
+
   // Initialize random number generator
   random.random_init()
-  
+
   // Generate random stack canary
-  stack_canary = random.random_get_u64()
-  
-  // Ensure canary is not zero or all 0xFF
-  if stack_canary == 0 or stack_canary == 0xFFFFFFFFFFFFFFFF {
-    stack_canary = 0xDEADBEEFCAFEBABE
+  stack_canary = generate_safe_canary()
+
+  // Clear per-process canary table.
+  var i: u32 = 0
+  while i < MAX_PROCESSES {
+    per_process_canary[i] = 0
+    per_process_valid[i] = 0
+    i = i + 1
   }
-  
+
   stack_protection_initialized = 1
-  
-  foundation.serial_write_string("[StackProtection] Initialized with canary: 0x")
-  foundation.serial_write_hex(stack_canary)
-  foundation.serial_write_string("\n")
+
+  foundation.serial_write_string("[StackProtection] Initialized\n")
+}
+
+// FIX R4 #23: Called on process creation to install a private canary.
+export fn stack_protection_init_process(pid: u32) {
+  if pid >= MAX_PROCESSES { return }
+  per_process_canary[pid] = generate_safe_canary()
+  per_process_valid[pid] = 1
+}
+
+// Retrieve this process's canary (falls back to the global canary
+// if the process's canary hasn't been initialized — e.g. during
+// early-boot or for kernel threads).
+export fn stack_protection_get_process_canary(pid: u32): u64 {
+  if stack_protection_initialized == 0 {
+    stack_protection_init()
+  }
+  if pid < MAX_PROCESSES and per_process_valid[pid] == 1 {
+    return per_process_canary[pid]
+  }
+  return stack_canary
 }
 
 export fn stack_protection_get_canary(): u64 {

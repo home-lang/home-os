@@ -4,6 +4,7 @@
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
+import "../sync/spinlock.home" as spinlock
 
 const SLAB_SIZE: u32 = 4096
 const MAX_SLABS: u32 = 128
@@ -44,6 +45,12 @@ struct Slab {
   memory: u64                   // Base memory address
   flags: u32                    // Slab flags
 
+  // FIX R4 #1, #2: Locks protect the shared freelist and the
+  // depot lists. The per-CPU caches remain lockless because only
+  // the owning CPU touches them.
+  freelist_lock: spinlock.Spinlock
+  depot_lock: spinlock.Spinlock
+
   // Per-CPU caches
   cpu_caches: [MAX_CPUS]CpuCache
 
@@ -53,7 +60,7 @@ struct Slab {
   depot_full_count: u32
   depot_empty_count: u32
 
-  // Statistics
+  // Statistics (FIX R4 #3: updated via atomic adds below)
   total_allocs: u64
   total_frees: u64
   cache_hits: u64               // Allocations served from CPU cache
@@ -120,10 +127,19 @@ fn magazine_push(mag: *Magazine, obj: u64): u32 {
   return 0
 }
 
-// Pop an object from magazine
+// Pop an object from magazine.
+//
+// FIX R4 #7: Return value `0` previously meant both "magazine empty"
+// AND "the object was 0". Callers can't distinguish, which corrupts
+// accounting if a legitimate 0 ever ends up in the magazine.
+// We now return a sentinel `MAGAZINE_EMPTY` that cannot be a valid
+// allocation (MAX_U64 — the kernel never returns such an address
+// for a real object).
+export const MAGAZINE_EMPTY: u64 = 0xFFFFFFFFFFFFFFFF
+
 fn magazine_pop(mag: *Magazine): u64 {
-  if mag == 0 { return 0 }
-  if mag.count == 0 { return 0 }
+  if mag == 0 { return MAGAZINE_EMPTY }
+  if mag.count == 0 { return MAGAZINE_EMPTY }
 
   mag.count = mag.count - 1
   return mag.objects[mag.count]
@@ -141,41 +157,49 @@ fn magazine_is_empty(mag: *Magazine): u32 {
   return if mag.count == 0 { 1 } else { 0 }
 }
 
-// Add magazine to depot
+// Add magazine to depot (FIX R4 #1: depot_lock serialises list mutations).
 fn depot_add_full(slab: *Slab, mag: *Magazine) {
   if mag == 0 { return }
-
+  spinlock.spinlock_acquire(&slab.depot_lock)
   mag.next = slab.depot_full
   slab.depot_full = mag
   slab.depot_full_count = slab.depot_full_count + 1
+  spinlock.spinlock_release(&slab.depot_lock)
 }
 
 fn depot_add_empty(slab: *Slab, mag: *Magazine) {
   if mag == 0 { return }
-
+  spinlock.spinlock_acquire(&slab.depot_lock)
   mag.next = slab.depot_empty
   slab.depot_empty = mag
   slab.depot_empty_count = slab.depot_empty_count + 1
+  spinlock.spinlock_release(&slab.depot_lock)
 }
 
-// Get magazine from depot
+// Get magazine from depot (FIX R4 #1).
 fn depot_get_full(slab: *Slab): *Magazine {
-  if slab.depot_full == 0 { return 0 }
-
+  spinlock.spinlock_acquire(&slab.depot_lock)
+  if slab.depot_full == 0 {
+    spinlock.spinlock_release(&slab.depot_lock)
+    return 0
+  }
   let mag: *Magazine = slab.depot_full
   slab.depot_full = mag.next
   slab.depot_full_count = slab.depot_full_count - 1
-
+  spinlock.spinlock_release(&slab.depot_lock)
   return mag
 }
 
 fn depot_get_empty(slab: *Slab): *Magazine {
-  if slab.depot_empty == 0 { return 0 }
-
+  spinlock.spinlock_acquire(&slab.depot_lock)
+  if slab.depot_empty == 0 {
+    spinlock.spinlock_release(&slab.depot_lock)
+    return 0
+  }
   let mag: *Magazine = slab.depot_empty
   slab.depot_empty = mag.next
   slab.depot_empty_count = slab.depot_empty_count - 1
-
+  spinlock.spinlock_release(&slab.depot_lock)
   return mag
 }
 
@@ -197,6 +221,11 @@ export fn slab_create(object_size: u32, flags: u32): u32 {
   }
 
   let slab: *Slab = &slabs[slab_count]
+
+  // FIX R4 #1/#2: initialise the new locks before the slab becomes
+  // visible to other CPUs.
+  spinlock.spinlock_init(&slab.freelist_lock)
+  spinlock.spinlock_init(&slab.depot_lock)
 
   slab.size = object_size
   slab.total_count = SLAB_SIZE / object_size
@@ -265,26 +294,29 @@ export fn slab_create(object_size: u32, flags: u32): u32 {
   return id
 }
 
-// Allocate from slab's free list
+// Allocate from slab's free list (FIX R4 #2: freelist_lock).
 fn slab_alloc_from_freelist(slab: *Slab): u64 {
-  if slab.free_count == 0 { return 0 }
-
+  spinlock.spinlock_acquire(&slab.freelist_lock)
+  if slab.free_count == 0 {
+    spinlock.spinlock_release(&slab.freelist_lock)
+    return 0
+  }
   let obj: u64 = slab.free_list
   let next_ptr: *u64 = obj
   slab.free_list = *next_ptr
-
   slab.free_count = slab.free_count - 1
-
+  spinlock.spinlock_release(&slab.freelist_lock)
   return obj
 }
 
-// Free back to slab's free list
+// Free back to slab's free list (FIX R4 #2).
 fn slab_free_to_freelist(slab: *Slab, obj: u64) {
+  spinlock.spinlock_acquire(&slab.freelist_lock)
   let ptr: *u64 = obj
   *ptr = slab.free_list
-
   slab.free_list = obj
   slab.free_count = slab.free_count + 1
+  spinlock.spinlock_release(&slab.freelist_lock)
 }
 
 // Fill a magazine from slab
@@ -312,7 +344,7 @@ fn magazine_empty_to_slab(mag: *Magazine, slab: *Slab) {
     if mag.count == 0 { break }
 
     let obj: u64 = magazine_pop(mag)
-    if obj == 0 { break }
+    if obj == MAGAZINE_EMPTY { break }
 
     slab_free_to_freelist(slab, obj)
   }
@@ -328,14 +360,16 @@ export fn slab_alloc(slab_id: u32): u64 {
   if cpu >= MAX_CPUS { return 0 }
   let cache: *CpuCache = &slab.cpu_caches[cpu]
 
-  slab.total_allocs = slab.total_allocs + 1
-  cache.allocs = cache.allocs + 1
+  // FIX R4 #3: stats are read by other CPUs (slab_print_stats); use
+  // atomic adds so concurrent allocs don't silently drop updates.
+  foundation.atomic_add_u64(@intFromPtr(&slab.total_allocs), 1)
+  foundation.atomic_add_u64(@intFromPtr(&cache.allocs), 1)
 
   // Try loaded magazine first
   if cache.loaded_mag != 0 && cache.loaded_mag.count > 0 {
     let obj: u64 = magazine_pop(cache.loaded_mag)
-    if obj != 0 {
-      slab.cache_hits = slab.cache_hits + 1
+    if obj != MAGAZINE_EMPTY {
+      foundation.atomic_add_u64(@intFromPtr(&slab.cache_hits), 1)
       return obj
     }
   }
@@ -348,8 +382,8 @@ export fn slab_alloc(slab_id: u32): u64 {
     cache.magazine_exchanges = cache.magazine_exchanges + 1
 
     let obj: u64 = magazine_pop(cache.loaded_mag)
-    if obj != 0 {
-      slab.cache_hits = slab.cache_hits + 1
+    if obj != MAGAZINE_EMPTY {
+      foundation.atomic_add_u64(@intFromPtr(&slab.cache_hits), 1)
       return obj
     }
   }
@@ -367,14 +401,14 @@ export fn slab_alloc(slab_id: u32): u64 {
     cache.magazine_exchanges = cache.magazine_exchanges + 1
 
     let obj: u64 = magazine_pop(cache.loaded_mag)
-    if obj != 0 {
-      slab.cache_hits = slab.cache_hits + 1
+    if obj != MAGAZINE_EMPTY {
+      foundation.atomic_add_u64(@intFromPtr(&slab.cache_hits), 1)
       return obj
     }
   }
 
   // No full magazines in depot, allocate directly from slab
-  slab.cache_misses = slab.cache_misses + 1
+  foundation.atomic_add_u64(@intFromPtr(&slab.cache_misses), 1)
 
   // If the slab itself is empty, there's nothing to fill a magazine
   // with. Avoid creating a magazine just to throw it away — that was
@@ -423,8 +457,8 @@ export fn slab_free(slab_id: u32, obj: u64) {
   let cpu: u32 = get_cpu_id()
   let cache: *CpuCache = &slab.cpu_caches[cpu]
 
-  slab.total_frees = slab.total_frees + 1
-  cache.frees = cache.frees + 1
+  foundation.atomic_add_u64(@intFromPtr(&slab.total_frees), 1)
+  foundation.atomic_add_u64(@intFromPtr(&cache.frees), 1)
 
   // Try to add to loaded magazine
   if cache.loaded_mag != 0 && cache.loaded_mag.count < MAGAZINE_SIZE {

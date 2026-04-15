@@ -8,11 +8,18 @@ import "random.home" as random
 const ASLR_ENABLED: u32 = 1
 const KASLR_ENABLED: u32 = 1
 
-// Randomization ranges
-const STACK_RANDOM_BITS: u32 = 28  // 256MB range
-const HEAP_RANDOM_BITS: u32 = 28   // 256MB range
-const MMAP_RANDOM_BITS: u32 = 28   // 256MB range
-const EXEC_RANDOM_BITS: u32 = 28   // 256MB range
+// Randomization ranges.
+//
+// FIX R4 #19: 28 bits is trivially brute-forceable (256M guesses).
+// Linux amd64 uses 30 bits for exec, 30–32 for heap/mmap, and up to
+// 36 for KASLR. Bump to realistic entropy so ASLR actually costs an
+// attacker something — 36 bits = ~68 billion possible bases, well
+// beyond what any practical attack can enumerate within a reboot.
+const STACK_RANDOM_BITS: u32 = 30  // 1 GB range
+const HEAP_RANDOM_BITS: u32 = 32   // 4 GB range
+const MMAP_RANDOM_BITS: u32 = 32   // 4 GB range
+const EXEC_RANDOM_BITS: u32 = 30   // 1 GB range
+const KASLR_RANDOM_BITS: u32 = 36  // Full 64 GB window for kernel base
 
 // Base addresses (will be randomized)
 const STACK_BASE: u64 = 0x7FFFFFFFFFFF
@@ -29,9 +36,10 @@ export fn aslr_init() {
   // Initialize random number generator
   random.random_init()
   
-  // Generate kernel ASLR offset
+  // Generate kernel ASLR offset using the full KASLR entropy range,
+  // not the (smaller) exec range.
   if KASLR_ENABLED == 1 {
-    kaslr_offset = aslr_generate_random_offset(EXEC_RANDOM_BITS)
+    kaslr_offset = aslr_generate_random_offset(KASLR_RANDOM_BITS)
     foundation.serial_write_string("[ASLR] Kernel offset: 0x")
     foundation.serial_write_hex(kaslr_offset)
     foundation.serial_write_string("\n")
@@ -47,77 +55,104 @@ export fn aslr_get_kaslr_offset(): u64 {
 
 export fn aslr_randomize_stack(base: u64): u64 {
   if ASLR_ENABLED == 0 { return base }
-  
+
+  // FIX R4 #20: The old code clamped `offset = base` on underflow,
+  // producing `randomized = 0` — i.e. it placed the stack at the
+  // first page of the address space, which is never mappable.
+  // We now cap the offset to leave at least a minimum stack headroom
+  // below `base` and fall back to a sensible minimum instead of zero.
+  const MIN_STACK_HEADROOM: u64 = 0x100000  // 1 MiB
+
   var offset: u64 = aslr_generate_random_offset(STACK_RANDOM_BITS)
-  if offset > base { offset = base }
+  // If base is too small to safely subtract, don't randomize —
+  // returning `base` unchanged is strictly safer than returning 0.
+  if base < MIN_STACK_HEADROOM { return base }
+  if offset > base - MIN_STACK_HEADROOM {
+    offset = base - MIN_STACK_HEADROOM
+  }
   var randomized: u64 = base - offset
 
   randomized = randomized & ~0xFFF
-  
+
   foundation.serial_write_string("[ASLR] Stack randomized: 0x")
   foundation.serial_write_hex(randomized)
   foundation.serial_write_string("\n")
-  
+
   return randomized
+}
+
+// FIX R4 #21: Canonical x86_64 user addresses must stay below the
+// 48-bit canonical split (0x0000_7FFF_FFFF_FFFF). Overflow past this
+// produces a non-canonical address that faults on first access.
+// Add checked arithmetic helper used by heap/mmap/exec/library.
+const USER_ADDR_MAX: u64 = 0x00007FFFFFFFFFFF
+
+fn aslr_saturating_add(base: u64, offset: u64): u64 {
+  if base >= USER_ADDR_MAX { return base }
+  if offset > USER_ADDR_MAX - base {
+    return USER_ADDR_MAX
+  }
+  return base + offset
 }
 
 export fn aslr_randomize_heap(base: u64): u64 {
   if ASLR_ENABLED == 0 { return base }
-  
+
   var offset: u64 = aslr_generate_random_offset(HEAP_RANDOM_BITS)
-  var randomized: u64 = base + offset
-  
+  var randomized: u64 = aslr_saturating_add(base, offset)
+
   // Align to page boundary
   randomized = randomized & ~0xFFF
-  
+
   foundation.serial_write_string("[ASLR] Heap randomized: 0x")
   foundation.serial_write_hex(randomized)
   foundation.serial_write_string("\n")
-  
+
   return randomized
 }
 
 export fn aslr_randomize_mmap(base: u64): u64 {
   if ASLR_ENABLED == 0 { return base }
-  
+
   var offset: u64 = aslr_generate_random_offset(MMAP_RANDOM_BITS)
-  var randomized: u64 = base + offset
-  
+  var randomized: u64 = aslr_saturating_add(base, offset)
+
   // Align to page boundary
   randomized = randomized & ~0xFFF
-  
+
   foundation.serial_write_string("[ASLR] Mmap randomized: 0x")
   foundation.serial_write_hex(randomized)
   foundation.serial_write_string("\n")
-  
+
   return randomized
 }
 
 export fn aslr_randomize_exec(base: u64): u64 {
   if ASLR_ENABLED == 0 { return base }
-  
+
   var offset: u64 = aslr_generate_random_offset(EXEC_RANDOM_BITS)
-  var randomized: u64 = base + offset
-  
+  var randomized: u64 = aslr_saturating_add(base, offset)
+
   // Align to page boundary
   randomized = randomized & ~0xFFF
-  
+
   foundation.serial_write_string("[ASLR] Exec randomized: 0x")
   foundation.serial_write_hex(randomized)
   foundation.serial_write_string("\n")
-  
+
   return randomized
 }
 
 export fn aslr_randomize_library(base: u64): u64 {
   if ASLR_ENABLED == 0 { return base }
-  
+
   var offset: u64 = aslr_generate_random_offset(MMAP_RANDOM_BITS)
-  var randomized: u64 = base + offset
-  
+  var randomized: u64 = aslr_saturating_add(base, offset)
+
   // Align to page boundary
   randomized = randomized & ~0xFFF
-  
+
+
   return randomized
 }
 

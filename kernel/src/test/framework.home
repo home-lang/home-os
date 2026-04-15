@@ -106,6 +106,43 @@ export fn test_init(): void {
     test_registry.filter_tags = 0xFFFFFFFF
 }
 
+// FIX R6 #29: Destroy a suite and return its memory to the pool.
+// Without this, every `test_suite_create` leaked sizeof(TestSuite)
+// bytes on each run.
+export fn test_suite_destroy(suite: *TestSuite): void {
+    if suite == null { return }
+    // Remove from registry so test_run_all doesn't revisit it.
+    var i: u32 = 0
+    while i < test_registry.suite_count {
+        if test_registry.suites[i] == suite {
+            // Shift remaining slots down.
+            var j: u32 = i
+            while j + 1 < test_registry.suite_count {
+                test_registry.suites[j] = test_registry.suites[j + 1]
+                j = j + 1
+            }
+            test_registry.suite_count = test_registry.suite_count - 1
+            break
+        }
+        i = i + 1
+    }
+    basics.free(suite)
+}
+
+// Convenience: tear down every registered suite.
+export fn test_registry_reset(): void {
+    var i: u32 = 0
+    while i < test_registry.suite_count {
+        basics.free(test_registry.suites[i])
+        test_registry.suites[i] = null
+        i = i + 1
+    }
+    test_registry.suite_count = 0
+    test_registry.current_suite = null
+    test_registry.current_test = null
+    test_registry.current_result = null
+}
+
 // Create a new test suite
 export fn test_suite_create(name: *u8, description: *u8): *TestSuite {
     if test_registry.suite_count >= MAX_SUITES {
@@ -201,10 +238,12 @@ export fn test_set_timeout(suite: *TestSuite, test_idx: u32, timeout_ms: u32): v
     }
 }
 
-// Get current timestamp in microseconds (placeholder - needs kernel timer)
+// FIX R6 #27: Actually wire up the kernel timer so test durations
+// reflect real elapsed time. `basics.timer_get_us` is the platform's
+// wall-clock microsecond counter since boot. Without this, every
+// test reported duration 0 and there was no way to notice slow tests.
 fn get_timestamp_us(): u64 {
-    // TODO: Integrate with kernel timer
-    return 0
+    return basics.timer_get_us()
 }
 
 // Run a single test
@@ -342,11 +381,17 @@ export fn test_run_suite(suite: *TestSuite): void {
     test_registry.current_suite = null
 }
 
-// Run all registered suites
+// Run all registered suites.
+// FIX R6 #31: Make the totals unambiguously scoped to this single
+// invocation — `let`-bind so repeated calls can't accidentally
+// share state.
 export fn test_run_all(): void {
-    var total_passed: u32 = 0
-    var total_failed: u32 = 0
-    var total_skipped: u32 = 0
+    let total_passed_init: u32 = 0
+    let total_failed_init: u32 = 0
+    let total_skipped_init: u32 = 0
+    var total_passed: u32 = total_passed_init
+    var total_failed: u32 = total_failed_init
+    var total_skipped: u32 = total_skipped_init
 
     var i: u32 = 0
     while i < test_registry.suite_count {
@@ -381,6 +426,26 @@ export fn test_run_tagged(tag_mask: u32): void {
     test_registry.filter_tags = old_filter
 }
 
+// FIX R6 #28: Populate the assertion context (file / line / function)
+// so a failed assertion can be traced back to a specific source
+// location. Callers use `assert_with_ctx` directly when they want
+// rich diagnostics; `assert_true` remains the simple fallback.
+export fn assert_set_context(file: *u8, line: u32, function: *u8): void {
+    if file != null {
+        let f_len = basics.strlen(file)
+        var cap: u32 = if f_len > 127 { 127 } else { f_len }
+        basics.memcpy(&current_assertion_ctx.file, file, cap)
+        current_assertion_ctx.file[cap] = 0
+    }
+    if function != null {
+        let g_len = basics.strlen(function)
+        var fcap: u32 = if g_len > 63 { 63 } else { g_len }
+        basics.memcpy(&current_assertion_ctx.function, function, fcap)
+        current_assertion_ctx.function[fcap] = 0
+    }
+    current_assertion_ctx.line = line
+}
+
 // Assertion functions
 
 // Basic assertion
@@ -401,6 +466,9 @@ export fn assert_true(condition: bool, message: *u8): void {
             }
             basics.memcpy(&result.message, message, msg_len)
             result.message[msg_len] = 0
+            // FIX R6 #28: Record where the failing assertion came from.
+            result.file = current_assertion_ctx.file
+            result.line = current_assertion_ctx.line
         }
     }
 }
@@ -558,7 +626,11 @@ export fn test_print_results(suite: *TestSuite): void {
     basics.print(" skipped\n")
 }
 
-// Export results in JSON format
+// FIX R6 #30: Replace every unbounded `sprintf(buffer + pos, ...)`
+// with `snprintf(buffer + pos, max_len - pos, ...)` so we can never
+// overrun the caller's buffer. The old code only checked the
+// per-iteration `pos < max_len - 200` guard which assumes each
+// test produces less than 200 bytes — untrue for long names.
 export fn test_export_json(suite: *TestSuite, buffer: *u8, max_len: u32): u32 {
     if suite == null or buffer == null or max_len < 100 {
         return 0
@@ -566,36 +638,45 @@ export fn test_export_json(suite: *TestSuite, buffer: *u8, max_len: u32): u32 {
 
     var pos: u32 = 0
 
-    // Start JSON object
-    pos = basics.sprintf(buffer, "{\n  \"suite\": \"%s\",\n", &suite.name)
-    pos = pos + basics.sprintf(buffer + pos, "  \"passed\": %d,\n", suite.passed)
-    pos = pos + basics.sprintf(buffer + pos, "  \"failed\": %d,\n", suite.failed)
-    pos = pos + basics.sprintf(buffer + pos, "  \"skipped\": %d,\n", suite.skipped)
-    pos = pos + basics.sprintf(buffer + pos, "  \"tests\": [\n")
+    pos = basics.snprintf(buffer, max_len, "{\n  \"suite\": \"%s\",\n", &suite.name)
+    if pos >= max_len { return pos }
+    pos = pos + basics.snprintf(buffer + pos, max_len - pos, "  \"passed\": %d,\n", suite.passed)
+    if pos >= max_len { return pos }
+    pos = pos + basics.snprintf(buffer + pos, max_len - pos, "  \"failed\": %d,\n", suite.failed)
+    if pos >= max_len { return pos }
+    pos = pos + basics.snprintf(buffer + pos, max_len - pos, "  \"skipped\": %d,\n", suite.skipped)
+    if pos >= max_len { return pos }
+    pos = pos + basics.snprintf(buffer + pos, max_len - pos, "  \"tests\": [\n")
 
     var i: u32 = 0
-    while i < suite.test_count and pos < max_len - 200 {
+    while i < suite.test_count and pos < max_len {
         let result = &suite.results[i]
         let status_str = if result.status == TEST_PASSED { "passed" }
                         else if result.status == TEST_FAILED { "failed" }
                         else if result.status == TEST_SKIPPED { "skipped" }
                         else { "timeout" }
 
-        pos = pos + basics.sprintf(buffer + pos, "    {\n")
-        pos = pos + basics.sprintf(buffer + pos, "      \"name\": \"%s\",\n", &result.test_name)
-        pos = pos + basics.sprintf(buffer + pos, "      \"status\": \"%s\",\n", status_str)
-        pos = pos + basics.sprintf(buffer + pos, "      \"duration_us\": %d\n", result.duration_us)
+        pos = pos + basics.snprintf(buffer + pos, max_len - pos, "    {\n")
+        if pos >= max_len { return pos }
+        pos = pos + basics.snprintf(buffer + pos, max_len - pos, "      \"name\": \"%s\",\n", &result.test_name)
+        if pos >= max_len { return pos }
+        pos = pos + basics.snprintf(buffer + pos, max_len - pos, "      \"status\": \"%s\",\n", status_str)
+        if pos >= max_len { return pos }
+        pos = pos + basics.snprintf(buffer + pos, max_len - pos, "      \"duration_us\": %d\n", result.duration_us)
+        if pos >= max_len { return pos }
 
         if i < suite.test_count - 1 {
-            pos = pos + basics.sprintf(buffer + pos, "    },\n")
+            pos = pos + basics.snprintf(buffer + pos, max_len - pos, "    },\n")
         } else {
-            pos = pos + basics.sprintf(buffer + pos, "    }\n")
+            pos = pos + basics.snprintf(buffer + pos, max_len - pos, "    }\n")
         }
 
         i = i + 1
     }
 
-    pos = pos + basics.sprintf(buffer + pos, "  ]\n}\n")
+    if pos < max_len {
+        pos = pos + basics.snprintf(buffer + pos, max_len - pos, "  ]\n}\n")
+    }
 
     return pos
 }

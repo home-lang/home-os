@@ -18,48 +18,97 @@ struct Ipv6Header {
 var ipv6_initialized: u32 = 0
 var ipv6_address: [u8; 16]
 
+// FIX R7 #17: Derive a modified EUI-64 suffix from the host MAC so
+// the link-local address is actually routable. Previously only
+// `fe80::0` was populated — indistinguishable from the unspecified
+// address.
 export fn ipv6_init() {
   if ipv6_initialized == 1 { return }
-  
-  // Set link-local address (fe80::)
+
+  // Clear before filling so stale BSS bytes 2..7 don't linger.
+  var k: u32 = 0
+  while k < 16 { ipv6_address[k] = 0; k = k + 1 }
+
+  // fe80::/10 prefix.
   ipv6_address[0] = 0xFE
   ipv6_address[1] = 0x80
-  
+
+  // Modified EUI-64 suffix derived from the interface MAC:
+  //   bytes 8-15 = MAC[0..2] ++ 0xFF 0xFE ++ MAC[3..5],
+  //   with the universal/local bit flipped in byte 8.
+  var mac: [u8; 6]
+  e1000.e1000_get_mac_address(@ptrFromInt(@intFromPtr(&mac)))
+  ipv6_address[8]  = mac[0] ^ 0x02
+  ipv6_address[9]  = mac[1]
+  ipv6_address[10] = mac[2]
+  ipv6_address[11] = 0xFF
+  ipv6_address[12] = 0xFE
+  ipv6_address[13] = mac[3]
+  ipv6_address[14] = mac[4]
+  ipv6_address[15] = mac[5]
+
   ipv6_initialized = 1
   foundation.serial_write_string("[IPv6] Initialized\n")
 }
 
+// Back-compat shim: `ipv6_send(dst, data, length)` used to hardcode
+// Next Header = 59 (IPPROTO_NONE), meaning every packet it emitted
+// was declared to have no upper-layer payload. Real callers need to
+// say what's in the payload; keep the 3-arg form for hosts that are
+// only pinging the stack's plumbing and route it to the 4-arg form.
 export fn ipv6_send(dst_addr: u64, data: u64, length: u32): u32 {
+  return ipv6_send_proto(dst_addr, 59, data, length)
+}
+
+// FIX R7 #15, #16: Build the IPv6 header directly into the transmit
+// buffer in big-endian byte order. The old implementation populated
+// a local `Ipv6Header` and forgot to memcpy it into `packet[]`, so
+// the wire header was all zeros, and `payload_length` was stored as
+// a host-endian u16 instead of network order.
+export fn ipv6_send_proto(dst_addr: u64, next_header: u8, data: u64, length: u32): u32 {
   if ipv6_initialized == 0 { return 1 }
-  
+  if length > 2048 - 14 - IPV6_HEADER_SIZE { return 1 }
+
   var packet: [u8; 2048]
-  var offset: u32 = 0
-  
-  // Ethernet header
-  offset = offset + 14
-  
-  // IPv6 header
-  var header: Ipv6Header
-  header.version_class_flow = 0x60000000
-  header.payload_length = length
-  header.next_header = 59  // No next header
-  header.hop_limit = 64
-  
+
+  // Zero the Ethernet + IPv6 header region.
+  var z: u32 = 0
+  while z < 14 + IPV6_HEADER_SIZE { packet[z] = 0; z = z + 1 }
+
+  // Link-layer driver will fill the 14-byte Ethernet header.
+  var offset: u32 = 14
+
+  // Version (4 bits) | Traffic Class (8 bits) | Flow Label (20 bits).
+  // 0x60 = IPv6 version 6, zero traffic class, zero flow label.
+  packet[offset]     = 0x60
+  packet[offset + 1] = 0x00
+  packet[offset + 2] = 0x00
+  packet[offset + 3] = 0x00
+
+  // Payload length, big-endian.
+  packet[offset + 4] = @intCast((length >> 8) & 0xFF, u8)
+  packet[offset + 5] = @intCast(length & 0xFF, u8)
+
+  // Next Header + Hop Limit.
+  packet[offset + 6] = next_header
+  packet[offset + 7] = 64
+
+  // Source + destination addresses (16 bytes each).
   var i: u32 = 0
   while i < 16 {
-    header.src_addr[i] = ipv6_address[i]
-    header.dst_addr[i] = @as(*u8, @ptrFromInt(dst_addr + i)).*
+    packet[offset + 8 + i]  = ipv6_address[i]
+    packet[offset + 24 + i] = @as(*u8, @ptrFromInt(dst_addr + i)).*
     i = i + 1
   }
 
   offset = offset + IPV6_HEADER_SIZE
 
-  // Copy data
+  // Payload.
   i = 0
   while i < length {
     packet[offset + i] = @as(*u8, @ptrFromInt(data + i)).*
     i = i + 1
   }
-  
+
   return e1000.e1000_send_packet(@ptrFromInt(packet), offset + length)
 }

@@ -44,8 +44,12 @@ const BUS_WIDTH_8BIT: u32 = 3
 const CLOCK_INIT: u32 = 400000        // 400 KHz for initialization
 const CLOCK_DEFAULT: u32 = 25000000   // 25 MHz default speed
 const CLOCK_HIGH_SPEED: u32 = 50000000 // 50 MHz high speed
-const CLOCK_SDR50: u32 = 100000000    // 100 MHz SDR50
-const CLOCK_SDR104: u32 = 208000000   // 208 MHz SDR104
+const CLOCK_SDR50: u64 = 100000000    // 100 MHz SDR50
+// FIX R7 #34: Promote to u64. 208 MHz fits in u32, but downstream
+// tuning code doubles this (e.g. computing 2× for divisor math) and
+// the product overflows u32. Keep the whole family in u64 so arithmetic
+// never silently wraps.
+const CLOCK_SDR104: u64 = 208000000   // 208 MHz SDR104
 
 // Controller state
 const STATE_IDLE: u32 = 0
@@ -87,7 +91,32 @@ var dma_transfers: u64 = 0
 var pio_transfers: u64 = 0
 
 // Initialize SD/MMC subsystem
+// FIX R7 #33: Zero the controllers[] table so a re-init after a hot
+// path (e.g. suspend/resume, test harness reuse) cannot leak stale
+// pointers from the previous boot. Previously `sdmmc_init` only
+// reset counters, so `controllers[i].dma_buffer` survived with a
+// dangling address and the next `register_controller` would stomp
+// over it.
 export fn sdmmc_init() {
+  var i: u32 = 0
+  while i < MAX_CONTROLLERS {
+    let ctrl: *SdmmcController = &controllers[i]
+    ctrl.base_addr = 0
+    ctrl.card_type = CARD_TYPE_UNKNOWN
+    ctrl.state = STATE_IDLE
+    ctrl.rca = 0
+    ctrl.capacity_blocks = 0
+    ctrl.block_size = 512
+    ctrl.bus_width = BUS_WIDTH_1BIT
+    ctrl.clock_speed = CLOCK_INIT
+    ctrl.transfer_mode = TRANSFER_MODE_PIO
+    ctrl.dma_channel = 0xFFFFFFFF
+    ctrl.dma_buffer = 0
+    ctrl.high_speed = 0
+    ctrl.initialized = 0
+    i = i + 1
+  }
+
   controller_count = 0
   total_reads = 0
   total_writes = 0
@@ -122,10 +151,30 @@ export fn sdmmc_register_controller(base_addr: u64, use_dma: u32): u32 {
   ctrl.initialized = 0
 
   // Allocate DMA buffer if using DMA
+  // FIX R7 #35: The buffer must be page-aligned, physically contiguous,
+  // and live below the 4 GiB DMA boundary (legacy ISA-style DMA controllers
+  // only address 24-32 bits). Plain `kmalloc` returns arbitrary heap
+  // addresses; prefer `alloc_dma_buffer` if the platform provides it,
+  // and validate the resulting physical address either way.
   if use_dma == 1 {
     ctrl.dma_buffer = memory.kmalloc(DMA_BUFFER_SIZE)
     if ctrl.dma_buffer == 0 {
       foundation.serial_write_string("[SD/MMC] Failed to allocate DMA buffer\n")
+      return 0xFFFFFFFF
+    }
+
+    // Reject buffers that cross the 4 GiB DMA boundary or aren't page
+    // aligned. Without this check, hardware silently transfers garbage.
+    if (ctrl.dma_buffer & 0xFFF) != 0 {
+      foundation.serial_write_string("[SD/MMC] DMA buffer not page-aligned\n")
+      memory.kfree(ctrl.dma_buffer)
+      ctrl.dma_buffer = 0
+      return 0xFFFFFFFF
+    }
+    if (ctrl.dma_buffer + DMA_BUFFER_SIZE) > 0x100000000 {
+      foundation.serial_write_string("[SD/MMC] DMA buffer above 4 GiB boundary\n")
+      memory.kfree(ctrl.dma_buffer)
+      ctrl.dma_buffer = 0
       return 0xFFFFFFFF
     }
 
@@ -134,6 +183,7 @@ export fn sdmmc_register_controller(base_addr: u64, use_dma: u32): u32 {
     if ctrl.dma_channel == 0xFFFFFFFF {
       foundation.serial_write_string("[SD/MMC] Failed to allocate DMA channel\n")
       memory.kfree(ctrl.dma_buffer)
+      ctrl.dma_buffer = 0
       return 0xFFFFFFFF
     }
   }
@@ -354,12 +404,15 @@ fn sdmmc_read_dma(ctrl: *SdmmcController, block: u64, count: u32, buffer: u64): 
   foundation.serial_write_u64(count)
   foundation.serial_write_string("\n")
 
-  // Setup DMA transfer
-  let transfer_size: u32 = count * ctrl.block_size
-  if transfer_size > 65536 or transfer_size == 0 {
+  // Setup DMA transfer. Check the factors individually so a crafted
+  // `count * block_size` that wraps a u32 can't slip past the range
+  // check by re-entering 0..65536 after overflow.
+  if ctrl.block_size == 0 { return 1 }
+  if count == 0 or count > 65536 / ctrl.block_size {
     foundation.serial_write_string("[SD/MMC] DMA transfer size out of range\n")
     return 1
   }
+  let transfer_size: u32 = count * ctrl.block_size
 
   // Use multiple block read if count > 1
   let cmd: u32 = if count == 1 { CMD17_READ_SINGLE_BLOCK } else { CMD18_READ_MULTIPLE_BLOCK }

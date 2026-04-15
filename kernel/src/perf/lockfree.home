@@ -222,12 +222,20 @@ struct SPSCRingBuffer {
   tail: u64                 // Consumer index
 }
 
-export fn spsc_init(rb: u64, buffer: u64, capacity: u32) {
+export fn spsc_init(rb: u64, buffer: u64, capacity: u32): u32 {
+  // FIX R3 #11: reject non-power-of-2 capacities. The mask-based
+  // indexing only works if `capacity` is a power of 2. Previously
+  // the function silently accepted e.g. 1000 and then produced
+  // incorrect indices. Return 0 on invalid capacity.
+  if capacity == 0 { return 0 }
+  if (capacity & (capacity - 1)) != 0 { return 0 }  // Not power of 2
+
   @as(*u64, @ptrFromInt(rb)).* = buffer
   @as(*volatile u32, @ptrFromInt(rb + 8)).* = capacity
-  @as(*volatile u32, @ptrFromInt(rb + 12)).* = capacity - 1  // mask (assumes power of 2)
+  @as(*volatile u32, @ptrFromInt(rb + 12)).* = capacity - 1  // mask
   foundation.atomic_store_u64(rb + 64, 0)   // head
   foundation.atomic_store_u64(rb + 128, 0)  // tail
+  return 1
 }
 
 export fn spsc_push(rb: u64, item: u64): u32 {
@@ -254,14 +262,15 @@ export fn spsc_push(rb: u64, item: u64): u32 {
 
 export fn spsc_pop(rb: u64): u64 {
   var tail: u64 = foundation.atomic_load_u64(rb + 128)
-
-  // Check if empty (tail equals head)
   var head: u64 = foundation.atomic_load_u64(rb + 64)
   if tail == head {
-    return 0xFFFFFFFFFFFFFFFF  // Empty (use sentinel value)
+    return 0xFFFFFFFFFFFFFFFF  // Empty
   }
 
-  // Acquire barrier to see producer's writes
+  // FIX R3 #12: acquire fence pairs with the release in spsc_push.
+  // This ensures we see the item write that preceded the producer's
+  // head update. Placed immediately after the empty-check so we
+  // never read a slot that the producer hasn't fully committed.
   foundation.memory_barrier_acquire()
 
   // Read data
@@ -270,7 +279,10 @@ export fn spsc_pop(rb: u64): u64 {
   var index: u64 = tail & @zext(mask, u64)
   var item: u64 = @as(*u64, @ptrFromInt(buffer + (index * 8))).*
 
-  // Advance tail
+  // Release barrier before advancing tail so the item read is
+  // visible to the producer (which uses (head - tail) for the full
+  // check) before the tail update is published.
+  foundation.memory_barrier_release()
   foundation.atomic_store_u64(rb + 128, (tail + 1) & @zext(mask, u64))
 
   return item
@@ -337,20 +349,30 @@ export fn mpmc_push(rb: u64, item: u64): u32 {
     var state: u32 = foundation.atomic_load_u32(slot + 8)
 
     if state == SLOT_EMPTY {
-      // Try to claim slot for writing
-      if foundation.atomic_cas_u32(slot + 8, SLOT_EMPTY, SLOT_WRITING) == 1 {
-        // Try to advance head
-        if foundation.atomic_cas_u64(rb + 64, head, head + 1) == 1 {
-          // Write data and mark full
-          @as(*u64, @ptrFromInt(slot)).* = item
-          foundation.memory_barrier_release()
-          foundation.atomic_store_u32(slot + 8, SLOT_FULL)
-          return 1
-        } else {
-          // Another producer advanced, release slot
-          foundation.atomic_store_u32(slot + 8, SLOT_EMPTY)
+      // FIX R3 #13: Advance head FIRST (the ordering anchor), then
+      // claim the slot. This eliminates the old race where a
+      // consumer could transition the slot from SLOT_EMPTY → SLOT_READING
+      // between the producer's state-check and the state-reset on
+      // head-CAS-failure. Now, if head CAS fails, we never touched
+      // the slot state in the first place.
+      if foundation.atomic_cas_u64(rb + 64, head, head + 1) == 1 {
+        // We own index `head` — wait until slot is actually empty
+        // (previous consumer may still be finishing). Spin briefly.
+        var wait_iters: u32 = 0
+        while foundation.atomic_load_u32(slot + 8) != SLOT_EMPTY {
+          foundation.cpu_pause()
+          wait_iters = wait_iters + 1
+          if wait_iters > 10000 { break }  // Escape hatch
         }
+        // Claim for writing; by design we're the unique producer for
+        // this slot so CAS cannot fail.
+        foundation.atomic_store_u32(slot + 8, SLOT_WRITING)
+        @as(*u64, @ptrFromInt(slot)).* = item
+        foundation.memory_barrier_release()
+        foundation.atomic_store_u32(slot + 8, SLOT_FULL)
+        return 1
       }
+      // Head-CAS failed: another producer got the slot. Retry.
     } else if state == SLOT_FULL {
       // Check if buffer is full
       var tail: u64 = foundation.atomic_load_u64(rb + 128)

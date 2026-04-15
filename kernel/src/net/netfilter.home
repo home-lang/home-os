@@ -16,6 +16,8 @@ const NF_AUDIT_PACKET_DROP: u32 = 3
 const NF_AUDIT_PACKET_ACCEPT: u32 = 4
 const NF_AUDIT_STATE_CHANGE: u32 = 5
 
+// FIX R7 #19: Rules carry an explicit priority so ordering is
+// deterministic rather than "whatever index you happened to pick".
 struct FirewallRule {
   src_ip: u32,
   dst_ip: u32,
@@ -24,6 +26,7 @@ struct FirewallRule {
   protocol: u8,
   action: u32,
   enabled: u32,
+  priority: u32,   // Lower number = higher priority
   hit_count: u64
 }
 
@@ -41,18 +44,39 @@ export fn netfilter_init() {
   foundation.serial_write_string("[Netfilter] Initialized\n")
 }
 
+// FIX R7 #18: Reuse a disabled slot if one exists; otherwise grow.
+fn netfilter_find_free_slot(): u32 {
+  var i: u32 = 0
+  while i < rule_count {
+    if rules[i].enabled == 0 { return i }
+    i = i + 1
+  }
+  if rule_count < MAX_RULES {
+    var slot: u32 = rule_count
+    rule_count = rule_count + 1
+    return slot
+  }
+  return 0xFFFFFFFF
+}
+
 export fn netfilter_add_rule(src_ip: u32, dst_ip: u32, protocol: u8, action: u32): u32 {
-  if rule_count >= MAX_RULES { return 0xFFFFFFFF }
+  return netfilter_add_rule_priority(src_ip, dst_ip, protocol, action, 100)
+}
 
-  rules[rule_count].src_ip = src_ip
-  rules[rule_count].dst_ip = dst_ip
-  rules[rule_count].protocol = protocol
-  rules[rule_count].action = action
-  rules[rule_count].enabled = 1
-  rules[rule_count].hit_count = 0
+// FIX R7 #19: Full-control variant that lets callers set priority.
+export fn netfilter_add_rule_priority(src_ip: u32, dst_ip: u32, protocol: u8, action: u32, priority: u32): u32 {
+  var slot: u32 = netfilter_find_free_slot()
+  if slot == 0xFFFFFFFF { return 0xFFFFFFFF }
 
-  var id: u32 = rule_count
-  rule_count = rule_count + 1
+  rules[slot].src_ip = src_ip
+  rules[slot].dst_ip = dst_ip
+  rules[slot].protocol = protocol
+  rules[slot].action = action
+  rules[slot].enabled = 1
+  rules[slot].priority = priority
+  rules[slot].hit_count = 0
+
+  var id: u32 = slot
 
   // Audit log the rule addition
   var rule_data: u64 = (@as(u64, src_ip) << 32) | @as(u64, dst_ip)
@@ -68,41 +92,76 @@ export fn netfilter_add_rule(src_ip: u32, dst_ip: u32, protocol: u8, action: u32
   return id
 }
 
+// Legacy 3-arg check: callers that don't track ports pass wildcard
+// ports so port-filtering rules remain inert for protocol-only traffic.
 export fn netfilter_check_packet(src_ip: u32, dst_ip: u32, protocol: u8): u32 {
+  return netfilter_check_packet_ports(src_ip, dst_ip, protocol, 0, 0)
+}
+
+// Evaluate rules in priority order. Within the same priority, first
+// match wins. Port matching closes a hole where FirewallRule carried
+// src_port / dst_port fields that were never consulted — a rule that
+// said "drop dst port 22" only dropped *everything* at the first
+// matching (src_ip, dst_ip, protocol), ignoring the port entirely.
+export fn netfilter_check_packet_ports(src_ip: u32, dst_ip: u32, protocol: u8, src_port: u16, dst_port: u16): u32 {
   if netfilter_enabled == 0 { return NF_ACCEPT }
 
-  var i: u32 = 0
-  while i < rule_count {
-    if rules[i].enabled == 1 {
-      if (rules[i].src_ip == 0 or rules[i].src_ip == src_ip) and
-         (rules[i].dst_ip == 0 or rules[i].dst_ip == dst_ip) and
-         (rules[i].protocol == 0 or rules[i].protocol == protocol) {
-        // Update hit count
-        rules[i].hit_count = rules[i].hit_count + 1
-
-        var action: u32 = rules[i].action
-        var pkt_addr: u64 = (@as(u64, src_ip) << 32) | @as(u64, dst_ip)
-
-        if action == NF_DROP {
-          total_drops = total_drops + 1
-          // Audit log dropped packets
-          if audit_drops == 1 {
-            audit.audit_log_network(0, 0, pkt_addr,
-                                    (NF_AUDIT_PACKET_DROP << 16) | @as(u32, protocol), -1)
-          }
-        } else {
-          total_accepts = total_accepts + 1
-          // Optionally audit accepted packets
-          if audit_accepts == 1 {
-            audit.audit_log_network(0, 0, pkt_addr,
-                                    (NF_AUDIT_PACKET_ACCEPT << 16) | @as(u32, protocol), 0)
-          }
+  var pass_priority: u32 = 0
+  var passes: u32 = 0
+  loop {
+    // Find the next priority level at or above pass_priority.
+    var found_next: u32 = 0
+    var next_priority: u32 = 0xFFFFFFFF
+    var i: u32 = 0
+    while i < rule_count {
+      if rules[i].enabled == 1 and rules[i].priority >= pass_priority {
+        if found_next == 0 or rules[i].priority < next_priority {
+          next_priority = rules[i].priority
+          found_next = 1
         }
-
-        return action
       }
+      i = i + 1
     }
-    i = i + 1
+    if found_next == 0 { break }
+
+    // Check every rule at that priority — first match wins.
+    i = 0
+    while i < rule_count {
+      if rules[i].enabled == 1 and rules[i].priority == next_priority {
+        if (rules[i].src_ip == 0 or rules[i].src_ip == src_ip) and
+           (rules[i].dst_ip == 0 or rules[i].dst_ip == dst_ip) and
+           (rules[i].protocol == 0 or rules[i].protocol == protocol) and
+           (rules[i].src_port == 0 or rules[i].src_port == src_port) and
+           (rules[i].dst_port == 0 or rules[i].dst_port == dst_port) {
+          rules[i].hit_count = rules[i].hit_count + 1
+
+          var action: u32 = rules[i].action
+          var pkt_addr: u64 = (@as(u64, src_ip) << 32) | @as(u64, dst_ip)
+
+          if action == NF_DROP {
+            total_drops = total_drops + 1
+            if audit_drops == 1 {
+              audit.audit_log_network(0, 0, pkt_addr,
+                                      (NF_AUDIT_PACKET_DROP << 16) | @as(u32, protocol), -1)
+            }
+          } else {
+            total_accepts = total_accepts + 1
+            if audit_accepts == 1 {
+              audit.audit_log_network(0, 0, pkt_addr,
+                                      (NF_AUDIT_PACKET_ACCEPT << 16) | @as(u32, protocol), 0)
+            }
+          }
+
+          return action
+        }
+      }
+      i = i + 1
+    }
+
+    // Bump past this priority and continue.
+    pass_priority = next_priority + 1
+    passes = passes + 1
+    if passes > MAX_RULES { break }  // Defensive
   }
 
   total_accepts = total_accepts + 1

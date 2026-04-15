@@ -215,10 +215,14 @@ struct ParsedUrl {
 fn http_parse_url(url: u64, parsed: *ParsedUrl): u32 {
   var url_ptr: *u8 = @ptrFromInt(url)
   var idx: u32 = 0
+  // Hard ceiling on the entire URL length so an unterminated string
+  // can't run the parser off into arbitrary memory. Any legitimate
+  // URL we care about fits in 4 KiB.
+  const URL_MAX: u32 = 4096
 
   // Parse scheme (http:// or https://)
   var scheme_idx: u32 = 0
-  while url_ptr[idx] != 0 and url_ptr[idx] != 58 and scheme_idx < 15 {
+  while idx < URL_MAX and url_ptr[idx] != 0 and url_ptr[idx] != 58 and scheme_idx < 15 {
     parsed.scheme[scheme_idx] = url_ptr[idx]
     scheme_idx = scheme_idx + 1
     idx = idx + 1
@@ -232,7 +236,7 @@ fn http_parse_url(url: u64, parsed: *ParsedUrl): u32 {
 
   // Parse host
   var host_idx: u32 = 0
-  while url_ptr[idx] != 0 and url_ptr[idx] != 58 and url_ptr[idx] != 47 and host_idx < 255 {
+  while idx < URL_MAX and url_ptr[idx] != 0 and url_ptr[idx] != 58 and url_ptr[idx] != 47 and host_idx < 255 {
     parsed.host[host_idx] = url_ptr[idx]
     host_idx = host_idx + 1
     idx = idx + 1
@@ -241,24 +245,25 @@ fn http_parse_url(url: u64, parsed: *ParsedUrl): u32 {
 
   // Parse port (optional)
   parsed.port = 80  // Default
-  if url_ptr[idx] == 58 {  // ':'
+  if idx < URL_MAX and url_ptr[idx] == 58 {  // ':'
     idx = idx + 1
     var port_str: [u8; 8]
     var port_idx: u32 = 0
-    while url_ptr[idx] >= 48 and url_ptr[idx] <= 57 and port_idx < 5 {
+    while idx < URL_MAX and url_ptr[idx] >= 48 and url_ptr[idx] <= 57 and port_idx < 5 {
       port_str[port_idx] = url_ptr[idx]
       port_idx = port_idx + 1
       idx = idx + 1
     }
     port_str[port_idx] = 0
-    port_str[port_idx] = 0
     parsed.port = str_to_u32(@ptrFromInt(port_str))
   }
 
-  // Parse path
+  // Parse path. path is [u8; 512] — cap at 511 so there is always one
+  // byte left for the null terminator. Previously an attacker-supplied
+  // URL with a >512-byte path silently overran the struct.
   var path_idx: u32 = 0
-  if url_ptr[idx] == 47 {  // '/'
-    while url_ptr[idx] != 0 {
+  if idx < URL_MAX and url_ptr[idx] == 47 {  // '/'
+    while idx < URL_MAX and url_ptr[idx] != 0 and path_idx < 511 {
       parsed.path[path_idx] = url_ptr[idx]
       path_idx = path_idx + 1
       idx = idx + 1
@@ -460,12 +465,16 @@ fn http_parse_response(conn_idx: u32, data: u64, data_len: u32): u32 {
   }
   offset = offset + 1  // Skip space
 
-  // Parse status code
+  // Parse status code. status_str is a 4-byte buffer (3 digits + NUL),
+  // so cap the accumulator at 3 and consume any further digits without
+  // storing so the status can't overrun the buffer.
   var status_str: [u8; 4]
   var status_idx: u32 = 0
   while offset < data_len and data_ptr[offset] >= 48 and data_ptr[offset] <= 57 {
-    status_str[status_idx] = data_ptr[offset]
-    status_idx = status_idx + 1
+    if status_idx < 3 {
+      status_str[status_idx] = data_ptr[offset]
+      status_idx = status_idx + 1
+    }
     offset = offset + 1
   }
   status_str[status_idx] = 0
@@ -487,26 +496,31 @@ fn http_parse_response(conn_idx: u32, data: u64, data_len: u32): u32 {
       break
     }
 
-    // Parse header name
+    // Parse header name. name is [u8; 64]; cap at 63 so we always have
+    // one byte for the null terminator.
     var name_idx: u32 = 0
     while offset < data_len and data_ptr[offset] != 58 {  // ':'
-      resp.headers[resp.header_count].name[name_idx] = data_ptr[offset]
-      name_idx = name_idx + 1
+      if name_idx < 63 {
+        resp.headers[resp.header_count].name[name_idx] = data_ptr[offset]
+        name_idx = name_idx + 1
+      }
       offset = offset + 1
     }
     resp.headers[resp.header_count].name[name_idx] = 0
     offset = offset + 1  // Skip ':'
 
     // Skip space
-    if data_ptr[offset] == 32 {
+    if offset < data_len and data_ptr[offset] == 32 {
       offset = offset + 1
     }
 
-    // Parse header value
+    // Parse header value. value is [u8; 256]; cap at 255 for terminator.
     var value_idx: u32 = 0
     while offset < data_len and data_ptr[offset] != 13 {
-      resp.headers[resp.header_count].value[value_idx] = data_ptr[offset]
-      value_idx = value_idx + 1
+      if value_idx < 255 {
+        resp.headers[resp.header_count].value[value_idx] = data_ptr[offset]
+        value_idx = value_idx + 1
+      }
       offset = offset + 1
     }
     resp.headers[resp.header_count].value[value_idx] = 0
@@ -515,7 +529,10 @@ fn http_parse_response(conn_idx: u32, data: u64, data_len: u32): u32 {
     resp.header_count = resp.header_count + 1
   }
 
-  // Body starts at offset
+  // Body starts at offset. Guard against a truncated response where
+  // `offset` ran past `data_len` in the header loop — saturate body_len
+  // at zero instead of wrapping a u32 subtraction.
+  if offset > data_len { offset = data_len }
   resp.body_len = data_len - offset
   if resp.body_len > 0 {
     resp.body = data + offset
