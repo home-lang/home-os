@@ -336,7 +336,7 @@ Pin  │ Function     │ Status
 
 ```bash
 # Run Pi 5 benchmarks
-./scripts/build-unified.sh --target=rpi5 --test
+./scripts/build.sh --target=rpi5 --test
 
 # Expected results:
 # Boot time: < 2.0s to shell

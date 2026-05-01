@@ -146,7 +146,7 @@ When HomeOS boots successfully, you should see:
 
 ```bash
 cd ~/Code/home-os
-./scripts/build-rpi5.sh
+./scripts/build.sh rpi5
 ```
 
 This will:

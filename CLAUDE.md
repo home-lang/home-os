@@ -300,15 +300,36 @@ As of October 28, 2025:
 
 ## Build Scripts & Environment
 
-The build scripts under `scripts/` derive paths from the script's own location, so
-they work regardless of where the repo is checked out. The following env vars
-can be overridden if your layout differs from the defaults:
+There is **one canonical build entry**: `scripts/build.sh`. It is a dispatcher
+that exposes every legacy build path as a subcommand. Run
+`./scripts/build.sh --help` to see the full list.
 
-- `KERNEL_DIR` — path to the kernel directory (default: `<repo-root>/kernel`)
-- `ISO_DIR` — path for ISO staging (default: `$KERNEL_DIR/iso`)
-- `BUILD_DIR` — path for build artifacts (default: `$KERNEL_DIR/build`)
-- `HOME_REPO` — path to the Home compiler repo (default: `<repo-root>/../home`)
-- `HOME_COMPILER` — path to the `home` binary (default: `$HOME_REPO/zig-out/bin/home`)
+Common invocations:
+
+```bash
+./scripts/build.sh                       # generic x86-64 kernel + ISO
+./scripts/build.sh rpi5                  # Raspberry Pi 5 build
+./scripts/build.sh home                  # build via the Home compiler
+./scripts/build.sh --target=rpi5 --release   # multi-target unified build
+./scripts/build.sh unified all --iso     # build every target + ISO
+./scripts/build.sh --help                # full subcommand reference
+```
+
+Subcommands map 1:1 to the old build-*.sh scripts: `kernel`, `home`,
+`home-zig`, `home-simple`, `standalone`, `rpi5`, `pi-image`, `pi3-minimal`,
+`legacy-boot`, `initramfs`, `all`, `unified`.
+
+Paths are derived from the script's own location, so the build works
+regardless of where the repo is checked out. Override these env vars if
+your layout differs from the defaults:
+
+- `KERNEL_DIR` — kernel directory (default: `<repo-root>/kernel`)
+- `ISO_DIR` — ISO staging directory (default: `$KERNEL_DIR/iso`)
+- `BUILD_DIR` — kernel build artifacts (default: `$KERNEL_DIR/build`)
+- `PROJECT_BUILD_DIR` — multi-target build root (default: `<repo-root>/build`)
+- `HOME_REPO` — Home compiler repo (default: `<repo-root>/../home`)
+- `HOME_COMPILER` — `home` binary (default: `$HOME_REPO/zig-out/bin/home`)
+- `RPI5_DIR` — Pi 5 firmware staging directory (default: `<repo-root>/rpi5`)
 
 Expected sibling layout:
 
@@ -319,4 +340,4 @@ parent/
 ```
 
 If your Home compiler lives elsewhere, export `HOME_REPO` (or `HOME_COMPILER`)
-before invoking the build scripts.
+before invoking the build script.

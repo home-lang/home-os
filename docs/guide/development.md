@@ -226,7 +226,7 @@ The primary testing environment is QEMU:
 **ARM64 (Raspberry Pi 5):**
 ```bash
 # Build for Raspberry Pi 5
-./scripts/build-rpi5.sh
+./scripts/build.sh rpi5
 
 # Run in QEMU (limited hardware support)
 ./scripts/run-qemu-arm64.sh

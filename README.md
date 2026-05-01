@@ -46,7 +46,7 @@ brew install aarch64-elf-gcc
 
 # 3. Build HomeOS
 cd ~/Code/home-os
-./scripts/build-rpi5.sh
+./scripts/build.sh rpi5
 
 # 4. Copy to SD card (FAT32 formatted)
 cp -r build/rpi5/boot/* /path/to/sd-card/
@@ -78,8 +78,7 @@ home-os/
 │   ├── config.txt            # Raspberry Pi 5 bootloader config
 │   └── cmdline.txt           # Kernel command line
 ├── scripts/
-│   ├── build-rpi5.sh         # Raspberry Pi 5 build script
-│   └── build.sh              # x86-64 build script
+│   └── build.sh              # Canonical build dispatcher (run with --help)
 └── docs/
     ├── RASPBERRY_PI_5.md     # Complete Pi 5 documentation
     ├── QUICK_START_RPI5.md   # Quick start for Pi 5
@@ -110,14 +109,14 @@ home-os/
 
 **Raspberry Pi 5:**
 ```bash
-./scripts/build-rpi5.sh
+./scripts/build.sh rpi5
 ```
 
 **x86-64:**
 ```bash
-cd kernel
-zig build iso    # Create bootable ISO
-zig build qemu   # Build and run in QEMU
+./scripts/build.sh                # Build kernel + bootable ISO
+./scripts/build.sh --run          # Build and run in QEMU
+./scripts/build.sh --help         # See all subcommands
 ```
 
 ## What Works

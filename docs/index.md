@@ -35,7 +35,7 @@ HomeOS is a modern operating system designed for both x86-64 and ARM64 architect
 
 ```bash
 # 1. Build HomeOS
-./scripts/build-rpi5.sh
+./scripts/build.sh rpi5
 
 # 2. Copy to SD card (FAT32 formatted)
 cp -r build/rpi5/boot/* /path/to/sd-card/

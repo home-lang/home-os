@@ -188,7 +188,7 @@ DO NOT CONNECT VCC/5V - Power via USB-C only!
 
 ```bash
 cd ~/Code/home-os
-./scripts/build-rpi5.sh
+./scripts/build.sh rpi5
 ```
 
 ### Build Output

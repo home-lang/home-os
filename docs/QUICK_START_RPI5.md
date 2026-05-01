@@ -42,7 +42,7 @@ sudo pacman -S aarch64-linux-gnu-gcc aarch64-linux-gnu-binutils
 
 ```bash
 cd ~/Code/home-os
-./scripts/build-rpi5.sh
+./scripts/build.sh rpi5
 ```
 
 Expected output:

@@ -64,7 +64,7 @@ HomeOS now supports the Raspberry Pi 5, utilizing its ARM64 architecture (Cortex
 
 ```bash
 cd ~/Code/home-os
-./scripts/build-rpi5.sh
+./scripts/build.sh rpi5
 ```
 
 The build script will:
@@ -372,7 +372,7 @@ For low-level debugging, you can use a JTAG adapter:
 ### Iterative Development
 
 1. Edit source files in `kernel/src/rpi5_main.home`
-2. Build: `./scripts/build-rpi5.sh`
+2. Build: `./scripts/build.sh rpi5`
 3. Copy only `home-kernel.img` to SD card:
    ```bash
    cp build/rpi5/boot/home-kernel.img /path/to/sd-card/
