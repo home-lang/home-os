@@ -1,14 +1,22 @@
 #!/bin/bash
 # Build script for home-os kernel using Home compiler
 # This builds a minimal kernel to test the Home language compiler
+#
+# Required env vars (with defaults):
+#   HOME_REPO       Path to the Home compiler repo (default: $REPO_ROOT/../home)
+#   HOME_COMPILER   Path to the Home compiler binary (default: $HOME_REPO/zig-out/bin/home)
+#   KERNEL_DIR      Path to the home-os kernel dir (default: $REPO_ROOT/kernel)
 
-set -e
+set -euo pipefail
 
-KERNEL_DIR="/Users/chrisbreuer/Code/home-os/kernel"
-HOME_DIR="/Users/chrisbreuer/Code/home"
-ISO_DIR="$KERNEL_DIR/iso"
-BUILD_DIR="$KERNEL_DIR/build"
-HOME_COMPILER="$HOME_DIR/zig-out/bin/home"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+KERNEL_DIR="${KERNEL_DIR:-$REPO_ROOT/kernel}"
+HOME_REPO="${HOME_REPO:-$REPO_ROOT/../home}"
+ISO_DIR="${ISO_DIR:-$KERNEL_DIR/iso}"
+BUILD_DIR="${BUILD_DIR:-$KERNEL_DIR/build}"
+HOME_COMPILER="${HOME_COMPILER:-$HOME_REPO/zig-out/bin/home}"
 
 echo "=== Building home-os kernel with Home Compiler ==="
 echo ""
@@ -17,7 +25,8 @@ echo ""
 if [ ! -f "$HOME_COMPILER" ]; then
     echo "Error: Home compiler not found at $HOME_COMPILER"
     echo "Please build the Home compiler first:"
-    echo "  cd $HOME_DIR && zig build"
+    echo "  cd \"$HOME_REPO\" && zig build"
+    echo "Or set HOME_COMPILER / HOME_REPO env vars to point at an existing build."
     exit 1
 fi
 
@@ -39,32 +48,17 @@ echo ""
 echo "Step 1: Compiling kernel_simple.home to assembly..."
 "$HOME_COMPILER" build src/kernel_simple.home --kernel -o "$BUILD_DIR/kernel_main.s"
 
-if [ $? -ne 0 ]; then
-    echo "Error: Home compiler failed!"
-    exit 1
-fi
-
 echo "Home compilation successful!"
 echo ""
 
 echo "Step 2: Assembling boot.s..."
 as -o "$BUILD_DIR/boot.o" src/boot.s
 
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to assemble boot.s!"
-    exit 1
-fi
-
 echo "boot.s assembled successfully!"
 echo ""
 
 echo "Step 3: Assembling kernel_main.s..."
 as -o "$BUILD_DIR/kernel_main.o" "$BUILD_DIR/kernel_main.s"
-
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to assemble kernel_main.s!"
-    exit 1
-fi
 
 echo "kernel_main.s assembled successfully!"
 echo ""
@@ -74,11 +68,6 @@ ld -n -o "$BUILD_DIR/home-kernel.elf" \
     -T linker.ld \
     "$BUILD_DIR/boot.o" \
     "$BUILD_DIR/kernel_main.o"
-
-if [ $? -ne 0 ]; then
-    echo "Error: Linking failed!"
-    exit 1
-fi
 
 echo "Kernel linked successfully!"
 ls -lh "$BUILD_DIR/home-kernel.elf"
@@ -116,10 +105,10 @@ ls -lh "$BUILD_DIR/home-os.iso"
 echo ""
 echo "=== Build complete! ==="
 echo ""
-echo "✅ Home compiler successfully compiled kernel!"
-echo "✅ Kernel assembled and linked!"
-echo "✅ Bootable ISO created!"
+echo "Home compiler successfully compiled kernel!"
+echo "Kernel assembled and linked!"
+echo "Bootable ISO created!"
 echo ""
 echo "To run in QEMU:"
-echo "  cd /Users/chrisbreuer/Code/home-os && ./scripts/run-qemu.sh"
+echo "  cd \"$REPO_ROOT\" && ./scripts/run-qemu.sh"
 echo ""

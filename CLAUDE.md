@@ -297,3 +297,26 @@ As of October 28, 2025:
 - **buddy-bot** handles dependency updates — not renovatebot
 - **better-dx** provides shared dev tooling as peer dependencies — do not install its peers (e.g., `typescript`, `pickier`, `bun-plugin-dtsx`) separately if `better-dx` is already in `package.json`
 - If `better-dx` is in `package.json`, ensure `bunfig.toml` includes `linker = "hoisted"`
+
+## Build Scripts & Environment
+
+The build scripts under `scripts/` derive paths from the script's own location, so
+they work regardless of where the repo is checked out. The following env vars
+can be overridden if your layout differs from the defaults:
+
+- `KERNEL_DIR` — path to the kernel directory (default: `<repo-root>/kernel`)
+- `ISO_DIR` — path for ISO staging (default: `$KERNEL_DIR/iso`)
+- `BUILD_DIR` — path for build artifacts (default: `$KERNEL_DIR/build`)
+- `HOME_REPO` — path to the Home compiler repo (default: `<repo-root>/../home`)
+- `HOME_COMPILER` — path to the `home` binary (default: `$HOME_REPO/zig-out/bin/home`)
+
+Expected sibling layout:
+
+```
+parent/
+├── home-os/   # this repo
+└── home/      # Home compiler repo (HOME_REPO)
+```
+
+If your Home compiler lives elsewhere, export `HOME_REPO` (or `HOME_COMPILER`)
+before invoking the build scripts.

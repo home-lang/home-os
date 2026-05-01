@@ -36,7 +36,7 @@ Welcome to home-os! This guide will help you build and run the operating system.
 ### Quick Build
 
 ```bash
-cd /Users/chrisbreuer/Code/home-os
+cd /path/to/home-os
 ./scripts/build.sh
 ```
 

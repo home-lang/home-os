@@ -1,11 +1,16 @@
 #!/bin/bash
 # Build script for home-os kernel
 
-set -e
+set -euo pipefail
 
-KERNEL_DIR="/Users/chrisbreuer/Code/home-os/kernel"
-ISO_DIR="$KERNEL_DIR/iso"
-BUILD_DIR="$KERNEL_DIR/build"
+# Resolve the repo root from this script's location so the build works
+# regardless of where it is invoked from.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+KERNEL_DIR="${KERNEL_DIR:-$REPO_ROOT/kernel}"
+ISO_DIR="${ISO_DIR:-$KERNEL_DIR/iso}"
+BUILD_DIR="${BUILD_DIR:-$KERNEL_DIR/build}"
 
 echo "=== Building home-os kernel ==="
 

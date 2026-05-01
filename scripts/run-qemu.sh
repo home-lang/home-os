@@ -1,15 +1,19 @@
 #!/bin/bash
 # Run home-os in QEMU
 
-set -e
+set -euo pipefail
 
-BUILD_DIR="/Users/chrisbreuer/Code/home-os/kernel/build"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+KERNEL_DIR="${KERNEL_DIR:-$REPO_ROOT/kernel}"
+BUILD_DIR="${BUILD_DIR:-$KERNEL_DIR/build}"
 ISO="$BUILD_DIR/home-os.iso"
 
 # Check if ISO exists
 if [ ! -f "$ISO" ]; then
     echo "ISO not found. Building first..."
-    ./scripts/build.sh
+    "$SCRIPT_DIR/build.sh"
 fi
 
 # Check for QEMU

@@ -122,7 +122,7 @@ Supports standard terminal applications:
 
 ```bash
 # Run terminal tests
-cd /Users/chrisbreuer/Code/home-os/apps/terminal
+cd "$(git rev-parse --show-toplevel)/apps/terminal"
 home test terminal_test.home
 ```
 
