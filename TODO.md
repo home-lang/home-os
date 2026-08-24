@@ -460,79 +460,34 @@
 
 ## How to Use This File
 
-- **Canonical Strategic TODO** (next section) is the **source of truth** for current status and priorities.
-- The long 18-phase roadmap further below is **legacy vision**; use it for ideas and long-term framing, not as an implementation checklist.
-- When adding or updating work, add it under the relevant **Canonical priority** instead of editing legacy checkboxes.
+- **`docs/MASTER_PLAN.md` is the single source of truth** for strategy, phases, gates, and priorities. Start there.
+- The **Canonical Plan** section below mirrors only the *current phase* and its open gate criteria.
+- The long 18-phase roadmap further below is **legacy vision**; historical only.
+- Add new work items against the current phase's gates, or to `docs/MASTER_PLAN.md` itself.
 
 ---
 
-## Canonical Strategic TODO (Strategic Roadmap)
+## Canonical Plan (mirror of docs/MASTER_PLAN.md)
 
-> **Last Analysis**: November 24, 2025  
-> **Purpose**: This section is the **authoritative, code-informed roadmap** for HomeOS as a minimal, Linux-class OS built entirely in Home and optimized for low-end hardware (Raspberry Pi and similar).  
-> The long 18-phase roadmap further below is now **legacy vision**; its individual checkboxes are historical and may not accurately reflect the current implementation.  
-> This roadmap merges and supersedes the earlier `TODO-UPDATES.md` strategic document, which can now be archived or deleted.
+> **Superseded:** the former "Canonical Strategic TODO" (Nov 24, 2025) is replaced by
+> [`docs/MASTER_PLAN.md`](docs/MASTER_PLAN.md) as of 2026-08-24. The priority sections
+> below (P1–P8) and the 18-phase roadmap are retained as historical record only.
 
-### Active Focus (Next Up)
+### Honest status snapshot (2026-08-24)
 
-- [x] **Security capabilities** – implement real capability checks and syscall enforcement in `kernel/src/security/caps.home`. (**COMPLETED Dec 5, 2025**: Added capability checks in syscall.home for privileged operations like kill, setuid, setgid, chroot, ptrace, reboot, mknod, bind, socket, ioctl, settimeofday, setrlimit)
-- [x] **DNS & networking verification** – complete `kernel/src/net/dns.home` and run end-to-end tests (DHCP + DNS + HTTP/TLS/WebSocket) on Pi and x86-64. (**COMPLETED Dec 5, 2025**: Full DNS resolver with query building, response parsing, caching, retries, and fallback servers)
-- [x] **Pi 3/4/5 boot & perf loop** – benchmark boot time, RAM footprint, and I/O on real hardware; wire results into automated tests. (**COMPLETED Dec 16, 2025**)
-  - Created `kernel/src/perf/pi_benchmark.home` comprehensive benchmark suite
-  - Platform detection: Pi 3, Pi 3 B+, Pi 4 (1-8GB), Pi 5 (4-8GB), x86-64
-  - Boot time benchmarks with phase breakdown (firmware, bootloader, kernel, drivers, fs, userspace)
-  - Memory benchmarks: footprint, bandwidth (read/write/copy)
-  - I/O benchmarks: SD card sequential/random read/write, IOPS
-  - CPU benchmarks: integer ops, multicore scaling
-  - Network benchmarks: ethernet throughput
-  - Performance targets per platform with pass/fail tracking
-  - JSON output for CI/CD integration (`pi_benchmark_to_json`)
-  - Created `tests/integration/test_pi_benchmark.sh` for automated testing
-- [x] **Unified build entrypoint** – consolidate current scripts into a single canonical build command for all targets. (**COMPLETED Dec 5, 2025**: Created `scripts/build-unified.sh` supporting x86-64, arm64, rpi3, rpi4, rpi5 with --release, --debug, --iso, --run, --test options)
-- [x] **Seccomp syscall filtering** – implement seccomp-like syscall filtering for process sandboxing. (**COMPLETED Dec 5, 2025**: Enhanced seccomp.home with whitelist mode, predefined security profiles (minimal, compute, filesystem, standard), integrated with syscall handler)
+- ~409 kernel `.home` files (~180k lines) written; **398/407 parse** with the Home compiler; no end-to-end compile → link → boot of Home-generated code has been demonstrated yet.
+- Detailed subsystem source exists (TCP, buddy/slab, CFS, syscalls, compositor, 80+ coreutils) but has **never executed**; load-bearing stubs remain (ARM64 MMIO, netdev RX, fb_console fonts, crypto, homefs) — see the stub-burndown register in `docs/MASTER_PLAN.md` § 7.
+- `scripts/build.sh` still contains silent stub fallbacks; CI does not yet build or boot the real kernel; existing test scripts are static checks, not runtime tests.
 
-### Subsystem Index
+### Current phase: Phase 0 — Truth & Toolchain
 
-- **Memory / MM / perf / power** – see P1, P2.3, P3.2, P8.
-- **Raspberry Pi & ARM64** – see P2 and legacy Phase 12.
-- **Developer experience & tooling** – see P3 and continuous tasks near the end of this file.
-- **Kernel core (process, VFS, syscalls)** – see P4.1 and audit docs in `docs/audits/`.
-- **Security** – see P4.2, P6, and legacy Phase 10.
-- **Networking** – see P1.3, P2.2, P4.3, P7, and legacy Phases 5 & 16.8.
-- **Drivers & hardware** – see P2.1 and legacy Phase 4 & Phase 13.
-- **Userspace & apps** – see P5 and legacy Phases 6, 9, 16.
+Exit gates (all must be green in CI; details in `docs/MASTER_PLAN.md` § 5):
 
-### Status Snapshot
-
-- ✅ **Kernel foundations solid**
-  - 210+ kernel modules in `kernel/src/**` written in Home
-  - Process management and VFS audited as **production-ready**  
-    - See `docs/audits/process-management-audit.md` and `docs/audits/vfs-audit.md`
-- ✅ **Drivers**
-  - ~60 hardware drivers in `kernel/src/drivers/**` (storage, input, network, USB, video, GPIO, sensors, etc.)
-  - Real SD/eMMC, NVMe, RAID, GPIO, I2C, SPI, USB{UHCI,EHCI,XHCI}, VirtIO, WiFi/Bluetooth (CYW43455) drivers
-- ✅ **Networking**
-  - 16+ protocols in `kernel/src/net/**` (TCP, UDP, IPv6, ICMP, ARP, DHCP, DNS, HTTP, TLS, WebSocket, MQTT, CoAP, NFS, SMB, NFC, QoS, Netfilter)
-- ✅ **File systems**
-  - Native VFS + home FS stack with advanced features (buffer cache, async I/O, mmap, xattr, links, locking, large files)  
-  - Audited as **world-class** in `docs/audits/vfs-audit.md`
-- ✅ **Userspace & tooling**
-  - `apps/shell.home` – full shell with history, env, aliases, jobs
-  - `apps/init/init.home` – structured init process (services, runlevels, mounts)
-  - 80+ utilities in `apps/utils/**` plus GUI apps (browser, file manager, editor, sysmon, terminal, etc.)
-- ✅ **Performance & power modules exist**
-  - `kernel/src/mm/{zram,slab,pool,swap,memcg,vmalloc}.home`
-  - `kernel/src/perf/{async_io,boot_opt,profiler,zero_copy,rcu,cache_opt,hugepages,memory_compression}.home`
-  - `kernel/src/power/{cpufreq,thermal,power,pm}.home`
-- ✅ **Security hardening (Dec 5, 2025)**
-  - Capability system (`kernel/src/security/caps.home`) now enforces real checks in syscall handler
-  - Seccomp syscall filtering (`kernel/src/security/seccomp.home`) with predefined security profiles
-  - DNS resolver (`kernel/src/net/dns.home`) fully implemented with caching and retries
-- ⚠️ **Remaining work**
-  - Some higher-level integrations (init syscalls, end-to-end network tests) are partial
-  - Pi hardware validation and performance benchmarking pending
-
-The rest of this section focuses on **improvements that matter most** for a minimal, dependency-free, high-performance OS that runs great on Pi-class devices.
+- [ ] `home` compiler builds the Minimum Viable Kernel file-set end-to-end (parse → typecheck → x86-64 freestanding codegen → link → multiboot2 ELF)
+- [ ] CI job `boot-qemu-x86_64` boots the ELF in QEMU, asserts a serial proof-of-life string, and fails red on regression — on every commit
+- [ ] CI job `parse-rate` reports 407/407 kernel files parsing (badge in README)
+- [ ] `scripts/build.sh` has zero silent fallbacks (hlt-stub path and dead `kernel.zig`/`rpi5_main.zig` references removed; failure ⇒ nonzero exit)
+- [ ] Docs realignment merged (README de-overclaimed; auto-generated `IMPLEMENTATION_STATUS.md`; status banners on aspirational guides)
 
 ---
 
@@ -1153,7 +1108,7 @@ Build a next-generation operating system that prioritizes:
 > **Legacy Roadmap Notice**  
 > The following 18-phase plan was written early in the project as an aspirational 78-week roadmap.  
 > Many items were marked complete well before real implementations existed, and others have since been replaced by better designs.  
-> **Do not treat these checkboxes as authoritative implementation status** – use the *Canonical Strategic TODO* section above for current priorities and truth.
+> **Do not treat these checkboxes as authoritative implementation status** – use the *Canonical Plan* section above and `docs/MASTER_PLAN.md` for current priorities and truth.
 
 ## Phase 1: Foundation & Bootloader (Weeks 1-4)
 
