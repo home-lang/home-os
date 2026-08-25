@@ -72,7 +72,7 @@ home-os/
    cd home && zig build
    ```
 
-2. **QEMU**, for the boot gate. This repo declares it in `deps.yaml`:
+2. **QEMU**, for the boot gate. This repo declares it in `pantry.jsonc`:
    ```bash
    pantry install
    ```
