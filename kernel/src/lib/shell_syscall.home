@@ -17,6 +17,10 @@ import "den_lib.home" as den
 const MAX_ARGS: u32 = 16
 const MAX_ARG_LEN: u32 = 256
 const MAX_ENV_VARS: u32 = 64
+// Bounds for the env name/value buffers in ShellState. copy_str truncates to
+// these, so measuring an incoming string past them would be wasted work.
+const MAX_ENV_NAME: u32 = 64
+const MAX_ENV_VALUE: u32 = 256
 const MAX_PATH: u32 = 256
 
 // Shell builtins
@@ -245,8 +249,11 @@ export fn shell_builtin_cd(pid: u32, path: u64): u32 {
     return 1
   }
 
-  // Update OLDPWD
-  set_env_var(pid, "OLDPWD", &shell_states[idx].cwd)
+  // Update OLDPWD. cwd is a fixed 256-byte buffer, so slice it to the length
+  // actually in use rather than handing over the whole buffer including its
+  // trailing zeros.
+  let old_len: u32 = shell_states[idx].cwd_len
+  set_env_var(pid, "OLDPWD", shell_states[idx].cwd[0..old_len])
 
   // Update CWD
   var len: u32 = 0
@@ -257,8 +264,8 @@ export fn shell_builtin_cd(pid: u32, path: u64): u32 {
   shell_states[idx].cwd[len] = 0
   shell_states[idx].cwd_len = len
 
-  // Update PWD environment variable
-  set_env_var(pid, "PWD", path_str)
+  // Update PWD. `len` is the length just measured while copying into cwd.
+  set_env_var(pid, "PWD", path_str[0..len])
 
   return 0
 }
@@ -282,10 +289,15 @@ export fn shell_builtin_export(pid: u32, name: u64, value: u64): u32 {
   var idx: u32 = get_shell_state(pid)
   if idx == 0xFFFFFFFF { return 1 }
 
-  var name_str: *u8 = @ptrFromInt(name)
-  var value_str: *u8 = @ptrFromInt(value)
+  // The syscall arguments are userspace addresses of NUL-terminated strings.
+  // set_env_var takes slices because it needs the lengths; measure them here
+  // rather than handing a bare pointer to a parameter that will read .len.
+  var name_ptr: *u8 = @ptrFromInt(name)
+  var value_ptr: *u8 = @ptrFromInt(value)
+  var name_len: u32 = cstr_len(name_ptr, MAX_ENV_NAME)
+  var value_len: u32 = cstr_len(value_ptr, MAX_ENV_VALUE)
 
-  set_env_var(pid, name_str, value_str)
+  set_env_var(pid, name_ptr[0..name_len], value_ptr[0..value_len])
   return 0
 }
 
@@ -293,8 +305,9 @@ export fn shell_builtin_unset(pid: u32, name: u64): u32 {
   var idx: u32 = get_shell_state(pid)
   if idx == 0xFFFFFFFF { return 1 }
 
-  var name_str: *u8 = @ptrFromInt(name)
-  unset_env_var(pid, name_str)
+  var name_ptr: *u8 = @ptrFromInt(name)
+  var name_len: u32 = cstr_len(name_ptr, MAX_ENV_NAME)
+  unset_env_var(pid, name_ptr[0..name_len])
   return 0
 }
 
@@ -529,6 +542,17 @@ fn shell_builtin_jobs(pid: u32): u32 {
 // HELPER FUNCTIONS
 // ============================================================================
 
+// Length of a NUL-terminated string, bounded so a userspace pointer that is
+// not terminated cannot walk off into kernel memory.
+fn cstr_len(p: *u8, max: u32): u32 {
+  var i: u32 = 0
+  while i < max {
+    if p[i] == 0 { return i }
+    i = i + 1
+  }
+  return max
+}
+
 fn str_match(a: *u8, b: []const u8): bool {
   var i: u32 = 0
   while i < b.len {
@@ -646,7 +670,11 @@ export fn shell_execute_pipeline(pid: u32, cmdline: u64): u32 {
 
   while c < cmd_count {
     // Create pipe for all but last command
-    var pipe_fds: [2]u32
+    // SYS_PIPE fills these through the pointer below. Zero them first: the
+    // checker cannot see an initialization that happens through a raw
+    // address, and an unset fd here would be a file descriptor of whatever
+    // was on the stack.
+    var pipe_fds: [2]u32 = [0, 0]
     if c < cmd_count - 1 {
       syscall.syscall_handler(95, @ptrFromInt(&pipe_fds[0]), 0, 0, 0)  // SYS_PIPE
     }
