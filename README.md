@@ -18,7 +18,8 @@ all of which has been written and parses, and **none of which has ever run**.
 | `parse-rate` | every kernel `.home` file parses | **410/410 (100%)** |
 | `stub-register` | the stub register matches the source | **green** |
 | `boot-qemu-x86_64` | Home-compiled code boots and prints on serial | **green** |
-| `mvk-compiles` | how much of the kernel reaches codegen | **28/39** and rising |
+| `mvk-compiles` | how much of the kernel reaches codegen | **29/39** and rising |
+| `typecheck` | how much of the kernel has zero type errors | **35/39** |
 | `boot-to-shell` | an interactive shell over serial | not started |
 | everything after | see the phase map | not started |
 
