@@ -41,6 +41,30 @@ fi
 [ -x "$HOME_COMPILER" ] || { echo "error: home compiler not found (set HOME_COMPILER)" >&2; exit 2; }
 [ -f "$PLAN" ] || { echo "error: $PLAN not found" >&2; exit 2; }
 
+# Assembler for step 3. Zig is used purely as an assembler here — no kernel
+# logic is written in it (CLAUDE.md). Order: $ZIG, PATH, the Home toolchain.
+ZIG="${ZIG:-}"
+if [ -z "$ZIG" ]; then
+    if command -v zig >/dev/null 2>&1; then
+        ZIG="zig"
+    else
+        for root in "${HOME_REPO:-}" "$REPO_ROOT/../home" "$REPO_ROOT/../lang"; do
+            [ -z "$root" ] && continue
+            if [ -x "$root/pantry/.bin/zig" ]; then ZIG="$root/pantry/.bin/zig"; break; fi
+        done
+    fi
+fi
+if [ -n "$ZIG" ] && command -v "$ZIG" >/dev/null 2>&1; then
+    ASSEMBLER="$ZIG"
+    ASSEMBLER_ARGS="cc -c -x assembler -target x86_64-freestanding"
+elif command -v as >/dev/null 2>&1; then
+    ASSEMBLER="as"
+    ASSEMBLER_ARGS="-c"
+else
+    echo "error: no assembler found (set ZIG, or install binutils)" >&2
+    exit 2
+fi
+
 # Appendix A lists its files as bullets holding a single backticked path.
 # Only .home files are compile targets; boot.s and linker.ld are inputs to the
 # link step, not to codegen.
@@ -73,13 +97,32 @@ while IFS= read -r rel; do
         [ "$LIST" = 1 ] && echo "MISSING $rel"
         continue
     fi
-    if "$HOME_COMPILER" build "$abs" --kernel -o "$tmpdir/out.s" >/dev/null 2>&1 \
-       && [ -s "$tmpdir/out.s" ]; then
+    # A file counts as compiling only when all three hold. The compiler
+    # exiting 0 is not enough on its own: the kernel backend emits a marker
+    # comment and carries on when it meets something it cannot lower, so an
+    # exit status of 0 can accompany a file that produced nothing usable.
+    #   1. the compiler exits 0 and writes a non-empty .s
+    #   2. that .s carries no ERROR or unsupported marker
+    #   3. the assembler accepts it
+    reason=""
+    if ! "$HOME_COMPILER" build "$abs" --kernel -o "$tmpdir/out.s" >/dev/null 2>&1; then
+        reason="compiler exited nonzero"
+    elif [ ! -s "$tmpdir/out.s" ]; then
+        reason="no output"
+    elif grep -qE '# (ERROR|unsupported)' "$tmpdir/out.s"; then
+        n_markers="$(grep -cE '# (ERROR|unsupported)' "$tmpdir/out.s")"
+        first="$(grep -oE '# (ERROR|unsupported)[^\n]*' "$tmpdir/out.s" | head -1)"
+        reason="$n_markers unlowered construct(s), first: ${first}"
+    elif ! "$ASSEMBLER" $ASSEMBLER_ARGS "$tmpdir/out.s" -o "$tmpdir/out.o" >"$tmpdir/as.log" 2>&1; then
+        reason="assembler rejected it: $(head -1 "$tmpdir/as.log")"
+    fi
+
+    if [ -z "$reason" ]; then
         ok=$((ok + 1))
         [ "$LIST" = 1 ] && echo "PASS $rel"
     else
-        failed="${failed}FAIL $rel"$'\n'
-        [ "$LIST" = 1 ] && echo "FAIL $rel"
+        failed="${failed}FAIL $rel — $reason"$'\n'
+        [ "$LIST" = 1 ] && echo "FAIL $rel — $reason"
     fi
 done <<< "$files"
 
