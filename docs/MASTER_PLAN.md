@@ -2,8 +2,8 @@
 
 > **The open-source macOS — built entirely in Home, one language from kernel to desktop, and better than Omarchy everywhere.**
 
-- **Version:** 1.0
-- **Date:** 2026-08-24
+- **Version:** 1.1
+- **Date:** 2026-08-24 (revised 2026-08-25 at the Phase 0 gate)
 - **Supersedes:** the "Canonical Strategic TODO" section of `TODO.md` (Nov 2025)
 - **Standing rule:** every claim of completion in this document must be CI-verifiable, or it must be labeled **ASPIRATION**. No exceptions.
 
@@ -65,13 +65,15 @@ The repository contains a very large body of Home source: roughly **409 kernel `
 | `apps/utils/` | 80+ files | Coreutils: ls, cat, grep, sed, awk, tar, ps, mount… |
 | `installer/installer.home` | 1,026 | OS installer |
 
-**The frontier.** As of the current HEAD, **398 of 407 kernel files parse (97.8%)** with the Home compiler. No end-to-end compile → link → boot of Home-generated code has ever been demonstrated. The only build artifacts in the tree are ~16KB stub ELFs and a GRUB ISO whose kernel is an hlt-loop stub. The Home compiler is developed in [`home-lang/home`](https://github.com/home-lang/home); every HomeOS release will pin a version of it (§6).
+**The frontier.** **410 of 410 kernel files parse (100%)** — milestone A1 is done. As of the Phase 0 gate, one Home-compiled kernel **executes**: `kernel/src/mvk_poc.home` compiles through the Home compiler, links via `kernel/linker.ld`, boots in QEMU, and prints `HomeOS v0.1: kernel_main reached` on the serial console. That is the entirety of what runs. The Home compiler is developed in [`home-lang/home`](https://github.com/home-lang/home); every HomeOS release pins a version of it (§6).
 
-**Load-bearing stubs** sit at exactly the seams where software meets hardware — see the Stub-Burndown Register in §7.
+Two facts keep that achievement in proportion. First, `mvk_poc.home` is written inside the *current* kernel-codegen subset — integer literals, local calls, and simple-form inline assembly — so the proof-of-life message is spelled out through `putc()` calls rather than printed from a string. Widening that subset to the Appendix A file-set is the bulk of Phase 1. Second, parsing is not compiling: 410/410 says the parser accepts these files, not that any of them typecheck or generate code.
 
-**Build, CI, and test truth.** `scripts/build.sh` contains silent fallbacks: its default path references a nonexistent `kernel/src/kernel.zig`, its `rpi5` path references a nonexistent `rpi5_main.zig`, and the `unified` path silently substitutes an hlt-loop stub when the compiler is missing. CI has never built the real kernel. The scripts under `tests/` check file existence and grep for symbol names — nothing executes.
+**Load-bearing stubs** sit at exactly the seams where software meets hardware — see the Stub-Burndown Register in §7. Each now carries a `// STUB(Sn)` marker enforced by CI against that register.
 
-The real frontier today is **compile → link → boot**, not feature breadth. This section is regenerated at every release and is the credibility anchor of the project: if this section is ever flattering but wrong, nothing else in this plan can be trusted.
+**Build, CI, and test truth.** All three lied, and all three were fixed at the Phase 0 gate. `scripts/build.sh` had four silent fallbacks — a default path compiling a nonexistent `kernel/src/kernel.zig`, an `rpi5` path around a nonexistent `rpi5_main.zig`, an hlt-loop stub substituted for a missing compiler in the `unified` path, and a toolchain check that downgraded a missing Home compiler to a warning. Every one now exits nonzero naming its real blocker. CI had never built the kernel; it now compiles, links, and boots it on every commit. The grep-scripts under `tests/` were renamed to `static-checks/`, because they assert that files exist and that symbol names appear, and execute nothing.
+
+The frontier is now **widening codegen** — from a single hand-shaped file to the Appendix A file-set — not feature breadth. This section is regenerated at every release and is the credibility anchor of the project: if it is ever flattering but wrong, nothing else in this plan can be trusted.
 
 ---
 
@@ -116,11 +118,21 @@ New decisions of this magnitude get an ADR in `docs/adr/`; this register indexes
 - **Workstreams:** A (A1, A8, A2, A3, A4), B (S1), docs (§13).
 - **Deliverables:** the last 9 files parsing; syntax-modernized tree; MVK compile pipeline; honest `build.sh`; CI boot job; docs realignment; auto-generated `IMPLEMENTATION_STATUS.md`.
 - **Exit gate:**
-  - The `home` compiler builds the MVK file-set (Appendix A) end-to-end: parse → typecheck → x86-64 freestanding codegen → link via `kernel/linker.ld` → multiboot2-loadable ELF.
-  - CI job **`boot-qemu-x86_64`**: boots that ELF in QEMU (`-serial stdio -display none`), asserts a proof-of-life string (`HomeOS <version>: kernel_main reached`) on serial within 30 seconds, fails red otherwise, runs on every commit.
-  - CI job **`parse-rate`**: 407/407 kernel files parse; published as a README badge.
-  - `scripts/build.sh` has zero silent fallbacks: the generated hlt-stub `kernel_stub.s` path and the dead references to `kernel/src/kernel.zig` and `kernel/src/rpi5_main.zig` are removed; a missing compiler or failed compile exits nonzero.
-  - All §13 documentation-realignment items merged.
+  - ✅ CI job **`parse-rate`**: 410/410 kernel files parse, published as a README badge.
+  - ✅ CI job **`boot-qemu-x86_64`**: a Home-compiled kernel boots in QEMU (`-serial stdio -display none`) and prints `HomeOS <version>: kernel_main reached` on serial within 30 seconds; fails red otherwise; runs on every commit.
+  - ✅ CI job **`stub-register`**: `scripts/stub-check.sh` enforces §7 against `// STUB(Sn)` markers in both directions.
+  - ✅ `scripts/build.sh` has zero silent fallbacks: the generated hlt-stub `kernel_stub.s` path and the dead references to `kernel/src/kernel.zig` and `kernel/src/rpi5_main.zig` are removed; a missing compiler or failed compile exits nonzero.
+  - ✅ All §13 documentation-realignment items merged; `IMPLEMENTATION_STATUS.md` is generated by measurement.
+  - ⬜ **The remaining gate item:** the `home` compiler builds the *MVK file-set* (Appendix A) end-to-end — parse → typecheck → x86-64 freestanding codegen → link. Today one hand-shaped file does. Closing this is the Phase 0 → Phase 1 boundary and it is a compiler-side task (A2, A3, A4). See §5.1.
+
+### Phase 0.5 — Codegen widening (the gap between one file and forty-one)
+
+Recorded as its own stretch because the original plan collapsed it into a single Phase 0 bullet, and it turned out to be the largest remaining piece of Phase 0. The MVK boots, but only a file written to the codegen's current shape. The distance from there to Appendix A is measured, not guessed, by a per-feature ratchet:
+
+- **A ladder of proof-of-life kernels.** Each step adds exactly one language feature to `mvk_poc.home`'s successor and must still boot and print. In order, because each depends on the last: string literals in `.rodata` → arrays and indexing → structs and field access → `while`/`for` over data → function pointers → imports across files → `const`/`comptime` evaluation → volatile MMIO loads and stores (A3).
+- **A per-file compile ratchet.** A CI job `mvk-compiles` records how many of the 41 Appendix A files reach codegen. The number may never fall. This replaces "does the tree compile" — an all-or-nothing question that stays "no" for months and tells nobody anything — with a number that moves every week.
+- **Diagnostics are a deliverable, not a side effect.** Every file that fails to compile must fail with `file:line:col`, expected/found types, and a suggested fix (A2's bar). The compile ratchet is only useful if its failures are actionable.
+- **Consolidate the two serial implementations** (`kernel/src/serial.home` and `kernel/src/drivers/serial.home`) before either is a compile target, per the Appendix A note.
 
 ### Phase 1 — Kernel Bring-up (MVK boots to shell)
 
@@ -198,14 +210,15 @@ New decisions of this magnitude get an ADR in `docs/adr/`; this register indexes
 
 **The compiler is the critical path. Roughly 40% of total effort through Phase 2 lands here. Nothing in this plan ships until A-milestones land.** HomeOS is the compiler's most demanding customer, and the kernel tree becomes the compiler's permanent regression corpus.
 
-- **A1 — Parse-100** *(Phase 0)*: 407/407 kernel files parse. The kernel tree is added to the compiler's CI as a parser-regression corpus; parser fuzzing is seeded from it.
+- **A1 — Parse-100** *(Phase 0)* — ✅ **done**: 410/410 kernel files parse. The kernel tree is added to the compiler's CI as a parser-regression corpus; parser fuzzing is seeded from it.
 - **A8 — Syntax modernization** *(Phase 0; deliberately ordered after A1, before A2)*: a one-time mechanical migration of the ~180k-line tree to current Home idiom — the TypeScript-flavored surface: `let`, `fn name(a: int): int`, `loop`, minimal semicolons — executed by a `home fmt --fix`-style tool so the diff is machine-generated and reviewable. Zig-era leftovers (`@import("x.zig")` path forms, `kernel/build.home` containing literal Zig) are replaced wherever current Home defines the replacement. Typechecking then targets modern syntax exactly once.
-- **A2 — Typecheck** *(Phase 0)*: the full type system checks the MVK file-set with zero escape-hatch holes. Diagnostics quality bar: `file:line:col`, expected/found types, and a suggested fix.
+- **A2 — Typecheck** *(Phase 0; the critical path now)*: the full type system checks the MVK file-set with zero escape-hatch holes. Diagnostics quality bar: `file:line:col`, expected/found types, and a suggested fix.
 - **A3 — Codegen, x86-64 freestanding** *(Phase 0)*: no libc, no red zone, kernel code model. An intrinsics or inline-assembly story for port I/O, MSRs, control registers, and `cli`/`sti`/`hlt` — the operations the project previously leaned on the Home repo's `packages/kernel/src/asm.zig` for. **Volatile MMIO load/store semantics are defined in the language specification** — the prerequisite for ever un-stubbing `arm64.home` (S8) honestly.
 - **A4 — Link** *(Phase 0)*: linker-script consumption (or lld emission) honoring `kernel/linker.ld`; section-placement attributes (e.g. `.boot`, per-CPU data) expressible from Home source.
 - **A5 — `home build`** *(Phase 1)*: manifest-driven whole-kernel builds from `kernel/home.toml` — targets, incremental compilation, cross-compilation. Replaces `scripts/compile_home_kernel.zig`; `scripts/build.sh` becomes a thin wrapper.
 - **A6 — arm64 backend** *(gates Phase 7b)*.
 - **A7 — Self-hosting** *(Phase 6+)*: `home` compiles itself; endgame, HomeOS builds itself on HomeOS — "the OS is its own SDK," a headline no distro can print.
+- **A9 — Kernel-codegen feature ladder** *(Phase 0.5; added at the Phase 0 gate)*: the ordered list in §5 Phase 0.5, driven by the `mvk-compiles` ratchet. Split out from A3 because A3 as written ("x86-64 freestanding codegen") reads as one task and is in practice a dozen, each independently demonstrable by a kernel that still boots. The kernel tree is the compiler's regression corpus; this ladder is how the corpus gets consumed in an order that keeps a booting artifact at every step.
 
 ### Compiler-interface contract
 
@@ -357,7 +370,9 @@ A published, versioned Human Interface Guidelines document: type scale, spacing 
 
 **Principle: every grep-test is replaced by an executed test.** The existing bash suites under `tests/` check file existence and grep for symbols; they are renamed to `static-checks/` immediately so nobody mistakes them for tests, and each is deleted the moment its runtime equivalent lands.
 
-- **Tier 1 — every commit:** the QEMU boot matrix. Serial-console expect harness, per-phase scenario scripts, deterministic, under 10 minutes. The Tier-1 job names ARE the phase gates: `parse-rate`, `boot-qemu-x86_64`, `boot-to-shell`, `storage-roundtrip`, `net-echo`, `fb-boot-log`, `libc-suite`, `shell-suite`, `coreutils-suite`, `pantry-local-install`, `craft-demo`, `wm-layouts`, `iso-install`, `desktop-parity-suite`, `snapshot-rollback`, `agent-cli-suite`.
+**Boot-protocol note (learned at the Phase 0 gate).** QEMU's `-kernel` loader implements Multiboot1 only, and its ELF path refuses 64-bit images. The kernel therefore ships two headers: Multiboot2 for GRUB — the real install path, used by the ISO — and Multiboot1 with the a.out kludge for QEMU, which is handed an objcopy'd flat image. This keeps every Tier-1 boot gate free of GRUB, `xorriso`, and ISO mastering, which matters because those tools are the least portable part of the toolchain (`grub-mkrescue` has no usable darwin build in the pantry registry today). The ISO path is exercised by `iso-install` at Phase 5, where it is the thing under test rather than a dependency of unrelated gates.
+
+- **Tier 1 — every commit:** the QEMU boot matrix. Serial-console expect harness, per-phase scenario scripts, deterministic, under 10 minutes. The Tier-1 job names ARE the phase gates: `parse-rate`, `stub-register`, `boot-qemu-x86_64`, `mvk-compiles`, `boot-to-shell`, `storage-roundtrip`, `net-echo`, `fb-boot-log`, `libc-suite`, `shell-suite`, `coreutils-suite`, `pantry-local-install`, `craft-demo`, `wm-layouts`, `iso-install`, `desktop-parity-suite`, `snapshot-rollback`, `agent-cli-suite`.
 - **Tier 2 — nightly:** syscall fuzzing; filesystem crash-consistency (kill QEMU mid-write → remount → verify); soak and leak runs.
 - **Tier 3 — weekly, from Phase 7a:** hardware-in-loop. Self-hosted runners: one NUC-class x86-64 box and one Raspberry Pi 5 on a network power relay; boot + smoke suite.
 - **Compiler CI (`home-lang/home`):** the kernel tree is the compiler's regression corpus; every HomeOS release pins one compiler version; the two repos' CI cross-trigger.
