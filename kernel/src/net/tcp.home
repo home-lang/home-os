@@ -196,6 +196,16 @@ struct TcpConnection {
   retransmissions: u64
 }
 
+// What accept() hands back about a newly established connection. Deliberately
+// small: the socket layer needs the peer's identity and a handle to talk
+// through, not a view into the TCP control block.
+export struct TCPConnectionInfo {
+  handle: u32,        // Connection id to use with tcp_send / tcp_receive
+  remote_addr: u32,   // Peer IPv4 address, host byte order
+  remote_port: u16,   // Peer port, host byte order
+  local_port: u16     // Port the connection was accepted on
+}
+
 struct TcpStats {
   active_connections: u32,
   passive_opens: u64,
@@ -1392,6 +1402,68 @@ export fn tcp_listen(port: u16): u32 {
   foundation.serial_write_string("\n")
 
   return conn_idx
+}
+
+// Accept a completed connection on a listening socket.
+//
+// Returns 1 and fills `out` when a connection has finished its handshake, 0
+// when nothing is pending. Non-blocking: the caller decides whether to wait.
+//
+// A note on the shape of this, because it is not the obvious one. When a SYN
+// arrives for a listening connection, this stack transitions *that same*
+// connection through SYN_RECEIVED to ESTABLISHED rather than forking a child
+// (see the LISTEN branch of the segment handler). So accepting means moving
+// the established connection into a fresh slot and re-arming the original
+// slot as a listener on the same port. That keeps the listening handle stable
+// for the socket layer, which holds on to it across accepts, and gives the
+// accepted connection an identity of its own.
+//
+// Limitation, stated rather than hidden: because the listener carries the
+// half-open connection itself, there is no backlog — exactly one connection
+// can be in progress per listening port, and a second SYN arriving before
+// accept() is called will be dropped. A real backlog queue needs the listener
+// to allocate a child connection on SYN, which is a change to the segment
+// handler and is left for when the net-echo gate needs it.
+export fn tcp_accept(listen_id: u32, out: *TCPConnectionInfo): u32 {
+  if listen_id >= MAX_TCP_CONNECTIONS {
+    return 0
+  }
+  if tcp_connections[listen_id].state != TCP_STATE_ESTABLISHED {
+    return 0
+  }
+
+  let accepted_idx: u32 = allocate_connection()
+  if accepted_idx == 0xFFFFFFFF {
+    // Out of connection slots. Leave the connection established on the
+    // listening slot so a later accept can still take it.
+    foundation.serial_write_string("[TCP] accept: no free connection slots\n")
+    return 0
+  }
+
+  let listen_port: u16 = tcp_connections[listen_id].local_port
+
+  // Move the established connection to its own slot.
+  tcp_connections[accepted_idx] = tcp_connections[listen_id]
+  tcp_connections[accepted_idx].id = accepted_idx
+
+  out.handle = accepted_idx
+  out.remote_addr = tcp_connections[accepted_idx].remote_ip
+  out.remote_port = tcp_connections[accepted_idx].remote_port
+  out.local_port = listen_port
+
+  // Re-arm the original slot so the socket keeps listening on the same port.
+  init_connection(listen_id)
+  tcp_connections[listen_id].local_ip = local_ip
+  tcp_connections[listen_id].local_port = listen_port
+  tcp_connections[listen_id].state = TCP_STATE_LISTEN
+
+  tcp_connection_count = tcp_connection_count + 1
+
+  foundation.serial_write_string("[TCP] Accepted connection on port ")
+  foundation.serial_write_u64(listen_port)
+  foundation.serial_write_string("\n")
+
+  return 1
 }
 
 export fn tcp_send(conn_id: u32, data: u64, length: u32): u32 {
