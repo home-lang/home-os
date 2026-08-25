@@ -1,3 +1,5 @@
+> **Status:** describes target behavior; see [IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md) for current reality.
+
 # Quick Start: HomeOS on Raspberry Pi 5
 
 Get HomeOS running on your Raspberry Pi 5 in under 10 minutes!

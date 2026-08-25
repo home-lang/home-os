@@ -126,7 +126,7 @@ home-os/
 ├── apps/             # Userspace applications
 ├── libs/             # Shared libraries
 ├── tools/            # Build and development tools
-├── tests/            # Test suites
+├── static-checks/    # Static/grep checks (executed tests land per MASTER_PLAN §12)
 ├── docs/             # Documentation
 └── installer/        # Installation system
 ```
@@ -421,7 +421,7 @@ make test VERBOSE=1
 
 ### Writing Tests
 
-Tests are located in `tests/` and use the test framework in `tests/kernel/test_suite.home`.
+Static checks live in `static-checks/`. Executed test suites are being introduced per [MASTER_PLAN §12](docs/MASTER_PLAN.md) — grep checks are deleted as their runtime equivalents land.
 
 ```home
 // Register a test
@@ -496,6 +496,32 @@ Contributors are recognized in:
 - Project website
 
 ---
+
+
+---
+
+## How an AI Agent Contributes
+
+Agent-legibility is a project strategy, not an afterthought
+([MASTER_PLAN §11.1](docs/MASTER_PLAN.md), Risk R4). The CI-encoded gates make
+project state legible to any newcomer — human or machine.
+
+If you are an AI agent contributing to HomeOS:
+
+1. **Read `docs/MASTER_PLAN.md` first.** It is the canonical roadmap. Work
+   only on tasks that trace to a phase gate or a stub-register entry.
+2. **Verify claims with tools, not text.** Run `scripts/parse-rate.sh`,
+   `python3 scripts/generate_status.py`, and the build script — never trust
+   documentation (including this one) over executable checks.
+3. **Every change links to an issue**, and every commit message references
+   that issue (`fix(kernel): ... (#NNN)`).
+4. **Respect the feature freeze** (decision D5): `kernel/src/iot/`,
+   `kernel/src/ml/`, `kernel/src/industrial/`, gaming, and the container
+   orchestrator receive zero work until Phase 3 exits.
+5. **Register new stubs**: any new `// STUB` marker in source must be added
+   to the Stub-Burndown Register ([MASTER_PLAN §7](docs/MASTER_PLAN.md)) —
+   CI fails on unregistered markers.
+6. **No silent fallbacks.** Missing inputs must fail loudly with nonzero exit.
 
 ## License
 

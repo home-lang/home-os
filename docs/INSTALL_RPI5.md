@@ -1,3 +1,5 @@
+> **Status:** describes target behavior; see [IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md) for current reality.
+
 # Installing HomeOS on Raspberry Pi 5
 
 This guide walks you through installing HomeOS on a Raspberry Pi 5, including hardware requirements, preparation steps, and boot configuration.

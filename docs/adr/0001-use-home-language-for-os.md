@@ -177,7 +177,7 @@ fn kmalloc(size: u64): *u8 {
 - Home Compiler: `~/Code/home/`
 - Home Kernel Package: `~/Code/home/packages/kernel/`
 - CLAUDE.md: Project development guidelines
-- HOME_KERNEL_FEATURES.md: Complete kernel feature audit
+- IMPLEMENTATION_STATUS.md: Auto-generated kernel feature/boot audit (folds in the never-created HOME_KERNEL_FEATURES.md)
 
 ---
 

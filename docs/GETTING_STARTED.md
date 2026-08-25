@@ -1,3 +1,5 @@
+> **Status:** describes target behavior; see [IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md) for current reality.
+
 # Getting Started with home-os
 
 Welcome to home-os! This guide will help you build and run the operating system.

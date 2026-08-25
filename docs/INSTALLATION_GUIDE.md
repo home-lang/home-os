@@ -1,3 +1,5 @@
+> **Status:** describes target behavior; see [IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md) for current reality.
+
 # home-os Installation Guide
 
 Version 1.0 | December 2025
