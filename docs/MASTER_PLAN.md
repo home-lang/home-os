@@ -227,7 +227,7 @@ Bring-up order (each stage proven over serial before the next): serial-first deb
 
 | # | Stub | File | Priority | Blocks gate |
 |---|------|------|----------|-------------|
-| S1 | Silent hlt-stub fallback + dead `.zig` references | `scripts/build.sh` | P0 | Phase 0 (truth) |
+| S1 | **CLOSED** — silent hlt-stub fallback + dead `.zig` references | `scripts/build.sh` | P0 | Phase 0 (truth) |
 | S2 | Font table implements only the glyph 'A' | `kernel/src/drivers/fb_console.home` | P1 | Phase 2 `fb-boot-log` |
 | S3 | RX path prints "stub" and drops every frame | `kernel/src/net/netdev.home` | P1 | Phase 2 `net-echo` |
 | S4 | Native filesystem is a 28-line import-satisfying stub | `kernel/src/fs/homefs.home` | P1 (design doc), P2 (CoW implementation) | Phase 2 storage; Phase 6 `snapshot-rollback` |
@@ -238,8 +238,9 @@ Bring-up order (each stage proven over serial before the next): serial-first deb
 
 **Register rules:**
 1. A stub may not be closed without a runtime test exercising it.
-2. Every new stub must be added to this register and carry a `// STUB` marker in source.
-3. CI greps for `// STUB` and fails if an unregistered marker appears.
+2. Every new stub must be added to this register and carry a `// STUB(Sn)` marker in the source it describes, where `Sn` is its register ID.
+3. The `stub-register` CI gate (`scripts/stub-check.sh`) parses this table as the single source of truth and enforces it in both directions: no marker may name an unregistered ID or sit outside the file the register names, and no open entry may lack a marker. A bare `// STUB` with no ID is a red build.
+4. Closing an entry means marking it **CLOSED** in this table *and* deleting its markers in the same commit — the gate fails otherwise, so the register cannot drift from the code.
 
 ---
 
