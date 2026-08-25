@@ -268,8 +268,16 @@ cmd_mvk() {
         -femit-bin="$BUILD_DIR/home-kernel.elf"
 
     require_file "$BUILD_DIR/home-kernel.elf"
-    log_success "MVK built: $BUILD_DIR/home-kernel.elf"
-    ls -lh "$BUILD_DIR/home-kernel.elf"
+
+    # Flat image for QEMU's -kernel loader. QEMU only implements Multiboot1
+    # and its ELF path rejects 64-bit images, so boot.s carries an a.out-kludge
+    # header and QEMU is handed this raw copy instead. GRUB boots the ELF.
+    log_info "Emitting flat binary for QEMU -kernel..."
+    "$ZIG" objcopy -O binary "$BUILD_DIR/home-kernel.elf" "$BUILD_DIR/home-kernel.bin"
+    require_file "$BUILD_DIR/home-kernel.bin"
+
+    log_success "MVK built:"
+    ls -lh "$BUILD_DIR/home-kernel.elf" "$BUILD_DIR/home-kernel.bin"
     echo ""
     echo "Boot it:  ./scripts/boot-test.sh"
 }

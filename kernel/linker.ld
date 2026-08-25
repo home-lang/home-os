@@ -17,7 +17,8 @@ SECTIONS
     /* Export kernel start before any sections */
     __kernel_start = .;
 
-    /* Multiboot2 header MUST be in first 32KB - place at very start */
+    /* Boot headers MUST be at the very start of the image: the Multiboot1
+       header within the first 8KB, the Multiboot2 header within 32KB. */
     .multiboot ALIGN(8) : {
         KEEP(*(.multiboot))
     } :boot
@@ -43,11 +44,19 @@ SECTIONS
         *(.idt)
     } :data
 
+    /* End of data with file contents. Everything from __kernel_start to
+       __load_end is copied verbatim by a Multiboot a.out-kludge loader; the
+       gap up to __bss_end is zeroed by it. Both are read by the Multiboot1
+       header in boot.s, so they must bracket .bss exactly. */
+    __load_end = .;
+
     .bss ALIGN(4K) : {
         *(COMMON)
         *(.bss)
         *(.bss.*)
     } :data
+
+    __bss_end = .;
 
     /* TLS support */
     .tdata ALIGN(4K) : {

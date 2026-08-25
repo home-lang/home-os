@@ -6,13 +6,38 @@
 .set HEADER_LENGTH, multiboot_header_end - multiboot_header_start
 .set CHECKSUM, -(MAGIC + ARCH + HEADER_LENGTH)
 
-/* Boot code with Multiboot2 header at the very start */
-.section .text
-.code32
-.global _start
-.type _start, @function
+/* Multiboot1 header, for QEMU's built-in -kernel loader.
+ *
+ * GRUB2 boots the ELF via the Multiboot2 header below. QEMU's -kernel loader
+ * only understands Multiboot1, and its ELF path refuses 64-bit images
+ * ("Cannot load x86-64 image, give a 32bit one"). So we set the a.out kludge
+ * bit (flag 16), which tells the loader to skip ELF parsing entirely and copy
+ * a flat image to load_addr — and we feed QEMU the objcopy'd flat binary.
+ * Both headers describe the same entry point; both must sit within the first
+ * 8KB of the image, which the .multiboot section placement guarantees. */
+.set MB1_MAGIC,    0x1BADB002
+.set MB1_FLAGS,    0x00010000            # bit 16: a.out kludge (explicit addrs)
+.set MB1_CHECKSUM, -(MB1_MAGIC + MB1_FLAGS)
 
-/* Multiboot2 header MUST be at start of .text section */
+/* Both boot headers live in .multiboot, which linker.ld KEEPs at the very
+ * start of the image — so neither can drift past its offset limit no matter
+ * how the rest of the objects are ordered. */
+.section .multiboot, "a"
+.code32
+
+/* Multiboot1 header — 4-byte aligned, within the first 8KB. */
+.align 4
+multiboot1_header:
+    .long MB1_MAGIC
+    .long MB1_FLAGS
+    .long MB1_CHECKSUM
+    .long multiboot1_header  # header_addr
+    .long __kernel_start     # load_addr:     start of the loaded image
+    .long __load_end         # load_end_addr: end of data to copy
+    .long __bss_end          # bss_end_addr:  zeroed by the loader
+    .long _start             # entry_addr
+
+/* Multiboot2 header MUST be within the first 32KB of the image */
 .align 8
 multiboot_header_start:
     .long MAGIC
@@ -27,7 +52,11 @@ multiboot_header_start:
     .long 8     # size
 multiboot_header_end:
 
-/* Entry point immediately after header */
+.section .text
+.code32
+.global _start
+.type _start, @function
+
 .align 16
 _start:
     /* Set up stack */
