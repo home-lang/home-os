@@ -14,7 +14,7 @@ source that has been written and parsed, but never run.
 
 **410/410 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `b5922e924`
+- Compiler: `home-lang/home` @ `7772905f9`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -30,7 +30,7 @@ result in QEMU with the serial console captured.
 
 ## Codegen ratchet
 
-**36/39 of the Minimum Viable Kernel file set reaches codegen.**
+**37/39 of the Minimum Viable Kernel file set reaches codegen.**
 
 This is the number to watch. The MVK set is
 [MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);
@@ -45,7 +45,7 @@ waiting on; the failures name the construct, not just the count.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 410 | 232,513 |
+| `kernel/` | 410 | 232,524 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -82,7 +82,7 @@ first red one are blocked by definition — they are not being worked yet.
 | 0 | `parse-rate` | ✅ green |
 | 0 | `stub-register` | ✅ pass — stub-register OK — 7 open entries, all marked and placed correctly |
 | 0 | `boot-qemu-x86_64` | ✅ pass |
-| 0.5 | `mvk-compiles` | 🟡 36/39 |
+| 0.5 | `mvk-compiles` | 🟡 37/39 |
 | 1 | `boot-to-shell` | ⬜ not started |
 | 2 | `storage-roundtrip` / `net-echo` / `fb-boot-log` | ⬜ not started |
 | 3 | `libc-suite` / `shell-suite` / `coreutils-suite` / `pantry-local-install` | ⬜ not started |
