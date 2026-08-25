@@ -35,7 +35,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 KERNEL_DIR="${KERNEL_DIR:-$REPO_ROOT/kernel}"
 ISO_DIR="${ISO_DIR:-$KERNEL_DIR/iso}"
 BUILD_DIR="${BUILD_DIR:-$KERNEL_DIR/build}"
-HOME_REPO="${HOME_REPO:-$REPO_ROOT/../home}"
+# Home compiler repo. Defaults to a sibling checkout; ../home is the name in
+# CLAUDE.md, ../lang is the other common one. Override with HOME_REPO.
+if [ -z "${HOME_REPO:-}" ]; then
+    for _cand in "$REPO_ROOT/../home" "$REPO_ROOT/../lang"; do
+        if [ -x "$_cand/zig-out/bin/home" ]; then HOME_REPO="$_cand"; break; fi
+    done
+    HOME_REPO="${HOME_REPO:-$REPO_ROOT/../home}"
+fi
 HOME_COMPILER="${HOME_COMPILER:-$HOME_REPO/zig-out/bin/home}"
 
 # Minimum Viable Kernel entry point (MASTER_PLAN Appendix A / Phase 0).
