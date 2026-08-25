@@ -38,6 +38,9 @@ BUILD_DIR="${BUILD_DIR:-$KERNEL_DIR/build}"
 HOME_REPO="${HOME_REPO:-$REPO_ROOT/../home}"
 HOME_COMPILER="${HOME_COMPILER:-$HOME_REPO/zig-out/bin/home}"
 
+# Minimum Viable Kernel entry point (MASTER_PLAN Appendix A / Phase 0).
+MVK_ENTRY="${MVK_ENTRY:-$KERNEL_DIR/src/mvk_poc.home}"
+
 # Top-level build directory for multi-target builds (rpi5, pi-image, etc.).
 # Differs from BUILD_DIR which targets the x86-64 kernel build tree.
 PROJECT_BUILD_DIR="${PROJECT_BUILD_DIR:-$REPO_ROOT/build}"
@@ -79,9 +82,11 @@ Usage:
   ./scripts/build.sh --help
 
 Subcommands (kernel builds):
-  kernel              Generic x86-64 kernel build via Zig (default if no
-                      subcommand is given). Produces ELF + bootable ISO.
-                      Options: none.
+  mvk                 Minimum Viable Kernel: compile the MVK entry with the
+                      Home compiler, link via kernel/linker.ld into a
+                      multiboot2 ELF. Default if no subcommand is given.
+                      This is the MASTER_PLAN Phase 0 build target.
+  kernel              REMOVED — built a nonexistent src/kernel.zig. Use mvk.
   home                Build the kernel via the Home compiler (Home -> .s,
                       then GNU as + ld). Produces ELF + bootable ISO.
   home-zig            Build the kernel via the Home compiler + Zig as the
@@ -165,12 +170,25 @@ find_grub_mkrescue() {
     fi
 }
 
+# Resolve a zig binary into $ZIG. Zig is used only as an assembler/linker
+# for freestanding targets — no kernel logic is written in Zig (CLAUDE.md).
+# Order: $ZIG, PATH, the Home repo's pinned pantry toolchain.
 require_zig() {
-    if ! command -v zig >/dev/null 2>&1; then
-        log_error "Zig compiler not found!"
-        echo "  Install with: brew install zig (macOS) or sudo apt install zig (Linux)" >&2
-        exit 1
+    if [ -n "${ZIG:-}" ] && command -v "$ZIG" >/dev/null 2>&1; then
+        return 0
     fi
+    if command -v zig >/dev/null 2>&1; then
+        ZIG="zig"
+        return 0
+    fi
+    if [ -x "$HOME_REPO/pantry/.bin/zig" ]; then
+        ZIG="$HOME_REPO/pantry/.bin/zig"
+        log_info "Using Zig from the Home toolchain: $ZIG"
+        return 0
+    fi
+    log_error "Zig compiler not found (assembler/linker for freestanding targets)!"
+    echo "  Install it, or set ZIG=/path/to/zig." >&2
+    exit 1
 }
 
 require_home_compiler() {
@@ -187,6 +205,16 @@ require_tool() {
     local tool="$1"
     if ! command -v "$tool" >/dev/null 2>&1; then
         log_error "$tool not found. Please install it."
+        exit 1
+    fi
+}
+
+# Fail loudly when a required source file is missing. Replaces the old
+# silent-fallback behavior (MASTER_PLAN Phase 0 / stub register S1).
+require_file() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        log_error "Required file not found: $file"
         exit 1
     fi
 }
@@ -209,37 +237,53 @@ make_iso() {
 # Subcommand: kernel (generic x86-64 build via Zig)
 # Replaces: scripts/build.sh (old)
 # ---------------------------------------------------------------------------
-cmd_kernel() {
-    echo "=== Building home-os kernel ==="
+cmd_mvk() {
+    echo "=== Building HomeOS Minimum Viable Kernel ==="
+    # MASTER_PLAN Phase 0 (#26). Pipeline:
+    #   mvk entry .home --(home --kernel)--> x86-64 asm
+    #   --> assemble + link with boot.s via linker.ld --> multiboot2 ELF
+    # The proof-of-life string "HomeOS v0.1: kernel_main reached" must appear
+    # on serial when this ELF boots in QEMU (scripts/boot-test.sh).
+    require_home_compiler
     require_zig
-    log_info "Using Zig compiler (Home compiler in development)"
+    require_file "$MVK_ENTRY"
+    require_file "$KERNEL_DIR/src/boot.s"
+    require_file "$KERNEL_DIR/linker.ld"
 
-    mkdir -p "$BUILD_DIR" "$ISO_DIR/boot/grub"
+    mkdir -p "$BUILD_DIR"
 
+    log_info "[1/2] Compiling $MVK_ENTRY -> x86-64 assembly..."
+    "$HOME_COMPILER" build "$MVK_ENTRY" --kernel -o "$BUILD_DIR/mvk.s"
+    require_file "$BUILD_DIR/mvk.s"
+
+    log_info "[2/2] Assembling + linking multiboot2 ELF..."
     cd "$KERNEL_DIR"
-    log_info "Compiling kernel..."
-    zig build-exe \
+    "$ZIG" build-exe \
         src/boot.s \
-        src/kernel.zig \
+        build/mvk.s \
         -target x86_64-freestanding \
         -O ReleaseSafe \
         -T linker.ld \
         --name home-kernel \
         -femit-bin="$BUILD_DIR/home-kernel.elf"
 
-    log_success "Kernel compiled successfully!"
-
-    cp "$BUILD_DIR/home-kernel.elf" "$ISO_DIR/boot/"
-    ls -lh "$ISO_DIR/boot/home-kernel.elf"
-
-    log_info "Creating bootable ISO..."
-    make_iso
-    log_success "ISO created: $BUILD_DIR/home-os.iso"
-    ls -lh "$BUILD_DIR/home-os.iso"
-
+    require_file "$BUILD_DIR/home-kernel.elf"
+    log_success "MVK built: $BUILD_DIR/home-kernel.elf"
+    ls -lh "$BUILD_DIR/home-kernel.elf"
     echo ""
-    echo "=== Build complete! ==="
-    echo "Run in QEMU: ./scripts/run-qemu.sh"
+    echo "Boot it:  ./scripts/boot-test.sh"
+}
+
+cmd_kernel() {
+    echo "=== Building home-os kernel ==="
+    # The legacy Zig kernel entry (src/kernel.zig) never existed and has been
+    # removed (MASTER_PLAN Phase 0, stub register S1). Kernel builds go
+    # through the Home compiler.
+    log_error "The 'kernel' subcommand built a nonexistent src/kernel.zig and has been removed."
+    log_error "Use the Home-compiler build path instead:"
+    log_error "  ./scripts/build.sh home        # Home compiler -> GNU as/ld"
+    log_error "  ./scripts/build.sh standalone  # auto-detect .home entry + Zig"
+    exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -249,6 +293,7 @@ cmd_kernel() {
 cmd_home() {
     echo "=== Building home-os kernel with Home Compiler ==="
     require_home_compiler
+    require_file "$KERNEL_DIR/src/kernel_simple.home"
     require_tool as
     log_info "Using Home compiler: $HOME_COMPILER"
 
@@ -291,6 +336,7 @@ cmd_home_zig() {
     echo "=== Building home-os kernel with Home compiler (Zig assembler/linker) ==="
     require_home_compiler
     require_zig
+    require_file "$KERNEL_DIR/src/kernel_simple.home"
 
     mkdir -p "$BUILD_DIR" "$ISO_DIR/boot/grub"
     cd "$KERNEL_DIR"
@@ -328,12 +374,9 @@ cmd_home_zig() {
 cmd_home_simple() {
     echo "=== Building Home-Compiled Kernel (Simple Method) ==="
     require_home_compiler
+    require_file "$KERNEL_DIR/src/kernel_simple.home"
 
     cd "$KERNEL_DIR"
-    log_info "Building base kernel via 'kernel' subcommand..."
-    cmd_kernel >/dev/null 2>&1 || true
-    log_success "Base kernel built"
-
     log_info "Compiling Home kernel_main..."
     "$HOME_COMPILER" build src/kernel_simple.home --kernel -o "$BUILD_DIR/home_kernel_main.s"
 
@@ -440,37 +483,17 @@ cmd_rpi5() {
     log_info "Assembling ARM64 boot code..."
     aarch64-linux-gnu-as "$rpi5_build_dir/boot.s" -o "$rpi5_build_dir/boot.o"
 
-    log_info "Building kernel with Home compiler infrastructure..."
-    cd "$HOME_REPO/packages/kernel"
-
-    cat > "$rpi5_build_dir/build.zig" <<EOF
-const std = @import("std");
-
-pub fn build(b: *std.Build) void {
-    const target = b.resolveTargetQuery(.{
-        .cpu_arch = .aarch64,
-        .os_tag = .freestanding,
-        .abi = .none,
-    });
-
-    const optimize = b.standardOptimizeOption(.{});
-
-    const kernel = b.addExecutable(.{
-        .name = "home-kernel.elf",
-        .root_source_file = b.path("$REPO_ROOT/kernel/src/rpi5_main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .linkage = .static,
-    });
-
-    kernel.setLinkerScriptPath(b.path("$REPO_ROOT/kernel/linker-rpi5.ld"));
-    kernel.addAssemblyFile(b.path("src/arm64/boot.s"));
-    b.installArtifact(kernel);
-}
-EOF
-
-    log_info "Building kernel binary..."
-    zig build -Doptimize=ReleaseSmall --build-file "$rpi5_build_dir/build.zig" --prefix "$rpi5_build_dir"
+    # No silent fallback (MASTER_PLAN Phase 0, stub register S1). The Pi 5
+    # kernel build has no working entry point today:
+    #   * kernel/src/rpi5_main.zig never existed (and Zig kernel sources are
+    #     out of policy per CLAUDE.md), and
+    #   * a .home ARM64 boot path needs the Home arm64 backend, milestone A6,
+    #     which gates Phase 7b entirely.
+    # Fail loudly rather than emitting a build.zig around a dead path.
+    log_error "The rpi5 kernel build has no entry point yet."
+    log_error "It is blocked on Home compiler milestone A6 (arm64 backend) — MASTER_PLAN Phase 7b."
+    log_error "See home-lang/home-os#8. Boot code assembled at: $rpi5_build_dir/boot.o"
+    exit 1
 
     log_info "Creating kernel image..."
     aarch64-linux-gnu-objcopy "$rpi5_build_dir/bin/home-kernel.elf" -O binary "$rpi5_build_dir/boot/home-kernel.img"
@@ -1870,7 +1893,8 @@ cmd_unified() {
         if [ -f "$home_compiler" ]; then
             log_success "Home compiler: found at $home_compiler"
         else
-            log_warn "Home compiler not found (using Zig as fallback)"
+            log_error "Home compiler not found at $home_compiler (no Zig fallback — S1)"
+            missing=1
         fi
         case "$target" in
             x86-64)
@@ -1961,49 +1985,16 @@ EOF
             if [ -f "$KERNEL_DIR/build/home-kernel.elf" ]; then
                 cp "$KERNEL_DIR/build/home-kernel.elf" "$target_dir/"
             fi
-        elif [ -n "$home_entry" ] && [ ! -f "$home_compiler" ]; then
-            log_warn "Home compiler not available, building with kernel stub..."
-            if [ ! -f "src/boot.s" ]; then
-                log_error "Missing boot.s for fallback compilation"
-                exit 1
-            fi
-            local stub_file="src/kernel_stub.s"
-            if [ ! -f "$stub_file" ]; then
-                log_info "Generating kernel stub (src/kernel_stub.s not found)..."
-                mkdir -p "$(dirname "$stub_file")"
-                cat > "$stub_file" <<'STUB_EOF'
-.section .text
-.global kernel_main
-kernel_main:
-    hlt
-    jmp kernel_main
-STUB_EOF
-            fi
-            zig build-exe \
-                src/boot.s \
-                "$stub_file" \
-                -target x86_64-freestanding \
-                $opt_flag \
-                -T linker.ld \
-                --name home-kernel \
-                -femit-bin="$target_dir/home-kernel.elf" 2>&1 || {
-                log_error "Kernel stub compilation failed"
-                exit 1
-            }
-            log_warn "Built with stub kernel — Home source was not compiled"
+        elif [ -n "$home_entry" ]; then
+            # No silent stub fallback (MASTER_PLAN Phase 0, stub register S1):
+            # a missing compiler is a hard error.
+            log_error "Home compiler not found at: $home_compiler"
+            log_error "Build it first or set HOME_COMPILER / HOME_REPO."
+            exit 1
         elif [ -f "src/kernel.zig" ]; then
-            log_info "Compiling kernel with Zig..."
-            zig build-exe \
-                src/boot.s \
-                src/kernel.zig \
-                -target x86_64-freestanding \
-                $opt_flag \
-                -T linker.ld \
-                --name home-kernel \
-                -femit-bin="$target_dir/home-kernel.elf" 2>&1 || {
-                log_error "Kernel compilation failed"
-                exit 1
-            }
+            log_error "Found src/kernel.zig but the Zig kernel path was removed."
+            log_error "Kernel builds go through the Home compiler."
+            exit 1
         else
             log_error "No kernel source found"
             exit 1
@@ -2201,10 +2192,10 @@ STUB_EOF
 # Main dispatcher
 # ---------------------------------------------------------------------------
 
-# If invoked with zero args, default to the legacy generic kernel build
-# (preserves previous "./scripts/build.sh" behaviour).
+# If invoked with zero args, build the Minimum Viable Kernel — the
+# MASTER_PLAN Phase 0 target and the only end-to-end Home build path.
 if [ $# -eq 0 ]; then
-    cmd_kernel
+    cmd_mvk
     exit 0
 fi
 
@@ -2214,6 +2205,9 @@ shift || true
 case "$cmd" in
     -h|--help|help)
         usage
+        ;;
+    mvk)
+        cmd_mvk "$@"
         ;;
     kernel)
         cmd_kernel "$@"
