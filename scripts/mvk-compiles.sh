@@ -136,9 +136,13 @@ if [ -n "$FLOOR" ]; then
     if [ "$ok" -lt "$FLOOR" ]; then
         echo "" >&2
         echo "RATCHET BROKEN: $ok files compile, floor is $FLOOR." >&2
-        echo "The count may never fall. Fix the regression, or if a file was" >&2
-        echo "deliberately removed from Appendix A, lower $FLOOR_FILE in the" >&2
-        echo "same commit as the plan edit." >&2
+        echo "The count may never fall. There are exactly three legitimate" >&2
+        echo "reasons to lower $FLOOR_FILE, each requiring the reason in the" >&2
+        echo "commit message:" >&2
+        echo "  1. a file was deliberately removed from Appendix A" >&2
+        echo "  2. this script got stricter, so the old number measured less" >&2
+        echo "  3. the compiler pin moved backwards deliberately" >&2
+        echo "Anything else is a regression. Fix it." >&2
         [ "$LIST" = 0 ] && printf '%s' "$failed" >&2
         exit 1
     fi
