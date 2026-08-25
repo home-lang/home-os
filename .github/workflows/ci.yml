@@ -1,4 +1,11 @@
-name: HomeOS CI/CD
+name: HomeOS CI
+
+# MASTER_PLAN §12 Tier 1 — the job names ARE the phase gates.
+#
+# The ratchet rule: a gate is added when its phase is worked, and once it is
+# green on main it is never removed. Gates accumulate into a permanent
+# regression wall. Nothing here is allowed to pass by skipping: a missing
+# tool, a missing compiler, or a missing artifact is a red build.
 
 on:
   push:
@@ -7,315 +14,136 @@ on:
     branches: [ main ]
 
 env:
-  CARGO_TERM_COLOR: always
+  # Every HomeOS commit builds against one pinned Home compiler revision
+  # (MASTER_PLAN §6, compiler-interface contract). Bump deliberately.
+  HOME_COMPILER_REPO: https://github.com/home-lang/home
+  HOME_COMPILER_REF: 71d573199c57094f10563b6acad22fca7429911f
+  ZIG_VERSION: 0.17.0-dev.1441+d5181a9c9
 
 jobs:
-  # ============================================================================
-  # Build Jobs
-  # ============================================================================
-
-  build-x86_64:
-    name: Build x86-64
+  # ---------------------------------------------------------------------------
+  # Shared: build the pinned Home compiler once, reuse it in every gate.
+  # ---------------------------------------------------------------------------
+  home-compiler:
+    name: home-compiler
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v6
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          nasm \
-          grub-pc-bin \
-          xorriso \
-          qemu-system-x86 \
-          mtools
+      - name: Check out the pinned Home compiler
+        run: |
+          git clone "$HOME_COMPILER_REPO" home-compiler
+          cd home-compiler
+          # No fallback to main: an unresolvable pin is a red build, not a
+          # silently different compiler (MASTER_PLAN §6 pinning policy).
+          git checkout "$HOME_COMPILER_REF"
+          git rev-parse HEAD > ../home-compiler-rev.txt
 
-    - name: Install Zig
-      uses: mlugg/setup-zig@v2
-      with:
-        version: 0.17.0-dev.56+a8226cd53
+      - name: Build
+        run: cd home-compiler && zig build -Doptimize=ReleaseSafe
 
-    - name: Build Home compiler
-      run: |
-        if [ -d ~/Code/home ]; then
-          cd ~/Code/home && zig build
-        else
-          echo "Home compiler not available, using Zig directly"
-        fi
+      - name: Upload compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: home-compiler
+          path: |
+            home-compiler/zig-out/bin/home
+            home-compiler-rev.txt
+          if-no-files-found: error
 
-    - name: Build kernel (x86-64)
-      run: |
-        ./scripts/build.sh unified x86-64 --debug
-
-    - name: Upload kernel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: home-kernel-x86_64
-        path: build/x86-64/home-kernel.elf
-        if-no-files-found: warn
-
-  build-arm64:
-    name: Build ARM64
+  # ---------------------------------------------------------------------------
+  # Gate: parse-rate — every kernel .home file must parse (A1, #23)
+  # ---------------------------------------------------------------------------
+  parse-rate:
+    name: parse-rate
     runs-on: ubuntu-latest
-
+    needs: home-compiler
     steps:
-    - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          gcc-aarch64-linux-gnu \
-          binutils-aarch64-linux-gnu \
-          qemu-system-arm
+      - uses: actions/download-artifact@v4
+        with:
+          name: home-compiler
+          path: compiler
 
-    - name: Install Zig
-      uses: mlugg/setup-zig@v2
-      with:
-        version: 0.17.0-dev.56+a8226cd53
+      - name: Parse-rate gate (must be 100%)
+        run: |
+          chmod +x compiler/zig-out/bin/home
+          HOME_COMPILER="$PWD/compiler/zig-out/bin/home" ./scripts/parse-rate.sh --strict
 
-    - name: Build kernel (ARM64)
-      run: |
-        ./scripts/build.sh unified arm64 --debug
-
-    - name: Upload kernel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: home-kernel-arm64
-        path: build/arm64/home-kernel.elf
-        if-no-files-found: warn
-
-  # ============================================================================
-  # Test Jobs
-  # ============================================================================
-
-  test-utilities:
-    name: Test Utilities
+  # ---------------------------------------------------------------------------
+  # Gate: stub-register — every // STUB marker must be registered (§7 rule 3)
+  # ---------------------------------------------------------------------------
+  stub-register:
+    name: stub-register
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+      - name: Check for unregistered STUB markers
+        run: ./scripts/stub-check.sh
 
-    - name: Run utility tests
-      run: |
-        ./tests/utils/test_utils.sh
-
-    - name: Upload test results
-      uses: actions/upload-artifact@v4
-      with:
-        name: utility-test-results
-        path: build/test-results/
-        if-no-files-found: warn
-
-  test-kernel-syntax:
-    name: Kernel Syntax Check
+  # ---------------------------------------------------------------------------
+  # Gate: boot-qemu-x86_64 — the Phase 0 exit gate (#26).
+  # Compiles the MVK with the Home compiler, links it, boots it in QEMU, and
+  # asserts the proof-of-life string on the serial console.
+  # ---------------------------------------------------------------------------
+  boot-qemu-x86_64:
+    name: boot-qemu-x86_64
     runs-on: ubuntu-latest
-
+    needs: home-compiler
     steps:
-    - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
-    - name: Check .home file syntax
-      run: |
-        echo "Checking kernel source files..."
-        find kernel/src -name "*.home" | wc -l
-        echo "All .home files found"
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
 
-        # Basic syntax checks
-        for file in $(find kernel/src -name "*.home" | head -20); do
-          echo "Checking: $file"
-          # Check for basic structure
-          if ! grep -q "import\|export\|fn\|const\|struct" "$file"; then
-            echo "Warning: $file may have syntax issues"
-          fi
-        done
+      - name: Install QEMU
+        # deps.yaml pins qemu.org for local development via pantry; CI uses
+        # the distro package because it is an order of magnitude faster to
+        # provision and this gate runs on every commit.
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
 
-  # ============================================================================
-  # QEMU Boot Test
-  # ============================================================================
+      - uses: actions/download-artifact@v4
+        with:
+          name: home-compiler
+          path: compiler
 
-  qemu-smoke-test:
-    name: QEMU Boot Test
+      - name: Build the Minimum Viable Kernel
+        run: |
+          chmod +x compiler/zig-out/bin/home
+          HOME_COMPILER="$PWD/compiler/zig-out/bin/home" ./scripts/build.sh mvk
+
+      - name: Boot it and assert proof-of-life on serial
+        run: ./scripts/boot-test.sh
+
+      - name: Upload kernel + serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mvk-x86_64
+          path: |
+            kernel/build/home-kernel.elf
+            kernel/build/home-kernel.bin
+            kernel/build/boot-test.log
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Housekeeping: shell scripts must at least parse.
+  # ---------------------------------------------------------------------------
+  shellcheck:
+    name: shell-syntax
     runs-on: ubuntu-latest
-    needs: build-x86_64
-
     steps:
-    - uses: actions/checkout@v6
-
-    - name: Install QEMU
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y qemu-system-x86
-
-    - name: Download kernel
-      uses: actions/download-artifact@v4
-      with:
-        name: home-kernel-x86_64
-        path: build/x86-64/
-
-    - name: Run QEMU boot test
-      run: |
-        # Boot kernel and capture serial output
-        timeout 30s qemu-system-x86_64 \
-          -kernel build/x86-64/home-kernel.elf \
-          -serial file:/tmp/serial.log \
-          -display none \
-          -m 256M \
-          -no-reboot \
-          -d guest_errors \
-          || true
-
-        echo "=== Serial Output ==="
-        cat /tmp/serial.log || echo "No serial output"
-
-        # Check for successful boot indicators
-        if grep -q "home-os\|HomeOS\|kernel\|Initialized" /tmp/serial.log 2>/dev/null; then
-          echo "Boot test PASSED"
-        else
-          echo "Boot test - no expected output detected"
-        fi
-
-  # ============================================================================
-  # Code Quality
-  # ============================================================================
-
-  lint:
-    name: Lint & Format Check
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v6
-
-    - name: Check file formatting
-      run: |
-        # Check for trailing whitespace
-        echo "Checking for trailing whitespace..."
-        ! grep -rn " $" kernel/src/*.home || echo "Found trailing whitespace"
-
-        # Check for tabs vs spaces consistency
-        echo "Checking indentation..."
-
-    - name: Check documentation
-      run: |
-        echo "Checking documentation..."
-        ls -la docs/ || echo "No docs directory"
-        ls -la *.md || echo "No markdown files in root"
-
-  security-audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v6
-
-    - name: Run security audit
-      run: |
-        echo "Running security audit..."
-
-        # Check for common security issues
-        echo "Checking for unsafe patterns..."
-
-        # Look for raw pointer usage without bounds checking
-        grep -rn "@ptrFromInt" kernel/src/ | head -20 || true
-
-        # Check for potential buffer overflows
-        grep -rn "while.*<.*len" kernel/src/ | head -20 || true
-
-        # Verify security features are enabled
-        if [ -f "kernel/src/security/cpu_security.home" ]; then
-          echo "SMEP/SMAP module: FOUND"
-        fi
-
-        if [ -f "kernel/src/security/seccomp.home" ]; then
-          echo "Seccomp module: FOUND"
-        fi
-
-        if [ -f "kernel/src/security/capabilities.home" ]; then
-          echo "Capabilities module: FOUND"
-        fi
-
-  # ============================================================================
-  # Release Build
-  # ============================================================================
-
-  release:
-    name: Release Build
-    runs-on: ubuntu-latest
-    needs: [build-x86_64, build-arm64, test-utilities, qemu-smoke-test]
-    if: github.ref == 'refs/heads/main'
-
-    steps:
-    - uses: actions/checkout@v6
-
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          nasm \
-          grub-pc-bin \
-          xorriso \
-          mtools
-
-    - name: Install Zig
-      uses: mlugg/setup-zig@v2
-      with:
-        version: 0.17.0-dev.56+a8226cd53
-
-    - name: Build release (x86-64)
-      run: |
-        ./scripts/build.sh unified x86-64 --release --iso
-
-    - name: Upload ISO
-      uses: actions/upload-artifact@v4
-      with:
-        name: home-os-x86_64.iso
-        path: build/x86-64/home-os.iso
-        if-no-files-found: warn
-
-  # ============================================================================
-  # Performance Tracking
-  # ============================================================================
-
-  perf-metrics:
-    name: Performance Metrics
-    runs-on: ubuntu-latest
-    needs: build-x86_64
-
-    steps:
-    - uses: actions/checkout@v6
-
-    - name: Download kernel
-      uses: actions/download-artifact@v4
-      with:
-        name: home-kernel-x86_64
-        path: build/x86-64/
-
-    - name: Measure kernel size
-      run: |
-        echo "=== Kernel Size Metrics ==="
-        ls -lh build/x86-64/home-kernel.elf || echo "Kernel not found"
-
-        # Get size in bytes
-        SIZE=$(stat -c%s build/x86-64/home-kernel.elf 2>/dev/null || echo "0")
-        echo "Kernel size: $SIZE bytes"
-
-        # Check against target (1MB for minimal kernel)
-        if [ "$SIZE" -gt 1048576 ]; then
-          echo "Warning: Kernel exceeds 1MB target"
-        else
-          echo "Kernel size within target"
-        fi
-
-    - name: Count modules
-      run: |
-        echo "=== Module Count ==="
-        MODULES=$(find kernel/src -name "*.home" | wc -l)
-        echo "Total .home files: $MODULES"
-
-        echo ""
-        echo "By category:"
-        echo "  Core:     $(find kernel/src/core -name "*.home" 2>/dev/null | wc -l)"
-        echo "  Drivers:  $(find kernel/src/drivers -name "*.home" 2>/dev/null | wc -l)"
-        echo "  Net:      $(find kernel/src/net -name "*.home" 2>/dev/null | wc -l)"
-        echo "  FS:       $(find kernel/src/fs -name "*.home" 2>/dev/null | wc -l)"
-        echo "  Security: $(find kernel/src/security -name "*.home" 2>/dev/null | wc -l)"
+      - uses: actions/checkout@v6
+      - name: bash -n every script
+        run: |
+          rc=0
+          while IFS= read -r f; do
+            bash -n "$f" || { echo "SYNTAX ERROR: $f"; rc=1; }
+          done < <(find scripts static-checks -name '*.sh')
+          exit $rc
