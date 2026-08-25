@@ -14,7 +14,7 @@ source that has been written and parsed, but never run.
 
 **410/410 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `71d573199`
+- Compiler: `home-lang/home` @ `706e7cd9b`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -28,11 +28,24 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
+## Codegen ratchet
+
+**4/39 of the Minimum Viable Kernel file set reaches codegen.**
+
+This is the number to watch. The MVK set is
+[MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);
+a file counts only when the compiler produces assembly with no unlowered
+construct in it *and* the assembler accepts that assembly. It may never
+fall — `scripts/mvk-compiles.sh` fails the build if it does.
+
+Run `scripts/mvk-compiles.sh --list` to see what each remaining file is
+waiting on; the failures name the construct, not just the count.
+
 ## Source inventory
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 410 | 232,416 |
+| `kernel/` | 410 | 232,408 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -69,6 +82,7 @@ first red one are blocked by definition — they are not being worked yet.
 | 0 | `parse-rate` | ✅ green |
 | 0 | `stub-register` | ✅ pass — stub-register OK — 7 open entries, all marked and placed correctly |
 | 0 | `boot-qemu-x86_64` | ✅ pass |
+| 0.5 | `mvk-compiles` | 🟡 4/39 |
 | 1 | `boot-to-shell` | ⬜ not started |
 | 2 | `storage-roundtrip` / `net-echo` / `fb-boot-log` | ⬜ not started |
 | 3 | `libc-suite` / `shell-suite` / `coreutils-suite` / `pantry-local-install` | ⬜ not started |

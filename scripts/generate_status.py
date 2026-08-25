@@ -128,6 +128,17 @@ def count_markers():
     return counts
 
 
+def run_codegen_ratchet(home):
+    """Run the mvk-compiles ratchet. Returns (ok, total) or None."""
+    env = dict(os.environ, HOME_COMPILER=home)
+    r = subprocess.run([os.path.join(REPO, "scripts", "mvk-compiles.sh")],
+                       capture_output=True, text=True, env=env, cwd=REPO)
+    m = re.search(r"mvk-compiles: (\d+)/(\d+)", r.stdout or "")
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
 def run_stub_gate():
     """Run the stub-register gate. Returns (state, detail)."""
     r = subprocess.run([os.path.join(REPO, "scripts", "stub-check.sh")],
@@ -183,6 +194,7 @@ def main():
         boot_state, boot_detail = run_boot_gate(home)
 
     stub_state, stub_detail = run_stub_gate()
+    ratchet = None if no_boot else run_codegen_ratchet(home)
     entries = register_entries()
     markers = count_markers()
     L = []
@@ -240,6 +252,25 @@ def main():
     w("result in QEMU with the serial console captured.")
     w("")
 
+    # --- Codegen ratchet ----------------------------------------------------
+    w("## Codegen ratchet")
+    w("")
+    if ratchet:
+        ok_n, total_n = ratchet
+        w(f"**{ok_n}/{total_n} of the Minimum Viable Kernel file set reaches codegen.**")
+        w("")
+        w("This is the number to watch. The MVK set is")
+        w("[MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);")
+        w("a file counts only when the compiler produces assembly with no unlowered")
+        w("construct in it *and* the assembler accepts that assembly. It may never")
+        w("fall — `scripts/mvk-compiles.sh` fails the build if it does.")
+        w("")
+        w("Run `scripts/mvk-compiles.sh --list` to see what each remaining file is")
+        w("waiting on; the failures name the construct, not just the count.")
+    else:
+        w("Not measured in this run.")
+    w("")
+
     # --- Source inventory ---------------------------------------------------
     w("## Source inventory")
     w("")
@@ -282,6 +313,10 @@ def main():
     stub_icon = {"PASS": "✅", "FAIL": "❌"}[stub_state]
     w(f"| 0 | `stub-register` | {stub_icon} {stub_state.lower()} — {stub_detail} |")
     w(f"| 0 | `boot-qemu-x86_64` | {icon} {boot_state.lower()} |")
+    if ratchet:
+        ok_n, total_n = ratchet
+        done = "✅ green" if ok_n == total_n else f"🟡 {ok_n}/{total_n}"
+        w(f"| 0.5 | `mvk-compiles` | {done} |")
     for phase, gate in [
         (1, "`boot-to-shell`"),
         (2, "`storage-roundtrip` / `net-echo` / `fb-boot-log`"),
