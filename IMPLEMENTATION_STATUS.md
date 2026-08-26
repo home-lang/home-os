@@ -30,7 +30,7 @@ result in QEMU with the serial console captured.
 
 ## Codegen ratchet
 
-**54/54 of the Minimum Viable Kernel file set reaches codegen.**
+**56/56 of the Minimum Viable Kernel file set reaches codegen.**
 
 This is the number to watch. The MVK set is
 [MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);

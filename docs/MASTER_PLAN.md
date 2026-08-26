@@ -544,11 +544,13 @@ These were referenced by files already in the set and were not listed, which is 
 - `kernel/src/drivers/nvme.home`
 - `kernel/src/net/udp.home`
 - `kernel/src/net/dns.home`
+- `kernel/src/drivers/pci.home`
+- `kernel/src/drivers/e1000.home`
 
 **Link script**
 - `kernel/linker.ld`
 
-Total: **64 source files + 1 linker script.**
+Total: **66 source files + 1 linker script.**
 
 **Deliberately excluded — networking.** `net/socket.home`, `net/tcp.home`, and `net/udp.home` were in this list only because `main.home` imported them, and the simplification this section already recommended — shrink the entry's imports — was taken. `tcp` and `udp` were imported and never used; `socket` was used once, in an IRQ branch for interrupts a kernel with no NIC driver cannot receive. Servicing it dragged `drivers/e1000` in behind it. They return with the Phase 2 `net-echo` gate.
 
