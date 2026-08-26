@@ -1,0 +1,233 @@
+// home-os Kernel — interrupt descriptor table, PIC, and dispatch
+//
+// The kernel enabled interrupts with no IDT loaded, so the first timer tick
+// took a #GP, then a #DF, then reset the machine. Everything here exists to
+// make that tick land somewhere.
+
+import "../../core/foundation.home" as foundation
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+// The GDT built in boot.s: null, 64-bit code at 0x08, data at 0x10.
+const KERNEL_CODE_SELECTOR: u64 = 0x08
+
+// Gate type 0xE is a 64-bit interrupt gate: it clears IF on entry, so a
+// handler is not re-entered by the same line before it sends EOI.
+const GATE_INTERRUPT: u64 = 0xE
+
+const IDT_ENTRIES: u64 = 256
+
+// 8259 PIC command and data ports.
+const PIC1_COMMAND: u16 = 0x20
+const PIC1_DATA: u16 = 0x21
+const PIC2_COMMAND: u16 = 0xA0
+const PIC2_DATA: u16 = 0xA1
+
+const PIC_EOI: u8 = 0x20
+const ICW1_INIT: u8 = 0x11   // init sequence, expect ICW4
+const ICW4_8086: u8 = 0x01   // 8086/88 mode
+
+// Where the PIC's 16 lines are remapped to. They arrive at vectors 8-15 by
+// default, which collide with the CPU's own exceptions — that overlap is why
+// a timer tick is indistinguishable from a double fault on a bare machine.
+const IRQ_BASE: u64 = 32
+
+const VECTOR_TIMER: u64 = 32
+const VECTOR_KEYBOARD: u64 = 33
+
+// ============================================================================
+// STATE
+// ============================================================================
+
+// Two quadwords per gate. Built as raw words rather than a packed struct so
+// the layout is visible at the point it is written.
+var idt: [512]u64 = undefined
+
+// The 10-byte operand for LIDT: a 2-byte limit followed by an 8-byte base.
+// Held as bytes so the two fields stay adjacent and unpadded.
+var idtr: [16]u8 = undefined
+
+var interrupts_initialized: u32 = 0
+
+// Counters, so a shell can assert that the lines actually fire rather than
+// that the kernel merely survived enabling them.
+var timer_ticks: u64 = 0
+var keyboard_irqs: u64 = 0
+var spurious_irqs: u64 = 0
+
+// The stub addresses live in idt_stubs.s. Home cannot name a linker symbol,
+// so the table is reached through a function.
+extern fn isr_stub_addr(vector: u64): u64
+
+// ============================================================================
+// IDT
+// ============================================================================
+
+// Write one 16-byte gate descriptor.
+//
+//   word 0: offset[15:0] | selector<<16 | ist<<32 | flags<<40 | offset[31:16]<<48
+//   word 1: offset[63:32]
+//
+// present=1, dpl=0, type=interrupt gate.
+fn set_gate(vector: u64, handler: u64) {
+  var lo: u64 = handler & 0xFFFF
+  lo = lo | (KERNEL_CODE_SELECTOR << 16)
+  // IST 0: use the stack the interrupt was taken on.
+  var flags: u64 = GATE_INTERRUPT | 0x80   // type | present, dpl 0
+  lo = lo | (flags << 40)
+  lo = lo | (((handler >> 16) & 0xFFFF) << 48)
+
+  idt[vector * 2] = lo
+  idt[vector * 2 + 1] = (handler >> 32) & 0xFFFFFFFF
+}
+
+fn load_idt() {
+  var base: u64 = @intFromPtr(&idt)
+  var limit: u64 = IDT_ENTRIES * 16 - 1
+
+  idtr[0] = @as(u8, limit & 0xFF)
+  idtr[1] = @as(u8, (limit >> 8) & 0xFF)
+  idtr[2] = @as(u8, base & 0xFF)
+  idtr[3] = @as(u8, (base >> 8) & 0xFF)
+  idtr[4] = @as(u8, (base >> 16) & 0xFF)
+  idtr[5] = @as(u8, (base >> 24) & 0xFF)
+  idtr[6] = @as(u8, (base >> 32) & 0xFF)
+  idtr[7] = @as(u8, (base >> 40) & 0xFF)
+  idtr[8] = @as(u8, (base >> 48) & 0xFF)
+  idtr[9] = @as(u8, (base >> 56) & 0xFF)
+
+  var ptr: u64 = @intFromPtr(&idtr)
+  asm volatile ("lidt (%[p])"
+    :
+    : [p] "r" (ptr)
+  )
+}
+
+// ============================================================================
+// 8259 PIC
+// ============================================================================
+
+// Move the two PICs to vectors 32-47 and mask every line.
+//
+// Remapping is not optional: left alone, IRQ0 arrives as vector 8, which is
+// also #DF. A handler cannot tell a timer tick from a double fault, and the
+// error code the CPU pushes for one is absent for the other.
+fn pic_remap() {
+  // Save nothing: every line is masked below anyway.
+  foundation.outb(PIC1_COMMAND, ICW1_INIT)
+  foundation.outb(PIC2_COMMAND, ICW1_INIT)
+
+  // ICW2: vector offsets.
+  foundation.outb(PIC1_DATA, @as(u8, IRQ_BASE))
+  foundation.outb(PIC2_DATA, @as(u8, IRQ_BASE + 8))
+
+  // ICW3: the slave is wired to master line 2.
+  foundation.outb(PIC1_DATA, 4)
+  foundation.outb(PIC2_DATA, 2)
+
+  // ICW4: 8086 mode.
+  foundation.outb(PIC1_DATA, ICW4_8086)
+  foundation.outb(PIC2_DATA, ICW4_8086)
+
+  // Mask everything; callers unmask what they can handle.
+  foundation.outb(PIC1_DATA, 0xFF)
+  foundation.outb(PIC2_DATA, 0xFF)
+}
+
+// Unmask one line on the master PIC (0-7).
+export fn pic_unmask(irq: u8) {
+  var mask: u8 = foundation.inb(PIC1_DATA)
+  var bit: u8 = @as(u8, 1 << irq)
+  foundation.outb(PIC1_DATA, mask & ~bit)
+}
+
+fn pic_eoi(vector: u64) {
+  // A line on the slave needs both chips told.
+  if vector >= IRQ_BASE + 8 {
+    foundation.outb(PIC2_COMMAND, PIC_EOI)
+  }
+  foundation.outb(PIC1_COMMAND, PIC_EOI)
+}
+
+// ============================================================================
+// DISPATCH
+// ============================================================================
+
+// Called by isr_common_stub in idt_stubs.s for every vector.
+//
+// The name is unmangled because the stub names it directly.
+export fn interrupt_dispatch(vector: u64, error_code: u64, rip: u64) {
+  if vector >= IRQ_BASE {
+    if vector == VECTOR_TIMER {
+      timer_ticks = timer_ticks + 1
+    } else if vector == VECTOR_KEYBOARD {
+      keyboard_irqs = keyboard_irqs + 1
+      // Read the scancode so the controller releases the line. Dropping it is
+      // fine here; the keyboard driver takes over once it is wired in.
+      var scancode: u8 = foundation.inb(0x60)
+    } else {
+      spurious_irqs = spurious_irqs + 1
+    }
+    pic_eoi(vector)
+    return
+  }
+
+  // An exception. Nothing here can continue, so report and stop rather than
+  // returning into the faulting instruction and looping forever.
+  foundation.serial_write_string("\n[Exception] vector=")
+  foundation.serial_write_hex(vector)
+  foundation.serial_write_string(" error=")
+  foundation.serial_write_hex(error_code)
+  foundation.serial_write_string(" rip=")
+  foundation.serial_write_hex(rip)
+  if vector == 14 {
+    foundation.serial_write_string(" cr2=")
+    foundation.serial_write_hex(foundation.read_cr2())
+  }
+  foundation.serial_write_string("\n[Exception] halted\n")
+  loop {
+    foundation.cli()
+    foundation.hlt()
+  }
+}
+
+// ============================================================================
+// INIT
+// ============================================================================
+
+export fn interrupts_init() {
+  if interrupts_initialized == 1 { return }
+
+  var v: u64 = 0
+  while v < IDT_ENTRIES {
+    set_gate(v, isr_stub_addr(v))
+    v = v + 1
+  }
+
+  load_idt()
+  pic_remap()
+
+  // Timer and keyboard only. Everything else stays masked until something
+  // exists to service it — an unmasked line with no handler is just a faster
+  // way to reach the spurious counter.
+  pic_unmask(0)
+  pic_unmask(1)
+
+  interrupts_initialized = 1
+  foundation.serial_write_string("[IDT] 256 gates loaded, PIC remapped to 32-47\n")
+
+}
+
+export fn get_timer_ticks(): u64 {
+  return timer_ticks
+}
+
+export fn get_keyboard_irqs(): u64 {
+  return keyboard_irqs
+}
+
+export fn get_spurious_irqs(): u64 {
+  return spurious_irqs
+}

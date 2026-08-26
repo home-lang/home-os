@@ -79,7 +79,7 @@ while IFS= read -r rel; do
 done <<< "$files"
 
 log="$workdir/link.log"
-"$ZIG" build-exe "$REPO_ROOT/kernel/src/boot.s" "$workdir"/*.o \
+"$ZIG" build-exe "$REPO_ROOT/kernel/src/boot.s" "$REPO_ROOT/kernel/src/idt_stubs.s" "$workdir"/*.o \
     -target x86_64-freestanding -O ReleaseSafe \
     -T "$REPO_ROOT/kernel/linker.ld" \
     --name mvk-all -femit-bin="$workdir/mvk-all.elf" > "$log" 2>&1

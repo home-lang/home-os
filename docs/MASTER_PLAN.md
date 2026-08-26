@@ -446,8 +446,9 @@ This list is the ONLY compile target for Phases 0–1. A file may be added only 
 - `kernel/src/multiboot2.home`
 - `kernel/src/boot/initramfs.home`
 
-**Interrupts (1)**
-- `kernel/src/idt.home`
+**Interrupts (2)**
+- `kernel/src/arch/x86_64/interrupts.home` — needed by `boot-to-shell`: builds and loads the IDT, remaps the PIC to vectors 32-47, and dispatches. Before it, `kernel_main` called `sti()` with IDTR still zero and triple-faulted on the first timer tick.
+- `kernel/src/idt.home` — superseded by the above and no longer reached; its `init()` is called from nowhere. Remove once nothing references it.
 
 **Memory (6)**
 - `kernel/src/pmm.home`

@@ -86,7 +86,7 @@ while IFS= read -r rel; do
         "$workdir/$base.s" -o "$workdir/$base.o" >/dev/null 2>&1 || true
 done <<< "$files"
 
-if ! "$ZIG" build-exe "$REPO_ROOT/kernel/src/boot.s" "$workdir"/*.o \
+if ! "$ZIG" build-exe "$REPO_ROOT/kernel/src/boot.s" "$REPO_ROOT/kernel/src/idt_stubs.s" "$workdir"/*.o \
         -target x86_64-freestanding -O ReleaseSafe \
         -T "$REPO_ROOT/kernel/linker.ld" \
         --name boot-gate -femit-bin="$workdir/boot-gate.elf" > "$workdir/link.log" 2>&1; then
