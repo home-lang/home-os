@@ -45,7 +45,7 @@ waiting on; the failures name the construct, not just the count.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 410 | 233,212 |
+| `kernel/` | 410 | 233,364 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
