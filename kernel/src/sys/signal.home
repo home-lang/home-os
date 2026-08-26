@@ -651,3 +651,58 @@ export fn signal_get_stats(sent: *u64, delivered: *u64, ignored: *u64) {
   delivered.* = signals_delivered
   ignored.* = signals_ignored
 }
+
+// Deliver one pending signal to a process, if any. Called from the syscall
+// return path (main.home::syscall_entry): signals are only ever taken on
+// the way back to userspace, never from arbitrary context.
+//
+// Returns 1 when a signal was dequeued and delivered (the caller should
+// force the trap frame onto the handler), 0 when nothing was pending.
+export fn signal_deliver_pending(pid: u32): u32 {
+  if pid >= MAX_PROCESSES { return 0 }
+
+  ensure_signal_locks_initialized()
+  spinlock.spinlock_acquire(&signal_locks[pid])
+
+  // Deliverable = pending AND not blocked. Nothing to do otherwise.
+  var deliverable: u64 = signal_states[pid].pending_mask & ~signal_states[pid].blocked_mask
+  if deliverable == 0 {
+    spinlock.spinlock_release(&signal_locks[pid])
+    return 0
+  }
+
+  // Lowest pending signum first: deterministic ordering, and matches the
+  // queue's FIFO discipline for standard signals.
+  var signum: u32 = 0
+  while signum < 64 {
+    if (deliverable >> signum) & 1 == 1 {
+      break
+    }
+    signum = signum + 1
+  }
+
+  var handler: u64 = signal_states[pid].actions[signum].handler
+
+  // Consume the signal regardless of disposition.
+  var bit: u64 = (@as(u64, 1) << signum)
+  signal_states[pid].pending_mask = signal_states[pid].pending_mask & ~bit
+  signal_states[pid].queue_head = (signal_states[pid].queue_head + 1) % 32
+
+  spinlock.spinlock_release(&signal_locks[pid])
+
+  // Default dispositions for the signals the entry path can hit.
+  // SIGKILL/SIGSTOP cannot be caught or ignored; default-terminate.
+  if handler == SIG_DFL or handler == SIG_IGN {
+    if signum == SIGKILL or signum == SIGSTOP {
+      foundation.serial_write_string("[Signal] fatal ")
+      foundation.serial_write_u64(signum as u64)
+      foundation.serial_write_string(" pid ")
+      foundation.serial_write_u64(pid as u64)
+      foundation.serial_write_string("\n")
+      return 2  // terminate
+    }
+    return 0      // ignored default
+  }
+
+  return 1       // userspace handler; trap frame dispatch happens above
+}
