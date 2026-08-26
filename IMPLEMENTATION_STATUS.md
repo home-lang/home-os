@@ -14,7 +14,7 @@ source that has been written and parsed, but never run.
 
 **410/410 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `ab75f6f2b`
+- Compiler: `home-lang/home` @ `355c1f5d4`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -30,7 +30,7 @@ result in QEMU with the serial console captured.
 
 ## Codegen ratchet
 
-**58/58 of the Minimum Viable Kernel file set reaches codegen.**
+**60/60 of the Minimum Viable Kernel file set reaches codegen.**
 
 This is the number to watch. The MVK set is
 [MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);
@@ -45,7 +45,7 @@ waiting on; the failures name the construct, not just the count.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 410 | 233,470 |
+| `kernel/` | 410 | 233,595 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
