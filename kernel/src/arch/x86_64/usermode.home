@@ -1,0 +1,168 @@
+// home-os Kernel — ring 3 entry and the system call path
+//
+// The Phase 1 exit gate asks for a userspace binary that runs via real write
+// and exit syscalls. This is the path it takes: a flat binary is read out of
+// the initramfs, mapped into user-accessible pages, and entered at ring 3;
+// its `int $0x80` lands in syscall_dispatch below.
+
+import "../../core/foundation.home" as foundation
+import "../../core/memory.home" as memory
+import "../../core/filesystem.home" as filesystem
+import "../../sys/syscall.home" as syscall
+
+// Where a user program is mapped. Well clear of the identity-mapped kernel,
+// and inside the first PML4 slot so the existing tables are reused.
+const USER_TEXT_BASE: u64 = 0x0000_0000_4000_0000
+const USER_STACK_TOP: u64 = 0x0000_0000_4010_0000
+
+const PAGE_PRESENT: u64 = 0x1
+const PAGE_WRITE: u64 = 0x2
+const PAGE_USER: u64 = 0x4
+
+// home-os's own numbering, from kernel/src/sys/syscall.home. Not Linux's:
+// this kernel defines its own ABI and userland/ is built against it.
+const SYS_EXIT: u64 = 0
+const SYS_WRITE: u64 = 3
+
+var user_exited: u32 = 0
+var user_exit_code: u64 = 0
+var syscalls_served: u64 = 0
+
+// Loading buffer. A user program is read here before being copied into the
+// pages it will actually run from.
+var load_buffer: [4096]u8 = undefined
+
+extern fn enter_usermode(rip: u64, rsp: u64)
+extern fn return_to_kernel()
+
+// ============================================================================
+// SYSCALLS
+// ============================================================================
+
+// Called from syscall_entry in idt_stubs.s. The name is unmangled because the
+// stub names it directly, and distinct from sys/syscall.home's
+// syscall_dispatch — this is the arch-level trampoline into that table, not a
+// second copy of it.
+//
+// Only the two calls the gate needs are implemented. Anything else returns
+// -ENOSYS rather than 0, so a program that depends on one fails visibly
+// instead of continuing on a fabricated success.
+export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64): u64 {
+  syscalls_served = syscalls_served + 1
+
+  // exit is handled here rather than in the table because it does not
+  // return: it has to unwind to the kernel context enter_usermode saved,
+  // which the table has no way to reach.
+  if nr == SYS_EXIT {
+    user_exit_code = a1
+    user_exited = 1
+    foundation.serial_write_string("[User] exit(")
+    foundation.serial_write_u64(a1)
+    foundation.serial_write_string(")\n")
+    return_to_kernel()
+  }
+
+  // Writes to the standard streams go to the console. vfs_write already does
+  // this for fd 1 and 2, but routing them here keeps the console reachable
+  // even when the filesystem is not.
+  if nr == SYS_WRITE {
+    if a1 < 3 {
+      return write_console(a2, a3)
+    }
+  }
+
+  // Everything else goes to the kernel's own table, so there is one syscall
+  // implementation rather than a second one growing in the arch directory.
+  var rc: i64 = syscall.syscall_dispatch(@as(u32, nr), a1, a2, a3, 0, 0, 0)
+  return @as(u64, rc)
+}
+
+fn write_console(buf: u64, count: u64): u64 {
+  var i: u64 = 0
+  while i < count {
+    foundation.serial_write_char(@as(*u8, @ptrFromInt(buf + i)).*)
+    i = i + 1
+  }
+  return count
+}
+
+// ============================================================================
+// LOADING
+// ============================================================================
+
+// Map one page of user-accessible memory at `virt`, returning its physical
+// address or 0.
+fn map_user_page(virt: u64): u64 {
+  var phys: u64 = memory.pmm_alloc_page()
+  if phys == 0 { return 0 }
+
+  var rc: u32 = memory.vmm_map_page(virt, phys, PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
+  if rc != 0 { return 0 }
+
+  return phys
+}
+
+// Read a flat binary from the filesystem and run it at ring 3.
+//
+// Flat, not ELF: the loader is the next piece of work, and a raw image is
+// enough to prove the privilege transition and the syscall path, which is
+// what the gate asks about. Returns nonzero if the program could not be
+// started; if it starts, this does not return.
+export fn run_user_program(path: u64): u32 {
+  var fd: u32 = filesystem.vfs_open(path, 0)
+  if fd == 0 {
+    foundation.serial_write_string("[User] not found\n")
+    return 1
+  }
+
+  var size: u64 = filesystem.vfs_read(fd, @intFromPtr(&load_buffer), 4096)
+  var closed: u32 = filesystem.vfs_close(fd)
+
+  if size == 0 {
+    foundation.serial_write_string("[User] empty program\n")
+    return 1
+  }
+
+  // Text page.
+  var text_phys: u64 = map_user_page(USER_TEXT_BASE)
+  if text_phys == 0 {
+    foundation.serial_write_string("[User] could not map text\n")
+    return 1
+  }
+
+  // Copy through the physical address: the virtual mapping is user-accessible
+  // but this is the same address space, so either works. Physical is used to
+  // keep the copy independent of whether the new mapping is live yet.
+  var i: u64 = 0
+  while i < size {
+    @as(*u8, @ptrFromInt(text_phys + i)).* = load_buffer[i]
+    i = i + 1
+  }
+
+  // Stack page, mapped one page below the top so the initial rsp is inside it.
+  var stack_phys: u64 = map_user_page(USER_STACK_TOP - 4096)
+  if stack_phys == 0 {
+    foundation.serial_write_string("[User] could not map stack\n")
+    return 1
+  }
+
+  foundation.serial_write_string("[User] entering ring 3 at ")
+  foundation.serial_write_hex(USER_TEXT_BASE)
+  foundation.serial_write_string(", ")
+  foundation.serial_write_u64(size)
+  foundation.serial_write_string(" bytes\n")
+
+  // Leave a little headroom below the top: the program is entered with an
+  // empty stack and nothing pushed for it.
+  enter_usermode(USER_TEXT_BASE, USER_STACK_TOP - 64)
+
+  return 0
+}
+
+export fn get_syscall_count(): u64 {
+  return syscalls_served
+}
+
+export fn get_user_exit_code(): u64 {
+  return user_exit_code
+}

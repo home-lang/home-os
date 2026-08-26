@@ -639,8 +639,34 @@ struct GDTEntry {
 // Bytes, written at explicit offsets, are the only layout the instruction
 // accepts. The IDT pointer in arch/x86_64/interrupts.home is built the same
 // way for the same reason.
-var gdt: [5]GDTEntry = undefined
+// Seven slots: null, kernel code, kernel data, user code, user data, and a
+// TSS descriptor, which is sixteen bytes in long mode and so occupies two.
+var gdt: [7]GDTEntry = undefined
 var gdtr: [16]u8 = undefined
+
+// The 64-bit TSS. Only rsp0 is used: it is the stack the CPU switches to when
+// an interrupt arrives while running in ring 3. Without it a ring-3 fault has
+// nowhere to push its frame and the machine triple-faults on the first
+// syscall.
+//
+// Laid out as bytes at explicit offsets for the same reason the GDT and IDT
+// pointers are — the CPU reads a packed structure and Home would pad it.
+//   0   reserved
+//   4   rsp0
+//   12  rsp1
+//   20  rsp2
+//   100 iomap base
+var tss: [104]u8 = undefined
+
+// The stack the CPU switches to on entry from ring 3. One page is enough for
+// the syscall path this kernel has; a deeper interrupt nest needs more.
+var kernel_stack: [8192]u8 = undefined
+
+export const KERNEL_CODE_SEL: u16 = 0x08
+export const KERNEL_DATA_SEL: u16 = 0x10
+export const USER_CODE_SEL: u16 = 0x18
+export const USER_DATA_SEL: u16 = 0x20
+export const TSS_SEL: u16 = 0x28
 
 // Long-mode GDT.
 //
@@ -702,7 +728,29 @@ export fn gdt_init() {
   gdt[4].granularity = 0
   gdt[4].base_high = 0
 
-  var limit: u64 = (@sizeOf(GDTEntry) * 5) - 1
+  // The TSS descriptor, slots 5 and 6.
+  //
+  // Long mode widens it to sixteen bytes: the usual eight, then the upper 32
+  // bits of the base and a reserved word. Type 0x9 is an available 64-bit TSS.
+  var tss_base: u64 = @intFromPtr(&tss)
+  var tss_limit: u64 = 103   // sizeof(TSS) - 1
+
+  gdt[5].limit_low = @as(u16, tss_limit & 0xFFFF)
+  gdt[5].base_low = @as(u16, tss_base & 0xFFFF)
+  gdt[5].base_middle = @as(u8, (tss_base >> 16) & 0xFF)
+  gdt[5].access = 0x89       // present, DPL 0, available 64-bit TSS
+  gdt[5].granularity = @as(u8, (tss_limit >> 16) & 0x0F)
+  gdt[5].base_high = @as(u8, (tss_base >> 24) & 0xFF)
+
+  // Slot 6 is not a descriptor: it holds base[63:32] and a reserved word.
+  gdt[6].limit_low = @as(u16, (tss_base >> 32) & 0xFFFF)
+  gdt[6].base_low = @as(u16, (tss_base >> 48) & 0xFFFF)
+  gdt[6].base_middle = 0
+  gdt[6].access = 0
+  gdt[6].granularity = 0
+  gdt[6].base_high = 0
+
+  var limit: u64 = (@sizeOf(GDTEntry) * 7) - 1
   var base: u64 = @intFromPtr(&gdt)
 
   gdtr[0] = @as(u8, limit & 0xFF)
@@ -720,6 +768,39 @@ export fn gdt_init() {
   asm volatile ("lgdt (%[gdt_ptr])"
     :
     : [gdt_ptr] "r" (ptr)
+  )
+
+  tss_init()
+}
+
+// Zero the TSS, point rsp0 at the top of the kernel stack, and load it.
+//
+// The iomap base is set past the end of the structure, which is how a 64-bit
+// TSS says "no I/O permission bitmap" — leaving it zero makes the CPU read
+// 8 KB of whatever follows as a permission map.
+fn tss_init() {
+  var i: u32 = 0
+  while i < 104 {
+    tss[i] = 0
+    i = i + 1
+  }
+
+  // Stacks grow down, so rsp0 is the far end of the array.
+  var rsp0: u64 = @intFromPtr(&kernel_stack) + 8192
+  var j: u32 = 0
+  while j < 8 {
+    tss[4 + j] = @as(u8, (rsp0 >> (j * 8)) & 0xFF)
+    j = j + 1
+  }
+
+  // iomap base = 104: past the end, so no bitmap.
+  tss[102] = 104
+  tss[103] = 0
+
+  var sel: u16 = TSS_SEL
+  asm volatile ("ltr %[s]"
+    :
+    : [s] "r" (sel)
   )
 }
 

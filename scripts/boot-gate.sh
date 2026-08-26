@@ -99,6 +99,26 @@ fi
 # Build the initramfs the kernel is handed as a boot module. Its contents are
 # what `ls` and `cat` are asserted against, so they live in the repo rather
 # than being invented here.
+# Assemble the userspace programs into the initramfs before packing it. They
+# are flat binaries — the kernel's loader reads an image and jumps to offset
+# zero — so they are linked against userland/flat.ld rather than the kernel's
+# script.
+if [ -d "$REPO_ROOT/userland" ]; then
+    mkdir -p "$REPO_ROOT/initramfs/bin"
+    for src in "$REPO_ROOT"/userland/*.s; do
+        [ -e "$src" ] || continue
+        name="$(basename "$src" .s)"
+        "$ZIG" cc -c -x assembler -target x86_64-freestanding "$src" \
+            -o "$workdir/$name.o" >/dev/null 2>&1 || {
+            echo "error: could not assemble $src" >&2; exit 2; }
+        "$ZIG" build-exe "$workdir/$name.o" -target x86_64-freestanding \
+            -O ReleaseSmall -T "$REPO_ROOT/userland/flat.ld" \
+            --name "$name" -femit-bin="$workdir/$name.elf" >/dev/null 2>&1 || {
+            echo "error: could not link $src" >&2; exit 2; }
+        "$ZIG" objcopy -O binary "$workdir/$name.elf" "$REPO_ROOT/initramfs/bin/$name"
+    done
+fi
+
 initrd=""
 if [ -d "$REPO_ROOT/initramfs" ] && command -v cpio >/dev/null 2>&1; then
     ( cd "$REPO_ROOT/initramfs" && find . -print0 | cpio --null -o --format=newc ) \

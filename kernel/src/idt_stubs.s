@@ -195,3 +195,114 @@ isr_common_stub:
 
     /* Return from interrupt */
     iretq
+
+/* ---------------------------------------------------------------------------
+ * System call entry — int $0x80
+ *
+ * A separate stub from the interrupt path: the interrupt path saves fifteen
+ * registers so a handler can inspect the interrupted state, which a syscall
+ * does not need, and it has no way to put a return value back in %rax.
+ *
+ * Arguments arrive as they do on Linux: %rax the call number, then %rdi,
+ * %rsi, %rdx. The handler is called with them shifted along, and its return
+ * value goes back to the caller in %rax.
+ * ------------------------------------------------------------------------ */
+/* u64 syscall_entry_addr(void) — the address of the entry below, so the IDT
+ * can be built from Home. */
+.global syscall_entry_addr
+syscall_entry_addr:
+    lea syscall_entry(%rip), %rax
+    ret
+
+.global syscall_entry
+syscall_entry:
+    /* Callee-saved registers are preserved by the handler; these are the
+     * caller-saved ones the userspace program expects to keep. %rax is not
+     * saved: it carries the return value out. */
+    push %rcx
+    push %r11
+    push %rdi
+    push %rsi
+    push %rdx
+    push %r8
+    push %r9
+    push %r10
+
+    /* syscall_entry_dispatch(nr, a1, a2, a3) */
+    mov %rdx, %rcx      /* a3 -> 4th argument */
+    mov %rsi, %rdx      /* a2 -> 3rd */
+    mov %rdi, %rsi      /* a1 -> 2nd */
+    mov %rax, %rdi      /* nr -> 1st */
+
+    mov %rsp, %rbp
+    and $-16, %rsp
+    call syscall_entry_dispatch
+    mov %rbp, %rsp
+
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rdx
+    pop %rsi
+    pop %rdi
+    pop %r11
+    pop %rcx
+    iretq
+
+/* ---------------------------------------------------------------------------
+ * enter_usermode(rip, rsp) — drop to ring 3 and never come back.
+ *
+ * There is no instruction that lowers privilege directly; the way down is to
+ * build the frame an interrupt from ring 3 would have pushed and execute the
+ * return. RFLAGS is set to 0x202 — reserved bit 1, plus IF, so the timer
+ * keeps running once userspace is live.
+ * ------------------------------------------------------------------------ */
+.global enter_usermode
+enter_usermode:
+    /* Save the kernel context so exit() can come back to it. Without this a
+     * program that exits has nowhere to return: iretq is one-way, and the
+     * kernel stack it left behind is the only way to resume the caller. */
+    push %rbx
+    push %rbp
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    mov %rsp, saved_kernel_rsp(%rip)
+
+    mov $0x23, %ax          /* user data selector, RPL 3 */
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+
+    push $0x23              /* ss */
+    push %rsi               /* rsp */
+    push $0x202             /* rflags */
+    push $0x1b              /* cs: user code selector, RPL 3 */
+    push %rdi               /* rip */
+    iretq
+
+/* return_to_kernel() — resume enter_usermode's caller.
+ *
+ * Called from the exit syscall. Restores the stack enter_usermode saved and
+ * returns through it, so run_user_program returns normally and the shell that
+ * invoked it carries on.
+ */
+.global return_to_kernel
+return_to_kernel:
+    mov saved_kernel_rsp(%rip), %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbp
+    pop %rbx
+    ret
+
+.section .bss
+.align 8
+saved_kernel_rsp:
+    .quad 0
+
+.section .text
