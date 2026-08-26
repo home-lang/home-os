@@ -191,11 +191,21 @@ long_mode_start:
     /* Note: We can't use external symbols here as they may not be accessible yet */
     /* So we'll skip .bss zeroing and rely on Zig's undefined initialization */
 
-    /* Restore Multiboot2 info (zero-extend to 64-bit) */
-    pop %rax  # magic
-    pop %rbx  # info address
-    mov %eax, %edi  # First argument (magic)
-    mov %ebx, %esi  # Second argument (info_addr)
+    /* Restore the bootloader handoff values.
+     *
+     * They were pushed in 32-bit protected mode, so they occupy four bytes
+     * each and share a single eight-byte slot: magic at the lower address,
+     * the info pointer above it. Popping twice with 64-bit operands — which
+     * is what this did — recovers magic correctly by accident and reads
+     * whatever lies further down the stack as the info pointer, which is why
+     * the info address arrived as bytes of the command line.
+     *
+     * One 64-bit pop takes both: magic in the low half, info in the high.
+     */
+    pop %rax
+    mov %eax, %edi         # First argument: magic (low 32 bits)
+    shr $32, %rax
+    mov %eax, %esi         # Second argument: info address (high 32 bits)
 
     /* Call kernel main */
     call kernel_main
