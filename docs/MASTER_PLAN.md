@@ -494,17 +494,14 @@ This list is the ONLY compile target for Phases 0–1. A file may be added only 
 **Timer (1)**
 - `kernel/src/time/clocksource.home`
 
-**Networking placeholders imported by the entry point (3)** — included only because `main.home` imports them; their gates are Phase 2, and shrinking the entry's imports instead is an acceptable MVK simplification:
-- `kernel/src/net/socket.home`
-- `kernel/src/net/tcp.home`
-- `kernel/src/net/udp.home`
-
 **Link script**
 - `kernel/linker.ld`
 
-Total: **40 source files + 1 linker script.**
+Total: **37 source files + 1 linker script.**
 
-**Deliberately excluded:** `kernel/src/integration.home`, which initializes the package manager (`lib/pantry_lib.home`), the den shell (`lib/den_lib.home`), and the Craft GUI toolkit (`lib/craft_lib.home`). Those are Phase 3 and Phase 4 concerns. It was in this list until the set was first linked, where it contributed 61 of 188 unresolved symbols — a *minimum* viable kernel does not reach into the package manager or the GUI toolkit. The call to it was removed from `main.home` in the same change.
+**Deliberately excluded — networking.** `net/socket.home`, `net/tcp.home`, and `net/udp.home` were in this list only because `main.home` imported them, and the simplification this section already recommended — shrink the entry's imports — was taken. `tcp` and `udp` were imported and never used; `socket` was used once, in an IRQ branch for interrupts a kernel with no NIC driver cannot receive. Servicing it dragged `drivers/e1000` in behind it. They return with the Phase 2 `net-echo` gate.
+
+**Deliberately excluded — libraries.** `kernel/src/integration.home`, which initializes the package manager (`lib/pantry_lib.home`), the den shell (`lib/den_lib.home`), and the Craft GUI toolkit (`lib/craft_lib.home`). Those are Phase 3 and Phase 4 concerns. It was in this list until the set was first linked, where it contributed 61 of 188 unresolved symbols — a *minimum* viable kernel does not reach into the package manager or the GUI toolkit. The call to it was removed from `main.home` in the same change.
 
 **Known gaps:** this list was described as having none. That was wrong, and per-file compilation could not show it — linking the set together did. Two problems surfaced (see [#41](https://github.com/home-lang/home-os/issues/41)):
 
