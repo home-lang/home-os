@@ -1,0 +1,336 @@
+// home-os Kernel — interactive serial console
+//
+// The Phase 1 exit gate asks for a shell on the serial line that runs echo,
+// ls, cat, ps and uname. This is that shell: it runs in the kernel, reads
+// from COM1, and calls the subsystems directly. It is not the userspace
+// shell in apps/shell.home, which needs an ELF loader and a syscall path
+// that does not exist yet.
+
+import "../core/foundation.home" as foundation
+import "../core/filesystem.home" as filesystem
+import "../core/process.home" as process
+import "../arch/x86_64/interrupts.home" as interrupts
+
+const LINE_MAX: u32 = 256
+const READDIR_MAX: u32 = 64
+const CAT_CHUNK: u64 = 512
+
+var line: [256]u8 = undefined
+var line_len: u32 = 0
+
+var dir_entries: [64]filesystem.DirEntryInfo = undefined
+var cat_buffer: [512]u8 = undefined
+
+// Command names and the default path. Declared here, with the other module
+// state, because a global must be in scope before the function that takes its
+// address.
+var root_path: [2]u8 = undefined
+var lit_echo: [5]u8 = undefined
+var lit_ls: [3]u8 = undefined
+var lit_cat: [4]u8 = undefined
+var lit_ps: [3]u8 = undefined
+var lit_uname: [6]u8 = undefined
+var lit_irq: [4]u8 = undefined
+var lit_help: [5]u8 = undefined
+
+
+// ============================================================================
+// SMALL STRING HELPERS
+//
+// These take a length rather than trusting a terminator: the line buffer is
+// filled from a serial port, and a device is not a source of well-formed
+// strings.
+// ============================================================================
+
+fn is_space(c: u8): u32 {
+  if c == 32 { return 1 }
+  if c == 9 { return 1 }
+  return 0
+}
+
+// Index of the first non-space at or after `from`, or `len` if there is none.
+fn skip_spaces(from: u32, len: u32): u32 {
+  var i: u32 = from
+  while i < len {
+    if is_space(line[i]) == 0 { return i }
+    i = i + 1
+  }
+  return len
+}
+
+// Index one past the current word.
+fn word_end(from: u32, len: u32): u32 {
+  var i: u32 = from
+  while i < len {
+    if is_space(line[i]) == 1 { return i }
+    i = i + 1
+  }
+  return len
+}
+
+// Whether line[start..end] equals a literal, given as its bytes.
+fn word_is(start: u32, end: u32, lit: u64, lit_len: u32): u32 {
+  if (end - start) != lit_len { return 0 }
+  var i: u32 = 0
+  while i < lit_len {
+    var c: u8 = @as(*u8, @ptrFromInt(lit + @as(u64, i))).*
+    if line[start + i] != c { return 0 }
+    i = i + 1
+  }
+  return 1
+}
+
+fn write_span(start: u32, end: u32) {
+  var i: u32 = start
+  while i < end {
+    foundation.serial_write_char(line[i])
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// BUILTINS
+// ============================================================================
+
+fn cmd_echo(arg_start: u32, len: u32) {
+  write_span(arg_start, len)
+  foundation.serial_write_string("\n")
+}
+
+fn cmd_uname() {
+  foundation.serial_write_string("home-os x86_64\n")
+}
+
+fn cmd_ps() {
+  foundation.serial_write_string("  PID  STATE  PRI\n")
+  var count: u32 = process.process_get_count()
+  var pid: u32 = 1
+  var shown: u32 = 0
+  // Process ids are not dense, so walk a bounded range rather than assuming
+  // the count is also the highest id.
+  while pid < 256 {
+    if shown >= count { return }
+    var state: u32 = process.process_get_state(pid)
+    if state != 0 {
+      foundation.serial_write_string("  ")
+      foundation.serial_write_u64(@as(u64, pid))
+      foundation.serial_write_string("      ")
+      foundation.serial_write_u64(@as(u64, state))
+      foundation.serial_write_string("      ")
+      foundation.serial_write_u64(@as(u64, process.process_get_priority(pid)))
+      foundation.serial_write_string("\n")
+      shown = shown + 1
+    }
+    pid = pid + 1
+  }
+}
+
+fn cmd_ls(arg_start: u32, len: u32) {
+  // Default to the root when no path is given.
+  var path_ptr: u64 = 0
+  if arg_start >= len {
+    path_ptr = @intFromPtr(&root_path)
+  } else {
+    // Terminate the argument in place; the line is ours until the next read.
+    var end: u32 = word_end(arg_start, len)
+    line[end] = 0
+    path_ptr = @intFromPtr(&line) + @as(u64, arg_start)
+  }
+
+  var n: u32 = filesystem.vfs_readdir(path_ptr, &dir_entries, READDIR_MAX)
+  if n == 0 {
+    foundation.serial_write_string("ls: empty or not a directory\n")
+    return
+  }
+
+  var i: u32 = 0
+  while i < n {
+    var j: u32 = 0
+    while j < 256 {
+      var c: u8 = dir_entries[i].name[j]
+      if c == 0 { break }
+      foundation.serial_write_char(c)
+      j = j + 1
+    }
+    foundation.serial_write_string("\n")
+    i = i + 1
+  }
+}
+
+fn cmd_cat(arg_start: u32, len: u32) {
+  if arg_start >= len {
+    foundation.serial_write_string("cat: missing operand\n")
+    return
+  }
+  var end: u32 = word_end(arg_start, len)
+  line[end] = 0
+  var path_ptr: u64 = @intFromPtr(&line) + @as(u64, arg_start)
+
+  var fd: u32 = filesystem.vfs_open(path_ptr, 0)
+  if fd == 0 {
+    foundation.serial_write_string("cat: cannot open\n")
+    return
+  }
+
+  var total: u64 = 0
+  loop {
+    var got: u64 = filesystem.vfs_read(fd, @intFromPtr(&cat_buffer), CAT_CHUNK)
+    if got == 0 { break }
+    total = total + got
+    var k: u64 = 0
+    while k < got {
+      foundation.serial_write_char(cat_buffer[k])
+      k = k + 1
+    }
+    if got < CAT_CHUNK { break }
+  }
+  var closed: u32 = filesystem.vfs_close(fd)
+
+  // Say so rather than printing nothing. vfs_open does not resolve paths yet
+  // — it allocates a fresh inode per call — so every path "opens" and reads
+  // back empty, and a silent cat is indistinguishable from a working one.
+  if total == 0 {
+    foundation.serial_write_string("cat: read 0 bytes (vfs_open does not resolve paths yet)\n")
+  }
+}
+
+fn cmd_irq() {
+  foundation.serial_write_string("timer=")
+  foundation.serial_write_u64(interrupts.get_timer_ticks())
+  foundation.serial_write_string(" keyboard=")
+  foundation.serial_write_u64(interrupts.get_keyboard_irqs())
+  foundation.serial_write_string(" spurious=")
+  foundation.serial_write_u64(interrupts.get_spurious_irqs())
+  foundation.serial_write_string("\n")
+}
+
+fn cmd_help() {
+  foundation.serial_write_string("echo ls cat ps uname irq help\n")
+}
+
+// ============================================================================
+// DISPATCH
+// ============================================================================
+
+// String literals are not yet usable as byte arrays in this backend, so the
+// command names are built once at init. Spelled out rather than looped so the
+// bytes are readable at the point they are defined.
+fn init_literals() {
+  root_path[0] = 47  // '/'
+  root_path[1] = 0
+
+  lit_echo[0] = 101
+  lit_echo[1] = 99
+  lit_echo[2] = 104
+  lit_echo[3] = 111
+  lit_echo[4] = 0
+  lit_ls[0] = 108
+  lit_ls[1] = 115
+  lit_ls[2] = 0
+  lit_cat[0] = 99
+  lit_cat[1] = 97
+  lit_cat[2] = 116
+  lit_cat[3] = 0
+  lit_ps[0] = 112
+  lit_ps[1] = 115
+  lit_ps[2] = 0
+  lit_uname[0] = 117
+  lit_uname[1] = 110
+  lit_uname[2] = 97
+  lit_uname[3] = 109
+  lit_uname[4] = 101
+  lit_uname[5] = 0
+  lit_irq[0] = 105
+  lit_irq[1] = 114
+  lit_irq[2] = 113
+  lit_irq[3] = 0
+  lit_help[0] = 104
+  lit_help[1] = 101
+  lit_help[2] = 108
+  lit_help[3] = 112
+  lit_help[4] = 0
+}
+
+fn run_line(len: u32) {
+  var start: u32 = skip_spaces(0, len)
+  if start >= len { return }
+  var end: u32 = word_end(start, len)
+  var arg: u32 = skip_spaces(end, len)
+
+  if word_is(start, end, @intFromPtr(&lit_echo), 4) == 1 {
+    cmd_echo(arg, len)
+    return
+  }
+  if word_is(start, end, @intFromPtr(&lit_ls), 2) == 1 {
+    cmd_ls(arg, len)
+    return
+  }
+  if word_is(start, end, @intFromPtr(&lit_cat), 3) == 1 {
+    cmd_cat(arg, len)
+    return
+  }
+  if word_is(start, end, @intFromPtr(&lit_ps), 2) == 1 {
+    cmd_ps()
+    return
+  }
+  if word_is(start, end, @intFromPtr(&lit_uname), 5) == 1 {
+    cmd_uname()
+    return
+  }
+  if word_is(start, end, @intFromPtr(&lit_irq), 3) == 1 {
+    cmd_irq()
+    return
+  }
+  if word_is(start, end, @intFromPtr(&lit_help), 4) == 1 {
+    cmd_help()
+    return
+  }
+
+  write_span(start, end)
+  foundation.serial_write_string(": not found\n")
+}
+
+// ============================================================================
+// ENTRY
+// ============================================================================
+
+export fn serial_shell_init() {
+  init_literals()
+  line_len = 0
+  foundation.serial_write_string("\n[Shell] serial console ready\n")
+  foundation.serial_write_string("home-os> ")
+}
+
+// Consume whatever the port has and run any completed line.
+//
+// Called from the idle loop rather than from an interrupt: the shell calls
+// into the filesystem and the process table, and running that inside an
+// interrupt handler would need every one of them to be reentrant.
+export fn serial_shell_poll() {
+  while foundation.serial_has_data() == 1 {
+    var c: u8 = foundation.serial_read_char()
+
+    if c == 13 {
+      c = 10
+    }
+
+    if c == 10 {
+      foundation.serial_write_string("\n")
+      run_line(line_len)
+      line_len = 0
+      foundation.serial_write_string("home-os> ")
+    } else if c == 8 {
+      if line_len > 0 {
+        line_len = line_len - 1
+        // Erase the character on the terminal as well as in the buffer.
+        foundation.serial_write_string("\x08 \x08")
+      }
+    } else if c >= 32 {
+      if line_len < LINE_MAX - 1 {
+        line[line_len] = c
+        line_len = line_len + 1
+        foundation.serial_write_char(c)
+      }
+    }
+  }
+}

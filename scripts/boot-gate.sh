@@ -98,9 +98,23 @@ fi
 
 # The kernel drops out of init and idles rather than powering off, so QEMU is
 # given a deadline instead of being waited on.
+#
+# The console is driven rather than only read: the serial line carries the
+# scripted commands in, so the shell milestones prove the shell *runs* a
+# command, not merely that it printed a banner. Commands are fed one at a
+# time — the 16550 receive FIFO is 16 bytes, and a burst of them is dropped
+# on the floor.
 log="$workdir/serial.log"
-"$QEMU" -kernel "$workdir/boot-gate.bin" -serial file:"$log" \
-    -display none -no-reboot -m 256M > /dev/null 2>&1 &
+{
+    sleep 4
+    while IFS= read -r cmd; do
+        case "$cmd" in ''|\#*) continue ;; esac
+        printf '%s\n' "$cmd"
+        sleep 2
+    done < "$SCRIPT_DIR/boot-commands.txt"
+    sleep "${BOOT_TIMEOUT:-45}"
+} | "$QEMU" -kernel "$workdir/boot-gate.bin" -serial stdio \
+    -display none -no-reboot -m 256M > "$log" 2>&1 &
 qemu_pid=$!
 deadline=$(( $(date +%s) + ${BOOT_TIMEOUT:-45} ))
 while kill -0 "$qemu_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do

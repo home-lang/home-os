@@ -258,6 +258,7 @@ Bring-up order (each stage proven over serial before the next): serial-first deb
 | S6 | USB core is 44 lines | `kernel/src/drivers/usb.home` | P2 | Phase 7a (keyboards, storage on metal) |
 | S7 | ACPI is 71 lines | `kernel/src/drivers/acpi.home` | P2 | Phase 7a (power, S3 suspend) |
 | S8 | `mmio_read32` returns 0; `mmio_write32` is a no-op — every ARM64/Pi driver is inert | `kernel/src/arch/arm64/arm64.home` | P3 | Phase 7b entirely |
+| S9 | `vfs_open` ignores the path: it allocates a fresh inode per call rather than resolving, so every path "opens" and reads back empty | `kernel/src/core/filesystem.home` | P1 | Phase 1 `boot-to-shell` (`cat` of a real file); Phase 2 `storage-roundtrip` |
 
 **Register rules:**
 1. A stub may not be closed without a runtime test exercising it.
@@ -445,6 +446,9 @@ This list is the ONLY compile target for Phases 0–1. A file may be added only 
 - `kernel/src/main.home`
 - `kernel/src/multiboot2.home`
 - `kernel/src/boot/initramfs.home`
+
+**Console (1)**
+- `kernel/src/console/serial_shell.home` — needed by `boot-to-shell`: the interactive serial console. Runs in the kernel and calls the subsystems directly; `apps/shell.home` is the userspace shell and needs an ELF loader and syscall path that do not exist yet.
 
 **Interrupts (2)**
 - `kernel/src/arch/x86_64/interrupts.home` — needed by `boot-to-shell`: builds and loads the IDT, remaps the PIC to vectors 32-47, and dispatches. Before it, `kernel_main` called `sti()` with IDTR still zero and triple-faulted on the first timer tick.
