@@ -9,7 +9,22 @@ import "foundation.home" as foundation
 
 const PAGE_SIZE: u64 = 4096
 const MAX_MEMORY: u64 = 1024 * 1024 * 1024  // 1GB
+
+// How much physical memory vmm_init identity-maps. Must match what the boot
+// page tables cover, so that switching CR3 changes nothing about which
+// addresses are reachable.
+const VMM_IDENTITY_SIZE: u64 = 1024 * 1024 * 1024  // 1GB
 const BITMAP_SIZE: u32 = (MAX_MEMORY / PAGE_SIZE / 8)
+
+// Physical memory below this address is never handed out: the BIOS structures
+// and ROM hole in the low megabyte, and the kernel image loaded at 1 MB.
+//
+// The image is far larger than its loaded bytes suggest — .bss carries the
+// static tables, and the boot stack sits at the top of it. The linker puts
+// __kernel_end (== __bss_end == stack_top) at 0x3573000, just under 56 MB, so
+// this bound has to clear that or the allocator hands out the kernel's own
+// state. 64 MB leaves room to grow.
+const PMM_RESERVED_BELOW: u64 = 64 * 1024 * 1024
 
 // ============================================================================
 // PHYSICAL MEMORY MANAGER (Real implementation)
@@ -26,14 +41,40 @@ export fn pmm_init(memory_size: u64) {
   
   pmm_total_pages = (memory_size / PAGE_SIZE)
   pmm_used_pages = 0
-  
+
   // Clear bitmap
   var i: u32 = 0
   while i < BITMAP_SIZE {
     pmm_bitmap[i] = 0
     i = i + 1
   }
-  
+
+  // Reserve everything below the kernel before handing out a single page.
+  //
+  // Without this the allocator starts at physical page 0 and gives away, in
+  // order: the null page, the real-mode interrupt vector table, the BIOS data
+  // area, the VGA and option-ROM hole at 0xA0000-0xFFFFF, and then the kernel
+  // image itself at 1 MB. Page tables built on those pages are the reason the
+  // first walk of a high address dereferenced 0xF000FF53F000E000 — a
+  // non-canonical address assembled from BIOS ROM bytes, because writes into
+  // the ROM hole are dropped and the reads come back as firmware.
+  //
+  // PMM_RESERVED_BELOW must stay above the end of the loaded image. The image
+  // is linked at 1 MB and is presently well under a megabyte, so 8 MB leaves
+  // room to grow; raise it rather than letting the two meet. The linker
+  // exports __kernel_end for exactly this, but Home cannot yet name an extern
+  // symbol, so the bound is a constant here.
+  var reserved_pages: u32 = @as(u32, PMM_RESERVED_BELOW / PAGE_SIZE)
+  var p: u32 = 0
+  while p < reserved_pages {
+    if p < pmm_total_pages {
+      pmm_set_bit(p)
+      pmm_used_pages = pmm_used_pages + 1
+    }
+    p = p + 1
+  }
+  pmm_hint = reserved_pages
+
   pmm_initialized = 1
   foundation.serial_write_string("[PMM] Initialized with ")
   foundation.serial_write_u64(pmm_total_pages)
@@ -213,8 +254,13 @@ export fn vmm_init() {
     i = i + 1
   }
   
-  // Identity map first 4MB for kernel
-  vmm_map_range(0, 0, 4 * 1024 * 1024, PAGE_PRESENT | PAGE_WRITE)
+  // Identity-map the same first gigabyte the boot page tables cover, before
+  // this table replaces them in CR3.
+  //
+  // This mapped 4 MB, which does not reach the kernel's own .bss — the boot
+  // stack is at 0x3573000, just under 56 MB. Loading CR3 with it unmapped the
+  // stack under the running kernel, and the next push faulted.
+  vmm_map_range(0, 0, VMM_IDENTITY_SIZE, PAGE_PRESENT | PAGE_WRITE)
   
   // Load CR3
   asm volatile ("mov %[pml4], %%cr3"
