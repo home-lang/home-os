@@ -6,15 +6,20 @@
 
 ## Where the project actually is
 
-A Home-compiled kernel **boots and prints on the serial console**. That is
-the whole of what executes today: everything else in this repository is
-source that has been written and parsed, but never run.
+The Home-compiled kernel **boots and runs its full initialisation**: memory
+management, the scheduler, the security subsystems, drivers, filesystems,
+networking and system services all initialise on the serial console. The
+milestones are listed in `scripts/boot-milestones.txt` and checked on every
+build.
+
+What executes is the Appendix A set. The rest of this repository is source
+that has been written and parsed, but never run.
 
 ## Parse rate
 
 **410/410 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `6682e108d`
+- Compiler: `home-lang/home` @ `69d3f9e84`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -27,6 +32,13 @@ parser; it has not been typechecked, code-generated, linked, or run.
 Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
+
+✅ **`boot-full-kernel`: PASS** — 29/29 init milestones reached, through to the end of init
+
+The line above measures the proof-of-life kernel: one file that prints and
+halts. This one measures the real kernel — every Appendix A file linked into
+one image — against the milestone list in `scripts/boot-milestones.txt`,
+which names one subsystem per entry and may only ever grow.
 
 ## Codegen ratchet
 
@@ -45,7 +57,7 @@ waiting on; the failures name the construct, not just the count.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 410 | 233,681 |
+| `kernel/` | 410 | 233,772 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |

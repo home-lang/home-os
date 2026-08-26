@@ -147,6 +147,33 @@ def run_stub_gate():
     return ("PASS" if r.returncode == 0 else "FAIL"), line[0]
 
 
+def run_full_boot_gate(home):
+    """Boot the whole Appendix A kernel. Returns (state, detail).
+
+    run_boot_gate below measures the proof-of-life kernel — one file that
+    prints and halts. This measures the real one: every Appendix A file,
+    linked into one image and booted, checked against the milestone list in
+    scripts/boot-milestones.txt.
+    """
+    env = dict(os.environ, HOME_COMPILER=home)
+    r = subprocess.run([os.path.join(REPO, "scripts", "boot-gate.sh")],
+                       capture_output=True, text=True, env=env, cwd=REPO)
+    out = (r.stdout or "") + (r.stderr or "")
+    m = re.search(r"boot-gate: (\d+)/(\d+) milestones reached", out)
+    if "qemu-system-x86_64 not found" in out or "home compiler not found" in out:
+        return "UNVERIFIED", "QEMU not available in this run"
+    if not m:
+        return "FAIL", "boot gate produced no milestone count"
+    reached, total = int(m.group(1)), int(m.group(2))
+    if r.returncode == 0 and reached == total:
+        return "PASS", f"{reached}/{total} init milestones reached, through to the end of init"
+    stopped = re.search(r"First milestone not reached: (.+)", out)
+    detail = f"{reached}/{total} init milestones reached"
+    if stopped:
+        detail += f"; stopped before `{stopped.group(1).strip()}`"
+    return "FAIL", detail
+
+
 def run_boot_gate(home):
     """Build the MVK and boot it. Returns (state, detail)."""
     env = dict(os.environ, HOME_COMPILER=home)
@@ -190,8 +217,10 @@ def main():
 
     if no_boot:
         boot_state, boot_detail = "UNVERIFIED", "skipped (--no-boot)"
+        full_state, full_detail = "UNVERIFIED", "skipped (--no-boot)"
     else:
         boot_state, boot_detail = run_boot_gate(home)
+        full_state, full_detail = run_full_boot_gate(home)
 
     stub_state, stub_detail = run_stub_gate()
     ratchet = None if no_boot else run_codegen_ratchet(home)
@@ -210,10 +239,20 @@ def main():
     # --- The one-line answer ------------------------------------------------
     w("## Where the project actually is")
     w("")
-    if boot_state == "PASS":
-        w("A Home-compiled kernel **boots and prints on the serial console**. That is")
-        w("the whole of what executes today: everything else in this repository is")
-        w("source that has been written and parsed, but never run.")
+    if full_state == "PASS":
+        w("The Home-compiled kernel **boots and runs its full initialisation**: memory")
+        w("management, the scheduler, the security subsystems, drivers, filesystems,")
+        w("networking and system services all initialise on the serial console. The")
+        w("milestones are listed in `scripts/boot-milestones.txt` and checked on every")
+        w("build.")
+        w("")
+        w("What executes is the Appendix A set. The rest of this repository is source")
+        w("that has been written and parsed, but never run.")
+    elif boot_state == "PASS":
+        w("A Home-compiled kernel **boots and prints on the serial console**, but the")
+        w("full Appendix A kernel does not complete initialisation — see Boot status.")
+        w("Everything else in this repository is source that has been written and")
+        w("parsed, but never run.")
     elif boot_state == "FAIL":
         w("**No Home-compiled kernel currently boots.** The boot gate is red — see")
         w("Boot status below. Nothing in this repository executes.")
@@ -250,6 +289,14 @@ def main():
     w("Measured by building `kernel/src/mvk_poc.home` through the Home compiler,")
     w("linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the")
     w("result in QEMU with the serial console captured.")
+    w("")
+    icon = {"PASS": "✅", "FAIL": "❌", "UNVERIFIED": "⬜"}[full_state]
+    w(f"{icon} **`boot-full-kernel`: {full_state}** — {full_detail}")
+    w("")
+    w("The line above measures the proof-of-life kernel: one file that prints and")
+    w("halts. This one measures the real kernel — every Appendix A file linked into")
+    w("one image — against the milestone list in `scripts/boot-milestones.txt`,")
+    w("which names one subsystem per entry and may only ever grow.")
     w("")
 
     # --- Codegen ratchet ----------------------------------------------------
