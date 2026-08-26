@@ -109,6 +109,171 @@ export fn rdtsc(): u64 {
 }
 
 // ============================================================================
+// CPU CONTROL
+// ============================================================================
+
+// Halt the CPU until the next interrupt. Callers that mean "stop forever"
+// wrap this in a loop themselves — a bare hlt resumes on any interrupt.
+export fn cpu_halt() {
+  asm volatile ("hlt")
+}
+
+// Reset the machine through the 8042 keyboard controller's pulse line. This
+// is the crude method that works without ACPI; when ACPI comes up (S7) it
+// should be preferred and this kept as the fallback.
+export fn cpu_reboot() {
+  cli()
+  // Wait for the input buffer to drain, then pulse the reset line.
+  var guard: u32 = 0
+  while guard < 100000 {
+    if (inb(0x64) & 0x02) == 0 { break }
+    guard = guard + 1
+  }
+  outb(0x64, 0xFE)
+  // If the controller did not take it, fall back to halting rather than
+  // returning into a caller that believes the machine is going down.
+  loop {
+    asm volatile ("hlt")
+  }
+}
+
+// CR2 holds the faulting linear address after a page fault, and is only
+// meaningful inside that handler.
+export fn read_cr2(): u64 {
+  var value: u64
+  asm volatile ("mov %%cr2, %[value]"
+    : [value] "=r" (value)
+  )
+  return value
+}
+
+// Local APIC id of the current CPU, from CPUID leaf 1 bits 31:24.
+export fn get_lapic_id(): u32 {
+  var ebx: u32
+  asm volatile ("cpuid"
+    : "={ebx}" (ebx)
+    : "{eax}" (1)
+    : "eax", "ecx", "edx"
+  )
+  return ebx >> 24
+}
+
+// ============================================================================
+// INTERRUPT STATE
+// ============================================================================
+
+// Save the interrupt flag and disable interrupts. Pair with irq_restore.
+// Returning the previous state rather than unconditionally re-enabling is
+// what makes this safe to nest: an inner critical section must not switch
+// interrupts back on underneath an outer one.
+export fn irq_save(): u64 {
+  var flags: u64
+  asm volatile ("pushfq; popq %[flags]; cli"
+    : [flags] "=r" (flags)
+  )
+  return flags
+}
+
+export fn irq_restore(flags: u64) {
+  asm volatile ("pushq %[flags]; popfq"
+    :
+    : [flags] "r" (flags)
+    : "cc"
+  )
+}
+
+// Acknowledge an interrupt at the PIC. IRQs 8-15 are on the slave, which
+// must be told first, then the master.
+export fn pic_eoi(irq: u32) {
+  if irq >= 8 {
+    outb(0xA0, 0x20)
+  }
+  outb(0x20, 0x20)
+}
+
+// ============================================================================
+// ATOMICS AND ORDERING
+// ============================================================================
+
+// Atomically add to a 64-bit location and return the value it held before.
+// `lock xadd` is the whole operation: no compare-and-swap retry loop, so it
+// cannot livelock under contention.
+export fn atomic_add_u64(addr: u64, value: u64): u64 {
+  var previous: u64 = value
+  asm volatile ("lock xaddq %[previous], (%[addr])"
+    : [previous] "+r" (previous)
+    : [addr] "r" (addr)
+    : "memory", "cc"
+  )
+  return previous
+}
+
+// Full barrier. mfence orders loads and stores against each other; the
+// "memory" clobber additionally stops the compiler reordering across it,
+// which matters as much as the instruction does.
+export fn memory_barrier() {
+  asm volatile ("mfence" ::: "memory")
+}
+
+// ============================================================================
+// MEMORY
+// ============================================================================
+
+// Copy `count` bytes. Forward-only, so it is correct for disjoint regions
+// and for dst < src, but NOT for overlapping regions where dst > src — use
+// a move for that case when one exists.
+export fn mem_copy(dst: u64, src: u64, count: u64) {
+  var i: u64 = 0
+  while i < count {
+    var b: u8 = @as(*u8, @ptrFromInt(src + i)).*
+    @as(*u8, @ptrFromInt(dst + i)).* = b
+    i = i + 1
+  }
+}
+
+export fn mem_set(dst: u64, value: u8, count: u64) {
+  var i: u64 = 0
+  while i < count {
+    @as(*u8, @ptrFromInt(dst + i)).* = value
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// TIME
+// ============================================================================
+
+// Monotonic tick counter, advanced by the timer interrupt. Not wall-clock
+// time and not calibrated to any unit yet — it counts timer interrupts, so
+// its resolution is whatever the PIT or APIC timer was programmed for.
+var tick_count: u64 = 0
+
+export fn get_ticks(): u64 {
+  return tick_count
+}
+
+export fn tick_advance() {
+  tick_count = tick_count + 1
+}
+
+// ============================================================================
+// PANIC
+// ============================================================================
+
+// Report an unrecoverable condition on serial and stop. Never returns:
+// interrupts are disabled first so nothing can resume the machine into a
+// state the caller already declared invalid.
+export fn kernel_panic(message: u64) {
+  cli()
+  serial_write_string("\n\n*** KERNEL PANIC ***\n")
+  serial_write_string(message)
+  serial_write_char(10)
+  loop {
+    asm volatile ("hlt")
+  }
+}
+
+// ============================================================================
 // SERIAL PORT (Real implementation)
 // ============================================================================
 
@@ -171,6 +336,24 @@ export fn serial_write_hex(value: u64) {
     serial_write_char(hex_chars[nibble])
     if i == 0 { break }
     i = i - 4
+  }
+}
+
+// Full 16-digit hex, zero-padded. serial_write_hex trims leading zeros,
+// which is right for readability and wrong for anything being compared
+// column-wise, such as a register dump.
+export fn serial_write_hex64(value: u64) {
+  serial_write_string("0x")
+  var shift: u32 = 60
+  loop {
+    var nibble: u64 = (value >> shift) & 15
+    if nibble < 10 {
+      serial_write_char(@as(u8, 48 + nibble))
+    } else {
+      serial_write_char(@as(u8, 55 + nibble))
+    }
+    if shift == 0 { break }
+    shift = shift - 4
   }
 }
 

@@ -14,7 +14,7 @@ source that has been written and parsed, but never run.
 
 **410/410 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `b1cf22ca8`
+- Compiler: `home-lang/home` @ `f133a2418`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -45,7 +45,7 @@ waiting on; the failures name the construct, not just the count.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 410 | 232,525 |
+| `kernel/` | 410 | 232,708 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
