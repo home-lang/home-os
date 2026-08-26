@@ -72,6 +72,10 @@ files="$(awk '
 ' "$PLAN" | sort -u)"
 [ -n "$files" ] || { echo "error: no Appendix A files found in $PLAN" >&2; exit 2; }
 
+# A port for QEMU's monitor. Derived from the pid so two runs on one machine
+# do not collide.
+MONITOR_PORT=$(( 24000 + ($$ % 1000) ))
+
 workdir="$(mktemp -d)"
 cleanup() { [ "$KEEP" = 1 ] || rm -rf "$workdir"; }
 trap cleanup EXIT
@@ -151,8 +155,28 @@ log="$workdir/serial.log"
     done < "$SCRIPT_DIR/boot-commands.txt"
     sleep "${BOOT_TIMEOUT:-45}"
 } | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" -serial stdio \
+    -monitor "telnet:127.0.0.1:$MONITOR_PORT,server,nowait" \
     -display none -no-reboot -m 256M > "$log" 2>&1 &
 qemu_pid=$!
+
+# Press a key on the emulated PS/2 keyboard.
+#
+# The gate asserts that the keyboard line fires, and with -display none
+# nothing else will ever press one. sendkey goes through QEMU's monitor,
+# reached over a loopback socket because bash can open one without any extra
+# tool being installed.
+(
+    sleep 6
+    exec 3<>"/dev/tcp/127.0.0.1/$MONITOR_PORT" 2>/dev/null || exit 0
+    printf 'sendkey a\n' >&3
+    sleep 1
+    printf 'sendkey b\n' >&3
+    # Hold the connection until the run is over. QEMU treats the monitor
+    # closing as a reason to exit, which cut every run short at the moment
+    # the keys had been delivered.
+    sleep "${BOOT_TIMEOUT:-45}"
+) &
+keypress_pid=$!
 # Stop as soon as the final milestone appears, rather than always waiting out
 # the deadline. "Final" means the last real entry — taking the file's last
 # line would pick up a blank or a comment, and grep for an empty string
@@ -169,6 +193,7 @@ while kill -0 "$qemu_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
 done
 kill "$qemu_pid" 2>/dev/null
 wait "$qemu_pid" 2>/dev/null
+kill "$keypress_pid" 2>/dev/null
 
 [ -f "$log" ] || { echo "boot-gate: no serial output at all" >&2; exit 1; }
 

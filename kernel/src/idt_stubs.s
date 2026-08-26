@@ -291,6 +291,16 @@ enter_usermode:
  */
 .global return_to_kernel
 return_to_kernel:
+    /* Re-enable interrupts.
+     *
+     * The syscall arrived through an interrupt gate, which clears IF, and
+     * this path never executes the iretq that would restore it. Returning
+     * with interrupts still masked left the kernel halted in its idle loop
+     * with nothing able to wake it: the console stopped responding the
+     * moment a program exited.
+     */
+    sti
+
     mov saved_kernel_rsp(%rip), %rsp
     pop %r15
     pop %r14

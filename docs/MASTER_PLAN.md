@@ -141,11 +141,11 @@ Recorded as its own stretch because the original plan collapsed it into a single
 - **Entry:** Phase 0 gates green.
 - **Workstreams:** A (A5), B, C (init + shell glue).
 - **Deliverables:** GDT/IDT/paging/PMM/heap/scheduler initialization; initramfs loading; syscall path; serial shell; `home build` (A5) as the build entry.
-- **Exit gate — CI job `boot-to-shell`:**
-  - Kernel initializes GDT, IDT, paging, PMM, heap, and the scheduler, then loads an initramfs.
-  - A userspace `hello` binary runs via real `write`/`exit` syscalls.
-  - The interactive serial shell executes 5 scripted commands (`echo`, `ls`, `cat`, `ps`, `uname`) under an expect-style harness.
-  - Timer and keyboard IRQs demonstrably fire (interrupt counters exposed via the shell and asserted).
+- **Exit gate — CI job `boot-to-shell`:** ✅ green, enforced by `scripts/boot-gate.sh` against `scripts/boot-milestones.txt`.
+  - ✅ Kernel initializes GDT, IDT, paging, PMM, heap, and the scheduler, then loads an initramfs. The GDT carries a TSS so ring 3 has a kernel stack; the initramfs arrives as a Multiboot boot module and is unpacked into the VFS.
+  - ✅ A userspace `hello` binary runs via real `write`/`exit` syscalls. `userland/hello.s` is a flat binary entered at ring 3 through `iretq`; its `int $0x80` reaches `sys/syscall.home`'s table. The ELF loader is Phase 2.
+  - ✅ The interactive serial shell executes scripted commands (`echo`, `ls`, `cat`, `ps`, `uname`, plus `irq` and `run`). `scripts/boot-commands.txt` is fed over the serial line and the milestones are each command's output.
+  - ✅ Timer and keyboard IRQs demonstrably fire. The gate presses a key through QEMU's monitor — with `-display none` nothing else would — and asserts the shell reports both lines live.
 
 ### Phase 2 — Subsystem Realization (stub burndown: storage + net + console)
 
@@ -257,7 +257,7 @@ Bring-up order (each stage proven over serial before the next): serial-first deb
 | S5 | chacha20 / poly1305 / curve25519 / blake2s are stubs | `kernel/src/crypto/` | P2 | Phase 3 `pantry-local-install` (signing); later WireGuard |
 | S6 | USB core is 44 lines | `kernel/src/drivers/usb.home` | P2 | Phase 7a (keyboards, storage on metal) |
 | S7 | ACPI is 71 lines | `kernel/src/drivers/acpi.home` | P2 | Phase 7a (power, S3 suspend) |
-| S8 | `mmio_read32` returns 0; `mmio_write32` is a no-op — every ARM64/Pi driver is inert | `kernel/src/arch/arm64/arm64.home` | P3 | Phase 7b entirely | `kernel/src/core/filesystem.home` | P1 | Phase 1 `boot-to-shell` (`cat` of a real file); Phase 2 `storage-roundtrip` |
+| S8 | `mmio_read32` returns 0; `mmio_write32` is a no-op — every ARM64/Pi driver is inert | `kernel/src/arch/arm64/arm64.home` | P3 | Phase 7b entirely |
 
 **Register rules:**
 1. A stub may not be closed without a runtime test exercising it.
