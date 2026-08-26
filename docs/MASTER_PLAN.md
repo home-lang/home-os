@@ -551,11 +551,14 @@ These were referenced by files already in the set and were not listed, which is 
 - `kernel/src/block/io_scheduler.home`
 - `kernel/src/block/request_merge.home`
 - `kernel/src/core/driver_init.home`
+- `kernel/src/net/socket.home`
+- `kernel/src/net/tcp.home`
+- `kernel/src/net/arp.home`
 
 **Link script**
 - `kernel/linker.ld`
 
-Total: **71 source files + 1 linker script.**
+Total: **74 source files + 1 linker script.**
 
 **Deliberately excluded — networking.** `net/socket.home`, `net/tcp.home`, and `net/udp.home` were in this list only because `main.home` imported them, and the simplification this section already recommended — shrink the entry's imports — was taken. `tcp` and `udp` were imported and never used; `socket` was used once, in an IRQ branch for interrupts a kernel with no NIC driver cannot receive. Servicing it dragged `drivers/e1000` in behind it. They return with the Phase 2 `net-echo` gate.
 
