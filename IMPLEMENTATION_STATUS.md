@@ -17,9 +17,9 @@ that has been written and parsed, but never run.
 
 ## Parse rate
 
-**411/411 kernel `.home` files parse (100%)**
+**412/412 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `dcbc618bc`
+- Compiler: `home-lang/home` @ `141031d85`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -33,7 +33,7 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-✅ **`boot-full-kernel`: PASS** — 32/32 init milestones reached, through to the end of init
+✅ **`boot-full-kernel`: PASS** — 36/36 init milestones reached, through to the end of init
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
@@ -42,7 +42,7 @@ which names one subsystem per entry and may only ever grow.
 
 ## Codegen ratchet
 
-**65/65 of the Minimum Viable Kernel file set reaches codegen.**
+**66/66 of the Minimum Viable Kernel file set reaches codegen.**
 
 This is the number to watch. The MVK set is
 [MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);
@@ -57,7 +57,7 @@ waiting on; the failures name the construct, not just the count.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 411 | 234,062 |
+| `kernel/` | 412 | 234,430 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -81,8 +81,9 @@ CI gate (`scripts/stub-check.sh`).
 | S6 | USB core is 44 lines | `kernel/src/drivers/usb.home` | 1 | open — blocks Phase 7a (keyboards, storage on metal) |
 | S7 | ACPI is 71 lines | `kernel/src/drivers/acpi.home` | 1 | open — blocks Phase 7a (power, S3 suspend) |
 | S8 | `mmio_read32` returns 0; `mmio_write32` is a no-op — every ARM64/Pi driver is inert | `kernel/src/arch/arm64/arm64.home` | 1 | open — blocks Phase 7b entirely |
+| S9 | `vfs_open` ignores the path: it allocates a fresh inode per call rather than resolving, so every path "opens" and reads back empty | `kernel/src/core/filesystem.home` | 1 | open — blocks Phase 1 `boot-to-shell` (`cat` of a real file); Phase 2 `storage-roundtrip` |
 
-7 of 8 entries open.
+8 of 9 entries open.
 
 ## Phase gates ([MASTER_PLAN §4](docs/MASTER_PLAN.md#4-the-phase-map))
 
@@ -92,7 +93,7 @@ first red one are blocked by definition — they are not being worked yet.
 | Phase | Gate | Status |
 |-------|------|--------|
 | 0 | `parse-rate` | ✅ green |
-| 0 | `stub-register` | ✅ pass — stub-register OK — 7 open entries, all marked and placed correctly |
+| 0 | `stub-register` | ✅ pass — stub-register OK — 8 open entries, all marked and placed correctly |
 | 0 | `boot-qemu-x86_64` | ✅ pass |
 | 0.5 | `mvk-compiles` | ✅ green |
 | 1 | `boot-to-shell` | ⬜ not started |
