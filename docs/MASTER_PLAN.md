@@ -491,13 +491,47 @@ This list is the ONLY compile target for Phases 0–1. A file may be added only 
 - `kernel/src/drivers/framebuffer.home`
 - `kernel/src/drivers/ramdisk.home`
 
+**Import-closure additions (15)** — the set was not import-closed ([#41]): these
+modules are called from files already in the list, so each is added with the
+gate that needs it. Every one reaches clean codegen today.
+
+**Boot timing (1)** — Phase 0 link (kernel_init phase instrumentation):
+- `kernel/src/perf/boot_opt.home`
+
+**Security depth (4)** — Phase 0 link (init path calls each):
+- `kernel/src/security/aslr.home`
+- `kernel/src/security/smep_smap.home`
+- `kernel/src/security/audit.home`
+- `kernel/src/core/vfs_permissions.home`
+
+**Block devices (2)** — Phase 2 `storage-roundtrip` (vfs_block_io dispatches here):
+- `kernel/src/drivers/ata.home`
+- `kernel/src/drivers/nvme.home`
+
+**Pseudo-filesystems (4)** — Phase 2 storage (kernel_init mounts them at boot):
+- `kernel/src/fs/devfs.home`
+- `kernel/src/fs/procfs.home`
+- `kernel/src/fs/sysfs.home`
+- `kernel/src/fs/tmpfs.home`
+
+**Async I/O (1)** — Phase 2 storage (io path completion processing):
+- `kernel/src/perf/async_io.home`
+
+**Network resolution (2)** — Phase 2 `net-echo`. DHCP lands now; DNS stays
+out until its 26 type-checker diagnostics are resolved (it returns with
+`net-echo`, same terms as tcp/udp):
+- `kernel/src/net/dhcp.home`
+
+**Shell library (1)** — Phase 1 boot-to-shell (shell_syscall boots the den shell):
+- `kernel/src/lib/den_lib.home`
+
 **Timer (1)**
 - `kernel/src/time/clocksource.home`
 
 **Link script**
 - `kernel/linker.ld`
 
-Total: **37 source files + 1 linker script.**
+Total: **52 source files + 1 linker script.**
 
 **Deliberately excluded — networking.** `net/socket.home`, `net/tcp.home`, and `net/udp.home` were in this list only because `main.home` imported them, and the simplification this section already recommended — shrink the entry's imports — was taken. `tcp` and `udp` were imported and never used; `socket` was used once, in an IRQ branch for interrupts a kernel with no NIC driver cannot receive. Servicing it dragged `drivers/e1000` in behind it. They return with the Phase 2 `net-echo` gate.
 
