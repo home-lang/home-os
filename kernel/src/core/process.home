@@ -50,7 +50,16 @@ export struct PCB {
   
   // File descriptors
   fd_count: u32,
-  fd_table: [u32; 32]
+  fd_table: [u32; 32],
+
+  // Identity. pgid defaults to the pid, making each process its own group
+  // leader until something moves it — the same rule POSIX uses.
+  pgid: u32,
+  uid: u32,
+  gid: u32,
+  // 1 for a kernel thread, which has no user mapping and must never be
+  // handed a user address.
+  is_kernel: u32
 }
 
 // ============================================================================
@@ -62,6 +71,177 @@ var process_count: u32 = 0
 var current_pid: u32 = 0
 var next_pid: u32 = 1
 var scheduler_initialized: u32 = 0
+
+// ============================================================================
+// PROCESS LOOKUP AND ACCESSORS
+// ============================================================================
+
+// Slot holding `pid`, or MAX_PROCESSES if there is none. Every accessor below
+// goes through this rather than indexing by pid: slots are reused and a pid is
+// not its index.
+fn slot_of(pid: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_PROCESSES {
+    if process_table[i].pid == pid and process_table[i].state != PROCESS_UNUSED {
+      return i
+    }
+    i = i + 1
+  }
+  return MAX_PROCESSES
+}
+
+export fn process_exists(pid: u32): u32 {
+  if slot_of(pid) < MAX_PROCESSES { return 1 }
+  return 0
+}
+
+// A pid with no live slot reports PROCESS_UNUSED rather than failing: callers
+// are asking "is this runnable", and a process that is gone is not.
+export fn process_get_state(pid: u32): u32 {
+  var slot: u32 = slot_of(pid)
+  if slot >= MAX_PROCESSES { return PROCESS_UNUSED }
+  return process_table[slot].state
+}
+
+export fn process_set_state(pid: u32, state: u32) {
+  var slot: u32 = slot_of(pid)
+  if slot >= MAX_PROCESSES { return }
+  process_table[slot].state = state
+}
+
+export fn process_get_parent(pid: u32): u32 {
+  var slot: u32 = slot_of(pid)
+  if slot >= MAX_PROCESSES { return 0 }
+  return process_table[slot].parent_pid
+}
+
+export fn process_get_priority(pid: u32): u32 {
+  var slot: u32 = slot_of(pid)
+  if slot >= MAX_PROCESSES { return 0 }
+  return process_table[slot].priority
+}
+
+export fn process_get_pgid(pid: u32): u32 {
+  var slot: u32 = slot_of(pid)
+  if slot >= MAX_PROCESSES { return 0 }
+  return process_table[slot].pgid
+}
+
+export fn process_is_kernel(pid: u32): u32 {
+  var slot: u32 = slot_of(pid)
+  if slot >= MAX_PROCESSES { return 0 }
+  return process_table[slot].is_kernel
+}
+
+// Charge one timer tick to a process and report whether its slice is spent.
+// The scheduler decides what to do about that; this only does the accounting.
+export fn process_tick(pid: u32): u32 {
+  var slot: u32 = slot_of(pid)
+  if slot >= MAX_PROCESSES { return 0 }
+  process_table[slot].cpu_time = process_table[slot].cpu_time + 1
+  if process_table[slot].time_slice > 0 {
+    process_table[slot].time_slice = process_table[slot].time_slice - 1
+    if process_table[slot].time_slice == 0 { return 1 }
+  }
+  return 0
+}
+
+// ============================================================================
+// CONTEXT SWITCH
+// ============================================================================
+
+// Save `prev`'s stack pointer and resume `next`'s.
+//
+// Incomplete, and worth being precise about what it does not do: it moves
+// the stack pointer and the page table, and nothing else. Callee-saved
+// registers are not saved here — they are preserved by the caller's own
+// prologue, which is only true while every switch goes through a normal
+// function call. The moment a switch happens from an interrupt handler this
+// has to save the full frame instead. Floating-point and SSE state are not
+// touched at all.
+export fn context_switch(prev: u32, next: u32) {
+  var prev_slot: u32 = slot_of(prev)
+  var next_slot: u32 = slot_of(next)
+  if next_slot >= MAX_PROCESSES { return }
+
+  if prev_slot < MAX_PROCESSES {
+    var sp: u64 = 0
+    asm volatile ("movq %%rsp, %[sp]" : [sp] "=r" (sp))
+    process_table[prev_slot].rsp = sp
+  }
+
+  current_pid = next
+
+  var new_page_table: u64 = process_table[next_slot].page_table
+  if new_page_table != 0 {
+    asm volatile ("movq %[pt], %%cr3" :: [pt] "r" (new_page_table) : "memory")
+  }
+
+  var new_sp: u64 = process_table[next_slot].rsp
+  if new_sp != 0 {
+    asm volatile ("movq %[sp], %%rsp" :: [sp] "r" (new_sp) : "memory")
+  }
+}
+
+// ============================================================================
+// PROCESS SYSCALLS
+// ============================================================================
+
+// Signal delivery is not implemented, so this does the one thing it can do
+// honestly: SIGKILL (9) and SIGTERM (15) terminate the target, and every
+// other signal is accepted and dropped. Returns 0 on success, and a nonzero
+// errno-shaped value otherwise.
+export fn sys_kill(pid: u32, sig: u32): u32 {
+  var slot: u32 = slot_of(pid)
+  if slot >= MAX_PROCESSES { return 3 }  // ESRCH
+  if sig == 9 or sig == 15 {
+    process_table[slot].state = PROCESS_ZOMBIE
+    return 0
+  }
+  return 0
+}
+
+// Wait for a specific child. Non-blocking in the only sense available yet:
+// if the child has not exited, this reports that rather than sleeping, since
+// there is no wait queue to sleep on. `status` may be 0 to discard it.
+export fn sys_waitpid(pid: u32, status: u64, options: u32): u32 {
+  var slot: u32 = slot_of(pid)
+  if slot >= MAX_PROCESSES { return 0xFFFFFFFF }
+  if process_table[slot].state != PROCESS_ZOMBIE {
+    return 0
+  }
+  if status != 0 {
+    @as(*u32, @ptrFromInt(status)).* = process_table[slot].cpu_time
+  }
+  var reaped: u32 = process_table[slot].pid
+  process_table[slot].state = PROCESS_UNUSED
+  if process_count > 0 { process_count = process_count - 1 }
+  return reaped
+}
+
+// There is no privilege model yet, so these record the ids and nothing
+// enforces them. Recording is still worth doing: it is what a later check
+// will read, and a process that never stored its uid cannot be checked.
+export fn sys_setuid(uid: u32): u32 {
+  var slot: u32 = slot_of(current_pid)
+  if slot >= MAX_PROCESSES { return 1 }
+  process_table[slot].uid = uid
+  return 0
+}
+
+export fn sys_setgid(gid: u32): u32 {
+  var slot: u32 = slot_of(current_pid)
+  if slot >= MAX_PROCESSES { return 1 }
+  process_table[slot].gid = gid
+  return 0
+}
+
+// ptrace needs a debugger interface that does not exist. Rather than pretend,
+// this fails with EPERM for every request — a debugger gets a clear refusal
+// instead of silence or a wrong answer.
+export fn sys_ptrace(request: u32, pid: u32, addr: u64): u32 {
+  return 1  // EPERM
+}
 
 // ============================================================================
 // PROCESS CREATION
@@ -162,6 +342,14 @@ export fn process_create(entry_point: u64): u32 {
   var pcb: PCB = undefined
   pcb.pid = assigned_pid
   pcb.state = PROCESS_READY
+
+  // A new process leads its own group until something moves it, which is the
+  // rule POSIX uses. uid/gid start at 0 and is_kernel at 0; a kernel thread
+  // is marked by its creator.
+  pcb.pgid = assigned_pid
+  pcb.uid = 0
+  pcb.gid = 0
+  pcb.is_kernel = 0
 
   // Validate parent_pid. Kernel-thread callers have
   // current_pid == 0; users expect PID 1 (init) to be their ancestor
@@ -347,8 +535,12 @@ fn scheduler_switch() {
       
       current_pid = process_table[i].pid
       
-      // Context switch would happen here
-      context_switch(start_idx, i)
+      // context_switch takes pids, not slot indices. There used to be a
+      // second, private context_switch here that took indices and only
+      // reloaded CR3 — the two coexisted with different conventions, and the
+      // scheduler was calling the exported one with pids while this call
+      // passed slots.
+      context_switch(process_table[start_idx].pid, process_table[i].pid)
       
       return
     }
@@ -356,18 +548,6 @@ fn scheduler_switch() {
     i = (i + 1) % MAX_PROCESSES
     searched = searched + 1
   }
-}
-
-fn context_switch(from_idx: u32, to_idx: u32) {
-  // Save current context (would be done in assembly)
-  // Load new context (would be done in assembly)
-  
-  // Switch page table
-  var new_cr3: u64 = process_table[to_idx].page_table
-  asm volatile ("mov %[cr3], %%cr3"
-    :
-    : [cr3] "r" (new_cr3)
-  )
 }
 
 // ============================================================================
