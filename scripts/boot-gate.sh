@@ -96,6 +96,23 @@ if ! "$ZIG" build-exe "$REPO_ROOT/kernel/src/boot.s" "$REPO_ROOT/kernel/src/idt_
 fi
 "$ZIG" objcopy -O binary "$workdir/boot-gate.elf" "$workdir/boot-gate.bin"
 
+# Build the initramfs the kernel is handed as a boot module. Its contents are
+# what `ls` and `cat` are asserted against, so they live in the repo rather
+# than being invented here.
+initrd=""
+if [ -d "$REPO_ROOT/initramfs" ] && command -v cpio >/dev/null 2>&1; then
+    ( cd "$REPO_ROOT/initramfs" && find . -print0 | cpio --null -o --format=newc ) \
+        > "$workdir/initrd.cpio" 2>/dev/null
+    if [ -s "$workdir/initrd.cpio" ]; then
+        initrd="$workdir/initrd.cpio"
+        echo "boot-gate: initramfs $(wc -c < "$initrd" | tr -d ' ') bytes"
+    fi
+fi
+if [ -z "$initrd" ]; then
+    echo "error: could not build the initramfs (need cpio and $REPO_ROOT/initramfs)" >&2
+    exit 2
+fi
+
 # The kernel drops out of init and idles rather than powering off, so QEMU is
 # given a deadline instead of being waited on.
 #
@@ -113,12 +130,19 @@ log="$workdir/serial.log"
         sleep 2
     done < "$SCRIPT_DIR/boot-commands.txt"
     sleep "${BOOT_TIMEOUT:-45}"
-} | "$QEMU" -kernel "$workdir/boot-gate.bin" -serial stdio \
+} | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" -serial stdio \
     -display none -no-reboot -m 256M > "$log" 2>&1 &
 qemu_pid=$!
+# Stop as soon as the final milestone appears, rather than always waiting out
+# the deadline. "Final" means the last real entry — taking the file's last
+# line would pick up a blank or a comment, and grep for an empty string
+# matches immediately, which ends the run before the kernel has done anything.
+last_milestone="$(grep -vE '^\s*(#|$)' "$MILESTONES" | tail -n 1 | sed 's/^ *//; s/ *$//')"
+[ -n "$last_milestone" ] || { echo "error: $MILESTONES has no entries" >&2; exit 2; }
+
 deadline=$(( $(date +%s) + ${BOOT_TIMEOUT:-45} ))
 while kill -0 "$qemu_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
-    if [ -s "$log" ] && grep -qF "$(tail -n 1 "$MILESTONES" | sed 's/^ *//; s/ *$//')" "$log" 2>/dev/null; then
+    if [ -s "$log" ] && grep -qF "$last_milestone" "$log" 2>/dev/null; then
         break
     fi
     sleep 1
