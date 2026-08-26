@@ -449,8 +449,9 @@ This list is the ONLY compile target for Phases 0–1. A file may be added only 
 **Console (1)**
 - `kernel/src/console/serial_shell.home` — needed by `boot-to-shell`: the interactive serial console. Runs in the kernel and calls the subsystems directly; `apps/shell.home` is the userspace shell and needs an ELF loader and syscall path that do not exist yet.
 
-**Userspace (1)**
-- `kernel/src/arch/x86_64/usermode.home` — needed by `boot-to-shell`: the ring-3 transition and the `int $0x80` system call path (`write`, `exit`). Loads a flat binary from the initramfs; the ELF loader is Phase 2.
+**Userspace (2)**
+- `kernel/src/arch/x86_64/usermode.home` — needed by `boot-to-shell`: the ring-3 transition and the `int $0x80` system call path (`write`, `exit`).
+- `kernel/src/loader/elf.home` — needed by Phase 2 (ELF loader runs coreutils from disk): maps an ELF64 image's PT_LOAD segments where they ask to live, with user permissions.
 
 **Interrupts (2)**
 - `kernel/src/arch/x86_64/interrupts.home` — needed by `boot-to-shell`: builds and loads the IDT, remaps the PIC to vectors 32-47, and dispatches. Before it, `kernel_main` called `sti()` with IDTR still zero and triple-faulted on the first timer tick.

@@ -112,14 +112,28 @@ if [ -d "$REPO_ROOT/userland" ]; then
     for src in "$REPO_ROOT"/userland/*.s; do
         [ -e "$src" ] || continue
         name="$(basename "$src" .s)"
+
+        # A program ending in _elf keeps its headers and is loaded by
+        # kernel/src/loader/elf.home; everything else is flattened and
+        # entered at offset zero. The two loaders are both exercised.
+        case "$name" in
+            *_elf) script="$REPO_ROOT/userland/elf.ld"; flatten=0 ;;
+            *)     script="$REPO_ROOT/userland/flat.ld"; flatten=1 ;;
+        esac
+
         "$ZIG" cc -c -x assembler -target x86_64-freestanding "$src" \
             -o "$workdir/$name.o" >/dev/null 2>&1 || {
             echo "error: could not assemble $src" >&2; exit 2; }
         "$ZIG" build-exe "$workdir/$name.o" -target x86_64-freestanding \
-            -O ReleaseSmall -T "$REPO_ROOT/userland/flat.ld" \
+            -O ReleaseSmall -T "$script" \
             --name "$name" -femit-bin="$workdir/$name.elf" >/dev/null 2>&1 || {
             echo "error: could not link $src" >&2; exit 2; }
-        "$ZIG" objcopy -O binary "$workdir/$name.elf" "$REPO_ROOT/initramfs/bin/$name"
+
+        if [ "$flatten" = 1 ]; then
+            "$ZIG" objcopy -O binary "$workdir/$name.elf" "$REPO_ROOT/initramfs/bin/$name"
+        else
+            cp "$workdir/$name.elf" "$REPO_ROOT/initramfs/bin/$name"
+        fi
     done
 fi
 

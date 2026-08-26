@@ -50,87 +50,191 @@ export fn elf_init() {
   foundation.serial_write_string("[ELF] Loader initialized\n")
 }
 
+// Page permission bits, as core/memory.home writes them.
+const PAGE_PRESENT: u64 = 0x1
+const PAGE_WRITE: u64 = 0x2
+const PAGE_USER: u64 = 0x4
+
+const ELF_CLASS_64: u8 = 2
+const ELF_DATA_LSB: u8 = 1
+const EM_X86_64: u16 = 62
+const ET_EXEC: u16 = 2
+
+const PAGE_SIZE: u64 = 4096
+
+// Header scratch. Loading is not reentrant; nothing calls it from an
+// interrupt.
+var header_buf: [64]u8 = undefined
+var phdr_buf: [56]u8 = undefined
+
+// Round down to a page boundary.
+fn page_base(addr: u64): u64 {
+  return addr & 0xFFFFFFFFFFFFF000
+}
+
+// Map `bytes` of user-accessible memory covering [vaddr, vaddr+bytes), and
+// return the physical address corresponding to `vaddr` itself.
+//
+// Pages are allocated one at a time and mapped where the segment asks to
+// live. The previous version allocated from the kernel heap and passed that
+// virtual address to vmm_map_page as though it were physical, then mapped a
+// single page however large the segment was.
+fn map_segment(vaddr: u64, bytes: u64): u64 {
+  if bytes == 0 { return 0 }
+
+  var first_phys: u64 = 0
+  var base: u64 = page_base(vaddr)
+  var end: u64 = vaddr + bytes
+  var addr: u64 = base
+
+  while addr < end {
+    // Reuse a page an earlier segment already mapped. Segments routinely
+    // share one — a linker packs .text, .rodata and .data into consecutive
+    // bytes — and allocating a fresh zero page for the second one replaces
+    // the first and loses its contents. That showed up as an ELF that loaded
+    // three segments cleanly and then page-faulted on its first instruction.
+    var phys: u64 = memory.vmm_get_kernel_physical(addr)
+
+    if phys == 0 {
+      phys = memory.pmm_alloc_page()
+      if phys == 0 { return 0 }
+
+      // Zero on first use only: a segment's memsz is usually larger than its
+      // filesz, and the difference is .bss, which must read as zero. Zeroing
+      // a shared page again would erase the neighbour.
+      var z: u64 = 0
+      while z < PAGE_SIZE {
+        @as(*u8, @ptrFromInt(phys + z)).* = 0
+        z = z + 1
+      }
+
+      if memory.vmm_map_page(addr, phys, PAGE_PRESENT | PAGE_WRITE | PAGE_USER) != 0 {
+        return 0
+      }
+    }
+
+    if addr == base {
+      first_phys = phys + (vaddr - base)
+    }
+    addr = addr + PAGE_SIZE
+  }
+
+  return first_phys
+}
+
+// Load an ELF64 executable and return its entry point, or 0.
+//
+// Segments are mapped where they ask to be, with user permissions, and the
+// file's bytes are written through the physical address — the whole of low
+// memory is identity-mapped, so that reaches the same storage the new virtual
+// mapping does, without depending on which page tables are live.
 export fn elf_load(path: u64): u64 {
   var fd: u32 = filesystem.vfs_open(path, 0)
-  if fd == 0xFFFFFFFF {
-    foundation.serial_write_string("[ELF] Failed to open file\n")
+  if fd == 0 {
+    foundation.serial_write_string("[ELF] cannot open\n")
     return 0
   }
-  
-  var header_buf: [u8; 64]
-  var read: u64 = filesystem.vfs_read(fd, @ptrFromInt(header_buf), 64)
-  
-  if read < 64 {
-    filesystem.vfs_close(fd)
+
+  var got: u64 = filesystem.vfs_read(fd, @intFromPtr(&header_buf), 64)
+  if got < 64 {
+    foundation.serial_write_string("[ELF] short header\n")
+    var c1: u32 = filesystem.vfs_close(fd)
     return 0
   }
-  
-  var header: ElfHeader = @as(*ElfHeader, @ptrFromInt(header_buf)).*
-  
+
+  var header: ElfHeader = @as(*ElfHeader, @ptrFromInt(@intFromPtr(&header_buf))).*
+
+  // Check what the loader actually assumes, by name, rather than only the
+  // magic: a 32-bit or big-endian or non-x86-64 image would otherwise be
+  // walked as though its headers had this layout.
   if header.magic != ELF_MAGIC {
-    foundation.serial_write_string("[ELF] Invalid magic\n")
-    filesystem.vfs_close(fd)
+    foundation.serial_write_string("[ELF] not an ELF image\n")
+    var c2: u32 = filesystem.vfs_close(fd)
     return 0
   }
-  
+  if header.class != ELF_CLASS_64 {
+    foundation.serial_write_string("[ELF] not ELF64\n")
+    var c3: u32 = filesystem.vfs_close(fd)
+    return 0
+  }
+  if header.data != ELF_DATA_LSB {
+    foundation.serial_write_string("[ELF] not little-endian\n")
+    var c4: u32 = filesystem.vfs_close(fd)
+    return 0
+  }
+  if header.machine != EM_X86_64 {
+    foundation.serial_write_string("[ELF] wrong machine\n")
+    var c5: u32 = filesystem.vfs_close(fd)
+    return 0
+  }
+
   var entry: u64 = header.entry
-  
-  // Load program headers
-  // Limit program header count to prevent excessive iteration
   var phnum: u16 = header.phnum
   if phnum > 128 { phnum = 128 }
 
+  var loaded: u32 = 0
   var i: u16 = 0
   while i < phnum {
-    // Check for integer overflow in offset calculation
     var phdr_offset: u64 = header.phoff + (@as(u64, i) * @as(u64, header.phentsize))
-    if phdr_offset < header.phoff { break }  // Overflow detected
+    if phdr_offset < header.phoff { break }  // overflow
 
-    var phdr_buf: [u8; 56]
-    filesystem.vfs_lseek(fd, phdr_offset, 0)
-    filesystem.vfs_read(fd, @ptrFromInt(phdr_buf), 56)
+    var seek: u64 = filesystem.vfs_lseek(fd, phdr_offset, 0)
+    var pgot: u64 = filesystem.vfs_read(fd, @intFromPtr(&phdr_buf), 56)
+    if pgot < 56 { break }
 
-    var phdr: ElfProgramHeader = @as(*ElfProgramHeader, @ptrFromInt(phdr_buf)).*
+    var phdr: ElfProgramHeader = @as(*ElfProgramHeader, @ptrFromInt(@intFromPtr(&phdr_buf))).*
 
     if phdr.type == PT_LOAD {
-      // Reject unreasonably large segments (> 256 MB)
-      if phdr.memsz > 0x10000000 or phdr.memsz == 0 {
+      if phdr.memsz == 0 {
         i = i + 1
         continue
       }
-      // Reject filesz > memsz (malformed)
+      if phdr.memsz > 0x10000000 {
+        foundation.serial_write_string("[ELF] segment too large\n")
+        var c6: u32 = filesystem.vfs_close(fd)
+        return 0
+      }
       if phdr.filesz > phdr.memsz {
-        i = i + 1
-        continue
+        foundation.serial_write_string("[ELF] filesz exceeds memsz\n")
+        var c7: u32 = filesystem.vfs_close(fd)
+        return 0
       }
 
-      var mem: u64 = memory.kmalloc(phdr.memsz)
-      if mem != 0 {
-        // Zero the memory first (memsz may be larger than filesz for BSS)
-        memory.memset(mem, 0, phdr.memsz)
-        filesystem.vfs_lseek(fd, phdr.offset, 0)
-        filesystem.vfs_read(fd, mem, phdr.filesz)
-
-        // Map to virtual address
-        memory.vmm_map_page(phdr.vaddr, mem, 7)
+      var phys: u64 = map_segment(phdr.vaddr, phdr.memsz)
+      if phys == 0 {
+        foundation.serial_write_string("[ELF] could not map segment\n")
+        var c8: u32 = filesystem.vfs_close(fd)
+        return 0
       }
+
+      if phdr.filesz > 0 {
+        var s2: u64 = filesystem.vfs_lseek(fd, phdr.offset, 0)
+        var r2: u64 = filesystem.vfs_read(fd, phys, phdr.filesz)
+        if r2 < phdr.filesz {
+          foundation.serial_write_string("[ELF] short segment read\n")
+          var c9: u32 = filesystem.vfs_close(fd)
+          return 0
+        }
+      }
+
+      loaded = loaded + 1
     }
 
     i = i + 1
   }
-  
-  filesystem.vfs_close(fd)
-  
-  foundation.serial_write_string("[ELF] Loaded successfully\n")
-  return entry
-}
 
-export fn elf_exec(path: u64): u32 {
-  var entry: u64 = elf_load(path)
-  if entry == 0 { return 1 }
-  
-  // Jump to entry point (stub)
-  foundation.serial_write_string("[ELF] Would execute at entry point\n")
-  
-  return 0
+  var c: u32 = filesystem.vfs_close(fd)
+
+  if loaded == 0 {
+    foundation.serial_write_string("[ELF] no loadable segments\n")
+    return 0
+  }
+
+  foundation.serial_write_string("[ELF] loaded ")
+  foundation.serial_write_u64(@as(u64, loaded))
+  foundation.serial_write_string(" segment(s), entry ")
+  foundation.serial_write_hex(entry)
+  foundation.serial_write_string("\n")
+
+  return entry
 }
