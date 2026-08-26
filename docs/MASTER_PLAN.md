@@ -528,10 +528,27 @@ out until its 26 type-checker diagnostics are resolved (it returns with
 **Timer (1)**
 - `kernel/src/time/clocksource.home`
 
+**Import closure — added because MVK files call into them (12)**
+
+These were referenced by files already in the set and were not listed, which is how the set came to have 188 unresolved symbols at its first whole-set link. Each compiles and typechecks clean; they were added once that was true, not before.
+
+- `kernel/src/security/ptr_safety.home`
+- `kernel/src/security/capabilities.home`
+- `kernel/src/security/audit.home`
+- `kernel/src/core/vfs_permissions.home`
+- `kernel/src/mm/memcg.home`
+- `kernel/src/perf/boot_opt.home`
+- `kernel/src/perf/async_io.home`
+- `kernel/src/drivers/timer.home`
+- `kernel/src/drivers/ata.home`
+- `kernel/src/drivers/nvme.home`
+- `kernel/src/net/udp.home`
+- `kernel/src/net/dns.home`
+
 **Link script**
 - `kernel/linker.ld`
 
-Total: **52 source files + 1 linker script.**
+Total: **64 source files + 1 linker script.**
 
 **Deliberately excluded — networking.** `net/socket.home`, `net/tcp.home`, and `net/udp.home` were in this list only because `main.home` imported them, and the simplification this section already recommended — shrink the entry's imports — was taken. `tcp` and `udp` were imported and never used; `socket` was used once, in an IRQ branch for interrupts a kernel with no NIC driver cannot receive. Servicing it dragged `drivers/e1000` in behind it. They return with the Phase 2 `net-echo` gate.
 
