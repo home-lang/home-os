@@ -499,12 +499,16 @@ This list is the ONLY compile target for Phases 0–1. A file may be added only 
 - `kernel/src/net/tcp.home`
 - `kernel/src/net/udp.home`
 
-**Integration glue (1)**
-- `kernel/src/integration.home`
-
 **Link script**
 - `kernel/linker.ld`
 
-Total: **41 source files + 1 linker script.**
+Total: **40 source files + 1 linker script.**
 
-**Known gaps:** none — every candidate role resolved to a real file. Two serial implementations exist (`kernel/src/serial.home` and `kernel/src/drivers/serial.home`); MVK bring-up should consolidate on one and delete or fold in the other, noted here so the duplication is not silently carried forward.
+**Deliberately excluded:** `kernel/src/integration.home`, which initializes the package manager (`lib/pantry_lib.home`), the den shell (`lib/den_lib.home`), and the Craft GUI toolkit (`lib/craft_lib.home`). Those are Phase 3 and Phase 4 concerns. It was in this list until the set was first linked, where it contributed 61 of 188 unresolved symbols — a *minimum* viable kernel does not reach into the package manager or the GUI toolkit. The call to it was removed from `main.home` in the same change.
+
+**Known gaps:** this list was described as having none. That was wrong, and per-file compilation could not show it — linking the set together did. Two problems surfaced (see [#41](https://github.com/home-lang/home-os/issues/41)):
+
+1. **The set is not import-closed.** It imports modules it does not contain — `drivers/ata`, `drivers/nvme`, `drivers/e1000`, `mm/memcg`, `mm/swap`, `net/dhcp`, `net/dns`, `block_io/scheduler`, `perf/async_io`. Each needs a decision: add it, or cut the call.
+2. **Some imports resolve to functions that were never written.** `core/foundation.home` is called for `atomic_add_u64`, `cpu_halt`, `cpu_reboot`, `get_ticks`, and `get_lapic_id`, and defines none of them.
+
+The `mvk-links` ratchet tracks the remaining count so this cannot drift back. Two serial implementations exist (`kernel/src/serial.home` and `kernel/src/drivers/serial.home`); MVK bring-up should consolidate on one and delete or fold in the other, noted here so the duplication is not silently carried forward.
