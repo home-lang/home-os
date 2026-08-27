@@ -168,6 +168,11 @@ fi
 # command, not merely that it printed a banner. Commands are fed one at a
 # time — the 16550 receive FIFO is 16 bytes, and a burst of them is dropped
 # on the floor.
+# A blank disk for the block layer to prove itself against. Written fresh
+# each run so a round-trip cannot pass on the previous run's bytes.
+disk="$workdir/disk.img"
+dd if=/dev/zero of="$disk" bs=1048576 count=8 >/dev/null 2>&1
+
 log="$workdir/serial.log"
 SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
 {
@@ -191,7 +196,8 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
         sleep 2
     done < "$SCRIPT_DIR/boot-commands.txt"
     sleep "${BOOT_TIMEOUT:-45}"
-} | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" -serial stdio \
+} | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" \
+    -drive file="$disk",format=raw,if=ide -serial stdio \
     -monitor "telnet:127.0.0.1:$MONITOR_PORT,server,nowait" \
     -display none -vga std -no-reboot -m 256M > "$log" 2>&1 &
 qemu_pid=$!
