@@ -7,6 +7,9 @@ import "arch/x86_64/interrupts.home" as interrupts
 import "console/serial_shell.home" as serial_shell
 import "boot/initramfs.home" as initramfs
 import "drivers/fb_console.home" as fb_console
+import "drivers/bochs_vbe.home" as vbe
+import "drivers/pci.home" as pci
+import "drivers/framebuffer.home" as framebuffer
 import "core/foundation.home" as foundation
 import "core/memory.home" as memory
 import "core/process.home" as process
@@ -47,6 +50,14 @@ var initramfs_size: u64 = 0
 // Where the console font is staged in the initramfs. Spelled out as bytes
 // because a string literal is not yet usable as a path pointer here.
 var font_path: [32]u8 = undefined
+
+// Framebuffer geometry, as the bootloader reported it. Zero width means no
+// framebuffer was provided and the console stays on the serial line.
+var fb_addr: u64 = 0
+var fb_pitch: u32 = 0
+var fb_width: u32 = 0
+var fb_height: u32 = 0
+var fb_bpp: u8 = 0
 
 // ============================================================================
 // CONSTANTS
@@ -149,6 +160,43 @@ export fn kernel_main(magic: u32, boot_info: u32): never {
     foundation.serial_write_string("[InitramFS] No boot module supplied\n")
   }
 
+  // Bring up a graphical console.
+  //
+  // The bootloader gave us no framebuffer — QEMU's -kernel loader ignores the
+  // video request in the Multiboot header — so the display is programmed
+  // directly. PCI is scanned first because the framebuffer's address is a BAR
+  // and guessing it would write over whatever else lives there.
+  pci.pci_init()
+  if vbe.bochs_vbe_set_mode(1024, 768, 32) == 0 {
+    // Map the framebuffer before anything draws into it. The linear
+    // framebuffer sits at the top of the physical address space — QEMU puts
+    // it near 0xFD000000 — which is far outside the gigabyte the boot page
+    // tables identity-map, so the first pixel written faults.
+    var lfb: u64 = vbe.bochs_vbe_get_base()
+    var lfb_bytes: u64 = @as(u64, vbe.bochs_vbe_get_width()) *
+                         @as(u64, vbe.bochs_vbe_get_height()) *
+                         @as(u64, vbe.bochs_vbe_get_bpp() / 8)
+    var mapped: u64 = 0
+    while mapped < lfb_bytes {
+      var mrc: u32 = memory.vmm_map_page(lfb + mapped, lfb + mapped, 3)
+      if mrc != 0 { break }
+      mapped = mapped + 4096
+    }
+    foundation.serial_write_string("[Boot] Mapped framebuffer, ")
+    foundation.serial_write_u64(mapped / 1024)
+    foundation.serial_write_string(" KB\n")
+
+    var fbrc: u32 = framebuffer.fb_init(
+      vbe.bochs_vbe_get_base(),
+      vbe.bochs_vbe_get_width(),
+      vbe.bochs_vbe_get_height(),
+      vbe.bochs_vbe_get_bpp(),
+      2)
+    if fbrc == 0 {
+      var crc: u32 = fb_console.fb_console_init()
+    }
+  }
+
   // The console font lives in the image, so it can only be loaded once the
   // initramfs is unpacked. Until then every glyph is blank.
   // "/usr/share/fonts/default.psf"
@@ -182,6 +230,17 @@ export fn kernel_main(magic: u32, boot_info: u32): never {
   font_path[27] = 102
   font_path[28] = 0
   var font_rc: u32 = fb_console.fb_console_load_font(@intFromPtr(&font_path))
+
+  // Replay everything the kernel has said so far onto the framebuffer
+  // console, which could not exist until PCI was scanned and a mode set. From
+  // here both consoles carry the same output.
+  if fb_console.fb_console_font_loaded() == 1 {
+    fb_console.fb_console_write_n(foundation.get_boot_log(), foundation.get_boot_log_len())
+    fb_console.fb_console_refresh()
+    foundation.serial_write_string("[FB] boot log rendered, ")
+    foundation.serial_write_u64(@as(u64, foundation.get_boot_log_len()))
+    foundation.serial_write_string(" bytes\n")
+  }
 
   interrupts.interrupts_init()
   foundation.sti()
@@ -319,6 +378,34 @@ fn parse_boot_info_mb1(info_addr: u32) {
         }
       }
     }
+  }
+
+  // Framebuffer, when the loader answered the video request in the header.
+  // Info flags bit 12 says these fields are present.
+  //
+  //   offset 88  framebuffer_addr (u64)
+  //   offset 96  framebuffer_pitch
+  //   offset 100 framebuffer_width
+  //   offset 104 framebuffer_height
+  //   offset 108 framebuffer_bpp (u8)
+  //   offset 109 framebuffer_type (u8)
+  if (flags & 0x1000) != 0 {
+    fb_addr = @as(*u64, @ptrFromInt(base + 88)).*
+    fb_pitch = @as(*u32, @ptrFromInt(base + 96)).*
+    fb_width = @as(*u32, @ptrFromInt(base + 100)).*
+    fb_height = @as(*u32, @ptrFromInt(base + 104)).*
+    fb_bpp = @as(*u8, @ptrFromInt(base + 108)).*
+    foundation.serial_write_string("[Boot] Framebuffer ")
+    foundation.serial_write_u64(@as(u64, fb_width))
+    foundation.serial_write_string("x")
+    foundation.serial_write_u64(@as(u64, fb_height))
+    foundation.serial_write_string("x")
+    foundation.serial_write_u64(@as(u64, fb_bpp))
+    foundation.serial_write_string(" at ")
+    foundation.serial_write_hex(fb_addr)
+    foundation.serial_write_string("\n")
+  } else {
+    foundation.serial_write_string("[Boot] No framebuffer from loader\n")
   }
 
   if (flags & 1) != 0 {

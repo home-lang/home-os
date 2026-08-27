@@ -169,8 +169,22 @@ fi
 # time — the 16550 receive FIFO is 16 bytes, and a burst of them is dropped
 # on the floor.
 log="$workdir/serial.log"
+SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
 {
-    sleep 4
+    # Wait for the shell to announce itself rather than guessing how long the
+    # boot takes. It is not a fixed cost: rendering the boot log onto the
+    # framebuffer adds seconds, and feeding commands before the console is
+    # polling loses them — the 16550 receive FIFO is sixteen bytes deep.
+    waited=0
+    while [ "$waited" -lt "${BOOT_TIMEOUT:-45}" ]; do
+        if [ -s "$log" ] && grep -qF '[Shell] serial console ready' "$log" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    sleep 1
+
     while IFS= read -r cmd; do
         case "$cmd" in ''|\#*) continue ;; esac
         printf '%s\n' "$cmd"
@@ -179,7 +193,7 @@ log="$workdir/serial.log"
     sleep "${BOOT_TIMEOUT:-45}"
 } | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" -serial stdio \
     -monitor "telnet:127.0.0.1:$MONITOR_PORT,server,nowait" \
-    -display none -no-reboot -m 256M > "$log" 2>&1 &
+    -display none -vga std -no-reboot -m 256M > "$log" 2>&1 &
 qemu_pid=$!
 
 # Press a key on the emulated PS/2 keyboard.
@@ -194,6 +208,13 @@ qemu_pid=$!
     printf 'sendkey a\n' >&3
     sleep 1
     printf 'sendkey b\n' >&3
+
+    # Capture the framebuffer once the boot log has been rendered onto it.
+    # A screenshot is the only way to tell a console that drew the log from
+    # one that drew nothing: both leave the serial output identical.
+    sleep 8
+    printf 'screendump %s\n' "$SHOT" >&3
+
     # Hold the connection until the run is over. QEMU treats the monitor
     # closing as a reason to exit, which cut every run short at the moment
     # the keys had been delivered.
@@ -243,6 +264,25 @@ while IFS= read -r line; do
         [ -z "$missing" ] && missing="$line"
     fi
 done < "$MILESTONES"
+
+# The framebuffer must actually have been drawn on. A PPM of a single colour
+# is what an uninitialised or unmapped framebuffer produces, and it is
+# indistinguishable from a working one by serial output alone.
+if [ -s "$SHOT" ]; then
+    distinct="$(od -An -tx1 -v -j 15 "$SHOT" 2>/dev/null | tr -s ' ' '\n' \
+                | grep -v '^$' | sort -u | wc -l | tr -d ' ')"
+    if [ "${distinct:-0}" -lt 2 ]; then
+        echo "" >&2
+        echo "RATCHET BROKEN: the framebuffer screenshot is a single flat colour." >&2
+        echo "The console reported drawing but nothing reached the display." >&2
+        exit 1
+    fi
+    echo "boot-gate: framebuffer $(wc -c < "$SHOT" | tr -d ' ') bytes, $distinct distinct byte values"
+else
+    echo "" >&2
+    echo "RATCHET BROKEN: no framebuffer screenshot was captured." >&2
+    exit 1
+fi
 
 echo "boot-gate: $reached/$total milestones reached"
 

@@ -16,7 +16,12 @@
  * Both headers describe the same entry point; both must sit within the first
  * 8KB of the image, which the .multiboot section placement guarantees. */
 .set MB1_MAGIC,    0x1BADB002
-.set MB1_FLAGS,    0x00010000            # bit 16: a.out kludge (explicit addrs)
+/* bit 2  (0x4):     ask the loader for a linear framebuffer and tell us where
+ *                   it is. Without it the info structure's framebuffer fields
+ *                   are absent and the console has nothing to draw on.
+ * bit 16 (0x10000): a.out kludge — the load addresses are given explicitly
+ *                   rather than read from an ELF header. */
+.set MB1_FLAGS,    0x00010004
 .set MB1_CHECKSUM, -(MB1_MAGIC + MB1_FLAGS)
 
 /* Both boot headers live in .multiboot, which linker.ld KEEPs at the very
@@ -36,6 +41,15 @@ multiboot1_header:
     .long __load_end         # load_end_addr: end of data to copy
     .long __bss_end          # bss_end_addr:  zeroed by the loader
     .long _start             # entry_addr
+
+    /* Video mode request, present because of flags bit 2.
+     * mode_type 0 is linear graphics; 1 would be EGA text. Zero for width,
+     * height and depth means "no preference": the loader picks, and the
+     * kernel reads back what it got rather than assuming. */
+    .long 0                  # mode_type: linear framebuffer
+    .long 0                  # width
+    .long 0                  # height
+    .long 0                  # depth
 
 /* Multiboot2 header MUST be within the first 32KB of the image */
 .align 8
