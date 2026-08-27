@@ -313,6 +313,7 @@ fi
 # The kernel grading its own filesystem work is not a check.
 if ! python3 "$REPO_ROOT/tools/mkext2.py" check "$disk" \
         --expect 'hello.txt=ext2 read path works
+' --expect 'written.txt=kernel wrote this
 ' > "$workdir/fsck.out" 2>&1; then
     echo "" >&2
     echo "RATCHET BROKEN: the disk image did not survive the run." >&2

@@ -255,6 +255,21 @@ def check(path, expect):
             entries[name] = ino
         pos += rec
 
+    # The free-block count must match the bitmap. A write path that allocates
+    # a block, records it in the bitmap and the inode, but forgets to
+    # decrement the count leaves a filesystem that passes every structural
+    # check and hands the same block out twice on the next allocation.
+    used_in_bitmap = sum(bin(b).count('1') for b in bitmap[:(blocks + 7) // 8])
+    # Bits past the end of the filesystem are set as padding and are not
+    # allocations, so they are excluded from the comparison.
+    padding = sum(1 for i in range(blocks, ((blocks + 7) // 8) * 8) if bit(i))
+    used_in_bitmap -= padding
+    expected_free = blocks - used_in_bitmap
+    if expected_free != free_blocks:
+        problems.append(f'free block count is {free_blocks}, but the bitmap '
+                        f'has {used_in_bitmap} of {blocks} blocks in use '
+                        f'({expected_free} free)')
+
     for name, ino in entries.items():
         if name in ('.', '..'):
             continue

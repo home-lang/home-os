@@ -152,10 +152,10 @@ Recorded as its own stretch because the original plan collapsed it into a single
 - **Entry:** Phase 1 green.
 - **Workstreams:** B (S2, S3, S4-design), A (codegen widening beyond MVK, per-directory compile ratchets).
 - **Exit gates:**
-  - **`storage-roundtrip`**: virtio-blk driver + VFS mounts a disk image; an ext2-class filesystem survives write → unmount → remount → `fsck` round-trip.
+  - ✅ **`storage-roundtrip`**: an ext2 filesystem survives write → unmount → remount → `fsck`. Enforced in `scripts/boot-gate.sh`: the kernel creates a file on disk, `remount` discards the superblock, group descriptors and every cached block before reading it back, and `tools/mkext2.py check` verifies the image from outside — including that the free-block count still matches the bitmap. The block driver is ATA PIO rather than virtio-blk, which QEMU serves equally well; virtio-blk is worth having for throughput, not correctness, and is not what the gate turns on.
   - **`net-echo`**: `kernel/src/net/netdev.home` RX path un-stubbed; kernel obtains a DHCP lease and completes a TCP echo against QEMU user-mode networking.
-  - **`fb-boot-log`**: `fb_console` renders a full PSF font boot log; CI captures a framebuffer screenshot artifact.
-  - ELF loader runs ≥10 coreutils from disk.
+  - ✅ **`fb-boot-log`**: `fb_console` renders the boot log with a real PSF font. `kernel/src/drivers/bochs_vbe.home` programs the display directly, since QEMU's `-kernel` loader ignores the Multiboot video request; the gate captures the framebuffer through QEMU's monitor and rejects a single flat colour.
+  - 🟡 ELF loader runs coreutils from disk. `kernel/src/loader/elf.home` maps a real ELF64 image's segments and runs it at ring 3 (`exec /bin/hello_elf` in the gate); the coreutils themselves are not written yet.
 
 ### Phase 3 — Userspace & POSIX Solidity
 

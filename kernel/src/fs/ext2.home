@@ -775,6 +775,18 @@ export fn ext2_list_directory(dir_ino: u32): u32 {
 // Whether a filesystem was successfully mounted. Callers need to tell "no
 // ext2 on this disk" from "mounted and empty"; both otherwise read as zero
 // entries.
+// Unmount and mount again, re-reading everything from disk.
+//
+// This is what makes a write test mean something: reading back through the
+// same in-memory superblock and cache that performed the write proves only
+// that memory remembers. A remount discards all of it and asks the disk.
+export fn ext2_remount(): u32 {
+  ext2_cache_invalidate()
+  ext2_initialized = 0
+  groups_count = 0
+  return ext2_init()
+}
+
 export fn ext2_mounted(): u32 {
   return ext2_initialized
 }
@@ -804,4 +816,311 @@ export fn ext2_print_stats() {
   } else {
     foundation.serial_write_string("\n")
   }
+}
+
+// ============================================================================
+// WRITE PATH
+//
+// Everything above reads. These write, and they are deliberately narrow: one
+// file created in the root directory, data in direct blocks only. That covers
+// what the storage gate asks — a file written, unmounted, remounted and
+// checked — without an indirect-block allocator whose failures would be
+// invisible until a file crossed twelve kilobytes.
+//
+// Every allocation updates three places: the bitmap, the group descriptor,
+// and the superblock. A write path that allocates without recording is the
+// corruption that survives a remount and then eats the next file, so
+// tools/mkext2.py checks exactly that.
+// ============================================================================
+
+var write_buffer: [4096]u8 = undefined
+var bitmap_buffer: [4096]u8 = undefined
+
+// Drop every cached block.
+//
+// Anything written goes to the disk directly, so a cache entry from before
+// the write is now stale — and a stale entry is worse than no cache: it
+// hands back the bytes that were overwritten, so a read-after-write appears
+// to have lost the data.
+fn ext2_cache_invalidate() {
+  var i: u32 = 0
+  while i < EXT2_CACHE_SIZE {
+    block_cache_valid[i] = 0
+    block_cache_tags[i] = 0
+    block_cache_index[i] = EXT2_CACHE_EMPTY
+    i = i + 1
+  }
+}
+
+fn ext2_write_block_raw(block_num: u32, buffer: u64): u32 {
+  var sectors_per_block: u32 = block_size / 512
+  var start_sector: u32 = block_num * sectors_per_block
+  return ata.ata_write_sectors(0, @as(u64, start_sector), sectors_per_block, buffer)
+}
+
+// Find a clear bit in a bitmap block, set it, and write the block back.
+// Returns the bit index, or 0xFFFFFFFF if the bitmap is full.
+fn ext2_bitmap_take(bitmap_block: u32, limit: u32): u32 {
+  if ext2_read_block_raw(bitmap_block, @intFromPtr(&bitmap_buffer)) != 0 {
+    return 0xFFFFFFFF
+  }
+
+  var i: u32 = 0
+  while i < limit {
+    var byte_index: u32 = i / 8
+    var bit: u8 = @as(u8, 1 << (i % 8))
+    if (bitmap_buffer[byte_index] & bit) == 0 {
+      bitmap_buffer[byte_index] = bitmap_buffer[byte_index] | bit
+      if ext2_write_block_raw(bitmap_block, @intFromPtr(&bitmap_buffer)) != 0 {
+        return 0xFFFFFFFF
+      }
+      return i
+    }
+    i = i + 1
+  }
+  return 0xFFFFFFFF
+}
+
+// Write the superblock and group descriptors back to disk.
+//
+// Both, always. Updating one and not the other leaves free counts that
+// disagree, which is exactly what an fsck reports and what a later mount
+// will act on.
+export fn ext2_sync(): u32 {
+  // Read the superblock back before modifying it.
+  //
+  // The Home struct covers only the fields this kernel reads, which is far
+  // short of the 1024 bytes on disk. Writing a zeroed buffer with the struct
+  // copied over the front erased everything past it — the inode size at
+  // offset 88 among them, which an fsck reports as a corrupt filesystem.
+  if ata.ata_read_sector(0, 2, @intFromPtr(&write_buffer)) != 0 { return 1 }
+  if ata.ata_read_sector(0, 3, @intFromPtr(&write_buffer) + 512) != 0 { return 1 }
+
+  var sbi: u32 = 0
+  while sbi < @sizeOf(Ext2Superblock) {
+    write_buffer[sbi] = @as(*u8, @ptrFromInt(@intFromPtr(&superblock) + @as(u64, sbi))).*
+    sbi = sbi + 1
+  }
+  if ata.ata_write_sector(0, 2, @intFromPtr(&write_buffer)) != 0 { return 1 }
+  if ata.ata_write_sector(0, 3, @intFromPtr(&write_buffer) + 512) != 0 { return 1 }
+
+  var gd_block: u32 = 2
+  if superblock.first_data_block == 0 { gd_block = 1 }
+
+  if ext2_read_block_raw(gd_block, @intFromPtr(&write_buffer)) != 0 { return 1 }
+  var g: u32 = 0
+  while g < groups_count {
+    if g >= 32 { break }
+    var off: u32 = g * @sizeOf(Ext2GroupDescriptor)
+    var b: u32 = 0
+    while b < @sizeOf(Ext2GroupDescriptor) {
+      write_buffer[off + b] =
+        @as(*u8, @ptrFromInt(@intFromPtr(&group_descriptors[g]) + @as(u64, b))).*
+      b = b + 1
+    }
+    g = g + 1
+  }
+  if ext2_write_block_raw(gd_block, @intFromPtr(&write_buffer)) != 0 { return 1 }
+
+  // Cached blocks are now stale against the disk for anything this touched.
+  ext2_cache_invalidate()
+  return 0
+}
+
+// Write an inode back into the inode table.
+fn ext2_write_inode(ino: u32, src: *Ext2Inode): u32 {
+  if ino == 0 { return 1 }
+  if ino > superblock.inodes_count { return 1 }
+
+  var group: u32 = (ino - 1) / superblock.inodes_per_group
+  var index: u32 = (ino - 1) % superblock.inodes_per_group
+  if group >= groups_count { return 1 }
+
+  var inodes_per_block: u32 = block_size / inode_size
+  var block: u32 = group_descriptors[group].inode_table + (index / inodes_per_block)
+  var offset: u32 = (index % inodes_per_block) * inode_size
+
+  // Read, modify, write: an inode is smaller than a block and the rest of
+  // the block belongs to other inodes.
+  if ext2_read_block_raw(block, @intFromPtr(&write_buffer)) != 0 { return 1 }
+
+  var i: u32 = 0
+  while i < @sizeOf(Ext2Inode) {
+    write_buffer[offset + i] =
+      @as(*u8, @ptrFromInt(@intFromPtr(src) + @as(u64, i))).*
+    i = i + 1
+  }
+
+  if ext2_write_block_raw(block, @intFromPtr(&write_buffer)) != 0 { return 1 }
+  ext2_cache_invalidate()
+  return 0
+}
+
+// Create a regular file in a directory and write its contents.
+//
+// Returns the new inode number, or 0. Data must fit in the twelve direct
+// blocks; a larger file is refused rather than silently truncated.
+export fn ext2_create_file(dir_ino: u32, name: u64, data: u64, size: u64): u32 {
+  if ext2_initialized == 0 { return 0 }
+
+  var max_direct: u64 = @as(u64, block_size) * 12
+  if size > max_direct {
+    foundation.serial_write_string("[EXT2] file needs indirect blocks\n")
+    return 0
+  }
+
+  var group: u32 = 0
+  var bitmap_inode_block: u32 = group_descriptors[group].inode_bitmap
+  var bitmap_block_block: u32 = group_descriptors[group].block_bitmap
+
+  var ino_bit: u32 = ext2_bitmap_take(bitmap_inode_block, superblock.inodes_per_group)
+  if ino_bit == 0xFFFFFFFF {
+    foundation.serial_write_string("[EXT2] no free inodes\n")
+    return 0
+  }
+  var new_ino: u32 = ino_bit + 1
+
+  // Data blocks.
+  var needed: u32 = 0
+  if size > 0 {
+    needed = @as(u32, (size + @as(u64, block_size) - 1) / @as(u64, block_size))
+  }
+
+  var new_inode: Ext2Inode = undefined
+  var z: u32 = 0
+  while z < @sizeOf(Ext2Inode) {
+    @as(*u8, @ptrFromInt(@intFromPtr(&new_inode) + @as(u64, z))).* = 0
+    z = z + 1
+  }
+
+  new_inode.mode = EXT2_S_IFREG | 0o644
+  new_inode.size = @as(u32, size)
+  new_inode.links_count = 1
+  new_inode.blocks = needed * (block_size / 512)
+
+  var written: u64 = 0
+  var bi: u32 = 0
+  while bi < needed {
+    var blk_bit: u32 = ext2_bitmap_take(bitmap_block_block, superblock.blocks_count)
+    if blk_bit == 0xFFFFFFFF {
+      foundation.serial_write_string("[EXT2] no free blocks\n")
+      return 0
+    }
+
+    var chunk: u64 = @as(u64, block_size)
+    if size - written < chunk { chunk = size - written }
+
+    var c: u32 = 0
+    while c < block_size {
+      if @as(u64, c) < chunk {
+        write_buffer[c] = @as(*u8, @ptrFromInt(data + written + @as(u64, c))).*
+      } else {
+        write_buffer[c] = 0
+      }
+      c = c + 1
+    }
+
+    if ext2_write_block_raw(blk_bit, @intFromPtr(&write_buffer)) != 0 { return 0 }
+    new_inode.block[bi] = blk_bit
+    written = written + chunk
+
+    superblock.free_blocks_count = superblock.free_blocks_count - 1
+    group_descriptors[group].free_blocks_count =
+      group_descriptors[group].free_blocks_count - 1
+    bi = bi + 1
+  }
+
+  if ext2_write_inode(new_ino, &new_inode) != 0 { return 0 }
+
+  if ext2_dir_add(dir_ino, name, new_ino) != 0 {
+    foundation.serial_write_string("[EXT2] could not link into directory\n")
+    return 0
+  }
+
+  superblock.free_inodes_count = superblock.free_inodes_count - 1
+  group_descriptors[group].free_inodes_count =
+    group_descriptors[group].free_inodes_count - 1
+
+  if ext2_sync() != 0 { return 0 }
+
+  return new_ino
+}
+
+// Add an entry to a directory's first data block.
+//
+// Entries are packed front to back with the last one's rec_len running to the
+// end of the block, so making room means shrinking that last entry to its
+// true size and putting the new one in the space that frees.
+fn ext2_dir_add(dir_ino: u32, name: u64, ino: u32): u32 {
+  var dir_inode: Ext2Inode = undefined
+  if ext2_read_inode(dir_ino, &dir_inode) != 0 { return 1 }
+  if ext2_is_directory(dir_inode.mode) == 0 { return 1 }
+
+  var dir_block: u32 = dir_inode.block[0]
+  if dir_block == 0 { return 1 }
+
+  var name_len: u32 = 0
+  while @as(*u8, @ptrFromInt(name + @as(u64, name_len))).* != 0 {
+    name_len = name_len + 1
+    if name_len > 255 { return 1 }
+  }
+  if name_len == 0 { return 1 }
+
+  var need: u32 = (8 + name_len + 3) & ~3
+
+  if ext2_read_block_raw(dir_block, @intFromPtr(&write_buffer)) != 0 { return 1 }
+
+  var offset: u32 = 0
+  var placed: u32 = 0
+  while offset < block_size {
+    var e_ino: u32 = @as(*u32, @ptrFromInt(@intFromPtr(&write_buffer) + @as(u64, offset))).*
+    var e_rec: u16 = @as(*u16, @ptrFromInt(@intFromPtr(&write_buffer) + @as(u64, offset) + 4)).*
+    var e_nlen: u8 = @as(*u8, @ptrFromInt(@intFromPtr(&write_buffer) + @as(u64, offset) + 6)).*
+
+    if e_rec < 8 { return 1 }
+
+    var actual: u32 = 0
+    if e_ino != 0 {
+      actual = (8 + @as(u32, e_nlen) + 3) & ~3
+    }
+
+    if @as(u32, e_rec) >= actual + need {
+      // Split: the existing entry keeps only what it needs, the new one takes
+      // the remainder.
+      var new_off: u32 = offset + actual
+      var remainder: u32 = @as(u32, e_rec) - actual
+
+      if e_ino != 0 {
+        @as(*u16, @ptrFromInt(@intFromPtr(&write_buffer) + @as(u64, offset) + 4)).* = @as(u16, actual)
+      } else {
+        new_off = offset
+        remainder = @as(u32, e_rec)
+      }
+
+      @as(*u32, @ptrFromInt(@intFromPtr(&write_buffer) + @as(u64, new_off))).* = ino
+      @as(*u16, @ptrFromInt(@intFromPtr(&write_buffer) + @as(u64, new_off) + 4)).* = @as(u16, remainder)
+      @as(*u8, @ptrFromInt(@intFromPtr(&write_buffer) + @as(u64, new_off) + 6)).* = @as(u8, name_len)
+      @as(*u8, @ptrFromInt(@intFromPtr(&write_buffer) + @as(u64, new_off) + 7)).* = 1  // regular file
+
+      var n: u32 = 0
+      while n < name_len {
+        write_buffer[new_off + 8 + n] = @as(*u8, @ptrFromInt(name + @as(u64, n))).*
+        n = n + 1
+      }
+
+      placed = 1
+      break
+    }
+
+    offset = offset + @as(u32, e_rec)
+  }
+
+  if placed == 0 {
+    foundation.serial_write_string("[EXT2] directory block is full\n")
+    return 1
+  }
+
+  if ext2_write_block_raw(dir_block, @intFromPtr(&write_buffer)) != 0 { return 1 }
+  ext2_cache_invalidate()
+  return 0
 }
