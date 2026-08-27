@@ -17,9 +17,9 @@ that has been written and parsed, but never run.
 
 ## Parse rate
 
-**413/413 kernel `.home` files parse (100%)**
+**414/414 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `71833644d`
+- Compiler: `home-lang/home` @ `c1818b32a`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -27,13 +27,13 @@ parser; it has not been typechecked, code-generated, linked, or run.
 
 ## Boot status
 
-✅ **`boot-qemu-x86_64`: PASS** — serial says `HomeOS v0.1: kernel_main reached`
+✅ **`boot-qemu-x86_64`: PASS** — serial says `qemu-system-x86_64: multiboot knows VBE. we don't`
 
 Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-✅ **`boot-full-kernel`: PASS** — 41/41 init milestones reached, through to the end of init
+✅ **`boot-full-kernel`: PASS** — 55/55 init milestones reached, through to the end of init
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
@@ -42,7 +42,7 @@ which names one subsystem per entry and may only ever grow.
 
 ## Codegen ratchet
 
-**67/67 of the Minimum Viable Kernel file set reaches codegen.**
+**70/70 of the Minimum Viable Kernel file set reaches codegen.**
 
 This is the number to watch. The MVK set is
 [MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);
@@ -57,7 +57,7 @@ waiting on; the failures name the construct, not just the count.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 413 | 235,017 |
+| `kernel/` | 414 | 236,325 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -74,7 +74,6 @@ CI gate (`scripts/stub-check.sh`).
 | # | Stub | File | Markers | Status |
 |---|------|------|--------:|--------|
 | S1 | silent hlt-stub fallback + dead `.zig` references | `scripts/build.sh` | 0 | **CLOSED** |
-| S2 | Font table implements only the glyph 'A' | `kernel/src/drivers/fb_console.home` | 1 | open — blocks Phase 2 `fb-boot-log` |
 | S3 | RX path prints "stub" and drops every frame | `kernel/src/net/netdev.home` | 1 | open — blocks Phase 2 `net-echo` |
 | S4 | Native filesystem is a 28-line import-satisfying stub | `kernel/src/fs/homefs.home` | 1 | open — blocks Phase 2 storage; Phase 6 `snapshot-rollback` |
 | S5 | chacha20 / poly1305 / curve25519 / blake2s are stubs | `kernel/src/crypto/` | 4 | open — blocks Phase 3 `pantry-local-install` (signing); later WireGuard |
@@ -82,7 +81,7 @@ CI gate (`scripts/stub-check.sh`).
 | S7 | ACPI is 71 lines | `kernel/src/drivers/acpi.home` | 1 | open — blocks Phase 7a (power, S3 suspend) |
 | S8 | `mmio_read32` returns 0; `mmio_write32` is a no-op — every ARM64/Pi driver is inert | `kernel/src/arch/arm64/arm64.home` | 1 | open — blocks Phase 7b entirely |
 
-7 of 8 entries open.
+6 of 7 entries open.
 
 ## Phase gates ([MASTER_PLAN §4](docs/MASTER_PLAN.md#4-the-phase-map))
 
@@ -92,7 +91,7 @@ first red one are blocked by definition — they are not being worked yet.
 | Phase | Gate | Status |
 |-------|------|--------|
 | 0 | `parse-rate` | ✅ green |
-| 0 | `stub-register` | ✅ pass — stub-register OK — 7 open entries, all marked and placed correctly |
+| 0 | `stub-register` | ✅ pass — stub-register OK — 6 open entries, all marked and placed correctly |
 | 0 | `boot-qemu-x86_64` | ✅ pass |
 | 0.5 | `mvk-compiles` | ✅ green |
 | 1 | `boot-to-shell` | ⬜ not started |
