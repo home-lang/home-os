@@ -5,6 +5,7 @@
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
 import "framebuffer.home" as framebuffer
+import "../core/filesystem.home" as filesystem
 
 // Console configuration
 const CONSOLE_WIDTH: u32 = 80        // Characters
@@ -73,28 +74,141 @@ var initialized: u32 = 0
 // Each character is 16 bytes (16 rows of 8 pixels)
 var font_data: [4096]u8 = undefined  // 256 chars * 16 bytes
 
-// Initialize font data (simplified)
+// PSF magic numbers and layout.
+//
+//   PSF2: magic, version, headersize, flags, length, charsize, height, width
+//         — eight little-endian u32s, glyphs immediately after headersize.
+//   PSF1: 0x36 0x04, mode byte, charsize byte; 256 or 512 glyphs follow.
+//
+// Both are accepted: PSF1 is what most older console fonts are, and refusing
+// it would mean the console works only with fonts this repo generates.
+const PSF2_MAGIC: u32 = 0x864AB572
+const PSF1_MAGIC0: u8 = 0x36
+const PSF1_MAGIC1: u8 = 0x04
+
+const GLYPH_BYTES: u32 = 16
+
+var font_loaded: u32 = 0
+var font_header: [32]u8 = undefined
+
+fn read_le32(buf: u64, off: u64): u32 {
+  var b0: u32 = @as(u32, @as(*u8, @ptrFromInt(buf + off)).*)
+  var b1: u32 = @as(u32, @as(*u8, @ptrFromInt(buf + off + 1)).*)
+  var b2: u32 = @as(u32, @as(*u8, @ptrFromInt(buf + off + 2)).*)
+  var b3: u32 = @as(u32, @as(*u8, @ptrFromInt(buf + off + 3)).*)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+// Load a PSF console font. Returns 0 on success.
+//
+// Only 8x16 glyphs are taken: the console's cell size is fixed and rescaling
+// a bitmap font is worse than refusing one, since a half-height glyph drawn
+// into a full cell is unreadable either way.
+export fn fb_console_load_font(path: u64): u32 {
+  var fd: u32 = filesystem.vfs_open(path, 0)
+  if fd == 0 {
+    foundation.serial_write_string("[FB] font not found\n")
+    return 1
+  }
+
+  var got: u64 = filesystem.vfs_read(fd, @intFromPtr(&font_header), 32)
+  if got < 4 {
+    foundation.serial_write_string("[FB] font too short\n")
+    var c0: u32 = filesystem.vfs_close(fd)
+    return 1
+  }
+
+  var hbuf: u64 = @intFromPtr(&font_header)
+  var glyph_offset: u64 = 0
+  var glyph_count: u32 = 0
+  var charsize: u32 = 0
+
+  if read_le32(hbuf, 0) == PSF2_MAGIC {
+    if got < 32 {
+      foundation.serial_write_string("[FB] truncated PSF2 header\n")
+      var c1: u32 = filesystem.vfs_close(fd)
+      return 1
+    }
+    glyph_offset = @as(u64, read_le32(hbuf, 8))
+    glyph_count = read_le32(hbuf, 16)
+    charsize = read_le32(hbuf, 20)
+    var height: u32 = read_le32(hbuf, 24)
+    var width: u32 = read_le32(hbuf, 28)
+    if width != 8 {
+      foundation.serial_write_string("[FB] font is not 8 pixels wide\n")
+      var c2: u32 = filesystem.vfs_close(fd)
+      return 1
+    }
+    if height != 16 {
+      foundation.serial_write_string("[FB] font is not 16 pixels tall\n")
+      var c3: u32 = filesystem.vfs_close(fd)
+      return 1
+    }
+  } else if font_header[0] == PSF1_MAGIC0 {
+    if font_header[1] != PSF1_MAGIC1 {
+      foundation.serial_write_string("[FB] not a PSF font\n")
+      var c4: u32 = filesystem.vfs_close(fd)
+      return 1
+    }
+    glyph_offset = 4
+    charsize = @as(u32, font_header[3])
+    // PSF1 mode bit 0 selects 512 glyphs instead of 256.
+    if (font_header[2] & 1) != 0 {
+      glyph_count = 512
+    } else {
+      glyph_count = 256
+    }
+    if charsize != 16 {
+      foundation.serial_write_string("[FB] PSF1 font is not 16 rows\n")
+      var c5: u32 = filesystem.vfs_close(fd)
+      return 1
+    }
+  } else {
+    foundation.serial_write_string("[FB] not a PSF font\n")
+    var c6: u32 = filesystem.vfs_close(fd)
+    return 1
+  }
+
+  if charsize != GLYPH_BYTES {
+    foundation.serial_write_string("[FB] unexpected glyph size\n")
+    var c7: u32 = filesystem.vfs_close(fd)
+    return 1
+  }
+  if glyph_count > 256 { glyph_count = 256 }
+
+  var seek: u64 = filesystem.vfs_lseek(fd, glyph_offset, 0)
+  var want: u64 = @as(u64, glyph_count) * @as(u64, GLYPH_BYTES)
+  var read: u64 = filesystem.vfs_read(fd, @intFromPtr(&font_data), want)
+  var c: u32 = filesystem.vfs_close(fd)
+
+  if read < want {
+    foundation.serial_write_string("[FB] font glyphs truncated\n")
+    return 1
+  }
+
+  font_loaded = 1
+  foundation.serial_write_string("[FB] font loaded: ")
+  foundation.serial_write_u64(@as(u64, glyph_count))
+  foundation.serial_write_string(" glyphs, 8x16\n")
+  return 0
+}
+
+// Clear the font table. Every glyph is blank until a font is loaded, which is
+// honest: this used to define exactly one glyph, 'A', so a boot log rendered
+// as scattered letters and looked like a broken framebuffer rather than a
+// missing font.
 fn init_font() {
-  // STUB(S2): the font table defines exactly one glyph, 'A'. Every other
-  // character renders blank, so a boot log through this console is
-  // unreadable. Closing this means loading a real PSF font.
-  // Blocks the Phase 2 fb-boot-log gate. See MASTER_PLAN §7.
   var i: u32 = 0
   loop {
     if i >= 256 * 16 { break }
     font_data[i] = 0
     i = i + 1
   }
+  font_loaded = 0
+}
 
-  // Set up a simple pattern for ASCII 'A' (0x41)
-  font_data[0x41 * 16 + 0] = 0b00111100
-  font_data[0x41 * 16 + 1] = 0b01100110
-  font_data[0x41 * 16 + 2] = 0b11000011
-  font_data[0x41 * 16 + 3] = 0b11000011
-  font_data[0x41 * 16 + 4] = 0b11111111
-  font_data[0x41 * 16 + 5] = 0b11000011
-  font_data[0x41 * 16 + 6] = 0b11000011
-  font_data[0x41 * 16 + 7] = 0b11000011
+export fn fb_console_font_loaded(): u32 {
+  return font_loaded
 }
 
 // Get color from index
