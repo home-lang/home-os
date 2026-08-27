@@ -171,7 +171,16 @@ fi
 # A blank disk for the block layer to prove itself against. Written fresh
 # each run so a round-trip cannot pass on the previous run's bytes.
 disk="$workdir/disk.img"
-dd if=/dev/zero of="$disk" bs=1048576 count=8 >/dev/null 2>&1
+if [ -x "$(command -v python3 2>/dev/null)" ] && [ -f "$REPO_ROOT/tools/mkext2.py" ]; then
+    python3 "$REPO_ROOT/tools/mkext2.py" build "$disk" --size-mb 8 \
+        --file 'hello.txt=ext2 read path works
+' --file 'second.txt=another file
+' >/dev/null 2>&1 || {
+        echo "error: could not build the ext2 image" >&2; exit 2; }
+else
+    echo "error: python3 and tools/mkext2.py are needed to build the disk" >&2
+    exit 2
+fi
 
 log="$workdir/serial.log"
 SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
@@ -209,7 +218,17 @@ qemu_pid=$!
 # reached over a loopback socket because bash can open one without any extra
 # tool being installed.
 (
-    sleep 6
+    # Wait for the shell, as the command feed does. Sending keys before the
+    # kernel has enabled interrupts delivers them to a masked line, and the
+    # counter the gate asserts on stays at zero.
+    kwait=0
+    while [ "$kwait" -lt "${BOOT_TIMEOUT:-45}" ]; do
+        if [ -s "$log" ] && grep -qF '[Shell] serial console ready' "$log" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        kwait=$(( kwait + 1 ))
+    done
     exec 3<>"/dev/tcp/127.0.0.1/$MONITOR_PORT" 2>/dev/null || exit 0
     printf 'sendkey a\n' >&3
     sleep 1
@@ -289,6 +308,18 @@ else
     echo "RATCHET BROKEN: no framebuffer screenshot was captured." >&2
     exit 1
 fi
+
+# Check the image with the independent implementation in tools/mkext2.py.
+# The kernel grading its own filesystem work is not a check.
+if ! python3 "$REPO_ROOT/tools/mkext2.py" check "$disk" \
+        --expect 'hello.txt=ext2 read path works
+' > "$workdir/fsck.out" 2>&1; then
+    echo "" >&2
+    echo "RATCHET BROKEN: the disk image did not survive the run." >&2
+    cat "$workdir/fsck.out" >&2
+    exit 1
+fi
+sed 's/^/boot-gate: fsck /' "$workdir/fsck.out"
 
 echo "boot-gate: $reached/$total milestones reached"
 

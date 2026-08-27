@@ -448,6 +448,10 @@ This list is the ONLY compile target for Phases 0–1. A file may be added only 
 **Console (1)**
 - `kernel/src/console/serial_shell.home` — needed by `boot-to-shell`: the interactive serial console. Runs in the kernel and calls the subsystems directly; `apps/shell.home` is the userspace shell and needs an ELF loader and syscall path that do not exist yet.
 
+**Storage (2)**
+- `kernel/src/drivers/ata.home` — needed by `storage-roundtrip`: ATA PIO, with the capacity read out of the drive's IDENTIFY response.
+- `kernel/src/fs/ext2.home` — needed by `storage-roundtrip`: mounts an ext2 filesystem from disk 0 and reads from it. `tools/mkext2.py` builds the images and checks them independently.
+
 **Display (1)**
 - `kernel/src/drivers/bochs_vbe.home` — needed by `fb-boot-log`: programs the Bochs/std-VGA adapter directly and finds its linear framebuffer through PCI. QEMU's `-kernel` loader ignores the Multiboot video request, so a kernel booted that way has no framebuffer unless it sets one up itself.
 

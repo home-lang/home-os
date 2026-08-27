@@ -293,18 +293,46 @@ fn ext2_read_block_raw(block_num: u32, buffer: u64): u32 {
 // INITIALIZATION
 // ============================================================================
 
+// Superblock scratch. At module scope because a kilobyte is a lot of stack
+// frame, and because reading it in two sector-sized pieces needs a stable
+// address across both reads.
+var sb_buffer: [1024]u8 = undefined
+
+// Block scratch, at module scope: a 4 KB local is more stack than this
+// kernel's frames are sized for, and reading through a pointer to one needs
+// a stable address anyway.
+var block_buffer: [4096]u8 = undefined
+var gd_buffer: [4096]u8 = undefined
+var ind_buffer: [4096]u8 = undefined
+var dind_buffer: [4096]u8 = undefined
+
 export fn ext2_init(): u32 {
   if ext2_initialized == 1 { return 0 }
 
   foundation.serial_write_string("[EXT2] Initializing...\n")
 
-  // Read superblock (located at byte 1024, sector 2)
-  var sb_buffer: [u8; 1024] = undefined
-  ata.ata_read_sector(0, 2, @ptrFromInt(sb_buffer))
+  // The superblock sits at byte 1024 and is 1024 bytes long, which is
+  // sectors 2 and 3. Both are read: the revision-1 fields this kernel needs
+  // — inode size, first inode — live past the first 512 bytes.
+  var rc1: u32 = ata.ata_read_sector(0, 2, @intFromPtr(&sb_buffer))
+  if rc1 != 0 {
+    foundation.serial_write_string("[EXT2] could not read superblock\n")
+    return 1
+  }
+  var rc2: u32 = ata.ata_read_sector(0, 3, @intFromPtr(&sb_buffer) + 512)
+  if rc2 != 0 {
+    foundation.serial_write_string("[EXT2] could not read superblock\n")
+    return 1
+  }
 
-  // Parse superblock
-  var sb_ptr: *Ext2Superblock = @ptrFromInt(sb_buffer)
-  superblock = sb_ptr[0]
+  // Copy byte by byte: the backend has no whole-struct assignment, and a
+  // superblock is large enough that a field-by-field copy would be its own
+  // source of drift when a field is added.
+  var sbi: u32 = 0
+  while sbi < @sizeOf(Ext2Superblock) {
+    @as(*u8, @ptrFromInt(@intFromPtr(&superblock) + @as(u64, sbi))).* = sb_buffer[sbi]
+    sbi = sbi + 1
+  }
 
   // Verify magic number
   if superblock.magic != EXT2_SUPER_MAGIC {
@@ -340,10 +368,10 @@ export fn ext2_init(): u32 {
 
   // Read group descriptors
   var gd_block: u32 = if superblock.first_data_block == 0 then 1 else 2
-  var gd_buffer: [u8; 4096] = undefined
-  ext2_read_block_raw(gd_block, @ptrFromInt(gd_buffer))
 
-  var gd_ptr: *Ext2GroupDescriptor = @ptrFromInt(gd_buffer)
+  ext2_read_block_raw(gd_block, @intFromPtr(&gd_buffer))
+
+  var gd_ptr: *Ext2GroupDescriptor = @intFromPtr(&gd_buffer)
   var i: u32 = 0
   while i < groups_count and i < 32 {
     group_descriptors[i] = gd_ptr[i]
@@ -413,6 +441,7 @@ export fn ext2_read_inode(ino: u32, inode_out: *Ext2Inode): u32 {
   // Get inode table location
   var inode_table: u32 = group_descriptors[group].inode_table
 
+
   // Calculate block and offset (validate inode_size before dividing)
   if inode_size == 0 or inode_size > block_size { return 1 }
   var inodes_per_block: u32 = block_size / inode_size
@@ -420,14 +449,19 @@ export fn ext2_read_inode(ino: u32, inode_out: *Ext2Inode): u32 {
   var offset: u32 = (index % inodes_per_block) * inode_size
 
   // Read block containing inode
-  var block_buffer: [u8; 4096] = undefined
-  if ext2_read_block_cached(block, @ptrFromInt(block_buffer)) != 0 {
+  if ext2_read_block_cached(block, @intFromPtr(&block_buffer)) != 0 {
     return 1
   }
 
   // Copy inode data
-  var inode_ptr: *Ext2Inode = @ptrFromInt(@ptrFromInt(block_buffer) + offset)
-  inode_out[0] = inode_ptr[0]
+  // Copy bytewise: the backend has no whole-struct assignment.
+  var src: u64 = @intFromPtr(&block_buffer) + @as(u64, offset)
+  var dst: u64 = @intFromPtr(inode_out)
+  var bi: u32 = 0
+  while bi < @sizeOf(Ext2Inode) {
+    @as(*u8, @ptrFromInt(dst + @as(u64, bi))).* = @as(*u8, @ptrFromInt(src + @as(u64, bi))).*
+    bi = bi + 1
+  }
 
   ext2_stats.inodes_read = ext2_stats.inodes_read + 1
 
@@ -465,10 +499,10 @@ fn ext2_get_block_number(inode: *Ext2Inode, logical_block: u32): u32 {
       return 0
     }
 
-    var ind_buffer: [u8; 4096] = undefined
-    ext2_read_block_cached(ind_block, @ptrFromInt(ind_buffer))
 
-    var ind_ptr: *u32 = @ptrFromInt(ind_buffer)
+    ext2_read_block_cached(ind_block, @intFromPtr(&ind_buffer))
+
+    var ind_ptr: *u32 = @intFromPtr(&ind_buffer)
     var offset: u32 = logical_block - EXT2_NDIR_BLOCKS
     if offset >= block_ptrs_per_block { return 0 }  // Bounds check
     return ind_ptr[offset]
@@ -483,10 +517,10 @@ fn ext2_get_block_number(inode: *Ext2Inode, logical_block: u32): u32 {
       return 0
     }
 
-    var dind_buffer: [u8; 4096] = undefined
-    ext2_read_block_cached(dind_block, @ptrFromInt(dind_buffer))
 
-    var dind_ptr: *u32 = @ptrFromInt(dind_buffer)
+    ext2_read_block_cached(dind_block, @intFromPtr(&dind_buffer))
+
+    var dind_ptr: *u32 = @intFromPtr(&dind_buffer)
     var ind_idx: u32 = logical_block / block_ptrs_per_block
     var ind_block: u32 = dind_ptr[ind_idx]
 
@@ -494,10 +528,10 @@ fn ext2_get_block_number(inode: *Ext2Inode, logical_block: u32): u32 {
       return 0
     }
 
-    var ind_buffer: [u8; 4096] = undefined
-    ext2_read_block_cached(ind_block, @ptrFromInt(ind_buffer))
 
-    var ind_ptr: *u32 = @ptrFromInt(ind_buffer)
+    ext2_read_block_cached(ind_block, @intFromPtr(&ind_buffer))
+
+    var ind_ptr: *u32 = @intFromPtr(&ind_buffer)
     var offset: u32 = logical_block % block_ptrs_per_block
     return ind_ptr[offset]
   }
@@ -506,19 +540,33 @@ fn ext2_get_block_number(inode: *Ext2Inode, logical_block: u32): u32 {
   return 0
 }
 
+// Read bytes from any inode, whatever its type.
+//
+// ext2_read_file below refuses a directory, which is right for something
+// named "read file" — but a directory's blocks have to be readable by the
+// code that walks it, and routing that through the file path made every
+// listing report "Not a regular file" and return nothing.
+export fn ext2_read_inode_data(ino: u32, offset: u64, buffer: u64, size: u64): u64 {
+  return ext2_read_bytes(ino, offset, buffer, size, 0)
+}
+
 export fn ext2_read_file(ino: u32, offset: u64, buffer: u64, size: u64): u64 {
+  return ext2_read_bytes(ino, offset, buffer, size, 1)
+}
+
+fn ext2_read_bytes(ino: u32, offset: u64, buffer: u64, size: u64, require_regular: u32): u64 {
   if ext2_initialized == 0 {
     return 0
   }
 
   // Read inode
   var inode: Ext2Inode = undefined
-  if ext2_read_inode(ino, @ptrFromInt(inode)) != 0 {
+  if ext2_read_inode(ino, &inode) != 0 {
     return 0
   }
 
-  // Check if regular file
-  if ext2_is_regular_file(inode.mode) == 0 {
+  // Only the file path insists on a regular file.
+  if require_regular == 1 and ext2_is_regular_file(inode.mode) == 0 {
     foundation.serial_write_string("[EXT2] Not a regular file\n")
     return 0
   }
@@ -539,7 +587,7 @@ export fn ext2_read_file(ino: u32, offset: u64, buffer: u64, size: u64): u64 {
   while bytes_read < to_read {
     var block_num: u32 = current_offset / block_size
     var block_offset: u32 = current_offset % block_size
-    var physical_block: u32 = ext2_get_block_number(@ptrFromInt(inode), block_num)
+    var physical_block: u32 = ext2_get_block_number(&inode, block_num)
 
     if physical_block == 0 {
       // Sparse file - return zeros
@@ -560,14 +608,14 @@ export fn ext2_read_file(ino: u32, offset: u64, buffer: u64, size: u64): u64 {
     } else {
       // Read actual block
       var block_buffer: [u8; 4096] = undefined
-      ext2_read_block_cached(physical_block, @ptrFromInt(block_buffer))
+      ext2_read_block_cached(physical_block, @intFromPtr(&block_buffer))
 
       var chunk: u32 = block_size - block_offset
       if chunk > (to_read - bytes_read) {
         chunk = to_read - bytes_read
       }
 
-      memory.mem_copy(buffer + bytes_read, @ptrFromInt(block_buffer) + block_offset, chunk)
+      memory.mem_copy(buffer + bytes_read, @intFromPtr(&block_buffer) + block_offset, chunk)
 
       bytes_read = bytes_read + chunk
       current_offset = current_offset + chunk
@@ -588,7 +636,7 @@ export fn ext2_lookup_entry(dir_ino: u32, name: u64): u32 {
 
   // Read directory inode
   var dir_inode: Ext2Inode = undefined
-  if ext2_read_inode(dir_ino, @ptrFromInt(dir_inode)) != 0 {
+  if ext2_read_inode(dir_ino, &dir_inode) != 0 {
     return 0
   }
 
@@ -601,7 +649,7 @@ export fn ext2_lookup_entry(dir_ino: u32, name: u64): u32 {
   var dir_buffer: [u8; 4096] = undefined
   var read_size: u64 = dir_inode.size
   if read_size > 4096 { read_size = 4096 }
-  var bytes_read: u64 = ext2_read_file(dir_ino, 0, @ptrFromInt(dir_buffer), read_size)
+  var bytes_read: u64 = ext2_read_inode_data(dir_ino, 0, @intFromPtr(&dir_buffer), read_size)
 
   if bytes_read == 0 {
     return 0
@@ -611,7 +659,7 @@ export fn ext2_lookup_entry(dir_ino: u32, name: u64): u32 {
   // name_len to reject malformed/malicious directory blocks.
   var offset: u32 = 0
   while offset < bytes_read {
-    var entry: *Ext2DirEntry = @ptrFromInt(@ptrFromInt(dir_buffer) + offset)
+    var entry: *Ext2DirEntry = @ptrFromInt(@intFromPtr(&dir_buffer) + @as(u64, offset))
 
     // rec_len must be at least the fixed-header size AND must not
     // extend past the end of the directory buffer.
@@ -671,7 +719,7 @@ export fn ext2_list_directory(dir_ino: u32): u32 {
   }
 
   var dir_inode: Ext2Inode = undefined
-  if ext2_read_inode(dir_ino, @ptrFromInt(dir_inode)) != 0 {
+  if ext2_read_inode(dir_ino, &dir_inode) != 0 {
     return 1
   }
 
@@ -680,13 +728,17 @@ export fn ext2_list_directory(dir_ino: u32): u32 {
   }
 
   var dir_buffer: [u8; 4096] = undefined
-  var bytes_read: u64 = ext2_read_file(dir_ino, 0, @ptrFromInt(dir_buffer), dir_inode.size)
+  var bytes_read: u64 = ext2_read_inode_data(dir_ino, 0, @intFromPtr(&dir_buffer), dir_inode.size)
 
   foundation.serial_write_string("[EXT2] Directory listing:\n")
 
+  // Count what is listed and return it. This returned a flat 0, which is
+  // also its failure value, so a caller could not tell an empty directory
+  // from an unreadable one from a full one.
+  var listed: u32 = 0
   var offset: u32 = 0
   while offset < bytes_read {
-    var entry: *Ext2DirEntry = @ptrFromInt(@ptrFromInt(dir_buffer) + offset)
+    var entry: *Ext2DirEntry = @ptrFromInt(@intFromPtr(&dir_buffer) + @as(u64, offset))
 
     if entry.rec_len < 8 { break }
 
@@ -707,17 +759,25 @@ export fn ext2_list_directory(dir_ino: u32): u32 {
       foundation.serial_write_string(" (type ")
       foundation.serial_write_u64(entry.file_type)
       foundation.serial_write_string(")\n")
+      listed = listed + 1
     }
 
     offset = offset + entry.rec_len
   }
 
-  return 0
+  return listed
 }
 
 // ============================================================================
 // STATISTICS
 // ============================================================================
+
+// Whether a filesystem was successfully mounted. Callers need to tell "no
+// ext2 on this disk" from "mounted and empty"; both otherwise read as zero
+// entries.
+export fn ext2_mounted(): u32 {
+  return ext2_initialized
+}
 
 export fn ext2_get_stats(): *Ext2Stats {
   return @ptrFromInt(ext2_stats)
