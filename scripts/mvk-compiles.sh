@@ -9,27 +9,50 @@
 # The Appendix A list is parsed out of the plan, so there is one source of truth
 # and adding a file to the MVK means editing the plan.
 #
-# Usage: scripts/mvk-compiles.sh [--list] [--floor N]
+# Usage: scripts/mvk-compiles.sh [--list] [--floor N] [--arch ARCH]
 #   --list     print per-file PASS/FAIL
 #   --floor N  exit 1 if fewer than N files compile (the ratchet; CI passes the
 #              committed floor from scripts/mvk-floor.txt)
+#   --arch A   x86_64 (default) or aarch64. Each architecture keeps its own
+#              floor file, because they advance independently: a file can lower
+#              on one and not the other, and averaging the two would hide it.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PLAN="$REPO_ROOT/docs/MASTER_PLAN.md"
-FLOOR_FILE="$REPO_ROOT/scripts/mvk-floor.txt"
-
 LIST=0
 FLOOR=""
+ARCH="x86_64"
 while [ $# -gt 0 ]; do
     case "$1" in
         --list)  LIST=1; shift ;;
         --floor) FLOOR="$2"; shift 2 ;;
         --floor=*) FLOOR="${1#*=}"; shift ;;
+        --arch)  ARCH="$2"; shift 2 ;;
+        --arch=*) ARCH="${1#*=}"; shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+case "$ARCH" in
+    x86_64|x86-64)
+        ARCH="x86_64"
+        FLOOR_FILE="$REPO_ROOT/scripts/mvk-floor.txt"
+        # No --target: x86-64 is this path's default, and passing it would
+        # make the invocation differ from the one build.sh uses.
+        COMPILER_TARGET_ARGS=""
+        ;;
+    aarch64|arm64)
+        ARCH="aarch64"
+        FLOOR_FILE="$REPO_ROOT/scripts/mvk-floor-aarch64.txt"
+        COMPILER_TARGET_ARGS="--target=aarch64-freestanding"
+        ;;
+    *)
+        echo "error: --arch $ARCH is not a target this backend lowers for (x86_64, aarch64)" >&2
+        exit 2
+        ;;
+esac
 
 HOME_COMPILER="${HOME_COMPILER:-}"
 if [ -z "$HOME_COMPILER" ]; then
@@ -56,12 +79,14 @@ if [ -z "$ZIG" ]; then
 fi
 if [ -n "$ZIG" ] && command -v "$ZIG" >/dev/null 2>&1; then
     ASSEMBLER="$ZIG"
-    ASSEMBLER_ARGS="cc -c -x assembler -target x86_64-freestanding"
-elif command -v as >/dev/null 2>&1; then
+    ASSEMBLER_ARGS="cc -c -x assembler -target ${ARCH}-freestanding"
+elif [ "$ARCH" = "x86_64" ] && command -v as >/dev/null 2>&1; then
     ASSEMBLER="as"
     ASSEMBLER_ARGS="-c"
 else
-    echo "error: no assembler found (set ZIG, or install binutils)" >&2
+    # The host assembler only assembles for the host. Cross-assembling needs
+    # zig, so say that rather than failing later with a confusing error.
+    echo "error: no assembler for $ARCH found (set ZIG to a zig binary)" >&2
     exit 2
 fi
 
@@ -105,7 +130,7 @@ while IFS= read -r rel; do
     #   2. that .s carries no ERROR or unsupported marker
     #   3. the assembler accepts it
     reason=""
-    if ! "$HOME_COMPILER" build "$abs" --kernel -o "$tmpdir/out.s" >/dev/null 2>&1; then
+    if ! "$HOME_COMPILER" build "$abs" --kernel $COMPILER_TARGET_ARGS -o "$tmpdir/out.s" >/dev/null 2>&1; then
         reason="compiler exited nonzero"
     elif [ ! -s "$tmpdir/out.s" ]; then
         reason="no output"
@@ -126,7 +151,7 @@ while IFS= read -r rel; do
     fi
 done <<< "$files"
 
-echo "mvk-compiles: $ok/$total Appendix A files reach codegen"
+echo "mvk-compiles ($ARCH): $ok/$total Appendix A files reach codegen"
 
 if [ -z "$FLOOR" ] && [ -f "$FLOOR_FILE" ]; then
     FLOOR="$(grep -vE '^\s*#' "$FLOOR_FILE" | tr -dc '0-9')"

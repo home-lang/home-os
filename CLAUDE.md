@@ -19,6 +19,22 @@ Only use non-Home languages in these specific cases:
 - **Assembly (`.s` files)**: ONLY for bootloader and low-level CPU initialization that absolutely cannot be done in Home
 - **Zig/C/Other**: NEVER - if Home is missing a feature, extend Home first
 
+#### Exception: Home's own standard library (media packages)
+
+The Home standard library is shipped by the Home toolchain, not by this repo. Like the already-blessed kernel support modules (`~/Code/Home/lang/packages/kernel/`), the media packages `~/Code/Home/lang/packages/{audio,video,image,media}` are **Home standard library** and may be used from HomeOS. This is an exception about *where Home's own runtime lives*, NOT a licence to write Zig for HomeOS.
+
+The exception applies ONLY when all three conditions hold:
+
+1. **Location**: the code lives in the Home compiler repo (`~/Code/Home/lang/packages/{audio,video,image,media}`) - never in this repo.
+2. **Interface**: HomeOS consumes it ONLY through Home FFI bindings (`src/bindings/home.zig` / `home_bindings.zig`). No HomeOS file imports Zig directly.
+3. **Never vendored**: these packages are NEVER copied, vendored, or forked into home-os. **HomeOS source stays 100 % `.home`** (plus the unavoidable boot assembly above). If it lands in this tree, the exception does not apply and it must be removed.
+
+If any one of those three fails, the normal rule applies: **NEVER** - extend Home first.
+
+This exception does not extend to any other library, and it does not change the philosophy: when a media capability is missing or wrong, fix it in the Home toolchain (extend Home first), then use it here. A port-to-Home track for the media stdlib is tracked under compiler milestone A7 (self-hosting) - Zig stdlib is a stage, not the destination. Hardware decode (e.g. HEVC on VideoCore VII) is NOT covered by this exception: it is a kernel driver written in Home.
+
+See `docs/adr/ADR-MC3-media-stdlib.md` for the full decision and its conditions.
+
 ### If Home is Missing Features
 
 When Home doesn't have a feature we need:
