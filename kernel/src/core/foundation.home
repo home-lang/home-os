@@ -147,23 +147,76 @@ export fn cpuid(leaf: u32): u32 {
   return eax
 }
 
-// SMAP: allow and forbid kernel access to user pages. STAC opens a window in
-// which the kernel may touch user memory; CLAC closes it again. They must
-// bracket the access tightly — leaving the window open is the thing SMAP
-// exists to prevent.
-// STUB(S10): the ARM64 counterpart of SMAP is the PAN bit in PSTATE, which
-// nothing sets up yet, so on ARM64 these are no-ops and the kernel can always
-// reach user memory. That is a real gap, not an equivalence.
+// Allow and forbid kernel access to user pages. asm_stac() opens a window in
+// which the kernel may touch user memory; asm_clac() closes it again. They
+// must bracket the access tightly — leaving the window open is the thing this
+// protection exists to prevent.
+//
+// x86-64 spells it SMAP and keeps the state in EFLAGS.AC, set to *permit* the
+// access. ARM64 spells it PAN and keeps it in PSTATE.PAN, set to *forbid* it.
+// The backend hides that inversion, so both names mean the same thing here.
 export fn asm_stac() {
-  if @targetIs("x86_64") {
-    asm volatile ("stac" ::: "cc")
-  }
+  arch_allow_user_access()
 }
 
 export fn asm_clac() {
+  arch_forbid_user_access()
+}
+
+// PSTATE.PAN as MRS reports it, and as SCTLR_EL1 and ID_AA64MMFR1_EL1 spell
+// the surrounding controls. Every other bit in the PAN register is RES0.
+const SCTLR_EL1_SPAN: u64 = 0x800000       // bit 23
+const ID_AA64MMFR1_PAN: u64 = 0xF00000     // bits [23:20]
+const CR4_SMAP: u64 = 0x200000             // bit 21
+const CPUID7_EBX_SMAP: u64 = 0x100000      // bit 20
+
+// Whether this CPU implements the protection at all. 1 if it does.
+//
+// Neither architecture guarantees it: SMAP arrived with Broadwell, PAN with
+// ARMv8.1. A kernel that assumes it is present will fault on the enable rather
+// than run unprotected, so the caller has to ask first.
+export fn user_access_protection_available(): u64 {
   if @targetIs("x86_64") {
-    asm volatile ("clac" ::: "cc")
+    let ebx: u64 = cpuid_ebx_ecx(7, 0) >> 32
+    if (ebx & CPUID7_EBX_SMAP) != 0 { return 1 }
+    return 0
+  } else {
+    if (arch_read_sysreg("id_aa64mmfr1_el1") & ID_AA64MMFR1_PAN) != 0 { return 1 }
+    return 0
   }
+}
+
+// Turn the protection on. Returns 1 if it is now active, 0 if the CPU does not
+// implement it.
+//
+// Must run during early init, before anything relies on asm_stac()/asm_clac()
+// bracketing meaning anything. Until it does, the window is permanently open
+// and both calls are decoration.
+export fn enable_user_access_protection(): u64 {
+  if user_access_protection_available() == 0 {
+    return 0
+  }
+  if @targetIs("x86_64") {
+    write_cr4(read_cr4() | CR4_SMAP)
+  } else {
+    // Clearing SPAN makes the CPU set PSTATE.PAN on every exception entry to
+    // EL1, so a syscall or fault arrives with user access already forbidden.
+    // Left set, PAN keeps whatever value it happened to have, which defeats
+    // the point of having it.
+    arch_write_sysreg("sctlr_el1", arch_read_sysreg("sctlr_el1") & ~SCTLR_EL1_SPAN)
+  }
+  // Start closed rather than inheriting whatever the firmware left behind.
+  asm_clac()
+  return 1
+}
+
+// Whether the kernel may touch user memory right now: 1 if the window is open.
+//
+// Reads the architectural bit back rather than tracking it in a variable, so a
+// caller can prove the window actually moved. MASTER_PLAN §7 rule 1 needs that
+// to close a stub, and a shadow copy would prove only that this file can count.
+export fn user_access_window_open(): u64 {
+  return arch_user_access_allowed()
 }
 
 // CPUID leaf `eax`, subleaf `ecx`, returning ebx and ecx packed as
