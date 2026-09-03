@@ -85,28 +85,69 @@ BUILD="$REPO_ROOT/build/aarch64-virt"
 mkdir -p "$BUILD"
 [ "$KEEP" = 1 ] || trap 'rm -rf "$BUILD"' EXIT
 
-# --- build -------------------------------------------------------------------
-echo "==> compiling $(basename "$ENTRY") for aarch64"
-if ! "$HOME_COMPILER" build "$ENTRY" --kernel --target=aarch64-freestanding \
-        -o "$BUILD/kernel.s" >"$BUILD/compile.log" 2>&1; then
-    echo "--- compiler output:" >&2
-    cat "$BUILD/compile.log" >&2
-    fail "the Home compiler could not lower $ENTRY for aarch64"
-fi
-# The kernel backend emits a marker comment and carries on when it meets
-# something it cannot lower, so exit status 0 does not mean the file compiled.
-if grep -qE '# (ERROR|unsupported)' "$BUILD/kernel.s"; then
-    echo "--- unlowered constructs:" >&2
-    grep -E '# (ERROR|unsupported)' "$BUILD/kernel.s" | head -20 >&2
-    fail "$ENTRY contains constructs the aarch64 backend cannot lower"
-fi
+# --- collect the module set ---------------------------------------------------
+# An imported module's declarations are registered in the importing file, but
+# its function bodies are not emitted there — so every module reached by an
+# import needs compiling and linking in its own right, or the link fails on an
+# undefined symbol. Walk the import graph from the entry file.
+collect_modules() {
+    local pending="$1"
+    local seen=""
+    local current dir imported rel abs
+    while [ -n "$pending" ]; do
+        current="${pending%%$'\n'*}"
+        if [ "$pending" = "$current" ]; then pending=""; else pending="${pending#*$'\n'}"; fi
+        [ -z "$current" ] && continue
+        case "$seen" in *"|$current|"*) continue ;; esac
+        seen="$seen|$current|"
+        echo "$current"
+        dir="$(cd "$(dirname "$current")" && pwd)"
+        # `import "./path.home" as name` — the quoted path is relative to the
+        # importing file, which is why this resolves against its directory.
+        imported="$(sed -n 's/^[[:space:]]*import[[:space:]]*"\([^"]*\.home\)".*/\1/p' "$current" 2>/dev/null)"
+        while IFS= read -r rel; do
+            [ -z "$rel" ] && continue
+            abs="$(cd "$dir" 2>/dev/null && cd "$(dirname "$rel")" 2>/dev/null && pwd)/$(basename "$rel")"
+            [ -f "$abs" ] && pending="$pending"$'\n'"$abs"
+        done <<< "$imported"
+    done
+}
 
-echo "==> assembling and linking"
-"$ZIG" cc -c -x assembler -target aarch64-freestanding "$BUILD/kernel.s" \
-    -o "$BUILD/kernel.o" || fail "assembler rejected the generated kernel"
+MODULES="$(collect_modules "$(cd "$(dirname "$ENTRY")" && pwd)/$(basename "$ENTRY")")"
+echo "==> module set:"
+echo "$MODULES" | sed "s|^$REPO_ROOT/|    |"
+
+# --- build --------------------------------------------------------------------
+OBJECTS=""
+while IFS= read -r module; do
+    [ -z "$module" ] && continue
+    name="$(echo "${module#$REPO_ROOT/}" | sed 's|/|_|g; s|\.home$||')"
+    echo "==> compiling $(basename "$module") for aarch64"
+    if ! "$HOME_COMPILER" build "$module" --kernel --target=aarch64-freestanding \
+            -o "$BUILD/$name.s" >"$BUILD/$name.log" 2>&1; then
+        echo "--- compiler output:" >&2
+        cat "$BUILD/$name.log" >&2
+        fail "the Home compiler could not lower $module for aarch64"
+    fi
+    # The kernel backend emits a marker comment and carries on when it meets
+    # something it cannot lower, so exit status 0 does not mean it compiled.
+    if grep -qE '# (ERROR|unsupported)' "$BUILD/$name.s"; then
+        echo "--- unlowered constructs:" >&2
+        grep -E '# (ERROR|unsupported)' "$BUILD/$name.s" | head -20 >&2
+        fail "$module contains constructs the aarch64 backend cannot lower"
+    fi
+    "$ZIG" cc -c -x assembler -target aarch64-freestanding "$BUILD/$name.s" \
+        -o "$BUILD/$name.o" || fail "assembler rejected the code generated from $module"
+    OBJECTS="$OBJECTS $BUILD/$name.o"
+done <<< "$MODULES"
+
+echo "==> assembling boot code and linking"
 "$ZIG" cc -c -x assembler -target aarch64-freestanding "$BOOT_S" \
     -o "$BUILD/boot.o" || fail "assembler rejected $BOOT_S"
-"$ZIG" ld.lld -T "$LINKER" -o "$BUILD/kernel.elf" "$BUILD/boot.o" "$BUILD/kernel.o" \
+# boot.o first: the linker script keeps .text.boot at the start of the image,
+# and an ELF loader honours the entry symbol but a raw binary is jumped to at
+# its first byte.
+"$ZIG" ld.lld -T "$LINKER" -o "$BUILD/kernel.elf" "$BUILD/boot.o" $OBJECTS \
     || fail "link failed"
 
 # --- boot --------------------------------------------------------------------

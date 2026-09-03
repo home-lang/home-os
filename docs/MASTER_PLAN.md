@@ -256,7 +256,7 @@ Bring-up order (each stage proven over serial before the next): serial-first deb
 | S5 | chacha20 / poly1305 / curve25519 / blake2s are stubs | `kernel/src/crypto/` | P2 | Phase 3 `pantry-local-install` (signing); later WireGuard |
 | S6 | USB core is 44 lines | `kernel/src/drivers/usb.home` | P2 | Phase 7a (keyboards, storage on metal) |
 | S7 | ACPI is 71 lines | `kernel/src/drivers/acpi.home` | P2 | Phase 7a (power, S3 suspend) |
-| S8 | `mmio_read32` returns 0; `mmio_write32` is a no-op — every ARM64/Pi driver is inert | `kernel/src/arch/arm64/arm64.home` | P3 | Phase 7b entirely |
+| S8 | **CLOSED** — `mmio_read32`/`mmio_write32` were inert, so every ARM64/Pi driver was too | `kernel/src/arch/arm64/arm64.home` | P3 | Phase 7b entirely |
 
 **Register rules:**
 1. A stub may not be closed without a runtime test exercising it.

@@ -19,7 +19,7 @@ that has been written and parsed, but never run.
 
 **415/415 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `879544b62`
+- Compiler: `home-lang/home` @ `bc1a87bef`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -76,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 415 | 236,447 |
+| `kernel/` | 415 | 236,500 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -98,9 +98,9 @@ CI gate (`scripts/stub-check.sh`).
 | S5 | chacha20 / poly1305 / curve25519 / blake2s are stubs | `kernel/src/crypto/` | 4 | open — blocks Phase 3 `pantry-local-install` (signing); later WireGuard |
 | S6 | USB core is 44 lines | `kernel/src/drivers/usb.home` | 1 | open — blocks Phase 7a (keyboards, storage on metal) |
 | S7 | ACPI is 71 lines | `kernel/src/drivers/acpi.home` | 1 | open — blocks Phase 7a (power, S3 suspend) |
-| S8 | `mmio_read32` returns 0; `mmio_write32` is a no-op — every ARM64/Pi driver is inert | `kernel/src/arch/arm64/arm64.home` | 1 | open — blocks Phase 7b entirely |
+| S8 | `mmio_read32`/`mmio_write32` were inert, so every ARM64/Pi driver was too | `kernel/src/arch/arm64/arm64.home` | 0 | **CLOSED** |
 
-6 of 7 entries open.
+5 of 7 entries open.
 
 ## Phase gates ([MASTER_PLAN §4](docs/MASTER_PLAN.md#4-the-phase-map))
 
@@ -110,7 +110,7 @@ first red one are blocked by definition — they are not being worked yet.
 | Phase | Gate | Status |
 |-------|------|--------|
 | 0 | `parse-rate` | ✅ green |
-| 0 | `stub-register` | ✅ pass — stub-register OK — 6 open entries, all marked and placed correctly |
+| 0 | `stub-register` | ✅ pass — stub-register OK — 5 open entries, all marked and placed correctly |
 | 0 | `boot-qemu-x86_64` | ✅ pass |
 | 0.5 | `mvk-compiles` | ✅ green |
 | 1 | `boot-to-shell` | ⬜ not started |
