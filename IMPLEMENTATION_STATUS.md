@@ -19,7 +19,7 @@ that has been written and parsed, but never run.
 
 **416/416 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `af52eded7`
+- Compiler: `home-lang/home` @ `e2d301c58`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -33,7 +33,7 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-✅ **`boot-full-kernel`: PASS** — 60/60 init milestones reached, through to the end of init
+✅ **`boot-full-kernel`: PASS** — 67/67 init milestones reached, through to the end of init
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
@@ -53,7 +53,7 @@ only the hardware gate can measure.
 
 ## Codegen ratchet
 
-**77/77 of the Minimum Viable Kernel file set reaches codegen.**
+**78/78 of the Minimum Viable Kernel file set reaches codegen.**
 
 This is the number to watch. The MVK set is
 [MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);
@@ -64,7 +64,7 @@ fall — `scripts/mvk-compiles.sh` fails the build if it does.
 Run `scripts/mvk-compiles.sh --list` to see what each remaining file is
 waiting on; the failures name the construct, not just the count.
 
-**77/77 of the same set reaches codegen for `aarch64`.**
+**78/78 of the same set reaches codegen for `aarch64`.**
 
 Kept as its own number rather than averaged in, because the two targets
 advance independently. The gap is not a compiler gap: the files that do
@@ -76,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 416 | 238,042 |
+| `kernel/` | 416 | 238,595 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -95,7 +95,7 @@ CI gate (`scripts/stub-check.sh`).
 | S1 | silent hlt-stub fallback + dead `.zig` references | `scripts/build.sh` | 0 | **CLOSED** |
 | S3 | the RX path parses Ethernet, demuxes on ethertype, validates IPv4 and dispatches to arp/icmp/udp | `kernel/src/net/netdev.home` | 0 | **CLOSED** |
 | S4 | Native filesystem is a 28-line import-satisfying stub | `kernel/src/fs/homefs.home` | 1 | open — blocks Phase 2 storage; Phase 6 `snapshot-rollback` |
-| S5 | chacha20 / poly1305 / curve25519 / blake2s are stubs | `kernel/src/crypto/` | 1 | open — blocks Phase 3 `pantry-local-install` (signing); later WireGuard |
+| S5 | chacha20, poly1305, blake2s and curve25519 are implemented and checked against the vectors in RFC 8439, RFC 7693 and RFC 7748 | `kernel/src/crypto/` | 0 | **CLOSED** |
 | S6 | USB core is 44 lines | `kernel/src/drivers/usb.home` | 1 | open — blocks Phase 7a (keyboards, storage on metal) |
 | S7 | ACPI is 71 lines | `kernel/src/drivers/acpi.home` | 1 | open — blocks Phase 7a (power, S3 suspend) |
 | S8 | `mmio_read32`/`mmio_write32` were inert, so every ARM64/Pi driver was too | `kernel/src/arch/arm64/arm64.home` | 0 | **CLOSED** |
@@ -103,7 +103,7 @@ CI gate (`scripts/stub-check.sh`).
 | S10 | SMAP's ARM64 counterpart (the PAN bit in PSTATE) is set up, so `asm_stac`/`asm_clac` move a real bit on both architectures | `kernel/src/core/foundation.home` | 0 | **CLOSED** |
 | S11 | TCP segments arriving from the wire are counted and dropped — `tcp.home` has no segment-input entry point, only the socket-level `tcp_receive()` | `kernel/src/net/netdev.home` | 1 | open — blocks Phase 2 `net-echo` for TCP |
 
-6 of 10 entries open.
+5 of 10 entries open.
 
 ## Phase gates ([MASTER_PLAN §4](docs/MASTER_PLAN.md#4-the-phase-map))
 
@@ -113,7 +113,7 @@ first red one are blocked by definition — they are not being worked yet.
 | Phase | Gate | Status |
 |-------|------|--------|
 | 0 | `parse-rate` | ✅ green |
-| 0 | `stub-register` | ✅ pass — stub-register OK — 6 open entries, all marked and placed correctly |
+| 0 | `stub-register` | ✅ pass — stub-register OK — 5 open entries, all marked and placed correctly |
 | 0 | `boot-qemu-x86_64` | ✅ pass |
 | 0.5 | `mvk-compiles` | ✅ green |
 | 1 | `boot-to-shell` | ⬜ not started |

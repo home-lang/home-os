@@ -253,7 +253,7 @@ Bring-up order (each stage proven over serial before the next): serial-first deb
 | S1 | **CLOSED** — silent hlt-stub fallback + dead `.zig` references | `scripts/build.sh` | P0 | Phase 0 (truth) |
 | S3 | **CLOSED** — the RX path parses Ethernet, demuxes on ethertype, validates IPv4 and dispatches to arp/icmp/udp | `kernel/src/net/netdev.home` | P1 | Phase 2 `net-echo` |
 | S4 | Native filesystem is a 28-line import-satisfying stub | `kernel/src/fs/homefs.home` | P1 (design doc), P2 (CoW implementation) | Phase 2 storage; Phase 6 `snapshot-rollback` |
-| S5 | chacha20 / poly1305 / curve25519 / blake2s are stubs | `kernel/src/crypto/` | P2 | Phase 3 `pantry-local-install` (signing); later WireGuard |
+| S5 | **CLOSED** — chacha20, poly1305, blake2s and curve25519 are implemented and checked against the vectors in RFC 8439, RFC 7693 and RFC 7748 | `kernel/src/crypto/` | P2 | Phase 3 `pantry-local-install` (signing); later WireGuard |
 | S6 | USB core is 44 lines | `kernel/src/drivers/usb.home` | P2 | Phase 7a (keyboards, storage on metal) |
 | S7 | ACPI is 71 lines | `kernel/src/drivers/acpi.home` | P2 | Phase 7a (power, S3 suspend) |
 | S8 | **CLOSED** — `mmio_read32`/`mmio_write32` were inert, so every ARM64/Pi driver was too | `kernel/src/arch/arm64/arm64.home` | P3 | Phase 7b entirely |
@@ -579,6 +579,7 @@ These were referenced by files already in the set and were not listed, which is 
 - `kernel/src/crypto/crypto_selftest.home`
 - `kernel/src/crypto/blake2s.home`
 - `kernel/src/crypto/sha256.home`
+- `kernel/src/crypto/curve25519.home`
 
 **Link script**
 - `kernel/linker.ld`
