@@ -17,9 +17,9 @@ that has been written and parsed, but never run.
 
 ## Parse rate
 
-**414/414 kernel `.home` files parse (100%)**
+**415/415 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `c1818b32a`
+- Compiler: `home-lang/home` @ `879544b62`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -40,6 +40,17 @@ halts. This one measures the real kernel — every Appendix A file linked into
 one image — against the milestone list in `scripts/boot-milestones.txt`,
 which names one subsystem per entry and may only ever grow.
 
+✅ **`boot-qemu-aarch64`: PASS** — serial says `HomeOS v0.1: aarch64 kernel_main reached`
+
+Measured by building `kernel/src/arm64_poc.home` for
+`aarch64-freestanding`, linking it with `kernel/src/arch/arm64/boot.s` via
+`kernel/linker-virt.ld`, and booting it on QEMU's `virt` machine.
+
+**This is not a Raspberry Pi.** QEMU has no Pi 5 machine model — there is no
+RP1 — so a pass here means the compiler, the frame layout, the MMIO path and
+the boot handoff work. It says nothing about the Pi's own peripherals, which
+only the hardware gate can measure.
+
 ## Codegen ratchet
 
 **70/70 of the Minimum Viable Kernel file set reaches codegen.**
@@ -53,11 +64,19 @@ fall — `scripts/mvk-compiles.sh` fails the build if it does.
 Run `scripts/mvk-compiles.sh --list` to see what each remaining file is
 waiting on; the failures name the construct, not just the count.
 
+**13/70 of the same set reaches codegen for `aarch64`.**
+
+Kept as its own number rather than averaged in, because the two targets
+advance independently. The gap is not a compiler gap: the files that do
+not lower for ARM are the ones reached by `asm volatile` blocks written
+in x86 assembly, which is emitted verbatim by definition. Making those
+architecture-neutral is kernel work, not backend work.
+
 ## Source inventory
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 414 | 236,325 |
+| `kernel/` | 415 | 236,447 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |

@@ -128,15 +128,43 @@ def count_markers():
     return counts
 
 
-def run_codegen_ratchet(home):
-    """Run the mvk-compiles ratchet. Returns (ok, total) or None."""
+def run_codegen_ratchet(home, arch="x86_64"):
+    """Run the mvk-compiles ratchet for one architecture.
+
+    Returns (ok, total), or None when the run produced no measurement — no
+    compiler, or no cross-assembler for the requested target. The page then
+    says so rather than repeating a previous answer.
+    """
     env = dict(os.environ, HOME_COMPILER=home)
-    r = subprocess.run([os.path.join(REPO, "scripts", "mvk-compiles.sh")],
-                       capture_output=True, text=True, env=env, cwd=REPO)
-    m = re.search(r"mvk-compiles: (\d+)/(\d+)", r.stdout or "")
-    if not m:
+    cmd = [os.path.join(REPO, "scripts", "mvk-compiles.sh")]
+    if arch != "x86_64":
+        cmd.append("--arch=" + arch)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=REPO)
+    m = re.search(r"mvk-compiles \((\S+)\): (\d+)/(\d+)", r.stdout or "")
+    if not m or m.group(1) != arch:
         return None
-    return int(m.group(1)), int(m.group(2))
+    return int(m.group(2)), int(m.group(3))
+
+
+def run_boot_gate_aarch64(home):
+    """Build the ARM64 kernel and boot it on QEMU's `virt` machine.
+
+    Returns (state, detail). This is not a Raspberry Pi: QEMU has no Pi 5
+    model, so a PASS here means the compiler, the frame layout, the MMIO path
+    and the boot handoff work, and says nothing about the Pi's peripherals.
+    """
+    env = dict(os.environ, HOME_COMPILER=home)
+    r = subprocess.run([os.path.join(REPO, "scripts", "boot-gate-aarch64.sh")],
+                       capture_output=True, text=True, env=env, cwd=REPO)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode == 0:
+        for line in out.splitlines():
+            if line.startswith("ok  "):
+                return "PASS", f"serial says `{line[4:].strip()}`"
+        return "PASS", "every ARM64 boot milestone reached"
+    if "qemu-system-aarch64 not found" in out or "zig not found" in out:
+        return "UNVERIFIED", "no aarch64 QEMU or cross-assembler in this run"
+    return "FAIL", "the ARM64 kernel did not reach its boot milestones"
 
 
 def run_stub_gate():
@@ -218,12 +246,15 @@ def main():
     if no_boot:
         boot_state, boot_detail = "UNVERIFIED", "skipped (--no-boot)"
         full_state, full_detail = "UNVERIFIED", "skipped (--no-boot)"
+        arm_state, arm_detail = "UNVERIFIED", "skipped (--no-boot)"
     else:
         boot_state, boot_detail = run_boot_gate(home)
         full_state, full_detail = run_full_boot_gate(home)
+        arm_state, arm_detail = run_boot_gate_aarch64(home)
 
     stub_state, stub_detail = run_stub_gate()
     ratchet = None if no_boot else run_codegen_ratchet(home)
+    ratchet_arm = None if no_boot else run_codegen_ratchet(home, "aarch64")
     entries = register_entries()
     markers = count_markers()
     L = []
@@ -298,6 +329,18 @@ def main():
     w("one image — against the milestone list in `scripts/boot-milestones.txt`,")
     w("which names one subsystem per entry and may only ever grow.")
     w("")
+    icon = {"PASS": "✅", "FAIL": "❌", "UNVERIFIED": "⬜"}[arm_state]
+    w(f"{icon} **`boot-qemu-aarch64`: {arm_state}** — {arm_detail}")
+    w("")
+    w("Measured by building `kernel/src/arm64_poc.home` for")
+    w("`aarch64-freestanding`, linking it with `kernel/src/arch/arm64/boot.s` via")
+    w("`kernel/linker-virt.ld`, and booting it on QEMU's `virt` machine.")
+    w("")
+    w("**This is not a Raspberry Pi.** QEMU has no Pi 5 machine model — there is no")
+    w("RP1 — so a pass here means the compiler, the frame layout, the MMIO path and")
+    w("the boot handoff work. It says nothing about the Pi's own peripherals, which")
+    w("only the hardware gate can measure.")
+    w("")
 
     # --- Codegen ratchet ----------------------------------------------------
     w("## Codegen ratchet")
@@ -314,6 +357,19 @@ def main():
         w("")
         w("Run `scripts/mvk-compiles.sh --list` to see what each remaining file is")
         w("waiting on; the failures name the construct, not just the count.")
+        w("")
+        if ratchet_arm:
+            arm_ok, arm_total = ratchet_arm
+            w(f"**{arm_ok}/{arm_total} of the same set reaches codegen for `aarch64`.**")
+            w("")
+            w("Kept as its own number rather than averaged in, because the two targets")
+            w("advance independently. The gap is not a compiler gap: the files that do")
+            w("not lower for ARM are the ones reached by `asm volatile` blocks written")
+            w("in x86 assembly, which is emitted verbatim by definition. Making those")
+            w("architecture-neutral is kernel work, not backend work.")
+        else:
+            w("The `aarch64` count was **not verified in this run** — no cross-assembler")
+            w("or no compiler.")
     else:
         w("Not measured in this run.")
     w("")
