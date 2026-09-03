@@ -1,23 +1,222 @@
-// home-os Kernel - Poly1305 MAC
+// home-os Kernel - Poly1305 one-time authenticator (RFC 8439 §2.5)
 //
-// STUB(S5): Poly1305 MAC, RFC 8439 is not implemented. This primitive fails closed —
-// it returns zeros or an error rather than a wrong-but-plausible result.
-// Package signing needs it, so it blocks the Phase 3 pantry-local-install
-// gate, and WireGuard later. See MASTER_PLAN §7.
-// TODO(#11): This is a stub. Implement Poly1305 per RFC 8439. The
-// authentication tag is currently zeroed so any verification will
-// fail closed.
+// This module used to be STUB(S5): poly1305_mac() zeroed the tag, so every
+// verification failed closed and nothing that needed authentication worked.
+//
+// Poly1305 evaluates a polynomial over GF(2^130 - 5). The reference
+// implementations reach for a 128-bit multiply; Home has no such type, so
+// this uses the five-limb radix-2^26 representation instead. Every limb is
+// under 2^26, so a product is under 2^52 and a sum of five under 2^55 — all
+// of which fit a u64 with room to spare, and no operation here can overflow
+// one.
 
-import "../core/foundation.home" as foundation
+const LIMB_MASK: u64 = 0x3FFFFFF          // 26 bits
+
+// Little-endian 32-bit read, assembled a byte at a time because the input is
+// a byte buffer with no alignment guarantee.
+fn le32(base: u64, offset: u32): u64 {
+  let b0: u64 = @as(u64, @as(*u8, @ptrFromInt(base + @as(u64, offset))).*)
+  let b1: u64 = @as(u64, @as(*u8, @ptrFromInt(base + @as(u64, offset + 1))).*)
+  let b2: u64 = @as(u64, @as(*u8, @ptrFromInt(base + @as(u64, offset + 2))).*)
+  let b3: u64 = @as(u64, @as(*u8, @ptrFromInt(base + @as(u64, offset + 3))).*)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn put8(base: u64, offset: u32, value: u64) {
+  @as(*u8, @ptrFromInt(base + @as(u64, offset))).* = @as(u8, value & 0xFF)
+}
 
 // Compute a 16-byte authentication tag over `data` using `key` (32 bytes).
+//
+// The key splits into r (clamped, the polynomial's evaluation point) and s
+// (the one-time pad added at the end). Reusing a key across two messages
+// breaks the scheme completely, which is why callers derive one per nonce.
 export fn poly1305_mac(tag: u64, key: u64, data: u64, len: u32) {
-  // TODO(#11): real implementation. Zero the tag so callers cannot
-  // mistake a stubbed MAC for a valid one.
+  // --- clamp r -------------------------------------------------------------
+  // The clamping constants are part of the definition: they clear the bits
+  // that would let a carry escape the 130-bit field.
+  let t0: u64 = le32(key, 0)
+  let t1: u64 = le32(key, 4)
+  let t2: u64 = le32(key, 8)
+  let t3: u64 = le32(key, 12)
+
+  let r0: u64 = t0 & 0x3FFFFFF
+  let r1: u64 = ((t0 >> 26) | (t1 << 6)) & 0x3FFFF03
+  let r2: u64 = ((t1 >> 20) | (t2 << 12)) & 0x3FFC0FF
+  let r3: u64 = ((t2 >> 14) | (t3 << 18)) & 0x3F03FFF
+  let r4: u64 = (t3 >> 8) & 0x00FFFFF
+
+  // Multiplying by 5 folds the 2^130 overflow back into the low limbs, which
+  // is what makes the modulus 2^130 - 5 cheap.
+  let s1: u64 = r1 * 5
+  let s2: u64 = r2 * 5
+  let s3: u64 = r3 * 5
+  let s4: u64 = r4 * 5
+
+  var h0: u64 = 0
+  var h1: u64 = 0
+  var h2: u64 = 0
+  var h3: u64 = 0
+  var h4: u64 = 0
+
+  // --- absorb ---------------------------------------------------------------
+  var block: [u8; 16] = undefined
+  var offset: u32 = 0
+  while offset < len {
+    var remaining: u32 = len - offset
+    var hibit: u64 = 0x1000000              // 2^24, the implicit high bit
+
+    var base: u64 = data + @as(u64, offset)
+    if remaining < 16 {
+      // The final short block is padded with a 1 byte then zeros, and the
+      // implicit high bit moves to just past the padding instead of bit 128.
+      var i: u32 = 0
+      while i < 16 {
+        if i < remaining {
+          block[i] = @as(*u8, @ptrFromInt(data + @as(u64, offset + i))).*
+        } else {
+          if i == remaining {
+            block[i] = 1
+          } else {
+            block[i] = 0
+          }
+        }
+        i = i + 1
+      }
+      base = @intFromPtr(&block)
+      hibit = 0
+    }
+    // Every iteration consumes exactly one 16-byte block, whether it came
+    // from the message or from the padded tail.
+    remaining = 16
+
+    let m0: u64 = le32(base, 0)
+    let m1: u64 = le32(base, 4)
+    let m2: u64 = le32(base, 8)
+    let m3: u64 = le32(base, 12)
+
+    h0 = h0 + (m0 & LIMB_MASK)
+    h1 = h1 + (((m0 >> 26) | (m1 << 6)) & LIMB_MASK)
+    h2 = h2 + (((m1 >> 20) | (m2 << 12)) & LIMB_MASK)
+    h3 = h3 + (((m2 >> 14) | (m3 << 18)) & LIMB_MASK)
+    h4 = h4 + ((m3 >> 8) | hibit)
+
+    // --- h = h * r mod 2^130 - 5 -------------------------------------------
+    let d0: u64 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+    let d1: u64 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+    let d2: u64 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+    let d3: u64 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+    let d4: u64 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+
+    var c: u64 = d0 >> 26
+    h0 = d0 & LIMB_MASK
+    var v1: u64 = d1 + c
+    c = v1 >> 26
+    h1 = v1 & LIMB_MASK
+    var v2: u64 = d2 + c
+    c = v2 >> 26
+    h2 = v2 & LIMB_MASK
+    var v3: u64 = d3 + c
+    c = v3 >> 26
+    h3 = v3 & LIMB_MASK
+    var v4: u64 = d4 + c
+    c = v4 >> 26
+    h4 = v4 & LIMB_MASK
+    h0 = h0 + c * 5
+    c = h0 >> 26
+    h0 = h0 & LIMB_MASK
+    h1 = h1 + c
+
+    offset = offset + remaining
+  }
+
+  // --- fully carry ----------------------------------------------------------
+  var c: u64 = h1 >> 26
+  h1 = h1 & LIMB_MASK
+  h2 = h2 + c
+  c = h2 >> 26
+  h2 = h2 & LIMB_MASK
+  h3 = h3 + c
+  c = h3 >> 26
+  h3 = h3 & LIMB_MASK
+  h4 = h4 + c
+  c = h4 >> 26
+  h4 = h4 & LIMB_MASK
+  h0 = h0 + c * 5
+  c = h0 >> 26
+  h0 = h0 & LIMB_MASK
+  h1 = h1 + c
+
+  // --- reduce: compute h - p and take it if it did not borrow ---------------
+  var g0: u64 = h0 + 5
+  c = g0 >> 26
+  g0 = g0 & LIMB_MASK
+  var g1: u64 = h1 + c
+  c = g1 >> 26
+  g1 = g1 & LIMB_MASK
+  var g2: u64 = h2 + c
+  c = g2 >> 26
+  g2 = g2 & LIMB_MASK
+  var g3: u64 = h3 + c
+  c = g3 >> 26
+  g3 = g3 & LIMB_MASK
+  var g4: u64 = h4 + c - 0x4000000          // subtract 2^26 from the top limb
+
+  // Branch-free select: a borrow out of g4 means h < p, so keep h.
+  // Doing this with an `if` would make the choice depend on secret data.
+  var mask: u64 = (g4 >> 63) - 1            // all ones when g4 did not borrow
+  g0 = g0 & mask
+  g1 = g1 & mask
+  g2 = g2 & mask
+  g3 = g3 & mask
+  g4 = g4 & mask
+  let inv: u64 = ~mask
+  h0 = (h0 & inv) | g0
+  h1 = (h1 & inv) | g1
+  h2 = (h2 & inv) | g2
+  h3 = (h3 & inv) | g3
+  h4 = (h4 & inv) | g4
+
+  // --- serialize, adding the one-time pad ----------------------------------
+  var f0: u64 = ((h0) | (h1 << 26)) & 0xFFFFFFFF
+  var f1: u64 = ((h1 >> 6) | (h2 << 20)) & 0xFFFFFFFF
+  var f2: u64 = ((h2 >> 12) | (h3 << 14)) & 0xFFFFFFFF
+  var f3: u64 = ((h3 >> 18) | (h4 << 8)) & 0xFFFFFFFF
+
+  var acc: u64 = f0 + le32(key, 16)
+  put8(tag, 0, acc)
+  put8(tag, 1, acc >> 8)
+  put8(tag, 2, acc >> 16)
+  put8(tag, 3, acc >> 24)
+  acc = f1 + le32(key, 20) + (acc >> 32)
+  put8(tag, 4, acc)
+  put8(tag, 5, acc >> 8)
+  put8(tag, 6, acc >> 16)
+  put8(tag, 7, acc >> 24)
+  acc = f2 + le32(key, 24) + (acc >> 32)
+  put8(tag, 8, acc)
+  put8(tag, 9, acc >> 8)
+  put8(tag, 10, acc >> 16)
+  put8(tag, 11, acc >> 24)
+  acc = f3 + le32(key, 28) + (acc >> 32)
+  put8(tag, 12, acc)
+  put8(tag, 13, acc >> 8)
+  put8(tag, 14, acc >> 16)
+  put8(tag, 15, acc >> 24)
+}
+
+// Constant-time tag comparison. Returns 0 if equal, non-zero otherwise.
+//
+// A byte-at-a-time early return would leak how many leading bytes an attacker
+// guessed correctly, which is enough to forge a tag one byte at a time.
+export fn poly1305_verify(tag_a: u64, tag_b: u64): u32 {
+  var diff: u32 = 0
   var i: u32 = 0
   while i < 16 {
-    @as(*u8, @ptrFromInt(tag + i)).* = 0
+    let a: u32 = @as(u32, @as(*u8, @ptrFromInt(tag_a + @as(u64, i))).*)
+    let b: u32 = @as(u32, @as(*u8, @ptrFromInt(tag_b + @as(u64, i))).*)
+    diff = diff | (a ^ b)
     i = i + 1
   }
-  foundation.serial_write_string("[poly1305] mac stub invoked\n")
+  return diff
 }

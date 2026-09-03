@@ -1,16 +1,197 @@
-// home-os Kernel - ChaCha20-Poly1305 AEAD
+// home-os Kernel - ChaCha20 stream cipher and ChaCha20-Poly1305 AEAD
+// RFC 8439.
 //
-// STUB(S5): ChaCha20 stream cipher, RFC 8439 is not implemented. This primitive fails closed —
-// it returns zeros or an error rather than a wrong-but-plausible result.
-// Package signing needs it, so it blocks the Phase 3 pantry-local-install
-// gate, and WireGuard later. See MASTER_PLAN §7.
-// TODO(#11): This is a stub. Implement ChaCha20 stream cipher and
-// Poly1305-AEAD per RFC 8439. Currently returns failure for all
-// operations so callers degrade gracefully instead of corrupting data.
+// This module used to be STUB(S5): both AEAD entry points printed a line and
+// returned failure, so nothing that needed authenticated encryption worked.
+//
+// ChaCha20 is 32-bit addition, XOR and rotation only. Home's integers are
+// 64-bit underneath, and arithmetic on a narrower type is not truncated for
+// you, so every operation that can carry past bit 31 is cast back to u32 —
+// `@as(u32, ...)` is what makes the arithmetic modulo 2^32 that the cipher
+// specifies. Leaving one out does not fail loudly; it produces a plausible
+// wrong keystream.
 
-import "../core/foundation.home" as foundation
+import "poly1305.home" as poly1305
 
-// AEAD output: ciphertext bytes followed by 16-byte authentication tag.
+fn rotl32(x: u32, n: u32): u32 {
+  let v: u64 = @as(u64, x)
+  return @as(u32, (v << n) | (v >> (32 - n)))
+}
+
+fn add32(a: u32, b: u32): u32 {
+  return @as(u32, @as(u64, a) + @as(u64, b))
+}
+
+fn le32_load(base: u64, offset: u32): u32 {
+  let b0: u32 = @as(u32, @as(*u8, @ptrFromInt(base + @as(u64, offset))).*)
+  let b1: u32 = @as(u32, @as(*u8, @ptrFromInt(base + @as(u64, offset + 1))).*)
+  let b2: u32 = @as(u32, @as(*u8, @ptrFromInt(base + @as(u64, offset + 2))).*)
+  let b3: u32 = @as(u32, @as(*u8, @ptrFromInt(base + @as(u64, offset + 3))).*)
+  return @as(u32, b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+}
+
+fn le32_store(base: u64, offset: u32, value: u32) {
+  @as(*u8, @ptrFromInt(base + @as(u64, offset))).* = @as(u8, value & 0xFF)
+  @as(*u8, @ptrFromInt(base + @as(u64, offset + 1))).* = @as(u8, (value >> 8) & 0xFF)
+  @as(*u8, @ptrFromInt(base + @as(u64, offset + 2))).* = @as(u8, (value >> 16) & 0xFF)
+  @as(*u8, @ptrFromInt(base + @as(u64, offset + 3))).* = @as(u8, (value >> 24) & 0xFF)
+}
+
+// One 64-byte keystream block for (key, counter, nonce), written to `out`.
+//
+// The four constants are the ASCII of "expand 32-byte k" read little-endian,
+// which is where the cipher's name for them comes from.
+export fn chacha20_block(key: u64, counter: u32, nonce: u64, out: u64) {
+  var s: [u32; 16] = undefined
+
+  s[0] = 0x61707865
+  s[1] = 0x3320646E
+  s[2] = 0x79622D32
+  s[3] = 0x6B206574
+
+  var i: u32 = 0
+  while i < 8 {
+    s[4 + i] = le32_load(key, i * 4)
+    i = i + 1
+  }
+
+  s[12] = counter
+  s[13] = le32_load(nonce, 0)
+  s[14] = le32_load(nonce, 4)
+  s[15] = le32_load(nonce, 8)
+
+  var w: [u32; 16] = undefined
+  i = 0
+  while i < 16 {
+    w[i] = s[i]
+    i = i + 1
+  }
+
+  // Twenty rounds, applied as ten column-then-diagonal double rounds.
+  var round: u32 = 0
+  while round < 10 {
+    // Columns
+    quarter_round(&w, 0, 4, 8, 12)
+    quarter_round(&w, 1, 5, 9, 13)
+    quarter_round(&w, 2, 6, 10, 14)
+    quarter_round(&w, 3, 7, 11, 15)
+    // Diagonals
+    quarter_round(&w, 0, 5, 10, 15)
+    quarter_round(&w, 1, 6, 11, 12)
+    quarter_round(&w, 2, 7, 8, 13)
+    quarter_round(&w, 3, 4, 9, 14)
+    round = round + 1
+  }
+
+  // Adding the original state back is what makes the permutation one-way:
+  // without it the 20 rounds would be trivially invertible.
+  i = 0
+  while i < 16 {
+    le32_store(out, i * 4, add32(w[i], s[i]))
+    i = i + 1
+  }
+}
+
+fn quarter_round(w: *[u32; 16], a: u32, b: u32, c: u32, d: u32) {
+  w[a] = add32(w[a], w[b])
+  w[d] = rotl32(w[d] ^ w[a], 16)
+  w[c] = add32(w[c], w[d])
+  w[b] = rotl32(w[b] ^ w[c], 12)
+  w[a] = add32(w[a], w[b])
+  w[d] = rotl32(w[d] ^ w[a], 8)
+  w[c] = add32(w[c], w[d])
+  w[b] = rotl32(w[b] ^ w[c], 7)
+}
+
+// XOR `len` bytes at `data` with the keystream, writing to `out`.
+// Encryption and decryption are the same operation.
+export fn chacha20_xor(key: u64, counter: u32, nonce: u64, data: u64, len: u32, out: u64) {
+  var stream: [u8; 64] = undefined
+  var produced: u32 = 0
+  var block_counter: u32 = counter
+
+  while produced < len {
+    chacha20_block(key, block_counter, nonce, @intFromPtr(&stream))
+    var n: u32 = len - produced
+    if n > 64 {
+      n = 64
+    }
+    var i: u32 = 0
+    while i < n {
+      let plain: u8 = @as(*u8, @ptrFromInt(data + @as(u64, produced + i))).*
+      @as(*u8, @ptrFromInt(out + @as(u64, produced + i))).* = plain ^ stream[i]
+      i = i + 1
+    }
+    produced = produced + n
+    block_counter = block_counter + 1
+  }
+}
+
+// ============================================================================
+// AEAD (RFC 8439 §2.8)
+// ============================================================================
+
+// The Poly1305 key is the first 32 bytes of ChaCha20's counter-zero block, so
+// each nonce gets its own one-time authenticator key. Reusing one across two
+// messages breaks Poly1305 outright.
+fn derive_poly_key(key: u64, nonce: u64, poly_key: u64) {
+  var block: [u8; 64] = undefined
+  chacha20_block(key, 0, nonce, @intFromPtr(&block))
+  var i: u32 = 0
+  while i < 32 {
+    @as(*u8, @ptrFromInt(poly_key + @as(u64, i))).* = block[i]
+    i = i + 1
+  }
+}
+
+// The authenticated data is AAD ‖ pad ‖ ciphertext ‖ pad ‖ len(AAD) ‖ len(CT),
+// each part padded to a 16-byte boundary. The lengths are what stop an
+// attacker moving bytes between the two fields without changing the tag.
+fn build_mac_input(aad: u64, aad_len: u32, ct: u64, ct_len: u32, buf: u64): u32 {
+  var pos: u32 = 0
+  var i: u32 = 0
+  while i < aad_len {
+    @as(*u8, @ptrFromInt(buf + @as(u64, pos))).* = @as(*u8, @ptrFromInt(aad + @as(u64, i))).*
+    pos = pos + 1
+    i = i + 1
+  }
+  while (pos % 16) != 0 {
+    @as(*u8, @ptrFromInt(buf + @as(u64, pos))).* = 0
+    pos = pos + 1
+  }
+  i = 0
+  while i < ct_len {
+    @as(*u8, @ptrFromInt(buf + @as(u64, pos))).* = @as(*u8, @ptrFromInt(ct + @as(u64, i))).*
+    pos = pos + 1
+    i = i + 1
+  }
+  while (pos % 16) != 0 {
+    @as(*u8, @ptrFromInt(buf + @as(u64, pos))).* = 0
+    pos = pos + 1
+  }
+  // Both lengths are 64-bit little-endian.
+  var v: u64 = @as(u64, aad_len)
+  i = 0
+  while i < 8 {
+    @as(*u8, @ptrFromInt(buf + @as(u64, pos))).* = @as(u8, (v >> (i * 8)) & 0xFF)
+    pos = pos + 1
+    i = i + 1
+  }
+  v = @as(u64, ct_len)
+  i = 0
+  while i < 8 {
+    @as(*u8, @ptrFromInt(buf + @as(u64, pos))).* = @as(u8, (v >> (i * 8)) & 0xFF)
+    pos = pos + 1
+    i = i + 1
+  }
+  return pos
+}
+
+// Scratch for the MAC input. A kernel AEAD call is not reentrant against
+// itself; this is sized for the largest message the callers below use.
+const MAC_SCRATCH_SIZE: u32 = 1024
+var mac_scratch: [u8; 1024] = undefined
+
 // Returns 0 on success, non-zero on failure.
 export fn chacha20_poly1305_encrypt(
   key: u64,
@@ -22,13 +203,24 @@ export fn chacha20_poly1305_encrypt(
   ciphertext: u64,
   tag: u64
 ): u32 {
-  // TODO(#11): real implementation. Refuse so callers don't think
-  // they got authenticated ciphertext.
-  foundation.serial_write_string("[chacha20] encrypt stub invoked\n")
-  return 1
+  // Refuse rather than truncate: a silently short MAC input would
+  // authenticate only part of the message.
+  if aad_len + plaintext_len + 48 > MAC_SCRATCH_SIZE {
+    return 1
+  }
+
+  // Counter starts at 1; block zero produced the Poly1305 key.
+  chacha20_xor(key, 1, nonce, plaintext, plaintext_len, ciphertext)
+
+  var poly_key: [u8; 32] = undefined
+  derive_poly_key(key, nonce, @intFromPtr(&poly_key))
+
+  let n: u32 = build_mac_input(aad, aad_len, ciphertext, plaintext_len, @intFromPtr(&mac_scratch))
+  poly1305.poly1305_mac(tag, @intFromPtr(&poly_key), @intFromPtr(&mac_scratch), n)
+  return 0
 }
 
-// Returns 0 on success (tag verified, plaintext written), non-zero on failure.
+// Returns 0 on success (tag verified, plaintext written), non-zero otherwise.
 export fn chacha20_poly1305_decrypt(
   key: u64,
   nonce: u64,
@@ -39,8 +231,24 @@ export fn chacha20_poly1305_decrypt(
   tag: u64,
   plaintext: u64
 ): u32 {
-  // TODO(#11): real implementation. Refuse so callers don't accept
-  // unauthenticated data.
-  foundation.serial_write_string("[chacha20] decrypt stub invoked\n")
-  return 1
+  if aad_len + ciphertext_len + 48 > MAC_SCRATCH_SIZE {
+    return 1
+  }
+
+  var poly_key: [u8; 32] = undefined
+  derive_poly_key(key, nonce, @intFromPtr(&poly_key))
+
+  let n: u32 = build_mac_input(aad, aad_len, ciphertext, ciphertext_len, @intFromPtr(&mac_scratch))
+  var expected: [u8; 16] = undefined
+  poly1305.poly1305_mac(@intFromPtr(&expected), @intFromPtr(&poly_key), @intFromPtr(&mac_scratch), n)
+
+  // Verify before decrypting. Writing plaintext first and checking after
+  // hands unauthenticated bytes to the caller for the length of the call,
+  // which is the whole failure mode AEAD exists to prevent.
+  if poly1305.poly1305_verify(tag, @intFromPtr(&expected)) != 0 {
+    return 1
+  }
+
+  chacha20_xor(key, 1, nonce, ciphertext, ciphertext_len, plaintext)
+  return 0
 }
