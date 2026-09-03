@@ -17,9 +17,9 @@ that has been written and parsed, but never run.
 
 ## Parse rate
 
-**415/415 kernel `.home` files parse (100%)**
+**416/416 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `67adab666`
+- Compiler: `home-lang/home` @ `af52eded7`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -53,7 +53,7 @@ only the hardware gate can measure.
 
 ## Codegen ratchet
 
-**72/72 of the Minimum Viable Kernel file set reaches codegen.**
+**77/77 of the Minimum Viable Kernel file set reaches codegen.**
 
 This is the number to watch. The MVK set is
 [MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);
@@ -64,7 +64,7 @@ fall — `scripts/mvk-compiles.sh` fails the build if it does.
 Run `scripts/mvk-compiles.sh --list` to see what each remaining file is
 waiting on; the failures name the construct, not just the count.
 
-**72/72 of the same set reaches codegen for `aarch64`.**
+**77/77 of the same set reaches codegen for `aarch64`.**
 
 Kept as its own number rather than averaged in, because the two targets
 advance independently. The gap is not a compiler gap: the files that do
@@ -76,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 415 | 237,098 |
+| `kernel/` | 416 | 238,042 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -95,7 +95,7 @@ CI gate (`scripts/stub-check.sh`).
 | S1 | silent hlt-stub fallback + dead `.zig` references | `scripts/build.sh` | 0 | **CLOSED** |
 | S3 | the RX path parses Ethernet, demuxes on ethertype, validates IPv4 and dispatches to arp/icmp/udp | `kernel/src/net/netdev.home` | 0 | **CLOSED** |
 | S4 | Native filesystem is a 28-line import-satisfying stub | `kernel/src/fs/homefs.home` | 1 | open — blocks Phase 2 storage; Phase 6 `snapshot-rollback` |
-| S5 | chacha20 / poly1305 / curve25519 / blake2s are stubs | `kernel/src/crypto/` | 4 | open — blocks Phase 3 `pantry-local-install` (signing); later WireGuard |
+| S5 | chacha20 / poly1305 / curve25519 / blake2s are stubs | `kernel/src/crypto/` | 1 | open — blocks Phase 3 `pantry-local-install` (signing); later WireGuard |
 | S6 | USB core is 44 lines | `kernel/src/drivers/usb.home` | 1 | open — blocks Phase 7a (keyboards, storage on metal) |
 | S7 | ACPI is 71 lines | `kernel/src/drivers/acpi.home` | 1 | open — blocks Phase 7a (power, S3 suspend) |
 | S8 | `mmio_read32`/`mmio_write32` were inert, so every ARM64/Pi driver was too | `kernel/src/arch/arm64/arm64.home` | 0 | **CLOSED** |

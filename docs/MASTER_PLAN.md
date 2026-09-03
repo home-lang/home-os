@@ -574,6 +574,11 @@ These were referenced by files already in the set and were not listed, which is 
 - `kernel/src/net/arp.home`
 - `kernel/src/net/icmp.home`
 - `kernel/src/net/netdev.home`
+- `kernel/src/crypto/chacha20.home`
+- `kernel/src/crypto/poly1305.home`
+- `kernel/src/crypto/crypto_selftest.home`
+- `kernel/src/crypto/blake2s.home`
+- `kernel/src/crypto/sha256.home`
 
 **Link script**
 - `kernel/linker.ld`
