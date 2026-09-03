@@ -1,35 +1,478 @@
-// home-os Kernel - Curve25519 ECDH
+// home-os Kernel - X25519 key agreement (RFC 7748)
 //
-// STUB(S5): X25519 key agreement, RFC 7748 is not implemented. This primitive fails closed —
-// it returns zeros or an error rather than a wrong-but-plausible result.
-// Package signing needs it, so it blocks the Phase 3 pantry-local-install
-// gate, and WireGuard later. See MASTER_PLAN §7.
-// TODO(#11): This is a stub. Implement X25519 per RFC 7748. Currently
-// produces an all-zero output so handshakes fail closed instead of
-// silently negotiating bogus keys.
+// This module used to be STUB(S5): both entry points zeroed their output, so
+// every "shared secret" was 32 zero bytes and any protocol built on it was
+// talking to itself.
+//
+// Field elements live in GF(2^255 - 19), represented as ten limbs in
+// alternating radix 2^26 / 2^25. The five-limb radix-2^51 form is faster but
+// needs a 128-bit multiply, and Home has no such type; ten limbs keep every
+// product inside a signed 64-bit word with room for the sums around it.
+//
+// Limbs are i64 rather than u64 because subtraction is done without borrowing
+// and carry propagation relies on an arithmetic right shift of a possibly
+// negative limb — which is what `>>` on a signed type now emits.
 
-import "../core/foundation.home" as foundation
+const RADIX_MASK_26: i64 = 0x3FFFFFF
+const RADIX_MASK_25: i64 = 0x1FFFFFF
 
-// Compute the X25519 public key (or shared secret with `curve25519`).
-// `out` and `scalar` are 32-byte buffers; `base` is the basepoint
-// implied by `curve25519_base` (= 9).
-export fn curve25519_base(out: u64, scalar: u64) {
-  // TODO(#11): real implementation. Zero the output to make callers
-  // observably fail rather than treat a stubbed key as a real one.
+fn fe_zero(h: *[i64; 10]) {
   var i: u32 = 0
-  while i < 32 {
-    @as(*u8, @ptrFromInt(out + i)).* = 0
+  while i < 10 {
+    h[i] = 0
     i = i + 1
   }
-  foundation.serial_write_string("[curve25519] base stub invoked\n")
+}
+
+fn fe_one(h: *[i64; 10]) {
+  fe_zero(h)
+  h[0] = 1
+}
+
+fn fe_copy(h: *[i64; 10], f: *[i64; 10]) {
+  var i: u32 = 0
+  while i < 10 {
+    h[i] = f[i]
+    i = i + 1
+  }
+}
+
+fn fe_add(h: *[i64; 10], f: *[i64; 10], g: *[i64; 10]) {
+  var i: u32 = 0
+  while i < 10 {
+    h[i] = f[i] + g[i]
+    i = i + 1
+  }
+}
+
+fn fe_sub(h: *[i64; 10], f: *[i64; 10], g: *[i64; 10]) {
+  var i: u32 = 0
+  while i < 10 {
+    h[i] = f[i] - g[i]
+    i = i + 1
+  }
+}
+
+// Constant-time conditional swap. The ladder must not branch on a scalar bit,
+// so the choice is arithmetic: mask is all-ones when b is 1 and zero when it
+// is 0, and both elements are rewritten either way.
+fn fe_cswap(f: *[i64; 10], g: *[i64; 10], b: u32) {
+  let mask: i64 = 0 - @as(i64, b)
+  var i: u32 = 0
+  while i < 10 {
+    let x: i64 = mask & (f[i] ^ g[i])
+    f[i] = f[i] ^ x
+    g[i] = g[i] ^ x
+    i = i + 1
+  }
+}
+
+// Carry the limbs back into range. The odd-indexed limbs hold 25 bits and the
+// even ones 26; the carry out of the top limb re-enters at the bottom
+// multiplied by 19, which is what reduces modulo 2^255 - 19.
+fn fe_carry(h: *[i64; 10]) {
+  // Floor carries, not rounding ones. A rounding carry adds half the limb
+  // width before shifting, so a top limb just under 2^25 carries out a 1 that
+  // is not really there — and the fold of that phantom carry into limb 0
+  // subtracts a whole p from the value. That is legal in a signed limb
+  // representation but leaves the element one p below canonical, and
+  // fe_tobytes removes exactly one multiple of p, so it cannot get back.
+  //
+  // Flooring only carries on genuine overflow. A negative limb still borrows
+  // correctly, because an arithmetic shift right of a negative value floors
+  // toward minus infinity, which is what a borrow needs.
+  var i: u32 = 0
+  while i < 10 {
+    var c: i64 = 0
+    if (i % 2) == 0 {
+      c = h[i] >> 26
+      h[i] = h[i] - (c << 26)
+    } else {
+      c = h[i] >> 25
+      h[i] = h[i] - (c << 25)
+    }
+    if i == 9 {
+      h[0] = h[0] + c * 19
+    } else {
+      h[i + 1] = h[i + 1] + c
+    }
+    i = i + 1
+  }
+  // The 19x fold can push limb 0 out of range again, but only once.
+  let c: i64 = h[0] >> 26
+  h[0] = h[0] - (c << 26)
+  h[1] = h[1] + c
+}
+
+fn fe_mul(h: *[i64; 10], f: *[i64; 10], g: *[i64; 10]) {
+  var t: [i64; 19] = undefined
+  var i: u32 = 0
+  while i < 19 {
+    t[i] = 0
+    i = i + 1
+  }
+
+  // Schoolbook product into 19 columns. The odd-index doubling that the
+  // radix-2^25.5 layout requires is applied when both indices are odd,
+  // because two 25-bit limbs multiplied land one bit low.
+  i = 0
+  while i < 10 {
+    var j: u32 = 0
+    while j < 10 {
+      var p: i64 = f[i] * g[j]
+      if (i % 2) == 1 and (j % 2) == 1 {
+        p = p * 2
+      }
+      t[i + j] = t[i + j] + p
+      j = j + 1
+    }
+    i = i + 1
+  }
+
+  // Fold the columns above 2^255 back down; each is worth 19 in place.
+  i = 0
+  while i < 9 {
+    t[i] = t[i] + t[i + 10] * 19
+    i = i + 1
+  }
+
+  i = 0
+  while i < 10 {
+    h[i] = t[i]
+    i = i + 1
+  }
+  // A product limb reaches about 2^59 before carrying, and one pass cannot
+  // bring that inside 2^26: the carry out of the top folds back into the
+  // bottom multiplied by 19, which re-inflates the low limbs. Two passes are
+  // enough, and ref10 runs two interleaved chains for the same reason.
+  fe_carry(h)
+  fe_carry(h)
+}
+
+fn fe_sq(h: *[i64; 10], f: *[i64; 10]) {
+  fe_mul(h, f, f)
+}
+
+// Multiplication by the curve constant (A - 2) / 4 = 121665, which the ladder
+// needs once per bit.
+fn fe_mul121666(h: *[i64; 10], f: *[i64; 10]) {
+  var i: u32 = 0
+  while i < 10 {
+    h[i] = f[i] * 121666
+    i = i + 1
+  }
+  fe_carry(h)
+}
+
+// Inversion by Fermat: z^(p-2). The addition chain is the standard one for
+// 2^255 - 21; it costs 254 squarings and 11 multiplications.
+fn fe_invert(out: *[i64; 10], z: *[i64; 10]) {
+  var t0: [i64; 10] = undefined
+  var t1: [i64; 10] = undefined
+  var t2: [i64; 10] = undefined
+  var t3: [i64; 10] = undefined
+  var i: u32 = 0
+
+  fe_sq(&t0, z)
+  fe_sq(&t1, &t0)
+  fe_sq(&t1, &t1)
+  fe_mul(&t1, z, &t1)
+  fe_mul(&t0, &t0, &t1)
+  fe_sq(&t2, &t0)
+  fe_mul(&t1, &t1, &t2)
+  fe_sq(&t2, &t1)
+  i = 1
+  while i < 5 {
+    fe_sq(&t2, &t2)
+    i = i + 1
+  }
+  fe_mul(&t1, &t2, &t1)
+  fe_sq(&t2, &t1)
+  i = 1
+  while i < 10 {
+    fe_sq(&t2, &t2)
+    i = i + 1
+  }
+  fe_mul(&t2, &t2, &t1)
+  fe_sq(&t3, &t2)
+  i = 1
+  while i < 20 {
+    fe_sq(&t3, &t3)
+    i = i + 1
+  }
+  fe_mul(&t2, &t3, &t2)
+  fe_sq(&t2, &t2)
+  i = 1
+  while i < 10 {
+    fe_sq(&t2, &t2)
+    i = i + 1
+  }
+  fe_mul(&t1, &t2, &t1)
+  fe_sq(&t2, &t1)
+  i = 1
+  while i < 50 {
+    fe_sq(&t2, &t2)
+    i = i + 1
+  }
+  fe_mul(&t2, &t2, &t1)
+  fe_sq(&t3, &t2)
+  i = 1
+  while i < 100 {
+    fe_sq(&t3, &t3)
+    i = i + 1
+  }
+  fe_mul(&t2, &t3, &t2)
+  fe_sq(&t2, &t2)
+  i = 1
+  while i < 50 {
+    fe_sq(&t2, &t2)
+    i = i + 1
+  }
+  fe_mul(&t1, &t2, &t1)
+  fe_sq(&t1, &t1)
+  i = 1
+  while i < 5 {
+    fe_sq(&t1, &t1)
+    i = i + 1
+  }
+  fe_mul(out, &t1, &t0)
+}
+
+fn load_byte(base: u64, offset: u32): i64 {
+  return @as(i64, @as(u64, @as(*u8, @ptrFromInt(base + @as(u64, offset))).*))
+}
+
+// Unpack 32 little-endian bytes into ten limbs. The top bit is discarded:
+// RFC 7748 requires it be ignored on input, so a peer cannot smuggle a
+// non-canonical value past the reduction.
+fn fe_frombytes(h: *[i64; 10], s: u64) {
+  var acc: i64 = 0
+  var bits: u32 = 0
+  var byte: u32 = 0
+  var limb: u32 = 0
+
+  while limb < 10 {
+    var width: u32 = 25
+    if (limb % 2) == 0 {
+      width = 26
+    }
+    while bits < width {
+      var b: i64 = load_byte(s, byte)
+      if byte == 31 {
+        b = b & 0x7F
+      }
+      acc = acc | (b << bits)
+      bits = bits + 8
+      byte = byte + 1
+    }
+    if width == 26 {
+      h[limb] = acc & RADIX_MASK_26
+      acc = acc >> 26
+    } else {
+      h[limb] = acc & RADIX_MASK_25
+      acc = acc >> 25
+    }
+    bits = bits - width
+    limb = limb + 1
+  }
+}
+
+// Pack ten limbs into 32 little-endian bytes, fully reduced.
+//
+// This is ref10's sequence and the order matters. The `q` chain computes how
+// many times p divides into h by propagating a candidate carry all the way up;
+// adding 19*q then folds it out. Doing the reduction any less carefully leaves
+// a limb negative, and because `>>` on a signed value is arithmetic, a single
+// negative limb turns the whole serialization into trailing 0xFF bytes.
+fn fe_tobytes(s: u64, h: *[i64; 10]) {
+  var t: [i64; 10] = undefined
+  fe_copy(&t, h)
+  // No carry here on purpose. Every carry pass whose top limb overflows folds
+  // 19 back into limb 0, which subtracts p from the represented value — a
+  // legitimate move in a signed limb representation, but the q chain below
+  // removes exactly one multiple of p, so carrying again first puts the value
+  // further out of range than the chain can bring it back. Callers hand this
+  // function an already-carried element; fe_mul ends with two passes.
+  var q: i64 = (19 * t[9] + (1 << 24)) >> 25
+  q = (t[0] + q) >> 26
+  q = (t[1] + q) >> 25
+  q = (t[2] + q) >> 26
+  q = (t[3] + q) >> 25
+  q = (t[4] + q) >> 26
+  q = (t[5] + q) >> 25
+  q = (t[6] + q) >> 26
+  q = (t[7] + q) >> 25
+  q = (t[8] + q) >> 26
+  q = (t[9] + q) >> 25
+
+  // h - (2^255 - 19)q, which lands between 0 and 2^255 - 20.
+  t[0] = t[0] + 19 * q
+
+  var c: i64 = t[0] >> 26
+  t[1] = t[1] + c
+  t[0] = t[0] - (c << 26)
+  c = t[1] >> 25
+  t[2] = t[2] + c
+  t[1] = t[1] - (c << 25)
+  c = t[2] >> 26
+  t[3] = t[3] + c
+  t[2] = t[2] - (c << 26)
+  c = t[3] >> 25
+  t[4] = t[4] + c
+  t[3] = t[3] - (c << 25)
+  c = t[4] >> 26
+  t[5] = t[5] + c
+  t[4] = t[4] - (c << 26)
+  c = t[5] >> 25
+  t[6] = t[6] + c
+  t[5] = t[5] - (c << 25)
+  c = t[6] >> 26
+  t[7] = t[7] + c
+  t[6] = t[6] - (c << 26)
+  c = t[7] >> 25
+  t[8] = t[8] + c
+  t[7] = t[7] - (c << 25)
+  c = t[8] >> 26
+  t[9] = t[9] + c
+  t[8] = t[8] - (c << 26)
+  c = t[9] >> 25
+  t[9] = t[9] - (c << 25)
+
+  put_byte(s, 0, t[0])
+  put_byte(s, 1, t[0] >> 8)
+  put_byte(s, 2, t[0] >> 16)
+  put_byte(s, 3, (t[0] >> 24) | (t[1] << 2))
+  put_byte(s, 4, t[1] >> 6)
+  put_byte(s, 5, t[1] >> 14)
+  put_byte(s, 6, (t[1] >> 22) | (t[2] << 3))
+  put_byte(s, 7, t[2] >> 5)
+  put_byte(s, 8, t[2] >> 13)
+  put_byte(s, 9, (t[2] >> 21) | (t[3] << 5))
+  put_byte(s, 10, t[3] >> 3)
+  put_byte(s, 11, t[3] >> 11)
+  put_byte(s, 12, (t[3] >> 19) | (t[4] << 6))
+  put_byte(s, 13, t[4] >> 2)
+  put_byte(s, 14, t[4] >> 10)
+  put_byte(s, 15, t[4] >> 18)
+  put_byte(s, 16, t[5])
+  put_byte(s, 17, t[5] >> 8)
+  put_byte(s, 18, t[5] >> 16)
+  put_byte(s, 19, (t[5] >> 24) | (t[6] << 1))
+  put_byte(s, 20, t[6] >> 7)
+  put_byte(s, 21, t[6] >> 15)
+  put_byte(s, 22, (t[6] >> 23) | (t[7] << 3))
+  put_byte(s, 23, t[7] >> 5)
+  put_byte(s, 24, t[7] >> 13)
+  put_byte(s, 25, (t[7] >> 21) | (t[8] << 4))
+  put_byte(s, 26, t[8] >> 4)
+  put_byte(s, 27, t[8] >> 12)
+  put_byte(s, 28, (t[8] >> 20) | (t[9] << 6))
+  put_byte(s, 29, t[9] >> 2)
+  put_byte(s, 30, t[9] >> 10)
+  put_byte(s, 31, t[9] >> 18)
+}
+
+fn put_byte(base: u64, offset: u32, value: i64) {
+  @as(*u8, @ptrFromInt(base + @as(u64, offset))).* = @as(u8, @as(u64, value) & 0xFF)
+}
+
+// The Montgomery ladder. Every iteration does the same work whichever way the
+// bit goes; the choice is made by conditional swaps, never by a branch.
+fn scalarmult(out: u64, scalar: u64, point: u64) {
+  var clamped: [u8; 32] = undefined
+  var i: u32 = 0
+  while i < 32 {
+    clamped[i] = @as(*u8, @ptrFromInt(scalar + @as(u64, i))).*
+    i = i + 1
+  }
+  // RFC 7748 §5: clear the low three bits, clear the top bit, set bit 254.
+  // The first keeps the scalar in the prime-order subgroup; the last two fix
+  // its length so the ladder runs a constant number of iterations.
+  clamped[0] = clamped[0] & 248
+  clamped[31] = clamped[31] & 127
+  clamped[31] = clamped[31] | 64
+
+  var x1: [i64; 10] = undefined
+  fe_frombytes(&x1, point)
+
+  var x2: [i64; 10] = undefined
+  var z2: [i64; 10] = undefined
+  var x3: [i64; 10] = undefined
+  var z3: [i64; 10] = undefined
+  fe_one(&x2)
+  fe_zero(&z2)
+  fe_copy(&x3, &x1)
+  fe_one(&z3)
+
+  var a: [i64; 10] = undefined
+  var b: [i64; 10] = undefined
+  var c: [i64; 10] = undefined
+  var d: [i64; 10] = undefined
+  var e: [i64; 10] = undefined
+  var aa: [i64; 10] = undefined
+  var bb: [i64; 10] = undefined
+  var da: [i64; 10] = undefined
+  var cb: [i64; 10] = undefined
+  var t: [i64; 10] = undefined
+
+  var swap: u32 = 0
+  var pos: i64 = 254
+  while pos >= 0 {
+    let byte_index: u32 = @as(u32, @as(u64, pos >> 3))
+    let bit_index: u32 = @as(u32, @as(u64, pos & 7))
+    let bit: u32 = @as(u32, (@as(u64, clamped[byte_index]) >> bit_index) & 1)
+
+    swap = swap ^ bit
+    fe_cswap(&x2, &x3, swap)
+    fe_cswap(&z2, &z3, swap)
+    swap = bit
+
+    fe_sub(&a, &x2, &z2)
+    fe_add(&b, &x2, &z2)
+    fe_sub(&c, &x3, &z3)
+    fe_add(&d, &x3, &z3)
+    fe_mul(&da, &d, &a)
+    fe_mul(&cb, &c, &b)
+    fe_add(&t, &da, &cb)
+    fe_sq(&x3, &t)
+    fe_sub(&t, &da, &cb)
+    fe_sq(&e, &t)
+    fe_mul(&z3, &e, &x1)
+    fe_sq(&aa, &a)
+    fe_sq(&bb, &b)
+    fe_mul(&x2, &aa, &bb)
+    // E is (x2+z2)^2 - (x2-z2)^2, in that order. Taking the difference the
+    // other way negates it, and while E appears squared in one term of z2 it
+    // appears linearly in the other — so the sign does not cancel and the
+    // ladder silently computes a different point.
+    fe_sub(&e, &bb, &aa)
+    fe_mul121666(&t, &e)
+    fe_add(&t, &t, &aa)
+    fe_mul(&z2, &e, &t)
+
+    pos = pos - 1
+  }
+  fe_cswap(&x2, &x3, swap)
+  fe_cswap(&z2, &z3, swap)
+
+  var zinv: [i64; 10] = undefined
+  fe_invert(&zinv, &z2)
+  fe_mul(&x2, &x2, &zinv)
+  fe_tobytes(out, &x2)
+}
+
+// The base point is u = 9.
+export fn curve25519_base(out: u64, scalar: u64) {
+  var basepoint: [u8; 32] = undefined
+  var i: u32 = 0
+  while i < 32 {
+    basepoint[i] = 0
+    i = i + 1
+  }
+  basepoint[0] = 9
+  scalarmult(out, scalar, @intFromPtr(&basepoint))
 }
 
 export fn curve25519(out: u64, scalar: u64, point: u64) {
-  // TODO(#11): real implementation.
-  var i: u32 = 0
-  while i < 32 {
-    @as(*u8, @ptrFromInt(out + i)).* = 0
-    i = i + 1
-  }
-  foundation.serial_write_string("[curve25519] scalarmult stub invoked\n")
+  scalarmult(out, scalar, point)
 }
