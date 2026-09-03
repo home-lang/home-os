@@ -6,16 +6,20 @@
 
 ## Where the project actually is
 
-A Home-compiled kernel **boots and prints on the serial console**, but the
-full Appendix A kernel does not complete initialisation — see Boot status.
-Everything else in this repository is source that has been written and
-parsed, but never run.
+The Home-compiled kernel **boots and runs its full initialisation**: memory
+management, the scheduler, the security subsystems, drivers, filesystems,
+networking and system services all initialise on the serial console. The
+milestones are listed in `scripts/boot-milestones.txt` and checked on every
+build.
+
+What executes is the Appendix A set. The rest of this repository is source
+that has been written and parsed, but never run.
 
 ## Parse rate
 
 **415/415 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `2f1a7bf51`
+- Compiler: `home-lang/home` @ `2e00a4169`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -29,7 +33,7 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-❌ **`boot-full-kernel`: FAIL** — 51/55 init milestones reached; stopped before `remount: ok`
+✅ **`boot-full-kernel`: PASS** — 55/55 init milestones reached, through to the end of init
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
@@ -60,7 +64,7 @@ fall — `scripts/mvk-compiles.sh` fails the build if it does.
 Run `scripts/mvk-compiles.sh --list` to see what each remaining file is
 waiting on; the failures name the construct, not just the count.
 
-**62/70 of the same set reaches codegen for `aarch64`.**
+**70/70 of the same set reaches codegen for `aarch64`.**
 
 Kept as its own number rather than averaged in, because the two targets
 advance independently. The gap is not a compiler gap: the files that do
@@ -72,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 415 | 236,573 |
+| `kernel/` | 415 | 236,611 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
