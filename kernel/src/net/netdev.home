@@ -1,17 +1,384 @@
-// home-os Kernel - Network Device Abstraction
+// home-os Kernel - Network Device Abstraction and L2/L3 Demux
 //
-// STUB(S3): the RX path drops every frame it is handed. No packet has ever
-// reached the IP stack. Blocks the Phase 2 net-echo gate. See MASTER_PLAN §7.
-// TODO(#11): This is a stub providing the minimal surface area used by
-// drivers/wifi.home (netdev.receive_packet). Expand into a proper
-// netdev registry, RX/TX queues, and L2 demux when needed.
+// This module used to be STUB(S3): receive_packet() printed a line and
+// dropped the frame, so no packet had ever reached the IP stack. Every
+// protocol module below it — arp, icmp, udp, tcp — was complete-looking and
+// unreachable, because nothing ever handed them a packet.
+//
+// It now parses the Ethernet header, demultiplexes on ethertype, validates
+// the IPv4 header it is given, and dispatches to the protocol handler the
+// packet names. Frames it cannot make sense of are counted and dropped rather
+// than passed on half-parsed.
 
 import "../core/foundation.home" as foundation
+import "arp.home" as arp
+import "icmp.home" as icmp
+import "udp.home" as udp
 
-// Hand a received frame up to the stack. Currently a no-op so wifi
-// drivers can call it without crashing; real implementation would
-// route into the IP stack via socket.home.
+const ETH_HEADER_SIZE: u32 = 14
+const ETHERTYPE_IPV4: u16 = 0x0800
+const ETHERTYPE_ARP: u16 = 0x0806
+const ETHERTYPE_IPV6: u16 = 0x86DD
+
+const ARP_PAYLOAD_SIZE: u32 = 28
+const ARP_SENDER_MAC_OFFSET: u32 = 8
+const ARP_SENDER_IP_OFFSET: u32 = 14
+
+const IPV4_MIN_HEADER: u32 = 20
+const IPPROTO_ICMP: u8 = 1
+const IPPROTO_TCP: u8 = 6
+const IPPROTO_UDP: u8 = 17
+
+// Counters, not a struct, because the accessors below are the only way out of
+// this module and a caller that wants one number should not have to know the
+// shape of all of them.
+var frames_received: u64 = 0
+var frames_too_short: u64 = 0
+var arp_frames: u64 = 0
+var ipv4_frames: u64 = 0
+var ipv6_frames: u64 = 0
+var unknown_ethertype: u64 = 0
+var ipv4_malformed: u64 = 0
+var ipv4_bad_checksum: u64 = 0
+var icmp_dispatched: u64 = 0
+var udp_dispatched: u64 = 0
+var tcp_dropped: u64 = 0
+var unknown_protocol: u64 = 0
+
+// ============================================================================
+// Frame accessors
+//
+// Network byte order is big-endian, and a frame is not aligned to anything in
+// particular, so every multi-byte field is assembled a byte at a time. A wider
+// load would be both misaligned and byte-swapped.
+// ============================================================================
+
+fn byte_at(base: u64, offset: u32): u8 {
+  return @as(*u8, @ptrFromInt(base + @as(u64, offset))).*
+}
+
+fn be16(base: u64, offset: u32): u16 {
+  return (@as(u16, byte_at(base, offset)) << 8) | @as(u16, byte_at(base, offset + 1))
+}
+
+fn be32(base: u64, offset: u32): u32 {
+  return (@as(u32, byte_at(base, offset)) << 24)
+    | (@as(u32, byte_at(base, offset + 1)) << 16)
+    | (@as(u32, byte_at(base, offset + 2)) << 8)
+    | @as(u32, byte_at(base, offset + 3))
+}
+
+// The internet checksum of RFC 1071: the one's complement of the one's
+// complement sum of 16-bit words. Run over a header that already carries its
+// own checksum it yields zero, which is how a receiver verifies one.
+export fn inet_checksum(base: u64, length: u32): u16 {
+  var sum: u32 = 0
+  var i: u32 = 0
+  while i + 1 < length {
+    sum = sum + @as(u32, be16(base, i))
+    i = i + 2
+  }
+  // An odd trailing byte is padded on the right, not the left.
+  if i < length {
+    sum = sum + (@as(u32, byte_at(base, i)) << 8)
+  }
+  loop {
+    if (sum >> 16) == 0 { break }
+    sum = (sum & 0xFFFF) + (sum >> 16)
+  }
+  return @as(u16, (~sum) & 0xFFFF)
+}
+
+// ============================================================================
+// Demux
+// ============================================================================
+
+// Hand a received frame up to the stack.
+//
+// `buffer` points at the first byte of the Ethernet header and `length` counts
+// from there, so a driver passes what it received without adjusting anything.
 export fn receive_packet(buffer: u64, length: u32) {
-  // TODO(#11): dispatch to the L2/L3 demux instead of dropping.
-  foundation.serial_write_string("[netdev] receive_packet stub\n")
+  frames_received = frames_received + 1
+
+  if length < ETH_HEADER_SIZE {
+    frames_too_short = frames_too_short + 1
+    return
+  }
+
+  let ethertype: u16 = be16(buffer, 12)
+  let payload: u64 = buffer + @as(u64, ETH_HEADER_SIZE)
+  let payload_len: u32 = length - ETH_HEADER_SIZE
+
+  if ethertype == ETHERTYPE_ARP {
+    handle_arp(payload, payload_len)
+    return
+  }
+  if ethertype == ETHERTYPE_IPV4 {
+    handle_ipv4(payload, payload_len)
+    return
+  }
+  if ethertype == ETHERTYPE_IPV6 {
+    // ipv6.home is a 114-line skeleton with no input path, so an IPv6 frame
+    // is counted and dropped rather than handed somewhere that would ignore
+    // it less visibly.
+    ipv6_frames = ipv6_frames + 1
+    return
+  }
+  unknown_ethertype = unknown_ethertype + 1
+}
+
+// An ARP packet teaches us the sender's mapping whether it is a request or a
+// reply, so the cache is updated from either. arp_add_entry() takes the
+// address of six MAC bytes, not a packed integer.
+fn handle_arp(base: u64, length: u32) {
+  if length < ARP_PAYLOAD_SIZE {
+    frames_too_short = frames_too_short + 1
+    return
+  }
+  arp_frames = arp_frames + 1
+  let sender_ip: u32 = be32(base, ARP_SENDER_IP_OFFSET)
+  arp.arp_add_entry(sender_ip, base + @as(u64, ARP_SENDER_MAC_OFFSET))
+}
+
+fn handle_ipv4(base: u64, length: u32) {
+  if length < IPV4_MIN_HEADER {
+    frames_too_short = frames_too_short + 1
+    return
+  }
+
+  let version_ihl: u8 = byte_at(base, 0)
+  if (version_ihl >> 4) != 4 {
+    ipv4_malformed = ipv4_malformed + 1
+    return
+  }
+
+  // IHL counts 32-bit words. Below five it cannot describe a header; above the
+  // frame it would send every later read off the end.
+  let header_len: u32 = @as(u32, version_ihl & 0x0F) * 4
+  if header_len < IPV4_MIN_HEADER or header_len > length {
+    ipv4_malformed = ipv4_malformed + 1
+    return
+  }
+
+  // Trust total_length over the frame length: Ethernet pads short frames to 60
+  // bytes, so the frame is routinely longer than the datagram inside it. It
+  // may never be shorter.
+  let total_len: u32 = @as(u32, be16(base, 2))
+  if total_len < header_len or total_len > length {
+    ipv4_malformed = ipv4_malformed + 1
+    return
+  }
+
+  if inet_checksum(base, header_len) != 0 {
+    ipv4_bad_checksum = ipv4_bad_checksum + 1
+    return
+  }
+
+  ipv4_frames = ipv4_frames + 1
+
+  let protocol: u8 = byte_at(base, 9)
+  let src_ip: u32 = be32(base, 12)
+  let dst_ip: u32 = be32(base, 16)
+  let payload: *u8 = @as(*u8, @ptrFromInt(base + @as(u64, header_len)))
+  let payload_len: u32 = total_len - header_len
+
+  if protocol == IPPROTO_ICMP {
+    icmp_dispatched = icmp_dispatched + 1
+    icmp.icmp_input(src_ip, dst_ip, payload, payload_len)
+    return
+  }
+  if protocol == IPPROTO_UDP {
+    udp_dispatched = udp_dispatched + 1
+    udp.udp_input(src_ip, dst_ip, payload, payload_len)
+    return
+  }
+  if protocol == IPPROTO_TCP {
+    // STUB(S11): tcp.home has no segment-input entry point — tcp_receive() is
+    // a socket-level read, not an ingress path — so a TCP segment is counted
+    // and dropped here. Connections cannot be established from the wire until
+    // that handler exists.
+    tcp_dropped = tcp_dropped + 1
+    return
+  }
+  unknown_protocol = unknown_protocol + 1
+}
+
+// ============================================================================
+// Counters
+// ============================================================================
+
+export fn netdev_frames_received(): u64 { return frames_received }
+export fn netdev_frames_too_short(): u64 { return frames_too_short }
+export fn netdev_arp_frames(): u64 { return arp_frames }
+export fn netdev_ipv4_frames(): u64 { return ipv4_frames }
+export fn netdev_unknown_ethertype(): u64 { return unknown_ethertype }
+export fn netdev_ipv4_malformed(): u64 { return ipv4_malformed }
+export fn netdev_ipv4_bad_checksum(): u64 { return ipv4_bad_checksum }
+export fn netdev_icmp_dispatched(): u64 { return icmp_dispatched }
+export fn netdev_udp_dispatched(): u64 { return udp_dispatched }
+export fn netdev_tcp_dropped(): u64 { return tcp_dropped }
+
+// ============================================================================
+// Boot self-test
+//
+// MASTER_PLAN §7 rule 1 does not let a stub close without a runtime test
+// exercising it. This builds real frames in memory and drives them through
+// receive_packet() — the same entry a driver calls — then checks both that
+// this module demultiplexed them and that the protocol handler underneath
+// accepted them. Counting only what netdev did would prove the demux picked a
+// branch, not that anything downstream could use the result.
+//
+// Each check prints only on success, so a regression drops a boot milestone.
+// ============================================================================
+
+var test_frame: [u8; 128] = undefined
+
+fn frame_base(): u64 {
+  return @intFromPtr(&test_frame)
+}
+
+fn put8(offset: u32, value: u8) {
+  @as(*u8, @ptrFromInt(frame_base() + @as(u64, offset))).* = value
+}
+
+fn put16(offset: u32, value: u16) {
+  put8(offset, @as(u8, (value >> 8) & 0xFF))
+  put8(offset + 1, @as(u8, value & 0xFF))
+}
+
+fn put32(offset: u32, value: u32) {
+  put8(offset, @as(u8, (value >> 24) & 0xFF))
+  put8(offset + 1, @as(u8, (value >> 16) & 0xFF))
+  put8(offset + 2, @as(u8, (value >> 8) & 0xFF))
+  put8(offset + 3, @as(u8, value & 0xFF))
+}
+
+fn clear_frame() {
+  var i: u32 = 0
+  while i < 128 {
+    put8(i, 0)
+    i = i + 1
+  }
+}
+
+// dst = broadcast, src = 52:54:00:12:34:56 (QEMU's usual guest MAC).
+fn write_eth_header(ethertype: u16) {
+  var i: u32 = 0
+  while i < 6 {
+    put8(i, 0xFF)
+    i = i + 1
+  }
+  put8(6, 0x52)
+  put8(7, 0x54)
+  put8(8, 0x00)
+  put8(9, 0x12)
+  put8(10, 0x34)
+  put8(11, 0x56)
+  put16(12, ethertype)
+}
+
+// A 20-byte IPv4 header with its checksum filled in from the bytes actually
+// written, rather than a constant that would silently rot if a field changed.
+fn write_ipv4_header(protocol: u8, payload_len: u32, src_ip: u32, dst_ip: u32) {
+  let base: u32 = ETH_HEADER_SIZE
+  put8(base, 0x45)                                  // version 4, IHL 5
+  put8(base + 1, 0)                                 // DSCP/ECN
+  put16(base + 2, @as(u16, IPV4_MIN_HEADER + payload_len))
+  put16(base + 4, 0x1234)                           // identification
+  put16(base + 6, 0)                                // flags/fragment offset
+  put8(base + 8, 64)                                // TTL
+  put8(base + 9, protocol)
+  put16(base + 10, 0)                               // checksum, computed below
+  put32(base + 12, src_ip)
+  put32(base + 16, dst_ip)
+  put16(base + 10, inet_checksum(frame_base() + @as(u64, base), IPV4_MIN_HEADER))
+}
+
+export fn netdev_selftest() {
+  let arp_before: u64 = arp_frames
+  let icmp_before: u64 = icmp.icmp_echo_replies_received()
+  let udp_before: u64 = udp.udp_datagrams_received()
+  let short_before: u64 = frames_too_short
+  let bad_sum_before: u64 = ipv4_bad_checksum
+
+  // --- 1. An ARP reply teaches the cache a mapping -------------------------
+  // 10.0.2.15 -> 52:54:00:12:34:56
+  clear_frame()
+  write_eth_header(ETHERTYPE_ARP)
+  let arp_base: u32 = ETH_HEADER_SIZE
+  put16(arp_base, 1)                                // hardware type: Ethernet
+  put16(arp_base + 2, ETHERTYPE_IPV4)               // protocol type
+  put8(arp_base + 4, 6)                             // hardware size
+  put8(arp_base + 5, 4)                             // protocol size
+  put16(arp_base + 6, 2)                            // opcode: reply
+  put8(arp_base + 8, 0x52)
+  put8(arp_base + 9, 0x54)
+  put8(arp_base + 10, 0x00)
+  put8(arp_base + 11, 0x12)
+  put8(arp_base + 12, 0x34)
+  put8(arp_base + 13, 0x56)
+  put32(arp_base + 14, 0x0A00020F)                  // sender 10.0.2.15
+  put32(arp_base + 24, 0x0A000202)                  // target 10.0.2.2
+  receive_packet(frame_base(), ETH_HEADER_SIZE + ARP_PAYLOAD_SIZE)
+
+  if arp_frames == arp_before + 1 and arp.arp_lookup(0x0A00020F) != 0 {
+    foundation.serial_write_string("[netdev] ARP demuxed, cache learned 10.0.2.15\n")
+  }
+
+  // --- 2. IPv4 carrying ICMP ------------------------------------------------
+  // An echo *reply*, not a request: a request would make icmp.home transmit,
+  // and this test runs with no NIC behind it.
+  clear_frame()
+  write_eth_header(ETHERTYPE_IPV4)
+  write_ipv4_header(IPPROTO_ICMP, 8, 0x0A000202, 0x0A00020F)
+  let icmp_base: u32 = ETH_HEADER_SIZE + IPV4_MIN_HEADER
+  put8(icmp_base, 0)                                // type: echo reply
+  put8(icmp_base + 1, 0)                            // code
+  put16(icmp_base + 2, 0)                           // checksum, computed below
+  put16(icmp_base + 4, 0x0001)                      // identifier
+  put16(icmp_base + 6, 0x0001)                      // sequence
+  put16(icmp_base + 2, inet_checksum(frame_base() + @as(u64, icmp_base), 8))
+  receive_packet(frame_base(), ETH_HEADER_SIZE + IPV4_MIN_HEADER + 8)
+
+  if icmp.icmp_echo_replies_received() == icmp_before + 1 {
+    foundation.serial_write_string("[netdev] IPv4/ICMP demuxed and accepted by icmp\n")
+  }
+
+  // --- 3. IPv4 carrying UDP -------------------------------------------------
+  // Checksum left zero, which IPv4 permits and udp_input() skips.
+  clear_frame()
+  write_eth_header(ETHERTYPE_IPV4)
+  write_ipv4_header(IPPROTO_UDP, 10, 0x0A000202, 0x0A00020F)
+  let udp_base: u32 = ETH_HEADER_SIZE + IPV4_MIN_HEADER
+  put16(udp_base, 4096)                             // source port
+  put16(udp_base + 2, 7)                            // destination port: echo
+  put16(udp_base + 4, 10)                           // length: header + 2 bytes
+  put16(udp_base + 6, 0)                            // checksum: none
+  put8(udp_base + 8, 0x68)                          // 'h'
+  put8(udp_base + 9, 0x69)                          // 'i'
+  receive_packet(frame_base(), ETH_HEADER_SIZE + IPV4_MIN_HEADER + 10)
+
+  if udp.udp_datagrams_received() == udp_before + 1 {
+    foundation.serial_write_string("[netdev] IPv4/UDP demuxed and accepted by udp\n")
+  }
+
+  // --- 4. A frame too short to hold an Ethernet header ----------------------
+  clear_frame()
+  receive_packet(frame_base(), 8)
+  if frames_too_short == short_before + 1 {
+    foundation.serial_write_string("[netdev] runt frame rejected, not dispatched\n")
+  }
+
+  // --- 5. A corrupted IPv4 header checksum ---------------------------------
+  // Same datagram as case 3 with one flipped bit in the checksum, to show the
+  // validation rejects rather than decorates.
+  clear_frame()
+  write_eth_header(ETHERTYPE_IPV4)
+  write_ipv4_header(IPPROTO_UDP, 10, 0x0A000202, 0x0A00020F)
+  put8(ETH_HEADER_SIZE + 10, byte_at(frame_base(), ETH_HEADER_SIZE + 10) ^ 0xFF)
+  receive_packet(frame_base(), ETH_HEADER_SIZE + IPV4_MIN_HEADER + 10)
+
+  if ipv4_bad_checksum == bad_sum_before + 1 {
+    foundation.serial_write_string("[netdev] bad IPv4 checksum rejected\n")
+  }
 }
