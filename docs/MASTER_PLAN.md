@@ -257,6 +257,8 @@ Bring-up order (each stage proven over serial before the next): serial-first deb
 | S6 | USB core is 44 lines | `kernel/src/drivers/usb.home` | P2 | Phase 7a (keyboards, storage on metal) |
 | S7 | ACPI is 71 lines | `kernel/src/drivers/acpi.home` | P2 | Phase 7a (power, S3 suspend) |
 | S8 | **CLOSED** — `mmio_read32`/`mmio_write32` were inert, so every ARM64/Pi driver was too | `kernel/src/arch/arm64/arm64.home` | P3 | Phase 7b entirely |
+| S9 | Port-I/O wrappers halt the machine on ARM64 — the architecture has no I/O address space, so calling one is always a bug | `kernel/src/core/foundation.home` | P3 | Phase 7b (only reachable from ARM64 code paths) |
+| S10 | SMAP's ARM64 counterpart (the PAN bit in PSTATE) is not set up, so `asm_stac`/`asm_clac` are no-ops there and the kernel can always reach user memory | `kernel/src/core/foundation.home` | P3 | Phase 7b hardening |
 
 **Register rules:**
 1. A stub may not be closed without a runtime test exercising it.
