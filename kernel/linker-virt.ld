@@ -38,11 +38,16 @@ SECTIONS
     }
 
     /* boot.s zeroes everything between these two symbols, so they must
-       bracket .bss exactly. Both are 8-byte aligned because the zeroing loop
-       stores a word at a time. */
-    . = ALIGN(8);
+       bracket .bss exactly. The zeroing loop stores a word at a time, so 8
+       would satisfy it — but objects in .bss carry their own alignment
+       requests, and the section has to be aligned to the strictest of them or
+       every variable inside it shifts off its required boundary. foundation.home
+       asks for 256, and with an 8-aligned section the linker warned that it
+       could not honour that. Page alignment covers 256 and anything short of a
+       page that a future module asks for. */
+    . = ALIGN(4K);
     __bss_start = .;
-    .bss ALIGN(8) : {
+    .bss ALIGN(4K) : {
         *(.bss)
         *(.bss.*)
         *(COMMON)
