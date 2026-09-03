@@ -24,20 +24,50 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 TESTS_SKIPPED=0
 
+# Compile a module and require the backend to lower all of it.
+#
+# This used to print PASS when the file merely existed, which is how
+# crypto/sha256 sat here reporting success for as long as it has existed while
+# computing wrong digests. Existence is not a test, and a suite that says
+# "87/87 passed" when it has run nothing is worse than no suite: it is cited as
+# evidence.
+#
+# Compiling is still a weak check — it catches nothing about behaviour — so it
+# is named for what it does. Behavioural checks belong in the boot gate, where
+# scripts/boot-milestones.txt drives real inputs through real code and compares
+# against published vectors.
 test_module() {
     local module=$1
     local test_name=$2
-    echo -n "  Testing ${module}... "
+    echo -n "  Compiling ${module}... "
 
-    # Run module-specific tests
-    # TODO: Implement actual test execution when Home compiler ready
-    if [ -f "$PROJECT_ROOT/kernel/src/${module}.home" ]; then
+    local src="$PROJECT_ROOT/kernel/src/${module}.home"
+    if [ ! -f "$src" ]; then
+        echo -e "${YELLOW}SKIP${NC} (file not found)"
+        TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
+        return
+    fi
+
+    if [ -z "${HOME_COMPILER:-}" ] || [ ! -x "${HOME_COMPILER:-}" ]; then
+        echo -e "${YELLOW}SKIP${NC} (set HOME_COMPILER to compile)"
+        TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
+        return
+    fi
+
+    local out
+    out="$(mktemp)"
+    if "$HOME_COMPILER" build "$src" --kernel -o "$out" >/dev/null 2>&1 &&
+       ! grep -q '^# ERROR' "$out"; then
         echo -e "${GREEN}PASS${NC}"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        echo -e "${YELLOW}SKIP${NC} (file not found)"
-        TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
+        echo -e "${RED}FAIL${NC}"
+        # Name what the backend could not lower, rather than only that it did
+        # not work.
+        grep -m3 '^# ERROR' "$out" 2>/dev/null | sed 's/^/      /'
+        TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
+    rm -f "$out"
 }
 
 # ============================================================================
