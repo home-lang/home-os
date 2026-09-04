@@ -57,14 +57,17 @@ test_module() {
     local out
     out="$(mktemp)"
     if "$HOME_COMPILER" build "$src" --kernel -o "$out" >/dev/null 2>&1 &&
-       ! grep -q '^# ERROR' "$out"; then
+       ! grep -qE '# (ERROR|unsupported)' "$out"; then
         echo -e "${GREEN}PASS${NC}"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         echo -e "${RED}FAIL${NC}"
         # Name what the backend could not lower, rather than only that it did
         # not work.
-        grep -m3 '^# ERROR' "$out" 2>/dev/null | sed 's/^/      /'
+        # Unanchored, matching scripts/mvk-compiles.sh. The backend indents
+        # some markers, and an anchored pattern reads those as a clean
+        # compile — which is the same shape of hole this function replaced.
+        grep -m3 -E '# (ERROR|unsupported)' "$out" 2>/dev/null | sed 's/^/      /'
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
     rm -f "$out"
