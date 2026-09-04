@@ -33,7 +33,7 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-✅ **`boot-full-kernel`: PASS** — 79/79 init milestones reached, through to the end of init
+✅ **`boot-full-kernel`: PASS** — 82/82 init milestones reached, through to the end of init
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
@@ -76,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 416 | 239,921 |
+| `kernel/` | 416 | 240,078 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -96,7 +96,7 @@ CI gate (`scripts/stub-check.sh`).
 | S3 | the RX path parses Ethernet, demuxes on ethertype, validates IPv4 and dispatches to arp/icmp/udp | `kernel/src/net/netdev.home` | 0 | **CLOSED** |
 | S4 | Native filesystem is a 33-line import-satisfying stub. The P1 design doc is **done** (`docs/design/homefs.md`); the P2 CoW implementation is not started | `kernel/src/fs/homefs.home` | 1 | open — blocks Phase 2 storage; Phase 6 `snapshot-rollback` |
 | S5 | chacha20, poly1305, blake2s and curve25519 are implemented and checked against the vectors in RFC 8439, RFC 7693 and RFC 7748 | `kernel/src/crypto/` | 0 | **CLOSED** |
-| S6 | No class drivers and no interrupt or bulk endpoints, so there is still no USB keyboard and no USB storage. The host-controller driver is done: discovery, bring-up, command ring, port reset, Enable Slot, Address Device, and control transfers on endpoint 0 — the boot gate enumerates a device and reads its descriptor | `kernel/src/drivers/usb.home` | 2 | open — blocks Phase 7a (keyboards, storage on metal) |
+| S6 | No class drivers and no data moved on a non-control endpoint, so there is still no USB keyboard and no USB storage. The host-controller driver is done: discovery, bring-up, command ring, port reset, Enable Slot, Address Device, control transfers, configuration descriptor parsing, SET_CONFIGURATION and Configure Endpoint — the boot gate enumerates a device, reads its descriptors and configures its interrupt endpoint | `kernel/src/drivers/usb.home` | 2 | open — blocks Phase 7a (keyboards, storage on metal) |
 | S7 | No AML interpreter and no power-state transitions, so there is still no S3 suspend/resume. Table discovery is done: RSDP from both permitted locations, checksums verified, RSDT/XSDT walked, FADT and MADT parsed | `kernel/src/drivers/acpi.home` | 1 | open — blocks Phase 7a (power, S3 suspend) |
 | S8 | `mmio_read32`/`mmio_write32` were inert, so every ARM64/Pi driver was too | `kernel/src/arch/arm64/arm64.home` | 0 | **CLOSED** |
 | S9 | Port-I/O wrappers halt the machine on ARM64 — the architecture has no I/O address space, so calling one is always a bug | `kernel/src/core/foundation.home` | 1 | open — blocks Phase 7b (only reachable from ARM64 code paths) |
