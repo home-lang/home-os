@@ -1,47 +1,181 @@
-// home-os USB Driver (UHCI/EHCI/XHCI)
+// home-os USB — xHCI host controller discovery
 //
-// STUB(S6): 44 lines of descriptor structs — no host-controller driver, no
-// enumeration, no transfers. On real hardware this means no USB keyboard and
-// no USB storage. Blocks Phase 7a (x86-64 metal). See MASTER_PLAN §7.
+// STUB(S6): there is no enumeration and no transfers. The command ring, event
+// ring and device-context base array are not set up, so no device is
+// addressed and no data moves. On real hardware that still means no USB
+// keyboard and no USB storage. Blocks Phase 7a. MASTER_PLAN §7.
+//
+// What is implemented is the layer underneath: finding the controller on the
+// PCI bus, mapping its register window, and reading the capability registers
+// that say how many ports and device slots it has. Ring setup needs those
+// numbers — the device-context base array is sized by MaxSlots — so this is
+// the part that has to be right first.
 
 import "../core/foundation.home" as foundation
+import "pci.home" as pci
+import "../core/memory.home" as memory
 
-// USB device descriptor
-struct USBDevice {
-  address: u8,
-  vendor_id: u16,
-  product_id: u16,
-  class: u8,
-  subclass: u8,
-  protocol: u8,
-  max_packet_size: u16
+// A USB controller is class 0x0C (serial bus), subclass 0x03 (USB); the
+// programming interface distinguishes the four generations, and 0x30 is xHCI.
+const PCI_CLASS_SERIAL_BUS: u8 = 0x0C
+const PCI_SUBCLASS_USB: u8 = 0x03
+const PCI_PROGIF_UHCI: u8 = 0x00
+const PCI_PROGIF_OHCI: u8 = 0x10
+const PCI_PROGIF_EHCI: u8 = 0x20
+const PCI_PROGIF_XHCI: u8 = 0x30
+
+const PCI_OFFSET_PROGIF: u8 = 0x09
+const PCI_OFFSET_SUBCLASS: u8 = 0x0A
+const PCI_OFFSET_CLASS: u8 = 0x0B
+const PCI_OFFSET_COMMAND: u8 = 0x04
+
+// Capability registers, at the base of the register window.
+const XHCI_CAPLENGTH: u32 = 0x00
+const XHCI_HCIVERSION: u32 = 0x02
+const XHCI_HCSPARAMS1: u32 = 0x04
+const XHCI_HCCPARAMS1: u32 = 0x10
+
+// Operational registers, at base + CAPLENGTH.
+const XHCI_USBCMD: u32 = 0x00
+const XHCI_USBSTS: u32 = 0x04
+const XHCI_PORTSC_BASE: u32 = 0x400
+const XHCI_PORT_STRIDE: u32 = 0x10
+
+const USBSTS_HCHALTED: u32 = 0x00000001
+const PORTSC_CCS: u32 = 0x00000001      // current connect status
+
+var controller_pci: u64 = 0
+var register_base: u64 = 0
+var operational_base: u64 = 0
+var hci_version: u32 = 0
+var max_ports: u32 = 0
+var max_slots: u32 = 0
+var controller_found: u32 = 0
+var ports_connected: u32 = 0
+
+// Register reads go through the architecture-neutral MMIO intrinsic rather
+// than a plain load: it is what tells the backend this access must not be
+// reordered or elided, which on ARM64 also emits the barrier.
+fn read32(addr: u64): u32 {
+  return arch_mmio_read32(addr)
 }
 
-var usb_devices: [USBDevice; 16] = undefined
-var usb_device_count: u32 = 0
-
-export fn usb_init() {
-  usb_device_count = 0
-  foundation.serial_write_string("[USB] Initialized\n")
-}
-
-export fn usb_enumerate(): u32 {
-  // Stub: would scan USB buses
-  foundation.serial_write_string("[USB] Enumerating devices...\n")
-  return usb_device_count
-}
-
-export fn usb_get_device(index: u32): u64 {
-  if index >= usb_device_count { return 0 }
-  return @ptrFromInt(usb_devices[index])
-}
-
-export fn usb_send_control(device: u8, request: u8, value: u16, index: u16, data: u64, length: u16): u32 {
-  // Stub: would send USB control transfer
+// Find the first xHCI controller on the bus. Returns the PCI device handle,
+// or 0. Reported by class rather than by vendor and device id, because the
+// class is what the specification fixes — a vendor table would find QEMU's
+// controller and miss every real one.
+fn find_xhci(): u64 {
+  var i: u32 = 0
+  let count: u32 = pci.pci_get_device_count()
+  while i < count {
+    let dev: u64 = pci.pci_get_device(i)
+    if dev != 0 {
+      let class: u8 = pci.pci_read_config8(dev, PCI_OFFSET_CLASS)
+      let subclass: u8 = pci.pci_read_config8(dev, PCI_OFFSET_SUBCLASS)
+      let progif: u8 = pci.pci_read_config8(dev, PCI_OFFSET_PROGIF)
+      if class == PCI_CLASS_SERIAL_BUS and subclass == PCI_SUBCLASS_USB and progif == PCI_PROGIF_XHCI {
+        return dev
+      }
+    }
+    i = i + 1
+  }
   return 0
 }
 
-export fn usb_bulk_transfer(device: u8, endpoint: u8, data: u64, length: u32): u32 {
-  // Stub: would perform bulk transfer
+// The register window sits above the kernel's identity map, so its pages have
+// to be mapped before the first read. Mapping one page and hoping is how a
+// driver reads the first capability register and faults on the operational
+// ones: the window is 64 KiB on every controller this has been run against.
+fn map_registers(base: u64, bytes: u64): u32 {
+  var mapped: u64 = 0
+  while mapped < bytes {
+    if memory.vmm_map_page(base + mapped, base + mapped, 3) != 0 {
+      return 0
+    }
+    mapped = mapped + 4096
+  }
+  return 1
+}
+
+export fn usb_init() {
+  controller_pci = find_xhci()
+  if controller_pci == 0 {
+    foundation.serial_write_string("[USB] no xHCI controller on the PCI bus\n")
+    return
+  }
+
+  // BAR0 is a 64-bit memory BAR on xHCI; its high half is BAR1. Reading only
+  // the low dword works until firmware places the window above 4 GB.
+  let bar_low: u64 = @as(u64, pci.pci_read_bar(controller_pci, 0))
+  let bar_high: u64 = @as(u64, pci.pci_read_bar(controller_pci, 1))
+  register_base = bar_low | (bar_high << 32)
+  if register_base == 0 {
+    foundation.serial_write_string("[USB] xHCI BAR is unassigned\n")
+    return
+  }
+
+  // Bus mastering and memory space have to be enabled before the controller
+  // will answer, and firmware does not always leave them on.
+  let command: u16 = pci.pci_read_config16(controller_pci, PCI_OFFSET_COMMAND)
+  pci.pci_write_config16(controller_pci, PCI_OFFSET_COMMAND, command | 0x0006)
+
+  if map_registers(register_base, 65536) == 0 {
+    foundation.serial_write_string("[USB] could not map the xHCI register window\n")
+    return
+  }
+
+  // Read the capability header as one dword and take the fields out of it.
+  // An MMIO window is not memory: a controller only has to decode the access
+  // widths its registers are defined at, and xHCI defines these as 32-bit.
+  // Byte and word reads of this window return zero on QEMU, which reads as a
+  // controller reporting version 0 rather than as an access the device
+  // declined to answer.
+  let cap_header: u32 = read32(register_base + @as(u64, XHCI_CAPLENGTH))
+  let cap_length: u32 = cap_header & 0xFF
+  hci_version = (cap_header >> 16) & 0xFFFF
+  operational_base = register_base + @as(u64, cap_length)
+
+  // HCSPARAMS1 packs the three numbers that size everything above this layer:
+  // slots in [7:0], interrupters in [18:8], ports in [31:24].
+  let hcsparams1: u32 = read32(register_base + @as(u64, XHCI_HCSPARAMS1))
+  max_slots = hcsparams1 & 0xFF
+  max_ports = (hcsparams1 >> 24) & 0xFF
+
+  // Count ports with something plugged in. Port registers are indexed from 1
+  // and stride 0x10 from the operational base plus 0x400.
+  ports_connected = 0
+  var port: u32 = 0
+  while port < max_ports {
+    let portsc: u32 = read32(operational_base + @as(u64, XHCI_PORTSC_BASE + port * XHCI_PORT_STRIDE))
+    if (portsc & PORTSC_CCS) != 0 {
+      ports_connected = ports_connected + 1
+    }
+    port = port + 1
+  }
+
+  controller_found = 1
+  foundation.serial_write_string("[USB] xHCI ")
+  foundation.serial_write_hex_word(@as(u16, hci_version))
+  foundation.serial_write_string(", ")
+  foundation.serial_write_u64(@as(u64, max_ports))
+  foundation.serial_write_string(" ports, ")
+  foundation.serial_write_u64(@as(u64, max_slots))
+  foundation.serial_write_string(" slots\n")
+}
+
+export fn usb_controller_found(): u32 { return controller_found }
+export fn usb_hci_version(): u32 { return hci_version }
+export fn usb_max_ports(): u32 { return max_ports }
+export fn usb_max_slots(): u32 { return max_slots }
+export fn usb_ports_connected(): u32 { return ports_connected }
+
+// Whether the controller is halted. After reset and before the ring setup
+// STUB(S6) still lacks, a controller is halted — reporting it is how a caller
+// can tell "not started yet" from "started and wedged".
+export fn usb_is_halted(): u32 {
+  if controller_found == 0 { return 1 }
+  if (read32(operational_base + @as(u64, XHCI_USBSTS)) & USBSTS_HCHALTED) != 0 {
+    return 1
+  }
   return 0
 }
