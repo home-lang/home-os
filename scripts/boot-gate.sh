@@ -22,10 +22,14 @@ MILESTONES="$REPO_ROOT/scripts/boot-milestones.txt"
 
 VERBOSE=0
 KEEP=0
+BUILD_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --verbose) VERBOSE=1 ;;
         --keep) KEEP=1 ;;
+        # Build the kernel and stop. scripts/crash-gate.sh uses this so both
+        # gates test the same image rather than two builds that drifted apart.
+        --build-only) BUILD_ONLY=1 ;;
     esac
 done
 
@@ -99,6 +103,12 @@ if ! "$ZIG" build-exe "$REPO_ROOT/kernel/src/boot.s" "$REPO_ROOT/kernel/src/idt_
     exit 1
 fi
 "$ZIG" objcopy -O binary "$workdir/boot-gate.elf" "$workdir/boot-gate.bin"
+
+if [ "$BUILD_ONLY" = 1 ]; then
+    cp "$workdir/boot-gate.bin" "${BUILD_OUT:-$workdir/boot-gate.bin}"
+    echo "boot-gate: built ${BUILD_OUT:-$workdir/boot-gate.bin}"
+    exit 0
+fi
 
 # Build the initramfs the kernel is handed as a boot module. Its contents are
 # what `ls` and `cat` are asserted against, so they live in the repo rather
@@ -187,6 +197,11 @@ with open(sys.argv[1], "wb") as f:
     f.write(b"\x00" * (2 * 1024 * 1024 - 512))
 USBIMG
 
+# A blank second drive for homefs. The first stays ext2, so the two
+# filesystems are tested against the same machine without sharing a disk.
+fsdisk="$workdir/homefs.img"
+dd if=/dev/zero of="$fsdisk" bs=1048576 count=16 >/dev/null 2>&1
+
 disk="$workdir/disk.img"
 if [ -x "$(command -v python3 2>/dev/null)" ] && [ -f "$REPO_ROOT/tools/mkext2.py" ]; then
     python3 "$REPO_ROOT/tools/mkext2.py" build "$disk" --size-mb 8 \
@@ -223,7 +238,9 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
     done < "$SCRIPT_DIR/boot-commands.txt"
     sleep "${BOOT_TIMEOUT:-45}"
 } | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" \
-    -drive file="$disk",format=raw,if=ide -serial stdio \
+    -drive file="$disk",format=raw,if=ide,index=0 \
+    -drive file="$fsdisk",format=raw,if=ide,index=1,cache=writethrough \
+    -serial stdio \
     -device qemu-xhci,id=xhci \
     -drive file="$usbdisk",format=raw,if=none,id=usbstick \
     -device usb-storage,bus=xhci.0,drive=usbstick \
