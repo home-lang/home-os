@@ -170,6 +170,14 @@ fi
 # on the floor.
 # A blank disk for the block layer to prove itself against. Written fresh
 # each run so a round-trip cannot pass on the previous run's bytes.
+# A second, tiny image behind a USB mass-storage device. It exists so the USB
+# stack has a device with bulk endpoints to talk to: the hub above it
+# enumerates but moves no data, and a usb-kbd would take keystrokes away from
+# the PS/2 controller and silence the keyboard milestone.
+usbdisk="$workdir/usbdisk.img"
+: > "$usbdisk"
+dd if=/dev/zero of="$usbdisk" bs=1048576 count=2 >/dev/null 2>&1
+
 disk="$workdir/disk.img"
 if [ -x "$(command -v python3 2>/dev/null)" ] && [ -f "$REPO_ROOT/tools/mkext2.py" ]; then
     python3 "$REPO_ROOT/tools/mkext2.py" build "$disk" --size-mb 8 \
@@ -207,7 +215,9 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
     sleep "${BOOT_TIMEOUT:-45}"
 } | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" \
     -drive file="$disk",format=raw,if=ide -serial stdio \
-    -device qemu-xhci,id=xhci -device usb-hub,bus=xhci.0 \
+    -device qemu-xhci,id=xhci \
+    -drive file="$usbdisk",format=raw,if=none,id=usbstick \
+    -device usb-storage,bus=xhci.0,drive=usbstick \
     -monitor "telnet:127.0.0.1:$MONITOR_PORT,server,nowait" \
     -display none -vga std -no-reboot -m 256M > "$log" 2>&1 &
 qemu_pid=$!
