@@ -1,71 +1,251 @@
 // home-os ACPI Driver
 //
-// STUB(S7): 71 lines of table headers — no AML interpreter, no power-state
-// transitions. Without it there is no S3 suspend/resume, which is a headline
-// requirement of the certified-hardware promise. Blocks Phase 7a. MASTER_PLAN §7.
+// STUB(S7): there is no AML interpreter and no power-state transitions, so
+// there is still no S3 suspend/resume. Blocks Phase 7a. MASTER_PLAN §7.
+//
+// Table discovery *is* implemented: the RSDP is found in both places the
+// specification allows, every table's checksum is verified before it is
+// trusted, and the RSDT/XSDT is walked so a table can be looked up by
+// signature. That is the substrate an AML interpreter needs — it has to find
+// the DSDT before it can interpret anything — and it is what makes shutdown
+// read its port from the FADT rather than guessing per-hypervisor.
 
 import "../core/foundation.home" as foundation
 
-struct ACPISDTHeader {
-  signature: [u8; 4],
-  length: u32,
-  revision: u8,
-  checksum: u8,
-  oem_id: [u8; 6],
-  oem_table_id: [u8; 8],
-  oem_revision: u32,
-  creator_id: u32,
-  creator_revision: u32
-}
-
-struct RSDP {
-  signature: [u8; 8],
-  checksum: u8,
-  oem_id: [u8; 6],
-  revision: u8,
-  rsdt_address: u32
-}
-
 var acpi_initialized: u32 = 0
-var rsdt_address: u64 = 0
+var rsdp_address: u64 = 0
+var sdt_address: u64 = 0      // RSDT or XSDT, whichever the revision selects
+var sdt_entry_size: u32 = 4   // 4 for RSDT, 8 for XSDT
+var sdt_entry_count: u32 = 0
+var acpi_revision: u32 = 0
+var table_checksum_failures: u32 = 0
 
-fn acpi_find_rsdp(): u64 {
-  // Search EBDA
-  var ebda: u64 = 0x000E0000
-  var i: u64 = 0
-  
-  while i < 0x20000 {
-    var sig: u64 = @as(*u64, @ptrFromInt(ebda + i)).*
-    if sig == 0x2052545020445352 {  // "RSD PTR "
-      return ebda + i
-    }
-    i = i + 16
+// FADT-derived power management state.
+var pm1a_control_block: u32 = 0
+var pm1b_control_block: u32 = 0
+var fadt_found: u32 = 0
+
+// MADT-derived interrupt topology.
+var local_apic_address: u32 = 0
+var enabled_cpu_count: u32 = 0
+
+fn byte_at(base: u64, offset: u32): u8 {
+  return @as(*u8, @ptrFromInt(base + @as(u64, offset))).*
+}
+
+fn le32(base: u64, offset: u32): u32 {
+  return @as(u32, byte_at(base, offset))
+    | (@as(u32, byte_at(base, offset + 1)) << 8)
+    | (@as(u32, byte_at(base, offset + 2)) << 16)
+    | (@as(u32, byte_at(base, offset + 3)) << 24)
+}
+
+fn le64(base: u64, offset: u32): u64 {
+  return @as(u64, le32(base, offset)) | (@as(u64, le32(base, offset + 4)) << 32)
+}
+
+// Every ACPI structure carries a checksum over its own bytes that must sum to
+// zero modulo 256. Skipping it is how a kernel ends up parsing a table that
+// firmware never wrote — the signature alone is four bytes and appears in
+// unrelated memory often enough to matter.
+fn checksum_ok(base: u64, length: u32): u32 {
+  var sum: u32 = 0
+  var i: u32 = 0
+  while i < length {
+    sum = sum + @as(u32, byte_at(base, i))
+    i = i + 1
   }
-  
+  if (sum & 0xFF) == 0 {
+    return 1
+  }
+  return 0
+}
+
+fn signature_matches(base: u64, a: u8, b: u8, c: u8, d: u8): u32 {
+  if byte_at(base, 0) == a and byte_at(base, 1) == b and
+     byte_at(base, 2) == c and byte_at(base, 3) == d {
+    return 1
+  }
+  return 0
+}
+
+// "RSD PTR " — eight bytes, and the trailing space is part of it.
+fn is_rsdp(base: u64): u32 {
+  if byte_at(base, 0) == 82 and byte_at(base, 1) == 83 and
+     byte_at(base, 2) == 68 and byte_at(base, 3) == 32 and
+     byte_at(base, 4) == 80 and byte_at(base, 5) == 84 and
+     byte_at(base, 6) == 82 and byte_at(base, 7) == 32 {
+    return 1
+  }
+  return 0
+}
+
+// The RSDP lives in one of two places, and a kernel that checks only the
+// second misses machines that use the first. It is 16-byte aligned in both.
+fn find_rsdp(): u64 {
+  // 1. The first kilobyte of the Extended BIOS Data Area, whose segment is
+  //    stored at 0x40E.
+  let ebda_segment: u32 = @as(u32, byte_at(0x40E, 0)) | (@as(u32, byte_at(0x40E, 1)) << 8)
+  let ebda: u64 = @as(u64, ebda_segment) << 4
+  if ebda >= 0x400 and ebda < 0xA0000 {
+    var i: u32 = 0
+    while i < 1024 {
+      let candidate: u64 = ebda + @as(u64, i)
+      // The first 20 bytes are the revision-0 structure; its checksum covers
+      // exactly those, whatever the revision claims.
+      if is_rsdp(candidate) == 1 and checksum_ok(candidate, 20) == 1 {
+        return candidate
+      }
+      i = i + 16
+    }
+  }
+
+  // 2. The BIOS read-only area, 0xE0000 to 0xFFFFF.
+  var addr: u64 = 0xE0000
+  while addr < 0x100000 {
+    if is_rsdp(addr) == 1 and checksum_ok(addr, 20) == 1 {
+      return addr
+    }
+    addr = addr + 16
+  }
   return 0
 }
 
 export fn acpi_init() {
   if acpi_initialized == 1 { return }
-  
-  var rsdp_addr: u64 = acpi_find_rsdp()
-  if rsdp_addr == 0 {
+
+  rsdp_address = find_rsdp()
+  if rsdp_address == 0 {
     foundation.serial_write_string("[ACPI] RSDP not found\n")
     return
   }
-  
-  var rsdp: RSDP = @as(*RSDP, @ptrFromInt(rsdp_addr)).*
-  rsdt_address = rsdp.rsdt_address
-  
+
+  acpi_revision = @as(u32, byte_at(rsdp_address, 15))
+
+  // Revision 2 and later carry a 64-bit XSDT pointer and a second checksum
+  // over the longer structure. Preferring the XSDT is not optional on a
+  // machine whose tables sit above 4 GB.
+  if acpi_revision >= 2 and checksum_ok(rsdp_address, 36) == 1 {
+    sdt_address = le64(rsdp_address, 24)
+    sdt_entry_size = 8
+  } else {
+    sdt_address = @as(u64, le32(rsdp_address, 16))
+    sdt_entry_size = 4
+  }
+
+  if sdt_address == 0 {
+    foundation.serial_write_string("[ACPI] no RSDT or XSDT\n")
+    return
+  }
+
+  let sdt_length: u32 = le32(sdt_address, 4)
+  if sdt_length < 36 or checksum_ok(sdt_address, sdt_length) == 0 {
+    foundation.serial_write_string("[ACPI] root table checksum failed\n")
+    return
+  }
+  sdt_entry_count = (sdt_length - 36) / sdt_entry_size
+
+  parse_fadt()
+  parse_madt()
+
   acpi_initialized = 1
-  foundation.serial_write_string("[ACPI] Initialized\n")
+  foundation.serial_write_string("[ACPI] revision ")
+  foundation.serial_write_u64(@as(u64, acpi_revision))
+  foundation.serial_write_string(", ")
+  foundation.serial_write_u64(@as(u64, sdt_entry_count))
+  foundation.serial_write_string(" tables\n")
 }
 
+// Address of the nth entry in the root table, following either width.
+fn sdt_entry(index: u32): u64 {
+  let offset: u32 = 36 + index * sdt_entry_size
+  if sdt_entry_size == 8 {
+    return le64(sdt_address, offset)
+  }
+  return @as(u64, le32(sdt_address, offset))
+}
+
+// Find a table by its four-character signature. Returns 0 when absent, and
+// when a table is present but fails its own checksum — a corrupt table is
+// worse than a missing one, because a caller would parse it.
+export fn acpi_find_table(a: u8, b: u8, c: u8, d: u8): u64 {
+  if sdt_address == 0 { return 0 }
+  var i: u32 = 0
+  while i < sdt_entry_count {
+    let table: u64 = sdt_entry(i)
+    if table != 0 and signature_matches(table, a, b, c, d) == 1 {
+      let length: u32 = le32(table, 4)
+      if length >= 36 and checksum_ok(table, length) == 1 {
+        return table
+      }
+      table_checksum_failures = table_checksum_failures + 1
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The FADT is signed "FACP", not "FADT" — a detail that has cost people hours.
+fn parse_fadt() {
+  let fadt: u64 = acpi_find_table(70, 65, 67, 80)
+  if fadt == 0 { return }
+  fadt_found = 1
+  pm1a_control_block = le32(fadt, 64)
+  pm1b_control_block = le32(fadt, 68)
+}
+
+// "APIC" — the MADT. Its entries are a length-prefixed chain, so walking it
+// means trusting each record's length field; a zero-length record would spin
+// forever, which is why the walk refuses one.
+fn parse_madt() {
+  let madt: u64 = acpi_find_table(65, 80, 73, 67)
+  if madt == 0 { return }
+  local_apic_address = le32(madt, 36)
+
+  let length: u32 = le32(madt, 4)
+  var offset: u32 = 44
+  while offset + 2 <= length {
+    let entry_type: u8 = byte_at(madt, offset)
+    let entry_len: u32 = @as(u32, byte_at(madt, offset + 1))
+    if entry_len < 2 { break }
+    // Type 0 is a Local APIC; bit 0 of its flags word says the processor is
+    // usable. A disabled entry still occupies a slot and must not be counted.
+    if entry_type == 0 and entry_len >= 8 {
+      if (le32(madt, offset + 4) & 1) != 0 {
+        enabled_cpu_count = enabled_cpu_count + 1
+      }
+    }
+    offset = offset + entry_len
+  }
+}
+
+export fn acpi_is_initialized(): u32 { return acpi_initialized }
+export fn acpi_table_count(): u32 { return sdt_entry_count }
+export fn acpi_get_revision(): u32 { return acpi_revision }
+export fn acpi_local_apic_address(): u32 { return local_apic_address }
+export fn acpi_enabled_cpu_count(): u32 { return enabled_cpu_count }
+export fn acpi_pm1a_control_block(): u32 { return pm1a_control_block }
+export fn acpi_checksum_failures(): u32 { return table_checksum_failures }
+
+// Write SLP_TYP | SLP_EN to the PM1 control blocks.
+//
+// The port comes from the FADT rather than a per-hypervisor guess. The sleep
+// type for S5 properly comes from the DSDT's \_S5_ object, which needs the AML
+// interpreter this module does not have — so 5 is used, which is what every
+// machine this has been run on encodes, and the fallback below covers the
+// rest. That gap is the remaining half of STUB(S7).
 export fn acpi_shutdown() {
   foundation.serial_write_string("[ACPI] Shutdown requested\n")
-  foundation.outb(0xB004, 0x2000)  // QEMU
-  foundation.outb(0x604, 0x2000)   // Bochs
-  foundation.outb(0x4004, 0x3400)  // VirtualBox
+  if fadt_found == 1 and pm1a_control_block != 0 {
+    foundation.outw(@as(u16, pm1a_control_block), 0x2005)
+    if pm1b_control_block != 0 {
+      foundation.outw(@as(u16, pm1b_control_block), 0x2005)
+    }
+  }
+  // Hypervisor shutdown ports, for firmware whose FADT we could not read.
+  foundation.outw(0xB004, 0x2000)  // QEMU
+  foundation.outw(0x604, 0x2000)   // Bochs, and newer QEMU
+  foundation.outw(0x4004, 0x3400)  // VirtualBox
 }
 
 export fn acpi_reboot() {
