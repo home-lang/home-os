@@ -116,6 +116,18 @@ var interrupt_ep_interval: u32 = 0
 var interrupt_ep_dci: u32 = 0
 var interrupt_ring: u64 = 0
 var device_port: u32 = 0
+var bulk_in_address: u32 = 0
+var bulk_out_address: u32 = 0
+var bulk_in_max_packet: u32 = 0
+var bulk_out_max_packet: u32 = 0
+var bulk_in_dci: u32 = 0
+var bulk_out_dci: u32 = 0
+var bulk_in_ring: u64 = 0
+var bulk_out_ring: u64 = 0
+var bulk_in_enqueue: u32 = 0
+var bulk_out_enqueue: u32 = 0
+var interface_class: u32 = 0
+var interface_protocol: u32 = 0
 
 // Register reads go through the architecture-neutral MMIO intrinsic rather
 // than a plain load: it is what tells the backend this access must not be
@@ -715,13 +727,30 @@ export fn xhci_read_config_descriptor(slot: u32): u32 {
     if kind == 5 and length >= 7 {
       let attributes: u32 = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 3))).*)
       let address: u32 = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 2))).*)
-      if (attributes & 3) == 3 and (address & 0x80) != 0 {
+      let max_packet: u32 = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 4))).*)
+        | (@as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 5))).*) << 8)
+      let transfer_type: u32 = attributes & 3
+      // Bit 7 of the address is the direction: set means IN.
+      if transfer_type == 3 and (address & 0x80) != 0 {
         interrupt_ep_address = address
-        interrupt_ep_max_packet = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 4))).*)
-          | (@as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 5))).*) << 8)
+        interrupt_ep_max_packet = max_packet
         interrupt_ep_interval = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 6))).*)
-        return 1
       }
+      if transfer_type == 2 {
+        if (address & 0x80) != 0 {
+          bulk_in_address = address
+          bulk_in_max_packet = max_packet
+        } else {
+          bulk_out_address = address
+          bulk_out_max_packet = max_packet
+        }
+      }
+      // Also remember the interface class, which is what says a device is
+      // mass storage rather than something else with the same endpoints.
+    }
+    if kind == 4 and length >= 9 {
+      interface_class = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 5))).*)
+      interface_protocol = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 7))).*)
     }
     offset = offset + length
   }
@@ -785,6 +814,158 @@ export fn xhci_configure_interrupt_endpoint(slot: u32): u32 {
   return 1
 }
 
+// Configure both bulk endpoints in one Configure Endpoint command. The
+// controller takes an input context describing every endpoint being added, so
+// doing them together is both fewer round trips and the only way to set the
+// slot's context-entries count once and correctly.
+export fn xhci_configure_bulk_endpoints(slot: u32): u32 {
+  if bulk_in_address == 0 or bulk_out_address == 0 or input_context == 0 { return 0 }
+
+  bulk_in_dci = (bulk_in_address & 0x0F) * 2 + 1
+  bulk_out_dci = (bulk_out_address & 0x0F) * 2
+  bulk_in_ring = memory.pmm_alloc_page()
+  bulk_out_ring = memory.pmm_alloc_page()
+  if bulk_in_ring == 0 or bulk_out_ring == 0 { return 0 }
+  zero_page(bulk_in_ring)
+  zero_page(bulk_out_ring)
+  zero_page(input_context)
+
+  var highest: u32 = bulk_in_dci
+  if bulk_out_dci > highest { highest = bulk_out_dci }
+
+  write_mem32(input_context, 4, 1 | (1 << bulk_in_dci) | (1 << bulk_out_dci))
+
+  let slot_ctx: u32 = context_size
+  let portsc: u64 = operational_base + @as(u64, XHCI_PORTSC_BASE + (device_port - 1) * XHCI_PORT_STRIDE)
+  let speed: u32 = (read32(portsc) >> 10) & 0x0F
+  write_mem32(input_context, slot_ctx, (highest << 27) | (speed << 20))
+  write_mem32(input_context, slot_ctx + 4, device_port << 16)
+
+  // EP type 6 is bulk IN, 2 is bulk OUT.
+  let in_ctx: u32 = context_size * (1 + bulk_in_dci)
+  write_mem32(input_context, in_ctx + 4, (bulk_in_max_packet << 16) | (6 << 3) | (3 << 1))
+  write_mem32(input_context, in_ctx + 8, @as(u32, (bulk_in_ring & 0xFFFFFFFF)) | 1)
+  write_mem32(input_context, in_ctx + 12, @as(u32, (bulk_in_ring >> 32) & 0xFFFFFFFF))
+  write_mem32(input_context, in_ctx + 16, bulk_in_max_packet)
+
+  let out_ctx: u32 = context_size * (1 + bulk_out_dci)
+  write_mem32(input_context, out_ctx + 4, (bulk_out_max_packet << 16) | (2 << 3) | (3 << 1))
+  write_mem32(input_context, out_ctx + 8, @as(u32, (bulk_out_ring & 0xFFFFFFFF)) | 1)
+  write_mem32(input_context, out_ctx + 12, @as(u32, (bulk_out_ring >> 32) & 0xFFFFFFFF))
+  write_mem32(input_context, out_ctx + 16, bulk_out_max_packet)
+
+  if issue_command_slot(input_context, TRB_TYPE_CONFIGURE_ENDPOINT, slot) != TRB_COMPLETION_SUCCESS {
+    return 0
+  }
+  return 1
+}
+
+// ============================================================================
+// USB Mass Storage, Bulk-Only Transport
+//
+// Every command is three transfers: a 31-byte Command Block Wrapper out, the
+// data, then a 13-byte Command Status Wrapper in. The CSW is what says whether
+// the command worked — a data phase that returns bytes proves the transfer
+// happened, not that the device liked the request.
+// ============================================================================
+
+const CBW_SIGNATURE: u32 = 0x43425355   // 'USBC'
+const CSW_SIGNATURE: u32 = 0x53425355   // 'USBS'
+
+var cbw_buffer: u64 = 0
+var csw_buffer: u64 = 0
+var data_buffer: u64 = 0
+var scsi_tag: u32 = 1
+
+// Queue one Normal TRB on a bulk ring and ring its doorbell.
+fn bulk_transfer(slot: u32, dci: u32, ring: u64, enqueue: u32, buffer: u64, length: u32, direction_in: u32): u32 {
+  let off: u32 = enqueue * TRB_SIZE
+  write_mem32(ring, off, @as(u32, buffer & 0xFFFFFFFF))
+  write_mem32(ring, off + 4, @as(u32, (buffer >> 32) & 0xFFFFFFFF))
+  write_mem32(ring, off + 8, length)
+  // Normal TRB is type 1. Interrupt on completion so one transfer yields one
+  // event; the ISP bit lets a short packet finish rather than stall.
+  write_mem32(ring, off + 12, (1 << 10) | TRB_IOC | 0x4 | 1)
+
+  write32(doorbell_base + @as(u64, slot * 4), dci)
+  return await_transfer_event()
+}
+
+// Send a SCSI command and read its reply. `cdb_len` bytes of command block
+// have already been written into cbw_buffer at offset 15.
+fn scsi_command(slot: u32, transfer_length: u32): u32 {
+  // Command Block Wrapper.
+  write_mem32(cbw_buffer, 0, CBW_SIGNATURE)
+  write_mem32(cbw_buffer, 4, scsi_tag)
+  write_mem32(cbw_buffer, 8, transfer_length)
+  // Flags: bit 7 set means the data flows device-to-host.
+  @as(*u8, @ptrFromInt(cbw_buffer + 12)).* = 0x80
+  @as(*u8, @ptrFromInt(cbw_buffer + 13)).* = 0      // LUN 0
+
+  if bulk_transfer(slot, bulk_out_dci, bulk_out_ring, bulk_out_enqueue, cbw_buffer, 31, 0) == 0 {
+    return 0
+  }
+  bulk_out_enqueue = bulk_out_enqueue + 1
+
+  if transfer_length > 0 {
+    if bulk_transfer(slot, bulk_in_dci, bulk_in_ring, bulk_in_enqueue, data_buffer, transfer_length, 1) == 0 {
+      return 0
+    }
+    bulk_in_enqueue = bulk_in_enqueue + 1
+  }
+
+  // Command Status Wrapper. Its signature and matching tag are what make the
+  // reply trustworthy: a device that is out of step will still return bytes.
+  if bulk_transfer(slot, bulk_in_dci, bulk_in_ring, bulk_in_enqueue, csw_buffer, 13, 1) == 0 {
+    return 0
+  }
+  bulk_in_enqueue = bulk_in_enqueue + 1
+
+  if read_mem32(csw_buffer, 0) != CSW_SIGNATURE { return 0 }
+  if read_mem32(csw_buffer, 4) != scsi_tag { return 0 }
+  scsi_tag = scsi_tag + 1
+  // Byte 12 is the status: 0 is success.
+  if @as(*u8, @ptrFromInt(csw_buffer + 12)).* != 0 { return 0 }
+  return 1
+}
+
+// SCSI INQUIRY. Returns 1 when the device answered, leaving its vendor and
+// product strings in the data buffer.
+export fn usb_storage_inquiry(slot: u32): u32 {
+  if bulk_in_dci == 0 or bulk_out_dci == 0 { return 0 }
+  if cbw_buffer == 0 {
+    cbw_buffer = memory.pmm_alloc_page()
+    csw_buffer = memory.pmm_alloc_page()
+    data_buffer = memory.pmm_alloc_page()
+    if cbw_buffer == 0 or csw_buffer == 0 or data_buffer == 0 { return 0 }
+  }
+  zero_page(cbw_buffer)
+  zero_page(csw_buffer)
+  zero_page(data_buffer)
+
+  // A 6-byte INQUIRY asking for 36 bytes: the standard reply.
+  @as(*u8, @ptrFromInt(cbw_buffer + 14)).* = 6         // CDB length
+  @as(*u8, @ptrFromInt(cbw_buffer + 15)).* = 0x12      // INQUIRY
+  @as(*u8, @ptrFromInt(cbw_buffer + 19)).* = 36        // allocation length
+
+  return scsi_command(slot, 36)
+}
+
+// The INQUIRY reply puts the vendor at bytes 8..15 and the product at 16..31,
+// space-padded ASCII.
+export fn usb_storage_vendor_byte(index: u32): u8 {
+  if data_buffer == 0 or index >= 8 { return 0 }
+  return @as(*u8, @ptrFromInt(data_buffer + @as(u64, 8 + index))).*
+}
+
+export fn usb_storage_product_byte(index: u32): u8 {
+  if data_buffer == 0 or index >= 16 { return 0 }
+  return @as(*u8, @ptrFromInt(data_buffer + @as(u64, 16 + index))).*
+}
+
+export fn usb_bulk_in_address(): u32 { return bulk_in_address }
+export fn usb_bulk_out_address(): u32 { return bulk_out_address }
+export fn usb_interface_class(): u32 { return interface_class }
 export fn usb_interrupt_ep_dci(): u32 { return interrupt_ep_dci }
 export fn usb_config_value(): u32 { return config_value }
 export fn usb_interrupt_ep_address(): u32 { return interrupt_ep_address }
