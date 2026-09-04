@@ -326,6 +326,74 @@ export fn xhci_start(): u32 {
   return 1
 }
 
+// TRB types used here. A TRB is 16 bytes: a 64-bit parameter, a status
+// dword, and a control dword whose bit 0 is the cycle and whose bits 15:10
+// are the type.
+const TRB_TYPE_NOOP_COMMAND: u32 = 23
+const TRB_TYPE_COMMAND_COMPLETION: u32 = 33
+const TRB_COMPLETION_SUCCESS: u32 = 1
+const ERDP_EHB: u64 = 0x8            // event handler busy, write-1-to-clear
+
+fn write_mem32(base: u64, offset: u32, value: u32) {
+  @as(*u32, @ptrFromInt(base + @as(u64, offset))).* = value
+}
+
+fn read_mem32(base: u64, offset: u32): u32 {
+  return @as(*u32, @ptrFromInt(base + @as(u64, offset))).*
+}
+
+// Issue a No-Op command and wait for its completion event.
+//
+// This is the command the specification provides for exactly this purpose: it
+// asks the controller to do nothing and report that it did. It exercises the
+// whole path — our TRB on the command ring, the doorbell, the controller's
+// event on the event ring, the cycle bit that separates new entries from
+// stale ones — without needing a device attached.
+//
+// Returns 1 when the completion event names our TRB and reports success.
+export fn xhci_noop_command(): u32 {
+  if controller_running == 0 { return 0 }
+
+  // Slot 0 of the command ring. The cycle bit is 1 because the ring was
+  // zeroed and CRCR was armed with RCS=1: the controller consumes entries
+  // whose cycle matches, so a zeroed ring reads as empty until we set it.
+  write_mem32(command_ring, 0, 0)
+  write_mem32(command_ring, 4, 0)
+  write_mem32(command_ring, 8, 0)
+  write_mem32(command_ring, 12, (TRB_TYPE_NOOP_COMMAND << 10) | 1)
+
+  // Ring the host controller doorbell. Doorbell 0 is the command ring; a
+  // device slot's doorbell is its slot id.
+  write32(doorbell_base, 0)
+
+  // The controller writes its event into slot 0 of the event ring with the
+  // cycle bit set, for the same reason: a zeroed ring is an empty one.
+  var spins: u32 = 0
+  while spins < 1000000 {
+    let control: u32 = read_mem32(event_ring, 12)
+    if (control & 1) != 0 {
+      let trb_type: u32 = (control >> 10) & 0x3F
+      let completion_code: u32 = read_mem32(event_ring, 8) >> 24
+      let pointer_low: u32 = read_mem32(event_ring, 0)
+
+      // Advance the dequeue pointer past the event we just read and clear
+      // the busy flag, or the controller stops writing events.
+      let ir0: u64 = runtime_base + @as(u64, XHCI_IR0)
+      write64(ir0 + @as(u64, XHCI_IR_ERDP), (event_ring + @as(u64, TRB_SIZE)) | ERDP_EHB)
+
+      if trb_type == TRB_TYPE_COMMAND_COMPLETION and
+         completion_code == TRB_COMPLETION_SUCCESS and
+         @as(u64, pointer_low) == (command_ring & 0xFFFFFFFF) {
+        return 1
+      }
+      return 0
+    }
+    foundation.cpu_pause()
+    spins = spins + 1
+  }
+  return 0
+}
+
 export fn usb_controller_running(): u32 { return controller_running }
 export fn usb_controller_found(): u32 { return controller_found }
 export fn usb_hci_version(): u32 { return hci_version }

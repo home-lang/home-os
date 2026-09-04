@@ -33,7 +33,7 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-✅ **`boot-full-kernel`: PASS** — 74/74 init milestones reached, through to the end of init
+✅ **`boot-full-kernel`: PASS** — 75/75 init milestones reached, through to the end of init
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
@@ -76,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 416 | 239,551 |
+| `kernel/` | 416 | 239,622 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
