@@ -1,10 +1,14 @@
 # homefs — Design Document
 
-> **Status: design, pre-implementation.** This document is written *before*
-> any homefs implementation lands ([MASTER_PLAN §11.2](../MASTER_PLAN.md)).
+> **Status: design complete, pre-implementation.** This document is written
+> *before* any homefs implementation lands ([MASTER_PLAN §11.2](../MASTER_PLAN.md)).
 > `kernel/src/fs/homefs.home` is a 33-line import stub (stub register S4,
 > [#32](https://github.com/home-lang/home-os/issues/32)); nothing here is
 > implemented yet.
+>
+> S4 is registered as "P1 (design doc), P2 (CoW implementation)". This document
+> is that P1 deliverable and it is done; the entry stays open for the
+> implementation, whose steps are in §9.
 
 - **Version:** 1.0 (draft for review)
 - **Date:** 2026-08-24
@@ -199,9 +203,13 @@ Steps 1–2 start only after Phase 1 exits; step 4–5 are the S4 closure.
 
 ## 10. Open Questions
 
-1. **Checksum algorithm:** blake2s is stubbed (S5); until then, commit
-   records use CRC32C as an interim? Or hold commits hostage on S5?
-   Recommendation: CRC32C interim, upgrade path via superblock `flags`.
+1. ~~**Checksum algorithm:**~~ **Resolved.** This asked whether commit records
+   should use CRC32C as an interim because blake2s was stubbed. STUB(S5) is
+   closed: `kernel/src/crypto/blake2s.home` implements RFC 7693 and the boot
+   gate checks it against the Appendix B vector on every commit. Use blake2s
+   directly — there is no interim to carry, and no superblock `flags` upgrade
+   path to design and later support. The same primitive already backs pantry's
+   signed indexes, so the filesystem and the updater agree on one digest.
 2. **Encryption:** out of scope for v1; fscrypt-style per-file encryption
    would hook the write path at step 4. Needs its own ADR.
 3. **Compression:** transparent LZO/zstd per-extent — post-v1; the `shared`
