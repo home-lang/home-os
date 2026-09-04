@@ -207,7 +207,7 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
     sleep "${BOOT_TIMEOUT:-45}"
 } | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" \
     -drive file="$disk",format=raw,if=ide -serial stdio \
-    -device qemu-xhci,id=xhci \
+    -device qemu-xhci,id=xhci -device usb-hub,bus=xhci.0 \
     -monitor "telnet:127.0.0.1:$MONITOR_PORT,server,nowait" \
     -display none -vga std -no-reboot -m 256M > "$log" 2>&1 &
 qemu_pid=$!
