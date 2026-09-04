@@ -109,6 +109,13 @@ var ep0_enqueue: u32 = 0
 var ep0_cycle: u32 = 1
 var device_vendor: u32 = 0
 var device_product: u32 = 0
+var config_value: u32 = 0
+var interrupt_ep_address: u32 = 0
+var interrupt_ep_max_packet: u32 = 0
+var interrupt_ep_interval: u32 = 0
+var interrupt_ep_dci: u32 = 0
+var interrupt_ring: u64 = 0
+var device_port: u32 = 0
 
 // Register reads go through the architecture-neutral MMIO intrinsic rather
 // than a plain load: it is what tells the backend this access must not be
@@ -365,6 +372,7 @@ export fn xhci_start(): u32 {
 // are the type.
 const TRB_TYPE_ENABLE_SLOT: u32 = 9
 const TRB_TYPE_ADDRESS_DEVICE: u32 = 11
+const TRB_TYPE_CONFIGURE_ENDPOINT: u32 = 12
 const TRB_TYPE_NOOP_COMMAND: u32 = 23
 const TRB_TYPE_SETUP_STAGE: u32 = 2
 const TRB_TYPE_DATA_STAGE: u32 = 3
@@ -552,6 +560,7 @@ export fn xhci_address_device(slot: u32, port: u32): u32 {
   if issue_command_slot(input_context, TRB_TYPE_ADDRESS_DEVICE, slot) != TRB_COMPLETION_SUCCESS {
     return 0
   }
+  device_port = port
   return 1
 }
 
@@ -594,38 +603,7 @@ fn control_in(slot: u32, request_type: u32, request: u32, value: u32, index: u32
 
   // Doorbell for this slot, target 1 = endpoint 0.
   write32(doorbell_base + @as(u64, slot * 4), 1)
-
-  var spins: u32 = 0
-  while spins < 1000000 {
-    let eoff: u32 = event_dequeue * TRB_SIZE
-    let control: u32 = read_mem32(event_ring, eoff + 12)
-    if (control & 1) == event_cycle {
-      let event_type: u32 = (control >> 10) & 0x3F
-      let completion_code: u32 = read_mem32(event_ring, eoff + 8) >> 24
-
-      event_dequeue = event_dequeue + 1
-      if event_dequeue >= RING_TRBS {
-        event_dequeue = 0
-        event_cycle = event_cycle ^ 1
-      }
-      let ir0: u64 = runtime_base + @as(u64, XHCI_IR0)
-      write64(ir0 + @as(u64, XHCI_IR_ERDP),
-        (event_ring + @as(u64, event_dequeue * TRB_SIZE)) | ERDP_EHB)
-
-      if event_type == TRB_TYPE_TRANSFER_EVENT {
-        // Short packet is a success for a descriptor read: the device sent
-        // what it had, which is less than the 18 bytes asked for only if the
-        // descriptor really is shorter.
-        if completion_code == TRB_COMPLETION_SUCCESS or completion_code == 13 {
-          return 1
-        }
-        return 0
-      }
-    }
-    foundation.cpu_pause()
-    spins = spins + 1
-  }
-  return 0
+  return await_transfer_event()
 }
 
 // Read the device descriptor and keep the two identifiers out of it.
@@ -649,6 +627,169 @@ export fn xhci_read_device_descriptor(slot: u32): u32 {
   if @as(*u8, @ptrFromInt(descriptor_buffer + 1)).* != 1 { return 0 }
   return 1
 }
+
+// A control transfer with no data stage: setup, then status. SET_CONFIGURATION
+// is one of these — the request is entirely in the setup packet.
+fn control_no_data(slot: u32, request_type: u32, request: u32, value: u32, index: u32): u32 {
+  if ep0_ring == 0 { return 0 }
+
+  var off: u32 = ep0_enqueue * TRB_SIZE
+  write_mem32(ep0_ring, off, request_type | (request << 8) | (value << 16))
+  write_mem32(ep0_ring, off + 4, index)
+  write_mem32(ep0_ring, off + 8, 8)
+  // Transfer type 0: no data stage.
+  write_mem32(ep0_ring, off + 12, (TRB_TYPE_SETUP_STAGE << 10) | TRB_IDT | ep0_cycle)
+  ep0_enqueue = ep0_enqueue + 1
+
+  // With no data, the status stage runs IN.
+  off = ep0_enqueue * TRB_SIZE
+  write_mem32(ep0_ring, off, 0)
+  write_mem32(ep0_ring, off + 4, 0)
+  write_mem32(ep0_ring, off + 8, 0)
+  write_mem32(ep0_ring, off + 12, TRB_DIR_IN | (TRB_TYPE_STATUS_STAGE << 10) | TRB_IOC | ep0_cycle)
+  ep0_enqueue = ep0_enqueue + 1
+
+  write32(doorbell_base + @as(u64, slot * 4), 1)
+  return await_transfer_event()
+}
+
+// Wait for the next transfer event and report whether it succeeded.
+fn await_transfer_event(): u32 {
+  var spins: u32 = 0
+  while spins < 1000000 {
+    let eoff: u32 = event_dequeue * TRB_SIZE
+    let control: u32 = read_mem32(event_ring, eoff + 12)
+    if (control & 1) == event_cycle {
+      let event_type: u32 = (control >> 10) & 0x3F
+      let completion_code: u32 = read_mem32(event_ring, eoff + 8) >> 24
+
+      event_dequeue = event_dequeue + 1
+      if event_dequeue >= RING_TRBS {
+        event_dequeue = 0
+        event_cycle = event_cycle ^ 1
+      }
+      let ir0: u64 = runtime_base + @as(u64, XHCI_IR0)
+      write64(ir0 + @as(u64, XHCI_IR_ERDP),
+        (event_ring + @as(u64, event_dequeue * TRB_SIZE)) | ERDP_EHB)
+
+      if event_type == TRB_TYPE_TRANSFER_EVENT {
+        if completion_code == TRB_COMPLETION_SUCCESS or completion_code == 13 { return 1 }
+        return 0
+      }
+    }
+    foundation.cpu_pause()
+    spins = spins + 1
+  }
+  return 0
+}
+
+// Read the configuration descriptor and find the first interrupt IN endpoint
+// in it.
+//
+// The configuration descriptor is a header followed by the interface and
+// endpoint descriptors that belong to it, laid end to end. Its wTotalLength
+// says how far that goes, and walking by each descriptor's own bLength is the
+// only way through — the records are not fixed width.
+export fn xhci_read_config_descriptor(slot: u32): u32 {
+  if descriptor_buffer == 0 { return 0 }
+  zero_page(descriptor_buffer)
+
+  // GET_DESCRIPTOR(CONFIGURATION, index 0). Ask for a page; the device sends
+  // what it has and a short packet says so.
+  if control_in(slot, 0x80, 6, 0x0200, 0, 255) == 0 { return 0 }
+  if @as(*u8, @ptrFromInt(descriptor_buffer + 1)).* != 2 { return 0 }
+
+  config_value = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + 5)).*)
+  let total_length: u32 = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + 2)).*)
+    | (@as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + 3)).*) << 8)
+
+  var offset: u32 = 0
+  while offset + 2 <= total_length and offset < 4096 {
+    let length: u32 = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset))).*)
+    let kind: u32 = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 1))).*)
+    // A zero-length record would not advance, so refuse it rather than spin.
+    if length < 2 { return 0 }
+    // Endpoint descriptor: address at byte 2, attributes at 3, max packet at
+    // 4-5, interval at 6. Attribute bits 1:0 select the transfer type, and 3
+    // is interrupt; bit 7 of the address is the direction.
+    if kind == 5 and length >= 7 {
+      let attributes: u32 = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 3))).*)
+      let address: u32 = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 2))).*)
+      if (attributes & 3) == 3 and (address & 0x80) != 0 {
+        interrupt_ep_address = address
+        interrupt_ep_max_packet = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 4))).*)
+          | (@as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 5))).*) << 8)
+        interrupt_ep_interval = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 6))).*)
+        return 1
+      }
+    }
+    offset = offset + length
+  }
+  // A configuration with no interrupt IN endpoint is still a configuration
+  // read successfully; the caller decides whether that is a problem.
+  return 1
+}
+
+// SET_CONFIGURATION moves the device from addressed to configured, which is
+// what makes its endpoints usable.
+export fn xhci_set_configuration(slot: u32): u32 {
+  if config_value == 0 { return 0 }
+  return control_no_data(slot, 0x00, 9, config_value, 0)
+}
+
+// Tell the controller about the interrupt endpoint, so it will move data on
+// it. Returns 1 when the Configure Endpoint command succeeds.
+//
+// Endpoints are addressed by Device Context Index, not by their USB address:
+// DCI = 2 * endpoint number + direction, with endpoint 0 occupying DCI 1.
+// Endpoint 0x81 is endpoint 1 IN, so DCI 3. Getting this mapping wrong
+// configures a different endpoint than the one intended, and the controller
+// has no way to notice.
+export fn xhci_configure_interrupt_endpoint(slot: u32): u32 {
+  if interrupt_ep_address == 0 or input_context == 0 { return 0 }
+
+  let endpoint_number: u32 = interrupt_ep_address & 0x0F
+  let dci: u32 = endpoint_number * 2 + 1     // IN endpoints take the odd index
+
+  interrupt_ring = memory.pmm_alloc_page()
+  if interrupt_ring == 0 { return 0 }
+  zero_page(interrupt_ring)
+  zero_page(input_context)
+
+  // Add the slot context and this endpoint. The slot context is required on
+  // a Configure Endpoint because its context-entries field has to grow to
+  // cover the new highest DCI.
+  write_mem32(input_context, 4, 1 | (1 << dci))
+
+  let slot_ctx: u32 = context_size
+  let portsc: u64 = operational_base + @as(u64, XHCI_PORTSC_BASE + (device_port - 1) * XHCI_PORT_STRIDE)
+  let speed: u32 = (read32(portsc) >> 10) & 0x0F
+  write_mem32(input_context, slot_ctx, (dci << 27) | (speed << 20))
+  write_mem32(input_context, slot_ctx + 4, device_port << 16)
+
+  let ep_ctx: u32 = context_size * (1 + dci)
+  // Interval is a power-of-two exponent in the context but a frame count in
+  // the descriptor; passing the descriptor's value through unchanged would
+  // poll at wildly the wrong rate.
+  write_mem32(input_context, ep_ctx, (interrupt_ep_interval & 0xFF) << 16)
+  // EP type 7 is interrupt IN. CErr = 3.
+  write_mem32(input_context, ep_ctx + 4, (interrupt_ep_max_packet << 16) | (7 << 3) | (3 << 1))
+  write_mem32(input_context, ep_ctx + 8, @as(u32, (interrupt_ring & 0xFFFFFFFF)) | 1)
+  write_mem32(input_context, ep_ctx + 12, @as(u32, (interrupt_ring >> 32) & 0xFFFFFFFF))
+  write_mem32(input_context, ep_ctx + 16, interrupt_ep_max_packet)
+
+  if issue_command_slot(input_context, TRB_TYPE_CONFIGURE_ENDPOINT, slot) != TRB_COMPLETION_SUCCESS {
+    return 0
+  }
+  interrupt_ep_dci = dci
+  return 1
+}
+
+export fn usb_interrupt_ep_dci(): u32 { return interrupt_ep_dci }
+export fn usb_config_value(): u32 { return config_value }
+export fn usb_interrupt_ep_address(): u32 { return interrupt_ep_address }
+export fn usb_interrupt_ep_max_packet(): u32 { return interrupt_ep_max_packet }
+export fn usb_interrupt_ep_interval(): u32 { return interrupt_ep_interval }
 
 export fn usb_device_vendor(): u32 { return device_vendor }
 export fn usb_device_product(): u32 { return device_product }
