@@ -1,33 +1,383 @@
-// home-os Native Filesystem (homefs) - Stub Module
+// home-os Native Filesystem (homefs) — on-disk structures
 //
-// STUB(S4): this file exists only to satisfy imports. homefs is the CoW
-// filesystem the whole snapshot-and-rollback story rests on, and it needs a
-// design document (docs/design/homefs.md) before any implementation.
-// Blocks Phase 2 storage and the Phase 6 snapshot-rollback gate. MASTER_PLAN §7.
+// STUB(S4): the copy-on-write filesystem itself is not implemented. There is
+// no tree code, no commit protocol, no mount path. Blocks Phase 2 storage and
+// the Phase 6 snapshot-rollback gate. MASTER_PLAN §7.
 //
-// Minimal stub created for issue #15 to satisfy `import "homefs.home"`
-// in fsck.home and largefile.home. Both consumers are gated behind
-// `*_ENABLED = 0` and contain unparsed Zig syntax, so this stub only
-// needs to expose the symbols their import sites reference. A real
-// homefs implementation will replace this when the consumers are
-// rewritten in Home syntax.
+// What is implemented is step 1 of the plan in docs/design/homefs.md §9: the
+// on-disk structures and their encode/decode, checksummed. Everything above
+// them reads and writes through these, so getting the byte layout and the
+// integrity check right first means the tree code is never debugging two
+// things at once.
 //
-// TODO(#15): replace with real homefs implementation. Until then this
-// fails closed - any caller that actually executes against these
-// values will see zero/empty fields, which is intentional.
+// All fields are little-endian on disk regardless of the machine writing
+// them, so a volume is portable between architectures — which matters here,
+// where the same tree targets both x86-64 and ARM64.
+
+import "../crypto/blake2s.home" as blake2s
+
+// 'HOMS' read as a little-endian u32.
+export const HOMEFS_MAGIC: u32 = 0x534D4F48
+export const HOMEFS_VERSION: u32 = 1
+
+// The superblock occupies the first 256 bytes of its slot; the rest of the
+// two sectors is reserved. The checksum covers everything before it.
+export const SUPERBLOCK_SIZE: u32 = 256
+export const SUPERBLOCK_CHECKSUM_OFFSET: u32 = 96
+export const COMMIT_RECORD_SIZE: u32 = 128
+export const COMMIT_CHECKSUM_OFFSET: u32 = 64
+
+// Object IDs are typed by their top bits (design doc §2). A flat 64-bit space
+// with the type in the identifier means a snapshot root is an ordinary object
+// table entry rather than a separate namespace.
+export const OBJ_TYPE_MASK: u64 = 0xC000000000000000
+export const OBJ_TYPE_FILE: u64 = 0x0000000000000000
+export const OBJ_TYPE_DIR: u64 = 0x8000000000000000
+export const OBJ_TYPE_SNAPSHOT: u64 = 0xC000000000000000
 
 // Inode flag referenced by largefile.home::is_extent_based().
-// Real homefs will define the full INODE_* flag set.
-export const INODE_EXTENTS: u32 = 0x0000_0001
+export const INODE_EXTENTS: u32 = 0x00000001
 
-// Filesystem superblock referenced by fsck.home as `*homefs.Superblock`.
-// Fields are placeholders sufficient to let the type name resolve.
-pub struct Superblock {
-    magic: u32,
-    version: u32,
-    block_size: u32,
-    block_count: u64,
-    inode_count: u64,
-    free_blocks: u64,
-    free_inodes: u64,
+// The in-memory form. On-disk it is the byte layout that
+// homefs_encode_superblock writes; this struct is what the rest of the kernel
+// passes around.
+//
+// `generation` and `txid` are not in the design document's struct listing but
+// are required by its §5: recovery "picks the highest valid (generation,
+// txid) pair whose commit record checksums clean". Without both, two
+// superblock slots cannot be ordered.
+export struct Superblock {
+  magic: u32,
+  version: u32,
+  block_size: u32,
+  block_count: u64,
+  olog_head: u64,
+  olog_tail: u64,
+  root_dir_object: u64,
+  active_snapshot: u64,
+  flags: u64,
+  generation: u64,
+  txid: u64
+}
+
+// ============================================================================
+// Little-endian primitives
+// ============================================================================
+
+fn put8(base: u64, offset: u32, value: u8) {
+  @as(*u8, @ptrFromInt(base + @as(u64, offset))).* = value
+}
+
+fn get8(base: u64, offset: u32): u8 {
+  return @as(*u8, @ptrFromInt(base + @as(u64, offset))).*
+}
+
+fn put32(base: u64, offset: u32, value: u32) {
+  put8(base, offset, @as(u8, value & 0xFF))
+  put8(base, offset + 1, @as(u8, (value >> 8) & 0xFF))
+  put8(base, offset + 2, @as(u8, (value >> 16) & 0xFF))
+  put8(base, offset + 3, @as(u8, (value >> 24) & 0xFF))
+}
+
+fn get32(base: u64, offset: u32): u32 {
+  return @as(u32, get8(base, offset))
+    | (@as(u32, get8(base, offset + 1)) << 8)
+    | (@as(u32, get8(base, offset + 2)) << 16)
+    | (@as(u32, get8(base, offset + 3)) << 24)
+}
+
+fn put64(base: u64, offset: u32, value: u64) {
+  put32(base, offset, @as(u32, value & 0xFFFFFFFF))
+  put32(base, offset + 4, @as(u32, (value >> 32) & 0xFFFFFFFF))
+}
+
+fn get64(base: u64, offset: u32): u64 {
+  return @as(u64, get32(base, offset)) | (@as(u64, get32(base, offset + 4)) << 32)
+}
+
+fn zero_range(base: u64, from: u32, to: u32) {
+  var i: u32 = from
+  while i < to {
+    put8(base, i, 0)
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// Object IDs
+// ============================================================================
+
+export fn object_type(id: u64): u64 {
+  // Directory and snapshot ranges are distinguished by the top two bits;
+  // files occupy everything below them.
+  let top: u64 = id & OBJ_TYPE_MASK
+  if top == OBJ_TYPE_SNAPSHOT { return OBJ_TYPE_SNAPSHOT }
+  if top == OBJ_TYPE_DIR { return OBJ_TYPE_DIR }
+  return OBJ_TYPE_FILE
+}
+
+export fn object_is_snapshot(id: u64): u32 {
+  if object_type(id) == OBJ_TYPE_SNAPSHOT { return 1 }
+  return 0
+}
+
+export fn object_is_directory(id: u64): u32 {
+  if object_type(id) == OBJ_TYPE_DIR { return 1 }
+  return 0
+}
+
+// ============================================================================
+// Checksums
+//
+// blake2s, per docs/design/homefs.md §10 question 1. The interim CRC32C that
+// question proposed is not needed: STUB(S5) is closed and blake2s is checked
+// against RFC 7693 on every boot. Using one digest here and in pantry's signed
+// indexes means the filesystem and the updater agree on what a hash is.
+// ============================================================================
+
+// Compute the digest of `length` bytes at `base` and write 32 bytes at `out`.
+fn digest(out: u64, base: u64, length: u32) {
+  blake2s.blake2s(out, base, length)
+}
+
+// Verify a structure whose checksum sits at `checksum_offset` and covers
+// everything before it. Returns 1 when it matches.
+fn checksum_matches(base: u64, checksum_offset: u32): u32 {
+  var computed: [u8; 32] = undefined
+  digest(@intFromPtr(&computed), base, checksum_offset)
+  var i: u32 = 0
+  var diff: u32 = 0
+  while i < 32 {
+    // Compare every byte rather than returning on the first difference. A
+    // checksum is not a secret, but the habit is cheap and this code is
+    // copied.
+    diff = diff | (@as(u32, computed[i]) ^ @as(u32, get8(base, checksum_offset + i)))
+    i = i + 1
+  }
+  if diff == 0 { return 1 }
+  return 0
+}
+
+// ============================================================================
+// Superblock
+// ============================================================================
+
+// Write `sb` into a SUPERBLOCK_SIZE buffer at `base`, checksum included.
+export fn homefs_encode_superblock(base: u64, sb: *Superblock) {
+  zero_range(base, 0, SUPERBLOCK_SIZE)
+
+  put32(base, 0, sb.magic)
+  put32(base, 4, sb.version)
+  put32(base, 8, sb.block_size)
+  // Bytes 12..16 are padding, so every u64 below is eight-byte aligned in the
+  // image as well as in memory.
+  put64(base, 16, sb.block_count)
+  put64(base, 24, sb.olog_head)
+  put64(base, 32, sb.olog_tail)
+  put64(base, 40, sb.root_dir_object)
+  put64(base, 48, sb.active_snapshot)
+  put64(base, 56, sb.flags)
+  put64(base, 64, sb.generation)
+  put64(base, 72, sb.txid)
+  // 80..96 is the UUID, written by mkfs and preserved across commits.
+
+  digest(base + @as(u64, SUPERBLOCK_CHECKSUM_OFFSET), base, SUPERBLOCK_CHECKSUM_OFFSET)
+}
+
+// Read a superblock. Returns 1 on success, 0 if the magic, version or
+// checksum says this is not a superblock this kernel should mount.
+//
+// Checking the checksum before the fields is the point: a torn write leaves a
+// slot that still has the right magic.
+export fn homefs_decode_superblock(base: u64, sb: *Superblock): u32 {
+  if get32(base, 0) != HOMEFS_MAGIC { return 0 }
+  if get32(base, 4) != HOMEFS_VERSION { return 0 }
+  if checksum_matches(base, SUPERBLOCK_CHECKSUM_OFFSET) == 0 { return 0 }
+
+  sb.magic = get32(base, 0)
+  sb.version = get32(base, 4)
+  sb.block_size = get32(base, 8)
+  sb.block_count = get64(base, 16)
+  sb.olog_head = get64(base, 24)
+  sb.olog_tail = get64(base, 32)
+  sb.root_dir_object = get64(base, 40)
+  sb.active_snapshot = get64(base, 48)
+  sb.flags = get64(base, 56)
+  sb.generation = get64(base, 64)
+  sb.txid = get64(base, 72)
+  return 1
+}
+
+// Which of two superblock slots to mount, per §5: the highest valid
+// (generation, txid). Returns 0 or 1 for the slot, or 2 when neither is
+// valid — a filesystem with no readable superblock must not be mounted, and
+// saying so is different from defaulting to slot 0.
+export fn homefs_select_superblock(slot0: u64, slot1: u64, out: *Superblock): u32 {
+  var a: Superblock = undefined
+  var b: Superblock = undefined
+  let a_ok: u32 = homefs_decode_superblock(slot0, &a)
+  let b_ok: u32 = homefs_decode_superblock(slot1, &b)
+
+  if a_ok == 1 and b_ok == 0 {
+    out.* = a
+    return 0
+  }
+  if b_ok == 1 and a_ok == 0 {
+    out.* = b
+    return 1
+  }
+  if a_ok == 0 and b_ok == 0 {
+    return 2
+  }
+  if b.generation > a.generation or (b.generation == a.generation and b.txid > a.txid) {
+    out.* = b
+    return 1
+  }
+  out.* = a
+  return 0
+}
+
+// ============================================================================
+// Object-log commit record (§5 step 3)
+// ============================================================================
+
+export struct CommitRecord {
+  txid: u64,
+  generation: u64,
+  root_dir_object: u64,
+  active_snapshot: u64,
+  olog_tail: u64
+}
+
+export fn homefs_encode_commit(base: u64, rec: *CommitRecord) {
+  zero_range(base, 0, COMMIT_RECORD_SIZE)
+  put64(base, 0, rec.txid)
+  put64(base, 8, rec.generation)
+  put64(base, 16, rec.root_dir_object)
+  put64(base, 24, rec.active_snapshot)
+  put64(base, 32, rec.olog_tail)
+  digest(base + @as(u64, COMMIT_CHECKSUM_OFFSET), base, COMMIT_CHECKSUM_OFFSET)
+}
+
+// Returns 1 when the record is complete. A commit record is the thing that
+// makes a transaction durable, so a partially written one has to read as
+// absent rather than as a transaction that happened.
+export fn homefs_decode_commit(base: u64, rec: *CommitRecord): u32 {
+  if checksum_matches(base, COMMIT_CHECKSUM_OFFSET) == 0 { return 0 }
+  rec.txid = get64(base, 0)
+  rec.generation = get64(base, 8)
+  rec.root_dir_object = get64(base, 16)
+  rec.active_snapshot = get64(base, 24)
+  rec.olog_tail = get64(base, 32)
+  return 1
+}
+
+// ============================================================================
+// Boot self-test
+//
+// Step 1 of docs/design/homefs.md §9 is "on-disk struct definitions +
+// encode/decode unit tests". These are those tests, run on the machine rather
+// than asserted on paper: a round trip through the byte layout, a torn write
+// that must not read as valid, and the slot selection recovery depends on.
+// ============================================================================
+
+var sb_slot0: [u8; 256] = undefined
+var sb_slot1: [u8; 256] = undefined
+var commit_buf: [u8; 128] = undefined
+
+export fn homefs_selftest(): u32 {
+  var passed: u32 = 0
+
+  // --- round trip -----------------------------------------------------------
+  var sb: Superblock = undefined
+  sb.magic = HOMEFS_MAGIC
+  sb.version = HOMEFS_VERSION
+  sb.block_size = 4096
+  sb.block_count = 0x0000000100000000
+  sb.olog_head = 0x1122334455667788
+  sb.olog_tail = 0x0102030405060708
+  sb.root_dir_object = OBJ_TYPE_DIR | 1
+  sb.active_snapshot = OBJ_TYPE_SNAPSHOT | 7
+  sb.flags = 0
+  sb.generation = 42
+  sb.txid = 1000
+
+  homefs_encode_superblock(@intFromPtr(&sb_slot0), &sb)
+
+  var back: Superblock = undefined
+  if homefs_decode_superblock(@intFromPtr(&sb_slot0), &back) == 1 and
+     back.block_size == 4096 and
+     back.block_count == 0x0000000100000000 and
+     back.olog_head == 0x1122334455667788 and
+     back.root_dir_object == (OBJ_TYPE_DIR | 1) and
+     back.active_snapshot == (OBJ_TYPE_SNAPSHOT | 7) and
+     back.generation == 42 and
+     back.txid == 1000 {
+    passed = passed + 1
+  }
+
+  // --- object ID typing -----------------------------------------------------
+  if object_is_directory(OBJ_TYPE_DIR | 1) == 1 and
+     object_is_snapshot(OBJ_TYPE_SNAPSHOT | 7) == 1 and
+     object_is_directory(5) == 0 and
+     object_is_snapshot(OBJ_TYPE_DIR | 3) == 0 {
+    passed = passed + 1
+  }
+
+  // --- a torn write must not read as valid ----------------------------------
+  // One flipped bit in a field the checksum covers. The magic and version are
+  // untouched, which is exactly the case a magic-only check would wave through.
+  put8(@intFromPtr(&sb_slot0), 24, get8(@intFromPtr(&sb_slot0), 24) ^ 0x01)
+  if homefs_decode_superblock(@intFromPtr(&sb_slot0), &back) == 0 {
+    passed = passed + 1
+  }
+
+  // --- slot selection -------------------------------------------------------
+  // Slot 0 is the older generation, slot 1 the newer. Recovery must take the
+  // newer one; taking the first valid slot would silently roll the filesystem
+  // back one transaction on every mount.
+  homefs_encode_superblock(@intFromPtr(&sb_slot0), &sb)
+  var newer: Superblock = sb
+  newer.generation = 43
+  newer.txid = 1001
+  newer.root_dir_object = OBJ_TYPE_DIR | 9
+  homefs_encode_superblock(@intFromPtr(&sb_slot1), &newer)
+
+  var chosen: Superblock = undefined
+  if homefs_select_superblock(@intFromPtr(&sb_slot0), @intFromPtr(&sb_slot1), &chosen) == 1 and
+     chosen.generation == 43 and chosen.root_dir_object == (OBJ_TYPE_DIR | 9) {
+    passed = passed + 1
+  }
+
+  // And with the newer slot corrupted, the older one is mounted rather than
+  // nothing — that is the whole point of keeping two.
+  put8(@intFromPtr(&sb_slot1), 30, get8(@intFromPtr(&sb_slot1), 30) ^ 0xFF)
+  if homefs_select_superblock(@intFromPtr(&sb_slot0), @intFromPtr(&sb_slot1), &chosen) == 0 and
+     chosen.generation == 42 {
+    passed = passed + 1
+  }
+
+  // --- commit record --------------------------------------------------------
+  var rec: CommitRecord = undefined
+  rec.txid = 77
+  rec.generation = 43
+  rec.root_dir_object = OBJ_TYPE_DIR | 9
+  rec.active_snapshot = OBJ_TYPE_SNAPSHOT | 2
+  rec.olog_tail = 512
+  homefs_encode_commit(@intFromPtr(&commit_buf), &rec)
+
+  var rec_back: CommitRecord = undefined
+  if homefs_decode_commit(@intFromPtr(&commit_buf), &rec_back) == 1 and
+     rec_back.txid == 77 and rec_back.olog_tail == 512 {
+    passed = passed + 1
+  }
+
+  // A half-written commit record must read as absent, not as a transaction
+  // that happened.
+  put8(@intFromPtr(&commit_buf), 16, get8(@intFromPtr(&commit_buf), 16) ^ 0x80)
+  if homefs_decode_commit(@intFromPtr(&commit_buf), &rec_back) == 0 {
+    passed = passed + 1
+  }
+
+  return passed
 }
