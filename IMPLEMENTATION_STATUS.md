@@ -6,14 +6,10 @@
 
 ## Where the project actually is
 
-The Home-compiled kernel **boots and runs its full initialisation**: memory
-management, the scheduler, the security subsystems, drivers, filesystems,
-networking and system services all initialise on the serial console. The
-milestones are listed in `scripts/boot-milestones.txt` and checked on every
-build.
-
-What executes is the Appendix A set. The rest of this repository is source
-that has been written and parsed, but never run.
+A Home-compiled kernel **boots and prints on the serial console**, but the
+full Appendix A kernel does not complete initialisation — see Boot status.
+Everything else in this repository is source that has been written and
+parsed, but never run.
 
 ## Parse rate
 
@@ -33,14 +29,14 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-✅ **`boot-full-kernel`: PASS** — 83/83 init milestones reached, through to the end of init
+❌ **`boot-full-kernel`: FAIL** — boot gate produced no milestone count
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
 one image — against the milestone list in `scripts/boot-milestones.txt`,
 which names one subsystem per entry and may only ever grow.
 
-✅ **`boot-qemu-aarch64`: PASS** — serial says `HomeOS v0.1: aarch64 kernel_main reached`
+❌ **`boot-qemu-aarch64`: FAIL** — the ARM64 kernel did not reach its boot milestones
 
 Measured by building `kernel/src/arm64_poc.home` for
 `aarch64-freestanding`, linking it with `kernel/src/arch/arm64/boot.s` via
@@ -76,7 +72,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 416 | 240,275 |
+| `kernel/` | 416 | 240,360 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -96,7 +92,7 @@ CI gate (`scripts/stub-check.sh`).
 | S3 | the RX path parses Ethernet, demuxes on ethertype, validates IPv4 and dispatches to arp/icmp/udp | `kernel/src/net/netdev.home` | 0 | **CLOSED** |
 | S4 | Native filesystem is a 33-line import-satisfying stub. The P1 design doc is **done** (`docs/design/homefs.md`); the P2 CoW implementation is not started | `kernel/src/fs/homefs.home` | 1 | open — blocks Phase 2 storage; Phase 6 `snapshot-rollback` |
 | S5 | chacha20, poly1305, blake2s and curve25519 are implemented and checked against the vectors in RFC 8439, RFC 7693 and RFC 7748 | `kernel/src/crypto/` | 0 | **CLOSED** |
-| S6 | No HID driver, so still no USB keyboard, and mass storage reads no blocks yet — INQUIRY works, READ(10) does not. The host-controller driver is done end to end: discovery, bring-up, command ring, port reset, Enable Slot, Address Device, control transfers, descriptors, SET_CONFIGURATION, Configure Endpoint, and bulk transfers under Bulk-Only Transport. The boot gate enumerates a mass-storage device and completes a SCSI INQUIRY against it | `kernel/src/drivers/usb.home` | 2 | open — blocks Phase 7a (keyboards, storage on metal) |
+| S6 | No HID driver, so still no USB keyboard, and no write path or VFS integration for USB storage. The host-controller driver and a mass-storage read path are done: enumeration through Configure Endpoint, Bulk-Only Transport, INQUIRY, READ CAPACITY(10) and READ(10) — the boot gate reads a known block off a USB disk and checks its contents | `kernel/src/drivers/usb.home` | 2 | open — blocks Phase 7a (keyboards, storage on metal) |
 | S7 | No AML interpreter and no power-state transitions, so there is still no S3 suspend/resume. Table discovery is done: RSDP from both permitted locations, checksums verified, RSDT/XSDT walked, FADT and MADT parsed | `kernel/src/drivers/acpi.home` | 1 | open — blocks Phase 7a (power, S3 suspend) |
 | S8 | `mmio_read32`/`mmio_write32` were inert, so every ARM64/Pi driver was too | `kernel/src/arch/arm64/arm64.home` | 0 | **CLOSED** |
 | S9 | Port-I/O wrappers halt the machine on ARM64 — the architecture has no I/O address space, so calling one is always a bug | `kernel/src/core/foundation.home` | 1 | open — blocks Phase 7b (only reachable from ARM64 code paths) |
@@ -114,7 +110,7 @@ first red one are blocked by definition — they are not being worked yet.
 |-------|------|--------|
 | 0 | `parse-rate` | ✅ green |
 | 0 | `stub-register` | ✅ pass — stub-register OK — 4 open entries, all marked and placed correctly |
-| 0 | `boot-qemu-x86_64` | ✅ pass |
+| 0 | `boot-qemu-x86_64` | ❌ pass |
 | 0.5 | `mvk-compiles` | ✅ green |
 | 1 | `boot-to-shell` | ⬜ not started |
 | 2 | `storage-roundtrip` / `net-echo` / `fb-boot-log` | ⬜ not started |

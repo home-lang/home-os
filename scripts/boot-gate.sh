@@ -175,8 +175,17 @@ fi
 # enumerates but moves no data, and a usb-kbd would take keystrokes away from
 # the PS/2 controller and silence the keyboard milestone.
 usbdisk="$workdir/usbdisk.img"
-: > "$usbdisk"
-dd if=/dev/zero of="$usbdisk" bs=1048576 count=2 >/dev/null 2>&1
+# Known bytes at LBA 0, so a block read can be checked against what was
+# written rather than merely against "some bytes came back". Written fresh
+# each run for the same reason the ext2 image is.
+python3 - "$usbdisk" <<'USBIMG'
+import sys
+signature = b"HOMEOS-USB-BLOCK0"
+block = signature + b"\x00" * (512 - len(signature))
+with open(sys.argv[1], "wb") as f:
+    f.write(block)
+    f.write(b"\x00" * (2 * 1024 * 1024 - 512))
+USBIMG
 
 disk="$workdir/disk.img"
 if [ -x "$(command -v python3 2>/dev/null)" ] && [ -f "$REPO_ROOT/tools/mkext2.py" ]; then
