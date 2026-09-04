@@ -96,6 +96,9 @@ run_qemu() {
 
 failures=0
 iteration=1
+# Set once a verify run reports keys on the volume. From then on a reformat is
+# a failure rather than a fresh start.
+committed_any=0
 while [ "$iteration" -le "$ITERATIONS" ]; do
     # A different instant each time. Under two seconds the kernel has not
     # reached homefs at all; past about six it has finished, and neither
@@ -118,6 +121,19 @@ while [ "$iteration" -le "$ITERATIONS" ]; do
         continue
     fi
 
+    # Once a run has committed keys, every later mount has to recover them.
+    # Reformatting is the correct answer only for a volume that never held a
+    # complete transaction — after that it is data loss wearing the same
+    # message, and counting it as a pass is how a crash gate comes to certify
+    # a filesystem that quietly starts over.
+    if [ "$committed_any" = 1 ] && grep -qF '[homefs] volume formatted' "$verify_log" 2>/dev/null; then
+        echo "FAIL iteration $iteration (killed at ${kill_after}s): the volume was reformatted, losing a committed transaction"
+        grep -F '[homefs]' "$verify_log" | head -5
+        failures=$((failures + 1))
+        iteration=$((iteration + 1))
+        continue
+    fi
+
     if grep -qF '[homefs] mount inconsistent' "$verify_log" 2>/dev/null; then
         echo "FAIL iteration $iteration (killed at ${kill_after}s): the volume mounted a mixture"
         grep -F '[homefs]' "$verify_log" | head -5
@@ -125,6 +141,9 @@ while [ "$iteration" -le "$ITERATIONS" ]; do
     elif grep -qF '[homefs] volume consistent' "$verify_log" 2>/dev/null; then
         printf 'ok   iteration %d (killed at %ss): %s\n' "$iteration" "$kill_after" \
             "$(grep -F '[homefs] volume consistent' "$verify_log" | head -1)"
+        if grep -qE '\[homefs\] committed to key [1-9]' "$verify_log" 2>/dev/null; then
+            committed_any=1
+        fi
     else
         echo "FAIL iteration $iteration (killed at ${kill_after}s): the volume did not mount"
         grep -F '[homefs]' "$verify_log" | head -5
