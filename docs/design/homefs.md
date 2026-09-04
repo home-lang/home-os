@@ -75,9 +75,16 @@ struct Superblock {
     active_snapshot: u64    // object ID of the booted snapshot root
 
     flags: u64
+    generation: u64        // bumped on every superblock write
+    txid: u64              // transaction this superblock records
     uuid: [16]u8
 }
 ```
+
+`generation` and `txid` are required by §5 — recovery "picks the highest valid
+`(generation, txid)` pair" — and without both, two slots cannot be ordered.
+They were missing from this listing while §5 assumed them; the implementation
+(`kernel/src/fs/homefs.home`) carries them at offsets 64 and 72.
 
 Two superblocks alternate ("superblock ping-pong"). A superblock is only
 rewritten after its referenced metadata is durable (§5), so any crash

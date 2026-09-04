@@ -581,6 +581,7 @@ These were referenced by files already in the set and were not listed, which is 
 - `kernel/src/crypto/sha256.home`
 - `kernel/src/crypto/curve25519.home`
 - `kernel/src/drivers/acpi.home`
+- `kernel/src/fs/homefs.home`
 
 **Link script**
 - `kernel/linker.ld`

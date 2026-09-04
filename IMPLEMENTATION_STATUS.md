@@ -33,7 +33,7 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-✅ **`boot-full-kernel`: PASS** — 71/71 init milestones reached, through to the end of init
+✅ **`boot-full-kernel`: PASS** — 72/72 init milestones reached, through to the end of init
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
@@ -53,7 +53,7 @@ only the hardware gate can measure.
 
 ## Codegen ratchet
 
-**79/79 of the Minimum Viable Kernel file set reaches codegen.**
+**80/80 of the Minimum Viable Kernel file set reaches codegen.**
 
 This is the number to watch. The MVK set is
 [MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);
@@ -64,7 +64,7 @@ fall — `scripts/mvk-compiles.sh` fails the build if it does.
 Run `scripts/mvk-compiles.sh --list` to see what each remaining file is
 waiting on; the failures name the construct, not just the count.
 
-**79/79 of the same set reaches codegen for `aarch64`.**
+**80/80 of the same set reaches codegen for `aarch64`.**
 
 Kept as its own number rather than averaged in, because the two targets
 advance independently. The gap is not a compiler gap: the files that do
@@ -76,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 416 | 238,887 |
+| `kernel/` | 416 | 239,243 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
