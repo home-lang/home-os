@@ -62,6 +62,12 @@ const USBSTS_CNR: u32 = 0x00000800      // controller not ready
 
 const CRCR_RCS: u32 = 0x00000001        // ring cycle state
 const PORTSC_CCS: u32 = 0x00000001      // current connect status
+const PORTSC_PED: u32 = 0x00000002      // port enabled
+const PORTSC_PR: u32 = 0x00000010       // port reset
+const PORTSC_PRC: u32 = 0x00200000      // port reset change
+// Every write-1-to-clear status bit in PORTSC, masked off before a
+// read-modify-write so a control change does not silently clear them.
+const PORTSC_CHANGE_MASK: u32 = 0x00FE0002
 
 // One page each. 256 TRBs of 16 bytes fills a page exactly, which is why the
 // ring sizes below are what they are.
@@ -84,6 +90,16 @@ var command_ring: u64 = 0
 var event_ring: u64 = 0
 var erst_page: u64 = 0
 var controller_running: u32 = 0
+
+// Producer and consumer state for the two rings. The cycle bit is what marks
+// an entry as belonging to the current pass around a ring, so it flips every
+// time the index wraps — without it the controller cannot tell a fresh TRB
+// from the one that occupied the slot last time round.
+var cmd_enqueue: u32 = 0
+var cmd_cycle: u32 = 1
+var event_dequeue: u32 = 0
+var event_cycle: u32 = 1
+var last_slot_id: u32 = 0
 
 // Register reads go through the architecture-neutral MMIO intrinsic rather
 // than a plain load: it is what tells the backend this access must not be
@@ -329,6 +345,7 @@ export fn xhci_start(): u32 {
 // TRB types used here. A TRB is 16 bytes: a 64-bit parameter, a status
 // dword, and a control dword whose bit 0 is the cycle and whose bits 15:10
 // are the type.
+const TRB_TYPE_ENABLE_SLOT: u32 = 9
 const TRB_TYPE_NOOP_COMMAND: u32 = 23
 const TRB_TYPE_COMMAND_COMPLETION: u32 = 33
 const TRB_COMPLETION_SUCCESS: u32 = 1
@@ -342,55 +359,117 @@ fn read_mem32(base: u64, offset: u32): u32 {
   return @as(*u32, @ptrFromInt(base + @as(u64, offset))).*
 }
 
-// Issue a No-Op command and wait for its completion event.
+// Place a command TRB on the ring, ring the doorbell, and wait for the
+// completion event that names it.
 //
-// This is the command the specification provides for exactly this purpose: it
-// asks the controller to do nothing and report that it did. It exercises the
-// whole path — our TRB on the command ring, the doorbell, the controller's
-// event on the event ring, the cycle bit that separates new entries from
-// stale ones — without needing a device attached.
-//
-// Returns 1 when the completion event names our TRB and reports success.
-export fn xhci_noop_command(): u32 {
+// Returns the completion code — 1 is success — and leaves the slot id the
+// event carried in last_slot_id. A code rather than a boolean because the
+// controller distinguishes its refusals, and a caller that cannot see which
+// one it got has to guess.
+fn issue_command(param: u64, trb_type: u32): u32 {
   if controller_running == 0 { return 0 }
 
-  // Slot 0 of the command ring. The cycle bit is 1 because the ring was
-  // zeroed and CRCR was armed with RCS=1: the controller consumes entries
-  // whose cycle matches, so a zeroed ring reads as empty until we set it.
-  write_mem32(command_ring, 0, 0)
-  write_mem32(command_ring, 4, 0)
-  write_mem32(command_ring, 8, 0)
-  write_mem32(command_ring, 12, (TRB_TYPE_NOOP_COMMAND << 10) | 1)
+  // The last TRB of the ring must be a Link back to the start, so the ring is
+  // one short of its size for commands. Wrapping is handled by refusing to
+  // fill the final slot rather than by writing a Link TRB, because nothing
+  // here issues enough commands to reach it.
+  if cmd_enqueue >= RING_TRBS - 1 { return 0 }
 
-  // Ring the host controller doorbell. Doorbell 0 is the command ring; a
-  // device slot's doorbell is its slot id.
+  let slot: u32 = cmd_enqueue * TRB_SIZE
+  write_mem32(command_ring, slot, @as(u32, param & 0xFFFFFFFF))
+  write_mem32(command_ring, slot + 4, @as(u32, (param >> 32) & 0xFFFFFFFF))
+  write_mem32(command_ring, slot + 8, 0)
+  write_mem32(command_ring, slot + 12, (trb_type << 10) | cmd_cycle)
+
+  let issued_at: u64 = command_ring + @as(u64, slot)
+  cmd_enqueue = cmd_enqueue + 1
+
   write32(doorbell_base, 0)
 
-  // The controller writes its event into slot 0 of the event ring with the
-  // cycle bit set, for the same reason: a zeroed ring is an empty one.
   var spins: u32 = 0
   while spins < 1000000 {
-    let control: u32 = read_mem32(event_ring, 12)
-    if (control & 1) != 0 {
-      let trb_type: u32 = (control >> 10) & 0x3F
-      let completion_code: u32 = read_mem32(event_ring, 8) >> 24
-      let pointer_low: u32 = read_mem32(event_ring, 0)
+    let offset: u32 = event_dequeue * TRB_SIZE
+    let control: u32 = read_mem32(event_ring, offset + 12)
+    if (control & 1) == event_cycle {
+      let event_type: u32 = (control >> 10) & 0x3F
+      let completion_code: u32 = read_mem32(event_ring, offset + 8) >> 24
+      let pointer_low: u32 = read_mem32(event_ring, offset)
+      last_slot_id = (control >> 24) & 0xFF
 
-      // Advance the dequeue pointer past the event we just read and clear
-      // the busy flag, or the controller stops writing events.
-      let ir0: u64 = runtime_base + @as(u64, XHCI_IR0)
-      write64(ir0 + @as(u64, XHCI_IR_ERDP), (event_ring + @as(u64, TRB_SIZE)) | ERDP_EHB)
-
-      if trb_type == TRB_TYPE_COMMAND_COMPLETION and
-         completion_code == TRB_COMPLETION_SUCCESS and
-         @as(u64, pointer_low) == (command_ring & 0xFFFFFFFF) {
-        return 1
+      event_dequeue = event_dequeue + 1
+      if event_dequeue >= RING_TRBS {
+        event_dequeue = 0
+        event_cycle = event_cycle ^ 1
       }
+      let ir0: u64 = runtime_base + @as(u64, XHCI_IR0)
+      write64(ir0 + @as(u64, XHCI_IR_ERDP),
+        (event_ring + @as(u64, event_dequeue * TRB_SIZE)) | ERDP_EHB)
+
+      // The event ring carries every kind of event, not just command
+      // completions: a port reset posts a Port Status Change Event, and it
+      // arrives on the same ring. Treating the next event as the answer to
+      // the last command makes a command look like it failed whenever
+      // anything else happened first. Consume what is not ours and keep
+      // waiting.
+      if event_type == TRB_TYPE_COMMAND_COMPLETION and
+         @as(u64, pointer_low) == (issued_at & 0xFFFFFFFF) {
+        return completion_code
+      }
+    }
+    foundation.cpu_pause()
+    spins = spins + 1
+  }
+  return 0
+}
+
+// The No-Op command asks the controller to do nothing and report that it did.
+// It is the specification's own way of exercising the ring path without a
+// device attached.
+export fn xhci_noop_command(): u32 {
+  if issue_command(0, TRB_TYPE_NOOP_COMMAND) == TRB_COMPLETION_SUCCESS { return 1 }
+  return 0
+}
+
+// Reset a port and wait for the reset to be acknowledged. Ports are numbered
+// from 1; the register array is indexed from 0.
+export fn xhci_port_reset(port: u32): u32 {
+  if port == 0 or port > max_ports { return 0 }
+  let portsc: u64 = operational_base + @as(u64, XHCI_PORTSC_BASE + (port - 1) * XHCI_PORT_STRIDE)
+
+  // PORTSC has write-1-to-clear status bits alongside read/write control
+  // bits. Writing the value straight back would clear every status bit that
+  // happened to be set, so the change bits are masked out first.
+  let current: u32 = read32(portsc) & ~PORTSC_CHANGE_MASK
+  write32(portsc, current | PORTSC_PR)
+
+  var spins: u32 = 0
+  while spins < 1000000 {
+    let now: u32 = read32(portsc)
+    if (now & PORTSC_PRC) != 0 {
+      // Acknowledge the change bit, or it stays set and the next reset looks
+      // as though it completed instantly.
+      write32(portsc, (now & ~PORTSC_CHANGE_MASK) | PORTSC_PRC)
+      if (now & PORTSC_PED) != 0 { return 1 }
       return 0
     }
     foundation.cpu_pause()
     spins = spins + 1
   }
+  return 0
+}
+
+// Ask the controller for a device slot. The slot id comes back in the
+// completion event, and is the handle every later command for that device
+// carries.
+export fn xhci_enable_slot(): u32 {
+  if issue_command(0, TRB_TYPE_ENABLE_SLOT) != TRB_COMPLETION_SUCCESS { return 0 }
+  return last_slot_id
+}
+
+export fn usb_port_connected(port: u32): u32 {
+  if port == 0 or port > max_ports { return 0 }
+  let portsc: u64 = operational_base + @as(u64, XHCI_PORTSC_BASE + (port - 1) * XHCI_PORT_STRIDE)
+  if (read32(portsc) & PORTSC_CCS) != 0 { return 1 }
   return 0
 }
 
