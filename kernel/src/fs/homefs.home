@@ -61,7 +61,11 @@ export struct Superblock {
   active_snapshot: u64,
   flags: u64,
   generation: u64,
-  txid: u64
+  txid: u64,
+  // Block holding the snapshot table. Inside the checksummed region on
+  // purpose: a volume whose superblock verifies but whose snapshot list does
+  // not is a volume that has silently lost its rollback points.
+  snapshot_table: u64
 }
 
 // ============================================================================
@@ -183,6 +187,7 @@ export fn homefs_encode_superblock(base: u64, sb: *Superblock) {
   put64(base, 56, sb.flags)
   put64(base, 64, sb.generation)
   put64(base, 72, sb.txid)
+  put64(base, 80, sb.snapshot_table)
   // 80..96 is the UUID, written by mkfs and preserved across commits.
 
   digest(base + @as(u64, SUPERBLOCK_CHECKSUM_OFFSET), base, SUPERBLOCK_CHECKSUM_OFFSET)
@@ -209,6 +214,7 @@ export fn homefs_decode_superblock(base: u64, sb: *Superblock): u32 {
   sb.flags = get64(base, 56)
   sb.generation = get64(base, 64)
   sb.txid = get64(base, 72)
+  sb.snapshot_table = get64(base, 80)
   return 1
 }
 
@@ -788,6 +794,14 @@ const SB_SLOT1_LBA: u64 = 8
 const COMMIT_LBA: u64 = 16
 const DATA_START_LBA: u64 = 32
 
+// Declared here with the rest of the volume state rather than beside the
+// snapshot code below. A module-level var used by a function defined earlier
+// in the file did not resolve to this storage: homefs_commit read zero while
+// homefs_snapshot_create had just written to it, so a snapshot was taken and
+// then not recorded in the superblock that was supposed to carry it.
+var snapshot_table_block: u32 = 0
+var next_snapshot_id: u64 = 1
+
 var volume_drive: u32 = 0
 var volume_mounted: u32 = 0
 var committed_blocks: u32 = 0
@@ -816,6 +830,8 @@ export fn homefs_format(drive: u32, base: u64, blocks: u32): u32 {
   current_generation = 1
   current_txid = 1
   current_root = @as(u64, root)
+  snapshot_table_block = 0
+  next_snapshot_id = 1
   committed_blocks = 0
 
   if homefs_commit() == 0 { return 0 }
@@ -876,6 +892,7 @@ export fn homefs_commit(): u32 {
   sb.flags = 0
   sb.generation = current_generation
   sb.txid = current_txid
+  sb.snapshot_table = @as(u64, snapshot_table_block)
   homefs_encode_superblock(sb_scratch_addr(), &sb)
 
   // Alternate slots, so the one being overwritten is never the one a crash
@@ -953,6 +970,17 @@ export fn homefs_mount(drive: u32, base: u64, blocks: u32): u32 {
   current_generation = chosen.generation
   current_txid = chosen.txid
   current_root = chosen.root_dir_object
+  snapshot_table_block = @as(u32, chosen.snapshot_table)
+  // Any id already in the table has been used, so a new snapshot must start
+  // past the highest of them or two snapshots would share an id.
+  next_snapshot_id = 1
+  var si: u32 = 0
+  let scount: u32 = snapshot_count_in(snapshot_table_block)
+  while si < scount {
+    let sid: u64 = snapshot_entry_id(snapshot_table_block, si)
+    if sid >= next_snapshot_id { next_snapshot_id = sid + 1 }
+    si = si + 1
+  }
   volume_mounted = 1
   return 1
 }
@@ -977,4 +1005,119 @@ export fn homefs_insert_and_commit(key: u64, value: u64): u32 {
 export fn homefs_lookup(key: u64): u64 {
   if volume_mounted == 0 { return 0 }
   return homefs_btree_lookup(@as(u32, current_root), key)
+}
+
+// ============================================================================
+// Snapshots (design doc §7)
+//
+// A snapshot is a root of the tree that nothing will overwrite. Copy-on-write
+// already guarantees that: every insert writes a new root and leaves the old
+// one describing the tree exactly as it was. Taking a snapshot is therefore
+// recording a block number, and rolling back is choosing a different one —
+// both O(1) and independent of how much data the volume holds.
+//
+// The snapshot table is one block: a count, then entries of
+// (id, root block, generation). It is written copy-on-write like everything
+// else, so a crash during a snapshot leaves the previous table intact.
+// ============================================================================
+
+const SNAPSHOT_TABLE_MAGIC: u32 = 0x50414E53      // 'SNAP'
+const SNAPSHOT_HEADER_SIZE: u32 = 16
+const SNAPSHOT_ENTRY_SIZE: u32 = 16
+const SNAPSHOT_MAX: u32 = 254
+
+fn snapshot_count_in(block: u32): u32 {
+  if block_valid(block) == 0 { return 0 }
+  if get32(block_addr(block), 0) != SNAPSHOT_TABLE_MAGIC { return 0 }
+  let count: u32 = get32(block_addr(block), 4)
+  if count > SNAPSHOT_MAX { return 0 }
+  return count
+}
+
+fn snapshot_entry_id(block: u32, index: u32): u64 {
+  return get64(block_addr(block), SNAPSHOT_HEADER_SIZE + index * SNAPSHOT_ENTRY_SIZE)
+}
+
+fn snapshot_entry_root(block: u32, index: u32): u32 {
+  return get32(block_addr(block), SNAPSHOT_HEADER_SIZE + index * SNAPSHOT_ENTRY_SIZE + 8)
+}
+
+fn snapshot_entry_generation(block: u32, index: u32): u32 {
+  return get32(block_addr(block), SNAPSHOT_HEADER_SIZE + index * SNAPSHOT_ENTRY_SIZE + 12)
+}
+
+export fn homefs_snapshot_count(): u32 {
+  return snapshot_count_in(snapshot_table_block)
+}
+
+export fn homefs_snapshot_id_at(index: u32): u64 {
+  if index >= homefs_snapshot_count() { return 0 }
+  return snapshot_entry_id(snapshot_table_block, index)
+}
+
+// Pin the current root under a new snapshot id. Returns the id, or 0.
+//
+// The table is rewritten to a fresh block rather than appended in place, for
+// the same reason every tree node is: a crash midway through must leave the
+// previous table whole, not a table with a half-written entry on the end.
+export fn homefs_snapshot_create(): u64 {
+  if volume_mounted == 0 { return 0 }
+  let existing: u32 = homefs_snapshot_count()
+  if existing >= SNAPSHOT_MAX { return 0 }
+
+  let fresh: u32 = homefs_alloc_block()
+  if fresh == 0 { return 0 }
+  put32(block_addr(fresh), 0, SNAPSHOT_TABLE_MAGIC)
+  put32(block_addr(fresh), 4, existing + 1)
+
+  var i: u32 = 0
+  while i < existing {
+    put64(block_addr(fresh), SNAPSHOT_HEADER_SIZE + i * SNAPSHOT_ENTRY_SIZE,
+          snapshot_entry_id(snapshot_table_block, i))
+    put32(block_addr(fresh), SNAPSHOT_HEADER_SIZE + i * SNAPSHOT_ENTRY_SIZE + 8,
+          snapshot_entry_root(snapshot_table_block, i))
+    put32(block_addr(fresh), SNAPSHOT_HEADER_SIZE + i * SNAPSHOT_ENTRY_SIZE + 12,
+          snapshot_entry_generation(snapshot_table_block, i))
+    i = i + 1
+  }
+
+  let id: u64 = next_snapshot_id
+  put64(block_addr(fresh), SNAPSHOT_HEADER_SIZE + existing * SNAPSHOT_ENTRY_SIZE, id)
+  put32(block_addr(fresh), SNAPSHOT_HEADER_SIZE + existing * SNAPSHOT_ENTRY_SIZE + 8,
+        @as(u32, current_root))
+  put32(block_addr(fresh), SNAPSHOT_HEADER_SIZE + existing * SNAPSHOT_ENTRY_SIZE + 12,
+        @as(u32, current_generation))
+
+  snapshot_table_block = fresh
+  next_snapshot_id = next_snapshot_id + 1
+  current_generation = current_generation + 1
+  current_txid = current_txid + 1
+  if homefs_commit() == 0 { return 0 }
+  return id
+}
+
+// Roll the active tree back to a snapshot.
+//
+// The snapshot's root becomes the current root and a new transaction records
+// it. History is not rewritten: the root being left behind is still a valid
+// tree, and a snapshot taken now would pin it. That is what §7 means by
+// rolling back "by branching, never mutating history" — a rollback is
+// reversible because the state it left is still reachable.
+export fn homefs_snapshot_rollback(id: u64): u32 {
+  if volume_mounted == 0 { return 0 }
+  let count: u32 = homefs_snapshot_count()
+  var i: u32 = 0
+  while i < count {
+    if snapshot_entry_id(snapshot_table_block, i) == id {
+      let root: u32 = snapshot_entry_root(snapshot_table_block, i)
+      if block_valid(root) == 0 { return 0 }
+      if node_magic(root) != BTREE_MAGIC { return 0 }
+      current_root = @as(u64, root)
+      current_generation = current_generation + 1
+      current_txid = current_txid + 1
+      return homefs_commit()
+    }
+    i = i + 1
+  }
+  return 0
 }

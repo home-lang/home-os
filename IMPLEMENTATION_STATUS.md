@@ -19,7 +19,7 @@ that has been written and parsed, but never run.
 
 **416/416 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `b9731a52d`
+- Compiler: `home-lang/home` @ `33ae7855e`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -76,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 416 | 241,093 |
+| `kernel/` | 416 | 241,276 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -94,7 +94,7 @@ CI gate (`scripts/stub-check.sh`).
 |---|------|------|--------:|--------|
 | S1 | silent hlt-stub fallback + dead `.zig` references | `scripts/build.sh` | 0 | **CLOSED** |
 | S3 | the RX path parses Ethernet, demuxes on ethertype, validates IPv4 and dispatches to arp/icmp/udp | `kernel/src/net/netdev.home` | 0 | **CLOSED** |
-| S4 | No free-space reclamation, no VFS integration, no snapshots. Steps 1–3 of `docs/design/homefs.md` §9 are done: on-disk structures with blake2s checksums, a block device, copy-on-write B-trees, and the commit protocol — a volume survives a reboot, and `scripts/crash-gate.sh` kills QEMU mid-commit and remounts to prove it | `kernel/src/fs/homefs.home` | 1 | open — blocks Phase 2 storage; Phase 6 `snapshot-rollback` |
+| S4 | No free-space reclamation, no VFS integration, and no files — the tree is key/value, not directories and extents. Steps 1–3 of `docs/design/homefs.md` §9 are done: on-disk structures with blake2s checksums, a block device, copy-on-write B-trees, the commit protocol, and snapshots with rollback — a volume survives a reboot, `scripts/crash-gate.sh` kills QEMU mid-commit and remounts to prove it, and a snapshot survives a reboot too | `kernel/src/fs/homefs.home` | 1 | open — blocks Phase 2 storage; Phase 6 `snapshot-rollback` |
 | S5 | chacha20, poly1305, blake2s and curve25519 are implemented and checked against the vectors in RFC 8439, RFC 7693 and RFC 7748 | `kernel/src/crypto/` | 0 | **CLOSED** |
 | S6 | No HID driver, so still no USB keyboard, and no write path or VFS integration for USB storage. The host-controller driver and a mass-storage read path are done: enumeration through Configure Endpoint, Bulk-Only Transport, INQUIRY, READ CAPACITY(10) and READ(10) — the boot gate reads a known block off a USB disk and checks its contents | `kernel/src/drivers/usb.home` | 2 | open — blocks Phase 7a (keyboards, storage on metal) |
 | S7 | No AML interpreter and no power-state transitions, so there is still no S3 suspend/resume. Table discovery is done: RSDP from both permitted locations, checksums verified, RSDT/XSDT walked, FADT and MADT parsed | `kernel/src/drivers/acpi.home` | 1 | open — blocks Phase 7a (power, S3 suspend) |
