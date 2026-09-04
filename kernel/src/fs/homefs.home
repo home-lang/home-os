@@ -15,6 +15,9 @@
 // where the same tree targets both x86-64 and ARM64.
 
 import "../crypto/blake2s.home" as blake2s
+import "../drivers/ata.home" as ata
+import "../core/foundation.home" as foundation
+
 
 // 'HOMS' read as a little-endian u32.
 export const HOMEFS_MAGIC: u32 = 0x534D4F48
@@ -441,9 +444,30 @@ const NODE_HEADER_SIZE: u32 = 32
 const NODE_ENTRY_SIZE: u32 = 16
 const NODE_MAX_ENTRIES: u32 = 254          // (4096 - 32) / 16
 
-fn node_magic(block: u32): u32 { return get32(block_addr(block), 0) }
+// A block number that came off disk is not to be trusted: a torn commit can
+// leave a superblock pointing at anything. An out-of-range block read through
+// block_addr() would land outside the volume's memory entirely, which is a
+// page fault in the middle of a mount rather than a filesystem that refuses.
+fn block_valid(block: u32): u32 {
+  if block == 0 { return 0 }
+  if block >= device_blocks { return 0 }
+  return 1
+}
+
+fn node_magic(block: u32): u32 {
+  if block_valid(block) == 0 { return 0 }
+  return get32(block_addr(block), 0)
+}
 fn node_level(block: u32): u32 { return get32(block_addr(block), 4) }
-fn node_count(block: u32): u32 { return get32(block_addr(block), 8) }
+fn node_count(block: u32): u32 {
+  if block_valid(block) == 0 { return 0 }
+  let count: u32 = get32(block_addr(block), 8)
+  // A count past the node's capacity would walk entries off the end of the
+  // block. Reading it as empty is the safe answer: it makes the subtree look
+  // absent rather than making the walk read the next node's header as keys.
+  if count > NODE_MAX_ENTRIES { return 0 }
+  return count
+}
 
 fn set_node_header(block: u32, level: u32, count: u32) {
   put32(block_addr(block), 0, BTREE_MAGIC)
@@ -503,7 +527,9 @@ export fn homefs_btree_lookup(root: u32, key: u64): u64 {
       return 0
     }
     if slot >= node_count(node) { return 0 }
-    node = @as(u32, entry_value(node, slot))
+    let child: u32 = @as(u32, entry_value(node, slot))
+    if block_valid(child) == 0 { return 0 }
+    node = child
     depth = depth + 1
   }
   return 0
@@ -736,4 +762,218 @@ export fn homefs_btree_selftest(base: u64, blocks: u32): u32 {
   if homefs_blocks_used() > before { passed = passed + 1 }
 
   return passed
+}
+
+// ============================================================================
+// Disk backing and the commit protocol (design doc §5, §9 step 3)
+//
+// The volume lives in memory and is written through to disk at a commit —
+// the "in-memory mirror" of §9 step 2. Copy-on-write is what makes that safe
+// to do in bulk: newly allocated blocks are not referenced by anything on disk
+// until the superblock is updated to point at them, so their order of arrival
+// does not matter. Only the last two writes are ordered, and they are the
+// whole protocol.
+//
+// On-disk layout, in 512-byte sectors:
+//   0..7    superblock slot 0
+//   8..15   superblock slot 1
+//   16..23  commit record
+//   32..    data blocks, eight sectors each, homefs block N at 32 + N*8
+// ============================================================================
+
+const SECTORS_PER_BLOCK: u32 = 8
+const SB_SLOT0_LBA: u64 = 0
+const SB_SLOT1_LBA: u64 = 8
+const COMMIT_LBA: u64 = 16
+const DATA_START_LBA: u64 = 32
+
+var volume_drive: u32 = 0
+var volume_mounted: u32 = 0
+var committed_blocks: u32 = 0
+var current_generation: u64 = 0
+var current_txid: u64 = 0
+var current_root: u64 = 0
+
+fn disk_write_block(drive: u32, lba: u64, addr: u64): u32 {
+  return ata.ata_write_sectors(drive, lba, SECTORS_PER_BLOCK, addr)
+}
+
+fn disk_read_block(drive: u32, lba: u64, addr: u64): u32 {
+  return ata.ata_read_sectors(drive, lba, SECTORS_PER_BLOCK, addr)
+}
+
+// Lay down a fresh volume: an empty tree, a commit record for it, and both
+// superblocks. Both slots are written so a first mount has two valid
+// generations to choose between rather than one valid and one arbitrary.
+export fn homefs_format(drive: u32, base: u64, blocks: u32): u32 {
+  homefs_device_init(base, blocks)
+  volume_drive = drive
+
+  let root: u32 = homefs_btree_create()
+  if root == 0 { return 0 }
+
+  current_generation = 1
+  current_txid = 1
+  current_root = @as(u64, root)
+  committed_blocks = 0
+
+  if homefs_commit() == 0 { return 0 }
+  // The second slot starts as a copy of the first, one generation behind, so
+  // the ping-pong has somewhere to land on the next commit.
+  current_generation = 2
+  current_txid = 2
+  if homefs_commit() == 0 { return 0 }
+
+  volume_mounted = 1
+  return 1
+}
+
+// Write everything this transaction allocated, then the commit record, then
+// the superblock. The order is the design document's §5 and it is the entire
+// crash-consistency argument:
+//
+//   1. New blocks first. Nothing on disk points at them yet, so a crash here
+//      leaves the previous tree whole and the blocks merely orphaned.
+//   2. The commit record. A torn one fails its checksum and reads as absent.
+//   3. The superblock last, into the slot the *older* generation occupies.
+//      Until this write lands the volume still mounts the previous
+//      transaction; after it lands it mounts this one. There is no moment at
+//      which it mounts a mixture.
+export fn homefs_commit(): u32 {
+  if volume_drive == 0 and volume_mounted == 0 and committed_blocks == 0 {
+    // formatting: fall through, the drive was set by homefs_format
+  }
+
+  var block: u32 = committed_blocks
+  if block == 0 { block = 1 }
+  while block < device_next_free {
+    if disk_write_block(volume_drive, DATA_START_LBA + @as(u64, block) * @as(u64, SECTORS_PER_BLOCK),
+                        block_addr(block)) != 0 {
+      return 0
+    }
+    block = block + 1
+  }
+
+  var record: CommitRecord = undefined
+  record.txid = current_txid
+  record.generation = current_generation
+  record.root_dir_object = current_root
+  record.active_snapshot = 0
+  record.olog_tail = @as(u64, device_next_free)
+  homefs_encode_commit(commit_scratch_addr(), &record)
+  if disk_write_block(volume_drive, COMMIT_LBA, commit_scratch_addr()) != 0 { return 0 }
+
+  var sb: Superblock = undefined
+  sb.magic = HOMEFS_MAGIC
+  sb.version = HOMEFS_VERSION
+  sb.block_size = HOMEFS_BLOCK_SIZE
+  sb.block_count = @as(u64, device_blocks)
+  sb.olog_head = @as(u64, device_next_free)
+  sb.olog_tail = 0
+  sb.root_dir_object = current_root
+  sb.active_snapshot = 0
+  sb.flags = 0
+  sb.generation = current_generation
+  sb.txid = current_txid
+  homefs_encode_superblock(sb_scratch_addr(), &sb)
+
+  // Alternate slots, so the one being overwritten is never the one a crash
+  // would have to fall back to.
+  var target: u64 = SB_SLOT0_LBA
+  if (current_generation % 2) == 0 { target = SB_SLOT1_LBA }
+  if disk_write_block(volume_drive, target, sb_scratch_addr()) != 0 { return 0 }
+
+  committed_blocks = device_next_free
+  return 1
+}
+
+var sb_scratch: [u8; 4096] = undefined
+var commit_scratch: [u8; 4096] = undefined
+fn sb_scratch_addr(): u64 { return @intFromPtr(&sb_scratch) }
+fn commit_scratch_addr(): u64 { return @intFromPtr(&commit_scratch) }
+
+// Read both superblock slots, take the newer valid one, and load the blocks
+// it says are live back into the mirror.
+//
+// Returns 1 on success. A volume whose superblocks are both unreadable is not
+// mounted at all — that is a different answer from mounting an empty one, and
+// conflating them would present a wiped disk as a fresh install.
+export fn homefs_mount(drive: u32, base: u64, blocks: u32): u32 {
+  homefs_device_init(base, blocks)
+  volume_drive = drive
+  volume_mounted = 0
+
+  if disk_read_block(drive, SB_SLOT0_LBA, sb_scratch_addr()) != 0 { return 0 }
+  var slot0: Superblock = undefined
+  let slot0_ok: u32 = homefs_decode_superblock(sb_scratch_addr(), &slot0)
+
+  if disk_read_block(drive, SB_SLOT1_LBA, commit_scratch_addr()) != 0 { return 0 }
+  var slot1: Superblock = undefined
+  let slot1_ok: u32 = homefs_decode_superblock(commit_scratch_addr(), &slot1)
+
+  var chosen: Superblock = undefined
+  if slot0_ok == 1 and slot1_ok == 1 {
+    if slot1.generation > slot0.generation { chosen = slot1 } else { chosen = slot0 }
+  } else {
+    if slot0_ok == 1 {
+      chosen = slot0
+    } else {
+      if slot1_ok == 1 { chosen = slot1 } else { return 0 }
+    }
+  }
+
+  // Load the live blocks back. olog_head carries the allocation watermark,
+  // which is how many blocks the committed tree can reach.
+  //
+  // Both it and the root are checked against the device before anything is
+  // read through them. A superblock whose checksum passes can still describe
+  // a volume this device cannot hold — a torn write that happened to land on
+  // a checksum boundary, or an image from a larger disk — and following it
+  // reads outside the volume.
+  let live: u32 = @as(u32, chosen.olog_head)
+  let root_block: u32 = @as(u32, chosen.root_dir_object)
+  if live > blocks or live < 2 { return 0 }
+  if root_block == 0 or root_block >= live { return 0 }
+  var block: u32 = 1
+  while block < live {
+    if disk_read_block(drive, DATA_START_LBA + @as(u64, block) * @as(u64, SECTORS_PER_BLOCK),
+                       block_addr(block)) != 0 {
+      return 0
+    }
+    block = block + 1
+  }
+
+  device_next_free = live
+  committed_blocks = live
+  // The root has to be a B-tree node. Everything above mount trusts that the
+  // root it was handed is one, so this is where it is established rather than
+  // assumed.
+  if node_magic(root_block) != BTREE_MAGIC { return 0 }
+  current_generation = chosen.generation
+  current_txid = chosen.txid
+  current_root = chosen.root_dir_object
+  volume_mounted = 1
+  return 1
+}
+
+export fn homefs_is_mounted(): u32 { return volume_mounted }
+export fn homefs_root(): u32 { return @as(u32, current_root) }
+export fn homefs_generation(): u64 { return current_generation }
+export fn homefs_txid(): u64 { return current_txid }
+
+// Insert a key and commit it, advancing the transaction. Returns 1 on
+// success.
+export fn homefs_insert_and_commit(key: u64, value: u64): u32 {
+  if volume_mounted == 0 { return 0 }
+  let new_root: u32 = homefs_btree_insert(@as(u32, current_root), key, value)
+  if new_root == 0 { return 0 }
+  current_root = @as(u64, new_root)
+  current_generation = current_generation + 1
+  current_txid = current_txid + 1
+  return homefs_commit()
+}
+
+export fn homefs_lookup(key: u64): u64 {
+  if volume_mounted == 0 { return 0 }
+  return homefs_btree_lookup(@as(u32, current_root), key)
 }
