@@ -381,3 +381,359 @@ export fn homefs_selftest(): u32 {
 
   return passed
 }
+
+// ============================================================================
+// Block device (design doc §9 step 2)
+//
+// A ramdisk for now. Everything above it addresses blocks, not memory, so the
+// same tree code runs against a real device when one is wired up — which is
+// the whole reason this layer exists rather than the trees indexing memory
+// directly.
+// ============================================================================
+
+const HOMEFS_BLOCK_SIZE: u32 = 4096
+
+var device_base: u64 = 0
+var device_blocks: u32 = 0
+var device_next_free: u32 = 0
+
+// Block 0 is never handed out: zero doubles as "no block" in every pointer
+// field, and a tree that could legitimately live there would be
+// indistinguishable from an empty one.
+export fn homefs_device_init(base: u64, blocks: u32) {
+  device_base = base
+  device_blocks = blocks
+  device_next_free = 1
+}
+
+fn block_addr(block: u32): u64 {
+  return device_base + @as(u64, block) * @as(u64, HOMEFS_BLOCK_SIZE)
+}
+
+// Copy-on-write never rewrites a block, so allocation is a bump pointer until
+// the refcount walk of §6 exists to reclaim. Returns 0 when the device is
+// full, which callers must treat as failure rather than as block 0.
+export fn homefs_alloc_block(): u32 {
+  if device_next_free >= device_blocks { return 0 }
+  let block: u32 = device_next_free
+  device_next_free = device_next_free + 1
+  zero_range(block_addr(block), 0, HOMEFS_BLOCK_SIZE)
+  return block
+}
+
+export fn homefs_blocks_used(): u32 { return device_next_free }
+
+// ============================================================================
+// B-tree (design doc §3)
+//
+// One node per block, copy-on-write: a modified node is written to a fresh
+// block and its parent updated to point at the new copy, all the way to the
+// root. Nothing on disk is ever overwritten in place, which is what makes a
+// crash leave the previous tree intact.
+//
+// Node layout: a 32-byte header, then fixed 16-byte entries of (key, value).
+// In a leaf the value is the caller's; in an internal node it is the block
+// number of a child, and the key is the largest key in that subtree.
+// ============================================================================
+
+const BTREE_MAGIC: u32 = 0x52544248        // 'HBTR' little-endian
+const NODE_HEADER_SIZE: u32 = 32
+const NODE_ENTRY_SIZE: u32 = 16
+const NODE_MAX_ENTRIES: u32 = 254          // (4096 - 32) / 16
+
+fn node_magic(block: u32): u32 { return get32(block_addr(block), 0) }
+fn node_level(block: u32): u32 { return get32(block_addr(block), 4) }
+fn node_count(block: u32): u32 { return get32(block_addr(block), 8) }
+
+fn set_node_header(block: u32, level: u32, count: u32) {
+  put32(block_addr(block), 0, BTREE_MAGIC)
+  put32(block_addr(block), 4, level)
+  put32(block_addr(block), 8, count)
+}
+
+fn entry_key(block: u32, index: u32): u64 {
+  return get64(block_addr(block), NODE_HEADER_SIZE + index * NODE_ENTRY_SIZE)
+}
+
+fn entry_value(block: u32, index: u32): u64 {
+  return get64(block_addr(block), NODE_HEADER_SIZE + index * NODE_ENTRY_SIZE + 8)
+}
+
+fn set_entry(block: u32, index: u32, key: u64, value: u64) {
+  put64(block_addr(block), NODE_HEADER_SIZE + index * NODE_ENTRY_SIZE, key)
+  put64(block_addr(block), NODE_HEADER_SIZE + index * NODE_ENTRY_SIZE + 8, value)
+}
+
+// An empty tree is one empty leaf, so every later operation has a node to
+// work against and no case has to special-case "no root".
+export fn homefs_btree_create(): u32 {
+  let root: u32 = homefs_alloc_block()
+  if root == 0 { return 0 }
+  set_node_header(root, 0, 0)
+  return root
+}
+
+// The index of the first entry whose key is >= `key`. Linear because a node
+// holds 254 entries and the search is against memory; a binary search is a
+// later optimisation, not a correctness matter.
+fn find_slot(block: u32, key: u64): u32 {
+  var i: u32 = 0
+  let count: u32 = node_count(block)
+  while i < count {
+    if entry_key(block, i) >= key { return i }
+    i = i + 1
+  }
+  return count
+}
+
+export fn homefs_btree_lookup(root: u32, key: u64): u64 {
+  if root == 0 { return 0 }
+  var node: u32 = root
+  // Descend until a leaf. The loop is bounded by the tree's height, and a
+  // node whose magic is wrong ends the descent rather than being followed —
+  // a corrupt pointer must not send this walking arbitrary memory.
+  var depth: u32 = 0
+  while depth < 16 {
+    if node_magic(node) != BTREE_MAGIC { return 0 }
+    let slot: u32 = find_slot(node, key)
+    if node_level(node) == 0 {
+      if slot < node_count(node) and entry_key(node, slot) == key {
+        return entry_value(node, slot)
+      }
+      return 0
+    }
+    if slot >= node_count(node) { return 0 }
+    node = @as(u32, entry_value(node, slot))
+    depth = depth + 1
+  }
+  return 0
+}
+
+// Insert carries its result in these rather than through out-parameters: when
+// a node splits, its parent needs both halves, and the recursion is single
+// threaded through kernel init.
+var split_occurred: u32 = 0
+var split_key: u64 = 0
+var split_block: u32 = 0
+
+// Copy `source` into a fresh block, which is the copy-on-write step. Returns
+// 0 when the device is full.
+fn copy_node(source: u32): u32 {
+  let fresh: u32 = homefs_alloc_block()
+  if fresh == 0 { return 0 }
+  var i: u32 = 0
+  while i < HOMEFS_BLOCK_SIZE {
+    put8(block_addr(fresh), i, get8(block_addr(source), i))
+    i = i + 1
+  }
+  return fresh
+}
+
+// Insert into the subtree rooted at `node`, returning the block number of its
+// rewritten copy. Sets split_occurred when the node had to divide.
+fn insert_into(node: u32, key: u64, value: u64): u32 {
+  split_occurred = 0
+  if node_magic(node) != BTREE_MAGIC { return 0 }
+
+  let level: u32 = node_level(node)
+  let count: u32 = node_count(node)
+  let slot: u32 = find_slot(node, key)
+
+  if level == 0 {
+    let fresh: u32 = copy_node(node)
+    if fresh == 0 { return 0 }
+
+    // Replacing an existing key is an update, not an insert: the entry count
+    // does not change and nothing can overflow.
+    if slot < count and entry_key(node, slot) == key {
+      set_entry(fresh, slot, key, value)
+      return fresh
+    }
+
+    // Shift the tail up by one, from the end, so an entry is never
+    // overwritten before it has been moved.
+    var i: u32 = count
+    while i > slot {
+      set_entry(fresh, i, entry_key(fresh, i - 1), entry_value(fresh, i - 1))
+      i = i - 1
+    }
+    set_entry(fresh, slot, key, value)
+    set_node_header(fresh, 0, count + 1)
+
+    // Split when the node becomes full, not when it has overflowed. A node
+    // holds NODE_MAX_ENTRIES entries at indices 0..NODE_MAX_ENTRIES-1;
+    // waiting for the count to exceed that writes entry 254 at offset 4096,
+    // which is the first byte of the next block.
+    if count + 1 >= NODE_MAX_ENTRIES {
+      return split_node(fresh)
+    }
+    return fresh
+  }
+
+  // Internal node: descend into the child that covers this key. A key past
+  // every separator belongs in the rightmost child, whose separator then has
+  // to grow to cover it.
+  var child_slot: u32 = slot
+  if child_slot >= count { child_slot = count - 1 }
+  let child: u32 = @as(u32, entry_value(node, child_slot))
+  let new_child: u32 = insert_into(child, key, value)
+  if new_child == 0 { return 0 }
+
+  let child_split: u32 = split_occurred
+  let promoted_key: u64 = split_key
+  let promoted_block: u32 = split_block
+
+  let fresh: u32 = copy_node(node)
+  if fresh == 0 { return 0 }
+  split_occurred = 0
+
+  // The child's largest key may have grown, so its separator is rewritten
+  // from the child rather than left as it was.
+  set_entry(fresh, child_slot, largest_key(new_child), @as(u64, new_child))
+
+  if child_split == 0 {
+    return fresh
+  }
+
+  // The child divided, so its right half needs a separator of its own.
+  var i: u32 = count
+  while i > child_slot + 1 {
+    set_entry(fresh, i, entry_key(fresh, i - 1), entry_value(fresh, i - 1))
+    i = i - 1
+  }
+  set_entry(fresh, child_slot + 1, promoted_key, @as(u64, promoted_block))
+  set_node_header(fresh, level, count + 1)
+
+  if count + 1 >= NODE_MAX_ENTRIES {
+    return split_node(fresh)
+  }
+  return fresh
+}
+
+fn largest_key(block: u32): u64 {
+  let count: u32 = node_count(block)
+  if count == 0 { return 0 }
+  return entry_key(block, count - 1)
+}
+
+// Divide a node in half. The left half keeps its block; the right half gets a
+// fresh one, and its largest key is what the parent will use as its separator.
+fn split_node(node: u32): u32 {
+  let count: u32 = node_count(node)
+  let half: u32 = count / 2
+
+  let right: u32 = homefs_alloc_block()
+  if right == 0 { return 0 }
+  set_node_header(right, node_level(node), count - half)
+
+  var i: u32 = half
+  while i < count {
+    set_entry(right, i - half, entry_key(node, i), entry_value(node, i))
+    i = i + 1
+  }
+  set_node_header(node, node_level(node), half)
+
+  split_occurred = 1
+  split_key = largest_key(right)
+  split_block = right
+  return node
+}
+
+// Insert into the tree, returning its new root. Copy-on-write means the root
+// moves on every insert, and the caller must keep the value returned — the
+// old root still describes the tree as it was, which is exactly what a
+// snapshot is.
+export fn homefs_btree_insert(root: u32, key: u64, value: u64): u32 {
+  if root == 0 { return 0 }
+  let new_root: u32 = insert_into(root, key, value)
+  if new_root == 0 { return 0 }
+  if split_occurred == 0 { return new_root }
+
+  // The root divided, so the tree grows a level.
+  let grown: u32 = homefs_alloc_block()
+  if grown == 0 { return 0 }
+  set_node_header(grown, node_level(new_root) + 1, 2)
+  set_entry(grown, 0, largest_key(new_root), @as(u64, new_root))
+  set_entry(grown, 1, split_key, @as(u64, split_block))
+  split_occurred = 0
+  return grown
+}
+
+// ============================================================================
+// Tree tests (design doc §9 step 2: "executed tree tests")
+//
+// Run against the ramdisk at boot. The interesting case is the one that
+// splits: a tree that never divides exercises none of the copy-on-write path
+// through a parent, which is where the bugs live.
+// ============================================================================
+
+// 600 keys against 254 entries per node still forces the root to split and
+// the tree to grow a level, which is the case worth testing. Each insert
+// copies its whole path, so the block cost is roughly two per insert until
+// the refcount reclamation of design doc §6 exists to give blocks back.
+const TREE_TEST_KEYS: u32 = 600
+
+export fn homefs_btree_selftest(base: u64, blocks: u32): u32 {
+  homefs_device_init(base, blocks)
+  var passed: u32 = 0
+
+  var root: u32 = homefs_btree_create()
+  if root == 0 { return 0 }
+
+  // Insert ascending. 900 keys against 254 entries per node forces the root
+  // to split and the tree to grow a level.
+  var i: u32 = 0
+  var ok: u32 = 1
+  while i < TREE_TEST_KEYS {
+    let key: u64 = @as(u64, i) + 1
+    root = homefs_btree_insert(root, key, key * 7)
+    if root == 0 {
+      ok = 0
+      break
+    }
+    i = i + 1
+  }
+  if ok == 1 and node_level(root) > 0 { passed = passed + 1 }
+
+  // Every key must read back. A tree that lost entries during a split still
+  // answers most lookups, so all of them are checked rather than a sample.
+  ok = 1
+  i = 0
+  while i < TREE_TEST_KEYS {
+    let key: u64 = @as(u64, i) + 1
+    if homefs_btree_lookup(root, key) != key * 7 { ok = 0 }
+    i = i + 1
+  }
+  if ok == 1 { passed = passed + 1 }
+
+  // A key that was never inserted must not be found. Without this a lookup
+  // that returns the neighbouring entry passes the test above.
+  if homefs_btree_lookup(root, 0) == 0 and
+     homefs_btree_lookup(root, @as(u64, TREE_TEST_KEYS) + 1) == 0 {
+    passed = passed + 1
+  }
+
+  // Updating a key changes its value and not the tree's shape.
+  let before: u32 = homefs_blocks_used()
+  root = homefs_btree_insert(root, 500, 12345)
+  if root != 0 and homefs_btree_lookup(root, 500) == 12345 and
+     homefs_btree_lookup(root, 499) == 499 * 7 {
+    passed = passed + 1
+  }
+
+  // Copy-on-write: the old root still describes the tree as it was. This is
+  // the property snapshots are built on, so it is checked directly rather
+  // than assumed from the absence of overwrites.
+  let old_root: u32 = root
+  let newer: u32 = homefs_btree_insert(root, 4242, 999)
+  if newer != 0 and newer != old_root and
+     homefs_btree_lookup(newer, 4242) == 999 and
+     homefs_btree_lookup(old_root, 4242) == 0 {
+    passed = passed + 1
+  }
+
+  // An insert must consume blocks; a tree that rewrote in place would not.
+  if homefs_blocks_used() > before { passed = passed + 1 }
+
+  return passed
+}
