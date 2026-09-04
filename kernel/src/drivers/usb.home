@@ -38,11 +38,35 @@ const XHCI_HCCPARAMS1: u32 = 0x10
 // Operational registers, at base + CAPLENGTH.
 const XHCI_USBCMD: u32 = 0x00
 const XHCI_USBSTS: u32 = 0x04
+const XHCI_CRCR: u32 = 0x18
+const XHCI_DCBAAP: u32 = 0x30
+const XHCI_CONFIG: u32 = 0x38
 const XHCI_PORTSC_BASE: u32 = 0x400
 const XHCI_PORT_STRIDE: u32 = 0x10
 
+// Capability registers naming the other two register spaces.
+const XHCI_DBOFF: u32 = 0x14
+const XHCI_RTSOFF: u32 = 0x18
+
+// Interrupter 0 lives at runtime base + 0x20.
+const XHCI_IR0: u32 = 0x20
+const XHCI_IR_ERSTSZ: u32 = 0x08
+const XHCI_IR_ERSTBA: u32 = 0x10
+const XHCI_IR_ERDP: u32 = 0x18
+
+const USBCMD_RS: u32 = 0x00000001       // run/stop
+const USBCMD_HCRST: u32 = 0x00000002    // host controller reset
+
 const USBSTS_HCHALTED: u32 = 0x00000001
+const USBSTS_CNR: u32 = 0x00000800      // controller not ready
+
+const CRCR_RCS: u32 = 0x00000001        // ring cycle state
 const PORTSC_CCS: u32 = 0x00000001      // current connect status
+
+// One page each. 256 TRBs of 16 bytes fills a page exactly, which is why the
+// ring sizes below are what they are.
+const TRB_SIZE: u32 = 16
+const RING_TRBS: u32 = 256
 
 var controller_pci: u64 = 0
 var register_base: u64 = 0
@@ -53,11 +77,61 @@ var max_slots: u32 = 0
 var controller_found: u32 = 0
 var ports_connected: u32 = 0
 
+var runtime_base: u64 = 0
+var doorbell_base: u64 = 0
+var dcbaa_page: u64 = 0
+var command_ring: u64 = 0
+var event_ring: u64 = 0
+var erst_page: u64 = 0
+var controller_running: u32 = 0
+
 // Register reads go through the architecture-neutral MMIO intrinsic rather
 // than a plain load: it is what tells the backend this access must not be
 // reordered or elided, which on ARM64 also emits the barrier.
 fn read32(addr: u64): u32 {
   return arch_mmio_read32(addr)
+}
+
+fn write32(addr: u64, value: u32) {
+  arch_mmio_write32(addr, value)
+}
+
+// A 64-bit register is written as two dwords, low half first. Writing the
+// high half first would momentarily point the controller at an address made
+// of the new top and the old bottom.
+fn write64(addr: u64, value: u64) {
+  arch_mmio_write32(addr, @as(u32, value & 0xFFFFFFFF))
+  arch_mmio_write32(addr + 4, @as(u32, (value >> 32) & 0xFFFFFFFF))
+}
+
+fn zero_page(base: u64) {
+  var i: u32 = 0
+  while i < 4096 {
+    @as(*u8, @ptrFromInt(base + @as(u64, i))).* = 0
+    i = i + 1
+  }
+}
+
+// Spin until `mask` reads back clear, or give up. A controller that never
+// answers must not hang the boot: returning failure lets the caller say so.
+fn wait_clear(addr: u64, mask: u32): u32 {
+  var spins: u32 = 0
+  while spins < 1000000 {
+    if (read32(addr) & mask) == 0 { return 1 }
+    foundation.cpu_pause()
+    spins = spins + 1
+  }
+  return 0
+}
+
+fn wait_set(addr: u64, mask: u32): u32 {
+  var spins: u32 = 0
+  while spins < 1000000 {
+    if (read32(addr) & mask) != 0 { return 1 }
+    foundation.cpu_pause()
+    spins = spins + 1
+  }
+  return 0
 }
 
 // Find the first xHCI controller on the bus. Returns the PCI device handle,
@@ -143,6 +217,11 @@ export fn usb_init() {
 
   // Count ports with something plugged in. Port registers are indexed from 1
   // and stride 0x10 from the operational base plus 0x400.
+  // The doorbell and runtime register spaces are at offsets the capability
+  // registers name; they are not at fixed addresses.
+  doorbell_base = register_base + @as(u64, read32(register_base + @as(u64, XHCI_DBOFF)) & 0xFFFFFFFC)
+  runtime_base = register_base + @as(u64, read32(register_base + @as(u64, XHCI_RTSOFF)) & 0xFFFFFFE0)
+
   ports_connected = 0
   var port: u32 = 0
   while port < max_ports {
@@ -163,6 +242,91 @@ export fn usb_init() {
   foundation.serial_write_string(" slots\n")
 }
 
+// Bring the controller out of halt: reset it, give it the structures it
+// reads at run time, and start it.
+//
+// A controller with no device-context array and no command ring will refuse
+// to leave the halted state, or leave it and immediately fault on the first
+// pointer it follows — so these are set up before RS is written, in the order
+// the specification requires.
+export fn xhci_start(): u32 {
+  if controller_found == 0 { return 0 }
+
+  // 1. Stop, then reset. Resetting a running controller is undefined.
+  write32(operational_base + @as(u64, XHCI_USBCMD),
+    read32(operational_base + @as(u64, XHCI_USBCMD)) & ~USBCMD_RS)
+  if wait_set(operational_base + @as(u64, XHCI_USBSTS), USBSTS_HCHALTED) == 0 {
+    foundation.serial_write_string("[USB] controller did not halt
+")
+    return 0
+  }
+
+  write32(operational_base + @as(u64, XHCI_USBCMD), USBCMD_HCRST)
+  // The reset bit clears itself when the reset is done, and CNR stays set
+  // until the controller can answer register reads at all. Both have to be
+  // waited on; checking only the first reads registers from a controller that
+  // has not finished coming up.
+  if wait_clear(operational_base + @as(u64, XHCI_USBCMD), USBCMD_HCRST) == 0 {
+    foundation.serial_write_string("[USB] reset did not complete
+")
+    return 0
+  }
+  if wait_clear(operational_base + @as(u64, XHCI_USBSTS), USBSTS_CNR) == 0 {
+    foundation.serial_write_string("[USB] controller stayed not-ready
+")
+    return 0
+  }
+
+  // 2. Structures. Physical addresses: the first gigabyte is identity
+  //    mapped, so a page from the physical allocator is usable as both.
+  dcbaa_page = memory.pmm_alloc_page()
+  command_ring = memory.pmm_alloc_page()
+  event_ring = memory.pmm_alloc_page()
+  erst_page = memory.pmm_alloc_page()
+  if dcbaa_page == 0 or command_ring == 0 or event_ring == 0 or erst_page == 0 {
+    foundation.serial_write_string("[USB] could not allocate controller structures
+")
+    return 0
+  }
+  zero_page(dcbaa_page)
+  zero_page(command_ring)
+  zero_page(event_ring)
+  zero_page(erst_page)
+
+  // 3. Enable the slots the controller reports, or it accepts no device.
+  write32(operational_base + @as(u64, XHCI_CONFIG), max_slots)
+  write64(operational_base + @as(u64, XHCI_DCBAAP), dcbaa_page)
+
+  // The command ring pointer carries its cycle state in bit 0: the controller
+  // compares that bit against each TRB to know which entries are ours.
+  write64(operational_base + @as(u64, XHCI_CRCR), command_ring | @as(u64, CRCR_RCS))
+
+  // 4. Event ring. Without one the controller has nowhere to report
+  //    completions, so a command would be accepted and never answered.
+  //    The segment table is one entry: base and size of the single segment.
+  write64(erst_page, event_ring)
+  write32(erst_page + 8, RING_TRBS)
+  let ir0: u64 = runtime_base + @as(u64, XHCI_IR0)
+  write32(ir0 + @as(u64, XHCI_IR_ERSTSZ), 1)
+  write64(ir0 + @as(u64, XHCI_IR_ERDP), event_ring)
+  // ERSTBA last: writing it is what makes the controller read the table, so
+  // the table has to be complete first.
+  write64(ir0 + @as(u64, XHCI_IR_ERSTBA), erst_page)
+
+  // 5. Run.
+  write32(operational_base + @as(u64, XHCI_USBCMD),
+    read32(operational_base + @as(u64, XHCI_USBCMD)) | USBCMD_RS)
+  if wait_clear(operational_base + @as(u64, XHCI_USBSTS), USBSTS_HCHALTED) == 0 {
+    foundation.serial_write_string("[USB] controller did not start
+")
+    return 0
+  }
+
+  controller_running = 1
+  return 1
+}
+
+export fn usb_controller_running(): u32 { return controller_running }
 export fn usb_controller_found(): u32 { return controller_found }
 export fn usb_hci_version(): u32 { return hci_version }
 export fn usb_max_ports(): u32 { return max_ports }
