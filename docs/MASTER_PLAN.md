@@ -260,7 +260,7 @@ Bring-up order (each stage proven over serial before the next): serial-first deb
 | S9 | Port-I/O wrappers halt the machine on ARM64 — the architecture has no I/O address space, so calling one is always a bug | `kernel/src/core/foundation.home` | P3 | Phase 7b (only reachable from ARM64 code paths) |
 | S10 | **CLOSED** — SMAP's ARM64 counterpart (the PAN bit in PSTATE) is set up, so `asm_stac`/`asm_clac` move a real bit on both architectures | `kernel/src/core/foundation.home` | P3 | Phase 7b hardening |
 
-| S11 | TCP segments arriving from the wire are counted and dropped — `tcp.home` has no segment-input entry point, only the socket-level `tcp_receive()` | `kernel/src/net/netdev.home` | P1 | Phase 2 `net-echo` for TCP |
+| S11 | **CLOSED** — `tcp_input()` validates a segment and hands it to the state machine, and netdev dispatches to it | `kernel/src/net/netdev.home` | P1 | Phase 2 `net-echo` for TCP |
 
 **Register rules:**
 1. A stub may not be closed without a runtime test exercising it.

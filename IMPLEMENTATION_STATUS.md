@@ -19,7 +19,7 @@ that has been written and parsed, but never run.
 
 **416/416 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `e2d301c58`
+- Compiler: `home-lang/home` @ `edbed0fcf`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -33,7 +33,7 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-✅ **`boot-full-kernel`: PASS** — 67/67 init milestones reached, through to the end of init
+✅ **`boot-full-kernel`: PASS** — 68/68 init milestones reached, through to the end of init
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
@@ -76,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 416 | 238,595 |
+| `kernel/` | 416 | 238,687 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -101,9 +101,9 @@ CI gate (`scripts/stub-check.sh`).
 | S8 | `mmio_read32`/`mmio_write32` were inert, so every ARM64/Pi driver was too | `kernel/src/arch/arm64/arm64.home` | 0 | **CLOSED** |
 | S9 | Port-I/O wrappers halt the machine on ARM64 — the architecture has no I/O address space, so calling one is always a bug | `kernel/src/core/foundation.home` | 1 | open — blocks Phase 7b (only reachable from ARM64 code paths) |
 | S10 | SMAP's ARM64 counterpart (the PAN bit in PSTATE) is set up, so `asm_stac`/`asm_clac` move a real bit on both architectures | `kernel/src/core/foundation.home` | 0 | **CLOSED** |
-| S11 | TCP segments arriving from the wire are counted and dropped — `tcp.home` has no segment-input entry point, only the socket-level `tcp_receive()` | `kernel/src/net/netdev.home` | 1 | open — blocks Phase 2 `net-echo` for TCP |
+| S11 | `tcp_input()` validates a segment and hands it to the state machine, and netdev dispatches to it | `kernel/src/net/netdev.home` | 0 | **CLOSED** |
 
-5 of 10 entries open.
+4 of 10 entries open.
 
 ## Phase gates ([MASTER_PLAN §4](docs/MASTER_PLAN.md#4-the-phase-map))
 
@@ -113,7 +113,7 @@ first red one are blocked by definition — they are not being worked yet.
 | Phase | Gate | Status |
 |-------|------|--------|
 | 0 | `parse-rate` | ✅ green |
-| 0 | `stub-register` | ✅ pass — stub-register OK — 5 open entries, all marked and placed correctly |
+| 0 | `stub-register` | ✅ pass — stub-register OK — 4 open entries, all marked and placed correctly |
 | 0 | `boot-qemu-x86_64` | ✅ pass |
 | 0.5 | `mvk-compiles` | ✅ green |
 | 1 | `boot-to-shell` | ⬜ not started |
