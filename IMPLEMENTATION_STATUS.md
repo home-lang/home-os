@@ -6,10 +6,14 @@
 
 ## Where the project actually is
 
-A Home-compiled kernel **boots and prints on the serial console**, but the
-full Appendix A kernel does not complete initialisation — see Boot status.
-Everything else in this repository is source that has been written and
-parsed, but never run.
+The Home-compiled kernel **boots and runs its full initialisation**: memory
+management, the scheduler, the security subsystems, drivers, filesystems,
+networking and system services all initialise on the serial console. The
+milestones are listed in `scripts/boot-milestones.txt` and checked on every
+build.
+
+What executes is the Appendix A set. The rest of this repository is source
+that has been written and parsed, but never run.
 
 ## Parse rate
 
@@ -29,14 +33,14 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-❌ **`boot-full-kernel`: FAIL** — boot gate produced no milestone count
+✅ **`boot-full-kernel`: PASS** — 86/86 init milestones reached, through to the end of init
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
 one image — against the milestone list in `scripts/boot-milestones.txt`,
 which names one subsystem per entry and may only ever grow.
 
-❌ **`boot-qemu-aarch64`: FAIL** — the ARM64 kernel did not reach its boot milestones
+✅ **`boot-qemu-aarch64`: PASS** — serial says `HomeOS v0.1: aarch64 kernel_main reached`
 
 Measured by building `kernel/src/arm64_poc.home` for
 `aarch64-freestanding`, linking it with `kernel/src/arch/arm64/boot.s` via
@@ -72,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 416 | 240,360 |
+| `kernel/` | 416 | 240,729 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -110,7 +114,7 @@ first red one are blocked by definition — they are not being worked yet.
 |-------|------|--------|
 | 0 | `parse-rate` | ✅ green |
 | 0 | `stub-register` | ✅ pass — stub-register OK — 4 open entries, all marked and placed correctly |
-| 0 | `boot-qemu-x86_64` | ❌ pass |
+| 0 | `boot-qemu-x86_64` | ✅ pass |
 | 0.5 | `mvk-compiles` | ✅ green |
 | 1 | `boot-to-shell` | ⬜ not started |
 | 2 | `storage-roundtrip` / `net-echo` / `fb-boot-log` | ⬜ not started |
