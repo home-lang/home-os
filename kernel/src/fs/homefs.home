@@ -1,14 +1,16 @@
 // home-os Native Filesystem (homefs) — on-disk structures
 //
-// STUB(S4): the copy-on-write filesystem itself is not implemented. There is
-// no tree code, no commit protocol, no mount path. Blocks Phase 2 storage and
-// the Phase 6 snapshot-rollback gate. MASTER_PLAN §7.
+// STUB(S4): free space is never reclaimed — the allocator is a bump pointer
+// and copy-on-write spends blocks without giving any back — there is no
+// `fsck`, and nothing mounts this through the VFS. MASTER_PLAN §7.
 //
-// What is implemented is step 1 of the plan in docs/design/homefs.md §9: the
-// on-disk structures and their encode/decode, checksummed. Everything above
-// them reads and writes through these, so getting the byte layout and the
-// integrity check right first means the tree code is never debugging two
-// things at once.
+// Steps 1–4 and 6 of the plan in docs/design/homefs.md §9 are implemented:
+// the on-disk structures and their checksummed encode/decode, a block
+// device, copy-on-write B-trees, the commit protocol, snapshots with
+// rollback, and the object layer — files, directories and extent trees. The
+// layers are stacked in that order deliberately: getting the byte layout and
+// the integrity check right first meant the tree code was never debugging
+// two things at once, and the same for every layer since.
 //
 // All fields are little-endian on disk regardless of the machine writing
 // them, so a volume is portable between architectures — which matters here,
@@ -809,11 +811,19 @@ var current_generation: u64 = 0
 var current_txid: u64 = 0
 var current_root: u64 = 0
 
+// A volume with no backing disk: the tree lives in the ramdisk and commits
+// stop at memory. Needed because drive 0 is a real drive — the primary master,
+// which is the boot disk — so it cannot double as "no device". A self-test
+// that formatted drive 0 would commit its tree over whatever was booted from.
+export const HOMEFS_NO_DEVICE: u32 = 0xFFFFFFFF
+
 fn disk_write_block(drive: u32, lba: u64, addr: u64): u32 {
+  if drive == HOMEFS_NO_DEVICE { return 0 }
   return ata.ata_write_sectors(drive, lba, SECTORS_PER_BLOCK, addr)
 }
 
 fn disk_read_block(drive: u32, lba: u64, addr: u64): u32 {
+  if drive == HOMEFS_NO_DEVICE { return 1 }
   return ata.ata_read_sectors(drive, lba, SECTORS_PER_BLOCK, addr)
 }
 
@@ -833,6 +843,13 @@ export fn homefs_format(drive: u32, base: u64, blocks: u32): u32 {
   snapshot_table_block = 0
   next_snapshot_id = 1
   committed_blocks = 0
+  next_file_id = 1
+  next_dir_id = 2
+
+  // A volume without a root directory is not a filesystem, so it is made
+  // here rather than lazily on first use: every later path resolution can
+  // then assume the root exists instead of testing for it.
+  if create_root_directory() == 0 { return 0 }
 
   if homefs_commit() == 0 { return 0 }
   // The second slot starts as a copy of the first, one generation behind, so
@@ -982,6 +999,9 @@ export fn homefs_mount(drive: u32, base: u64, blocks: u32): u32 {
     si = si + 1
   }
   volume_mounted = 1
+  // Object ids are counted past what the table already holds, and the table
+  // is only readable now that the root is loaded.
+  refresh_id_watermarks()
   return 1
 }
 
@@ -1120,4 +1140,690 @@ export fn homefs_snapshot_rollback(id: u64): u32 {
     i = i + 1
   }
   return 0
+}
+
+// ============================================================================
+// Objects, directories and extents (design doc §9 step 4)
+//
+// Everything above this point is a key/value store: the root B-tree maps a
+// u64 to a u64 and nothing interprets either. This section is what turns that
+// into a filesystem — files with contents, directories with names, and the
+// extent trees that map a file's logical offsets onto physical blocks.
+//
+// Layering, so the two namespaces cannot collide: the root tree keeps its
+// raw key/value meaning (scripts/crash-gate.sh writes into it directly, with
+// small integer keys), and the object table is a *separate* tree hanging off
+// one reserved key. An object id and a crash-gate key can therefore both be 3
+// without meaning the same thing.
+//
+// Every mutation here is copy-on-write, like the trees underneath: a modified
+// object record is written to a fresh block and the object table updated to
+// point at it, so a crash leaves the previous version of the file intact.
+// ============================================================================
+
+// The reserved root-tree key under which the object table's root block lives.
+// At the very top of the space so it cannot be reached by counting upward
+// from 0, which is how every other writer of this tree picks keys.
+const OBJTABLE_KEY: u64 = 0xFFFFFFFFFFFFFFFE
+
+const OBJ_RECORD_MAGIC: u32 = 0x4A424F48   // 'HOBJ' little-endian
+export const OBJ_KIND_FILE: u32 = 0
+export const OBJ_KIND_DIR: u32 = 1
+
+// Names are bounded so an object record is a fixed shape. 64 bytes is the
+// same ceiling ext2 uses for a single component.
+export const HOMEFS_MAX_NAME: u32 = 64
+
+// The root directory's id is a constant rather than something stored in the
+// superblock: it is the one object whose identity cannot be discovered by
+// looking it up in a parent, because it has no parent.
+export const HOMEFS_ROOT_DIR: u64 = 0x8000000000000001
+
+// Object record layout, one per block. A whole 4 KiB block for ~112 bytes of
+// record is the v1 cost of not having a packed-record allocator; it is
+// written down here rather than hidden because it is the first thing worth
+// fixing when object density starts to matter. The on-disk *shape* below is
+// what a packing change would have to preserve, and it would not have to
+// change: only where records are placed would.
+//
+//    0  u32  magic
+//    4  u32  kind (file or directory)
+//    8  u64  size — bytes for a file, entry count for a directory
+//   16  u64  generation the record was written in
+//   24  u32  data_root — extent-tree root for a file, directory-tree root
+//            for a directory
+//   28  u32  refcount
+//   32  u64  object id
+//   40  u32  name length
+//   44  ..   name bytes
+const OBJ_NAME_OFFSET: u32 = 44
+
+fn obj_magic(block: u32): u32 {
+  if block_valid(block) == 0 { return 0 }
+  return get32(block_addr(block), 0)
+}
+
+fn obj_kind(block: u32): u32 { return get32(block_addr(block), 4) }
+fn obj_size(block: u32): u64 { return get64(block_addr(block), 8) }
+fn obj_data_root(block: u32): u32 { return get32(block_addr(block), 24) }
+fn obj_id_of(block: u32): u64 { return get64(block_addr(block), 32) }
+fn obj_name_len(block: u32): u32 {
+  let n: u32 = get32(block_addr(block), 40)
+  // A length off the disk decides how far a comparison walks, so it is capped
+  // here rather than trusted. Past the cap the name reads as empty, which
+  // fails a match instead of walking into the next field.
+  if n > HOMEFS_MAX_NAME { return 0 }
+  return n
+}
+
+fn set_obj_kind(block: u32, v: u32) { put32(block_addr(block), 4, v) }
+fn set_obj_size(block: u32, v: u64) { put64(block_addr(block), 8, v) }
+fn set_obj_generation(block: u32, v: u64) { put64(block_addr(block), 16, v) }
+fn set_obj_data_root(block: u32, v: u32) { put32(block_addr(block), 24, v) }
+fn set_obj_refcount(block: u32, v: u32) { put32(block_addr(block), 28, v) }
+fn set_obj_id(block: u32, v: u64) { put64(block_addr(block), 32, v) }
+
+// Whether the record's stored name equals the caller's.
+fn obj_name_matches(block: u32, name_ptr: u64, name_len: u32): u32 {
+  if obj_name_len(block) != name_len { return 0 }
+  var i: u32 = 0
+  while i < name_len {
+    let stored: u8 = get8(block_addr(block), OBJ_NAME_OFFSET + i)
+    let given: u8 = @as(*u8, @ptrFromInt(name_ptr + @as(u64, i))).*
+    if stored != given { return 0 }
+    i = i + 1
+  }
+  return 1
+}
+
+// Copy a record into a fresh block. This is the copy-on-write step for an
+// object: callers patch the copy and leave the original describing the
+// version a snapshot may still be pinning.
+fn obj_record_clone(source: u32): u32 {
+  let fresh: u32 = homefs_alloc_block()
+  if fresh == 0 { return 0 }
+  var i: u32 = 0
+  while i < HOMEFS_BLOCK_SIZE {
+    put8(block_addr(fresh), i, get8(block_addr(source), i))
+    i = i + 1
+  }
+  return fresh
+}
+
+fn obj_record_new(kind: u32, id: u64, name_ptr: u64, name_len: u32): u32 {
+  if name_len > HOMEFS_MAX_NAME { return 0 }
+  let block: u32 = homefs_alloc_block()
+  if block == 0 { return 0 }
+  put32(block_addr(block), 0, OBJ_RECORD_MAGIC)
+  set_obj_kind(block, kind)
+  set_obj_size(block, 0)
+  set_obj_generation(block, current_generation)
+  set_obj_data_root(block, 0)
+  set_obj_refcount(block, 1)
+  set_obj_id(block, id)
+  put32(block_addr(block), 40, name_len)
+  var i: u32 = 0
+  while i < name_len {
+    put8(block_addr(block), OBJ_NAME_OFFSET + i,
+         @as(*u8, @ptrFromInt(name_ptr + @as(u64, i))).*)
+    i = i + 1
+  }
+  return block
+}
+
+// ============================================================================
+// Object table
+// ============================================================================
+
+fn objtable_root(): u32 {
+  return @as(u32, homefs_btree_lookup(@as(u32, current_root), OBJTABLE_KEY))
+}
+
+// Point the root tree at a new object-table root. The root tree is itself
+// copy-on-write, so this moves `current_root` too.
+fn objtable_set(new_root: u32): u32 {
+  let grown: u32 = homefs_btree_insert(@as(u32, current_root), OBJTABLE_KEY,
+                                       @as(u64, new_root))
+  if grown == 0 { return 0 }
+  current_root = @as(u64, grown)
+  return 1
+}
+
+// The block holding an object's record, or 0 if there is no such object.
+export fn homefs_object_record(id: u64): u32 {
+  let table: u32 = objtable_root()
+  if table == 0 { return 0 }
+  let block: u32 = @as(u32, homefs_btree_lookup(table, id))
+  if obj_magic(block) != OBJ_RECORD_MAGIC { return 0 }
+  return block
+}
+
+fn objtable_put(id: u64, block: u32): u32 {
+  var table: u32 = objtable_root()
+  if table == 0 {
+    table = homefs_btree_create()
+    if table == 0 { return 0 }
+  }
+  let grown: u32 = homefs_btree_insert(table, id, @as(u64, block))
+  if grown == 0 { return 0 }
+  return objtable_set(grown)
+}
+
+export fn homefs_object_size(id: u64): u64 {
+  let rec: u32 = homefs_object_record(id)
+  if rec == 0 { return 0 }
+  return obj_size(rec)
+}
+
+export fn homefs_object_kind(id: u64): u32 {
+  let rec: u32 = homefs_object_record(id)
+  if rec == 0 { return 0xFFFFFFFF }
+  return obj_kind(rec)
+}
+
+export fn homefs_object_name(id: u64, out: u64, max: u32): u32 {
+  let rec: u32 = homefs_object_record(id)
+  if rec == 0 { return 0 }
+  var n: u32 = obj_name_len(rec)
+  if n > max { n = max }
+  var i: u32 = 0
+  while i < n {
+    @as(*u8, @ptrFromInt(out + @as(u64, i))).* = get8(block_addr(rec), OBJ_NAME_OFFSET + i)
+    i = i + 1
+  }
+  return n
+}
+
+// ============================================================================
+// Tree iteration
+//
+// The B-tree has no sibling pointers, so walking it in order means descending
+// again for each position. That is O(height) per step rather than O(1), which
+// for a directory listing against an in-memory device is not worth another
+// on-disk field to fix.
+// ============================================================================
+
+var iter_target: u32 = 0
+var iter_seen: u32 = 0
+var iter_found: u32 = 0
+var iter_key: u64 = 0
+var iter_value: u64 = 0
+var iter_counting: u32 = 0
+
+fn iter_walk(node: u32, depth: u32) {
+  if depth >= 16 { return }
+  if node_magic(node) != BTREE_MAGIC { return }
+  let count: u32 = node_count(node)
+  if node_level(node) == 0 {
+    var i: u32 = 0
+    while i < count {
+      if iter_counting == 0 and iter_found == 0 and iter_seen == iter_target {
+        iter_key = entry_key(node, i)
+        iter_value = entry_value(node, i)
+        iter_found = 1
+      }
+      iter_seen = iter_seen + 1
+      i = i + 1
+    }
+    return
+  }
+  var i: u32 = 0
+  while i < count {
+    if iter_counting == 0 and iter_found == 1 { return }
+    iter_walk(@as(u32, entry_value(node, i)), depth + 1)
+    i = i + 1
+  }
+}
+
+fn btree_count(root: u32): u32 {
+  if root == 0 { return 0 }
+  iter_counting = 1
+  iter_seen = 0
+  iter_found = 0
+  iter_walk(root, 0)
+  iter_counting = 0
+  return iter_seen
+}
+
+// Load the nth entry in key order into iter_key/iter_value. Returns 1 if
+// there is one.
+fn btree_nth(root: u32, index: u32): u32 {
+  if root == 0 { return 0 }
+  iter_counting = 0
+  iter_target = index
+  iter_seen = 0
+  iter_found = 0
+  iter_key = 0
+  iter_value = 0
+  iter_walk(root, 0)
+  return iter_found
+}
+
+// ============================================================================
+// Extents
+//
+// An extent value packs the triple the design document asks for (§3):
+// physical block, run length, and the `shared` flag. v1's writer only ever
+// emits runs of one block, but the encoding is the full one so that a writer
+// which coalesces runs later does not change the on-disk format.
+//
+//   bits  0..31  physical block
+//   bits 32..47  length in blocks
+//   bits 48..63  flags
+// ============================================================================
+
+export const EXTENT_SHARED: u32 = 0x0001
+
+fn extent_pack(physical: u32, length: u32, flags: u32): u64 {
+  return @as(u64, physical)
+    | (@as(u64, length & 0xFFFF) << 32)
+    | (@as(u64, flags & 0xFFFF) << 48)
+}
+
+fn extent_physical(value: u64): u32 { return @as(u32, value & 0xFFFFFFFF) }
+fn extent_length(value: u64): u32 { return @as(u32, (value >> 32) & 0xFFFF) }
+fn extent_flags(value: u64): u32 { return @as(u32, (value >> 48) & 0xFFFF) }
+
+// ============================================================================
+// Names
+// ============================================================================
+
+// FNV-1a, 64-bit. A directory tree is keyed by this rather than by the name
+// itself because a B-tree entry is a fixed 16 bytes. Collisions are handled
+// by probing rather than ignored — see homefs_dir_lookup.
+fn name_hash(ptr: u64, len: u32): u64 {
+  var hash: u64 = 0xCBF29CE484222325
+  var i: u32 = 0
+  while i < len {
+    let c: u64 = @as(u64, @as(*u8, @ptrFromInt(ptr + @as(u64, i))).*)
+    hash = hash ^ c
+    hash = hash * 0x00000100000001B3
+    i = i + 1
+  }
+  // 0 is the tree's "absent" value, so a name that hashes to it would be
+  // invisible. Displace it rather than letting one name in 2^64 vanish.
+  if hash == 0 { return 1 }
+  return hash
+}
+
+// How far a lookup or an insert will probe past a colliding hash. Two names
+// colliding under a 64-bit hash is already unlikely; nine in a row is not
+// something to keep walking a tree over.
+const NAME_PROBE_LIMIT: u32 = 8
+
+// ============================================================================
+// Directories
+// ============================================================================
+
+// The object id of `name` in `dir_id`, or 0.
+export fn homefs_dir_lookup(dir_id: u64, name_ptr: u64, name_len: u32): u64 {
+  let dir: u32 = homefs_object_record(dir_id)
+  if dir == 0 { return 0 }
+  if obj_kind(dir) != OBJ_KIND_DIR { return 0 }
+  let tree: u32 = obj_data_root(dir)
+  if tree == 0 { return 0 }
+
+  let base: u64 = name_hash(name_ptr, name_len)
+  var probe: u32 = 0
+  while probe < NAME_PROBE_LIMIT {
+    let child: u64 = homefs_btree_lookup(tree, base + @as(u64, probe))
+    // An empty slot ends the probe: an insert would have taken it, so no
+    // later slot can hold this name.
+    if child == 0 { return 0 }
+    let rec: u32 = homefs_object_record(child)
+    if rec != 0 and obj_name_matches(rec, name_ptr, name_len) == 1 { return child }
+    probe = probe + 1
+  }
+  return 0
+}
+
+// Number of entries in a directory.
+export fn homefs_dir_count(dir_id: u64): u32 {
+  let dir: u32 = homefs_object_record(dir_id)
+  if dir == 0 { return 0 }
+  if obj_kind(dir) != OBJ_KIND_DIR { return 0 }
+  return btree_count(obj_data_root(dir))
+}
+
+// The object id of the nth entry, in hash order. Hash order is not name
+// order; readdir does not promise one, and sorting would mean holding the
+// whole directory in memory.
+export fn homefs_dir_at(dir_id: u64, index: u32): u64 {
+  let dir: u32 = homefs_object_record(dir_id)
+  if dir == 0 { return 0 }
+  if obj_kind(dir) != OBJ_KIND_DIR { return 0 }
+  if btree_nth(obj_data_root(dir), index) == 0 { return 0 }
+  return iter_value
+}
+
+// Ids are handed out by counting past the highest already in the object
+// table, which is recomputed at mount rather than stored. A counter in the
+// superblock would be one more thing a torn write could set back, and
+// setting it back would reissue a live id.
+var next_file_id: u64 = 0
+var next_dir_id: u64 = 0
+
+fn refresh_id_watermarks() {
+  next_file_id = 1
+  next_dir_id = 2                      // 1 is the root directory
+  let table: u32 = objtable_root()
+  if table == 0 { return }
+  let total: u32 = btree_count(table)
+  var i: u32 = 0
+  while i < total {
+    if btree_nth(table, i) == 1 {
+      let id: u64 = iter_key
+      let bare: u64 = id & ~OBJ_TYPE_MASK
+      if object_type(id) == OBJ_TYPE_DIR {
+        if bare >= next_dir_id { next_dir_id = bare + 1 }
+      } else {
+        if object_type(id) == OBJ_TYPE_FILE {
+          if bare >= next_file_id { next_file_id = bare + 1 }
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+// Create a file or directory under `parent_id`. Returns the new object's id,
+// or 0. The caller commits.
+export fn homefs_create(parent_id: u64, name_ptr: u64, name_len: u32, kind: u32): u64 {
+  if volume_mounted == 0 { return 0 }
+  if name_len == 0 or name_len > HOMEFS_MAX_NAME { return 0 }
+  let parent: u32 = homefs_object_record(parent_id)
+  if parent == 0 { return 0 }
+  if obj_kind(parent) != OBJ_KIND_DIR { return 0 }
+  if homefs_dir_lookup(parent_id, name_ptr, name_len) != 0 { return 0 }
+
+  var id: u64 = 0
+  if kind == OBJ_KIND_DIR {
+    id = OBJ_TYPE_DIR | next_dir_id
+    next_dir_id = next_dir_id + 1
+  } else {
+    id = OBJ_TYPE_FILE | next_file_id
+    next_file_id = next_file_id + 1
+  }
+
+  let rec: u32 = obj_record_new(kind, id, name_ptr, name_len)
+  if rec == 0 { return 0 }
+  if objtable_put(id, rec) == 0 { return 0 }
+
+  // Link it into the parent. The parent's record is copied first, because the
+  // version on disk may be pinned by a snapshot.
+  var tree: u32 = obj_data_root(parent)
+  if tree == 0 {
+    tree = homefs_btree_create()
+    if tree == 0 { return 0 }
+  }
+  let base: u64 = name_hash(name_ptr, name_len)
+  var slot: u64 = 0
+  var probe: u32 = 0
+  while probe < NAME_PROBE_LIMIT {
+    if homefs_btree_lookup(tree, base + @as(u64, probe)) == 0 {
+      slot = base + @as(u64, probe)
+      probe = NAME_PROBE_LIMIT
+    } else {
+      probe = probe + 1
+    }
+  }
+  if slot == 0 { return 0 }
+
+  let grown: u32 = homefs_btree_insert(tree, slot, id)
+  if grown == 0 { return 0 }
+
+  // homefs_object_record is re-read rather than reused: objtable_put above
+  // rewrote the root tree, and the parent's record block is unchanged but the
+  // path to it is not.
+  let parent_now: u32 = homefs_object_record(parent_id)
+  if parent_now == 0 { return 0 }
+  let fresh_parent: u32 = obj_record_clone(parent_now)
+  if fresh_parent == 0 { return 0 }
+  set_obj_data_root(fresh_parent, grown)
+  set_obj_size(fresh_parent, obj_size(parent_now) + 1)
+  set_obj_generation(fresh_parent, current_generation)
+  if objtable_put(parent_id, fresh_parent) == 0 { return 0 }
+
+  return id
+}
+
+// ============================================================================
+// File data
+// ============================================================================
+
+// Write `len` bytes from `src` at `offset`. Returns the number of bytes
+// written, which is `len` or 0 — a partial write would leave the file in a
+// state no caller asked for, and the allocator is the only thing that can
+// fail here, so failing whole is both possible and honest.
+export fn homefs_file_write(id: u64, offset: u64, src: u64, len: u32): u32 {
+  if volume_mounted == 0 { return 0 }
+  let rec: u32 = homefs_object_record(id)
+  if rec == 0 { return 0 }
+  if obj_kind(rec) != OBJ_KIND_FILE { return 0 }
+
+  var tree: u32 = obj_data_root(rec)
+  if tree == 0 {
+    tree = homefs_btree_create()
+    if tree == 0 { return 0 }
+  }
+
+  var done: u32 = 0
+  while done < len {
+    let pos: u64 = offset + @as(u64, done)
+    let logical: u64 = pos / @as(u64, HOMEFS_BLOCK_SIZE)
+    let within: u32 = @as(u32, pos % @as(u64, HOMEFS_BLOCK_SIZE))
+    var chunk: u32 = HOMEFS_BLOCK_SIZE - within
+    if chunk > len - done { chunk = len - done }
+
+    // Copy-on-write, even for a full-block overwrite: the block being
+    // replaced may belong to a snapshot, and the allocator only ever hands
+    // out blocks nothing references.
+    let fresh: u32 = homefs_alloc_block()
+    if fresh == 0 { return 0 }
+    let existing: u64 = homefs_btree_lookup(tree, logical)
+    if existing != 0 {
+      let old_block: u32 = extent_physical(existing)
+      if block_valid(old_block) == 1 {
+        var i: u32 = 0
+        while i < HOMEFS_BLOCK_SIZE {
+          put8(block_addr(fresh), i, get8(block_addr(old_block), i))
+          i = i + 1
+        }
+      }
+    }
+
+    var i: u32 = 0
+    while i < chunk {
+      put8(block_addr(fresh), within + i,
+           @as(*u8, @ptrFromInt(src + @as(u64, done) + @as(u64, i))).*)
+      i = i + 1
+    }
+
+    let grown: u32 = homefs_btree_insert(tree, logical, extent_pack(fresh, 1, 0))
+    if grown == 0 { return 0 }
+    tree = grown
+    done = done + chunk
+  }
+
+  let now: u32 = homefs_object_record(id)
+  if now == 0 { return 0 }
+  let fresh_rec: u32 = obj_record_clone(now)
+  if fresh_rec == 0 { return 0 }
+  set_obj_data_root(fresh_rec, tree)
+  var size: u64 = obj_size(now)
+  if offset + @as(u64, len) > size { size = offset + @as(u64, len) }
+  set_obj_size(fresh_rec, size)
+  set_obj_generation(fresh_rec, current_generation)
+  if objtable_put(id, fresh_rec) == 0 { return 0 }
+  return len
+}
+
+// Read up to `len` bytes into `dst`. Returns the number of bytes read, which
+// is short at end of file. A logical block with no extent reads as zeroes —
+// that is a hole, not an error, and a file written at a high offset has them.
+export fn homefs_file_read(id: u64, offset: u64, dst: u64, len: u32): u32 {
+  let rec: u32 = homefs_object_record(id)
+  if rec == 0 { return 0 }
+  if obj_kind(rec) != OBJ_KIND_FILE { return 0 }
+  let size: u64 = obj_size(rec)
+  if offset >= size { return 0 }
+
+  var want: u32 = len
+  if offset + @as(u64, want) > size { want = @as(u32, size - offset) }
+  let tree: u32 = obj_data_root(rec)
+
+  var done: u32 = 0
+  while done < want {
+    let pos: u64 = offset + @as(u64, done)
+    let logical: u64 = pos / @as(u64, HOMEFS_BLOCK_SIZE)
+    let within: u32 = @as(u32, pos % @as(u64, HOMEFS_BLOCK_SIZE))
+    var chunk: u32 = HOMEFS_BLOCK_SIZE - within
+    if chunk > want - done { chunk = want - done }
+
+    let existing: u64 = homefs_btree_lookup(tree, logical)
+    let physical: u32 = extent_physical(existing)
+    var i: u32 = 0
+    if existing != 0 and block_valid(physical) == 1 {
+      while i < chunk {
+        @as(*u8, @ptrFromInt(dst + @as(u64, done) + @as(u64, i))).* =
+          get8(block_addr(physical), within + i)
+        i = i + 1
+      }
+    } else {
+      while i < chunk {
+        @as(*u8, @ptrFromInt(dst + @as(u64, done) + @as(u64, i))).* = 0
+        i = i + 1
+      }
+    }
+    done = done + chunk
+  }
+  return done
+}
+
+// The root directory is the one object created without a parent, so it does
+// not go through homefs_create: there is nothing to link it into and no name
+// lookup to lose a race with.
+var root_dir_name: [u8; 1] = undefined
+
+fn create_root_directory(): u32 {
+  root_dir_name[0] = 47                          // '/'
+  let rec: u32 = obj_record_new(OBJ_KIND_DIR, HOMEFS_ROOT_DIR,
+                                @intFromPtr(&root_dir_name), 1)
+  if rec == 0 { return 0 }
+  return objtable_put(HOMEFS_ROOT_DIR, rec)
+}
+
+// ============================================================================
+// Object-layer self-test (design doc §9 step 4)
+//
+// Run against the ramdisk at boot, like the tree test above. It asserts what
+// the layer is *for* — that a named file written through the object layer
+// reads back byte for byte — rather than that its functions return without
+// crashing. Every check compares against a value stated here, so a function
+// that quietly does nothing fails it.
+//
+// Returns a count of the checks that passed; the caller asserts the total.
+// ============================================================================
+
+const OBJ_TEST_CHECKS: u32 = 9
+
+// Deliberately larger than one block, so the write crosses an extent
+// boundary and the read has to reassemble it. A test that fits in a single
+// block never exercises the loop that made extents necessary.
+const OBJ_TEST_BYTES: u32 = 5000
+
+var obj_test_name: [u8; 8] = undefined
+var obj_test_dir: [u8; 4] = undefined
+var obj_test_out: [u8; 8] = undefined
+var obj_test_write: [u8; 5000] = undefined
+var obj_test_read: [u8; 5000] = undefined
+
+fn obj_test_fill_names() {
+  obj_test_name[0] = 104                         // 'h'
+  obj_test_name[1] = 101                         // 'e'
+  obj_test_name[2] = 108                         // 'l'
+  obj_test_name[3] = 108                         // 'l'
+  obj_test_name[4] = 111                         // 'o'
+  obj_test_name[5] = 46                          // '.'
+  obj_test_name[6] = 116                         // 't'
+  obj_test_name[7] = 120                         // 'x'
+
+  obj_test_dir[0] = 101                          // 'e'
+  obj_test_dir[1] = 116                          // 't'
+  obj_test_dir[2] = 99                           // 'c'
+  obj_test_dir[3] = 0
+}
+
+export fn homefs_object_selftest(base: u64, blocks: u32): u32 {
+  var passed: u32 = 0
+  obj_test_fill_names()
+
+  // A fresh volume. This test owns the device, so it formats rather than
+  // mounting whatever a previous test left.
+  if homefs_format(HOMEFS_NO_DEVICE, base, blocks) == 0 { return passed }
+
+  // 1: format made a root directory, and it is a directory.
+  if homefs_object_kind(HOMEFS_ROOT_DIR) == OBJ_KIND_DIR { passed = passed + 1 }
+
+  // 2: an empty root has no entries.
+  if homefs_dir_count(HOMEFS_ROOT_DIR) == 0 { passed = passed + 1 }
+
+  let dir: u64 = homefs_create(HOMEFS_ROOT_DIR, @intFromPtr(&obj_test_dir), 3,
+                               OBJ_KIND_DIR)
+  // 3: creating a directory returns an id in the directory range.
+  if dir != 0 and object_is_directory(dir) == 1 { passed = passed + 1 }
+
+  // 4: it is findable by name, and by the same id.
+  if homefs_dir_lookup(HOMEFS_ROOT_DIR, @intFromPtr(&obj_test_dir), 3) == dir {
+    passed = passed + 1
+  }
+
+  let file: u64 = homefs_create(dir, @intFromPtr(&obj_test_name), 8, OBJ_KIND_FILE)
+  // 5: a file created inside it is found by name from *that* directory.
+  if file != 0 and
+     homefs_dir_lookup(dir, @intFromPtr(&obj_test_name), 8) == file {
+    passed = passed + 1
+  }
+
+  // 6: and is not found from the root, which is a different directory.
+  if homefs_dir_lookup(HOMEFS_ROOT_DIR, @intFromPtr(&obj_test_name), 8) == 0 {
+    passed = passed + 1
+  }
+
+  // A pattern that differs per byte, so a read that returns the wrong block,
+  // or the same block twice, does not pass by looking like the right one.
+  var i: u32 = 0
+  while i < OBJ_TEST_BYTES {
+    obj_test_write[i] = @as(u8, (i * 7 + 13) & 0xFF)
+    obj_test_read[i] = 0
+    i = i + 1
+  }
+
+  // 7: the whole write lands.
+  if homefs_file_write(file, 0, @intFromPtr(&obj_test_write), OBJ_TEST_BYTES) ==
+     OBJ_TEST_BYTES {
+    passed = passed + 1
+  }
+
+  // 8: and the file's size is what was written, across a commit.
+  current_generation = current_generation + 1
+  current_txid = current_txid + 1
+  if homefs_commit() == 1 and homefs_object_size(file) == @as(u64, OBJ_TEST_BYTES) {
+    passed = passed + 1
+  }
+
+  // 9: it reads back byte for byte, including across the block boundary at
+  // 4096 that made this file more than one extent.
+  let got: u32 = homefs_file_read(file, 0, @intFromPtr(&obj_test_read),
+                                  OBJ_TEST_BYTES)
+  var same: u32 = 1
+  if got != OBJ_TEST_BYTES { same = 0 }
+  var j: u32 = 0
+  while j < OBJ_TEST_BYTES {
+    if obj_test_read[j] != obj_test_write[j] { same = 0 }
+    j = j + 1
+  }
+  if same == 1 { passed = passed + 1 }
+
+  return passed
 }
