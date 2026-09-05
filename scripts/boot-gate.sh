@@ -192,7 +192,11 @@ fi
 # A second, tiny image behind a USB mass-storage device. It exists so the USB
 # stack has a device with bulk endpoints to talk to: the hub above it
 # enumerates but moves no data, and a usb-kbd would take keystrokes away from
-# the PS/2 controller and silence the keyboard milestone.
+# the PS/2 controller and silence the keyboard milestone — measured, not
+# assumed: attaching one drops `keyboard=` to 0 while the PS/2 line is what
+# the IRQ milestone counts. The HID driver is therefore exercised against a
+# usb-mouse, which QEMU drives from the monitor's `mouse_move` and which
+# leaves the keyboard alone.
 usbdisk="$workdir/usbdisk.img"
 # Known bytes at LBA 0, so a block read can be checked against what was
 # written rather than merely against "some bytes came back". Written fresh
@@ -253,6 +257,7 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
     -device qemu-xhci,id=xhci \
     -drive file="$usbdisk",format=raw,if=none,id=usbstick,cache=writethrough \
     -device usb-storage,bus=xhci.0,drive=usbstick \
+    -device usb-mouse,bus=xhci.0 \
     -monitor "telnet:127.0.0.1:$MONITOR_PORT,server,nowait" \
     -display none -vga std -no-reboot -m 256M > "$log" 2>&1 &
 qemu_pid=$!
@@ -279,6 +284,17 @@ qemu_pid=$!
     printf 'sendkey a\n' >&3
     sleep 1
     printf 'sendkey b\n' >&3
+
+    # Move the emulated mouse so the HID device has something to report. A
+    # HID endpoint NAKs until something changes, so without this the `hid`
+    # command below would correctly find nothing and the milestone would be
+    # asserting on the harness rather than on the driver. Several moves,
+    # because the shell command feed runs on its own clock and only needs one
+    # of them to land before it.
+    for _ in 1 2 3 4 5 6; do
+        printf 'mouse_move 24 16\n' >&3
+        sleep 1
+    done
 
     # Capture the framebuffer once the boot log has been rendered onto it.
     # A screenshot is the only way to tell a console that drew the log from

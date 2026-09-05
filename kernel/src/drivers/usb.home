@@ -1,18 +1,22 @@
 // home-os USB — xHCI host controller discovery
 //
-// STUB(S6): there is no HID driver, so a USB keyboard is still not a keyboard
-// — the interrupt endpoint is configured but nothing reads a report off it —
-// and nothing mounts a USB disk through the VFS. Blocks Phase 7a.
-// MASTER_PLAN §7.
+// STUB(S6): nothing mounts a USB disk through the VFS, so no path in the rest
+// of the kernel resolves onto one, and the HID keyboard report layout is
+// decoded but never exercised — attaching a usb-kbd takes keystrokes away
+// from the PS/2 controller, so the gate drives a mouse instead and the
+// keyboard branch is the one line of this driver no test reaches.
+// Blocks Phase 7a. MASTER_PLAN §7.
 //
 // What is implemented is everything under that: the controller found on the
 // PCI bus and its register window mapped, the command ring, event ring and
 // device-context base array set up from the capability registers, a device
 // reset, addressed and configured, and Bulk-Only Transport carrying SCSI —
-// INQUIRY, READ CAPACITY(10), READ(10) and WRITE(10). The boot gate reads a
-// known block off a USB disk, writes another, reads it back, and then checks
-// the host image, because a device accepting a write is not the same as the
-// write reaching the media.
+// INQUIRY, READ CAPACITY(10), READ(10) and WRITE(10) — and the HID class
+// layer: boot protocol, the interrupt endpoint, and report polling. The boot
+// gate reads a known block off a USB disk, writes another, reads it back, and
+// then checks the host image, because a device accepting a write is not the
+// same as the write reaching the media; and it moves an emulated mouse and
+// reads the movement back off the interrupt endpoint.
 
 import "../core/foundation.home" as foundation
 import "pci.home" as pci
@@ -131,6 +135,7 @@ var bulk_in_enqueue: u32 = 0
 var bulk_out_enqueue: u32 = 0
 var interface_class: u32 = 0
 var interface_protocol: u32 = 0
+var interface_number: u32 = 0
 
 // Register reads go through the architecture-neutral MMIO intrinsic rather
 // than a plain load: it is what tells the backend this access must not be
@@ -544,6 +549,13 @@ export fn xhci_address_device(slot: u32, port: u32): u32 {
   zero_page(device_context)
   zero_page(input_context)
   zero_page(ep0_ring)
+  // The ring is fresh, so the controller's dequeue pointer for it starts at
+  // index 0 and the enqueue index has to as well. Carried over from the
+  // previous device it pointed part-way into a ring of zeroes, and every
+  // control transfer to the second device on the bus failed — which looked
+  // like a device that would not answer rather than a driver writing to the
+  // wrong offset.
+  ep0_enqueue = 0
 
   // DCBAA entry for this slot. Index 0 is reserved for the scratchpad array.
   @as(*u64, @ptrFromInt(dcbaa_page + @as(u64, slot * 8))).* = device_context
@@ -709,6 +721,22 @@ export fn xhci_read_config_descriptor(slot: u32): u32 {
   if descriptor_buffer == 0 { return 0 }
   zero_page(descriptor_buffer)
 
+  // Everything below is filled in from *this* device's descriptors, so it is
+  // cleared first. Left over from the previous device, a bulk address or an
+  // interrupt endpoint would be attributed to a device that does not have
+  // one — and the second device on the bus would be configured against the
+  // first one's endpoints.
+  interrupt_ep_address = 0
+  interrupt_ep_max_packet = 0
+  interrupt_ep_interval = 0
+  bulk_in_address = 0
+  bulk_out_address = 0
+  bulk_in_max_packet = 0
+  bulk_out_max_packet = 0
+  interface_class = 0
+  interface_protocol = 0
+  interface_number = 0
+
   // GET_DESCRIPTOR(CONFIGURATION, index 0). Ask for a page; the device sends
   // what it has and a short packet says so.
   if control_in(slot, 0x80, 6, 0x0200, 0, 255) == 0 { return 0 }
@@ -752,6 +780,7 @@ export fn xhci_read_config_descriptor(slot: u32): u32 {
       // mass storage rather than something else with the same endpoints.
     }
     if kind == 4 and length >= 9 {
+      interface_number = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 2))).*)
       interface_class = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 5))).*)
       interface_protocol = @as(u32, @as(*u8, @ptrFromInt(descriptor_buffer + @as(u64, offset + 7))).*)
     }
@@ -832,6 +861,10 @@ export fn xhci_configure_bulk_endpoints(slot: u32): u32 {
   zero_page(bulk_in_ring)
   zero_page(bulk_out_ring)
   zero_page(input_context)
+  // Fresh rings, so the enqueue indices start over — the same reason
+  // xhci_address_device resets ep0_enqueue.
+  bulk_in_enqueue = 0
+  bulk_out_enqueue = 0
 
   var highest: u32 = bulk_in_dci
   if bulk_out_dci > highest { highest = bulk_out_dci }
@@ -882,8 +915,10 @@ var scsi_tag: u32 = 1
 var storage_last_lba: u32 = 0
 var storage_block_size: u32 = 0
 
-// Queue one Normal TRB on a bulk ring and ring its doorbell.
-fn bulk_transfer(slot: u32, dci: u32, ring: u64, enqueue: u32, buffer: u64, length: u32, direction_in: u32): u32 {
+// Queue one Normal TRB on an endpoint ring and ring its doorbell. Bulk and
+// interrupt endpoints take the same TRB; what differs is the endpoint the
+// doorbell names, so this serves both.
+fn queue_transfer(slot: u32, dci: u32, ring: u64, enqueue: u32, buffer: u64, length: u32, direction_in: u32): u32 {
   let off: u32 = enqueue * TRB_SIZE
   write_mem32(ring, off, @as(u32, buffer & 0xFFFFFFFF))
   write_mem32(ring, off + 4, @as(u32, (buffer >> 32) & 0xFFFFFFFF))
@@ -917,19 +952,19 @@ fn scsi_command_dir(slot: u32, transfer_length: u32, direction_in: u32): u32 {
   }
   @as(*u8, @ptrFromInt(cbw_buffer + 13)).* = 0      // LUN 0
 
-  if bulk_transfer(slot, bulk_out_dci, bulk_out_ring, bulk_out_enqueue, cbw_buffer, 31, 0) == 0 {
+  if queue_transfer(slot, bulk_out_dci, bulk_out_ring, bulk_out_enqueue, cbw_buffer, 31, 0) == 0 {
     return 0
   }
   bulk_out_enqueue = bulk_out_enqueue + 1
 
   if transfer_length > 0 {
     if direction_in == 1 {
-      if bulk_transfer(slot, bulk_in_dci, bulk_in_ring, bulk_in_enqueue, data_buffer, transfer_length, 1) == 0 {
+      if queue_transfer(slot, bulk_in_dci, bulk_in_ring, bulk_in_enqueue, data_buffer, transfer_length, 1) == 0 {
         return 0
       }
       bulk_in_enqueue = bulk_in_enqueue + 1
     } else {
-      if bulk_transfer(slot, bulk_out_dci, bulk_out_ring, bulk_out_enqueue, data_buffer, transfer_length, 0) == 0 {
+      if queue_transfer(slot, bulk_out_dci, bulk_out_ring, bulk_out_enqueue, data_buffer, transfer_length, 0) == 0 {
         return 0
       }
       bulk_out_enqueue = bulk_out_enqueue + 1
@@ -938,7 +973,7 @@ fn scsi_command_dir(slot: u32, transfer_length: u32, direction_in: u32): u32 {
 
   // Command Status Wrapper. Its signature and matching tag are what make the
   // reply trustworthy: a device that is out of step will still return bytes.
-  if bulk_transfer(slot, bulk_in_dci, bulk_in_ring, bulk_in_enqueue, csw_buffer, 13, 1) == 0 {
+  if queue_transfer(slot, bulk_in_dci, bulk_in_ring, bulk_in_enqueue, csw_buffer, 13, 1) == 0 {
     return 0
   }
   bulk_in_enqueue = bulk_in_enqueue + 1
@@ -1131,3 +1166,147 @@ export fn usb_is_halted(): u32 {
   }
   return 0
 }
+
+// ============================================================================
+// USB HID
+//
+// A HID device reports through an interrupt IN endpoint: the host polls, and
+// the device returns a report or NAKs because nothing has changed. The
+// endpoint is configured by xhci_configure_interrupt_endpoint above; this is
+// the class layer on top of it.
+//
+// Boot protocol is requested rather than the report protocol, which is why
+// no report-descriptor parser appears here. A report descriptor describes an
+// arbitrary bit layout and needs an interpreter to read; boot protocol is a
+// fixed layout every HID keyboard and mouse must also support, and it is what
+// a kernel wants at this stage. A device that refuses SET_PROTOCOL says so,
+// and the caller finds out rather than reading a report in a layout it only
+// assumed.
+//
+//   keyboard (protocol 1): byte 0 modifiers, byte 1 reserved, bytes 2..7 up
+//                          to six keycodes, 0 meaning no key in that slot
+//   mouse    (protocol 2): byte 0 buttons, byte 1 dx, byte 2 dy, both signed
+// ============================================================================
+
+export const HID_PROTOCOL_KEYBOARD: u32 = 1
+export const HID_PROTOCOL_MOUSE: u32 = 2
+
+const HID_REQUEST_SET_IDLE: u32 = 0x0A
+const HID_REQUEST_SET_PROTOCOL: u32 = 0x0B
+// Host-to-device, class request, recipient interface.
+const HID_REQUEST_TYPE_OUT: u32 = 0x21
+
+var hid_report_buffer: u64 = 0
+// The slot the HID device was addressed on. Recorded by usb_hid_init rather
+// than tracked by the caller, so anything that wants to poll the device — the
+// serial shell, say — asks the driver instead of being handed a number it has
+// no way to check.
+var hid_slot: u32 = 0
+var hid_report_length: u32 = 0
+var interrupt_enqueue: u32 = 0
+
+// Ask the device for boot protocol. Value 0 is boot, 1 is report.
+export fn xhci_hid_set_protocol_boot(slot: u32): u32 {
+  if interface_class != 3 { return 0 }
+  return control_no_data(slot, HID_REQUEST_TYPE_OUT, HID_REQUEST_SET_PROTOCOL,
+                         0, interface_number)
+}
+
+// Idle duration 0 means "report only on change", which is what makes a poll
+// that returns nothing mean nothing happened, rather than the device
+// re-sending its last report forever.
+export fn xhci_hid_set_idle(slot: u32): u32 {
+  if interface_class != 3 { return 0 }
+  return control_no_data(slot, HID_REQUEST_TYPE_OUT, HID_REQUEST_SET_IDLE,
+                         0, interface_number)
+}
+
+fn ensure_hid_buffer(): u32 {
+  if hid_report_buffer != 0 { return 1 }
+  hid_report_buffer = memory.pmm_alloc_page()
+  if hid_report_buffer == 0 { return 0 }
+  return 1
+}
+
+// Poll the interrupt endpoint once. Returns the number of bytes the device
+// returned, or 0 — which means either "nothing to report" or "the transfer
+// did not complete", and the caller cannot tell them apart. That is the
+// honest shape for a single poll of an endpoint that is allowed to NAK.
+export fn xhci_hid_read_report(slot: u32): u32 {
+  if interrupt_ep_dci == 0 or interrupt_ring == 0 { return 0 }
+  if ensure_hid_buffer() == 0 { return 0 }
+  zero_page(hid_report_buffer)
+
+  var length: u32 = interrupt_ep_max_packet
+  if length == 0 or length > 64 { length = 8 }
+
+  if queue_transfer(slot, interrupt_ep_dci, interrupt_ring, interrupt_enqueue,
+                    hid_report_buffer, length, 1) == 0 {
+    return 0
+  }
+  interrupt_enqueue = interrupt_enqueue + 1
+  hid_report_length = length
+  return length
+}
+
+export fn usb_hid_report_byte(index: u32): u8 {
+  if hid_report_buffer == 0 or index >= hid_report_length { return 0 }
+  return @as(*u8, @ptrFromInt(hid_report_buffer + @as(u64, index))).*
+}
+
+export fn usb_hid_report_length(): u32 { return hid_report_length }
+export fn usb_interface_protocol(): u32 { return interface_protocol }
+export fn usb_interface_number(): u32 { return interface_number }
+
+// Boot-protocol keyboard: the modifier byte, and the six keycode slots.
+export fn usb_hid_modifiers(): u32 {
+  if interface_protocol != HID_PROTOCOL_KEYBOARD { return 0 }
+  return @as(u32, usb_hid_report_byte(0))
+}
+
+export fn usb_hid_keycode_at(index: u32): u8 {
+  if interface_protocol != HID_PROTOCOL_KEYBOARD { return 0 }
+  if index >= 6 { return 0 }
+  return usb_hid_report_byte(2 + index)
+}
+
+// Boot-protocol mouse. dx and dy are signed bytes on the wire; they are
+// widened here rather than left for every caller to remember, because a
+// leftward movement read as 250 pixels right is exactly the kind of bug that
+// looks like a working driver.
+export fn usb_hid_buttons(): u32 {
+  if interface_protocol != HID_PROTOCOL_MOUSE { return 0 }
+  return @as(u32, usb_hid_report_byte(0))
+}
+
+fn signed_byte(value: u8): i32 {
+  if value >= 128 { return @as(i32, @as(u32, value)) - 256 }
+  return @as(i32, @as(u32, value))
+}
+
+export fn usb_hid_mouse_dx(): i32 {
+  if interface_protocol != HID_PROTOCOL_MOUSE { return 0 }
+  return signed_byte(usb_hid_report_byte(1))
+}
+
+export fn usb_hid_mouse_dy(): i32 {
+  if interface_protocol != HID_PROTOCOL_MOUSE { return 0 }
+  return signed_byte(usb_hid_report_byte(2))
+}
+
+// Bring a HID interface up: boot protocol, idle on change, and its interrupt
+// endpoint configured. Returns 1 when the device is ready to be polled.
+export fn usb_hid_init(slot: u32): u32 {
+  if interface_class != 3 { return 0 }
+  if xhci_hid_set_protocol_boot(slot) == 0 { return 0 }
+  // SET_IDLE is optional in the specification and some devices STALL it.
+  // A stall here is not a reason to give up on the device, so its result is
+  // deliberately not checked.
+  xhci_hid_set_idle(slot)
+  if xhci_configure_interrupt_endpoint(slot) == 0 { return 0 }
+  interrupt_enqueue = 0
+  hid_slot = slot
+  return 1
+}
+
+export fn usb_hid_device_slot(): u32 { return hid_slot }
