@@ -4,6 +4,7 @@
 import "foundation.home" as foundation
 import "memory.home" as memory
 import "vfs_permissions.home" as perms
+import "../fs/homefs.home" as homefs
 
 // ============================================================================
 // CONSTANTS
@@ -58,7 +59,13 @@ struct OpenFile {
   ino: u32,
   offset: u64,
   flags: u32,
-  ref_count: u32
+  ref_count: u32,
+  // Non-zero when this descriptor names a homefs object rather than an entry
+  // in the in-memory inode table. The two namespaces are disjoint and a
+  // descriptor belongs to exactly one of them, so every operation below
+  // branches on this rather than trying to keep an inode in step with a file
+  // the inode table does not hold.
+  homefs_object: u64
 }
 
 // ============================================================================
@@ -566,8 +573,198 @@ export fn path_resolve(path: u64): u32 {
   }
 }
 
+// ============================================================================
+// HOMEFS MOUNT (MASTER_PLAN §7, S4: the VFS routing)
+//
+// A homefs volume is reachable through ordinary paths rather than only
+// through homefs's own API. One mount point is supported, which is what the
+// kernel has a volume for; the entry points below branch on whether a path
+// falls under it.
+//
+// The alternative — teaching the in-memory inode table to be backed by
+// homefs — would mean keeping two representations of every file in step, and
+// the failure mode of getting that wrong is a file that reads correctly from
+// one and not the other. A descriptor here belongs to exactly one namespace.
+// ============================================================================
+
+var homefs_mount_path: [u8; 64] = undefined
+var homefs_mount_len: u32 = 0
+
+// Register the mounted homefs volume at `path`. Returns 1 on success, and 0
+// if no volume is mounted — a mount point with nothing behind it would make
+// every path under it resolve to a missing file, which reads as an empty
+// filesystem rather than as an unmounted one.
+export fn vfs_mount_homefs(path: u64, path_len: u32): u32 {
+  if homefs.homefs_is_mounted() == 0 { return 0 }
+  if path_len == 0 or path_len >= 64 { return 0 }
+  var i: u32 = 0
+  while i < path_len {
+    homefs_mount_path[i] = @as(*u8, @ptrFromInt(path + @as(u64, i))).*
+    i = i + 1
+  }
+  homefs_mount_len = path_len
+
+  // And put it in the mount table, with figures homefs measured rather than
+  // figures chosen to look plausible. free_blocks is the difference between
+  // the device's size and what the trees actually reach, which is exactly
+  // what reclamation gives back.
+  if mount_count < MAX_MOUNTS {
+    let slot: u32 = mount_count
+    var j: u32 = 0
+    while j < path_len {
+      mount_table[slot].path[j] = homefs_mount_path[j]
+      j = j + 1
+    }
+    mount_table[slot].path_len = path_len
+    mount_table[slot].fs_type = FS_TYPE_HOMEFS
+    copy_string_to_array("homefs", &mount_table[slot].device, 32)
+    mount_table[slot].device_len = 6
+    mount_table[slot].total_blocks = @as(u64, homefs.homefs_device_blocks())
+    mount_table[slot].free_blocks =
+      @as(u64, homefs.homefs_device_blocks() - homefs.homefs_blocks_live())
+    // An object is homefs's inode. There is no fixed table of them, so the
+    // count is what exists and the ceiling is the volume itself.
+    mount_table[slot].total_inodes = @as(u64, homefs.homefs_device_blocks())
+    mount_table[slot].free_inodes =
+      @as(u64, homefs.homefs_device_blocks() - homefs.homefs_blocks_live())
+    mount_table[slot].block_size = 4096
+    mount_table[slot].mounted = 1
+    mount_count = mount_count + 1
+  }
+  return 1
+}
+
+export fn vfs_homefs_mounted(): u32 {
+  if homefs_mount_len == 0 { return 0 }
+  return homefs.homefs_is_mounted()
+}
+
+// The offset within `path` at which the part below the mount point starts,
+// or 0 if the path is not under it. A path equal to the mount point returns
+// its own length, which addresses the terminator — the empty remainder,
+// meaning the mount's root directory.
+fn homefs_path_offset(path: u64): u32 {
+  if vfs_homefs_mounted() == 0 { return 0 }
+  var i: u32 = 0
+  while i < homefs_mount_len {
+    let c: u8 = @as(*u8, @ptrFromInt(path + @as(u64, i))).*
+    if c != homefs_mount_path[i] { return 0 }
+    i = i + 1
+  }
+  // "/homefsx" must not match the mount point "/homefs". The character after
+  // the prefix has to end the component.
+  let next: u8 = @as(*u8, @ptrFromInt(path + @as(u64, homefs_mount_len))).*
+  if next != 0 and next != 47 { return 0 }
+  return homefs_mount_len
+}
+
+// Walk the path below the mount point through homefs's directories.
+// Returns the object id, or 0.
+export fn vfs_homefs_resolve(path: u64): u64 {
+  let start: u32 = homefs_path_offset(path)
+  if start == 0 { return 0 }
+
+  var object: u64 = homefs.HOMEFS_ROOT_DIR
+  var i: u32 = start
+  loop {
+    // Skip separators. Consecutive ones, and a trailing one, name the same
+    // directory as the path without them.
+    while @as(*u8, @ptrFromInt(path + @as(u64, i))).* == 47 { i = i + 1 }
+    if @as(*u8, @ptrFromInt(path + @as(u64, i))).* == 0 { return object }
+
+    let component: u64 = path + @as(u64, i)
+    var length: u32 = 0
+    loop {
+      let c: u8 = @as(*u8, @ptrFromInt(component + @as(u64, length))).*
+      if c == 0 or c == 47 { break }
+      length = length + 1
+      if length > 64 { return 0 }
+    }
+
+    object = homefs.homefs_dir_lookup(object, component, length)
+    if object == 0 { return 0 }
+    i = i + length
+  }
+}
+
+// Open a homefs path. Returns a descriptor, or 0 — including when the path is
+// not under the mount point, which is how vfs_open knows to carry on with the
+// inode table.
+fn homefs_open(path: u64, flags: u32): u32 {
+  if homefs_path_offset(path) == 0 { return 0 }
+
+  var object: u64 = vfs_homefs_resolve(path)
+  if object == 0 {
+    // O_CREAT is bit 6, as elsewhere in this file.
+    if (flags & 0x40) == 0 { return 0 }
+    object = homefs_create_at(path)
+    if object == 0 { return 0 }
+  }
+  if homefs.homefs_object_kind(object) != homefs.OBJ_KIND_FILE { return 0 }
+
+  var i: u32 = 0
+  while i < MAX_OPEN_FILES {
+    if open_files[i].ref_count == 0 {
+      open_files[i].ino = 0
+      open_files[i].offset = 0
+      open_files[i].flags = flags
+      open_files[i].ref_count = 1
+      open_files[i].homefs_object = object
+      open_file_count = open_file_count + 1
+      return i + 3
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Create the file `path` names, in the directory above it. The parent has to
+// exist: creating intermediate directories is mkdir -p, which no caller of
+// open() expects.
+fn homefs_create_at(path: u64): u64 {
+  let start: u32 = homefs_path_offset(path)
+  if start == 0 { return 0 }
+
+  // Find the last component, and the length of everything before it.
+  var i: u32 = start
+  var last: u32 = start
+  loop {
+    let c: u8 = @as(*u8, @ptrFromInt(path + @as(u64, i))).*
+    if c == 0 { break }
+    if c == 47 { last = i + 1 }
+    i = i + 1
+  }
+  let name: u64 = path + @as(u64, last)
+  let name_len: u32 = i - last
+  if name_len == 0 { return 0 }
+
+  // The parent is the path truncated at the separator. Truncating in place
+  // and restoring afterwards avoids a second buffer; the path belongs to the
+  // caller for the duration of this call.
+  var parent: u64 = homefs.HOMEFS_ROOT_DIR
+  if last > start {
+    let cut: u64 = path + @as(u64, last - 1)
+    let saved: u8 = @as(*u8, @ptrFromInt(cut)).*
+    @as(*u8, @ptrFromInt(cut)).* = 0
+    parent = vfs_homefs_resolve(path)
+    @as(*u8, @ptrFromInt(cut)).* = saved
+    if parent == 0 { return 0 }
+  }
+
+  let object: u64 = homefs.homefs_create(parent, name, name_len,
+                                         homefs.OBJ_KIND_FILE)
+  if object == 0 { return 0 }
+  if homefs.homefs_commit_transaction() == 0 { return 0 }
+  return object
+}
+
 export fn vfs_open(path: u64, flags: u32): u32 {
   if open_file_count >= MAX_OPEN_FILES { return 0 }
+
+  // A path under the homefs mount point belongs to homefs. Checked before
+  // path_resolve because the inode table would happily create an entry for
+  // it and then hold a file the volume knows nothing about.
+  if homefs_path_offset(path) != 0 { return homefs_open(path, flags) }
 
   // Resolve the path. This used to allocate a fresh inode per call and ignore
   // the path entirely, so every path "opened" and read back empty — a cat of
@@ -629,6 +826,9 @@ export fn vfs_open(path: u64, flags: u32): u32 {
       open_files[i].offset = 0
       open_files[i].flags = flags
       open_files[i].ref_count = 1
+      // Slots are reused, and a stale object id here would send this
+      // descriptor's reads to whatever file used the slot before it.
+      open_files[i].homefs_object = 0
 
       open_file_count = open_file_count + 1
 
@@ -659,6 +859,9 @@ export fn vfs_close(fd: u32): u32 {
     
     if open_files[idx].ref_count == 0 {
       open_file_count = open_file_count - 1
+      // The slot is free for reuse, and a stale object id in it would send
+      // the next descriptor's reads to this file.
+      open_files[idx].homefs_object = 0
     }
     
     return 0
@@ -674,6 +877,18 @@ export fn vfs_read(fd: u32, buffer: u64, count: u64): u64 {
   if idx >= MAX_OPEN_FILES { return 0 }
 
   if open_files[idx].ref_count == 0 { return 0 }
+
+  // homefs files carry no inode-table entry, so the permission check further
+  // down has nothing to check against. homefs has no owner or mode field
+  // yet; that is a gap to close when it grows one rather than a check being
+  // skipped quietly — MASTER_PLAN §7, S4.
+  if open_files[idx].homefs_object != 0 {
+    let got: u32 = homefs.homefs_file_read(open_files[idx].homefs_object,
+                                           open_files[idx].offset, buffer,
+                                           @as(u32, count))
+    open_files[idx].offset = open_files[idx].offset + @as(u64, got)
+    return @as(u64, got)
+  }
 
   var ino: u32 = open_files[idx].ino
   var inode_ptr: u64 = inode_get(ino)
@@ -750,6 +965,20 @@ export fn vfs_write(fd: u32, buffer: u64, count: u64): u64 {
   if idx >= MAX_OPEN_FILES { return 0 }
 
   if open_files[idx].ref_count == 0 { return 0 }
+
+  if open_files[idx].homefs_object != 0 {
+    let put: u32 = homefs.homefs_file_write(open_files[idx].homefs_object,
+                                            open_files[idx].offset, buffer,
+                                            @as(u32, count))
+    if put == 0 { return 0 }
+    // Committed per write rather than at close: a descriptor that is never
+    // closed — every one held open at a crash — would otherwise lose
+    // everything written through it, and homefs's whole argument is that a
+    // crash costs you the last transaction and nothing more.
+    if homefs.homefs_commit_transaction() == 0 { return 0 }
+    open_files[idx].offset = open_files[idx].offset + @as(u64, put)
+    return @as(u64, put)
+  }
 
   var ino: u32 = open_files[idx].ino
   var inode_ptr: u64 = inode_get(ino)
@@ -833,12 +1062,18 @@ export fn vfs_lseek(fd: u32, offset: u64, whence: u32): u64 {
     if offset > 0xFFFFFFFFFFFFFFFF - open_files[idx].offset { return 0 }
     open_files[idx].offset = open_files[idx].offset + offset
   } else if whence == 2 {
-    var ino: u32 = open_files[idx].ino
-    var inode_ptr: u64 = inode_get(ino)
-    if inode_ptr != 0 {
-      var inode: Inode = @as(*Inode, @ptrFromInt(inode_ptr)).*
-      if offset > 0xFFFFFFFFFFFFFFFF - inode.size { return 0 }
-      open_files[idx].offset = inode.size + offset
+    if open_files[idx].homefs_object != 0 {
+      let size: u64 = homefs.homefs_object_size(open_files[idx].homefs_object)
+      if offset > 0xFFFFFFFFFFFFFFFF - size { return 0 }
+      open_files[idx].offset = size + offset
+    } else {
+      var ino: u32 = open_files[idx].ino
+      var inode_ptr: u64 = inode_get(ino)
+      if inode_ptr != 0 {
+        var inode: Inode = @as(*Inode, @ptrFromInt(inode_ptr)).*
+        if offset > 0xFFFFFFFFFFFFFFFF - inode.size { return 0 }
+        open_files[idx].offset = inode.size + offset
+      }
     }
   }
   
@@ -974,55 +1209,51 @@ const MAX_MOUNTS: u32 = 16
 var mount_table: [MountPoint; 16] = undefined
 var mount_count: u32 = 0
 
-// Initialize default mount points
+// Initialize default mount points.
+//
+// These used to be invented: two homefs volumes on /dev/sda1 and /dev/sda2
+// with 10 GB and 20 GB capacities and plausible free-space figures, none of
+// which corresponded to a device, a filesystem, or a number anything had
+// measured. vfs_statfs reported them, so `df` printed a disk layout the
+// machine did not have.
+//
+// What is true is that "/" is served by the in-memory inode table above, and
+// that a homefs volume appears only once one is actually mounted — which is
+// what vfs_mount_homefs does, with figures homefs itself reports.
 fn init_mount_table() {
-  // Root filesystem
+  // The root filesystem is this file's inode table: it lives in RAM, it is
+  // sized by MAX_INODES, and it does not survive a reboot. Calling it tmpfs
+  // is what it is.
   mount_table[0].path[0] = '/'
   mount_table[0].path_len = 1
-  mount_table[0].fs_type = FS_TYPE_HOMEFS
-  copy_string_to_array("/dev/sda1", &mount_table[0].device, 32)
-  mount_table[0].device_len = 9
-  mount_table[0].total_blocks = 2621440  // 10GB in 4KB blocks
-  mount_table[0].free_blocks = 1310720   // 5GB free
-  mount_table[0].total_inodes = MAX_INODES
-  mount_table[0].free_inodes = MAX_INODES - inode_count
+  mount_table[0].fs_type = FS_TYPE_TMPFS
+  copy_string_to_array("rootfs", &mount_table[0].device, 32)
+  mount_table[0].device_len = 6
+  // One block per inode is the table's own shape, not a disk's. Reporting
+  // the inode table's real capacity beats reporting a disk that is not there.
+  mount_table[0].total_blocks = @as(u64, MAX_INODES)
+  mount_table[0].free_blocks = @as(u64, MAX_INODES - inode_count)
+  mount_table[0].total_inodes = @as(u64, MAX_INODES)
+  mount_table[0].free_inodes = @as(u64, MAX_INODES - inode_count)
   mount_table[0].block_size = BLOCK_SIZE
   mount_table[0].mounted = 1
 
-  // /home filesystem
   mount_table[1].path[0] = '/'
-  mount_table[1].path[1] = 'h'
-  mount_table[1].path[2] = 'o'
-  mount_table[1].path[3] = 'm'
-  mount_table[1].path[4] = 'e'
-  mount_table[1].path_len = 5
-  mount_table[1].fs_type = FS_TYPE_HOMEFS
-  copy_string_to_array("/dev/sda2", &mount_table[1].device, 32)
-  mount_table[1].device_len = 9
-  mount_table[1].total_blocks = 5242880  // 20GB
-  mount_table[1].free_blocks = 3145728   // 12GB free
-  mount_table[1].total_inodes = 65536
-  mount_table[1].free_inodes = 60000
+  mount_table[1].path[1] = 't'
+  mount_table[1].path[2] = 'm'
+  mount_table[1].path[3] = 'p'
+  mount_table[1].path_len = 4
+  mount_table[1].fs_type = FS_TYPE_TMPFS
+  copy_string_to_array("tmpfs", &mount_table[1].device, 32)
+  mount_table[1].device_len = 5
+  mount_table[1].total_blocks = @as(u64, MAX_INODES)
+  mount_table[1].free_blocks = @as(u64, MAX_INODES - inode_count)
+  mount_table[1].total_inodes = @as(u64, MAX_INODES)
+  mount_table[1].free_inodes = @as(u64, MAX_INODES - inode_count)
   mount_table[1].block_size = BLOCK_SIZE
   mount_table[1].mounted = 1
 
-  // tmpfs
-  mount_table[2].path[0] = '/'
-  mount_table[2].path[1] = 't'
-  mount_table[2].path[2] = 'm'
-  mount_table[2].path[3] = 'p'
-  mount_table[2].path_len = 4
-  mount_table[2].fs_type = FS_TYPE_TMPFS
-  copy_string_to_array("tmpfs", &mount_table[2].device, 32)
-  mount_table[2].device_len = 5
-  mount_table[2].total_blocks = 131072  // 512MB
-  mount_table[2].free_blocks = 114688   // ~448MB free
-  mount_table[2].total_inodes = 65536
-  mount_table[2].free_inodes = 65000
-  mount_table[2].block_size = BLOCK_SIZE
-  mount_table[2].mounted = 1
-
-  mount_count = 3
+  mount_count = 2
 }
 
 fn copy_string_to_array(src: []u8, dst: *[u8; 32], max_len: u32) {
@@ -1130,7 +1361,46 @@ export struct DirEntryInfo {
 
 // Read directory entries
 // Returns number of entries read, or 0 on error
+// List a homefs directory. Entries come out in hash order, which is the
+// order the directory tree holds them in; readdir promises no other, and
+// sorting would mean holding the whole directory in memory to do it.
+fn homefs_readdir(path: u64, entries: *[DirEntryInfo; 256], max_entries: u32): u32 {
+  let dir: u64 = vfs_homefs_resolve(path)
+  if dir == 0 { return 0 }
+  if homefs.homefs_object_kind(dir) != homefs.OBJ_KIND_DIR { return 0 }
+
+  let total: u32 = homefs.homefs_dir_count(dir)
+  var count: u32 = 0
+  var i: u32 = 0
+  while i < total {
+    if count >= max_entries { return count }
+    let child: u64 = homefs.homefs_dir_at(dir, i)
+    if child != 0 {
+      // The inode number a homefs object gets here is the low half of its
+      // object id. It is what identifies the file to a caller of readdir
+      // within this directory; it is not an inode-table index, and nothing
+      // looks it up as one.
+      entries[count].ino = @as(u32, child & 0xFFFFFFFF)
+      if homefs.homefs_object_kind(child) == homefs.OBJ_KIND_DIR {
+        entries[count].file_type = FILE_TYPE_DIRECTORY
+      } else {
+        entries[count].file_type = FILE_TYPE_REGULAR
+      }
+      entries[count].size = homefs.homefs_object_size(child)
+      let written: u32 = homefs.homefs_object_name(child,
+                                                   @intFromPtr(&entries[count].name),
+                                                   255)
+      entries[count].name[written] = 0
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
 export fn vfs_readdir(path: u64, entries: *[DirEntryInfo; 256], max_entries: u32): u32 {
+  if homefs_path_offset(path) != 0 { return homefs_readdir(path, entries, max_entries) }
+
   var ino: u32 = path_resolve(path)
   if ino == 0 { return 0 }
 
@@ -1209,6 +1479,11 @@ export fn vfs_readdir(path: u64, entries: *[DirEntryInfo; 256], max_entries: u32
 
 // Get file/directory size by path
 export fn vfs_get_size(path: u64): u64 {
+  if homefs_path_offset(path) != 0 {
+    let object: u64 = vfs_homefs_resolve(path)
+    if object == 0 { return 0 }
+    return homefs.homefs_object_size(object)
+  }
   var ino: u32 = inode_lookup(path)
   if ino == 0 { return 0 }
 
@@ -1220,6 +1495,14 @@ export fn vfs_get_size(path: u64): u64 {
 
 // Get file type by path (1=file, 2=dir, 3=symlink)
 export fn vfs_get_type(path: u64): u32 {
+  if homefs_path_offset(path) != 0 {
+    let object: u64 = vfs_homefs_resolve(path)
+    if object == 0 { return 0 }
+    if homefs.homefs_object_kind(object) == homefs.OBJ_KIND_DIR {
+      return FILE_TYPE_DIRECTORY
+    }
+    return FILE_TYPE_REGULAR
+  }
   var ino: u32 = inode_lookup(path)
   if ino == 0 { return 0 }
 
@@ -1265,6 +1548,11 @@ export fn vfs_pread(fd: u32, buffer: u64, count: u64, offset: u64): u64 {
   if idx >= MAX_OPEN_FILES { return 0 }
 
   if open_files[idx].ref_count == 0 { return 0 }
+
+  if open_files[idx].homefs_object != 0 {
+    return @as(u64, homefs.homefs_file_read(open_files[idx].homefs_object,
+                                            offset, buffer, @as(u32, count)))
+  }
 
   var ino: u32 = open_files[idx].ino
   var inode_ptr: u64 = inode_get(ino)
@@ -1323,6 +1611,14 @@ export fn vfs_pwrite(fd: u32, buffer: u64, count: u64, offset: u64): u64 {
   if idx >= MAX_OPEN_FILES { return 0 }
 
   if open_files[idx].ref_count == 0 { return 0 }
+
+  if open_files[idx].homefs_object != 0 {
+    let put: u32 = homefs.homefs_file_write(open_files[idx].homefs_object,
+                                            offset, buffer, @as(u32, count))
+    if put == 0 { return 0 }
+    if homefs.homefs_commit_transaction() == 0 { return 0 }
+    return @as(u64, put)
+  }
 
   var ino: u32 = open_files[idx].ino
   var inode_ptr: u64 = inode_get(ino)
