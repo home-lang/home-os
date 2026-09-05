@@ -1,119 +1,177 @@
-// HomeOS - Raspberry Pi 5 Kernel Entry Point
-// Written in the Home programming language
+// HomeOS — Raspberry Pi 5 kernel entry point
+//
+// This file previously described an API that no module ever exported:
+// `bcm_gpio.init_rpi5()` returning a handle with `.set_function`/`.set_pin`,
+// a `dtb.parse()` returning a walkable tree, and `serial.write()`. It also
+// read two names — `property` and `node` — that were never bound, so it was
+// never going to compile, let alone run. It is rewritten here against the
+// modules this tree actually has:
+//
+//   arch/arm64/rpi5.home        board bring-up, RP1 UART, RP1 GPIO
+//   arch/arm64/devicetree.home  flattened device tree parsing
+//   arch/arm64/arm64.home       wfi
+//
+// Output goes through the RP1 UART directly rather than through
+// foundation.serial_write_string: foundation's serial path is x86 port I/O,
+// which on aarch64 lands in port_io_unavailable() and prints nothing
+// (STUB(S9) — ARM64 has no I/O address space). Anything this file reports
+// has to reach a real Pi's console, so it writes MMIO.
 
-// Imports point at the in-tree drivers and ARM64 board support.
-// (The earlier `basics/os/...` and `basics/drivers/...` paths were
-// leftovers from a planned standard library that does not exist.)
-import "drivers/serial.home" as serial
-import "arch/arm64/rpi/devicetree.home" as dtb
-import "arch/arm64/rpi/gpio.home" as bcm_gpio
+import "./arch/arm64/rpi5.home" as rpi5
+import "./arch/arm64/devicetree.home" as dt
+import "./arch/arm64/arm64.home" as arch
 
-// Kernel entry point - called by ARM64 bootloader
+// GPIO 17 is a plain header pin, driven here as proof the RP1 GPIO path
+// works. The Pi 5's activity LED is *not* on the 40-pin header — it hangs off
+// the PMIC — so the old code's "status LED" on pin 42 could not have blinked
+// even with a working GPIO API. Pin 42 is also outside the range
+// rpi5_gpio_set() accepts.
+const HEADER_PIN: u32 = 17
+const GPIO_FUNC_OUTPUT: u32 = 5   // RP1 function select: SYS_RIO
+
+// Kernel entry point — called from the ARM64 boot code with the address the
+// firmware left the flattened device tree at.
 export fn kernel_main(dtb_addr: u64): never {
-  // Initialize serial console for early debugging
-  serial.init_uart0()
-  serial.write("HomeOS booting on Raspberry Pi 5...\n")
+  rpi5.rpi5_init()
 
-  // Parse device tree to discover hardware
-  let device_tree = dtb.parse(dtb_addr)
-
-  // Display boot information
   print_banner()
-  print_device_info(device_tree)
+  print_device_info(dtb_addr)
 
-  // Initialize GPIO (BCM2712 for Pi 5)
-  let gpio = bcm_gpio.init_rpi5()
+  blink_header_pin()
 
-  // Blink the status LED to show we're alive
-  serial.write("Blinking status LED...\n")
-  gpio.set_function(42, bcm_gpio.Output)
-
-  let blink_count = 0
+  puts("Entering idle loop...\n")
   loop {
-    gpio.set_pin(42)
-    busy_wait(5000000)
-    gpio.clear_pin(42)
-    busy_wait(5000000)
-
-    blink_count = blink_count + 1
-    if blink_count == 5 {
-      serial.write("LED blink test complete!\n")
-      break
-    }
+    arch.wfi()
   }
+}
 
-  // Main kernel loop
-  serial.write("Entering idle loop...\n")
+// ---------------------------------------------------------------------------
+// Console
+// ---------------------------------------------------------------------------
+
+fn puts(s: str) {
+  var ptr: u64 = @intFromPtr(s)
+  var i: u32 = 0
+  while i < 1024 {
+    var c: u8 = @as(*u8, @ptrFromInt(ptr)).*
+    if c == 0 { break }
+    rpi5.rpi5_uart_putc(c)
+    ptr = ptr + 1
+    i = i + 1
+  }
+}
+
+fn put_hex(value: u64) {
+  puts("0x")
+  var shift: u32 = 60
   loop {
-    // Wait for interrupt
-    asm("wfe")
+    var nibble: u8 = @truncate((value >> shift) & 0xF, u8)
+    if nibble < 10 {
+      rpi5.rpi5_uart_putc(nibble + 48)      // '0'
+    } else {
+      rpi5.rpi5_uart_putc(nibble + 55)      // 'A' - 10
+    }
+    if shift == 0 { break }
+    shift = shift - 4
+  }
+}
+
+fn put_dec(value: u64) {
+  if value == 0 {
+    rpi5.rpi5_uart_putc(48)
+    return
+  }
+  // Build the digits backwards, then emit them in order. 20 digits covers
+  // the whole u64 range.
+  var digits: [u8; 20] = undefined
+  var count: u32 = 0
+  var v: u64 = value
+  while v > 0 {
+    digits[count] = @truncate(v % 10, u8) + 48
+    v = v / 10
+    count = count + 1
+  }
+  while count > 0 {
+    count = count - 1
+    rpi5.rpi5_uart_putc(digits[count])
   }
 }
 
 fn print_banner() {
-  serial.write("\n")
-  serial.write("╔════════════════════════════════════════╗\n")
-  serial.write("║     Home Operating System v0.1.0      ║\n")
-  serial.write("║   Built with Home Programming Lang    ║\n")
-  serial.write("║      Running on Raspberry Pi 5        ║\n")
-  serial.write("╚════════════════════════════════════════╝\n")
-  serial.write("\n")
+  puts("\n")
+  puts("==========================================\n")
+  puts("  Home Operating System v0.1.0\n")
+  puts("  Built with the Home programming language\n")
+  puts("  Running on Raspberry Pi 5 (BCM2712)\n")
+  puts("==========================================\n")
+  puts("\n")
 }
 
-fn print_device_info(dt: dtb.DeviceTree) {
-  serial.write("=== Device Tree Information ===\n")
+// ---------------------------------------------------------------------------
+// Boot information
+// ---------------------------------------------------------------------------
 
-  // Get model name
-  if dt.root.get_property("model") {
-    let model = property.as_string()
-    serial.write("Model: ")
-    serial.write(model)
-    serial.write("\n")
+fn print_device_info(dtb_addr: u64) {
+  puts("=== Board ===\n")
+  puts("Revision:  ")
+  put_hex(rpi5.rpi5_get_board_revision())
+  puts("\nCPU clock: ")
+  put_dec(rpi5.rpi5_get_cpu_freq() / 1000000)
+  puts(" MHz\n")
+
+  puts("\n=== Device tree ===\n")
+  puts("FDT at:    ")
+  put_hex(dtb_addr)
+  puts("\n")
+
+  dt.devicetree_init(dtb_addr)
+
+  // devicetree_init() returns silently on a bad magic, so a zero memory size
+  // is what a failed parse looks like from here. Report that rather than
+  // printing a confident 0 MB.
+  var mem_size: u64 = dt.devicetree_get_memory_size()
+  if mem_size == 0 {
+    puts("Memory:    not described by the device tree\n")
+  } else {
+    puts("Memory:    ")
+    put_dec(mem_size / (1024 * 1024))
+    puts(" MB at ")
+    put_hex(dt.devicetree_get_memory_base())
+    puts("\n")
   }
 
-  // Get memory information
-  if dt.find_node("/memory") {
-    let mem_node = node
-    let memory_ranges = dtb.parse_memory(mem_node)
+  puts("CPUs:      ")
+  put_dec(dt.devicetree_get_cpu_count())
+  puts("\n\n")
+}
 
-    serial.write("Memory regions:\n")
-    for (memory_ranges) |range| {
-      serial.write("  0x")
-      serial.write_hex(range.address)
-      serial.write(" - 0x")
-      serial.write_hex(range.address + range.size)
-      serial.write(" (")
-      serial.write_dec(range.size / (1024 * 1024))
-      serial.write(" MB)\n")
-    }
+// ---------------------------------------------------------------------------
+// GPIO proof of life
+// ---------------------------------------------------------------------------
+
+fn blink_header_pin() {
+  puts("Toggling GPIO ")
+  put_dec(HEADER_PIN)
+  puts("...\n")
+
+  rpi5.rpi5_gpio_function(HEADER_PIN, GPIO_FUNC_OUTPUT)
+
+  var count: u32 = 0
+  while count < 5 {
+    rpi5.rpi5_gpio_set(HEADER_PIN)
+    busy_wait(5000000)
+    rpi5.rpi5_gpio_clear(HEADER_PIN)
+    busy_wait(5000000)
+    count = count + 1
   }
 
-  // Get CPU information
-  if dt.find_node("/cpus") {
-    let cpus_node = node
-    let cpu_count = 0
-
-    for (cpus_node.children) |child| {
-      if child.name.starts_with("cpu") {
-        cpu_count = cpu_count + 1
-      }
-    }
-
-    serial.write("CPUs detected: ")
-    serial.write_dec(cpu_count)
-    serial.write("\n")
-  }
-
-  serial.write("\n")
+  puts("GPIO toggle complete.\n")
 }
 
 fn busy_wait(cycles: u32) {
-  let i = 0
-  loop {
-    if i >= cycles {
-      break
-    }
-    asm("nop")
+  var i: u32 = 0
+  while i < cycles {
+    arch.nop()
     i = i + 1
   }
 }
