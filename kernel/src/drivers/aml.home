@@ -1,0 +1,461 @@
+// home-os AML — the ACPI Machine Language namespace parser
+//
+// AML is the bytecode the firmware's DSDT and SSDT tables are written in. It
+// carries two different kinds of thing in one stream: declarations, which
+// build a namespace, and executable statements, which only appear inside
+// method bodies. This file parses the first and steps over the second.
+//
+// That split is what makes a useful parser much smaller than a full
+// interpreter. The sleep types a kernel needs in order to power the machine
+// down or suspend it are declarations — `Name (_S5, Package () { 0x00, ... })`
+// — evaluated by nobody. Reading them does not require running any AML.
+//
+// What this does NOT do is execute methods. `_PTS` and `_WAK`, which a real
+// S3 transition has to call, are methods; their bodies are skipped here. That
+// is the remaining half of STUB(S7) and it is registered as such.
+//
+// The parse is checked by arithmetic rather than by inspection: every
+// construct is length-prefixed, so a parser that misreads one opcode
+// desynchronises and cannot land exactly on the end of the table. Consuming
+// the table's own declared length, to the byte, is the assertion.
+
+import "../core/foundation.home" as foundation
+
+// Namespace-building opcodes.
+const OP_ZERO: u8 = 0x00
+const OP_ONE: u8 = 0x01
+const OP_ALIAS: u8 = 0x06
+const OP_NAME: u8 = 0x08
+const OP_BYTE_PREFIX: u8 = 0x0A
+const OP_WORD_PREFIX: u8 = 0x0B
+const OP_DWORD_PREFIX: u8 = 0x0C
+const OP_STRING_PREFIX: u8 = 0x0D
+const OP_QWORD_PREFIX: u8 = 0x0E
+const OP_SCOPE: u8 = 0x10
+const OP_BUFFER: u8 = 0x11
+const OP_PACKAGE: u8 = 0x12
+const OP_VAR_PACKAGE: u8 = 0x13
+const OP_METHOD: u8 = 0x14
+const OP_EXTERNAL: u8 = 0x15
+const OP_EXT_PREFIX: u8 = 0x5B
+const OP_ONES: u8 = 0xFF
+
+// Extended opcodes, all preceded by 0x5B.
+const EXT_MUTEX: u8 = 0x01
+const EXT_EVENT: u8 = 0x02
+const EXT_OP_REGION: u8 = 0x80
+const EXT_FIELD: u8 = 0x81
+const EXT_DEVICE: u8 = 0x82
+const EXT_PROCESSOR: u8 = 0x83
+const EXT_POWER_RES: u8 = 0x84
+const EXT_THERMAL_ZONE: u8 = 0x85
+const EXT_INDEX_FIELD: u8 = 0x86
+const EXT_BANK_FIELD: u8 = 0x87
+
+// Name path prefixes.
+const NAME_ROOT: u8 = 0x5C          // '\'
+const NAME_PARENT: u8 = 0x5E        // '^'
+const NAME_DUAL: u8 = 0x2E
+const NAME_MULTI: u8 = 0x2F
+const NAME_NULL: u8 = 0x00
+
+// A table longer than this is not parsed at all. The bound exists so a length
+// field that came off the firmware cannot send the walk through memory that
+// is not the table.
+const AML_MAX_LENGTH: u32 = 0x100000
+
+var aml_base: u64 = 0
+var aml_length: u32 = 0
+var aml_pos: u32 = 0
+var aml_failed: u32 = 0
+
+// How many named objects the walk built. Not a checksum, but a number that
+// changes if the walk starts skipping things.
+var aml_names: u32 = 0
+var aml_methods: u32 = 0
+var aml_devices: u32 = 0
+
+// Sleep types, indexed by state: S0 through S5.
+var sleep_a: [u32; 6] = undefined
+var sleep_b: [u32; 6] = undefined
+var sleep_known: [u32; 6] = undefined
+
+// The name currently being declared, as its last four characters packed
+// little-endian — which is exactly how a NameSeg sits in the byte stream.
+var current_name: u32 = 0
+
+fn at(offset: u32): u8 {
+  if offset >= aml_length { return 0 }
+  return @as(*u8, @ptrFromInt(aml_base + @as(u64, offset))).*
+}
+
+fn take(): u8 {
+  let b: u8 = at(aml_pos)
+  aml_pos = aml_pos + 1
+  return b
+}
+
+fn fail() {
+  aml_failed = 1
+  // Jump to the end so every enclosing loop unwinds rather than each one
+  // needing to test the flag.
+  aml_pos = aml_length
+}
+
+// PkgLength: the top two bits of the first byte say how many more bytes
+// follow. With none, the low six bits are the whole length; otherwise the low
+// four bits are the least significant nibble and the following bytes supply
+// the rest. The length counts itself, which is what makes "skip to start +
+// length" work.
+fn pkg_length(): u32 {
+  let lead: u8 = take()
+  let extra: u32 = @as(u32, lead >> 6)
+  if extra == 0 { return @as(u32, lead & 0x3F) }
+
+  var value: u32 = @as(u32, lead & 0x0F)
+  var i: u32 = 0
+  while i < extra {
+    value = value | (@as(u32, take()) << (4 + i * 8))
+    i = i + 1
+  }
+  return value
+}
+
+// Step over a name path and return its final NameSeg. Returning only the last
+// segment is enough for what this file looks for — `_S5` is `_S5_` wherever
+// it is scoped — and it avoids carrying a path buffer through the walk.
+fn name_string(): u32 {
+  // Prefixes first: a root marker, then any number of parent markers.
+  if at(aml_pos) == NAME_ROOT { aml_pos = aml_pos + 1 }
+  while at(aml_pos) == NAME_PARENT { aml_pos = aml_pos + 1 }
+
+  let lead: u8 = at(aml_pos)
+  if lead == NAME_NULL {
+    aml_pos = aml_pos + 1
+    return 0
+  }
+
+  var segments: u32 = 1
+  if lead == NAME_DUAL {
+    aml_pos = aml_pos + 1
+    segments = 2
+  } else {
+    if lead == NAME_MULTI {
+      aml_pos = aml_pos + 1
+      segments = @as(u32, take())
+      // A multi-name with no segments is malformed, and treating it as zero
+      // would leave the stream pointing at the next opcode's first byte with
+      // nothing consumed.
+      if segments == 0 { fail() }
+    }
+  }
+
+  var last: u32 = 0
+  var i: u32 = 0
+  while i < segments {
+    last = @as(u32, take())
+      | (@as(u32, take()) << 8)
+      | (@as(u32, take()) << 16)
+      | (@as(u32, take()) << 24)
+    i = i + 1
+  }
+  return last
+}
+
+// The integer a data object denotes, having consumed it. Non-integer objects
+// consume themselves and report 0 — this reads sleep packages, whose elements
+// are small integers, and everything else only has to be stepped over.
+fn data_object(): u32 {
+  let op: u8 = take()
+  if op == OP_ZERO { return 0 }
+  if op == OP_ONE { return 1 }
+  if op == OP_ONES { return 0xFFFFFFFF }
+  if op == OP_BYTE_PREFIX { return @as(u32, take()) }
+  if op == OP_WORD_PREFIX {
+    return @as(u32, take()) | (@as(u32, take()) << 8)
+  }
+  if op == OP_DWORD_PREFIX {
+    return @as(u32, take()) | (@as(u32, take()) << 8)
+      | (@as(u32, take()) << 16) | (@as(u32, take()) << 24)
+  }
+  if op == OP_QWORD_PREFIX {
+    // Only the low half is returned: nothing this reads is wider, and a
+    // sleep type that needed 64 bits would be a malformed table.
+    let low: u32 = @as(u32, take()) | (@as(u32, take()) << 8)
+      | (@as(u32, take()) << 16) | (@as(u32, take()) << 24)
+    var i: u32 = 0
+    while i < 4 {
+      aml_pos = aml_pos + 1
+      i = i + 1
+    }
+    return low
+  }
+  if op == OP_STRING_PREFIX {
+    while aml_pos < aml_length {
+      if take() == 0 { return 0 }
+    }
+    return 0
+  }
+  if op == OP_BUFFER or op == OP_PACKAGE or op == OP_VAR_PACKAGE {
+    let start: u32 = aml_pos
+    let length: u32 = pkg_length()
+    if length == 0 { fail() }
+    aml_pos = start + length
+    return 0
+  }
+  // Anything else in a data position is a name or an expression this parser
+  // does not evaluate. It has already consumed its opcode byte; there is
+  // nothing more to skip, and reporting 0 is honest — it is not an integer.
+  return 0
+}
+
+// A sleep package: `Name (_Sx, Package () { SLP_TYPa, SLP_TYPb, ... })`.
+// Called with the stream positioned at the package opcode.
+fn sleep_package(state: u32) {
+  let op: u8 = at(aml_pos)
+  if op != OP_PACKAGE and op != OP_VAR_PACKAGE {
+    // Not a package. Consume it as an ordinary data object so the walk stays
+    // aligned, and leave the state unknown rather than recording a value
+    // that was never there.
+    let ignored: u32 = data_object()
+    return
+  }
+
+  aml_pos = aml_pos + 1
+  let start: u32 = aml_pos
+  let length: u32 = pkg_length()
+  if length == 0 {
+    fail()
+    return
+  }
+  let end: u32 = start + length
+  let count: u32 = @as(u32, take())
+
+  if count >= 1 {
+    sleep_a[state] = data_object()
+    if count >= 2 {
+      sleep_b[state] = data_object()
+    }
+    sleep_known[state] = 1
+  }
+
+  // However many elements were read, the package ends where its length says.
+  aml_pos = end
+}
+
+// '_' 'S' <digit> '_' packed the way a NameSeg sits in the stream.
+fn sleep_state_of(name: u32): u32 {
+  if (name & 0xFF) != 95 { return 0xFFFFFFFF }          // '_'
+  if ((name >> 8) & 0xFF) != 83 { return 0xFFFFFFFF }   // 'S'
+  if ((name >> 24) & 0xFF) != 95 { return 0xFFFFFFFF }  // '_'
+  let digit: u32 = (name >> 16) & 0xFF
+  if digit < 48 or digit > 53 { return 0xFFFFFFFF }     // '0'..'5'
+  return digit - 48
+}
+
+// One declaration. Returns after consuming exactly it.
+fn term(): u32 {
+  if aml_pos >= aml_length { return 0 }
+  let op: u8 = take()
+
+  if op == OP_NAME {
+    aml_names = aml_names + 1
+    let name: u32 = name_string()
+    let state: u32 = sleep_state_of(name)
+    if state != 0xFFFFFFFF {
+      sleep_package(state)
+    } else {
+      let ignored: u32 = data_object()
+    }
+    return 1
+  }
+
+  if op == OP_SCOPE {
+    // A scope's body is more declarations, so it is walked rather than
+    // skipped — the sleep packages live inside the root scope.
+    let start: u32 = aml_pos
+    let length: u32 = pkg_length()
+    if length == 0 {
+      fail()
+      return 0
+    }
+    let end: u32 = start + length
+    let discarded: u32 = name_string()
+    term_list(end)
+    aml_pos = end
+    return 1
+  }
+
+  if op == OP_METHOD {
+    aml_methods = aml_methods + 1
+    let start: u32 = aml_pos
+    let length: u32 = pkg_length()
+    if length == 0 {
+      fail()
+      return 0
+    }
+    // The body is executable AML, which this parser does not interpret.
+    aml_pos = start + length
+    return 1
+  }
+
+  if op == OP_ALIAS {
+    let a: u32 = name_string()
+    let b: u32 = name_string()
+    aml_names = aml_names + 1
+    return 1
+  }
+
+  if op == OP_EXTERNAL {
+    let name: u32 = name_string()
+    aml_pos = aml_pos + 2    // object type, argument count
+    return 1
+  }
+
+  if op == OP_EXT_PREFIX {
+    return ext_term()
+  }
+
+  // Anything else at this level is not a declaration. The stream is no
+  // longer where this parser thinks it is, and guessing would produce a
+  // namespace built out of misread bytes.
+  fail()
+  return 0
+}
+
+fn ext_term(): u32 {
+  let op: u8 = take()
+
+  // Length-prefixed, with a body of further declarations.
+  if op == EXT_DEVICE or op == EXT_THERMAL_ZONE {
+    aml_devices = aml_devices + 1
+    let start: u32 = aml_pos
+    let length: u32 = pkg_length()
+    if length == 0 {
+      fail()
+      return 0
+    }
+    let end: u32 = start + length
+    let name: u32 = name_string()
+    term_list(end)
+    aml_pos = end
+    return 1
+  }
+
+  if op == EXT_PROCESSOR or op == EXT_POWER_RES {
+    let start: u32 = aml_pos
+    let length: u32 = pkg_length()
+    if length == 0 {
+      fail()
+      return 0
+    }
+    let end: u32 = start + length
+    let name: u32 = name_string()
+    // Both carry fixed fields before their body: a processor has an ID, a
+    // block address and a block length; a power resource a system level and
+    // a resource order. Their bodies are declarations, but nothing this
+    // reads lives in one, so the whole thing is stepped over.
+    aml_pos = end
+    return 1
+  }
+
+  // Length-prefixed, with a body this parser has no use for.
+  if op == EXT_FIELD or op == EXT_INDEX_FIELD or op == EXT_BANK_FIELD {
+    let start: u32 = aml_pos
+    let length: u32 = pkg_length()
+    if length == 0 {
+      fail()
+      return 0
+    }
+    aml_pos = start + length
+    return 1
+  }
+
+  // Not length-prefixed: each is a name followed by a fixed shape.
+  if op == EXT_OP_REGION {
+    let name: u32 = name_string()
+    aml_pos = aml_pos + 1              // region space
+    let offset: u32 = data_object()    // region offset
+    let size: u32 = data_object()      // region length
+    aml_names = aml_names + 1
+    return 1
+  }
+
+  if op == EXT_MUTEX {
+    let name: u32 = name_string()
+    aml_pos = aml_pos + 1              // sync flags
+    aml_names = aml_names + 1
+    return 1
+  }
+
+  if op == EXT_EVENT {
+    let name: u32 = name_string()
+    aml_names = aml_names + 1
+    return 1
+  }
+
+  fail()
+  return 0
+}
+
+fn term_list(end: u32) {
+  while aml_pos < end {
+    if aml_failed == 1 { return }
+    if term() == 0 { return }
+  }
+}
+
+// Parse a table's AML body. `base` is the table, `length` its whole length
+// including the 36-byte header. Returns 1 when the walk consumed exactly the
+// table and nothing was malformed.
+export fn aml_parse(base: u64, length: u32): u32 {
+  if base == 0 { return 0 }
+  if length <= 36 or length > AML_MAX_LENGTH { return 0 }
+
+  aml_base = base
+  aml_length = length
+  aml_pos = 36
+  aml_failed = 0
+
+  term_list(length)
+
+  if aml_failed == 1 { return 0 }
+  // Exactly the table, to the byte. Every construct here is length-prefixed,
+  // so a parser that misread one opcode desynchronises and lands somewhere
+  // else — which is why this is the check rather than "it did not crash".
+  if aml_pos != length { return 0 }
+  return 1
+}
+
+export fn aml_reset() {
+  aml_names = 0
+  aml_methods = 0
+  aml_devices = 0
+  var i: u32 = 0
+  while i < 6 {
+    sleep_a[i] = 0
+    sleep_b[i] = 0
+    sleep_known[i] = 0
+    i = i + 1
+  }
+}
+
+export fn aml_name_count(): u32 { return aml_names }
+export fn aml_method_count(): u32 { return aml_methods }
+export fn aml_device_count(): u32 { return aml_devices }
+
+// The SLP_TYP values for a sleep state, or 0 with aml_sleep_known() == 0.
+export fn aml_sleep_known(state: u32): u32 {
+  if state >= 6 { return 0 }
+  return sleep_known[state]
+}
+
+export fn aml_sleep_typ_a(state: u32): u32 {
+  if state >= 6 { return 0 }
+  return sleep_a[state]
+}
+
+export fn aml_sleep_typ_b(state: u32): u32 {
+  if state >= 6 { return 0 }
+  return sleep_b[state]
+}

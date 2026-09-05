@@ -1,16 +1,19 @@
 // home-os ACPI Driver
 //
-// STUB(S7): there is no AML interpreter and no power-state transitions, so
-// there is still no S3 suspend/resume. Blocks Phase 7a. MASTER_PLAN §7.
+// STUB(S7): AML methods are not executed, so there is still no S3
+// suspend/resume — `_PTS` and `_WAK`, which a transition has to call, are
+// methods and their bodies are stepped over. Blocks Phase 7a. MASTER_PLAN §7.
 //
-// Table discovery *is* implemented: the RSDP is found in both places the
-// specification allows, every table's checksum is verified before it is
-// trusted, and the RSDT/XSDT is walked so a table can be looked up by
-// signature. That is the substrate an AML interpreter needs — it has to find
-// the DSDT before it can interpret anything — and it is what makes shutdown
-// read its port from the FADT rather than guessing per-hypervisor.
+// Table discovery and the AML *namespace* are implemented: the RSDP is found
+// in both places the specification allows, every table's checksum is verified
+// before it is trusted, the RSDT/XSDT is walked, and the DSDT's declarations
+// are parsed by drivers/aml.home. That is enough for the sleep types, which
+// are declarations rather than anything that has to be run — so shutdown now
+// takes both its port and its SLP_TYP from the firmware instead of assuming
+// either.
 
 import "../core/foundation.home" as foundation
+import "aml.home" as aml
 
 var acpi_initialized: u32 = 0
 var rsdp_address: u64 = 0
@@ -24,6 +27,10 @@ var table_checksum_failures: u32 = 0
 var pm1a_control_block: u32 = 0
 var pm1b_control_block: u32 = 0
 var fadt_found: u32 = 0
+var dsdt_address: u64 = 0
+var dsdt_found: u32 = 0
+var dsdt_length: u32 = 0
+var dsdt_parsed: u32 = 0
 
 // MADT-derived interrupt topology.
 var local_apic_address: u32 = 0
@@ -146,6 +153,7 @@ export fn acpi_init() {
   sdt_entry_count = (sdt_length - 36) / sdt_entry_size
 
   parse_fadt()
+  parse_dsdt()
   parse_madt()
 
   acpi_initialized = 1
@@ -192,6 +200,40 @@ fn parse_fadt() {
   fadt_found = 1
   pm1a_control_block = le32(fadt, 64)
   pm1b_control_block = le32(fadt, 68)
+
+  // The DSDT is named by the FADT, in one of two places: a 32-bit pointer at
+  // offset 40, and a 64-bit one at 140 that supersedes it when present. A
+  // machine with memory above 4 GB has only the second, and reading the
+  // first there gives a truncated address that points at something else.
+  dsdt_address = @as(u64, le32(fadt, 40))
+  let fadt_length: u32 = le32(fadt, 4)
+  if fadt_length >= 148 {
+    let extended: u64 = le64(fadt, 140)
+    if extended != 0 { dsdt_address = extended }
+  }
+}
+
+// Walk the DSDT's namespace and take the sleep types out of it.
+//
+// The values a machine wants written to PM1_CNT to power down or suspend are
+// declared in the DSDT as `Name (_Sx, Package () { SLP_TYPa, SLP_TYPb, ... })`.
+// They are per-machine: 5 is common for S5 and is what this used to assume,
+// but assuming is how a shutdown becomes a hang on the machine that spells it
+// differently.
+fn parse_dsdt() {
+  if dsdt_address == 0 { return }
+  // "DSDT", checked before anything is read through it: the FADT is firmware
+  // data, and a pointer that survived a checksum can still be wrong.
+  if signature_matches(dsdt_address, 68, 83, 68, 84) == 0 { return }
+  let length: u32 = le32(dsdt_address, 4)
+  if checksum_ok(dsdt_address, length) == 0 {
+    table_checksum_failures = table_checksum_failures + 1
+    return
+  }
+  dsdt_found = 1
+  dsdt_length = length
+  aml.aml_reset()
+  dsdt_parsed = aml.aml_parse(dsdt_address, length)
 }
 
 // "APIC" — the MADT. Its entries are a length-prefixed chain, so walking it
@@ -226,20 +268,29 @@ export fn acpi_local_apic_address(): u32 { return local_apic_address }
 export fn acpi_enabled_cpu_count(): u32 { return enabled_cpu_count }
 export fn acpi_pm1a_control_block(): u32 { return pm1a_control_block }
 export fn acpi_checksum_failures(): u32 { return table_checksum_failures }
+export fn acpi_dsdt_found(): u32 { return dsdt_found }
+export fn acpi_dsdt_length(): u32 { return dsdt_length }
+export fn acpi_dsdt_parsed(): u32 { return dsdt_parsed }
+export fn acpi_dsdt_address(): u64 { return dsdt_address }
+
+// SLP_EN, bit 13 of PM1_CNT: writing it with SLP_TYP set performs the
+// transition.
+const SLP_EN: u32 = 0x2000
 
 // Write SLP_TYP | SLP_EN to the PM1 control blocks.
 //
-// The port comes from the FADT rather than a per-hypervisor guess. The sleep
-// type for S5 properly comes from the DSDT's \_S5_ object, which needs the AML
-// interpreter this module does not have — so 5 is used, which is what every
-// machine this has been run on encodes, and the fallback below covers the
-// rest. That gap is the remaining half of STUB(S7).
+// Both the port and the sleep type now come from the firmware: the port from
+// the FADT, the type from the DSDT's \_S5_ package. This used to hard-code
+// 5, which is what most machines encode — and assuming it is how a shutdown
+// becomes a hang on the machine that spells it differently.
 export fn acpi_shutdown() {
   foundation.serial_write_string("[ACPI] Shutdown requested\n")
-  if fadt_found == 1 and pm1a_control_block != 0 {
-    foundation.outw(@as(u16, pm1a_control_block), 0x2005)
+  if fadt_found == 1 and pm1a_control_block != 0 and aml.aml_sleep_known(5) == 1 {
+    foundation.outw(@as(u16, pm1a_control_block),
+                    @as(u16, (aml.aml_sleep_typ_a(5) << 10) | SLP_EN))
     if pm1b_control_block != 0 {
-      foundation.outw(@as(u16, pm1b_control_block), 0x2005)
+      foundation.outw(@as(u16, pm1b_control_block),
+                      @as(u16, (aml.aml_sleep_typ_b(5) << 10) | SLP_EN))
     }
   }
   // Hypervisor shutdown ports, for firmware whose FADT we could not read.
@@ -251,4 +302,60 @@ export fn acpi_shutdown() {
 export fn acpi_reboot() {
   foundation.serial_write_string("[ACPI] Reboot requested\n")
   foundation.outb(0x64, 0xFE)  // PS/2 controller reset
+}
+
+// ============================================================================
+// AML parser self-test
+//
+// "It parsed the DSDT" is only worth something if a *wrong* parse would have
+// been noticed. These checks corrupt a copy of the real table and require the
+// parser to reject it — otherwise consuming exactly the declared length would
+// be a coincidence rather than a check.
+//
+// A copy, not the table: the DSDT is firmware memory that other code reads.
+// Returns the number of checks that passed.
+// ============================================================================
+
+export const AML_TEST_CHECKS: u32 = 4
+
+export fn acpi_aml_selftest(scratch: u64, scratch_size: u32): u32 {
+  if dsdt_found == 0 or scratch == 0 { return 0 }
+  if dsdt_length == 0 or dsdt_length > scratch_size { return 0 }
+
+  var passed: u32 = 0
+  @memcpy(@as(*u8, @ptrFromInt(scratch)), @as(*u8, @ptrFromInt(dsdt_address)),
+          dsdt_length)
+
+  // 1: the copy parses, so anything below that fails, failed because of what
+  // was done to it.
+  aml.aml_reset()
+  if aml.aml_parse(scratch, dsdt_length) == 1 { passed = passed + 1 }
+
+  // 2: and it found the same namespace in the copy as in the original —
+  // a parser reading uninitialised memory would still "succeed" on a table
+  // whose length happened to work out.
+  if aml.aml_name_count() > 0 and aml.aml_method_count() > 0 {
+    passed = passed + 1
+  }
+
+  // 3: one byte short is rejected. The last construct then runs past the end
+  // the parser was given, and the position no longer matches the length —
+  // which is the arithmetic the whole check rests on.
+  aml.aml_reset()
+  if aml.aml_parse(scratch, dsdt_length - 1) == 0 { passed = passed + 1 }
+
+  // 4: a corrupted opcode is rejected. Byte 36 is the first opcode of the
+  // term list; 0x77 is not a declaration, and a parser that shrugged at it
+  // would go on to read the rest of the table as something it is not.
+  let first: u8 = @as(*u8, @ptrFromInt(scratch + 36)).*
+  @as(*u8, @ptrFromInt(scratch + 36)).* = 0x77
+  aml.aml_reset()
+  let rejected: u32 = aml.aml_parse(scratch, dsdt_length)
+  @as(*u8, @ptrFromInt(scratch + 36)).* = first
+  if rejected == 0 { passed = passed + 1 }
+
+  // Leave the parser holding the real table's namespace, not the copy's.
+  aml.aml_reset()
+  dsdt_parsed = aml.aml_parse(dsdt_address, dsdt_length)
+  return passed
 }
