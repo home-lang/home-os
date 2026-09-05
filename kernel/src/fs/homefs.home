@@ -1,14 +1,13 @@
 // home-os Native Filesystem (homefs) — on-disk structures
 //
-// STUB(S4): free space is never reclaimed — the allocator is a bump pointer
-// and copy-on-write spends blocks without giving any back — and nothing
-// mounts this through the VFS. MASTER_PLAN §7.
+// STUB(S4): nothing mounts this through the VFS, so no path in the rest of
+// the kernel resolves onto a homefs volume. MASTER_PLAN §7.
 //
 // Steps 1–4 and 6 of the plan in docs/design/homefs.md §9 are implemented:
 // the on-disk structures and their checksummed encode/decode, a block
 // device, copy-on-write B-trees, the commit protocol, snapshots with
-// rollback, the object layer — files, directories and extent trees — and
-// `fsck`. The
+// rollback, the object layer — files, directories and extent trees —
+// `fsck`, and free-space reclamation. The
 // layers are stacked in that order deliberately: getting the byte layout and
 // the integrity check right first meant the tree code was never debugging
 // two things at once, and the same for every layer since.
@@ -423,19 +422,96 @@ export fn homefs_device_init(base: u64, blocks: u32) {
   device_base = base
   device_blocks = blocks
   device_next_free = 1
+  alloc_cursor = 1
+  @memset(&block_used, 0)
+  @memset(&block_dirty, 0)
 }
 
 fn block_addr(block: u32): u64 {
   return device_base + @as(u64, block) * @as(u64, HOMEFS_BLOCK_SIZE)
 }
 
-// Copy-on-write never rewrites a block, so allocation is a bump pointer until
-// the refcount walk of §6 exists to reclaim. Returns 0 when the device is
-// full, which callers must treat as failure rather than as block 0.
+// Allocation state. `block_used` is the live set — every block some tree
+// reaches — and `block_dirty` is what this transaction has touched and the
+// next commit therefore has to write.
+//
+// The dirty set exists because reclamation makes the allocator go backwards.
+// Commit used to write the contiguous range [committed_blocks, next_free),
+// which was correct only while allocation was a bump pointer that never
+// revisited a block. Reusing a reclaimed block below that watermark would
+// have left the new contents in memory and the old ones on disk — a volume
+// that mounts, verifies, and is wrong.
+//
+// Both are bitmaps over the same 65536-block (256 MiB) ceiling fsck has.
+const ALLOC_MAX_BLOCKS: u32 = 65536
+var block_used: [u8; 8192] = undefined
+var block_dirty: [u8; 8192] = undefined
+// Where the next linear search for a free block starts, so allocation does
+// not rescan the whole volume from 1 every time.
+var alloc_cursor: u32 = 1
+
+fn bit_get(map: u64, block: u32): u32 {
+  let byte: u8 = @as(*u8, @ptrFromInt(map + @as(u64, block / 8))).*
+  if (byte & @as(u8, 1 << (block % 8))) != 0 { return 1 }
+  return 0
+}
+
+fn bit_set(map: u64, block: u32) {
+  let addr: u64 = map + @as(u64, block / 8)
+  @as(*u8, @ptrFromInt(addr)).* = @as(*u8, @ptrFromInt(addr)).* | @as(u8, 1 << (block % 8))
+}
+
+fn bit_clear(map: u64, block: u32) {
+  let addr: u64 = map + @as(u64, block / 8)
+  @as(*u8, @ptrFromInt(addr)).* = @as(*u8, @ptrFromInt(addr)).* & ~@as(u8, 1 << (block % 8))
+}
+
+fn used_map(): u64 { return @intFromPtr(&block_used) }
+fn dirty_map(): u64 { return @intFromPtr(&block_dirty) }
+
+export fn homefs_block_is_used(block: u32): u32 { return bit_get(used_map(), block) }
+
+// Take a block. Reclaimed blocks below the watermark are reused before the
+// watermark moves, so a volume that deletes and rewrites does not grow
+// without bound. Returns 0 when the device is full — callers must treat that
+// as failure rather than as block 0.
 export fn homefs_alloc_block(): u32 {
-  if device_next_free >= device_blocks { return 0 }
-  let block: u32 = device_next_free
-  device_next_free = device_next_free + 1
+  var block: u32 = 0
+
+  // Reuse first, scanning only what has actually been handed out: the blocks
+  // [1, device_next_free). Bounding the scan by the watermark rather than by
+  // the device means an empty volume does not walk a large disk to discover
+  // that everything past the watermark is untouched — and, more importantly,
+  // that a volume whose watermark is still 1 has nothing to reuse. Scanning
+  // block 1 itself in that state reported it free and handed it out without
+  // moving the watermark, so the next allocation returned it a second time.
+  if device_next_free > 1 {
+    let span: u32 = device_next_free - 1
+    var candidate: u32 = alloc_cursor
+    if candidate < 1 or candidate >= device_next_free { candidate = 1 }
+    var scanned: u32 = 0
+    while scanned < span {
+      if bit_get(used_map(), candidate) == 0 {
+        block = candidate
+        alloc_cursor = candidate + 1
+        scanned = span
+      } else {
+        candidate = candidate + 1
+        if candidate >= device_next_free { candidate = 1 }
+        scanned = scanned + 1
+      }
+    }
+  }
+
+  if block == 0 {
+    if device_next_free >= device_blocks { return 0 }
+    if device_next_free >= ALLOC_MAX_BLOCKS { return 0 }
+    block = device_next_free
+    device_next_free = device_next_free + 1
+  }
+
+  bit_set(used_map(), block)
+  bit_set(dirty_map(), block)
   zero_range(block_addr(block), 0, HOMEFS_BLOCK_SIZE)
   return block
 }
@@ -881,12 +957,17 @@ export fn homefs_commit(): u32 {
     // formatting: fall through, the drive was set by homefs_format
   }
 
-  var block: u32 = committed_blocks
-  if block == 0 { block = 1 }
+  // Every block this transaction touched, not a contiguous range: see the
+  // allocator's note. A reclaimed block reused below the old watermark is
+  // dirty and gets written; a block nothing touched is skipped, which is also
+  // why a commit after a no-op transaction costs nothing.
+  var block: u32 = 1
   while block < device_next_free {
-    if disk_write_block(volume_drive, DATA_START_LBA + @as(u64, block) * @as(u64, SECTORS_PER_BLOCK),
-                        block_addr(block)) != 0 {
-      return 0
+    if bit_get(dirty_map(), block) == 1 {
+      if disk_write_block(volume_drive, DATA_START_LBA + @as(u64, block) * @as(u64, SECTORS_PER_BLOCK),
+                          block_addr(block)) != 0 {
+        return 0
+      }
     }
     block = block + 1
   }
@@ -922,6 +1003,10 @@ export fn homefs_commit(): u32 {
   if disk_write_block(volume_drive, target, sb_scratch_addr()) != 0 { return 0 }
 
   committed_blocks = device_next_free
+  // Clean only after the superblock landed. A commit that failed partway
+  // leaves everything dirty, so the retry writes it all again rather than
+  // assuming the first attempt got there.
+  @memset(&block_dirty, 0)
   return 1
 }
 
@@ -1005,6 +1090,13 @@ export fn homefs_mount(drive: u32, base: u64, blocks: u32): u32 {
   // Object ids are counted past what the table already holds, and the table
   // is only readable now that the root is loaded.
   refresh_id_watermarks()
+  // Nothing on disk records which blocks are free, so the live set is
+  // recomputed from the trees. Without this the maps are still zero from
+  // device_init and the allocator would hand out blocks the volume is
+  // built from.
+  rebuild_used_map()
+  // Everything just read is what is on disk, so nothing is dirty yet.
+  @memset(&block_dirty, 0)
   return 1
 }
 
@@ -1720,7 +1812,7 @@ fn create_root_directory(): u32 {
 // Returns a count of the checks that passed; the caller asserts the total.
 // ============================================================================
 
-const OBJ_TEST_CHECKS: u32 = 12
+const OBJ_TEST_CHECKS: u32 = 15
 
 // Deliberately larger than one block, so the write crosses an extent
 // boundary and the read has to reassemble it. A test that fits in a single
@@ -1849,6 +1941,62 @@ export fn homefs_object_selftest(base: u64, blocks: u32): u32 {
   // 12: and says so again once it is put back, so check 11 was detection and
   // not a checker that had simply started failing.
   if homefs_fsck() == FSCK_OK { passed = passed + 1 }
+
+  // 13: reclamation gives back the copy-on-write garbage every insert above
+  // left behind, and the live count drops by exactly what it reported.
+  let live_before: u32 = homefs_blocks_live()
+  let freed: u32 = homefs_reclaim()
+  if freed > 0 and homefs_blocks_live() == live_before - freed {
+    passed = passed + 1
+  }
+
+  // 14: and freed nothing the file still needs. A sweep that is too eager
+  // passes check 13 by freeing more.
+  var intact: u32 = 1
+  if homefs_file_read(file, 0, @intFromPtr(&obj_test_read), OBJ_TEST_BYTES) !=
+     OBJ_TEST_BYTES {
+    intact = 0
+  }
+  var k: u32 = 0
+  while k < OBJ_TEST_BYTES {
+    if obj_test_read[k] != @as(u8, (k * 7 + 13) & 0xFF) { intact = 0 }
+    k = k + 1
+  }
+  if intact == 1 { passed = passed + 1 }
+
+  // 15: a snapshot's copy of the file survives being overwritten in the
+  // active tree and then swept. This is the check that fails if fsck walks a
+  // snapshot's root but not the object table hanging off it: the snapshot's
+  // records and extents would look unreferenced and go back to the allocator,
+  // and the rollback below would read whatever was written over them.
+  let snap: u64 = homefs_snapshot_create()
+  var m: u32 = 0
+  while m < OBJ_TEST_BYTES {
+    obj_test_write[m] = @as(u8, (m * 11 + 29) & 0xFF)
+    m = m + 1
+  }
+  var survived: u32 = 0
+  if snap != 0 and
+     homefs_file_write(file, 0, @intFromPtr(&obj_test_write), OBJ_TEST_BYTES) ==
+       OBJ_TEST_BYTES {
+    current_generation = current_generation + 1
+    current_txid = current_txid + 1
+    if homefs_commit() == 1 {
+      let swept: u32 = homefs_reclaim()
+      if swept >= 0 and homefs_snapshot_rollback(snap) == 1 {
+        if homefs_file_read(file, 0, @intFromPtr(&obj_test_read), OBJ_TEST_BYTES) ==
+           OBJ_TEST_BYTES {
+          survived = 1
+          var q: u32 = 0
+          while q < OBJ_TEST_BYTES {
+            if obj_test_read[q] != @as(u8, (q * 7 + 13) & 0xFF) { survived = 0 }
+            q = q + 1
+          }
+        }
+      }
+    }
+  }
+  if survived == 1 { passed = passed + 1 }
 
   return passed
 }
@@ -2091,6 +2239,13 @@ export fn homefs_fsck(): u32 {
   // blocks with the active one; the visited bitmap is deliberately not
   // cleared between them, so a shared block is counted once and a cycle
   // within a single tree is still caught (each walk marks as it descends).
+  // The snapshot table is a plain block, not a tree, so nothing above would
+  // have reached it. Unmarked it would look unreferenced, and reclamation
+  // would hand the volume's whole rollback history back to the allocator.
+  if block_valid(snapshot_table_block) == 1 {
+    fsck_mark(snapshot_table_block)
+  }
+
   let snapshots: u32 = homefs_snapshot_count()
   var i: u32 = 0
   while i < snapshots {
@@ -2102,14 +2257,98 @@ export fn homefs_fsck(): u32 {
     // A snapshot's root already visited by the active walk is the same tree,
     // not a cycle: sharing is what a snapshot *is*. Only descend into one
     // that has not been seen.
-    let byte: u32 = root / 8
-    let bit: u8 = @as(u8, 1 << (root % 8))
-    if (fsck_seen[byte] & bit) == 0 {
+    if bit_get(@intFromPtr(&fsck_seen), root) == 0 {
       fsck_tree(root, 0, 0)
+      if fsck_status != FSCK_OK { return fsck_status }
+    }
+    // A snapshot has its own object table, and its objects are live even
+    // when the active tree has since deleted them — that is the whole point
+    // of pinning one. Walking only the snapshot's root tree would leave its
+    // records and file extents unmarked, and reclamation would free the
+    // files the snapshot exists to preserve.
+    let table: u32 = @as(u32, homefs_btree_lookup(root, OBJTABLE_KEY))
+    if table != 0 and bit_get(@intFromPtr(&fsck_seen), table) == 0 {
+      fsck_tree(table, 0, 1)
       if fsck_status != FSCK_OK { return fsck_status }
     }
     i = i + 1
   }
 
   return FSCK_OK
+}
+
+// ============================================================================
+// Free-space reclamation (design doc §6)
+//
+// The design document specifies a refcount tree updated at commit boundaries.
+// This is mark-and-sweep against the same reachability walk fsck already
+// performs, and the deviation is deliberate: an incremental refcount that
+// drifts low frees a live block, which is silent corruption discovered much
+// later, while a walk that is wrong is wrong in the direction of leaking.
+// The walk is also self-healing, which §6 asks the refcount tree to be
+// ("rebuilt by inverting the refcount tree if corrupted") — here there is
+// nothing to invert, because free space is never stored, only derived.
+//
+// The cost is a full walk rather than an O(1) update. At the 256 MiB ceiling
+// the bitmap already imposes, that is bounded; past it, refcounts become
+// worth the risk and this is the thing to replace.
+// ============================================================================
+
+// Recompute the live set from what the trees actually reach.
+fn rebuild_used_map() {
+  @memset(&block_used, 0)
+  alloc_cursor = 1
+  if homefs_fsck() == FSCK_OK {
+    copy_bytes(used_map(), @intFromPtr(&fsck_seen), 8192)
+    // Block 0 holds the superblocks and is not the allocator's to give.
+    bit_set(used_map(), 0)
+    return
+  }
+  // The walk could not establish what is live, so nothing is treated as
+  // free. The volume then only grows — a leak, which is recoverable — rather
+  // than handing out a block something still points at.
+  var b: u32 = 0
+  while b < device_next_free {
+    bit_set(used_map(), b)
+    b = b + 1
+  }
+}
+
+// Give back every block no tree reaches. Returns how many.
+//
+// Only safe between operations: a tree part-way through being built holds its
+// new blocks in local variables that no root reaches yet, and a sweep run
+// then would free them out from under the caller. Every call site here is
+// after a commit.
+export fn homefs_reclaim(): u32 {
+  if volume_mounted == 0 { return 0 }
+  if homefs_fsck() != FSCK_OK { return 0 }
+
+  var freed: u32 = 0
+  var block: u32 = 1
+  while block < device_next_free {
+    if bit_get(used_map(), block) == 1 and
+       bit_get(@intFromPtr(&fsck_seen), block) == 0 {
+      bit_clear(used_map(), block)
+      freed = freed + 1
+    }
+    block = block + 1
+  }
+  // Reuse starts from the bottom again, so the freed blocks are the next
+  // ones handed out rather than the watermark continuing to climb.
+  if freed > 0 { alloc_cursor = 1 }
+  return freed
+}
+
+// How many blocks below the watermark are live. Distinct from
+// homefs_blocks_used(), which is the watermark itself — the difference
+// between them is what reclamation has given back.
+export fn homefs_blocks_live(): u32 {
+  var live: u32 = 0
+  var block: u32 = 1
+  while block < device_next_free {
+    if bit_get(used_map(), block) == 1 { live = live + 1 }
+    block = block + 1
+  }
+  return live
 }
