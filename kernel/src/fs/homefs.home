@@ -1,13 +1,14 @@
 // home-os Native Filesystem (homefs) — on-disk structures
 //
 // STUB(S4): free space is never reclaimed — the allocator is a bump pointer
-// and copy-on-write spends blocks without giving any back — there is no
-// `fsck`, and nothing mounts this through the VFS. MASTER_PLAN §7.
+// and copy-on-write spends blocks without giving any back — and nothing
+// mounts this through the VFS. MASTER_PLAN §7.
 //
 // Steps 1–4 and 6 of the plan in docs/design/homefs.md §9 are implemented:
 // the on-disk structures and their checksummed encode/decode, a block
 // device, copy-on-write B-trees, the commit protocol, snapshots with
-// rollback, and the object layer — files, directories and extent trees. The
+// rollback, the object layer — files, directories and extent trees — and
+// `fsck`. The
 // layers are stacked in that order deliberately: getting the byte layout and
 // the integrity check right first meant the tree code was never debugging
 // two things at once, and the same for every layer since.
@@ -105,12 +106,18 @@ fn get64(base: u64, offset: u32): u64 {
   return @as(u64, get32(base, offset)) | (@as(u64, get32(base, offset + 4)) << 32)
 }
 
+// Every block the allocator hands out is zeroed, and every copy-on-write
+// step copies a whole 4 KiB block, so these two are the filesystem's hottest
+// loops by a wide margin. Written as byte loops they were four function calls
+// per byte, which was enough to push the boot gate past its deadline.
 fn zero_range(base: u64, from: u32, to: u32) {
-  var i: u32 = from
-  while i < to {
-    put8(base, i, 0)
-    i = i + 1
-  }
+  if to <= from { return }
+  @memset(@as(*u8, @ptrFromInt(base + @as(u64, from))), 0, to - from)
+}
+
+fn copy_bytes(dest: u64, source: u64, length: u32) {
+  if length == 0 { return }
+  @memcpy(@as(*u8, @ptrFromInt(dest)), @as(*u8, @ptrFromInt(source)), length)
 }
 
 // ============================================================================
@@ -556,11 +563,7 @@ var split_block: u32 = 0
 fn copy_node(source: u32): u32 {
   let fresh: u32 = homefs_alloc_block()
   if fresh == 0 { return 0 }
-  var i: u32 = 0
-  while i < HOMEFS_BLOCK_SIZE {
-    put8(block_addr(fresh), i, get8(block_addr(source), i))
-    i = i + 1
-  }
+  copy_bytes(block_addr(fresh), block_addr(source), HOMEFS_BLOCK_SIZE)
   return fresh
 }
 
@@ -1242,11 +1245,7 @@ fn obj_name_matches(block: u32, name_ptr: u64, name_len: u32): u32 {
 fn obj_record_clone(source: u32): u32 {
   let fresh: u32 = homefs_alloc_block()
   if fresh == 0 { return 0 }
-  var i: u32 = 0
-  while i < HOMEFS_BLOCK_SIZE {
-    put8(block_addr(fresh), i, get8(block_addr(source), i))
-    i = i + 1
-  }
+  copy_bytes(block_addr(fresh), block_addr(source), HOMEFS_BLOCK_SIZE)
   return fresh
 }
 
@@ -1624,11 +1623,7 @@ export fn homefs_file_write(id: u64, offset: u64, src: u64, len: u32): u32 {
     if existing != 0 {
       let old_block: u32 = extent_physical(existing)
       if block_valid(old_block) == 1 {
-        var i: u32 = 0
-        while i < HOMEFS_BLOCK_SIZE {
-          put8(block_addr(fresh), i, get8(block_addr(old_block), i))
-          i = i + 1
-        }
+        copy_bytes(block_addr(fresh), block_addr(old_block), HOMEFS_BLOCK_SIZE)
       }
     }
 
@@ -1725,7 +1720,7 @@ fn create_root_directory(): u32 {
 // Returns a count of the checks that passed; the caller asserts the total.
 // ============================================================================
 
-const OBJ_TEST_CHECKS: u32 = 9
+const OBJ_TEST_CHECKS: u32 = 12
 
 // Deliberately larger than one block, so the write crosses an extent
 // boundary and the read has to reassemble it. A test that fits in a single
@@ -1825,5 +1820,296 @@ export fn homefs_object_selftest(base: u64, blocks: u32): u32 {
   }
   if same == 1 { passed = passed + 1 }
 
+  // 10: fsck agrees the volume is clean, and counts the three objects that
+  // were created — root, the directory, and the file. A checker that always
+  // says OK would pass check 10 and fail check 11.
+  if homefs_fsck() == FSCK_OK and homefs_fsck_objects() == 3 {
+    passed = passed + 1
+  }
+
+  // 11: and catches a volume that is not. Two keys in the object table are
+  // swapped so they no longer ascend — the shape a tree bug produces, which
+  // parses perfectly and answers lookups wrongly. Nothing else about the
+  // volume is touched.
+  let table: u32 = objtable_root()
+  var detected: u32 = 0
+  if node_count(table) >= 2 {
+    let key0: u64 = entry_key(table, 0)
+    let val0: u64 = entry_value(table, 0)
+    let key1: u64 = entry_key(table, 1)
+    let val1: u64 = entry_value(table, 1)
+    set_entry(table, 0, key1, val1)
+    set_entry(table, 1, key0, val0)
+    if homefs_fsck() == FSCK_UNSORTED { detected = 1 }
+    set_entry(table, 0, key0, val0)
+    set_entry(table, 1, key1, val1)
+  }
+  if detected == 1 { passed = passed + 1 }
+
+  // 12: and says so again once it is put back, so check 11 was detection and
+  // not a checker that had simply started failing.
+  if homefs_fsck() == FSCK_OK { passed = passed + 1 }
+
   return passed
+}
+
+// ============================================================================
+// fsck (design doc §5)
+//
+// "verifies reachability from all pinned snapshot roots + active root; runs
+// online (read-only against a frozen view)."
+//
+// Read-only is meant literally: nothing here allocates, writes a block, or
+// advances a transaction, so it is safe to run against a mounted volume. What
+// it produces is a verdict and three counts.
+//
+// The checks are the ones that catch a *silently* wrong volume, not just an
+// unreadable one. A torn write that lands on a checksum boundary, or a bug in
+// the tree code, does not usually produce a block that fails to parse — it
+// produces one that parses into the wrong shape: keys out of order, a child
+// pointer outside the volume, a directory entry whose name does not hash to
+// the key it was filed under. Each of those is checked by name below, so a
+// failure says which invariant broke rather than only that something did.
+// ============================================================================
+
+export const FSCK_OK: u32 = 0
+export const FSCK_NOT_MOUNTED: u32 = 1
+export const FSCK_BAD_NODE: u32 = 2          // missing or wrong node magic
+export const FSCK_BAD_CHILD: u32 = 3         // child pointer outside the volume
+export const FSCK_UNSORTED: u32 = 4          // keys not ascending within a node
+export const FSCK_TOO_DEEP: u32 = 5          // deeper than a tree can legally be
+export const FSCK_BAD_OBJECT: u32 = 6        // object record magic wrong
+export const FSCK_BAD_EXTENT: u32 = 7        // extent points outside the volume
+export const FSCK_BAD_DIRENT: u32 = 8        // name does not hash to its key
+export const FSCK_CYCLE: u32 = 9             // a block reachable twice in one tree
+
+// The visited bitmap is fixed, so fsck has a volume-size ceiling it must not
+// exceed silently: 65536 blocks is a 256 MiB volume. Past that it reports
+// FSCK_TOO_LARGE rather than checking part of the volume and calling it
+// clean, which would be the dangerous answer.
+export const FSCK_TOO_LARGE: u32 = 10
+const FSCK_MAX_BLOCKS: u32 = 65536
+var fsck_seen: [u8; 8192] = undefined
+
+var fsck_status: u32 = 0
+var fsck_blocks: u32 = 0
+var fsck_objects: u32 = 0
+var fsck_dirs: u32 = 0
+
+export fn homefs_fsck_blocks(): u32 { return fsck_blocks }
+export fn homefs_fsck_objects(): u32 { return fsck_objects }
+export fn homefs_fsck_directories(): u32 { return fsck_dirs }
+
+fn fsck_clear() {
+  var i: u32 = 0
+  while i < 8192 {
+    fsck_seen[i] = 0
+    i = i + 1
+  }
+}
+
+fn fsck_mark(block: u32): u32 {
+  let byte: u32 = block / 8
+  let bit: u8 = @as(u8, 1 << (block % 8))
+  if (fsck_seen[byte] & bit) != 0 { return 0 }
+  fsck_seen[byte] = fsck_seen[byte] | bit
+  fsck_blocks = fsck_blocks + 1
+  return 1
+}
+
+fn fsck_fail(code: u32) {
+  // The first failure is the one reported. A tree that has gone wrong tends
+  // to go wrong in several places at once, and the later ones are usually
+  // consequences of the first.
+  if fsck_status == FSCK_OK { fsck_status = code }
+}
+
+// Walk one B-tree, checking node invariants. `visit_kind` says what a leaf
+// value means: 0 = nothing (raw key/value), 1 = object record block,
+// 2 = extent.
+fn fsck_tree(root: u32, depth: u32, visit_kind: u32) {
+  if fsck_status != FSCK_OK { return }
+  if depth >= 16 {
+    fsck_fail(FSCK_TOO_DEEP)
+    return
+  }
+  if block_valid(root) == 0 {
+    fsck_fail(FSCK_BAD_CHILD)
+    return
+  }
+  if node_magic(root) != BTREE_MAGIC {
+    fsck_fail(FSCK_BAD_NODE)
+    return
+  }
+  // A block reached twice within one walk means two parents point at it. The
+  // tree code never produces that, and following it would loop.
+  if fsck_mark(root) == 0 {
+    fsck_fail(FSCK_CYCLE)
+    return
+  }
+
+  let count: u32 = node_count(root)
+  let level: u32 = node_level(root)
+
+  // Keys ascend. A node whose keys do not is one every lookup will answer
+  // wrongly rather than fail on, which is why it is checked rather than
+  // assumed from the insert path being correct.
+  var i: u32 = 1
+  while i < count {
+    if entry_key(root, i) <= entry_key(root, i - 1) {
+      fsck_fail(FSCK_UNSORTED)
+      return
+    }
+    i = i + 1
+  }
+
+  if level != 0 {
+    var c: u32 = 0
+    while c < count {
+      fsck_tree(@as(u32, entry_value(root, c)), depth + 1, visit_kind)
+      if fsck_status != FSCK_OK { return }
+      c = c + 1
+    }
+    return
+  }
+
+  if visit_kind == 0 { return }
+
+  var e: u32 = 0
+  while e < count {
+    let value: u64 = entry_value(root, e)
+    if visit_kind == 2 {
+      let physical: u32 = extent_physical(value)
+      if block_valid(physical) == 0 {
+        fsck_fail(FSCK_BAD_EXTENT)
+        return
+      }
+      fsck_mark(physical)
+    } else {
+      fsck_check_object(entry_key(root, e), @as(u32, value))
+      if fsck_status != FSCK_OK { return }
+    }
+    e = e + 1
+  }
+}
+
+fn fsck_check_object(id: u64, record: u32) {
+  if obj_magic(record) != OBJ_RECORD_MAGIC {
+    fsck_fail(FSCK_BAD_OBJECT)
+    return
+  }
+  // The record has to agree with the key it was filed under, or a lookup by
+  // id returns someone else's file.
+  if obj_id_of(record) != id {
+    fsck_fail(FSCK_BAD_OBJECT)
+    return
+  }
+  fsck_mark(record)
+  fsck_objects = fsck_objects + 1
+
+  let data_root: u32 = obj_data_root(record)
+  if data_root == 0 { return }
+
+  if obj_kind(record) == OBJ_KIND_DIR {
+    fsck_dirs = fsck_dirs + 1
+    fsck_tree(data_root, 0, 0)
+    if fsck_status != FSCK_OK { return }
+    fsck_check_dir_entries(data_root)
+    return
+  }
+  fsck_tree(data_root, 0, 2)
+}
+
+// Every directory entry must be filed under a key its child's own name
+// hashes to, allowing for the collision probe. Otherwise the entry is
+// unreachable by name: a lookup would hash the name, find a different child
+// or nothing, and report the file missing while it is plainly in the tree.
+fn fsck_check_dir_entries(tree: u32) {
+  let total: u32 = btree_count(tree)
+  var i: u32 = 0
+  while i < total {
+    if btree_nth(tree, i) == 1 {
+      let key: u64 = iter_key
+      let child: u64 = iter_value
+      let record: u32 = homefs_object_record(child)
+      if record == 0 {
+        fsck_fail(FSCK_BAD_DIRENT)
+        return
+      }
+      // The copy runs first and the hash second; written as two statements
+      // because as one call it would read as though the buffer's address
+      // were meaningful before the copy filled it.
+      let name_len: u32 = fsck_copy_name(record)
+      let base: u64 = name_hash(@intFromPtr(&fsck_name_scratch), name_len)
+      if key < base or key >= base + @as(u64, NAME_PROBE_LIMIT) {
+        fsck_fail(FSCK_BAD_DIRENT)
+        return
+      }
+    }
+    i = i + 1
+  }
+}
+
+var fsck_name_scratch: [u8; 64] = undefined
+
+fn fsck_copy_name(record: u32): u32 {
+  let n: u32 = obj_name_len(record)
+  var i: u32 = 0
+  while i < n {
+    fsck_name_scratch[i] = get8(block_addr(record), OBJ_NAME_OFFSET + i)
+    i = i + 1
+  }
+  return n
+}
+
+// Check the active root and every pinned snapshot root. Returns FSCK_OK or
+// the first invariant that broke.
+export fn homefs_fsck(): u32 {
+  if volume_mounted == 0 { return FSCK_NOT_MOUNTED }
+  if device_blocks > FSCK_MAX_BLOCKS { return FSCK_TOO_LARGE }
+
+  fsck_status = FSCK_OK
+  fsck_blocks = 0
+  fsck_objects = 0
+  fsck_dirs = 0
+  fsck_clear()
+
+  // The root tree's own values are raw, except the reserved key that carries
+  // the object table. Walking the object table by hand rather than through
+  // the generic leaf visitor keeps the reserved key from being mistaken for
+  // an object id.
+  fsck_tree(@as(u32, current_root), 0, 0)
+  if fsck_status != FSCK_OK { return fsck_status }
+
+  let table: u32 = objtable_root()
+  if table != 0 {
+    fsck_tree(table, 0, 1)
+    if fsck_status != FSCK_OK { return fsck_status }
+  }
+
+  // Snapshot roots are trees in their own right and share most of their
+  // blocks with the active one; the visited bitmap is deliberately not
+  // cleared between them, so a shared block is counted once and a cycle
+  // within a single tree is still caught (each walk marks as it descends).
+  let snapshots: u32 = homefs_snapshot_count()
+  var i: u32 = 0
+  while i < snapshots {
+    let root: u32 = snapshot_entry_root(snapshot_table_block, i)
+    if block_valid(root) == 0 {
+      fsck_fail(FSCK_BAD_CHILD)
+      return fsck_status
+    }
+    // A snapshot's root already visited by the active walk is the same tree,
+    // not a cycle: sharing is what a snapshot *is*. Only descend into one
+    // that has not been seen.
+    let byte: u32 = root / 8
+    let bit: u8 = @as(u8, 1 << (root % 8))
+    if (fsck_seen[byte] & bit) == 0 {
+      fsck_tree(root, 0, 0)
+      if fsck_status != FSCK_OK { return fsck_status }
+    }
+    i = i + 1
+  }
+
+  return FSCK_OK
 }

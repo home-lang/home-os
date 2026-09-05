@@ -20,6 +20,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PLAN="$REPO_ROOT/docs/MASTER_PLAN.md"
 MILESTONES="$REPO_ROOT/scripts/boot-milestones.txt"
 
+# How long a run may take before it is treated as hung. This is a *timeout*,
+# not a schedule: the wait loop below exits the moment the last milestone
+# appears, so a healthy run never spends it and raising it costs nothing.
+# It was 45s, which the boot had quietly grown up against — the deadline
+# started firing while the serial shell still had commands queued, and the
+# gate reported the *symptom* ("written.txt not present") rather than "the run
+# was cut short", which is a much harder thing to read.
+BOOT_TIMEOUT="${BOOT_TIMEOUT:-120}"
+
 VERBOSE=0
 KEEP=0
 BUILD_ONLY=0
@@ -222,7 +231,7 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
     # framebuffer adds seconds, and feeding commands before the console is
     # polling loses them — the 16550 receive FIFO is sixteen bytes deep.
     waited=0
-    while [ "$waited" -lt "${BOOT_TIMEOUT:-45}" ]; do
+    while [ "$waited" -lt "$BOOT_TIMEOUT" ]; do
         if [ -s "$log" ] && grep -qF '[Shell] serial console ready' "$log" 2>/dev/null; then
             break
         fi
@@ -236,7 +245,7 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
         printf '%s\n' "$cmd"
         sleep 2
     done < "$SCRIPT_DIR/boot-commands.txt"
-    sleep "${BOOT_TIMEOUT:-45}"
+    sleep "$BOOT_TIMEOUT"
 } | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" \
     -drive file="$disk",format=raw,if=ide,index=0 \
     -drive file="$fsdisk",format=raw,if=ide,index=1,cache=writethrough \
@@ -259,7 +268,7 @@ qemu_pid=$!
     # kernel has enabled interrupts delivers them to a masked line, and the
     # counter the gate asserts on stays at zero.
     kwait=0
-    while [ "$kwait" -lt "${BOOT_TIMEOUT:-45}" ]; do
+    while [ "$kwait" -lt "$BOOT_TIMEOUT" ]; do
         if [ -s "$log" ] && grep -qF '[Shell] serial console ready' "$log" 2>/dev/null; then
             break
         fi
@@ -280,7 +289,7 @@ qemu_pid=$!
     # Hold the connection until the run is over. QEMU treats the monitor
     # closing as a reason to exit, which cut every run short at the moment
     # the keys had been delivered.
-    sleep "${BOOT_TIMEOUT:-45}"
+    sleep "$BOOT_TIMEOUT"
 ) &
 keypress_pid=$!
 # Stop as soon as the final milestone appears, rather than always waiting out
@@ -290,7 +299,7 @@ keypress_pid=$!
 last_milestone="$(grep -vE '^\s*(#|$)' "$MILESTONES" | tail -n 1 | sed 's/^ *//; s/ *$//')"
 [ -n "$last_milestone" ] || { echo "error: $MILESTONES has no entries" >&2; exit 2; }
 
-deadline=$(( $(date +%s) + ${BOOT_TIMEOUT:-45} ))
+deadline=$(( $(date +%s) + $BOOT_TIMEOUT ))
 while kill -0 "$qemu_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
     if [ -s "$log" ] && grep -qF "$last_milestone" "$log" 2>/dev/null; then
         break
