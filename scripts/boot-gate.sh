@@ -251,7 +251,7 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
     -drive file="$fsdisk",format=raw,if=ide,index=1,cache=writethrough \
     -serial stdio \
     -device qemu-xhci,id=xhci \
-    -drive file="$usbdisk",format=raw,if=none,id=usbstick \
+    -drive file="$usbdisk",format=raw,if=none,id=usbstick,cache=writethrough \
     -device usb-storage,bus=xhci.0,drive=usbstick \
     -monitor "telnet:127.0.0.1:$MONITOR_PORT,server,nowait" \
     -display none -vga std -no-reboot -m 256M > "$log" 2>&1 &
@@ -367,6 +367,34 @@ if ! python3 "$REPO_ROOT/tools/mkext2.py" check "$disk" \
     exit 1
 fi
 sed 's/^/boot-gate: fsck /' "$workdir/fsck.out"
+
+# And the USB write reached the media, not just the device. The kernel reads
+# its own block back, which proves the device accepted it; only the image on
+# the host says it was written. Hence cache=writethrough on that drive — with
+# QEMU's default host page cache the bytes can sit in memory and the image
+# below still show the block the harness laid down.
+if ! python3 - "$usbdisk" <<'USBCHECK'
+import sys
+want = b"HOMEOS-USB-WRITE1"
+with open(sys.argv[1], "rb") as f:
+    f.seek(512)
+    block = f.read(512)
+if not block.startswith(want):
+    print("usb: LBA 1 does not hold the kernel's write: %r" % block[:24])
+    sys.exit(1)
+# The pattern past the tag varies per byte, so a block of repeated filler
+# that happened to start with the tag does not pass.
+for i in range(len(want), 64):
+    if block[i] != (i * 5 + 3) & 0xFF:
+        print("usb: LBA 1 byte %d is %d, expected %d" % (i, block[i], (i * 5 + 3) & 0xFF))
+        sys.exit(1)
+print("usb: LBA 1 holds the kernel's write, 64 bytes verified")
+USBCHECK
+then
+    echo "" >&2
+    echo "RATCHET BROKEN: the USB write did not reach the disk image." >&2
+    exit 1
+fi | sed 's/^/boot-gate: /'
 
 echo "boot-gate: $reached/$total milestones reached"
 

@@ -1,15 +1,18 @@
 // home-os USB — xHCI host controller discovery
 //
-// STUB(S6): there is no enumeration and no transfers. The command ring, event
-// ring and device-context base array are not set up, so no device is
-// addressed and no data moves. On real hardware that still means no USB
-// keyboard and no USB storage. Blocks Phase 7a. MASTER_PLAN §7.
+// STUB(S6): there is no HID driver, so a USB keyboard is still not a keyboard
+// — the interrupt endpoint is configured but nothing reads a report off it —
+// and nothing mounts a USB disk through the VFS. Blocks Phase 7a.
+// MASTER_PLAN §7.
 //
-// What is implemented is the layer underneath: finding the controller on the
-// PCI bus, mapping its register window, and reading the capability registers
-// that say how many ports and device slots it has. Ring setup needs those
-// numbers — the device-context base array is sized by MaxSlots — so this is
-// the part that has to be right first.
+// What is implemented is everything under that: the controller found on the
+// PCI bus and its register window mapped, the command ring, event ring and
+// device-context base array set up from the capability registers, a device
+// reset, addressed and configured, and Bulk-Only Transport carrying SCSI —
+// INQUIRY, READ CAPACITY(10), READ(10) and WRITE(10). The boot gate reads a
+// known block off a USB disk, writes another, reads it back, and then checks
+// the host image, because a device accepting a write is not the same as the
+// write reaching the media.
 
 import "../core/foundation.home" as foundation
 import "pci.home" as pci
@@ -893,15 +896,25 @@ fn bulk_transfer(slot: u32, dci: u32, ring: u64, enqueue: u32, buffer: u64, leng
   return await_transfer_event()
 }
 
-// Send a SCSI command and read its reply. `cdb_len` bytes of command block
-// have already been written into cbw_buffer at offset 15.
-fn scsi_command(slot: u32, transfer_length: u32): u32 {
+// Send a SCSI command and carry its data phase. `cdb_len` bytes of command
+// block have already been written into cbw_buffer at offset 15.
+//
+// `direction_in` says which way the data goes, and it decides three things
+// that have to agree: the CBW flags byte the device reads, which bulk
+// endpoint the data phase uses, and which ring it is queued on. A command
+// whose flags say IN while its data goes out on the OUT endpoint does not
+// fail cleanly — the device waits for bytes it was told to send.
+fn scsi_command_dir(slot: u32, transfer_length: u32, direction_in: u32): u32 {
   // Command Block Wrapper.
   write_mem32(cbw_buffer, 0, CBW_SIGNATURE)
   write_mem32(cbw_buffer, 4, scsi_tag)
   write_mem32(cbw_buffer, 8, transfer_length)
   // Flags: bit 7 set means the data flows device-to-host.
-  @as(*u8, @ptrFromInt(cbw_buffer + 12)).* = 0x80
+  if direction_in == 1 {
+    @as(*u8, @ptrFromInt(cbw_buffer + 12)).* = 0x80
+  } else {
+    @as(*u8, @ptrFromInt(cbw_buffer + 12)).* = 0x00
+  }
   @as(*u8, @ptrFromInt(cbw_buffer + 13)).* = 0      // LUN 0
 
   if bulk_transfer(slot, bulk_out_dci, bulk_out_ring, bulk_out_enqueue, cbw_buffer, 31, 0) == 0 {
@@ -910,10 +923,17 @@ fn scsi_command(slot: u32, transfer_length: u32): u32 {
   bulk_out_enqueue = bulk_out_enqueue + 1
 
   if transfer_length > 0 {
-    if bulk_transfer(slot, bulk_in_dci, bulk_in_ring, bulk_in_enqueue, data_buffer, transfer_length, 1) == 0 {
-      return 0
+    if direction_in == 1 {
+      if bulk_transfer(slot, bulk_in_dci, bulk_in_ring, bulk_in_enqueue, data_buffer, transfer_length, 1) == 0 {
+        return 0
+      }
+      bulk_in_enqueue = bulk_in_enqueue + 1
+    } else {
+      if bulk_transfer(slot, bulk_out_dci, bulk_out_ring, bulk_out_enqueue, data_buffer, transfer_length, 0) == 0 {
+        return 0
+      }
+      bulk_out_enqueue = bulk_out_enqueue + 1
     }
-    bulk_in_enqueue = bulk_in_enqueue + 1
   }
 
   // Command Status Wrapper. Its signature and matching tag are what make the
@@ -929,6 +949,11 @@ fn scsi_command(slot: u32, transfer_length: u32): u32 {
   // Byte 12 is the status: 0 is success.
   if @as(*u8, @ptrFromInt(csw_buffer + 12)).* != 0 { return 0 }
   return 1
+}
+
+// Device-to-host, which is what every command here but WRITE(10) wants.
+fn scsi_command(slot: u32, transfer_length: u32): u32 {
+  return scsi_command_dir(slot, transfer_length, 1)
 }
 
 // SCSI READ CAPACITY(10): the last addressable block and the block size, each
@@ -971,6 +996,49 @@ export fn usb_storage_read_block(slot: u32, lba: u32): u32 {
   @as(*u8, @ptrFromInt(cbw_buffer + 23)).* = 1
 
   return scsi_command(slot, storage_block_size)
+}
+
+// SCSI WRITE(10): one block from the data buffer to `lba`.
+//
+// Fill the buffer with usb_storage_set_data_byte first. The command is the
+// mirror of READ(10) — same CDB shape, opcode 0x2A, and a data phase that
+// goes the other way.
+export fn usb_storage_write_block(slot: u32, lba: u32): u32 {
+  if ensure_storage_buffers() == 0 { return 0 }
+  if storage_block_size == 0 { return 0 }
+  // The data buffer is not zeroed here, unlike the read path: it holds what
+  // the caller means to write.
+  zero_page(cbw_buffer)
+  zero_page(csw_buffer)
+
+  @as(*u8, @ptrFromInt(cbw_buffer + 14)).* = 10
+  @as(*u8, @ptrFromInt(cbw_buffer + 15)).* = 0x2A   // WRITE(10)
+  @as(*u8, @ptrFromInt(cbw_buffer + 17)).* = @as(u8, (lba >> 24) & 0xFF)
+  @as(*u8, @ptrFromInt(cbw_buffer + 18)).* = @as(u8, (lba >> 16) & 0xFF)
+  @as(*u8, @ptrFromInt(cbw_buffer + 19)).* = @as(u8, (lba >> 8) & 0xFF)
+  @as(*u8, @ptrFromInt(cbw_buffer + 20)).* = @as(u8, lba & 0xFF)
+  @as(*u8, @ptrFromInt(cbw_buffer + 22)).* = 0
+  @as(*u8, @ptrFromInt(cbw_buffer + 23)).* = 1
+
+  return scsi_command_dir(slot, storage_block_size, 0)
+}
+
+// Put a byte into the buffer the next write will send. Bounded by the block
+// size the device reported rather than by the page, so a caller cannot stage
+// more than one block and have the tail silently ignored.
+export fn usb_storage_set_data_byte(index: u32, value: u8): u32 {
+  if data_buffer == 0 { return 0 }
+  if storage_block_size == 0 or index >= storage_block_size { return 0 }
+  @as(*u8, @ptrFromInt(data_buffer + @as(u64, index))).* = value
+  return 1
+}
+
+// Clear the staging buffer, so a short write does not ship whatever the last
+// read left behind in the rest of the block.
+export fn usb_storage_clear_data(): u32 {
+  if data_buffer == 0 { return 0 }
+  zero_page(data_buffer)
+  return 1
 }
 
 fn be32_at(base: u64, offset: u32): u32 {
