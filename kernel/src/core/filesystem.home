@@ -687,6 +687,45 @@ export fn vfs_homefs_resolve(path: u64): u64 {
   }
 }
 
+// Build the Inode a permission check needs out of a homefs object record.
+// The check itself is the same code the inode table uses — a second
+// implementation of "may this user read this file" is a second thing to get
+// wrong, and the two would disagree quietly.
+fn homefs_as_inode(object: u64): Inode {
+  var stat: Inode = undefined
+  stat.ino = @as(u32, object & 0xFFFFFFFF)
+  if homefs.homefs_object_kind(object) == homefs.OBJ_KIND_DIR {
+    stat.file_type = FILE_TYPE_DIRECTORY
+  } else {
+    stat.file_type = FILE_TYPE_REGULAR
+  }
+  stat.mode = homefs.homefs_object_mode(object)
+  stat.size = homefs.homefs_object_size(object)
+  stat.blocks = 0
+  stat.link_count = 1
+  stat.uid = homefs.homefs_object_uid(object)
+  stat.gid = homefs.homefs_object_gid(object)
+  stat.atime = 0
+  stat.mtime = 0
+  stat.ctime = 0
+  stat.indirect_block = 0
+  return stat
+}
+
+// Whether the current user may open this object with these flags.
+fn homefs_may_open(object: u64, flags: u32): u32 {
+  var stat: Inode = homefs_as_inode(object)
+  let access_mode: u32 = flags & 0x3
+  if access_mode == 0 {
+    return perms.can_read(&stat, current_uid, current_gid)
+  }
+  if access_mode == 1 {
+    return perms.can_write(&stat, current_uid, current_gid)
+  }
+  if perms.can_read(&stat, current_uid, current_gid) == 0 { return 0 }
+  return perms.can_write(&stat, current_uid, current_gid)
+}
+
 // Open a homefs path. Returns a descriptor, or 0 — including when the path is
 // not under the mount point, which is how vfs_open knows to carry on with the
 // inode table.
@@ -701,6 +740,7 @@ fn homefs_open(path: u64, flags: u32): u32 {
     if object == 0 { return 0 }
   }
   if homefs.homefs_object_kind(object) != homefs.OBJ_KIND_FILE { return 0 }
+  if homefs_may_open(object, flags) == 0 { return 0 }
 
   var i: u32 = 0
   while i < MAX_OPEN_FILES {
@@ -754,6 +794,12 @@ fn homefs_create_at(path: u64): u64 {
   let object: u64 = homefs.homefs_create(parent, name, name_len,
                                          homefs.OBJ_KIND_FILE)
   if object == 0 { return 0 }
+  // The creator owns it. Without this every file on the volume belongs to
+  // uid 0, and the permission check above would be checking the wrong thing
+  // rather than nothing — which is worse.
+  if homefs.homefs_set_object_mode(object, 0o644, current_uid, current_gid) == 0 {
+    return 0
+  }
   if homefs.homefs_commit_transaction() == 0 { return 0 }
   return object
 }
@@ -878,10 +924,8 @@ export fn vfs_read(fd: u32, buffer: u64, count: u64): u64 {
 
   if open_files[idx].ref_count == 0 { return 0 }
 
-  // homefs files carry no inode-table entry, so the permission check further
-  // down has nothing to check against. homefs has no owner or mode field
-  // yet; that is a gap to close when it grows one rather than a check being
-  // skipped quietly — MASTER_PLAN §7, S4.
+  // A homefs file's permissions were checked at open, against its own mode
+  // and owner, by the same perms code the inode path uses below.
   if open_files[idx].homefs_object != 0 {
     let got: u32 = homefs.homefs_file_read(open_files[idx].homefs_object,
                                            open_files[idx].offset, buffer,
@@ -1084,7 +1128,91 @@ export fn vfs_lseek(fd: u32, offset: u64, whence: u32): u64 {
 // DIRECTORY OPERATIONS
 // ============================================================================
 
+// Split a homefs path into its parent object and its last component.
+// Returns the parent's object id, or 0. `name_out` receives the address of
+// the last component and `len_out` its length, both through single-element
+// arrays because this backend has no out-parameters.
+var homefs_split_name: [u64; 1] = undefined
+var homefs_split_len: [u32; 1] = undefined
+
+fn homefs_split_parent(path: u64): u64 {
+  let start: u32 = homefs_path_offset(path)
+  if start == 0 { return 0 }
+
+  var i: u32 = start
+  var last: u32 = start
+  loop {
+    let c: u8 = @as(*u8, @ptrFromInt(path + @as(u64, i))).*
+    if c == 0 { break }
+    if c == 47 { last = i + 1 }
+    i = i + 1
+  }
+  homefs_split_name[0] = path + @as(u64, last)
+  homefs_split_len[0] = i - last
+  if homefs_split_len[0] == 0 { return 0 }
+
+  if last <= start { return homefs.HOMEFS_ROOT_DIR }
+
+  // Truncate at the separator to resolve the parent, then put the byte back.
+  // The path belongs to the caller only for the duration of this call, so
+  // borrowing it beats demanding a second buffer from everyone who has a
+  // path already.
+  let cut: u64 = path + @as(u64, last - 1)
+  let saved: u8 = @as(*u8, @ptrFromInt(cut)).*
+  @as(*u8, @ptrFromInt(cut)).* = 0
+  let parent: u64 = vfs_homefs_resolve(path)
+  @as(*u8, @ptrFromInt(cut)).* = saved
+  return parent
+}
+
+// Returns 0 on success, matching vfs_mkdir's convention.
+fn homefs_mkdir(path: u64, mode: u32): u32 {
+  if vfs_homefs_resolve(path) != 0 { return 0 }
+  let parent: u64 = homefs_split_parent(path)
+  if parent == 0 { return 1 }
+  let made: u64 = homefs.homefs_create(parent, homefs_split_name[0],
+                                       homefs_split_len[0], homefs.OBJ_KIND_DIR)
+  if made == 0 { return 1 }
+  if mode != 0 {
+    if homefs.homefs_set_object_mode(made, mode, current_uid, current_gid) == 0 {
+      return 1
+    }
+  }
+  if homefs.homefs_commit_transaction() == 0 { return 1 }
+  return 0
+}
+
+// Remove a homefs path. `want_dir` says which kind the caller means, so
+// rmdir does not silently delete a file and unlink does not delete a
+// directory. Returns 0 on success.
+fn homefs_remove(path: u64, want_dir: u32): u32 {
+  let object: u64 = vfs_homefs_resolve(path)
+  if object == 0 { return 1 }
+  let kind: u32 = homefs.homefs_object_kind(object)
+  if want_dir == 1 and kind != homefs.OBJ_KIND_DIR { return 1 }
+  if want_dir == 0 and kind != homefs.OBJ_KIND_FILE { return 1 }
+
+  let parent: u64 = homefs_split_parent(path)
+  if parent == 0 { return 1 }
+  if homefs.homefs_unlink(parent, homefs_split_name[0], homefs_split_len[0]) == 0 {
+    return 1
+  }
+  if homefs.homefs_commit_transaction() == 0 { return 1 }
+  return 0
+}
+
+// Remove a file. There is no vfs_unlink for the inode table — removing an
+// entry there needs a parent-and-name resolution the inode path does not
+// have yet — so this is named for what it actually covers rather than
+// offered as a general unlink that works for one filesystem out of two.
+export fn vfs_homefs_unlink(path: u64): u32 {
+  if homefs_path_offset(path) == 0 { return 1 }
+  return homefs_remove(path, 0)
+}
+
 export fn vfs_mkdir(path: u64, mode: u32): u32 {
+  if homefs_path_offset(path) != 0 { return homefs_mkdir(path, mode) }
+
   // Already there is success, not an error: an initramfs names each parent
   // directory before the files inside it, and archives often name the same
   // one more than once.
@@ -1123,6 +1251,8 @@ export fn vfs_mkdir(path: u64, mode: u32): u32 {
 }
 
 export fn vfs_rmdir(path: u64): u32 {
+  if homefs_path_offset(path) != 0 { return homefs_remove(path, 1) }
+
   // TODO: Get directory inode from path
   // For now, check if we can write to root directory
   var root_inode_ptr: u64 = inode_get(1)
@@ -1266,8 +1396,31 @@ fn copy_string_to_array(src: []u8, dst: *[u8; 32], max_len: u32) {
 }
 
 // Get filesystem statistics for a path
+// Bring the homefs mount row up to date from the volume itself.
+fn refresh_homefs_mount_row() {
+  if vfs_homefs_mounted() == 0 { return }
+  var i: u32 = 0
+  while i < mount_count {
+    if mount_table[i].fs_type == FS_TYPE_HOMEFS {
+      let total: u32 = homefs.homefs_device_blocks()
+      let live: u32 = homefs.homefs_blocks_live()
+      mount_table[i].total_blocks = @as(u64, total)
+      mount_table[i].free_blocks = @as(u64, total - live)
+      mount_table[i].total_inodes = @as(u64, total)
+      mount_table[i].free_inodes = @as(u64, total - live)
+    }
+    i = i + 1
+  }
+}
+
 export fn vfs_statfs(path: u64, buf: *StatFS): u32 {
   var path_str: *u8 = @ptrFromInt(path)
+
+  // A homefs volume's free space changes with every commit and every sweep,
+  // so its row is refreshed here rather than left as whatever was true at
+  // mount. A figure that was measured once and then reported forever is the
+  // same kind of answer as one that was invented.
+  refresh_homefs_mount_row()
 
   // Find matching mount point (longest prefix match)
   var best_match: i32 = -1

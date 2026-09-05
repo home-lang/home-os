@@ -1,19 +1,20 @@
-// home-os Native Filesystem (homefs) — on-disk structures
+// home-os Native Filesystem (homefs)
 //
-// STUB(S4): there is no delete path — no way to remove a directory entry or
-// an object, so nothing a homefs volume holds can ever be taken off it — and
-// objects carry no owner or mode, so the VFS's permission checks have nothing
-// to check a homefs file against. MASTER_PLAN §7.
+// Steps 1–6 of the plan in docs/design/homefs.md §9 are implemented: the
+// on-disk structures and their checksummed encode/decode, a block device,
+// copy-on-write B-trees, the commit protocol, snapshots with rollback, the
+// object layer — files, directories and extent trees — removal, ownership
+// and mode, `fsck`, free-space reclamation, and the VFS routing that makes a
+// volume reachable through ordinary paths. The layers are stacked in that
+// order deliberately: getting the byte layout and the integrity check right
+// first meant the tree code was never debugging two things at once, and the
+// same for every layer since.
 //
-// Steps 1–4 and 6 of the plan in docs/design/homefs.md §9 are implemented:
-// the on-disk structures and their checksummed encode/decode, a block
-// device, copy-on-write B-trees, the commit protocol, snapshots with
-// rollback, the object layer — files, directories and extent trees —
-// `fsck`, free-space reclamation, and the VFS routing that makes a volume
-// reachable through ordinary paths. The
-// layers are stacked in that order deliberately: getting the byte layout and
-// the integrity check right first meant the tree code was never debugging
-// two things at once, and the same for every layer since.
+// What it does not have, none of which anything in the tree depends on
+// today: timestamps (atime/mtime/ctime are not stored), rename, hard links,
+// and compaction of the tombstones removal leaves behind in a directory.
+// Step 7 of the plan — pantry integration and `@factory` — is Phase 6
+// channels and is tracked there.
 //
 // All fields are little-endian on disk regardless of the machine writing
 // them, so a volume is portable between architectures — which matters here,
@@ -21,7 +22,6 @@
 
 import "../crypto/blake2s.home" as blake2s
 import "../drivers/ata.home" as ata
-import "../core/foundation.home" as foundation
 import "../core/foundation.home" as foundation
 
 
@@ -1367,6 +1367,16 @@ fn obj_record_new(kind: u32, id: u64, name_ptr: u64, name_len: u32): u32 {
   set_obj_refcount(block, 1)
   set_obj_id(block, id)
   put32(block_addr(block), 40, name_len)
+  // 0o755 for a directory, 0o644 for a file — the same defaults the inode
+  // table uses, so a homefs file and an in-memory one answer a permission
+  // check the same way.
+  if kind == OBJ_KIND_DIR {
+    put32(block_addr(block), OBJ_MODE_OFFSET, 0o755)
+  } else {
+    put32(block_addr(block), OBJ_MODE_OFFSET, 0o644)
+  }
+  put32(block_addr(block), OBJ_UID_OFFSET, 0)
+  put32(block_addr(block), OBJ_GID_OFFSET, 0)
   var i: u32 = 0
   while i < name_len {
     put8(block_addr(block), OBJ_NAME_OFFSET + i,
@@ -1398,7 +1408,11 @@ fn objtable_set(new_root: u32): u32 {
 export fn homefs_object_record(id: u64): u32 {
   let table: u32 = objtable_root()
   if table == 0 { return 0 }
-  let block: u32 = @as(u32, homefs_btree_lookup(table, id))
+  let value: u64 = homefs_btree_lookup(table, id)
+  // A tombstone is a removed object, which is absent — not a block number to
+  // truncate and read a record out of.
+  if value == BTREE_TOMBSTONE { return 0 }
+  let block: u32 = @as(u32, value)
   if obj_magic(block) != OBJ_RECORD_MAGIC { return 0 }
   return block
 }
@@ -1573,10 +1587,13 @@ export fn homefs_dir_lookup(dir_id: u64, name_ptr: u64, name_len: u32): u64 {
   while probe < NAME_PROBE_LIMIT {
     let child: u64 = homefs_btree_lookup(tree, base + @as(u64, probe))
     // An empty slot ends the probe: an insert would have taken it, so no
-    // later slot can hold this name.
+    // later slot can hold this name. A tombstone does not — it is a slot that
+    // was taken, so a name that collided with it is filed further along.
     if child == 0 { return 0 }
-    let rec: u32 = homefs_object_record(child)
-    if rec != 0 and obj_name_matches(rec, name_ptr, name_len) == 1 { return child }
+    if child != BTREE_TOMBSTONE {
+      let rec: u32 = homefs_object_record(child)
+      if rec != 0 and obj_name_matches(rec, name_ptr, name_len) == 1 { return child }
+    }
     probe = probe + 1
   }
   return 0
@@ -1587,7 +1604,20 @@ export fn homefs_dir_count(dir_id: u64): u32 {
   let dir: u32 = homefs_object_record(dir_id)
   if dir == 0 { return 0 }
   if obj_kind(dir) != OBJ_KIND_DIR { return 0 }
-  return btree_count(obj_data_root(dir))
+  // Tombstoned entries still occupy slots but are not entries. Counting them
+  // would report a directory as non-empty after its last file was removed,
+  // and rmdir would then refuse to remove it.
+  let tree: u32 = obj_data_root(dir)
+  let slots: u32 = btree_count(tree)
+  var live: u32 = 0
+  var i: u32 = 0
+  while i < slots {
+    if btree_nth(tree, i) == 1 {
+      if iter_value != BTREE_TOMBSTONE and iter_value != 0 { live = live + 1 }
+    }
+    i = i + 1
+  }
+  return live
 }
 
 // The object id of the nth entry, in hash order. Hash order is not name
@@ -1597,8 +1627,24 @@ export fn homefs_dir_at(dir_id: u64, index: u32): u64 {
   let dir: u32 = homefs_object_record(dir_id)
   if dir == 0 { return 0 }
   if obj_kind(dir) != OBJ_KIND_DIR { return 0 }
-  if btree_nth(obj_data_root(dir), index) == 0 { return 0 }
-  return iter_value
+  // Indexed over live entries, not over slots, so a caller walking
+  // 0..homefs_dir_count() sees every entry exactly once whatever has been
+  // removed before it.
+  let tree: u32 = obj_data_root(dir)
+  let slots: u32 = btree_count(tree)
+  var live: u32 = 0
+  var i: u32 = 0
+  while i < slots {
+    if btree_nth(tree, i) == 1 {
+      let value: u64 = iter_value
+      if value != BTREE_TOMBSTONE and value != 0 {
+        if live == index { return value }
+        live = live + 1
+      }
+    }
+    i = i + 1
+  }
+  return 0
 }
 
 // Ids are handed out by counting past the highest already in the object
@@ -1616,7 +1662,7 @@ fn refresh_id_watermarks() {
   let total: u32 = btree_count(table)
   var i: u32 = 0
   while i < total {
-    if btree_nth(table, i) == 1 {
+    if btree_nth(table, i) == 1 and iter_value != BTREE_TOMBSTONE {
       let id: u64 = iter_key
       let bare: u64 = id & ~OBJ_TYPE_MASK
       if object_type(id) == OBJ_TYPE_DIR {
@@ -1826,7 +1872,7 @@ fn create_root_directory(): u32 {
 // Returns a count of the checks that passed; the caller asserts the total.
 // ============================================================================
 
-const OBJ_TEST_CHECKS: u32 = 15
+const OBJ_TEST_CHECKS: u32 = 18
 
 // Deliberately larger than one block, so the write crosses an extent
 // boundary and the read has to reassemble it. A test that fits in a single
@@ -2012,6 +2058,42 @@ export fn homefs_object_selftest(base: u64, blocks: u32): u32 {
   }
   if survived == 1 { passed = passed + 1 }
 
+  // 16: the file can be removed — gone from its directory by name, gone from
+  // the count, and gone from the object table.
+  var removed: u32 = 0
+  if homefs_unlink(dir, @intFromPtr(&obj_test_name), 8) == 1 {
+    if homefs_dir_lookup(dir, @intFromPtr(&obj_test_name), 8) == 0 and
+       homefs_dir_count(dir) == 0 and
+       homefs_object_record(file) == 0 {
+      removed = 1
+    }
+  }
+  if removed == 1 { passed = passed + 1 }
+
+  // 17: and the volume still verifies. A tombstone is a value fsck has to
+  // expect in both trees, not one it should trip over.
+  if homefs_fsck() == FSCK_OK { passed = passed + 1 }
+
+  // 18: the removal did not reach into the snapshot. Rolling back brings the
+  // file and its original contents back, which is what pinning a root means
+  // — and it is checked after a sweep, so a reclamation that followed the
+  // active tree only would have already freed those blocks.
+  let after_sweep: u32 = homefs_reclaim()
+  var restored: u32 = 0
+  if after_sweep >= 0 and homefs_snapshot_rollback(snap) == 1 {
+    if homefs_dir_lookup(dir, @intFromPtr(&obj_test_name), 8) == file {
+      if homefs_file_read(file, 0, @intFromPtr(&obj_test_read), 64) == 64 {
+        restored = 1
+        var r: u32 = 0
+        while r < 64 {
+          if obj_test_read[r] != @as(u8, (r * 7 + 13) & 0xFF) { restored = 0 }
+          r = r + 1
+        }
+      }
+    }
+  }
+  if restored == 1 { passed = passed + 1 }
+
   return passed
 }
 
@@ -2051,7 +2133,14 @@ export const FSCK_CYCLE: u32 = 9             // a block reachable twice in one t
 // clean, which would be the dangerous answer.
 export const FSCK_TOO_LARGE: u32 = 10
 const FSCK_MAX_BLOCKS: u32 = 65536
+// The live set, accumulated across every root.
 var fsck_seen: [u8; 8192] = undefined
+// What the *current* root's walk has descended into. Two bitmaps rather than
+// one because sharing a subtree between roots and aliasing one within a root
+// are opposite things: the first is what a snapshot is, and the second is a
+// tree that has gone wrong. Detecting them with a single bitmap reported a
+// perfectly healthy volume with one snapshot as a cycle.
+var fsck_walk: [u8; 8192] = undefined
 
 var fsck_status: u32 = 0
 var fsck_blocks: u32 = 0
@@ -2063,18 +2152,35 @@ export fn homefs_fsck_objects(): u32 { return fsck_objects }
 export fn homefs_fsck_directories(): u32 { return fsck_dirs }
 
 fn fsck_clear() {
-  var i: u32 = 0
-  while i < 8192 {
-    fsck_seen[i] = 0
-    i = i + 1
-  }
+  @memset(&fsck_seen, 0)
+  @memset(&fsck_walk, 0)
 }
 
+// Start a new root's walk. The live set carries over; what this root has
+// descended into does not.
+fn fsck_new_root() {
+  @memset(&fsck_walk, 0)
+}
+
+// Record a block as live. Used for things that are referenced but not
+// descended into — object records, file extents, the snapshot table — where
+// being referenced twice is not by itself wrong.
 fn fsck_mark(block: u32): u32 {
-  let byte: u32 = block / 8
-  let bit: u8 = @as(u8, 1 << (block % 8))
-  if (fsck_seen[byte] & bit) != 0 { return 0 }
-  fsck_seen[byte] = fsck_seen[byte] | bit
+  if bit_get(@intFromPtr(&fsck_seen), block) == 1 { return 0 }
+  bit_set(@intFromPtr(&fsck_seen), block)
+  fsck_blocks = fsck_blocks + 1
+  return 1
+}
+
+// Enter a tree node.
+//   0 — already on this root's walk: two parents in one tree, a real fault
+//   1 — new
+//   2 — reached by an earlier root, so already verified; do not descend again
+fn fsck_visit(block: u32): u32 {
+  if bit_get(@intFromPtr(&fsck_walk), block) == 1 { return 0 }
+  bit_set(@intFromPtr(&fsck_walk), block)
+  if bit_get(@intFromPtr(&fsck_seen), block) == 1 { return 2 }
+  bit_set(@intFromPtr(&fsck_seen), block)
   fsck_blocks = fsck_blocks + 1
   return 1
 }
@@ -2103,10 +2209,17 @@ fn fsck_tree(root: u32, depth: u32, visit_kind: u32) {
     fsck_fail(FSCK_BAD_NODE)
     return
   }
-  // A block reached twice within one walk means two parents point at it. The
-  // tree code never produces that, and following it would loop.
-  if fsck_mark(root) == 0 {
+  let visit: u32 = fsck_visit(root)
+  if visit == 0 {
+    // Two parents in one tree. The tree code never produces that, and
+    // following it would loop.
     fsck_fail(FSCK_CYCLE)
+    return
+  }
+  if visit == 2 {
+    // An earlier root already walked this subtree and it verified. Sharing
+    // is what copy-on-write is for; re-descending would check it twice and
+    // is how a healthy snapshot came to look like a cycle.
     return
   }
 
@@ -2140,6 +2253,12 @@ fn fsck_tree(root: u32, depth: u32, visit_kind: u32) {
   var e: u32 = 0
   while e < count {
     let value: u64 = entry_value(root, e)
+    // A tombstone is a removed entry. It references nothing, so there is
+    // nothing to check and nothing to mark live.
+    if value == BTREE_TOMBSTONE {
+      e = e + 1
+      continue
+    }
     if visit_kind == 2 {
       let physical: u32 = extent_physical(value)
       if block_valid(physical) == 0 {
@@ -2186,6 +2305,22 @@ fn fsck_check_object(id: u64, record: u32) {
 // hashes to, allowing for the collision probe. Otherwise the entry is
 // unreachable by name: a lookup would hash the name, find a different child
 // or nothing, and report the file missing while it is plainly in the tree.
+// Which object table the directory entries being checked resolve against.
+// fsck walks several roots, and a snapshot's directory names a snapshot's
+// objects: resolving those through homefs_object_record — which always reads
+// the *active* table — reported every entry the active tree had since removed
+// as a broken dirent, in a snapshot that was perfectly intact.
+var fsck_table_root: u32 = 0
+
+fn fsck_object_record_in(table: u32, id: u64): u32 {
+  if table == 0 { return 0 }
+  let value: u64 = homefs_btree_lookup(table, id)
+  if value == BTREE_TOMBSTONE { return 0 }
+  let block: u32 = @as(u32, value)
+  if obj_magic(block) != OBJ_RECORD_MAGIC { return 0 }
+  return block
+}
+
 fn fsck_check_dir_entries(tree: u32) {
   let total: u32 = btree_count(tree)
   var i: u32 = 0
@@ -2193,7 +2328,11 @@ fn fsck_check_dir_entries(tree: u32) {
     if btree_nth(tree, i) == 1 {
       let key: u64 = iter_key
       let child: u64 = iter_value
-      let record: u32 = homefs_object_record(child)
+      if child == BTREE_TOMBSTONE {
+        i = i + 1
+        continue
+      }
+      let record: u32 = fsck_object_record_in(fsck_table_root, child)
       if record == 0 {
         fsck_fail(FSCK_BAD_DIRENT)
         return
@@ -2240,11 +2379,13 @@ export fn homefs_fsck(): u32 {
   // the object table. Walking the object table by hand rather than through
   // the generic leaf visitor keeps the reserved key from being mistaken for
   // an object id.
+  fsck_new_root()
   fsck_tree(@as(u32, current_root), 0, 0)
   if fsck_status != FSCK_OK { return fsck_status }
 
   let table: u32 = objtable_root()
   if table != 0 {
+    fsck_table_root = table
     fsck_tree(table, 0, 1)
     if fsck_status != FSCK_OK { return fsck_status }
   }
@@ -2268,20 +2409,19 @@ export fn homefs_fsck(): u32 {
       fsck_fail(FSCK_BAD_CHILD)
       return fsck_status
     }
-    // A snapshot's root already visited by the active walk is the same tree,
-    // not a cycle: sharing is what a snapshot *is*. Only descend into one
-    // that has not been seen.
-    if bit_get(@intFromPtr(&fsck_seen), root) == 0 {
-      fsck_tree(root, 0, 0)
-      if fsck_status != FSCK_OK { return fsck_status }
-    }
+    // Each snapshot is its own walk: the blocks it shares with the active
+    // tree have been verified, and fsck_visit stops the descent at them.
+    fsck_new_root()
+    fsck_tree(root, 0, 0)
+    if fsck_status != FSCK_OK { return fsck_status }
     // A snapshot has its own object table, and its objects are live even
     // when the active tree has since deleted them — that is the whole point
     // of pinning one. Walking only the snapshot's root tree would leave its
     // records and file extents unmarked, and reclamation would free the
     // files the snapshot exists to preserve.
     let table: u32 = @as(u32, homefs_btree_lookup(root, OBJTABLE_KEY))
-    if table != 0 and bit_get(@intFromPtr(&fsck_seen), table) == 0 {
+    if table != 0 and table != @as(u32, BTREE_TOMBSTONE) {
+      fsck_table_root = table
       fsck_tree(table, 0, 1)
       if fsck_status != FSCK_OK { return fsck_status }
     }
@@ -2365,4 +2505,141 @@ export fn homefs_blocks_live(): u32 {
     block = block + 1
   }
   return live
+}
+
+// ============================================================================
+// Removal
+//
+// The B-tree has no delete: removing an entry from a copy-on-write node means
+// rewriting the path, merging underfull nodes, and pulling separators down
+// through the parents — a large amount of code whose bugs are silent, because
+// a tree that lost an entry looks exactly like a tree that never had it.
+//
+// Entries are tombstoned instead. A tombstone is a value no real entry can
+// take, written through the ordinary insert path, so removal reuses the
+// copy-on-write machinery that is already tested rather than adding a second
+// way to modify a tree.
+//
+// The tombstone is a distinct value rather than 0 because 0 already means
+// "absent", and a directory probes past collisions until it finds an empty
+// slot: filing a removal as 0 would end the probe early and hide every name
+// that had collided past it. A tombstone is skipped and the probe continues.
+//
+// What this costs is space — a tombstoned entry still occupies its slot — and
+// that is bounded by the fact that reclamation gives back everything the
+// removed object held, which is where the bytes actually are.
+// ============================================================================
+
+const BTREE_TOMBSTONE: u64 = 0xFFFFFFFFFFFFFFFF
+
+// Remove `name` from `dir_id`. Returns 1 if it was there. The caller commits.
+export fn homefs_unlink(dir_id: u64, name_ptr: u64, name_len: u32): u32 {
+  if volume_mounted == 0 { return 0 }
+  let dir: u32 = homefs_object_record(dir_id)
+  if dir == 0 { return 0 }
+  if obj_kind(dir) != OBJ_KIND_DIR { return 0 }
+  let tree: u32 = obj_data_root(dir)
+  if tree == 0 { return 0 }
+
+  // Find the slot this name is actually filed under, which is not necessarily
+  // its bare hash — collisions probe.
+  let base: u64 = name_hash(name_ptr, name_len)
+  var slot: u64 = 0
+  var child: u64 = 0
+  var probe: u32 = 0
+  while probe < NAME_PROBE_LIMIT {
+    let key: u64 = base + @as(u64, probe)
+    let value: u64 = homefs_btree_lookup(tree, key)
+    if value == 0 { probe = NAME_PROBE_LIMIT }
+    else {
+      if value != BTREE_TOMBSTONE {
+        let record: u32 = homefs_object_record(value)
+        if record != 0 and obj_name_matches(record, name_ptr, name_len) == 1 {
+          slot = key
+          child = value
+          probe = NAME_PROBE_LIMIT
+        } else { probe = probe + 1 }
+      } else { probe = probe + 1 }
+    }
+  }
+  if slot == 0 or child == 0 { return 0 }
+
+  // A directory has to be empty. Removing one with children would strand
+  // them: nothing else references them, so reclamation would free their
+  // blocks, and the objects would be gone with no record that they had been.
+  if homefs_object_kind(child) == OBJ_KIND_DIR {
+    if homefs_dir_count(child) != 0 { return 0 }
+  }
+
+  let unlinked: u32 = homefs_btree_insert(tree, slot, BTREE_TOMBSTONE)
+  if unlinked == 0 { return 0 }
+
+  // And drop the object itself from the object table, so nothing reaches its
+  // record or its extents and reclamation can give the blocks back.
+  var table: u32 = objtable_root()
+  if table == 0 { return 0 }
+  table = homefs_btree_insert(table, child, BTREE_TOMBSTONE)
+  if table == 0 { return 0 }
+  if objtable_set(table) == 0 { return 0 }
+
+  // The parent's record moves, like every modified object.
+  let parent_now: u32 = homefs_object_record(dir_id)
+  if parent_now == 0 { return 0 }
+  let fresh: u32 = obj_record_clone(parent_now)
+  if fresh == 0 { return 0 }
+  set_obj_data_root(fresh, unlinked)
+  let count: u64 = obj_size(parent_now)
+  if count > 0 { set_obj_size(fresh, count - 1) }
+  set_obj_generation(fresh, current_generation)
+  if objtable_put(dir_id, fresh) == 0 { return 0 }
+  return 1
+}
+
+// ============================================================================
+// Ownership and mode
+//
+// The VFS checks permissions against an inode, and a homefs file had no
+// fields to check — so opening one skipped the check entirely rather than
+// failing it. These live in the object record's spare space, past the name.
+//
+//   108  u32  mode
+//   112  u32  uid
+//   116  u32  gid
+// ============================================================================
+
+const OBJ_MODE_OFFSET: u32 = 108
+const OBJ_UID_OFFSET: u32 = 112
+const OBJ_GID_OFFSET: u32 = 116
+
+export fn homefs_object_mode(id: u64): u32 {
+  let record: u32 = homefs_object_record(id)
+  if record == 0 { return 0 }
+  return get32(block_addr(record), OBJ_MODE_OFFSET)
+}
+
+export fn homefs_object_uid(id: u64): u32 {
+  let record: u32 = homefs_object_record(id)
+  if record == 0 { return 0 }
+  return get32(block_addr(record), OBJ_UID_OFFSET)
+}
+
+export fn homefs_object_gid(id: u64): u32 {
+  let record: u32 = homefs_object_record(id)
+  if record == 0 { return 0 }
+  return get32(block_addr(record), OBJ_GID_OFFSET)
+}
+
+// Set an object's mode and owner. Copy-on-write like every other change to a
+// record, so a snapshot keeps the permissions it was taken with.
+export fn homefs_set_object_mode(id: u64, mode: u32, uid: u32, gid: u32): u32 {
+  if volume_mounted == 0 { return 0 }
+  let record: u32 = homefs_object_record(id)
+  if record == 0 { return 0 }
+  let fresh: u32 = obj_record_clone(record)
+  if fresh == 0 { return 0 }
+  put32(block_addr(fresh), OBJ_MODE_OFFSET, mode)
+  put32(block_addr(fresh), OBJ_UID_OFFSET, uid)
+  put32(block_addr(fresh), OBJ_GID_OFFSET, gid)
+  set_obj_generation(fresh, current_generation)
+  return objtable_put(id, fresh)
 }
