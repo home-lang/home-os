@@ -1,8 +1,6 @@
 // home-os USB — xHCI host controller discovery
 //
-// STUB(S6): nothing mounts a USB disk through the VFS, so no path in the rest
-// of the kernel resolves onto one, and the HID keyboard report layout is
-// decoded but never exercised — attaching a usb-kbd takes keystrokes away
+// STUB(S6): the HID keyboard report layout is decoded but never exercised — attaching a usb-kbd takes keystrokes away
 // from the PS/2 controller, so the gate drives a mouse instead and the
 // keyboard branch is the one line of this driver no test reaches.
 // Blocks Phase 7a. MASTER_PLAN §7.
@@ -15,8 +13,10 @@
 // layer: boot protocol, the interrupt endpoint, and report polling. The boot
 // gate reads a known block off a USB disk, writes another, reads it back, and
 // then checks the host image, because a device accepting a write is not the
-// same as the write reaching the media; and it moves an emulated mouse and
-// reads the movement back off the interrupt endpoint.
+// same as the write reaching the media; it moves an emulated mouse and reads
+// the movement back off the interrupt endpoint; and the disk is registered as
+// /dev/usb0, so the rest of the kernel reaches it through a path rather than
+// through this driver's own API.
 
 import "../core/foundation.home" as foundation
 import "pci.home" as pci
@@ -1310,3 +1310,87 @@ export fn usb_hid_init(slot: u32): u32 {
 }
 
 export fn usb_hid_device_slot(): u32 { return hid_slot }
+
+// ============================================================================
+// Block-device interface
+//
+// What /dev/usb0 is made of. Offset-addressed rather than streamed, because
+// the device has no cursor of its own — the file descriptor above holds that.
+//
+// Both directions go through the one 4 KiB staging buffer the SCSI layer
+// already owns, a block at a time, so a request that straddles a block
+// boundary is split here rather than being refused or silently truncated.
+// ============================================================================
+
+var block_device_slot: u32 = 0
+
+// Bind these operations to an addressed mass-storage device. Returns 1 when
+// the device is one that can serve them.
+export fn usb_block_attach(slot: u32): u32 {
+  if storage_block_size == 0 { return 0 }
+  if bulk_in_dci == 0 or bulk_out_dci == 0 { return 0 }
+  block_device_slot = slot
+  return 1
+}
+
+export fn usb_block_attached(): u32 { return block_device_slot }
+
+export fn usb_block_read(buffer: u64, size: u32, offset: u64): u32 {
+  if block_device_slot == 0 or storage_block_size == 0 { return 0 }
+
+  var done: u32 = 0
+  while done < size {
+    let position: u64 = offset + @as(u64, done)
+    let lba: u32 = @as(u32, position / @as(u64, storage_block_size))
+    let within: u32 = @as(u32, position % @as(u64, storage_block_size))
+    var chunk: u32 = storage_block_size - within
+    if chunk > size - done { chunk = size - done }
+
+    if usb_storage_read_block(block_device_slot, lba) == 0 { return done }
+    var i: u32 = 0
+    while i < chunk {
+      @as(*u8, @ptrFromInt(buffer + @as(u64, done) + @as(u64, i))).* =
+        usb_storage_data_byte(within + i)
+      i = i + 1
+    }
+    done = done + chunk
+  }
+  return done
+}
+
+export fn usb_block_write(buffer: u64, size: u32, offset: u64): u32 {
+  if block_device_slot == 0 or storage_block_size == 0 { return 0 }
+
+  var done: u32 = 0
+  while done < size {
+    let position: u64 = offset + @as(u64, done)
+    let lba: u32 = @as(u32, position / @as(u64, storage_block_size))
+    let within: u32 = @as(u32, position % @as(u64, storage_block_size))
+    var chunk: u32 = storage_block_size - within
+    if chunk > size - done { chunk = size - done }
+
+    // A partial block is read first and modified, rather than written with
+    // the rest of the block zeroed. Writing 16 bytes should not destroy the
+    // other 496.
+    if chunk < storage_block_size {
+      if usb_storage_read_block(block_device_slot, lba) == 0 { return done }
+    } else {
+      if usb_storage_clear_data() == 0 { return done }
+    }
+
+    var i: u32 = 0
+    while i < chunk {
+      let byte: u8 = @as(*u8, @ptrFromInt(buffer + @as(u64, done) + @as(u64, i))).*
+      if usb_storage_set_data_byte(within + i, byte) == 0 { return done }
+      i = i + 1
+    }
+    if usb_storage_write_block(block_device_slot, lba) == 0 { return done }
+    done = done + chunk
+  }
+  return done
+}
+
+// The addresses devfs registers, since a device node holds functions rather
+// than names.
+export fn usb_block_read_fn(): u64 { return @intFromPtr(&usb_block_read) }
+export fn usb_block_write_fn(): u64 { return @intFromPtr(&usb_block_write) }

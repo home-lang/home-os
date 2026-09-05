@@ -46,6 +46,7 @@ import "net/netdev.home" as netdev
 import "crypto/crypto_selftest.home" as crypto_selftest
 import "drivers/acpi.home" as acpi
 import "fs/homefs.home" as homefs
+import "fs/devfs.home" as devfs
 import "drivers/usb.home" as usb
 import "net/arp.home" as arp
 
@@ -523,6 +524,23 @@ export fn kernel_main(magic: u32, boot_info: u32): never {
                             // than the device's own buffer.
                             if usb_storage_roundtrip(slot) == 1 {
                               foundation.serial_write_string("[USB] block 1 written and read back\n")
+                            }
+
+                            // And expose it as a device node, so the rest of
+                            // the kernel reaches the disk through a path
+                            // rather than through the USB driver's own API.
+                            if usb.usb_block_attach(slot) == 1 {
+                              init_usb_device_name()
+                              if devfs.devfs_register_device(
+                                    @intFromPtr(&usb_device_name),
+                                    devfs.DEV_TYPE_BLOCK, 8, 0,
+                                    usb.usb_block_read_fn(),
+                                    usb.usb_block_write_fn())
+                                  != devfs.DEVFS_NO_DEVICE {
+                                if vfs_usb_roundtrip() == 1 {
+                                  foundation.serial_write_string("[USB] /dev/usb0 round-trip through the VFS\n")
+                                }
+                              }
                             }
                           }
                         }
@@ -1167,3 +1185,104 @@ fn usb_storage_roundtrip(slot: u32): u32 {
 }
 
 var usb_write_tag: [u8; 17] = undefined
+
+// The device node's name, and the path it is reached by.
+var usb_device_name: [u8; 5] = undefined      // "usb0"
+var usb_device_path: [u8; 10] = undefined     // "/dev/usb0"
+var usb_dev_out: [u8; 32] = undefined
+var usb_dev_in: [u8; 32] = undefined
+
+fn init_usb_device_name() {
+  usb_device_name[0] = 117   // 'u'
+  usb_device_name[1] = 115   // 's'
+  usb_device_name[2] = 98    // 'b'
+  usb_device_name[3] = 48    // '0'
+  usb_device_name[4] = 0
+
+  usb_device_path[0] = 47    // '/'
+  usb_device_path[1] = 100   // 'd'
+  usb_device_path[2] = 101   // 'e'
+  usb_device_path[3] = 118   // 'v'
+  usb_device_path[4] = 47    // '/'
+  var i: u32 = 0
+  while i < 5 {
+    usb_device_path[5 + i] = usb_device_name[i]
+    i = i + 1
+  }
+}
+
+// Read the block the USB write path put at LBA 1, but through the VFS this
+// time: open /dev/usb0, pread at byte offset 512, and check the bytes are the
+// ones usb_storage_roundtrip wrote. Then write through the same descriptor
+// and read it back, so the write direction is exercised too.
+//
+// Reading the same bytes two ways is the point: the SCSI layer already
+// proved the disk holds them, so anything different here is the device node,
+// the descriptor, or the offset arithmetic between them.
+fn vfs_usb_roundtrip(): u32 {
+  let fd: u32 = filesystem.vfs_open(@intFromPtr(&usb_device_path), 2)
+  if fd == 0 { return 0 }
+
+  var i: u32 = 0
+  while i < 32 {
+    usb_dev_in[i] = 0
+    i = i + 1
+  }
+
+  if filesystem.vfs_pread(fd, @intFromPtr(&usb_dev_in), 17, 512) != 17 {
+    filesystem.vfs_close(fd)
+    return 0
+  }
+  var j: u32 = 0
+  while j < 17 {
+    if usb_dev_in[j] != usb_write_tag[j] {
+      filesystem.vfs_close(fd)
+      return 0
+    }
+    j = j + 1
+  }
+
+  // Write through the node at an offset inside block 2, then read it back.
+  // Inside a block rather than at its start, so a partial write that clobbers
+  // the rest of the block shows up as a failure on the next check.
+  var k: u32 = 0
+  while k < 16 {
+    usb_dev_out[k] = @as(u8, 200 - k * 3)
+    usb_dev_in[k] = 0
+    k = k + 1
+  }
+  if filesystem.vfs_pwrite(fd, @intFromPtr(&usb_dev_out), 16, 1024 + 8) != 16 {
+    filesystem.vfs_close(fd)
+    return 0
+  }
+  if filesystem.vfs_pread(fd, @intFromPtr(&usb_dev_in), 16, 1024 + 8) != 16 {
+    filesystem.vfs_close(fd)
+    return 0
+  }
+  var m: u32 = 0
+  while m < 16 {
+    if usb_dev_in[m] != usb_dev_out[m] {
+      filesystem.vfs_close(fd)
+      return 0
+    }
+    m = m + 1
+  }
+
+  // The bytes before the written span must still be zero: a partial write
+  // that rewrote the whole block would have cleared them to something else.
+  if filesystem.vfs_pread(fd, @intFromPtr(&usb_dev_in), 8, 1024) != 8 {
+    filesystem.vfs_close(fd)
+    return 0
+  }
+  var n: u32 = 0
+  while n < 8 {
+    if usb_dev_in[n] != 0 {
+      filesystem.vfs_close(fd)
+      return 0
+    }
+    n = n + 1
+  }
+
+  filesystem.vfs_close(fd)
+  return 1
+}

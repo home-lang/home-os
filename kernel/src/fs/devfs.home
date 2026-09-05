@@ -1,16 +1,32 @@
-// home-os DevFS
-// Device filesystem (/dev)
+// home-os DevFS — the device nodes under /dev
+//
+// A device node is a name, a kind, and a pair of functions. Reads and writes
+// are offset-addressed rather than streamed, because the devices this holds
+// are block devices: a disk has no cursor of its own, and giving it one in
+// the node would mean two readers of the same device sharing a position.
+// The file descriptor above holds the cursor; this layer takes the offset.
+//
+// The dispatch used to be absent: devfs_read checked that a function pointer
+// was non-zero and then returned 0 without calling it, so every registered
+// device read as empty and every write was discarded. Nothing called it, so
+// nothing noticed.
 
 import "../core/foundation.home" as foundation
 
 const DEVFS_MAX_DEVICES: u32 = 128
+const DEVFS_NAME_MAX: u32 = 32
 
-const DEV_TYPE_CHAR: u32 = 1
-const DEV_TYPE_BLOCK: u32 = 2
+export const DEV_TYPE_CHAR: u32 = 1
+export const DEV_TYPE_BLOCK: u32 = 2
+
+// A device's read and write have the same shape: move `size` bytes between
+// `buffer` and the device at `offset`, and return how many were moved.
+type DeviceOp = fn(u64, u32, u64): u32
 
 struct DeviceNode {
   name: [u8; 32],
-  type: u32,
+  name_len: u32,
+  kind: u32,
   major: u32,
   minor: u32,
   read_fn: u64,
@@ -23,73 +39,94 @@ var device_count: u32 = 0
 
 export fn devfs_init() {
   device_count = 0
-  foundation.serial_write_string("[DevFS] Initialized\n")
 }
 
-export fn devfs_register_device(name: u64, type: u32, major: u32, minor: u32, read_fn: u64, write_fn: u64): u32 {
-  if device_count >= DEVFS_MAX_DEVICES { return 0xFFFFFFFF }
-  
+export fn devfs_device_count(): u32 { return device_count }
+
+// Register a device. Returns its id, or DEVFS_NO_DEVICE.
+export const DEVFS_NO_DEVICE: u32 = 0xFFFFFFFF
+
+export fn devfs_register_device(name: u64, kind: u32, major: u32, minor: u32,
+                                read_fn: u64, write_fn: u64): u32 {
+  if device_count >= DEVFS_MAX_DEVICES { return DEVFS_NO_DEVICE }
+
+  let id: u32 = device_count
   var i: u32 = 0
-  while i < 32 {
-    devices[device_count].name[i] = @as(*u8, @ptrFromInt(name + i)).*
-    if devices[device_count].name[i] == 0 { break }
+  while i < DEVFS_NAME_MAX {
+    let c: u8 = @as(*u8, @ptrFromInt(name + @as(u64, i))).*
+    devices[id].name[i] = c
+    if c == 0 { break }
     i = i + 1
   }
-  
-  devices[device_count].type = type
-  devices[device_count].major = major
-  devices[device_count].minor = minor
-  devices[device_count].read_fn = read_fn
-  devices[device_count].write_fn = write_fn
-  devices[device_count].in_use = 1
-  
-  var id: u32 = device_count
+  // A name that filled the buffer has no terminator, and every later
+  // comparison would run off the end of it.
+  if i >= DEVFS_NAME_MAX { return DEVFS_NO_DEVICE }
+  devices[id].name_len = i
+
+  devices[id].kind = kind
+  devices[id].major = major
+  devices[id].minor = minor
+  devices[id].read_fn = read_fn
+  devices[id].write_fn = write_fn
+  devices[id].in_use = 1
   device_count = device_count + 1
-  
-  foundation.serial_write_string("[DevFS] Registered device: ")
-  
+
+  foundation.serial_write_string("[DevFS] registered /dev/")
+  foundation.serial_write_string(name)
   foundation.serial_write_string("\n")
-  
   return id
 }
 
+// Find a device by name. `name` is a NUL-terminated string.
 export fn devfs_open(name: u64): u32 {
   var i: u32 = 0
   while i < device_count {
     if devices[i].in_use == 1 {
-      var match: u32 = 1
+      var matched: u32 = 1
       var j: u32 = 0
-      while j < 32 {
-        if devices[i].name[j] != @as(*u8, @ptrFromInt(name + j)).* {
-          match = 0
-          break
-        }
-        if devices[i].name[j] == 0 { break }
+      while j <= devices[i].name_len {
+        let want: u8 = devices[i].name[j]
+        let got: u8 = @as(*u8, @ptrFromInt(name + @as(u64, j))).*
+        if want != got { matched = 0 }
+        if want == 0 { j = devices[i].name_len }
         j = j + 1
       }
-      
-      if match == 1 {
-        return i
-      }
+      if matched == 1 { return i }
     }
     i = i + 1
   }
-  
-  return 0xFFFFFFFF
+  return DEVFS_NO_DEVICE
 }
 
-export fn devfs_read(dev_id: u32, buffer: u64, size: u32): u32 {
+export fn devfs_name_at(id: u32, out: u64, max: u32): u32 {
+  if id >= device_count { return 0 }
+  var n: u32 = devices[id].name_len
+  if n > max { n = max }
+  var i: u32 = 0
+  while i < n {
+    @as(*u8, @ptrFromInt(out + @as(u64, i))).* = devices[id].name[i]
+    i = i + 1
+  }
+  return n
+}
+
+export fn devfs_kind_at(id: u32): u32 {
+  if id >= device_count { return 0 }
+  return devices[id].kind
+}
+
+export fn devfs_read(dev_id: u32, buffer: u64, size: u32, offset: u64): u32 {
   if dev_id >= device_count { return 0 }
+  if devices[dev_id].in_use == 0 { return 0 }
   if devices[dev_id].read_fn == 0 { return 0 }
-  
-  // Call read function (stub)
-  return 0
+  let op: DeviceOp = @ptrFromInt(devices[dev_id].read_fn)
+  return op(buffer, size, offset)
 }
 
-export fn devfs_write(dev_id: u32, buffer: u64, size: u32): u32 {
+export fn devfs_write(dev_id: u32, buffer: u64, size: u32, offset: u64): u32 {
   if dev_id >= device_count { return 0 }
+  if devices[dev_id].in_use == 0 { return 0 }
   if devices[dev_id].write_fn == 0 { return 0 }
-  
-  // Call write function (stub)
-  return 0
+  let op: DeviceOp = @ptrFromInt(devices[dev_id].write_fn)
+  return op(buffer, size, offset)
 }

@@ -5,6 +5,7 @@ import "foundation.home" as foundation
 import "memory.home" as memory
 import "vfs_permissions.home" as perms
 import "../fs/homefs.home" as homefs
+import "../fs/devfs.home" as devfs
 
 // ============================================================================
 // CONSTANTS
@@ -65,7 +66,10 @@ struct OpenFile {
   // descriptor belongs to exactly one of them, so every operation below
   // branches on this rather than trying to keep an inode in step with a file
   // the inode table does not hold.
-  homefs_object: u64
+  homefs_object: u64,
+  // The devfs device id, plus one — device id 0 is a real device, so 0 here
+  // has to keep meaning "not a device node".
+  device_id: u32
 }
 
 // ============================================================================
@@ -687,6 +691,55 @@ export fn vfs_homefs_resolve(path: u64): u64 {
   }
 }
 
+// ---------------------------------------------------------------------------
+// /dev routing
+//
+// A device node is not a file: it has no size, no inode-table entry, and its
+// reads are offset-addressed straight at the device. Descriptors that name
+// one carry the device id, the same way a homefs descriptor carries an object
+// id, so that no operation has to guess which of the three namespaces a
+// descriptor belongs to.
+// ---------------------------------------------------------------------------
+
+const DEV_PREFIX_LEN: u32 = 5      // "/dev/"
+
+// The device id a path names, or DEVFS_NO_DEVICE. A path that is not under
+// /dev also returns DEVFS_NO_DEVICE, which is how vfs_open knows to carry on.
+export fn vfs_dev_lookup(path: u64): u32 {
+  let p0: u8 = @as(*u8, @ptrFromInt(path)).*
+  let p1: u8 = @as(*u8, @ptrFromInt(path + 1)).*
+  let p2: u8 = @as(*u8, @ptrFromInt(path + 2)).*
+  let p3: u8 = @as(*u8, @ptrFromInt(path + 3)).*
+  let p4: u8 = @as(*u8, @ptrFromInt(path + 4)).*
+  if p0 != 47 or p1 != 100 or p2 != 101 or p3 != 118 or p4 != 47 {
+    return devfs.DEVFS_NO_DEVICE
+  }
+  return devfs.devfs_open(path + @as(u64, DEV_PREFIX_LEN))
+}
+
+fn dev_open(path: u64, flags: u32): u32 {
+  let device: u32 = vfs_dev_lookup(path)
+  if device == devfs.DEVFS_NO_DEVICE { return 0 }
+
+  var i: u32 = 0
+  while i < MAX_OPEN_FILES {
+    if open_files[i].ref_count == 0 {
+      open_files[i].ino = 0
+      open_files[i].offset = 0
+      open_files[i].flags = flags
+      open_files[i].ref_count = 1
+      open_files[i].homefs_object = 0
+      // Stored one past the id so that 0 keeps meaning "not a device", the
+      // same convention homefs_object uses. Device id 0 is a real device.
+      open_files[i].device_id = device + 1
+      open_file_count = open_file_count + 1
+      return i + 3
+    }
+    i = i + 1
+  }
+  return 0
+}
+
 // Build the Inode a permission check needs out of a homefs object record.
 // The check itself is the same code the inode table uses — a second
 // implementation of "may this user read this file" is a second thing to get
@@ -750,6 +803,7 @@ fn homefs_open(path: u64, flags: u32): u32 {
       open_files[i].flags = flags
       open_files[i].ref_count = 1
       open_files[i].homefs_object = object
+      open_files[i].device_id = 0
       open_file_count = open_file_count + 1
       return i + 3
     }
@@ -806,6 +860,10 @@ fn homefs_create_at(path: u64): u64 {
 
 export fn vfs_open(path: u64, flags: u32): u32 {
   if open_file_count >= MAX_OPEN_FILES { return 0 }
+
+  // A device node, checked first: /dev is not a place the inode table should
+  // be inventing files.
+  if vfs_dev_lookup(path) != devfs.DEVFS_NO_DEVICE { return dev_open(path, flags) }
 
   // A path under the homefs mount point belongs to homefs. Checked before
   // path_resolve because the inode table would happily create an entry for
@@ -872,9 +930,10 @@ export fn vfs_open(path: u64, flags: u32): u32 {
       open_files[i].offset = 0
       open_files[i].flags = flags
       open_files[i].ref_count = 1
-      // Slots are reused, and a stale object id here would send this
-      // descriptor's reads to whatever file used the slot before it.
+      // Slots are reused, and a stale object or device id here would send
+      // this descriptor's reads to whatever used the slot before it.
       open_files[i].homefs_object = 0
+      open_files[i].device_id = 0
 
       open_file_count = open_file_count + 1
 
@@ -905,9 +964,10 @@ export fn vfs_close(fd: u32): u32 {
     
     if open_files[idx].ref_count == 0 {
       open_file_count = open_file_count - 1
-      // The slot is free for reuse, and a stale object id in it would send
-      // the next descriptor's reads to this file.
+      // The slot is free for reuse, and a stale object or device id in it
+      // would send the next descriptor's reads to this file.
       open_files[idx].homefs_object = 0
+      open_files[idx].device_id = 0
     }
     
     return 0
@@ -923,6 +983,13 @@ export fn vfs_read(fd: u32, buffer: u64, count: u64): u64 {
   if idx >= MAX_OPEN_FILES { return 0 }
 
   if open_files[idx].ref_count == 0 { return 0 }
+
+  if open_files[idx].device_id != 0 {
+    let moved: u32 = devfs.devfs_read(open_files[idx].device_id - 1, buffer,
+                                      @as(u32, count), open_files[idx].offset)
+    open_files[idx].offset = open_files[idx].offset + @as(u64, moved)
+    return @as(u64, moved)
+  }
 
   // A homefs file's permissions were checked at open, against its own mode
   // and owner, by the same perms code the inode path uses below.
@@ -1009,6 +1076,13 @@ export fn vfs_write(fd: u32, buffer: u64, count: u64): u64 {
   if idx >= MAX_OPEN_FILES { return 0 }
 
   if open_files[idx].ref_count == 0 { return 0 }
+
+  if open_files[idx].device_id != 0 {
+    let moved: u32 = devfs.devfs_write(open_files[idx].device_id - 1, buffer,
+                                       @as(u32, count), open_files[idx].offset)
+    open_files[idx].offset = open_files[idx].offset + @as(u64, moved)
+    return @as(u64, moved)
+  }
 
   if open_files[idx].homefs_object != 0 {
     let put: u32 = homefs.homefs_file_write(open_files[idx].homefs_object,
@@ -1106,6 +1180,11 @@ export fn vfs_lseek(fd: u32, offset: u64, whence: u32): u64 {
     if offset > 0xFFFFFFFFFFFFFFFF - open_files[idx].offset { return 0 }
     open_files[idx].offset = open_files[idx].offset + offset
   } else if whence == 2 {
+    // A device node has no end. Seeking to one is a question with no answer,
+    // so the cursor is left where it was rather than moved somewhere invented.
+    if open_files[idx].device_id != 0 {
+      return open_files[idx].offset
+    }
     if open_files[idx].homefs_object != 0 {
       let size: u64 = homefs.homefs_object_size(open_files[idx].homefs_object)
       if offset > 0xFFFFFFFFFFFFFFFF - size { return 0 }
@@ -1702,6 +1781,11 @@ export fn vfs_pread(fd: u32, buffer: u64, count: u64, offset: u64): u64 {
 
   if open_files[idx].ref_count == 0 { return 0 }
 
+  if open_files[idx].device_id != 0 {
+    return @as(u64, devfs.devfs_read(open_files[idx].device_id - 1, buffer,
+                                     @as(u32, count), offset))
+  }
+
   if open_files[idx].homefs_object != 0 {
     return @as(u64, homefs.homefs_file_read(open_files[idx].homefs_object,
                                             offset, buffer, @as(u32, count)))
@@ -1764,6 +1848,11 @@ export fn vfs_pwrite(fd: u32, buffer: u64, count: u64, offset: u64): u64 {
   if idx >= MAX_OPEN_FILES { return 0 }
 
   if open_files[idx].ref_count == 0 { return 0 }
+
+  if open_files[idx].device_id != 0 {
+    return @as(u64, devfs.devfs_write(open_files[idx].device_id - 1, buffer,
+                                      @as(u32, count), offset))
+  }
 
   if open_files[idx].homefs_object != 0 {
     let put: u32 = homefs.homefs_file_write(open_files[idx].homefs_object,
@@ -1936,12 +2025,17 @@ export fn vfs_chroot(path: u64): u32 {
   return 0
 }
 
-// The pseudo-filesystems. Each needs a mount point and a set of synthetic
+// The pseudo-filesystems. procfs and sysfs each still need a set of synthetic
 // inodes generated on lookup, which needs the per-filesystem operation table
-// that VFS does not have yet. They create their mount directory so paths
-// under them resolve, and report that they are not backed.
+// VFS does not have yet; they report that they are not backed.
+//
+// devfs is backed: a path under /dev resolves to a registered device node and
+// reads and writes reach the device. It is handled by the routing below
+// rather than by synthetic inodes, for the same reason homefs is — a device
+// node has no inode-table entry to keep in step.
 export fn devfs_init() {
-  foundation.serial_write_string("[Filesystem] devfs: mount point only, no device nodes yet\n")
+  devfs.devfs_init()
+  foundation.serial_write_string("[Filesystem] devfs: device nodes under /dev\n")
 }
 
 export fn procfs_init() {
