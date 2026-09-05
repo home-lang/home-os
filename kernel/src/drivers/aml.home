@@ -294,8 +294,14 @@ fn term(): u32 {
       fail()
       return 0
     }
-    // The body is executable AML, which this parser does not interpret.
-    aml_pos = start + length
+    let end: u32 = start + length
+    let name: u32 = name_string()
+    // MethodFlags: the low three bits are the argument count.
+    let flags: u8 = take()
+    register_method(name, aml_pos, end, @as(u32, flags & 0x07))
+    // The body is executable AML. It is not walked here — it declares
+    // nothing — but it is now reachable through aml_call.
+    aml_pos = end
     return 1
   }
 
@@ -429,6 +435,8 @@ export fn aml_parse(base: u64, length: u32): u32 {
 
 export fn aml_reset() {
   aml_names = 0
+  method_count = 0
+  methods_dropped = 0
   aml_methods = 0
   aml_devices = 0
   var i: u32 = 0
@@ -458,4 +466,594 @@ export fn aml_sleep_typ_a(state: u32): u32 {
 export fn aml_sleep_typ_b(state: u32): u32 {
   if state >= 6 { return 0 }
   return sleep_b[state]
+}
+
+// ============================================================================
+// Method execution
+//
+// The declarations above build a namespace; this runs the executable AML
+// inside a method body. The subset is deliberate and its edge is sharp:
+// integers, the eight locals and seven arguments, arithmetic and logic,
+// If/Else/While, Return and Store.
+//
+// Everything outside that subset — a field read, a buffer, a package element,
+// a reference, a call to a method this parser did not see — makes evaluation
+// *refuse*, and a refused evaluation propagates: the caller is told the method
+// could not be run rather than handed a number. That is the whole design
+// decision here. An interpreter that guessed at an unimplemented opcode would
+// return plausible integers from methods it does not understand, and the
+// caller has no way to tell those from real ones.
+//
+// This is enough to call the simple methods firmware actually writes for
+// power transitions. It is not enough for a method that touches hardware
+// through an operation region, and the refusal is how you find that out.
+// ============================================================================
+
+// QEMU's DSDT alone declares a hundred methods, and a table that overflowed
+// silently would drop whichever ones came last — which is how _PTS, declared
+// late in that table, went missing while the walk reported finding it.
+const AML_MAX_METHODS: u32 = 256
+const AML_MAX_DEPTH: u32 = 16
+
+var method_name: [u32; 256] = undefined
+var method_start: [u32; 256] = undefined
+var method_end: [u32; 256] = undefined
+var method_argc: [u32; 256] = undefined
+var method_count: u32 = 0
+// Methods the table had no room for. Counted rather than ignored: a lookup
+// that misses is otherwise indistinguishable from a method the firmware does
+// not declare.
+var methods_dropped: u32 = 0
+
+// Execution state. One frame: this interpreter does not recurse into another
+// method while one is running, and says so rather than sharing the frame.
+var aml_local: [u32; 8] = undefined
+var aml_arg: [u32; 7] = undefined
+var aml_result: u32 = 0
+var aml_returned: u32 = 0
+var aml_refused: u32 = 0
+var aml_running: u32 = 0
+var aml_depth: u32 = 0
+
+// Opcodes this interpreter executes.
+const OP_LOCAL0: u8 = 0x60
+const OP_LOCAL7: u8 = 0x67
+const OP_ARG0: u8 = 0x68
+const OP_ARG6: u8 = 0x6E
+const OP_STORE: u8 = 0x70
+const OP_ADD: u8 = 0x72
+const OP_SUBTRACT: u8 = 0x74
+const OP_INCREMENT: u8 = 0x75
+const OP_DECREMENT: u8 = 0x76
+const OP_MULTIPLY: u8 = 0x77
+const OP_DIVIDE: u8 = 0x78
+const OP_SHIFT_LEFT: u8 = 0x79
+const OP_SHIFT_RIGHT: u8 = 0x7A
+const OP_AND: u8 = 0x7B
+const OP_NAND: u8 = 0x7C
+const OP_OR: u8 = 0x7D
+const OP_NOR: u8 = 0x7E
+const OP_XOR: u8 = 0x7F
+const OP_NOT: u8 = 0x80
+const OP_LAND: u8 = 0x90
+const OP_LOR: u8 = 0x91
+const OP_LNOT: u8 = 0x92
+const OP_LEQUAL: u8 = 0x93
+const OP_LGREATER: u8 = 0x94
+const OP_LLESS: u8 = 0x95
+const OP_IF: u8 = 0xA0
+const OP_ELSE: u8 = 0xA1
+const OP_WHILE: u8 = 0xA2
+const OP_NOOP: u8 = 0xA3
+const OP_RETURN: u8 = 0xA4
+const OP_BREAK: u8 = 0xA5
+const OP_BREAKPOINT: u8 = 0xCC
+
+// A while loop that never terminates would hang the kernel in firmware code.
+// Firmware loops are short; this bound is generous and finite.
+const AML_MAX_ITERATIONS: u32 = 100000
+
+fn refuse() {
+  aml_refused = 1
+}
+
+// A target for Store and for the third operand of the arithmetic operators.
+// Returns 1 if it consumed and applied a target, 0 if the target was the null
+// one (Zero), and refuses for anything it cannot write.
+fn store_target(value: u32): u32 {
+  let op: u8 = at(aml_pos)
+  if op == OP_ZERO {
+    // The null target: the operator's value is its result and nothing is
+    // written. Every arithmetic opcode carries one.
+    aml_pos = aml_pos + 1
+    return 0
+  }
+  if op >= OP_LOCAL0 and op <= OP_LOCAL7 {
+    aml_pos = aml_pos + 1
+    aml_local[@as(u32, op - OP_LOCAL0)] = value
+    return 1
+  }
+  if op >= OP_ARG0 and op <= OP_ARG6 {
+    aml_pos = aml_pos + 1
+    aml_arg[@as(u32, op - OP_ARG0)] = value
+    return 1
+  }
+  if op == OP_EXT_PREFIX and at(aml_pos + 1) == 0x31 {
+    // The debug object. Writes to it are diagnostics and are discarded, which
+    // is what it is for — not a refusal.
+    aml_pos = aml_pos + 2
+    return 1
+  }
+  // A named object, a field, an index, a reference. Writing any of those
+  // needs a mutable namespace or hardware access, neither of which exists
+  // here, and pretending the write happened would let a method appear to
+  // succeed while changing nothing.
+  refuse()
+  return 0
+}
+
+// Evaluate one TermArg to an integer.
+fn eval(): u32 {
+  if aml_refused == 1 { return 0 }
+  if aml_pos >= aml_length {
+    refuse()
+    return 0
+  }
+
+  let op: u8 = at(aml_pos)
+
+  if op >= OP_LOCAL0 and op <= OP_LOCAL7 {
+    aml_pos = aml_pos + 1
+    return aml_local[@as(u32, op - OP_LOCAL0)]
+  }
+  if op >= OP_ARG0 and op <= OP_ARG6 {
+    aml_pos = aml_pos + 1
+    return aml_arg[@as(u32, op - OP_ARG0)]
+  }
+
+  if op == OP_ZERO or op == OP_ONE or op == OP_ONES or op == OP_BYTE_PREFIX or
+     op == OP_WORD_PREFIX or op == OP_DWORD_PREFIX or op == OP_QWORD_PREFIX {
+    return data_object()
+  }
+
+  // Binary arithmetic: two operands and a target.
+  if op == OP_ADD or op == OP_SUBTRACT or op == OP_MULTIPLY or
+     op == OP_SHIFT_LEFT or op == OP_SHIFT_RIGHT or op == OP_AND or
+     op == OP_NAND or op == OP_OR or op == OP_NOR or op == OP_XOR {
+    aml_pos = aml_pos + 1
+    let a: u32 = eval()
+    let b: u32 = eval()
+    if aml_refused == 1 { return 0 }
+    var value: u32 = 0
+    if op == OP_ADD { value = a + b }
+    if op == OP_SUBTRACT { value = a - b }
+    if op == OP_MULTIPLY { value = a * b }
+    if op == OP_SHIFT_LEFT {
+      if b < 32 { value = a << b }
+    }
+    if op == OP_SHIFT_RIGHT {
+      if b < 32 { value = a >> b }
+    }
+    if op == OP_AND { value = a & b }
+    if op == OP_NAND { value = ~(a & b) }
+    if op == OP_OR { value = a | b }
+    if op == OP_NOR { value = ~(a | b) }
+    if op == OP_XOR { value = a ^ b }
+    let stored: u32 = store_target(value)
+    return value
+  }
+
+  if op == OP_DIVIDE {
+    aml_pos = aml_pos + 1
+    let dividend: u32 = eval()
+    let divisor: u32 = eval()
+    if aml_refused == 1 { return 0 }
+    if divisor == 0 {
+      // AML says this is a fatal error. Refusing is this interpreter's
+      // version of that: the caller learns the method did not run rather
+      // than receiving a quotient that was never computed.
+      refuse()
+      return 0
+    }
+    let remainder: u32 = dividend % divisor
+    let quotient: u32 = dividend / divisor
+    let r_target: u32 = store_target(remainder)
+    let q_target: u32 = store_target(quotient)
+    return quotient
+  }
+
+  if op == OP_NOT {
+    aml_pos = aml_pos + 1
+    let a: u32 = eval()
+    if aml_refused == 1 { return 0 }
+    let value: u32 = ~a
+    let stored: u32 = store_target(value)
+    return value
+  }
+
+  if op == OP_INCREMENT or op == OP_DECREMENT {
+    aml_pos = aml_pos + 1
+    // The operand is both source and target, so it is read without consuming
+    // it and then written.
+    let before: u32 = aml_pos
+    let a: u32 = eval()
+    if aml_refused == 1 { return 0 }
+    var value: u32 = a + 1
+    if op == OP_DECREMENT { value = a - 1 }
+    aml_pos = before
+    let stored: u32 = store_target(value)
+    return value
+  }
+
+  // Logical operators yield Ones for true and Zero for false, which is what
+  // AML's predicates test.
+  if op == OP_LEQUAL or op == OP_LGREATER or op == OP_LLESS or
+     op == OP_LAND or op == OP_LOR {
+    aml_pos = aml_pos + 1
+    let a: u32 = eval()
+    let b: u32 = eval()
+    if aml_refused == 1 { return 0 }
+    var truth: u32 = 0
+    if op == OP_LEQUAL and a == b { truth = 1 }
+    if op == OP_LGREATER and a > b { truth = 1 }
+    if op == OP_LLESS and a < b { truth = 1 }
+    if op == OP_LAND and a != 0 and b != 0 { truth = 1 }
+    if op == OP_LOR {
+      if a != 0 or b != 0 { truth = 1 }
+    }
+    if truth == 1 { return 0xFFFFFFFF }
+    return 0
+  }
+
+  if op == OP_LNOT {
+    aml_pos = aml_pos + 1
+    let a: u32 = eval()
+    if aml_refused == 1 { return 0 }
+    if a == 0 { return 0xFFFFFFFF }
+    return 0
+  }
+
+  if op == OP_STORE {
+    aml_pos = aml_pos + 1
+    let value: u32 = eval()
+    if aml_refused == 1 { return 0 }
+    let stored: u32 = store_target(value)
+    return value
+  }
+
+  // A name in an expression position is either a call to a method or a read
+  // of a named object. Neither is evaluable here — a named object's value
+  // lives in a namespace this parser does not keep, and a method call would
+  // need a second frame.
+  refuse()
+  return 0
+}
+
+// Execute the statements in [start, end).
+fn exec_term_list(start: u32, end: u32) {
+  aml_pos = start
+  var guard: u32 = 0
+  while aml_pos < end {
+    if aml_refused == 1 { return }
+    if aml_returned == 1 { return }
+    guard = guard + 1
+    if guard > AML_MAX_ITERATIONS {
+      refuse()
+      return
+    }
+    exec_statement(end)
+  }
+}
+
+fn exec_statement(end: u32) {
+  let op: u8 = at(aml_pos)
+
+  if op == OP_NOOP or op == OP_BREAKPOINT {
+    aml_pos = aml_pos + 1
+    return
+  }
+
+  if op == OP_RETURN {
+    aml_pos = aml_pos + 1
+    aml_result = eval()
+    aml_returned = 1
+    return
+  }
+
+  if op == OP_IF {
+    aml_pos = aml_pos + 1
+    let pkg_start: u32 = aml_pos
+    let length: u32 = pkg_length()
+    if length == 0 {
+      refuse()
+      return
+    }
+    let body_end: u32 = pkg_start + length
+    let taken: u32 = eval()
+    if aml_refused == 1 { return }
+    let body_start: u32 = aml_pos
+
+    if taken != 0 {
+      exec_term_list(body_start, body_end)
+      if aml_refused == 1 or aml_returned == 1 { return }
+    }
+    aml_pos = body_end
+
+    // An Else, if there is one, belongs to this If.
+    if aml_pos < end {
+      if at(aml_pos) == OP_ELSE {
+        aml_pos = aml_pos + 1
+        let else_start: u32 = aml_pos
+        let else_length: u32 = pkg_length()
+        if else_length == 0 {
+          refuse()
+          return
+        }
+        let else_end: u32 = else_start + else_length
+        if taken == 0 {
+          exec_term_list(aml_pos, else_end)
+          if aml_refused == 1 or aml_returned == 1 { return }
+        }
+        aml_pos = else_end
+      }
+    }
+    return
+  }
+
+  if op == OP_WHILE {
+    aml_pos = aml_pos + 1
+    let pkg_start: u32 = aml_pos
+    let length: u32 = pkg_length()
+    if length == 0 {
+      refuse()
+      return
+    }
+    let loop_end: u32 = pkg_start + length
+    let predicate_at: u32 = aml_pos
+
+    var iterations: u32 = 0
+    loop {
+      aml_pos = predicate_at
+      let condition: u32 = eval()
+      if aml_refused == 1 { return }
+      if condition == 0 { break }
+      let body_start: u32 = aml_pos
+      exec_term_list(body_start, loop_end)
+      if aml_refused == 1 or aml_returned == 1 { return }
+      iterations = iterations + 1
+      if iterations >= AML_MAX_ITERATIONS {
+        // Firmware loops are short. One that is not is either malformed or
+        // waiting on hardware this interpreter cannot touch, and hanging the
+        // kernel inside it is not an option.
+        refuse()
+        return
+      }
+    }
+    aml_pos = loop_end
+    return
+  }
+
+  if op == OP_ELSE {
+    // An Else with no If before it. The stream is not where this thinks it
+    // is, and stepping over it would run its body unconditionally.
+    refuse()
+    return
+  }
+
+  // Anything else is an expression evaluated for its effect — a Store, an
+  // arithmetic operator with a target, a call. eval() refuses what it cannot
+  // do, so an unimplemented opcode stops the method rather than being
+  // skipped.
+  let discarded: u32 = eval()
+}
+
+// Register a method the namespace walk found, so it can be called later.
+fn register_method(name: u32, body_start: u32, body_end: u32, argc: u32) {
+  if method_count >= AML_MAX_METHODS {
+    methods_dropped = methods_dropped + 1
+    return
+  }
+  method_name[method_count] = name
+  method_start[method_count] = body_start
+  method_end[method_count] = body_end
+  method_argc[method_count] = argc
+  method_count = method_count + 1
+}
+
+export fn aml_method_registered(name: u32): u32 {
+  var i: u32 = 0
+  while i < method_count {
+    if method_name[i] == name { return 1 }
+    i = i + 1
+  }
+  return 0
+}
+
+// Call a method by its final NameSeg with one argument.
+//
+// Returns 1 when the method ran to completion; the value is then in
+// aml_call_result(). Returns 0 when it could not be run — because it is not
+// registered, or because it used something outside the subset above. Those
+// are different from a method that ran and returned 0, which is why the
+// result is not the return value.
+export fn aml_call(name: u32, arg0: u32): u32 {
+  if aml_running == 1 { return 0 }
+
+  var index: u32 = AML_MAX_METHODS
+  var i: u32 = 0
+  while i < method_count {
+    if method_name[i] == name { index = i }
+    i = i + 1
+  }
+  if index >= method_count { return 0 }
+
+  aml_running = 1
+  aml_refused = 0
+  aml_returned = 0
+  aml_result = 0
+  var j: u32 = 0
+  while j < 8 {
+    aml_local[j] = 0
+    j = j + 1
+  }
+  j = 0
+  while j < 7 {
+    aml_arg[j] = 0
+    j = j + 1
+  }
+  aml_arg[0] = arg0
+
+  let saved: u32 = aml_pos
+  exec_term_list(method_start[index], method_end[index])
+  aml_pos = saved
+  aml_running = 0
+
+  if aml_refused == 1 { return 0 }
+  return 1
+}
+
+export fn aml_call_result(): u32 { return aml_result }
+export fn aml_registered_methods(): u32 { return method_count }
+export fn aml_methods_dropped(): u32 { return methods_dropped }
+
+
+// ============================================================================
+// Interpreter self-test
+//
+// A hand-assembled AML method rather than one out of the firmware, because a
+// firmware method's result depends on which firmware, and this has to assert
+// an exact number. The program is:
+//
+//   Method (TEST, 1) {
+//     Local0 = 0
+//     Local1 = Arg0
+//     While (Local1 > 0) { Local0 += Local1;  Local1 -= 1 }
+//     If (Local0 > 100)  { Return (Local0 - 100) }
+//     Return (Local0)
+//   }
+//
+// It exercises a loop, a conditional, arithmetic with a target, locals and an
+// argument — and the two calls take different branches, so a conditional that
+// always went one way would fail one of them.
+// ============================================================================
+
+export const AML_INTERP_CHECKS: u32 = 5
+
+const AML_TEST_LENGTH: u32 = 80
+var aml_test_table: [u8; 80] = undefined
+
+fn build_test_table() {
+  var i: u32 = 0
+  while i < AML_TEST_LENGTH {
+    aml_test_table[i] = 0
+    i = i + 1
+  }
+  // A DSDT header: only the signature and the length are read by the parser,
+  // and the length is what its correctness check compares against.
+  aml_test_table[0] = 68    // 'D'
+  aml_test_table[1] = 83    // 'S'
+  aml_test_table[2] = 68    // 'D'
+  aml_test_table[3] = 84    // 'T'
+  aml_test_table[4] = @as(u8, AML_TEST_LENGTH & 0xFF)
+  aml_test_table[5] = 0
+  aml_test_table[6] = 0
+  aml_test_table[7] = 0
+
+  aml_test_table[36] = 0x14
+  aml_test_table[37] = 0x2B
+  aml_test_table[38] = 0x54
+  aml_test_table[39] = 0x45
+  aml_test_table[40] = 0x53
+  aml_test_table[41] = 0x54
+  aml_test_table[42] = 0x01
+  aml_test_table[43] = 0x70
+  aml_test_table[44] = 0x00
+  aml_test_table[45] = 0x60
+  aml_test_table[46] = 0x70
+  aml_test_table[47] = 0x68
+  aml_test_table[48] = 0x61
+  aml_test_table[49] = 0xA2
+  aml_test_table[50] = 0x10
+  aml_test_table[51] = 0x94
+  aml_test_table[52] = 0x61
+  aml_test_table[53] = 0x00
+  aml_test_table[54] = 0x70
+  aml_test_table[55] = 0x72
+  aml_test_table[56] = 0x60
+  aml_test_table[57] = 0x61
+  aml_test_table[58] = 0x00
+  aml_test_table[59] = 0x60
+  aml_test_table[60] = 0x70
+  aml_test_table[61] = 0x74
+  aml_test_table[62] = 0x61
+  aml_test_table[63] = 0x01
+  aml_test_table[64] = 0x00
+  aml_test_table[65] = 0x61
+  aml_test_table[66] = 0xA0
+  aml_test_table[67] = 0x0B
+  aml_test_table[68] = 0x94
+  aml_test_table[69] = 0x60
+  aml_test_table[70] = 0x0A
+  aml_test_table[71] = 0x64
+  aml_test_table[72] = 0xA4
+  aml_test_table[73] = 0x74
+  aml_test_table[74] = 0x60
+  aml_test_table[75] = 0x0A
+  aml_test_table[76] = 0x64
+  aml_test_table[77] = 0x00
+  aml_test_table[78] = 0xA4
+  aml_test_table[79] = 0x60
+}
+
+export fn aml_interpreter_selftest(): u32 {
+  var passed: u32 = 0
+  build_test_table()
+
+  aml_reset()
+  // 1: the synthetic table parses, exactly.
+  if aml_parse(@intFromPtr(&aml_test_table), AML_TEST_LENGTH) == 1 {
+    passed = passed + 1
+  }
+
+  // 2: and the method in it was registered.
+  //    'T','E','S','T' packed the way a NameSeg sits in the stream.
+  let test_name: u32 = 84 | (69 << 8) | (83 << 16) | (84 << 24)
+  if aml_method_registered(test_name) == 1 { passed = passed + 1 }
+
+  // 3: sum 1..10 is 55, which does not exceed 100, so the If is not taken.
+  if aml_call(test_name, 10) == 1 and aml_call_result() == 55 {
+    passed = passed + 1
+  }
+
+  // 4: sum 1..20 is 210, which does, so it returns 110. Different branch,
+  //    same method — a conditional that always went one way fails one of
+  //    these two.
+  if aml_call(test_name, 20) == 1 and aml_call_result() == 110 {
+    passed = passed + 1
+  }
+
+  // 5: a method that does not exist is refused rather than answered. The
+  //    call returning 0 is what tells a caller apart from a method that ran
+  //    and returned 0.
+  if aml_call(0x5A5A5A5A, 1) == 0 { passed = passed + 1 }
+
+  return passed
+}
+
+// How many of the firmware's own methods this interpreter can execute.
+//
+// Every method is called with argument 0 and the results counted, not used.
+// That is safe precisely because of the refusal rule: a method that reaches a
+// field, a buffer, a package or another method stops rather than doing
+// anything, so the only side effects possible are writes to locals and to the
+// debug object. What comes back is a measurement of the subset against real
+// firmware rather than against a program written to fit it.
+export fn aml_survey_methods(): u32 {
+  var ran: u32 = 0
+  var i: u32 = 0
+  while i < method_count {
+    if aml_call(method_name[i], 0) == 1 { ran = ran + 1 }
+    i = i + 1
+  }
+  return ran
 }
