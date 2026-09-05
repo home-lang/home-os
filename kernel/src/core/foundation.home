@@ -170,6 +170,70 @@ const ID_AA64MMFR1_PAN: u64 = 0xF00000     // bits [23:20]
 const CR4_SMAP: u64 = 0x200000             // bit 21
 const CPUID7_EBX_SMAP: u64 = 0x100000      // bit 20
 
+// ============================================================================
+// FLOATING POINT
+//
+// The compiler's floating-point instructions are SSE on x86-64 and the FP/SIMD
+// unit on ARM64, and neither is usable out of reset: x86-64 traps SSE while
+// CR0.EM is set or CR4.OSFXSR is clear, and ARM64 traps FP while CPACR_EL1.FPEN
+// says so. A kernel that runs float code without this faults on the first
+// instruction — loudly, which is the right failure, but it has to be turned on
+// before any of that code runs.
+//
+// Nothing here saves the register file across a context switch. Float code in
+// this kernel runs in init and in driver paths that do not yield, so no two
+// contexts hold live float state at once; a scheduler that preempts float code
+// would need fxsave/fxrstor (or the ARM64 equivalent) added to its switch, and
+// the check below is what would catch its absence.
+// ============================================================================
+
+const CR0_MP: u64 = 0x2                    // monitor coprocessor
+const CR0_EM: u64 = 0x4                    // emulate — must be clear for SSE
+const CR4_OSFXSR: u64 = 0x200              // bit 9: fxsave/fxrstor and SSE
+const CR4_OSXMMEXCPT: u64 = 0x400          // bit 10: SSE exceptions as #XF
+const CPACR_EL1_FPEN: u64 = 0x300000       // bits [21:20] = 0b11
+
+// Turn floating point on. Returns 1 once it is usable.
+export fn enable_floating_point(): u64 {
+  if @targetIs("x86_64") {
+    // EM must be clear or every SSE instruction raises #UD; MP set pairs
+    // with it so that FWAIT behaves. OSFXSR is what actually tells the CPU
+    // the OS is prepared to save the SSE state, and OSXMMEXCPT routes SSE
+    // exceptions to #XF rather than #UD, so a real numeric fault is
+    // distinguishable from an instruction that was never enabled.
+    var cr0: u64 = read_cr0()
+    cr0 = cr0 & ~CR0_EM
+    cr0 = cr0 | CR0_MP
+    write_cr0(cr0)
+    write_cr4(read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT)
+    return 1
+  } else {
+    // FPEN = 0b11 leaves FP and SIMD untrapped at both EL0 and EL1.
+    //
+    // Written as an else rather than a fallthrough because the dead-branch
+    // elimination that removes the other architecture's code only follows
+    // if/else. Left as a fallthrough, the ARM64 register access survived into
+    // the x86-64 build and the file stopped compiling for it.
+    arch_write_sysreg("cpacr_el1", arch_read_sysreg("cpacr_el1") | CPACR_EL1_FPEN)
+    return 1
+  }
+}
+
+// Whether floating point is enabled, read back from the control register
+// rather than from a flag this file set. A write that the CPU ignored — a
+// hypervisor trapping it, a bit that is RES0 on this part — is exactly what
+// this is for.
+export fn floating_point_enabled(): u64 {
+  if @targetIs("x86_64") {
+    if (read_cr0() & CR0_EM) != 0 { return 0 }
+    if (read_cr4() & CR4_OSFXSR) == 0 { return 0 }
+    return 1
+  } else {
+    if (arch_read_sysreg("cpacr_el1") & CPACR_EL1_FPEN) != CPACR_EL1_FPEN { return 0 }
+    return 1
+  }
+}
+
 // Whether this CPU implements the protection at all. 1 if it does.
 //
 // Neither architecture guarantees it: SMAP arrived with Broadwell, PAN with
@@ -257,6 +321,24 @@ export fn write_cr3(value: u64) {
     arch_write_sysreg("cr3", value)
   } else {
     arch_write_sysreg("ttbr0_el1", value)
+  }
+}
+
+// CR0 carries the mode and coprocessor controls. It has no ARM64 counterpart
+// worth mapping — the bits it holds are split across SCTLR_EL1 and CPACR_EL1
+// there — so the ARM64 side reads zero and writes nothing rather than
+// pretending some other register means the same thing. Callers guard with
+// @targetIs, as the floating-point setup above does.
+export fn read_cr0(): u64 {
+  if @targetIs("x86_64") {
+    return arch_read_sysreg("cr0")
+  }
+  return 0
+}
+
+export fn write_cr0(value: u64) {
+  if @targetIs("x86_64") {
+    arch_write_sysreg("cr0", value)
   }
 }
 
@@ -1006,4 +1088,60 @@ export fn foundation_init() {
   
   serial_write_string("[Foundation] Initialized\n")
   vga_write_string("Foundation OK\n")
+}
+
+// ============================================================================
+// Floating-point self-test
+//
+// Every check compares against an exact IEEE-754 bit pattern rather than
+// against a tolerance. A tolerance would pass for a path that computed
+// roughly the right thing by accident — and the failure this is guarding
+// against is not imprecision, it is a value reinterpreted instead of
+// converted, which is wrong by hundreds of orders of magnitude.
+//
+// Returns the number of checks that passed; the caller asserts the total.
+// ============================================================================
+
+export const FLOAT_TEST_CHECKS: u64 = 8
+
+export fn float_selftest(): u64 {
+  var passed: u64 = 0
+
+  if floating_point_enabled() == 1 { passed = passed + 1 }
+
+  // 1.5 + 2.25 = 3.75. 0x400E000000000000.
+  let sum: f64 = 1.5 + 2.25
+  if @bitCast(sum, u64) == 0x400E000000000000 { passed = passed + 1 }
+
+  // 1.5 * 2.25 = 3.375. 0x400B000000000000.
+  let product: f64 = 1.5 * 2.25
+  if @bitCast(product, u64) == 0x400B000000000000 { passed = passed + 1 }
+
+  // 1.0 / 3.0 is not representable, and its exact double is the point: a
+  // path that computed in singles, or that rounded twice, gives a different
+  // pattern here and nowhere else in this test.
+  let third: f64 = 1.0 / 3.0
+  if @bitCast(third, u64) == 0x3FD5555555555555 { passed = passed + 1 }
+
+  // An integer converted, not reinterpreted. 10 as a double is
+  // 0x4024000000000000; 10 reinterpreted would be 4.9e-323.
+  let ten: f64 = @as(f64, 10)
+  if @bitCast(ten, u64) == 0x4024000000000000 { passed = passed + 1 }
+
+  // And back, truncating toward zero.
+  let truncated: u64 = @as(u64, 3.75)
+  if truncated == 3 { passed = passed + 1 }
+
+  // Ordered comparison. Both directions, so a predicate that answers the
+  // same way regardless fails one of them.
+  if 1.5 < 2.25 and 2.25 > 1.5 and 1.5 <= 1.5 { passed = passed + 1 }
+
+  // Single precision is single precision even in a local: 0.1 as an f32 is
+  // 0x3DCCCCCD, which widens to 0x3FB99999A0000000 — not the double 0.1,
+  // which is 0x3FB999999999999A.
+  let single: f32 = 0.1
+  let widened: f64 = single
+  if @bitCast(widened, u64) == 0x3FB99999A0000000 { passed = passed + 1 }
+
+  return passed
 }
