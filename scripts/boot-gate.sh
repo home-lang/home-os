@@ -103,7 +103,8 @@ while IFS= read -r rel; do
         "$workdir/$base.s" -o "$workdir/$base.o" >/dev/null 2>&1 || true
 done <<< "$files"
 
-if ! "$ZIG" build-exe "$REPO_ROOT/kernel/src/boot.s" "$REPO_ROOT/kernel/src/idt_stubs.s" "$workdir"/*.o \
+if ! "$ZIG" build-exe "$REPO_ROOT/kernel/src/boot.s" "$REPO_ROOT/kernel/src/idt_stubs.s" \
+        "$REPO_ROOT/kernel/src/arch/x86_64/s3.s" "$workdir"/*.o \
         -target x86_64-freestanding -O ReleaseSafe \
         -T "$REPO_ROOT/kernel/linker.ld" \
         --name boot-gate -femit-bin="$workdir/boot-gate.elf" > "$workdir/link.log" 2>&1; then
@@ -485,6 +486,95 @@ if [ "${kbd_key:-0}" = "0" ]; then
     exit 1
 fi
 echo "boot-gate: usb keyboard reported keycode $kbd_key"
+
+# A third run: suspend to RAM and come back.
+#
+# Its own boot, because suspending ends a run — which is exactly why the main
+# gate cannot test this. The sequence is: let the kernel boot, tell it to
+# suspend, confirm from *outside* the guest that the machine actually went to
+# sleep, wake it, and require the kernel to say it came back.
+#
+# The outside confirmation matters. A kernel that printed "resumed" without
+# ever suspending would pass a serial-only check; QEMU reporting the VM as
+# suspended is the part the guest cannot fake.
+s3log="$workdir/serial-s3.log"
+S3_MONITOR_PORT=$(( MONITOR_PORT + 2 ))
+{
+    swait=0
+    while [ "$swait" -lt "$BOOT_TIMEOUT" ]; do
+        if [ -s "$s3log" ] && grep -qF '[Shell] serial console ready' "$s3log" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        swait=$(( swait + 1 ))
+    done
+    sleep 1
+    printf 'suspend\n'
+    sleep "$BOOT_TIMEOUT"
+} | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" \
+    -drive file="$disk",format=raw,if=ide,index=0 \
+    -serial stdio \
+    -monitor "telnet:127.0.0.1:$S3_MONITOR_PORT,server,nowait" \
+    -display none -vga std -no-reboot -m 256M > "$s3log" 2>&1 &
+s3_pid=$!
+
+# Wait for the guest to say it is going down, then for QEMU to agree it has.
+s3_suspended=0
+s3_deadline=$(( $(date +%s) + BOOT_TIMEOUT ))
+while kill -0 "$s3_pid" 2>/dev/null && [ "$(date +%s)" -lt "$s3_deadline" ]; do
+    if [ -s "$s3log" ] && grep -qF '[S3] suspending' "$s3log" 2>/dev/null; then
+        # `read -t` rather than a timeout(1) that macOS does not ship.
+        # The monitor answers "VM status: ..." and then waits for more input,
+        # so the read has to stop on that line rather than on end of stream.
+        s3_status=""
+        if exec 5<>"/dev/tcp/127.0.0.1/$S3_MONITOR_PORT" 2>/dev/null; then
+            printf 'info status\n' >&5
+            while IFS= read -r -t 2 line <&5; do
+                s3_status="$s3_status $line"
+                case "$line" in *"VM status"*) break ;; esac
+            done
+            exec 5<&-
+        fi
+        case "$s3_status" in
+            *suspended*) s3_suspended=1; break ;;
+        esac
+    fi
+    sleep 1
+done
+
+if [ "$s3_suspended" = 1 ]; then
+    # Wake it, the way a power button or a timer would.
+    (
+        exec 6<>"/dev/tcp/127.0.0.1/$S3_MONITOR_PORT" 2>/dev/null || exit 0
+        printf 'system_wakeup\n' >&6
+        sleep 3
+    )
+    wake_deadline=$(( $(date +%s) + 30 ))
+    while kill -0 "$s3_pid" 2>/dev/null && [ "$(date +%s)" -lt "$wake_deadline" ]; do
+        if grep -qF '[S3] resumed from suspend-to-RAM' "$s3log" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+fi
+kill "$s3_pid" 2>/dev/null
+wait "$s3_pid" 2>/dev/null
+
+if [ "$s3_suspended" != 1 ]; then
+    echo "" >&2
+    echo "RATCHET BROKEN: the machine did not enter S3." >&2
+    echo "Last 15 lines of that run's serial output:" >&2
+    tail -15 "$s3log" >&2
+    exit 1
+fi
+if ! grep -qF '[S3] resumed from suspend-to-RAM' "$s3log" 2>/dev/null; then
+    echo "" >&2
+    echo "RATCHET BROKEN: the machine suspended but did not resume." >&2
+    echo "Last 15 lines of that run's serial output:" >&2
+    tail -15 "$s3log" >&2
+    exit 1
+fi
+echo "boot-gate: suspended to RAM and resumed, confirmed suspended by QEMU"
 
 echo "boot-gate: $reached/$total milestones reached"
 

@@ -1,13 +1,6 @@
 // home-os ACPI Driver
 //
-// STUB(S7): there is no S3 suspend/resume. The transition itself is a write
-// to PM1_CNT and the sleep type for it is already read from the DSDT — what
-// is missing is the other half, resume: saving the CPU state, planting the
-// real-mode entry in the FACS waking vector, and restoring on the way back.
-// Nor can the boot gate exercise a suspend, since suspending ends the run.
-// Blocks Phase 7a. MASTER_PLAN §7.
-//
-// Table discovery and the AML *namespace* are implemented: the RSDP is found
+// Table discovery, the AML namespace and interpreter, and S3: the RSDP is found
 // in both places the specification allows, every table's checksum is verified
 // before it is trusted, the RSDT/XSDT is walked, and the DSDT's declarations
 // are parsed by drivers/aml.home. That is enough for the sleep types, which
@@ -15,7 +8,9 @@
 // takes both its port and its SLP_TYP from the firmware instead of assuming
 // either. Methods within an integer subset are executed too; 15 of the 100
 // QEMU's DSDT declares fall inside it, and the rest are refused rather than
-// half-run.
+// half-run. Suspend-to-RAM works both ways: the machine sleeps and climbs
+// back through arch/x86_64/s3.s, which is where the firmware's real-mode
+// resume lands.
 
 import "../core/foundation.home" as foundation
 import "aml.home" as aml
@@ -60,6 +55,10 @@ fn le64(base: u64, offset: u32): u64 {
 // zero modulo 256. Skipping it is how a kernel ends up parsing a table that
 // firmware never wrote — the signature alone is four bytes and appears in
 // unrelated memory often enough to matter.
+fn put32(base: u64, offset: u32, value: u32) {
+  @as(*u32, @ptrFromInt(base + @as(u64, offset))).* = value
+}
+
 fn checksum_ok(base: u64, length: u32): u32 {
   var sum: u32 = 0
   var i: u32 = 0
@@ -159,6 +158,7 @@ export fn acpi_init() {
 
   parse_fadt()
   parse_dsdt()
+  locate_facs()
   parse_madt()
 
   acpi_initialized = 1
@@ -373,4 +373,97 @@ export fn acpi_reparse_dsdt(): u32 {
   aml.aml_reset()
   dsdt_parsed = aml.aml_parse(dsdt_address, dsdt_length)
   return dsdt_parsed
+}
+
+// ============================================================================
+// S3 suspend and resume
+//
+// The transition is a write to PM1_CNT with the sleep type the DSDT declares.
+// The hard half is coming back: the firmware resumes by jumping to the
+// physical address in the FACS waking vector, in real mode, with paging off.
+// arch/x86_64/s3.s is the code that climbs from there back to long mode, and
+// this is what puts it where the firmware will jump to and records the state
+// it restores.
+//
+// Both addresses are fixed and shared with that file: the trampoline is
+// copied to 0x8000 and its save area is 0x9000. They are below 1 MB because a
+// real-mode far jump cannot reach anything else, and page-aligned because
+// that is what a resume vector is expected to be.
+// ============================================================================
+
+const S3_TRAMPOLINE: u64 = 0x8000
+const S3_SAVE: u64 = 0x9000
+
+extern fn asm_s3_suspend(pm1a_port: u64, pm1a_value: u64, pm1b_port: u64, pm1b_value: u64): u64
+extern fn s3_trampoline_start()
+extern fn s3_trampoline_end()
+
+var facs_address: u64 = 0
+
+export fn acpi_facs_address(): u64 { return facs_address }
+
+// The FACS is named by the FADT, in the same two-pointer arrangement as the
+// DSDT: a 32-bit field at offset 36 and a 64-bit one at 132 that supersedes it.
+fn locate_facs() {
+  let fadt: u64 = acpi_find_table(70, 65, 67, 80)
+  if fadt == 0 { return }
+  var candidate: u64 = @as(u64, le32(fadt, 36))
+  let fadt_length: u32 = le32(fadt, 4)
+  if fadt_length >= 140 {
+    let extended: u64 = le64(fadt, 132)
+    if extended != 0 { candidate = extended }
+  }
+  if candidate == 0 { return }
+  // "FACS". Unlike the other tables it carries no checksum, so the signature
+  // is the whole of the validation available.
+  if signature_matches(candidate, 70, 65, 67, 83) == 0 { return }
+  facs_address = candidate
+}
+
+// Whether this machine can be suspended: firmware that offers S3, a control
+// port to write it to, and a FACS to leave the waking vector in. All three
+// are required, and saying which is missing beats reporting "cannot suspend".
+export fn acpi_s3_available(): u32 {
+  if aml.aml_sleep_known(3) == 0 { return 0 }
+  if fadt_found == 0 or pm1a_control_block == 0 { return 0 }
+  if facs_address == 0 { return 0 }
+  return 1
+}
+
+// Put the machine into S3 and come back. Returns 1 if it suspended and
+// resumed, 0 if it could not be suspended at all.
+//
+// A caller cannot tell those apart from the machine's behaviour — a suspend
+// that never happened looks exactly like one that resumed instantly — which
+// is why the assembly reports it rather than leaving the caller to guess.
+export fn acpi_suspend_s3(): u32 {
+  if acpi_s3_available() == 0 { return 0 }
+
+  // The trampoline, copied where the firmware will jump.
+  let source: u64 = @intFromPtr(&s3_trampoline_start)
+  let length: u32 = @as(u32, @intFromPtr(&s3_trampoline_end) - source)
+  if length == 0 or length > 4096 { return 0 }
+  @memcpy(@as(*u8, @ptrFromInt(S3_TRAMPOLINE)), @as(*u8, @ptrFromInt(source)),
+          length)
+
+  // The waking vector. The 32-bit field is the real-mode entry every firmware
+  // supports; the 64-bit one is cleared, because a firmware that honoured it
+  // would jump to the trampoline in long mode, where its first instruction is
+  // sixteen-bit code.
+  put32(facs_address, 12, @as(u32, S3_TRAMPOLINE))
+  if le32(facs_address, 4) >= 32 {
+    put32(facs_address, 24, 0)
+    put32(facs_address, 28, 0)
+  }
+
+  let value_a: u64 = @as(u64, (aml.aml_sleep_typ_a(3) << 10) | SLP_EN)
+  var port_b: u64 = 0
+  var value_b: u64 = 0
+  if pm1b_control_block != 0 {
+    port_b = @as(u64, pm1b_control_block)
+    value_b = @as(u64, (aml.aml_sleep_typ_b(3) << 10) | SLP_EN)
+  }
+
+  return @as(u32, asm_s3_suspend(@as(u64, pm1a_control_block), value_a,
+                                 port_b, value_b))
 }
