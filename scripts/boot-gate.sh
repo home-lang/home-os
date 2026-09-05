@@ -412,6 +412,80 @@ then
     exit 1
 fi | sed 's/^/boot-gate: /'
 
+# A second run, with a USB keyboard in place of the mouse.
+#
+# The two cannot share a run: attaching a usb-kbd routes keystrokes to it and
+# the PS/2 controller sees none, so the `[IRQ] keyboard line live` milestone
+# above goes quiet — measured, not assumed. Rather than weaken that
+# assertion, the keyboard path gets its own boot. It is short: the kernel is
+# already built, only `hid` is fed, and the run ends as soon as the report
+# appears.
+#
+# The boot-protocol keyboard report layout is decoded by the same driver the
+# mouse uses, and this is the only test that reaches that branch.
+kbdlog="$workdir/serial-kbd.log"
+KBD_MONITOR_PORT=$(( MONITOR_PORT + 1 ))
+{
+    kwait=0
+    while [ "$kwait" -lt "$BOOT_TIMEOUT" ]; do
+        if [ -s "$kbdlog" ] && grep -qF '[Shell] serial console ready' "$kbdlog" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        kwait=$(( kwait + 1 ))
+    done
+    sleep 1
+    # Press a key, then ask the kernel what the HID device reported. The key
+    # has to come first: a HID endpoint NAKs until something changes, so
+    # polling an idle keyboard correctly finds nothing.
+    (
+        exec 4<>"/dev/tcp/127.0.0.1/$KBD_MONITOR_PORT" 2>/dev/null || exit 0
+        printf 'sendkey a\n' >&4
+        sleep 1
+        printf 'sendkey b\n' >&4
+        sleep 1
+    )
+    printf 'hid\n'
+    sleep 5
+} | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" \
+    -drive file="$disk",format=raw,if=ide,index=0 \
+    -serial stdio \
+    -device qemu-xhci,id=xhci \
+    -device usb-kbd,bus=xhci.0 \
+    -monitor "telnet:127.0.0.1:$KBD_MONITOR_PORT,server,nowait" \
+    -display none -vga std -no-reboot -m 256M > "$kbdlog" 2>&1 &
+kbd_pid=$!
+
+kbd_deadline=$(( $(date +%s) + BOOT_TIMEOUT ))
+while kill -0 "$kbd_pid" 2>/dev/null && [ "$(date +%s)" -lt "$kbd_deadline" ]; do
+    if [ -s "$kbdlog" ] && grep -qF '[HID] keyboard report:' "$kbdlog" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+kill "$kbd_pid" 2>/dev/null
+wait "$kbd_pid" 2>/dev/null
+
+kbd_report="$(grep -F '[HID] keyboard report:' "$kbdlog" 2>/dev/null | head -1)"
+if [ -z "$kbd_report" ]; then
+    echo "" >&2
+    echo "RATCHET BROKEN: the USB keyboard reported nothing." >&2
+    echo "Last 15 lines of that run's serial output:" >&2
+    tail -15 "$kbdlog" >&2
+    exit 1
+fi
+# A report of key 0 is the device saying no key is down, which is what an
+# unpressed keyboard reports and what a driver that read the wrong offset
+# would also report.
+kbd_key="$(printf '%s\n' "$kbd_report" | sed 's/.* key //')"
+if [ "${kbd_key:-0}" = "0" ]; then
+    echo "" >&2
+    echo "RATCHET BROKEN: the USB keyboard reported no key down." >&2
+    echo "  $kbd_report" >&2
+    exit 1
+fi
+echo "boot-gate: usb keyboard reported keycode $kbd_key"
+
 echo "boot-gate: $reached/$total milestones reached"
 
 if [ "$reached" -lt "$total" ]; then
