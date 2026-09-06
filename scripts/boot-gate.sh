@@ -90,7 +90,11 @@ files="$(awk '
 MONITOR_PORT=$(( 24000 + ($$ % 1000) ))
 
 workdir="$(mktemp -d)"
-cleanup() { [ "$KEEP" = 1 ] || rm -rf "$workdir"; }
+cleanup() {
+    [ -n "${echo_srv_pid:-}" ] && kill "$echo_srv_pid" 2>/dev/null
+    [ -n "${echo_client_pid:-}" ] && kill "$echo_client_pid" 2>/dev/null
+    [ "$KEEP" = 1 ] || rm -rf "$workdir"
+}
 trap cleanup EXIT
 
 cd "$REPO_ROOT"
@@ -228,6 +232,36 @@ else
     exit 2
 fi
 
+# Ports for the net-echo gate. Derived from the pid like the monitor port, so
+# two runs on one machine do not collide.
+ECHO_HOST_PORT=7001
+ECHO_FWD_PORT=$(( 27000 + ($$ % 1000) ))
+
+# An echo server on the host's loopback. The guest reaches it at 10.0.2.2,
+# which is what QEMU's user-mode networking maps the host to — so the
+# kernel's outbound connection is to a real service, not to QEMU itself.
+python3 - "$ECHO_HOST_PORT" > "$workdir/echo-server.log" 2>&1 <<'ECHOSRV' &
+import socket, sys
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", int(sys.argv[1])))
+srv.listen(4)
+srv.settimeout(180)
+try:
+    while True:
+        conn, _ = srv.accept()
+        conn.settimeout(30)
+        try:
+            data = conn.recv(4096)
+            if data:
+                conn.sendall(data)
+        finally:
+            conn.close()
+except Exception:
+    pass
+ECHOSRV
+echo_srv_pid=$!
+
 log="$workdir/serial.log"
 SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
 {
@@ -259,7 +293,7 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
     -drive file="$usbdisk",format=raw,if=none,id=usbstick,cache=writethrough \
     -device usb-storage,bus=xhci.0,drive=usbstick \
     -device usb-mouse,bus=xhci.0 \
-    -netdev user,id=n0 \
+    -netdev user,id=n0,hostfwd=tcp:127.0.0.1:$ECHO_FWD_PORT-:7002 \
     -device e1000,netdev=n0 \
     -monitor "telnet:127.0.0.1:$MONITOR_PORT,server,nowait" \
     -display none -vga std -no-reboot -m 256M > "$log" 2>&1 &
@@ -311,6 +345,53 @@ qemu_pid=$!
     sleep "$BOOT_TIMEOUT"
 ) &
 keypress_pid=$!
+
+# The client half of the server test: once the kernel says it is listening,
+# connect in through QEMU's port forward, send the pattern, and read the echo
+# back. Run as a watcher rather than on a timer, because the kernel only
+# starts listening when the shell reaches the `nets` command.
+(
+    nwait=0
+    while [ "$nwait" -lt "$BOOT_TIMEOUT" ]; do
+        if [ -s "$log" ] && grep -qF '[NET] listening on 7002' "$log" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        nwait=$(( nwait + 1 ))
+    done
+    python3 - "$ECHO_FWD_PORT" > "$workdir/echo-client.log" 2>&1 <<'ECHOCLI'
+import socket, sys, time
+# The same pattern the kernel builds: 'A' + (i * 7) % 26, 32 bytes.
+payload = bytes((65 + (i * 7) % 26) for i in range(32))
+deadline = time.time() + 60
+while time.time() < deadline:
+    try:
+        c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
+    except OSError:
+        time.sleep(1)
+        continue
+    try:
+        c.settimeout(20)
+        c.sendall(payload)
+        got = b""
+        while len(got) < len(payload):
+            chunk = c.recv(len(payload) - len(got))
+            if not chunk:
+                break
+            got += chunk
+        if got == payload:
+            print("echo-client: %d bytes returned unchanged" % len(got))
+        else:
+            print("echo-client: mismatch, got %r" % got)
+        break
+    except OSError as exc:
+        print("echo-client: %s" % exc)
+        break
+    finally:
+        c.close()
+ECHOCLI
+) &
+echo_client_pid=$!
 # Stop as soon as the final milestone appears, rather than always waiting out
 # the deadline. "Final" means the last real entry — taking the file's last
 # line would pick up a blank or a comment, and grep for an empty string
@@ -577,6 +658,23 @@ if ! grep -qF '[S3] resumed from suspend-to-RAM' "$s3log" 2>/dev/null; then
     exit 1
 fi
 echo "boot-gate: suspended to RAM and resumed, confirmed suspended by QEMU"
+
+# The net-echo gate, both directions.
+#
+# The kernel's own lines say it connected out and got its bytes back, and that
+# it accepted a connection and echoed. This checks the *other* end of each:
+# the host client saw its payload returned unchanged, which is the half the
+# guest cannot assert about itself.
+if ! grep -qF 'echo-client: 32 bytes returned unchanged' "$workdir/echo-client.log" 2>/dev/null; then
+    echo "" >&2
+    echo "RATCHET BROKEN: the host client did not get its bytes back from the guest." >&2
+    echo "--- echo client ---" >&2
+    cat "$workdir/echo-client.log" >&2 2>/dev/null
+    echo "--- guest, last 15 lines ---" >&2
+    tail -15 "$log" >&2
+    exit 1
+fi
+echo "boot-gate: net-echo both ways, host client got 32 bytes back"
 
 echo "boot-gate: $reached/$total milestones reached"
 

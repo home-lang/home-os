@@ -15,6 +15,9 @@ import "../drivers/ata.home" as ata
 import "../fs/ext2.home" as ext2
 import "../drivers/usb.home" as usb
 import "../drivers/acpi.home" as acpi
+import "../net/link.home" as link
+import "../net/tcp.home" as tcp
+import "../net/netdev.home" as netdev
 
 const LINE_MAX: u32 = 256
 const READDIR_MAX: u32 = 64
@@ -38,6 +41,8 @@ var lit_uname: [6]u8 = undefined
 var lit_irq: [4]u8 = undefined
 var lit_hid: [4]u8 = undefined
 var lit_suspend: [8]u8 = undefined
+var lit_netc: [8]u8 = undefined
+var lit_nets: [8]u8 = undefined
 var lit_help: [5]u8 = undefined
 var lit_run: [4]u8 = undefined
 var lit_exec: [5]u8 = undefined
@@ -233,6 +238,144 @@ fn cmd_irq() {
   foundation.serial_write_string(" spurious=")
   foundation.serial_write_u64(interrupts.get_spurious_irqs())
   foundation.serial_write_string("\n")
+}
+
+// The bytes sent and expected back, both ways. A pattern rather than a word
+// so a reply that is the right length but the wrong content fails.
+var echo_out: [32]u8 = undefined
+var echo_in: [32]u8 = undefined
+const ECHO_LEN: u32 = 32
+
+// The port the harness listens on, and the one this kernel listens on. Both
+// are stated here and in scripts/boot-gate.sh; a mismatch shows up as a
+// connection that is refused rather than as a wrong answer.
+const ECHO_HOST_PORT: u16 = 7001
+const ECHO_LISTEN_PORT: u16 = 7002
+
+// QEMU's user-mode gateway. A guest connection to it reaches a service on the
+// host's loopback, which is what makes an outbound test possible at all.
+const ECHO_HOST_IP: u32 = 0x0A000202
+
+fn fill_echo_pattern() {
+  var i: u32 = 0
+  while i < ECHO_LEN {
+    echo_out[i] = @as(u8, 65 + ((i * 7) % 26))
+    echo_in[i] = 0
+    i = i + 1
+  }
+}
+
+fn echo_matches(): u32 {
+  var i: u32 = 0
+  while i < ECHO_LEN {
+    if echo_in[i] != echo_out[i] { return 0 }
+    i = i + 1
+  }
+  return 1
+}
+
+// Connect out to the harness's echo server, send, read the reply back, and
+// compare it. This is the client half of the net-echo gate.
+fn cmd_net_client() {
+  if link.link_local_ip() == 0 {
+    foundation.serial_write_string("netc: no address\n")
+    return
+  }
+  fill_echo_pattern()
+
+  let conn: u32 = tcp.tcp_connect(@as(u64, ECHO_HOST_IP), ECHO_HOST_PORT)
+  if conn == 0xFFFFFFFF {
+    foundation.serial_write_string("netc: no connection slot\n")
+    return
+  }
+  if link.link_tcp_wait_established(conn, 4000000) == 0 {
+    foundation.serial_write_string("netc: handshake did not complete\n")
+    return
+  }
+  foundation.serial_write_string("[NET] TCP connected outbound\n")
+
+  if tcp.tcp_send(conn, @intFromPtr(&echo_out), ECHO_LEN) == 0 {
+    foundation.serial_write_string("netc: send failed\n")
+    return
+  }
+  if link.link_tcp_wait_data(conn, 4000000) == 0 {
+    foundation.serial_write_string("netc: no reply\n")
+    return
+  }
+  let got: u32 = tcp.tcp_recv(conn, @intFromPtr(&echo_in), ECHO_LEN)
+  tcp.tcp_close(conn)
+
+  if got != ECHO_LEN {
+    foundation.serial_write_string("netc: short reply\n")
+    return
+  }
+  if echo_matches() == 0 {
+    foundation.serial_write_string("netc: reply did not match\n")
+    return
+  }
+  foundation.serial_write_string("[NET] TCP echo returned 32 bytes unchanged\n")
+}
+
+// Listen, accept one connection, and echo back whatever arrives. The server
+// half: this kernel is the one being connected to.
+fn cmd_net_server() {
+  if link.link_local_ip() == 0 {
+    foundation.serial_write_string("nets: no address\n")
+    return
+  }
+
+  let listener: u32 = tcp.tcp_listen(ECHO_LISTEN_PORT)
+  if listener == 0xFFFFFFFF {
+    foundation.serial_write_string("nets: could not listen\n")
+    return
+  }
+  foundation.serial_write_string("[NET] listening on 7002\n")
+
+  let conn: u32 = link.link_tcp_wait_accept(listener, 8000000)
+  if conn == 0xFFFFFFFF or conn == 0 {
+    foundation.serial_write_string("nets: nobody connected (frames ")
+    foundation.serial_write_u64(link.link_frames_polled())
+    foundation.serial_write_string(", tcp dispatched ")
+    foundation.serial_write_u64(netdev.netdev_tcp_dispatched())
+    foundation.serial_write_string(", segs ")
+    foundation.serial_write_u64(tcp.tcp_segments_received())
+    foundation.serial_write_string(", state ")
+    foundation.serial_write_u64(@as(u64, tcp.tcp_connection_state(listener)))
+    foundation.serial_write_string(")\n")
+    return
+  }
+  foundation.serial_write_string("[NET] TCP connection accepted\n")
+
+  if link.link_tcp_wait_data(conn, 8000000) == 0 {
+    foundation.serial_write_string("nets: no data\n")
+    tcp.tcp_close(conn)
+    return
+  }
+  var i: u32 = 0
+  while i < ECHO_LEN {
+    echo_in[i] = 0
+    i = i + 1
+  }
+  let got: u32 = tcp.tcp_recv(conn, @intFromPtr(&echo_in), ECHO_LEN)
+  if got == 0 {
+    foundation.serial_write_string("nets: read nothing\n")
+    tcp.tcp_close(conn)
+    return
+  }
+
+  // Echo it straight back, exactly as many bytes as arrived.
+  if tcp.tcp_send(conn, @intFromPtr(&echo_in), got) == 0 {
+    foundation.serial_write_string("nets: echo send failed\n")
+    tcp.tcp_close(conn)
+    return
+  }
+  foundation.serial_write_string("[NET] echoed ")
+  foundation.serial_write_u64(@as(u64, got))
+  foundation.serial_write_string(" bytes back to the client\n")
+
+  // Let the ACK for the echo go out before the connection is torn down.
+  link.link_poll_for(400000)
+  tcp.tcp_close(conn)
 }
 
 // Suspend to RAM and report having come back.
@@ -497,7 +640,7 @@ fn cmd_mkfile(arg_start: u32, len: u32) {
 }
 
 fn cmd_help() {
-  foundation.serial_write_string("echo ls cat ps uname irq hid suspend run exec disk ext2 mkfile remount help\n")
+  foundation.serial_write_string("echo ls cat ps uname irq hid suspend netc nets run exec disk ext2 mkfile remount help\n")
 }
 
 // ============================================================================
@@ -550,6 +693,18 @@ fn init_literals() {
   lit_suspend[5] = 110  // 'n'
   lit_suspend[6] = 100  // 'd'
   lit_suspend[7] = 0
+
+  lit_netc[0] = 110  // 'n'
+  lit_netc[1] = 101  // 'e'
+  lit_netc[2] = 116  // 't'
+  lit_netc[3] = 99   // 'c'
+  lit_netc[4] = 0
+
+  lit_nets[0] = 110  // 'n'
+  lit_nets[1] = 101  // 'e'
+  lit_nets[2] = 116  // 't'
+  lit_nets[3] = 115  // 's'
+  lit_nets[4] = 0
   lit_remount[0] = 114
   lit_remount[1] = 101
   lit_remount[2] = 109
@@ -627,6 +782,14 @@ fn run_line(len: u32) {
   }
   if word_is(start, end, @intFromPtr(&lit_suspend), 7) == 1 {
     cmd_suspend()
+    return
+  }
+  if word_is(start, end, @intFromPtr(&lit_netc), 4) == 1 {
+    cmd_net_client()
+    return
+  }
+  if word_is(start, end, @intFromPtr(&lit_nets), 4) == 1 {
+    cmd_net_server()
     return
   }
   if word_is(start, end, @intFromPtr(&lit_run), 3) == 1 {

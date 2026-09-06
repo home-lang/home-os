@@ -1135,10 +1135,29 @@ fn handle_tcp_packet(src_ip: u32, tcp_data: u64, tcp_len: u32) {
         tcp_connections[conn_idx].local_port = dst_port
         tcp_connections[conn_idx].remote_ip = src_ip
         tcp_connections[conn_idx].remote_port = src_port
+
+        // The sequence state this half of the connection starts from. The
+        // peer's initial sequence number is what everything it sends will be
+        // numbered against, and ours is what it will acknowledge.
+        tcp_connections[conn_idx].irs = seq_num
+        tcp_connections[conn_idx].rcv_nxt = seq_num + 1
+        tcp_connections[conn_idx].iss = generate_isn()
+        tcp_connections[conn_idx].snd_nxt = tcp_connections[conn_idx].iss
+        tcp_connections[conn_idx].snd_una = tcp_connections[conn_idx].iss
         tcp_connections[conn_idx].state = TCP_STATE_SYN_RECEIVED
+
         // Publish the fresh 5-tuple so subsequent segments hit O(1).
         tcp_hash_insert(dst_port, src_ip, src_port, conn_idx)
         tcp_stats.passive_opens = tcp_stats.passive_opens + 1
+
+        // Answer it. The state-machine branch below that sends a SYN-ACK is
+        // the one for a socket still in LISTEN — and this connection is
+        // already past that, so it never ran. Nothing replied to an inbound
+        // SYN: the peer retransmitted, got nothing each time, and gave up,
+        // which from inside looks exactly like a SYN that never arrived.
+        send_tcp_segment(conn_idx, TCP_SYN | TCP_ACK, 0, 0)
+        add_to_retx_queue(conn_idx, tcp_connections[conn_idx].iss, 0, 0,
+                          TCP_SYN | TCP_ACK)
       }
     }
   }
@@ -1171,22 +1190,11 @@ fn handle_tcp_packet(src_ip: u32, tcp_data: u64, tcp_len: u32) {
   // State machine
   var state: u32 = tcp_connections[conn_idx].state
 
-  if state == TCP_STATE_LISTEN {
-    if (flags & TCP_SYN) != 0 {
-      // Received SYN
-      tcp_connections[conn_idx].irs = seq_num
-      tcp_connections[conn_idx].rcv_nxt = seq_num + 1
-      tcp_connections[conn_idx].iss = generate_isn()
-      tcp_connections[conn_idx].snd_nxt = tcp_connections[conn_idx].iss
-      tcp_connections[conn_idx].snd_una = tcp_connections[conn_idx].iss
-
-      // Send SYN-ACK
-      send_tcp_segment(conn_idx, TCP_SYN | TCP_ACK, 0, 0)
-      add_to_retx_queue(conn_idx, tcp_connections[conn_idx].iss, 0, 0, TCP_SYN | TCP_ACK)
-
-      tcp_connections[conn_idx].state = TCP_STATE_SYN_RECEIVED
-    }
-  } else if state == TCP_STATE_SYN_SENT {
+  // A listening socket is never the connection a segment resolves to: an
+  // inbound SYN gets a connection of its own above, and every later segment
+  // matches that one by its five-tuple. The handshake for a passive open is
+  // answered where the connection is created, not here.
+  if state == TCP_STATE_SYN_SENT {
     if (flags & TCP_SYN) != 0 and (flags & TCP_ACK) != 0 {
       // Received SYN-ACK
       tcp_connections[conn_idx].irs = seq_num
@@ -1313,6 +1321,19 @@ fn handle_tcp_packet(src_ip: u32, tcp_data: u64, tcp_len: u32) {
 // Adopt the addresses a lease assigned. Connections already open keep the
 // address they were opened with: rewriting a live connection's source address
 // would break it more thoroughly than leaving it.
+// The state constants, and a connection's current state, for callers driving
+// a connection from outside — a poll loop has to know what it is waiting for.
+export const TCP_CLOSED: u32 = 0
+export const TCP_LISTEN: u32 = 1
+export const TCP_SYN_SENT: u32 = 2
+export const TCP_SYN_RECEIVED: u32 = 3
+export const TCP_ESTABLISHED: u32 = 4
+
+export fn tcp_connection_state(conn_id: u32): u32 {
+  if conn_id >= MAX_TCP_CONNECTIONS { return TCP_CLOSED }
+  return tcp_connections[conn_id].state
+}
+
 export fn tcp_set_addresses(local: u32, gateway: u32) {
   local_ip = local
   gateway_ip = gateway
@@ -1456,46 +1477,54 @@ export fn tcp_accept_id(listen_id: u32): u32 {
   return tcp_accept(listen_id, &accept_scratch)
 }
 
+// Take a completed connection off a listening socket.
+//
+// The listener itself never leaves LISTEN — an inbound SYN is given a
+// connection of its own, and this hands back one of those once its handshake
+// has finished. This used to require the *listening* slot to be ESTABLISHED
+// and then copy it elsewhere, which is a different design than the receive
+// path implements: under this one that condition is never true, so accept
+// always reported nothing waiting.
+//
+// Returns 0xFFFFFFFF when there is nothing to accept, which is distinct from
+// connection 0.
 export fn tcp_accept(listen_id: u32, out: *TCPConnectionInfo): u32 {
   if listen_id >= MAX_TCP_CONNECTIONS {
-    return 0
+    return 0xFFFFFFFF
   }
-  if tcp_connections[listen_id].state != TCP_STATE_ESTABLISHED {
-    return 0
-  }
-
-  let accepted_idx: u32 = allocate_connection()
-  if accepted_idx == 0xFFFFFFFF {
-    // Out of connection slots. Leave the connection established on the
-    // listening slot so a later accept can still take it.
-    foundation.serial_write_string("[TCP] accept: no free connection slots\n")
-    return 0
+  if tcp_connections[listen_id].state != TCP_STATE_LISTEN {
+    return 0xFFFFFFFF
   }
 
   let listen_port: u16 = tcp_connections[listen_id].local_port
 
-  // Move the established connection to its own slot.
-  tcp_connections[accepted_idx] = tcp_connections[listen_id]
-  tcp_connections[accepted_idx].id = accepted_idx
+  var accepted_idx: u32 = 0xFFFFFFFF
+  var i: u32 = 0
+  while i < MAX_TCP_CONNECTIONS {
+    if i != listen_id and
+       tcp_connections[i].state == TCP_STATE_ESTABLISHED and
+       tcp_connections[i].local_port == listen_port {
+      accepted_idx = i
+      i = MAX_TCP_CONNECTIONS
+    } else {
+      i = i + 1
+    }
+  }
+  if accepted_idx == 0xFFFFFFFF { return 0xFFFFFFFF }
 
   out.handle = accepted_idx
   out.remote_addr = tcp_connections[accepted_idx].remote_ip
   out.remote_port = tcp_connections[accepted_idx].remote_port
   out.local_port = listen_port
 
-  // Re-arm the original slot so the socket keeps listening on the same port.
-  init_connection(listen_id)
-  tcp_connections[listen_id].local_ip = local_ip
-  tcp_connections[listen_id].local_port = listen_port
-  tcp_connections[listen_id].state = TCP_STATE_LISTEN
-
-  tcp_connection_count = tcp_connection_count + 1
-
   foundation.serial_write_string("[TCP] Accepted connection on port ")
   foundation.serial_write_u64(listen_port)
   foundation.serial_write_string("\n")
 
-  return 1
+  // The connection, not a success flag. `out.handle` carries the same value,
+  // but a caller that wanted only the connection had no reason to pass an
+  // info structure to read it out of.
+  return accepted_idx
 }
 
 export fn tcp_send(conn_id: u32, data: u64, length: u32): u32 {
