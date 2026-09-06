@@ -216,9 +216,20 @@ syscall_entry_addr:
 
 .global syscall_entry
 syscall_entry:
-    /* Callee-saved registers are preserved by the handler; these are the
-     * caller-saved ones the userspace program expects to keep. %rax is not
-     * saved: it carries the return value out. */
+    /* %rbp first, because this stub uses it as the scratch that holds the
+     * stack pointer across the ABI alignment below. It is callee-saved, so
+     * the handler would have preserved it — but the stub clobbered it before
+     * the handler was ever called, and every syscall returned to userspace
+     * with %rbp pointing into the kernel stack.
+     *
+     * Nothing noticed while the only userspace programs were hand-written
+     * assembly that never used a frame pointer. The first compiled program
+     * to make a syscall faulted on its next local-variable access. */
+    push %rbp
+
+    /* The other callee-saved registers are preserved by the handler; these
+     * are the caller-saved ones the userspace program expects to keep. %rax
+     * is not saved: it carries the return value out. */
     push %rcx
     push %r11
     push %rdi
@@ -247,6 +258,7 @@ syscall_entry:
     pop %rdi
     pop %r11
     pop %rcx
+    pop %rbp
     iretq
 
 /* ---------------------------------------------------------------------------

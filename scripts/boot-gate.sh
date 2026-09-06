@@ -131,6 +131,56 @@ fi
 # are flat binaries — the kernel's loader reads an image and jumps to offset
 # zero — so they are linked against userland/flat.ld rather than the kernel's
 # script.
+# Userspace programs written in Home. These are the real ones — the assembly
+# below is two hand-written proofs that the loaders work, and everything a
+# user would actually run is compiled from .home like the rest of the tree.
+#
+# Each is compiled to freestanding assembly, assembled, and linked as an ELF64
+# at the address userland/elf.ld names, which is where the kernel's loader
+# maps it. The whole set is linked together so a program can import the libc
+# beside it.
+if [ -d "$REPO_ROOT/userland/bin" ]; then
+    mkdir -p "$REPO_ROOT/initramfs/bin"
+
+    # The library objects every program links against, compiled once.
+    user_lib_objs=""
+    for lib in "$REPO_ROOT"/userland/lib/*.home; do
+        [ -e "$lib" ] || continue
+        libname="$(basename "$lib" .home)"
+        "$HOME_COMPILER" build "$lib" --kernel -o "$workdir/ul_$libname.s" >/dev/null 2>&1 || {
+            echo "error: could not compile $lib" >&2; exit 2; }
+        if grep -qE '# (ERROR|unsupported)' "$workdir/ul_$libname.s"; then
+            echo "error: $lib did not fully lower:" >&2
+            grep -m3 -E '# (ERROR|unsupported)' "$workdir/ul_$libname.s" >&2
+            exit 2
+        fi
+        "$ZIG" cc -c -x assembler -target x86_64-freestanding \
+            "$workdir/ul_$libname.s" -o "$workdir/ul_$libname.o" >/dev/null 2>&1 || {
+            echo "error: could not assemble $lib" >&2; exit 2; }
+        user_lib_objs="$user_lib_objs $workdir/ul_$libname.o"
+    done
+
+    for src in "$REPO_ROOT"/userland/bin/*.home; do
+        [ -e "$src" ] || continue
+        name="$(basename "$src" .home)"
+        "$HOME_COMPILER" build "$src" --kernel -o "$workdir/ub_$name.s" >/dev/null 2>&1 || {
+            echo "error: could not compile $src" >&2; exit 2; }
+        if grep -qE '# (ERROR|unsupported)' "$workdir/ub_$name.s"; then
+            echo "error: $src did not fully lower:" >&2
+            grep -m3 -E '# (ERROR|unsupported)' "$workdir/ub_$name.s" >&2
+            exit 2
+        fi
+        "$ZIG" cc -c -x assembler -target x86_64-freestanding \
+            "$workdir/ub_$name.s" -o "$workdir/ub_$name.o" >/dev/null 2>&1 || {
+            echo "error: could not assemble $src" >&2; exit 2; }
+        "$ZIG" build-exe "$workdir/ub_$name.o" $user_lib_objs \
+            -target x86_64-freestanding -O ReleaseSmall \
+            -T "$REPO_ROOT/userland/elf.ld" \
+            --name "$name" -femit-bin="$REPO_ROOT/initramfs/bin/$name" >/dev/null 2>&1 || {
+            echo "error: could not link $src" >&2; exit 2; }
+    done
+fi
+
 if [ -d "$REPO_ROOT/userland" ]; then
     mkdir -p "$REPO_ROOT/initramfs/bin"
     for src in "$REPO_ROOT"/userland/*.s; do
