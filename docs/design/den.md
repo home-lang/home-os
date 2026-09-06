@@ -52,12 +52,34 @@ Thirty-seven builtins: `.` `[` `alias` `basename` `builtin` `cat` `cd` `clear`
 External programs are found in `/bin` (or by a path containing a separator) and
 run through the ELF loader at ring 3.
 
-## What it refuses, and why refusing is the point
+## Pipelines, without fork
 
-Pipelines (`|`), input redirection (`<`), redirecting an *external* command, and
-job control are **refused with a message**, not faked. Each needs a second
-process holding a descriptor this shell can hand it, which needs fork/exec.
-Registered as **S12** in MASTER_PLAN §7 and marked in the source.
+A pipeline runs in stages. Each stage runs with its output attached to a
+holding file; the next runs with its input attached to that file. For finite
+input — every pipeline in a script that terminates — the bytes and the exit
+status are what a concurrent pipe gives.
+
+Two processes running at once and passing bytes through a shared buffer needs
+fork. What a pipeline *means* does not, and the difference is stated rather
+than hidden: a stage runs to completion before the next starts, so an unbounded
+producer never reaches its consumer, and the intermediate bytes live in a file
+rather than a kernel buffer.
+
+It is written for any number of stages. A two-stage version would have run
+`a | b | c` as `a | b` and dropped `c` silently, which is the failure this tree
+keeps turning up — output that looks like it worked.
+
+`<` and `>` work the same way for a program as for a builtin: the kernel is
+told where standard input and output point (`set_user_stdin`,
+`set_user_stdout`) before the program is entered, and told to forget
+afterwards. Standard error is never redirected, so a program's complaint about
+a failure cannot vanish into the file the failure was about.
+
+## What it still refuses
+
+Job control — `&`, `jobs`, `fg`, `bg` — needs a process that keeps running
+after the shell returns, which needs fork/exec. Refused with a message, not
+faked, and registered as **S12** in MASTER_PLAN §7.
 
 This is the distinction that matters. The file this replaced,
 `kernel/src/lib/den_lib.home`, implemented these by returning `0`: its `pwd` and

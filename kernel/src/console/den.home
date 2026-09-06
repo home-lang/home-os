@@ -101,6 +101,10 @@ var nest_depth: u32 = 0
 // Output sink. `out_fd_active` selects between the serial console and an open
 // file descriptor; every builtin writes through den_putc so redirection works
 // for all of them rather than for the handful that remembered to check.
+// Where a builtin reads standard input from, when `<` or a pipeline has
+// attached one. Zero means nothing is attached, which reads as end of file.
+var stdin_fd: u32 = 0
+
 var out_fd: u32 = 0
 var out_fd_active: u32 = 0
 var out_buf: [256]u8 = undefined
@@ -166,6 +170,13 @@ fn den_put_i64(value: i64) {
     return
   }
   den_put_u64(@as(u64, @bitCast(value)))
+}
+
+// Read up to `max` bytes of standard input into `dst`, returning how many.
+// Zero means there is nothing attached, or nothing left.
+fn den_read_stdin(dst: u64, max: u32): u32 {
+  if stdin_fd == 0 { return 0 }
+  return @as(u32, filesystem.vfs_read(stdin_fd, dst, @as(u64, max)))
 }
 
 // ============================================================================
@@ -1396,7 +1407,23 @@ fn bi_umask(): u32 {
 }
 
 fn bi_cat(): u32 {
-  if argc < 2 { return 1 }
+  // No operand: copy standard input, which is what `cat` does and what makes
+  // it usable on the right of a pipe.
+  if argc < 2 {
+    var sbuf: [256]u8 = undefined
+    var guard: u32 = 0
+    while guard < 4096 {
+      let got: u32 = den_read_stdin(@intFromPtr(&sbuf), 256)
+      if got == 0 { break }
+      var k: u32 = 0
+      while k < got {
+        den_putc(sbuf[k])
+        k = k + 1
+      }
+      guard = guard + 1
+    }
+    return 0
+  }
   var a: u32 = 1
   var status: u32 = 0
   var buf: [256]u8 = undefined
@@ -1502,7 +1529,7 @@ fn bi_help(): u32 {
   den_puts("  dirs echo env eval exit export false help history let local\n")
   den_puts("  popd printf pushd pwd readonly realpath set source test true\n")
   den_puts("  type typeset umask uname unalias unset which whoami [\n")
-  den_puts("Operators: ; && || > >> 'quote' \"quote\" variables and #comment\n")
+  den_puts("Operators: ; && || | < > >> 'quote' \"quote\" variables #comment\n")
   if extra_help != 0 { den_puts(extra_help) }
   return 0
 }
@@ -1827,6 +1854,8 @@ fn run_simple(from: u32, to: u32): u32 {
   var redirect_out: u32 = 0
   var redirect_append: u32 = 0
   var redirect_target: u32 = DEN_MAX_TOKENS
+  var redirect_in: u32 = 0
+  var redirect_in_target: u32 = DEN_MAX_TOKENS
 
   var i: u32 = from
   while i < to {
@@ -1851,12 +1880,14 @@ fn run_simple(from: u32, to: u32): u32 {
       continue
     }
     if k == TOK_REDIR_IN {
-      // Input redirection needs a command that reads a descriptor, and no
-      // builtin here does. Saying so beats opening the file and ignoring it.
-      // STUB(S12): input redirection needs a descriptor handed to a
-      // command that reads one, which needs fork/exec.
-      den_puts("den: < is not supported yet\n")
-      return 2
+      if (i + 1) >= to or tok_kind[i + 1] != TOK_WORD {
+        den_puts("den: syntax error near redirection\n")
+        return 2
+      }
+      redirect_in = 1
+      redirect_in_target = i + 1
+      i = i + 2
+      continue
     }
     i = i + 1
   }
@@ -1954,22 +1985,61 @@ fn run_simple(from: u32, to: u32): u32 {
     out_used = 0
   }
 
+  // Input redirection, for a builtin and an external alike. A builtin reads
+  // through den_read_stdin; a program reads through the kernel, which is told
+  // where standard input points.
+  var in_fd: u32 = 0
+  if redirect_in == 1 {
+    var in_full: [256]u8 = undefined
+    resolve_path(tok_addr(redirect_in_target), @intFromPtr(&in_full), 256)
+    in_fd = filesystem.vfs_open(@intFromPtr(&in_full), 0, 0)
+    if in_fd == 0 {
+      den_puts("den: cannot open for reading: ")
+      den_puts(tok_addr(redirect_in_target))
+      den_putc(10)
+      if redirect_out == 1 {
+        den_flush()
+        filesystem.vfs_close(out_fd)
+        out_fd_active = 0
+        out_fd = 0
+      }
+      tok_count = entry_tok_count
+      arena_used = entry_arena
+      return 1
+    }
+    stdin_fd = in_fd
+  }
+
   var status: u32 = 0
   var id: u32 = builtin_id(arg_addr(0))
   if id != BI_NONE {
     status = run_builtin(id)
-  } else if redirect_out == 1 {
-    // An external program writes through its own descriptors, and this shell
-    // has no way to hand it one yet. Running it anyway would put the output on
-    // the console and leave the file empty — the redirect would look like it
-    // worked and the bytes would be somewhere else.
-    // STUB(S12): the program holds no descriptor from this shell.
-    den_puts("den: cannot redirect an external command yet: ")
-    den_puts(arg_addr(0))
-    den_putc(10)
-    status = 2
   } else {
+    // The kernel is told where the program's standard input and output are
+    // before it is entered, and told to forget afterwards. That is all a
+    // redirect is for a program that reads fd 0 and writes fd 1.
+    // Only when this command has its own `<`. Setting it unconditionally
+    // cleared the input a pipeline had just attached, so every stage after
+    // the first read nothing and produced nothing — while still exiting 0.
+    var saved_in: u32 = 0
+    var set_in: u32 = 0
+    if in_fd != 0 {
+      saved_in = usermode.set_user_stdin(in_fd)
+      set_in = 1
+    }
+    var saved_out: u32 = 0
+    if redirect_out == 1 {
+      den_flush()
+      saved_out = usermode.set_user_stdout(out_fd)
+    }
     status = run_external()
+    if set_in == 1 { usermode.set_user_stdin(saved_in) }
+    if redirect_out == 1 { usermode.set_user_stdout(saved_out) }
+  }
+
+  if in_fd != 0 {
+    filesystem.vfs_close(in_fd)
+    stdin_fd = 0
   }
 
   if redirect_out == 1 {
@@ -2029,6 +2099,125 @@ fn run_external(): u32 {
   return @as(u32, usermode.get_user_exit_code())
 }
 
+// Run a pipeline of any length: the span [from, to) split at each `|`.
+//
+// Two processes running at once and passing bytes through a shared buffer
+// needs fork; what a pipeline *means* does not. Each stage runs with its
+// output attached to a holding file, and the next stage runs with its input
+// attached to that file. For finite input — every pipeline in a script that
+// terminates — the bytes and the exit status are what a concurrent pipe gives.
+//
+// Written for N stages rather than two. A two-stage version would have run
+// `a | b | c` as `a | b` and dropped `c` without saying so, which is the
+// failure this tree keeps finding: output that looks like it worked.
+//
+// What differs from a real pipe is stated rather than hidden: a stage runs to
+// completion before the next starts, so an unbounded producer never reaches
+// its consumer, and the intermediate bytes live in a file. S12 keeps that.
+fn run_pipeline(from: u32, to: u32): u32 {
+  // Two holding files, used alternately: a stage reads one and writes the
+  // other, so neither is ever open for both at once.
+  let hold_a: u64 = @intFromPtr("/den.pipe.a")
+  let hold_b: u64 = @intFromPtr("/den.pipe.b")
+
+  var in_path: u64 = 0
+  var status: u32 = 0
+  var stage_start: u32 = from
+  var use_a: u32 = 1
+
+  var i: u32 = from
+  loop {
+    // The end of this stage: the next `|` in the span, or the span's end.
+    var stage_end: u32 = stage_start
+    while stage_end < to and tok_kind[stage_end] != TOK_PIPE {
+      stage_end = stage_end + 1
+    }
+    if stage_end == stage_start {
+      den_puts("den: syntax error near |\n")
+      if in_path != 0 { filesystem.vfs_unlink(in_path) }
+      return 2
+    }
+
+    var last: u32 = 0
+    if stage_end >= to { last = 1 }
+
+    // Attach this stage's input to the previous stage's output.
+    var in_fd: u32 = 0
+    if in_path != 0 {
+      in_fd = filesystem.vfs_open(in_path, 0, 0)
+      if in_fd == 0 {
+        den_puts("den: cannot read the pipeline's holding file\n")
+        filesystem.vfs_unlink(in_path)
+        return 2
+      }
+      stdin_fd = in_fd
+    }
+    var saved_in: u32 = usermode.set_user_stdin(in_fd)
+
+    // Every stage but the last writes to a holding file.
+    var out_path: u64 = 0
+    var stage_fd: u32 = 0
+    var saved_out: u32 = 0
+    if last == 0 {
+      if use_a == 1 {
+        out_path = hold_a
+      } else {
+        out_path = hold_b
+      }
+      stage_fd = filesystem.vfs_open(out_path, 65, 0o644)
+      if stage_fd == 0 {
+        den_puts("den: cannot open the pipeline's holding file\n")
+        usermode.set_user_stdin(saved_in)
+        if in_fd != 0 {
+          filesystem.vfs_close(in_fd)
+          stdin_fd = 0
+          filesystem.vfs_unlink(in_path)
+        }
+        return 2
+      }
+      filesystem.vfs_ftruncate(stage_fd, 0)
+      den_flush()
+      out_fd = stage_fd
+      out_fd_active = 1
+      out_used = 0
+      saved_out = usermode.set_user_stdout(stage_fd)
+    }
+
+    status = run_simple(stage_start, stage_end)
+
+    if last == 0 {
+      den_flush()
+      usermode.set_user_stdout(saved_out)
+      out_fd_active = 0
+      out_fd = 0
+      filesystem.vfs_close(stage_fd)
+    }
+
+    usermode.set_user_stdin(saved_in)
+    if in_fd != 0 {
+      filesystem.vfs_close(in_fd)
+      stdin_fd = 0
+      // The stage that produced it has been consumed; the file is not needed.
+      filesystem.vfs_unlink(in_path)
+    }
+
+    if last == 1 { break }
+
+    in_path = out_path
+    if use_a == 1 {
+      use_a = 0
+    } else {
+      use_a = 1
+    }
+    stage_start = stage_end + 1
+  }
+
+  if in_path != 0 { filesystem.vfs_unlink(in_path) }
+
+  // A pipeline's status is its last stage's, as POSIX says.
+  return status
+}
+
 // Run a tokenised line: a list of commands joined by `;`, `&&` and `||`.
 //
 // `&&` and `||` bind tighter than `;` in the sense that matters here: they
@@ -2049,6 +2238,32 @@ fn den_exec_tokens(): u32 {
       i = i + 1
     }
 
+    // A pipeline has to be recognised before anything runs. Running the span
+    // first and noticing the `|` afterwards ran the left side twice — once to
+    // the console, then again into the pipeline — and the console copy was
+    // what the eye, and the gate, saw first.
+    if i < tok_count and tok_kind[i] == TOK_PIPE {
+      var pipe_end: u32 = i
+      while pipe_end < tok_count {
+        var kp: u32 = tok_kind[pipe_end]
+        if kp == TOK_SEMI or kp == TOK_AND or kp == TOK_OR { break }
+        pipe_end = pipe_end + 1
+      }
+      if skip_next == 0 {
+        status = run_pipeline(start, pipe_end)
+        last_status = status
+      }
+      skip_next = 0
+      i = pipe_end
+      if i >= tok_count { break }
+      var psep: u32 = tok_kind[i]
+      if psep == TOK_AND and status != 0 { skip_next = 1 }
+      if psep == TOK_OR and status == 0 { skip_next = 1 }
+      i = i + 1
+      if exit_requested == 1 { break }
+      continue
+    }
+
     if skip_next == 0 {
       if i > start { status = run_simple(start, i) }
       last_status = status
@@ -2059,12 +2274,10 @@ fn den_exec_tokens(): u32 {
 
     var sep: u32 = tok_kind[i]
     if sep == TOK_PIPE {
-      // A pipeline needs a second process to read the first one's output,
-      // and there is no fork yet. Refusing is honest; running only the left
-      // side and discarding the right would look like it worked.
-      // STUB(S12): a pipeline needs a second process reading the first
-      // one's output, which needs fork/exec.
-      den_puts("den: | is not supported yet\n")
+      // Unreachable: a `|` is taken by the branch above, which runs the whole
+      // pipeline. Kept as a guard rather than deleted, so a future edit that
+      // reorders the walk fails loudly instead of running half a pipeline.
+      den_puts("den: internal error: pipeline reached the list walker\n")
       last_status = 2
       return 2
     }
