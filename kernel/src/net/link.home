@@ -1,0 +1,250 @@
+// home-os link layer — Ethernet frames onto a real wire
+//
+// Everything above this file built packets; nothing sent one. dhcp.home
+// assembles a BOOTP payload and stops, arp.home fills in a request and stops,
+// and netdev.home has a receive path that until now was only ever fed frames
+// the kernel had written itself. This is the piece in between: the Ethernet
+// header, the NIC, and the loop that takes frames off it.
+//
+// Addresses here are host-order u32 for IPv4 and are byte-swapped on the way
+// out, because the wire is big-endian and nothing else in this tree is. The
+// conversion happens once, here, rather than at each call site — a checksum
+// computed over a header whose fields are in the wrong order is arithmetic
+// that works perfectly and produces a number no peer agrees with.
+
+import "../core/foundation.home" as foundation
+import "../drivers/e1000.home" as e1000
+import "netdev.home" as netdev
+
+const ETH_HEADER_SIZE: u32 = 14
+const ETHERTYPE_ARP: u16 = 0x0806
+const ETHERTYPE_IPV4: u16 = 0x0800
+
+const IP_PROTO_ICMP: u8 = 1
+const IP_PROTO_TCP: u8 = 6
+const IP_PROTO_UDP: u8 = 17
+
+const FRAME_MAX: u32 = 1518
+
+var tx_frame: [u8; 1518] = undefined
+var rx_frame: [u8; 1518] = undefined
+
+var local_ip: u32 = 0
+var gateway_ip: u32 = 0
+var subnet_mask: u32 = 0
+var ip_ident: u16 = 1
+
+var frames_sent: u64 = 0
+var frames_polled: u64 = 0
+
+export fn link_local_ip(): u32 { return local_ip }
+export fn link_gateway_ip(): u32 { return gateway_ip }
+export fn link_subnet_mask(): u32 { return subnet_mask }
+export fn link_frames_sent(): u64 { return frames_sent }
+export fn link_frames_polled(): u64 { return frames_polled }
+
+export fn link_set_address(ip: u32, mask: u32, gateway: u32) {
+  local_ip = ip
+  subnet_mask = mask
+  gateway_ip = gateway
+}
+
+// ============================================================================
+// Byte order
+// ============================================================================
+
+fn put8(offset: u32, value: u8) {
+  tx_frame[offset] = value
+}
+
+fn put16(offset: u32, value: u16) {
+  tx_frame[offset] = @as(u8, (value >> 8) & 0xFF)
+  tx_frame[offset + 1] = @as(u8, value & 0xFF)
+}
+
+fn put32be(offset: u32, value: u32) {
+  tx_frame[offset] = @as(u8, (value >> 24) & 0xFF)
+  tx_frame[offset + 1] = @as(u8, (value >> 16) & 0xFF)
+  tx_frame[offset + 2] = @as(u8, (value >> 8) & 0xFF)
+  tx_frame[offset + 3] = @as(u8, value & 0xFF)
+}
+
+export fn link_frame_byte(offset: u32): u8 {
+  if offset >= FRAME_MAX { return 0 }
+  return tx_frame[offset]
+}
+
+// ============================================================================
+// Ethernet
+// ============================================================================
+
+// Write the Ethernet header. `dest` is a pointer to six bytes; a null one
+// means broadcast, which is what a device with no peer address yet has to
+// use.
+fn ethernet_header(dest: u64, ethertype: u16) {
+  var i: u32 = 0
+  while i < 6 {
+    if dest == 0 {
+      tx_frame[i] = 0xFF
+    } else {
+      tx_frame[i] = @as(*u8, @ptrFromInt(dest + @as(u64, i))).*
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < 6 {
+    tx_frame[6 + i] = e1000.e1000_mac_byte(i)
+    i = i + 1
+  }
+  put16(12, ethertype)
+}
+
+// Hand a built frame to the card. Ethernet requires 60 bytes before the FCS,
+// so a shorter frame is padded here rather than left for the card — QEMU's
+// e1000 transmits exactly what it is given.
+export fn link_transmit(length: u32): u32 {
+  var total: u32 = length
+  while total < 60 {
+    tx_frame[total] = 0
+    total = total + 1
+  }
+  if e1000.e1000_send_packet(@intFromPtr(&tx_frame), total) != 0 { return 0 }
+  frames_sent = frames_sent + 1
+  return 1
+}
+
+// ============================================================================
+// ARP
+// ============================================================================
+
+// Broadcast a request for `target`'s hardware address.
+export fn link_send_arp_request(target: u32): u32 {
+  if e1000.e1000_is_initialized() == 0 { return 0 }
+  ethernet_header(0, ETHERTYPE_ARP)
+
+  let arp: u32 = ETH_HEADER_SIZE
+  put16(arp, 1)                    // hardware type: Ethernet
+  put16(arp + 2, ETHERTYPE_IPV4)   // protocol type
+  put8(arp + 4, 6)                 // hardware length
+  put8(arp + 5, 4)                 // protocol length
+  put16(arp + 6, 1)                // opcode: request
+
+  var i: u32 = 0
+  while i < 6 {
+    tx_frame[arp + 8 + i] = e1000.e1000_mac_byte(i)
+    i = i + 1
+  }
+  put32be(arp + 14, local_ip)
+  i = 0
+  while i < 6 {
+    tx_frame[arp + 18 + i] = 0
+    i = i + 1
+  }
+  put32be(arp + 24, target)
+
+  return link_transmit(ETH_HEADER_SIZE + 28)
+}
+
+// ============================================================================
+// IPv4 and UDP
+// ============================================================================
+
+// Write an IPv4 header and return the offset its payload starts at. No
+// options, so the header is always twenty bytes.
+fn ipv4_header(source: u32, destination: u32, protocol: u8, payload_len: u32): u32 {
+  let ip: u32 = ETH_HEADER_SIZE
+  put8(ip, 0x45)                              // version 4, 5 dwords
+  put8(ip + 1, 0)                             // DSCP/ECN
+  put16(ip + 2, @as(u16, 20 + payload_len))   // total length
+  put16(ip + 4, ip_ident)
+  ip_ident = ip_ident + 1
+  put16(ip + 6, 0)                            // flags, fragment offset
+  put8(ip + 8, 64)                            // TTL
+  put8(ip + 9, protocol)
+  put16(ip + 10, 0)                           // checksum, filled in below
+  put32be(ip + 12, source)
+  put32be(ip + 16, destination)
+
+  // The checksum covers the header with its own field zero, which is why it
+  // is computed after everything else is written rather than as it goes.
+  let sum: u16 = netdev.inet_checksum(@intFromPtr(&tx_frame) + @as(u64, ip), 20)
+  put16(ip + 10, sum)
+  return ip + 20
+}
+
+// Send a UDP datagram. `payload` is copied into the frame; `payload_len` is
+// its length in bytes.
+export fn link_send_udp(destination: u32, dest_mac: u64, source_port: u16,
+                        dest_port: u16, payload: u64, payload_len: u32): u32 {
+  if e1000.e1000_is_initialized() == 0 { return 0 }
+  if payload_len + 42 > FRAME_MAX { return 0 }
+
+  ethernet_header(dest_mac, ETHERTYPE_IPV4)
+  let udp: u32 = ipv4_header(local_ip, destination, IP_PROTO_UDP, 8 + payload_len)
+
+  put16(udp, source_port)
+  put16(udp + 2, dest_port)
+  put16(udp + 4, @as(u16, 8 + payload_len))
+  // A zero checksum is legal for IPv4 UDP and means "not computed". It is
+  // chosen rather than defaulted: a wrong checksum is dropped silently by the
+  // peer, and this way there is nothing to get wrong.
+  put16(udp + 6, 0)
+
+  var i: u32 = 0
+  while i < payload_len {
+    tx_frame[udp + 8 + i] = @as(*u8, @ptrFromInt(payload + @as(u64, i))).*
+    i = i + 1
+  }
+  return link_transmit(udp + 8 + payload_len)
+}
+
+// ============================================================================
+// Receive
+// ============================================================================
+
+// Take one frame off the card and run it through the receive path. Returns
+// its length, or 0 when there was nothing waiting.
+export fn link_poll_once(): u32 {
+  if e1000.e1000_is_initialized() == 0 { return 0 }
+  let length: u32 = e1000.e1000_receive_packet(@intFromPtr(&rx_frame), FRAME_MAX)
+  if length == 0 { return 0 }
+  frames_polled = frames_polled + 1
+  netdev.receive_packet(@intFromPtr(&rx_frame), length)
+  return length
+}
+
+export fn link_rx_byte(offset: u32): u8 {
+  if offset >= FRAME_MAX { return 0 }
+  return rx_frame[offset]
+}
+
+// Poll until a frame arrives or the budget runs out. Returns its length, or 0.
+//
+// A budget rather than a deadline: there is no clock this early that is worth
+// trusting for sub-second waits, and a bounded number of reads is a bound
+// either way.
+export fn link_poll_for(attempts: u32): u32 {
+  var i: u32 = 0
+  while i < attempts {
+    let length: u32 = link_poll_once()
+    if length > 0 { return length }
+    i = i + 1
+  }
+  return 0
+}
+
+// Ask for an address and wait for the answer, retrying.
+//
+// One request and one poll is a race: the reply is produced by the host's
+// stack on its own schedule, and a poll that finishes first sees nothing.
+// Retrying is also what the protocol expects — ARP has no delivery guarantee
+// and a lost request is an ordinary event.
+export fn link_resolve(target: u32, tries: u32, budget: u32): u32 {
+  var attempt: u32 = 0
+  while attempt < tries {
+    if link_send_arp_request(target) == 0 { return 0 }
+    if link_poll_for(budget) > 0 { return 1 }
+    attempt = attempt + 1
+  }
+  return 0
+}

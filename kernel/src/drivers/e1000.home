@@ -3,6 +3,7 @@
 
 import "../core/foundation.home" as foundation
 import "../core/memory.home" as memory
+import "pci.home" as pci
 
 // ============================================================================
 // CONSTANTS
@@ -40,6 +41,13 @@ const E1000_CTRL_SLU: u32 = 0x00000040
 const E1000_RCTL_EN: u32 = 0x00000002
 const E1000_RCTL_BAM: u32 = 0x00008000
 const E1000_RCTL_BSIZE_2048: u32 = 0x00000000
+// Strip the frame check sequence. Without it the four CRC bytes are counted
+// in the descriptor length and every frame reads four bytes longer than it is
+// — which parses, and puts rubbish on the end of every payload.
+const E1000_RCTL_SECRC: u32 = 0x04000000
+// Receive Address High, bit 31: this entry is valid. An address written
+// without it is not a filter, it is sixteen bytes of ignored register.
+const E1000_RAH_AV: u32 = 0x80000000
 
 // Transmit control bits
 const E1000_TCTL_EN: u32 = 0x00000002
@@ -129,6 +137,73 @@ fn e1000_read_eeprom(addr: u8): u16 {
 // INITIALIZATION
 // ============================================================================
 
+// PCI identity. 0x100E is the 82540EM QEMU presents as `-device e1000`;
+// 0x10D3 is the 82574L it presents as `e1000e`. They differ above this layer,
+// not in the register block used here.
+const E1000_VENDOR_INTEL: u16 = 0x8086
+const E1000_DEVICE_82540EM: u16 = 0x100E
+const E1000_DEVICE_82574L: u16 = 0x10D3
+
+const PCI_COMMAND: u8 = 0x04
+const PCI_COMMAND_IO: u16 = 0x0001
+const PCI_COMMAND_MEMORY: u16 = 0x0002
+const PCI_COMMAND_BUS_MASTER: u16 = 0x0004
+
+var e1000_pci: u64 = 0
+
+fn map_registers(base: u64, bytes: u64): u32 {
+  var mapped: u64 = 0
+  while mapped < bytes {
+    if memory.vmm_map_page(base + mapped, base + mapped, 3) != 0 {
+      return 0
+    }
+    mapped = mapped + 4096
+  }
+  return 1
+}
+
+// Find the controller on the PCI bus and bring its register window up.
+// Returns 1 if there is one.
+//
+// Bus mastering is the part that is easy to leave out and impossible to
+// notice: without it the device's register writes all take, the driver
+// reports itself initialised, and every descriptor ring sits untouched
+// because the card is not allowed to reach memory. Nothing fails — packets
+// simply never move.
+export fn e1000_probe(): u32 {
+  if e1000_initialized == 1 { return 1 }
+
+  var dev: u64 = pci.pci_find_device(E1000_VENDOR_INTEL, E1000_DEVICE_82540EM)
+  if dev == 0 {
+    dev = pci.pci_find_device(E1000_VENDOR_INTEL, E1000_DEVICE_82574L)
+  }
+  if dev == 0 { return 0 }
+  e1000_pci = dev
+
+  let command: u16 = pci.pci_read_config16(dev, PCI_COMMAND)
+  pci.pci_write_config16(dev, PCI_COMMAND,
+                         command | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER)
+
+  let bar0: u64 = @as(u64, pci.pci_read_bar(dev, 0))
+  if bar0 == 0 { return 0 }
+
+  // The register window has to be mapped before it can be touched. QEMU puts
+  // this BAR around 0xFEBC0000, well above the 2 GB the boot path
+  // identity-maps, so the first register write faults rather than reaching
+  // the card — and a fault in early init looks like a kernel that stopped
+  // for no reason.
+  if map_registers(bar0, 131072) == 0 {
+    foundation.serial_write_string("[E1000] could not map the register window\n")
+    return 0
+  }
+
+  e1000_init(bar0)
+  if e1000_initialized == 0 { return 0 }
+  return 1
+}
+
+export fn e1000_pci_device(): u64 { return e1000_pci }
+
 export fn e1000_init(base_addr: u64) {
   if e1000_initialized == 1 { return }
   
@@ -155,13 +230,24 @@ export fn e1000_init(base_addr: u64) {
   mac_address[4] = mac_high & 0xFF
   mac_address[5] = (mac_high >> 8) & 0xFF
   
-  // Allocate descriptor rings
-  rx_buffers = memory.kmalloc(RX_DESC_COUNT * PACKET_SIZE)
-  tx_buffers = memory.kmalloc(TX_DESC_COUNT * PACKET_SIZE)
+  // Packet buffers, from the page allocator rather than the heap.
+  //
+  // The card reads and writes these by DMA, so the addresses in the
+  // descriptors have to be physical ones. kmalloc returns kernel-virtual
+  // addresses — the heap sits far above the identity map, and the buffers
+  // came back around 0x1000_0000_0000 — so the card was transmitting
+  // whatever happened to be at that *physical* address and receiving into
+  // it. Nothing failed: descriptors completed, the head pointer moved, and
+  // every frame on the wire was sixty bytes of unrelated memory.
+  //
+  // pmm_alloc_pages hands out identity-mapped physical pages, which is what
+  // every other DMA user in this tree already takes.
+  let rx_pages: u32 = (RX_DESC_COUNT * PACKET_SIZE + 4095) / 4096
+  let tx_pages: u32 = (TX_DESC_COUNT * PACKET_SIZE + 4095) / 4096
+  rx_buffers = memory.pmm_alloc_pages(rx_pages)
+  tx_buffers = memory.pmm_alloc_pages(tx_pages)
 
   if rx_buffers == 0 or tx_buffers == 0 {
-    if rx_buffers != 0 { memory.kfree(rx_buffers) }
-    if tx_buffers != 0 { memory.kfree(tx_buffers) }
     rx_buffers = 0
     tx_buffers = 0
     foundation.serial_write_string("[E1000] Failed to allocate buffers\n")
@@ -199,8 +285,28 @@ export fn e1000_init(base_addr: u64) {
   e1000_write_reg(E1000_REG_TDH, 0)
   e1000_write_reg(E1000_REG_TDT, 0)
   
+  // Program the receive address filter with our own MAC.
+  //
+  // Without this the card accepts broadcasts — because BAM is set — and
+  // nothing else. Every unicast reply to something this kernel sent is
+  // dropped by the card before the driver sees it, which looks exactly like
+  // a peer that never answered: the transmit descriptor completes, the head
+  // pointer moves, and no frame ever arrives. A device reset clears these,
+  // so reading them from the EEPROM is not enough.
+  let ral: u32 = @as(u32, mac_address[0])
+    | (@as(u32, mac_address[1]) << 8)
+    | (@as(u32, mac_address[2]) << 16)
+    | (@as(u32, mac_address[3]) << 24)
+  let rah: u32 = @as(u32, mac_address[4])
+    | (@as(u32, mac_address[5]) << 8)
+    | E1000_RAH_AV
+  e1000_write_reg(E1000_REG_RAL, ral)
+  e1000_write_reg(E1000_REG_RAH, rah)
+
   // Enable receive
-  e1000_write_reg(E1000_REG_RCTL, E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_BSIZE_2048)
+  e1000_write_reg(E1000_REG_RCTL,
+                  E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_BSIZE_2048 |
+                  E1000_RCTL_SECRC)
   
   // Enable transmit
   e1000_write_reg(E1000_REG_TCTL, E1000_TCTL_EN | E1000_TCTL_PSP)
@@ -315,6 +421,57 @@ export fn e1000_receive_packet(buffer: u64, max_length: u32): u32 {
 export fn e1000_get_mac_address(dest: u64) {
   if dest == 0 { return }
   memory.mem_copy(dest, @intFromPtr(&mac_address[0]), 6)
+}
+
+// One byte of the MAC the card reported. Exposed a byte at a time because the
+// caller printing it has no array to copy into and no need for one.
+export fn e1000_mac_byte(index: u32): u8 {
+  if index >= 6 { return 0 }
+  return @as(u8, mac_address[index])
+}
+
+// Ring positions and the descriptor status bits, straight off the card.
+// A transmit that the driver believes it queued and the card never processed
+// is indistinguishable from a wire with nothing on the other end, unless you
+// can see the head pointer move.
+export fn e1000_debug_tdh(): u32 { return e1000_read_reg(E1000_REG_TDH) }
+export fn e1000_debug_tdt(): u32 { return e1000_read_reg(E1000_REG_TDT) }
+export fn e1000_debug_rdh(): u32 { return e1000_read_reg(E1000_REG_RDH) }
+export fn e1000_debug_rdt(): u32 { return e1000_read_reg(E1000_REG_RDT) }
+export fn e1000_debug_status(): u32 { return e1000_read_reg(E1000_REG_STATUS) }
+export fn e1000_debug_tx_status(index: u32): u32 {
+  if index >= TX_DESC_COUNT { return 0xFF }
+  return @as(u32, @as(*volatile u8, @ptrFromInt(@intFromPtr(&tx_descriptors[index].status))).*)
+}
+export fn e1000_debug_rx_status(index: u32): u32 {
+  if index >= RX_DESC_COUNT { return 0xFF }
+  return @as(u32, @as(*volatile u8, @ptrFromInt(@intFromPtr(&rx_descriptors[index].status))).*)
+}
+export fn e1000_debug_rdbal(): u32 { return e1000_read_reg(E1000_REG_RDBAL) }
+export fn e1000_debug_ring_addr(): u64 { return @intFromPtr(&rx_descriptors) }
+export fn e1000_debug_rx_buffers(): u64 { return rx_buffers }
+export fn e1000_debug_tx_buffers(): u64 { return tx_buffers }
+export fn e1000_debug_rctl(): u32 { return e1000_read_reg(E1000_REG_RCTL) }
+export fn e1000_debug_rdlen(): u32 { return e1000_read_reg(E1000_REG_RDLEN) }
+export fn e1000_debug_tdlen(): u32 { return e1000_read_reg(E1000_REG_TDLEN) }
+export fn e1000_debug_rdbah(): u32 { return e1000_read_reg(E1000_REG_RDBAH) }
+export fn e1000_debug_desc_size(): u32 { return @sizeOf(RxDescriptor) }
+export fn e1000_debug_ral(): u32 { return e1000_read_reg(E1000_REG_RAL) }
+export fn e1000_debug_rah(): u32 { return e1000_read_reg(E1000_REG_RAH) }
+// A byte of what the card was actually told to transmit, read back from the
+// DMA buffer rather than from the staging frame the driver built.
+export fn e1000_debug_txbuf_byte(index: u32): u8 {
+  if tx_buffers == 0 or index >= PACKET_SIZE { return 0 }
+  return @as(*u8, @ptrFromInt(tx_buffers + @as(u64, index))).*
+}
+export fn e1000_debug_tx_length(index: u32): u32 {
+  if index >= TX_DESC_COUNT { return 0 }
+  return @as(u32, tx_descriptors[index].length)
+}
+export fn e1000_debug_tctl(): u32 { return e1000_read_reg(E1000_REG_TCTL) }
+export fn e1000_debug_tx_addr(index: u32): u64 {
+  if index >= TX_DESC_COUNT { return 0 }
+  return tx_descriptors[index].addr
 }
 
 export fn e1000_is_initialized(): u32 {

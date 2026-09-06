@@ -259,6 +259,8 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
     -drive file="$usbdisk",format=raw,if=none,id=usbstick,cache=writethrough \
     -device usb-storage,bus=xhci.0,drive=usbstick \
     -device usb-mouse,bus=xhci.0 \
+    -netdev user,id=n0 \
+    -device e1000,netdev=n0 \
     -monitor "telnet:127.0.0.1:$MONITOR_PORT,server,nowait" \
     -display none -vga std -no-reboot -m 256M > "$log" 2>&1 &
 qemu_pid=$!
