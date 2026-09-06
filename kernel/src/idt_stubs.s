@@ -209,6 +209,8 @@ isr_common_stub:
  * ------------------------------------------------------------------------ */
 /* u64 syscall_entry_addr(void) — the address of the entry below, so the IDT
  * can be built from Home. */
+.set KERNEL_CONTEXT_MAX, 8
+
 .global syscall_entry_addr
 syscall_entry_addr:
     lea syscall_entry(%rip), %rax
@@ -239,16 +241,29 @@ syscall_entry:
     push %r9
     push %r10
 
-    /* syscall_entry_dispatch(nr, a1, a2, a3) */
+    /* syscall_entry_dispatch(nr, a1, a2, a3, frame)
+     *
+     * `frame` is where the pushes above ended up, with the iretq frame just
+     * beyond them — the whole user context in one place. fork copies it into
+     * the child, and enter_usermode_resume reads it back in the same order.
+     * Passing the address costs nothing here and saves the dispatcher having
+     * to reconstruct a layout only this stub knows. */
+    push %rax           /* the syscall number's slot becomes the child's
+                         * return value, and keeps the block 16-byte aligned */
+    mov %rsp, %r9       /* frame -> 5th argument, before %rax is reused */
+
     mov %rdx, %rcx      /* a3 -> 4th argument */
     mov %rsi, %rdx      /* a2 -> 3rd */
     mov %rdi, %rsi      /* a1 -> 2nd */
     mov %rax, %rdi      /* nr -> 1st */
+    mov %r9, %r8        /* frame -> 5th */
 
     mov %rsp, %rbp
     and $-16, %rsp
     call syscall_entry_dispatch
     mov %rbp, %rsp
+
+    add $8, %rsp        /* drop the slot pushed above */
 
     pop %r10
     pop %r9
@@ -291,14 +306,27 @@ enter_usermode:
     push %r13
     push %r14
     push %r15
-    mov %rsp, saved_kernel_rsp(%rip)
-
-    /* Out of the argument registers before they are needed for other things,
-     * and before the iretq frame is built out of two of them. */
+    /* Out of the argument registers first, before anything below uses one as
+     * scratch. The context save that follows needs %rax and %rcx, and %rcx is
+     * carrying argv: saving the context before this move handed every program
+     * an argv pointing at saved_kernel_rsp, and the first program to read its
+     * arguments took a page fault on a kernel address. */
     mov %rdi, %r8           /* rip  */
     mov %rsi, %r9           /* rsp  */
     mov %rdx, %r10          /* argc */
     mov %rcx, %r11          /* argv */
+
+    /* Pushed, not stored. A child runs from inside its parent's wait()
+     * syscall, which is itself inside an enter_usermode — with one global
+     * slot the child's entry would overwrite the parent's context and the
+     * parent would have nowhere to return to. */
+    mov saved_depth(%rip), %rax
+    cmp $KERNEL_CONTEXT_MAX, %rax
+    jge enter_usermode_too_deep
+    lea saved_kernel_rsp(%rip), %rcx
+    mov %rsp, (%rcx,%rax,8)
+    inc %rax
+    mov %rax, saved_depth(%rip)
 
     mov $0x23, %ax          /* user data selector, RPL 3 */
     mov %ax, %ds
@@ -333,6 +361,87 @@ enter_usermode:
     xor %r15, %r15
     iretq
 
+/* enter_usermode_resume(frame, cr3) — continue a user context that was saved
+ * at a syscall, in the address space `cr3` names.
+ *
+ * `frame` points at the register block syscall_entry pushed, with the iretq
+ * frame above it — the same shape, so a context saved at fork can be resumed
+ * here without a second layout to keep in step.
+ *
+ * The saved %rax is whatever the caller put there: fork stores 0, so the
+ * child returns 0 from the call its parent returned a pid from.
+ */
+.global enter_usermode_resume
+enter_usermode_resume:
+    push %rbx
+    push %rbp
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+
+    mov saved_depth(%rip), %rax
+    cmp $KERNEL_CONTEXT_MAX, %rax
+    jge enter_usermode_too_deep
+    lea saved_kernel_rsp(%rip), %rcx
+    mov %rsp, (%rcx,%rax,8)
+    inc %rax
+    mov %rax, saved_depth(%rip)
+
+    /* The address space first: everything below reads the frame, which the
+     * kernel half of every space maps identically. */
+    test %rsi, %rsi
+    jz .Lresume_no_cr3
+    mov %rsi, %cr3
+.Lresume_no_cr3:
+
+    mov %rdi, %rsp          /* the saved block becomes the stack to pop from */
+
+    mov $0x23, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+
+    /* The frame's lowest slot is the %rax pushed last by syscall_entry, so
+     * that comes off first. The order below is the push order reversed, and
+     * it has to stay in step with the stub above — they are two halves of one
+     * layout.
+     *
+     *   frame+0   rax        <- the value the resumed call returns
+     *   frame+8   r10
+     *   frame+16  r9
+     *   frame+24  r8
+     *   frame+32  rdx
+     *   frame+40  rsi
+     *   frame+48  rdi
+     *   frame+56  r11
+     *   frame+64  rcx
+     *   frame+72  rbp
+     *   frame+80  the iretq frame: rip, cs, rflags, rsp, ss
+     */
+    pop %rax                /* the value the call returns */
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rdx
+    pop %rsi
+    pop %rdi
+    pop %r11
+    pop %rcx
+    pop %rbp
+    iretq
+
+enter_usermode_too_deep:
+    /* Nested too far. Halting is the honest answer: the alternative is to
+     * overwrite a saved context and return somewhere that no longer exists. */
+    hlt
+    jmp enter_usermode_too_deep
+
+return_to_kernel_underflow:
+    hlt
+    jmp return_to_kernel_underflow
+
 /* return_to_kernel() — resume enter_usermode's caller.
  *
  * Called from the exit syscall. Restores the stack enter_usermode saved and
@@ -351,7 +460,13 @@ return_to_kernel:
      */
     sti
 
-    mov saved_kernel_rsp(%rip), %rsp
+    mov saved_depth(%rip), %rax
+    test %rax, %rax
+    jz return_to_kernel_underflow
+    dec %rax
+    mov %rax, saved_depth(%rip)
+    lea saved_kernel_rsp(%rip), %rcx
+    mov (%rcx,%rax,8), %rsp
     pop %r15
     pop %r14
     pop %r13
@@ -363,6 +478,8 @@ return_to_kernel:
 .section .bss
 .align 8
 saved_kernel_rsp:
+    .space 8 * 8          /* KERNEL_CONTEXT_MAX entries */
+saved_depth:
     .quad 0
 
 .section .text

@@ -26,6 +26,8 @@ const SYS_EXIT: u64 = 0
 const SYS_READ: u64 = 2
 const SYS_WRITE: u64 = 3
 const SYS_OPEN: u64 = 4
+const SYS_FORK: u64 = 1
+const SYS_WAIT: u64 = 6
 
 // Every other call whose first argument is a path, and the three whose second
 // is one too. Taken from kernel/src/sys/syscall.home, which owns the numbering.
@@ -68,6 +70,46 @@ export fn set_user_stdout(fd: u32): u32 {
   return previous
 }
 
+// ============================================================================
+// FORK
+//
+// A child is created with an address space of its own, a copy of the parent's
+// user pages, and the parent's register state with a return value of 0 — so
+// the one call returns a pid to the parent and zero to the child.
+//
+// The child does not run at the moment it is created. It runs when the parent
+// waits for it, on the parent's kernel stack, and the parent's wait returns
+// the child's exit status. That is enough for fork-exec-wait, which is what a
+// shell does; it is not enough for a parent and child that both expect to make
+// progress, and a parent that never waits never runs its child at all. Saying
+// so is the point — the alternative is a fork that looks concurrent and is
+// not. S13 stays open for the scheduler that would make it so.
+//
+// Copying eagerly rather than on write. Copy-on-write needs a fault handler
+// that can tell a write to a shared page from a genuine fault, and this kernel
+// does not have one; an eager copy is slower and correct.
+// ============================================================================
+
+const FORK_FRAME_WORDS: u32 = 15   // 10 saved registers + the 5-word iretq frame
+const MAX_CHILDREN: u32 = 4
+
+// A kernel stack per child. Entry from ring 3 reloads rsp from the TSS, so a
+// child making a syscall while its parent is inside wait() would otherwise
+// land on the parent's kernel stack and overwrite the frames the parent has
+// to return through. Flat rather than two-dimensional so the arithmetic for a
+// slot's stack is visible where it is used.
+const CHILD_KSTACK_BYTES: u32 = 8192
+var child_kstack: [32768]u8 = undefined
+
+var child_frame: [4][15]u64 = undefined
+var child_space: [4]u64 = undefined
+var child_exit: [4]u64 = undefined
+var child_live: [4]u32 = undefined
+var child_count: u32 = 0
+
+// The address space the running program is in, so a fork knows what to copy.
+var current_space: u64 = 0
+
 var user_exited: u32 = 0
 var user_exit_code: u64 = 0
 var syscalls_served: u64 = 0
@@ -77,6 +119,7 @@ var syscalls_served: u64 = 0
 var load_buffer: [4096]u8 = undefined
 
 extern fn enter_usermode(rip: u64, rsp: u64, argc: u64, argv: u64)
+extern fn enter_usermode_resume(frame: u64, cr3: u64)
 extern fn return_to_kernel()
 
 // ============================================================================
@@ -191,7 +234,120 @@ const USER_EFAULT: u64 = 0xFFFF_FFFF_FFFF_FFF2
 // Anything the table does not implement returns -ENOSYS rather than 0, so a
 // program that depends on one fails visibly instead of continuing on a
 // fabricated success.
-export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64): u64 {
+// Copy every mapped user page from one address space into another.
+//
+// Walks the user window a page at a time rather than the page tables, because
+// the window is small and bounded and a walk of it cannot be led astray by a
+// table entry that is not what it claims to be.
+fn copy_user_pages(from_space: u64, to_space: u64): u32 {
+  var addr: u64 = USER_ADDR_MIN
+  var copied: u32 = 0
+  while addr < USER_ADDR_MAX {
+    let src: u64 = memory.vmm_space_physical(from_space, addr)
+    if src != 0 {
+      let dst: u64 = memory.pmm_alloc_page()
+      if dst == 0 { return 0 }
+      var i: u64 = 0
+      while i < 4096 {
+        @as(*u8, @ptrFromInt(dst + i)).* = @as(*u8, @ptrFromInt(src + i)).*
+        i = i + 1
+      }
+      if memory.vmm_map_page_in(to_space, addr, dst,
+                                PAGE_PRESENT | PAGE_WRITE | PAGE_USER) != 0 {
+        memory.pmm_free_page(dst)
+        return 0
+      }
+      copied = copied + 1
+    }
+    addr = addr + 4096
+  }
+  return copied
+}
+
+// fork(). Returns the child's index plus one to the parent, and 0 to the child
+// when it is later resumed. Returns -1 as a u64 when it cannot.
+fn do_fork(frame: u64): u64 {
+  if child_count >= MAX_CHILDREN {
+    foundation.serial_write_string("[fork] too many children\n")
+    return 0xFFFFFFFFFFFFFFFF
+  }
+  if current_space == 0 {
+    foundation.serial_write_string("[fork] no address space to fork\n")
+    return 0xFFFFFFFFFFFFFFFF
+  }
+
+  let space: u64 = memory.vmm_create_user_space()
+  if space == 0 {
+    foundation.serial_write_string("[fork] could not create an address space\n")
+    return 0xFFFFFFFFFFFFFFFF
+  }
+  if copy_user_pages(current_space, space) == 0 {
+    foundation.serial_write_string("[fork] could not copy the parent's pages\n")
+    return 0xFFFFFFFFFFFFFFFF
+  }
+
+  let slot: u32 = child_count
+  var i: u32 = 0
+  while i < FORK_FRAME_WORDS {
+    child_frame[slot][i] = @as(*u64, @ptrFromInt(frame + @as(u64, i * 8))).*
+    i = i + 1
+  }
+  // The child returns 0 from the call the parent returns a pid from. Slot 0
+  // is the %rax the stub pushed, which is what enter_usermode_resume pops
+  // into %rax before its iretq.
+  child_frame[slot][0] = 0
+
+  child_space[slot] = space
+  child_exit[slot] = 0
+  child_live[slot] = 1
+  child_count = child_count + 1
+
+  foundation.serial_write_string("[fork] child ")
+  foundation.serial_write_u64(@as(u64, slot + 1))
+  foundation.serial_write_string(" forked\n")
+  return @as(u64, slot + 1)
+}
+
+// wait(pid). Runs the child to completion and returns its exit status.
+fn do_wait(pid: u64): u64 {
+  if pid == 0 or pid > @as(u64, child_count) { return 0xFFFFFFFFFFFFFFFF }
+  let slot: u32 = @as(u32, pid - 1)
+  if child_live[slot] == 0 { return child_exit[slot] }
+
+  let parent_space: u64 = current_space
+  let parent_exited: u32 = user_exited
+
+  current_space = child_space[slot]
+  user_exited = 0
+
+  // The child gets a kernel stack of its own for the duration. Stacks grow
+  // down, so the far end of its slot is the top.
+  let saved_rsp0: u64 = foundation.tss_get_rsp0()
+  foundation.tss_set_rsp0(@intFromPtr(&child_kstack) +
+                          @as(u64, (slot + 1) * CHILD_KSTACK_BYTES))
+
+  enter_usermode_resume(@intFromPtr(&child_frame[slot]), child_space[slot])
+
+  foundation.tss_set_rsp0(saved_rsp0)
+
+  // The child's exit lands here, through return_to_kernel.
+  child_exit[slot] = user_exit_code
+  child_live[slot] = 0
+
+  current_space = parent_space
+  user_exited = parent_exited
+  memory.vmm_switch_user_space(parent_space)
+
+  // The child is finished, so its address space and every page under it go
+  // back. Without this each fork costs a copy of the parent that is never
+  // returned.
+  memory.vmm_destroy_user_space(child_space[slot])
+  child_space[slot] = 0
+
+  return child_exit[slot]
+}
+
+export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
   syscalls_served = syscalls_served + 1
 
   // exit is handled here rather than in the table because it does not
@@ -254,6 +410,9 @@ export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64): u64 {
       return USER_EFAULT
     }
   }
+
+  if nr == SYS_FORK { return do_fork(frame) }
+  if nr == SYS_WAIT { return do_wait(a1) }
 
   // Reads from standard input come from wherever the shell attached it. With
   // nothing attached there is nothing to read, which is end of file — the
@@ -374,6 +533,10 @@ export fn run_user_program(path: u64, command_line: u64 = 0): u32 {
     @as(*u8, @ptrFromInt(text_phys + i)).* = load_buffer[i]
     i = i + 1
   }
+
+  // Programs still run in the kernel's address space, with the user window
+  // cleared between them. That window is what a fork copies out of.
+  current_space = memory.vmm_kernel_space()
 
   if map_user_stack() == 0 {
     foundation.serial_write_string("[User] could not map stack\n")
