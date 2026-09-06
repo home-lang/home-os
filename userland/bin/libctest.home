@@ -1,0 +1,202 @@
+// libctest — execute libc and report what passed.
+//
+// The Phase 3 `libc-suite` gate asks for an executed test subset, not a
+// grepped one: every check below calls the function and compares its result,
+// in the VM, at ring 3. A count that came from counting function definitions
+// would say nothing about whether any of them work.
+//
+// The last line is `libc-suite: P/T passed`, which the boot gate asserts.
+
+import "../lib/libc.home" as libc
+import "../lib/sys.home" as sys
+
+var passed: u32 = 0
+var total: u32 = 0
+
+fn check(name: u64, ok: u32) {
+  total = total + 1
+  if ok == 1 {
+    passed = passed + 1
+    return
+  }
+  // A failure names itself. A count that falls without saying which check
+  // fell is a number nobody can act on.
+  libc.puts("libc-suite FAIL: ")
+  libc.puts(name)
+  libc.putc(10)
+}
+
+fn check_u64(name: u64, got: u64, want: u64) {
+  if got == want {
+    check(name, 1)
+    return
+  }
+  libc.puts("libc-suite FAIL: ")
+  libc.puts(name)
+  libc.puts(" got ")
+  libc.put_u64(got)
+  libc.puts(" want ")
+  libc.put_u64(want)
+  libc.putc(10)
+  total = total + 1
+}
+
+// Compare a counted run of bytes against a literal, since not everything this
+// library returns is NUL-terminated.
+fn bytes_equal(a: u64, alen: u32, b: u64, blen: u32): u32 {
+  if alen != blen { return 0 }
+  var i: u32 = 0
+  while i < alen {
+    if @as(*u8, @ptrFromInt(a + @as(u64, i))).* != @as(*u8, @ptrFromInt(b + @as(u64, i))).* {
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+var scratch_a: [u8; 64] = undefined
+var scratch_b: [u8; 64] = undefined
+var readback: [u8; 128] = undefined
+
+fn test_strings() {
+  check_u64("strlen empty", @as(u64, libc.strlen("")), 0)
+  check_u64("strlen abc", @as(u64, libc.strlen("abc")), 3)
+  check_u64("strlen home-os", @as(u64, libc.strlen("home-os")), 7)
+
+  check("strcmp equal", if libc.strcmp("abc", "abc") == 0 { 1 } else { 0 })
+  check("strcmp less", if libc.strcmp("abc", "abd") < 0 { 1 } else { 0 })
+  check("strcmp greater", if libc.strcmp("abd", "abc") > 0 { 1 } else { 0 })
+  check("strcmp prefix is less", if libc.strcmp("ab", "abc") < 0 { 1 } else { 0 })
+  check("strcmp empty vs nonempty", if libc.strcmp("", "a") < 0 { 1 } else { 0 })
+}
+
+fn test_memory() {
+  libc.memset(@intFromPtr(&scratch_a), 65, 8)
+  check("memset filled", if scratch_a[0] == 65 and scratch_a[7] == 65 { 1 } else { 0 })
+
+  libc.memset(@intFromPtr(&scratch_b), 0, 8)
+  check("memset zero", if scratch_b[0] == 0 and scratch_b[7] == 0 { 1 } else { 0 })
+
+  libc.memcpy(@intFromPtr(&scratch_b), @intFromPtr(&scratch_a), 8)
+  check("memcpy copied", if scratch_b[0] == 65 and scratch_b[7] == 65 { 1 } else { 0 })
+
+  // A zero-length copy must touch nothing.
+  scratch_b[0] = 90
+  libc.memcpy(@intFromPtr(&scratch_b), @intFromPtr(&scratch_a), 0)
+  check("memcpy of zero bytes", if scratch_b[0] == 90 { 1 } else { 0 })
+}
+
+fn test_parse() {
+  check_u64("parse_u64 zero", libc.parse_u64("0"), 0)
+  check_u64("parse_u64 42", libc.parse_u64("42"), 42)
+  check_u64("parse_u64 1234567890", libc.parse_u64("1234567890"), 1234567890)
+  check_u64("parse_u64 letters", libc.parse_u64("abc"), 0xFFFFFFFFFFFFFFFF)
+  check_u64("parse_u64 empty", libc.parse_u64(""), 0xFFFFFFFFFFFFFFFF)
+  check_u64("parse_u64 trailing letter", libc.parse_u64("12x"), 0xFFFFFFFFFFFFFFFF)
+}
+
+fn test_args(argv: u64) {
+  let zero: u64 = libc.arg_at(argv, 0)
+  check("arg_at 0 is a string", if zero != 0 and libc.strlen(zero) > 0 { 1 } else { 0 })
+  check("arg_at 0 names this program",
+        if libc.strcmp(zero, "/bin/libctest") == 0 { 1 } else { 0 })
+}
+
+// A file written and read back: open_write, write_all, close, open_read and
+// read, all checked by their effect rather than their return value alone.
+fn test_file_roundtrip() {
+  let path: u64 = @intFromPtr("/libctest.tmp")
+  let out: u64 = libc.open_write(path)
+  check("open_write returned a descriptor", if out != 0 { 1 } else { 0 })
+  if out == 0 { return }
+
+  check_u64("write_all reported success",
+            @as(u64, libc.write_all(out, @intFromPtr("hello\nworld\n"), 12)), 1)
+  libc.close(out)
+
+  let inp: u64 = libc.open_read(path)
+  check("open_read returned a descriptor", if inp != 0 { 1 } else { 0 })
+  if inp == 0 { return }
+
+  let got: u64 = sys.sys_read(inp, @intFromPtr(&readback), 128)
+  check_u64("read returned what was written", got, 12)
+  check("bytes came back unchanged",
+        if readback[0] == 104 and readback[5] == 10 and readback[11] == 10 { 1 } else { 0 })
+  libc.close(inp)
+
+  // read_line over the same file.
+  let lines_fd: u64 = libc.open_read(path)
+  if lines_fd == 0 {
+    check("reopen for read_line", 0)
+    return
+  }
+  libc.line_reader_open(lines_fd)
+  let first: u32 = libc.read_line(libc.line_buffer_addr(), libc.line_buffer_size())
+  check_u64("read_line first length", @as(u64, first), 5)
+  check("read_line first is hello",
+        if libc.strcmp(libc.line_buffer_addr(), "hello") == 0 { 1 } else { 0 })
+  let second: u32 = libc.read_line(libc.line_buffer_addr(), libc.line_buffer_size())
+  check_u64("read_line second length", @as(u64, second), 5)
+  let third: u32 = libc.read_line(libc.line_buffer_addr(), libc.line_buffer_size())
+  check_u64("read_line ends", @as(u64, third), 0xFFFFFFFF)
+  libc.close(lines_fd)
+
+  // The store over the same file.
+  let store_fd: u64 = libc.open_read(path)
+  if store_fd == 0 {
+    check("reopen for the store", 0)
+    return
+  }
+  libc.store_reset()
+  check_u64("store_read_all fitted", @as(u64, libc.store_read_all(store_fd)), 1)
+  check_u64("store holds two lines", @as(u64, libc.store_lines()), 2)
+  check_u64("store line 0 length", @as(u64, libc.store_line_length(0)), 5)
+  // By length, not with strcmp: the store holds lines back to back with no
+  // terminator between them, so line 0 read as a C string is "helloworld".
+  check("store line 0 is hello",
+        bytes_equal(libc.store_line_addr(0), libc.store_line_length(0), "hello", 5))
+  check("store line 1 is world",
+        bytes_equal(libc.store_line_addr(1), libc.store_line_length(1), "world", 5))
+  check_u64("hello sorts before world", @as(u64, libc.store_line_less(0, 1)), 1)
+  check_u64("world does not sort before hello", @as(u64, libc.store_line_less(1, 0)), 0)
+  libc.close(store_fd)
+
+  // And the file goes away again, which is unlink doing its job.
+  check_u64("unlink removed it", sys.sys_unlink(path), 0)
+  check("the file is gone", if libc.open_read(path) == 0 { 1 } else { 0 })
+}
+
+fn test_missing_file() {
+  check("open_read of a missing file fails",
+        if libc.open_read("/no/such/file/at/all") == 0 { 1 } else { 0 })
+  check("open_read of a missing file in the root fails",
+        if libc.open_read("/definitely-not-here") == 0 { 1 } else { 0 })
+}
+
+export fn _start(argc: u64, argv: u64): never {
+  test_strings()
+  test_memory()
+  test_parse()
+  test_args(argv)
+  test_file_roundtrip()
+  test_missing_file()
+
+  libc.puts("libc-suite: ")
+  libc.put_u64(@as(u64, passed))
+  libc.putc(47)
+  libc.put_u64(@as(u64, total))
+  libc.puts(" passed\n")
+
+  // A second line the gate can assert without hard-coding the count, which
+  // changes every time a check is added. The count above is for a person
+  // reading the log; this line is for the ratchet.
+  if passed == total {
+    libc.puts("libc-suite: every check passed\n")
+    libc.flush()
+    libc.exit(0)
+  }
+  libc.puts("libc-suite: some checks failed\n")
+  libc.flush()
+  libc.exit(1)
+}
