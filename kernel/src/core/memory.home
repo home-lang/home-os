@@ -266,6 +266,9 @@ export fn pmm_get_free_pages(): u32 {
 // ============================================================================
 
 const PML4_ENTRIES: u32 = 512
+// Bit 7 of a PDPT or PD entry: the entry maps a huge page directly rather
+// than pointing at the level below.
+const PAGE_HUGE: u64 = 0x80
 const PDPT_ENTRIES: u32 = 512
 const PD_ENTRIES: u32 = 512
 const PT_ENTRIES: u32 = 512
@@ -325,6 +328,198 @@ export fn read_u32(addr: u64): u32 {
 
 export fn write_u32(addr: u64, value: u32) {
   @as(*u32, @ptrFromInt(addr)).* = value
+}
+
+// ============================================================================
+// PER-PROCESS ADDRESS SPACES
+//
+// The split this rests on is already in the layout, and it is cleaner than it
+// looks. The kernel is identity-mapped over the first gigabyte, which is
+// PDPT entry 0, and it maps device registers just under four gigabytes, which
+// is entry 3. User programs live at 0x40000000, which is entry 1. Kernel and
+// user therefore never share a page directory, only a PDPT — so a process can
+// be given an address space of its own by handing it a fresh entry 1 and the
+// kernel's own entries everywhere else.
+//
+// No higher-half move is needed for that, which is worth saying because it is
+// the usual answer: a kernel that shares PML4[0] with its user programs
+// normally has to be moved out of the lower half before processes can differ.
+// Here the boundary already falls between two PDPT entries.
+//
+// The kernel's entries are shared rather than copied, so a mapping the kernel
+// makes later — a device the driver brings up after a process exists — is
+// visible in every address space without anything being told to update.
+// ============================================================================
+
+const USER_PDPT_INDEX: u32 = 1
+
+// Build an address space: the kernel's mappings, plus an empty user region.
+// Returns the PML4's physical address, or 0.
+export fn vmm_create_user_space(): u64 {
+  if vmm_pml4 == 0 { return 0 }
+
+  var pml4: u64 = pmm_alloc_page()
+  if pml4 == 0 { return 0 }
+  var pdpt: u64 = pmm_alloc_page()
+  if pdpt == 0 {
+    pmm_free_page(pml4)
+    return 0
+  }
+  var pd: u64 = pmm_alloc_page()
+  if pd == 0 {
+    pmm_free_page(pdpt)
+    pmm_free_page(pml4)
+    return 0
+  }
+
+  memset(pml4, 0, PAGE_SIZE)
+  memset(pdpt, 0, PAGE_SIZE)
+  memset(pd, 0, PAGE_SIZE)
+
+  // Everything above PML4[0] as the kernel has it. Nothing in this tree uses
+  // the upper half yet, but copying it costs one loop and means an address
+  // space does not quietly lose a mapping added there later.
+  var i: u32 = 1
+  while i < PML4_ENTRIES {
+    @as(*u64, @ptrFromInt(pml4 + (i * 8))).* =
+      @as(*u64, @ptrFromInt(vmm_pml4 + (i * 8))).*
+    i = i + 1
+  }
+
+  // PML4[0] gets this process's own PDPT, carrying the kernel's entries.
+  var kernel_pml4e: u64 = @as(*u64, @ptrFromInt(vmm_pml4)).*
+  if (kernel_pml4e & PAGE_PRESENT) == 0 {
+    pmm_free_page(pd)
+    pmm_free_page(pdpt)
+    pmm_free_page(pml4)
+    return 0
+  }
+  var kernel_pdpt: u64 = kernel_pml4e & ~0xFFF
+
+  var j: u32 = 0
+  while j < PML4_ENTRIES {
+    if j != USER_PDPT_INDEX {
+      @as(*u64, @ptrFromInt(pdpt + (j * 8))).* =
+        @as(*u64, @ptrFromInt(kernel_pdpt + (j * 8))).*
+    }
+    j = j + 1
+  }
+
+  // The user's own gigabyte, empty and reachable from ring 3.
+  @as(*u64, @ptrFromInt(pdpt + (USER_PDPT_INDEX * 8))).* =
+    pd | PAGE_PRESENT | PAGE_WRITE | PAGE_USER
+  @as(*u64, @ptrFromInt(pml4)).* =
+    pdpt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER
+
+  return pml4
+}
+
+// Make `pml4` the address space in force. The kernel is mapped in every space
+// this builds, so the code doing the switch stays mapped across it.
+export fn vmm_switch_user_space(pml4: u64) {
+  if pml4 == 0 { return }
+  foundation.write_cr3(pml4)
+}
+
+export fn vmm_kernel_space(): u64 {
+  return vmm_pml4
+}
+
+// Map one page inside a given address space, building the levels it needs.
+// The kernel's own vmm_map_page walks vmm_pml4; this walks whichever space it
+// is given, so a process's memory can be prepared without switching to it.
+export fn vmm_map_page_in(pml4: u64, virt: u64, phys: u64, flags: u64): u32 {
+  if pml4 == 0 { return 1 }
+
+  var pml4_index: u32 = (virt >> 39) & 0x1FF
+  var pdpt_index: u32 = (virt >> 30) & 0x1FF
+  var pd_index: u32 = (virt >> 21) & 0x1FF
+  var pt_index: u32 = (virt >> 12) & 0x1FF
+
+  var pml4e_addr: u64 = pml4 + (pml4_index * 8)
+  var pml4e: u64 = @as(*u64, @ptrFromInt(pml4e_addr)).*
+  if (pml4e & PAGE_PRESENT) == 0 { return 1 }
+  var pdpt: u64 = pml4e & ~0xFFF
+
+  var pdpte_addr: u64 = pdpt + (pdpt_index * 8)
+  var pdpte: u64 = @as(*u64, @ptrFromInt(pdpte_addr)).*
+  if (pdpte & PAGE_PRESENT) == 0 { return 1 }
+  // A gigabyte mapped as one huge page has no page directory to descend into,
+  // and silently overwriting it would unmap whatever else it covers.
+  if (pdpte & PAGE_HUGE) != 0 { return 1 }
+  var pd: u64 = pdpte & ~0xFFF
+
+  var pde_addr: u64 = pd + (pd_index * 8)
+  var pde: u64 = @as(*u64, @ptrFromInt(pde_addr)).*
+  var pt: u64 = 0
+  if (pde & PAGE_PRESENT) == 0 {
+    pt = pmm_alloc_page()
+    if pt == 0 { return 1 }
+    memset(pt, 0, PAGE_SIZE)
+    @as(*u64, @ptrFromInt(pde_addr)).* = pt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER
+  } else {
+    if (pde & PAGE_HUGE) != 0 { return 1 }
+    pt = pde & ~0xFFF
+  }
+
+  @as(*u64, @ptrFromInt(pt + (pt_index * 8))).* = (phys & ~0xFFF) | flags
+  return 0
+}
+
+// Prove that two address spaces are actually separate.
+//
+// Not "the call returned nonzero" — that is true of a function that allocates
+// a page and forgets it. Two spaces are given the same virtual address backed
+// by different physical pages, each written through that one address, and each
+// read back after switching. If the spaces were sharing anything the second
+// write would be visible from the first, and the check would fail.
+//
+// The kernel is mapped in both, which is what lets this code keep running
+// across the switches; that is the property being relied on, so it is also
+// the property being tested.
+//
+// Returns the number of checks that passed, out of 4.
+export fn vmm_address_space_selftest(): u32 {
+  let probe: u64 = 0x0000_0000_4800_0000   // inside the user gigabyte, clear of
+                                           // anything a program is loaded at
+  var passed: u32 = 0
+
+  let kernel_space: u64 = vmm_pml4
+  if kernel_space == 0 { return 0 }
+
+  var space_a: u64 = vmm_create_user_space()
+  var space_b: u64 = vmm_create_user_space()
+  if space_a == 0 or space_b == 0 { return 0 }
+  if space_a != space_b { passed = passed + 1 }
+
+  var page_a: u64 = pmm_alloc_page()
+  var page_b: u64 = pmm_alloc_page()
+  if page_a == 0 or page_b == 0 { return passed }
+  if page_a != page_b { passed = passed + 1 }
+
+  let rw: u64 = PAGE_PRESENT | PAGE_WRITE | PAGE_USER
+  if vmm_map_page_in(space_a, probe, page_a, rw) != 0 { return passed }
+  if vmm_map_page_in(space_b, probe, page_b, rw) != 0 { return passed }
+
+  vmm_switch_user_space(space_a)
+  @as(*u64, @ptrFromInt(probe)).* = 0xA11CE
+
+  vmm_switch_user_space(space_b)
+  @as(*u64, @ptrFromInt(probe)).* = 0xB0B
+
+  // Back to A: it must still hold what A wrote. If the two spaces shared the
+  // page directory, B's write would be here instead.
+  vmm_switch_user_space(space_a)
+  if @as(*u64, @ptrFromInt(probe)).* == 0xA11CE { passed = passed + 1 }
+
+  vmm_switch_user_space(space_b)
+  if @as(*u64, @ptrFromInt(probe)).* == 0xB0B { passed = passed + 1 }
+
+  vmm_switch_user_space(kernel_space)
+
+  pmm_free_page(page_a)
+  pmm_free_page(page_b)
+  return passed
 }
 
 export fn vmm_get_kernel_physical(virt: u64): u64 {
