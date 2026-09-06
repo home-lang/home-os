@@ -1169,6 +1169,62 @@ export fn vfs_write(fd: u32, buffer: u64, count: u64): u64 {
   return bytes_written
 }
 
+// Set an open file's length. This is what `>` needs: opening for write does
+// not shorten a file, so redirecting over a longer one left the old tail in
+// place and the reader saw the new output followed by the remains of the old.
+//
+// Returns 1 on success, 0 when the descriptor is not a truncatable file.
+// A device has no length to set, so truncating one is an error rather than a
+// silent success that a caller would read as "the device is now empty".
+export fn vfs_ftruncate(fd: u32, length: u64): u32 {
+  if fd < 3 { return 0 }
+  var idx: u32 = fd - 3
+  if idx >= MAX_OPEN_FILES { return 0 }
+  if open_files[idx].ref_count == 0 { return 0 }
+  if open_files[idx].device_id != 0 { return 0 }
+
+  if open_files[idx].homefs_object != 0 {
+    if homefs.homefs_file_truncate(open_files[idx].homefs_object, length) == 0 {
+      return 0
+    }
+    if homefs.homefs_commit_transaction() == 0 { return 0 }
+    if open_files[idx].offset > length { open_files[idx].offset = length }
+    return 1
+  }
+
+  var ino: u32 = open_files[idx].ino
+  var inode_ptr: u64 = inode_get(ino)
+  if inode_ptr == 0 { return 0 }
+  var inode: Inode = @as(*Inode, @ptrFromInt(inode_ptr)).*
+  if perms.can_write(&inode, current_uid, current_gid) == 0 { return 0 }
+
+  // Through the table, not the copy: the copy above is for the permission
+  // check, and writing the size back into it would change nothing on disk.
+  var live: *Inode = @ptrFromInt(inode_ptr)
+
+  // Release the direct blocks that fall entirely past the new end. The
+  // indirect block is left alone: nothing in this backend allocates one yet,
+  // and freeing a block this code did not allocate would corrupt whatever
+  // does allocate it later.
+  if length < live.size {
+    var first_dead: u32 = @truncate((length + @as(u64, BLOCK_SIZE) - 1) / @as(u64, BLOCK_SIZE), u32)
+    var b: u32 = first_dead
+    while b < 12 {
+      if live.data_blocks[b] != 0 {
+        // data_blocks holds a physical page address, as inode_free assumes.
+        memory.pmm_free_page(live.data_blocks[b])
+        live.data_blocks[b] = 0
+        if live.blocks > 0 { live.blocks = live.blocks - 1 }
+      }
+      b = b + 1
+    }
+  }
+
+  live.size = length
+  if open_files[idx].offset > length { open_files[idx].offset = length }
+  return 1
+}
+
 export fn vfs_lseek(fd: u32, offset: u64, whence: u32): u64 {
   if fd < 3 { return 0 }
   

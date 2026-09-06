@@ -1805,6 +1805,81 @@ export fn homefs_file_write(id: u64, offset: u64, src: u64, len: u32): u32 {
   return len
 }
 
+// Set a file's length, dropping every extent that falls entirely past the new
+// end and zeroing the tail of the block the new end lands in.
+//
+// Both halves matter. Without the drop, the extents stay reachable from the
+// data tree and mark-and-sweep keeps them forever: a file truncated in a loop
+// leaks the whole volume. Without the zeroing, a later write that extends the
+// file past the new end CoW-copies the old block and exposes the bytes that
+// were supposed to be gone — truncation that does not truncate.
+//
+// Extending is a hole: a logical block with no extent already reads as zeroes,
+// so growing the recorded size is all that is required.
+//
+// Returns 1 on success, 0 if the object is missing or is not a file.
+export fn homefs_file_truncate(id: u64, length: u64): u32 {
+  if volume_mounted == 0 { return 0 }
+  let rec: u32 = homefs_object_record(id)
+  if rec == 0 { return 0 }
+  if obj_kind(rec) != OBJ_KIND_FILE { return 0 }
+
+  let size: u64 = obj_size(rec)
+  var tree: u32 = obj_data_root(rec)
+
+  if length < size and tree != 0 {
+    let bs: u64 = @as(u64, HOMEFS_BLOCK_SIZE)
+
+    // The tail of the block the new end lands in, when the end is not on a
+    // block boundary.
+    let within: u32 = @as(u32, length % bs)
+    if within != 0 {
+      let logical: u64 = length / bs
+      let existing: u64 = homefs_btree_lookup(tree, logical)
+      if existing != 0 and existing != BTREE_TOMBSTONE {
+        let old_block: u32 = extent_physical(existing)
+        if block_valid(old_block) == 1 {
+          let fresh: u32 = homefs_alloc_block()
+          if fresh == 0 { return 0 }
+          copy_bytes(block_addr(fresh), block_addr(old_block), HOMEFS_BLOCK_SIZE)
+          var z: u32 = within
+          while z < HOMEFS_BLOCK_SIZE {
+            put8(block_addr(fresh), z, 0)
+            z = z + 1
+          }
+          let replaced: u32 = homefs_btree_insert(tree, logical,
+                                                  extent_pack(fresh, 1, 0))
+          if replaced == 0 { return 0 }
+          tree = replaced
+        }
+      }
+    }
+
+    // Every whole block past the new end.
+    var dead: u64 = (length + bs - 1) / bs
+    let last: u64 = (size + bs - 1) / bs
+    while dead < last {
+      let value: u64 = homefs_btree_lookup(tree, dead)
+      if value != 0 and value != BTREE_TOMBSTONE {
+        let cleared: u32 = homefs_btree_insert(tree, dead, BTREE_TOMBSTONE)
+        if cleared == 0 { return 0 }
+        tree = cleared
+      }
+      dead = dead + 1
+    }
+  }
+
+  let now: u32 = homefs_object_record(id)
+  if now == 0 { return 0 }
+  let fresh_rec: u32 = obj_record_clone(now)
+  if fresh_rec == 0 { return 0 }
+  set_obj_data_root(fresh_rec, tree)
+  set_obj_size(fresh_rec, length)
+  set_obj_generation(fresh_rec, current_generation)
+  if objtable_put(id, fresh_rec) == 0 { return 0 }
+  return 1
+}
+
 // Read up to `len` bytes into `dst`. Returns the number of bytes read, which
 // is short at end of file. A logical block with no extent reads as zeroes —
 // that is a hole, not an error, and a file written at a high offset has them.
