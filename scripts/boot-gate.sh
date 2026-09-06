@@ -378,16 +378,28 @@ qemu_pid=$!
     # asserting on the harness rather than on the driver. Several moves,
     # because the shell command feed runs on its own clock and only needs one
     # of them to land before it.
-    for _ in 1 2 3 4 5 6; do
-        printf 'mouse_move 24 16\n' >&3
-        sleep 1
-    done
-
     # Capture the framebuffer once the boot log has been rendered onto it.
     # A screenshot is the only way to tell a console that drew the log from
     # one that drew nothing: both leave the serial output identical.
     sleep 8
     printf 'screendump %s\n' "$SHOT" >&3
+
+    # Keep the mouse moving until the shell's `hid` command has reported, or
+    # the feed has had time to finish.
+    #
+    # Six moves in the first six seconds used to be enough, because `hid` was
+    # near the front of the command list. It is now near the back — the list
+    # has grown from around thirty commands to eighty-odd — so by the time the
+    # shell polled, the last move was minutes old and the endpoint correctly
+    # had nothing to report. Moving until the report appears makes this
+    # independent of how long the command list gets.
+    moves=0
+    while [ "$moves" -lt 200 ]; do
+        if grep -qaF '[HID] mouse report:' "$log" 2>/dev/null; then break; fi
+        printf 'mouse_move 24 16\n' >&3
+        sleep 2
+        moves=$(( moves + 1 ))
+    done
 
     # Hold the connection until the run is over. QEMU treats the monitor
     # closing as a reason to exit, which cut every run short at the moment
@@ -576,15 +588,27 @@ KBD_MONITOR_PORT=$(( MONITOR_PORT + 1 ))
     # Press a key, then ask the kernel what the HID device reported. The key
     # has to come first: a HID endpoint NAKs until something changes, so
     # polling an idle keyboard correctly finds nothing.
-    (
-        exec 4<>"/dev/tcp/127.0.0.1/$KBD_MONITOR_PORT" 2>/dev/null || exit 0
-        printf 'sendkey a\n' >&4
-        sleep 1
-        printf 'sendkey b\n' >&4
-        sleep 1
-    )
-    printf 'hid\n'
-    sleep 5
+    #
+    # Repeated rather than sent once. A single keypress and a single poll have
+    # to coincide to within the driver's polling window, and they did not
+    # always: this test reported keycode 4 on one run, 5 on the next and
+    # nothing on a third, which is a gate asserting on a race rather than on
+    # the driver. Retrying removes the coincidence without weakening what is
+    # asserted — the report still has to arrive and still has to decode.
+    tries=0
+    while [ "$tries" -lt 12 ]; do
+        (
+            exec 4<>"/dev/tcp/127.0.0.1/$KBD_MONITOR_PORT" 2>/dev/null || exit 0
+            printf 'sendkey a\n' >&4
+            sleep 1
+            printf 'sendkey b\n' >&4
+        )
+        printf 'hid\n'
+        sleep 2
+        if grep -qaF '[HID] keyboard report:' "$kbdlog" 2>/dev/null; then break; fi
+        tries=$(( tries + 1 ))
+    done
+    sleep 3
 } | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" \
     -drive file="$disk",format=raw,if=ide,index=0 \
     -serial stdio \
