@@ -584,6 +584,7 @@ These were referenced by files already in the set and were not listed, which is 
 - `kernel/src/crypto/blake2s.home`
 - `kernel/src/crypto/sha256.home`
 - `kernel/src/crypto/curve25519.home`
+- `kernel/src/crypto/rsa.home` — the only asymmetric primitive in the tree, and what a signed package rests on. Added to the set when it gained a known-answer test; before that it had never been executed.
 - `kernel/src/drivers/acpi.home`
 - `kernel/src/drivers/aml.home`
 - `kernel/src/fs/homefs.home`

@@ -265,16 +265,92 @@ fn bigint_mul(result: *BigInt, a: *BigInt, b: *BigInt) {
   }
 }
 
+// Shift left by one bit, in place.
+fn bigint_shl1(a: *BigInt) {
+  var carry: u32 = 0
+  var i: u32 = 0
+  while i < MAX_LIMBS {
+    let next_carry: u32 = a.limbs[i] >> 31
+    a.limbs[i] = (a.limbs[i] << 1) | carry
+    carry = next_carry
+    i = i + 1
+  }
+  // Grow the significant length if the shift moved a bit into a new limb.
+  var used: u32 = MAX_LIMBS
+  while used > 0 {
+    if a.limbs[used - 1] != 0 { break }
+    used = used - 1
+  }
+  a.len = used
+}
+
+// The bit at `index`, counting from the least significant.
+fn bigint_bit(a: *BigInt, index: u32): u32 {
+  let limb: u32 = index / 32
+  if limb >= MAX_LIMBS { return 0 }
+  return (a.limbs[limb] >> (index % 32)) & 1
+}
+
+// The index one past the highest set bit, or 0 for zero.
+fn bigint_bit_length(a: *BigInt): u32 {
+  var limb: u32 = MAX_LIMBS
+  while limb > 0 {
+    if a.limbs[limb - 1] != 0 { break }
+    limb = limb - 1
+  }
+  if limb == 0 { return 0 }
+  var bit: u32 = 32
+  while bit > 0 {
+    if ((a.limbs[limb - 1] >> (bit - 1)) & 1) == 1 { break }
+    bit = bit - 1
+  }
+  return (limb - 1) * 32 + bit
+}
+
+// r = a mod m, by binary long division.
+//
+// This used to reduce by repeated subtraction:
+//
+//   while bigint_compare(result, m) >= 0 { bigint_sub(result, result, m) }
+//
+// which costs one subtraction per unit of quotient. For a modular
+// exponentiation that is a 1024-bit product reduced by a 512-bit modulus, the
+// quotient is around 2^512, so the loop was not slow — it was unreachable. The
+// kernel hung inside rsa_verify the first time anything called it, which is
+// also the first time anything ever did: rsa.home was not in the build.
+//
+// Shift-and-subtract costs one iteration per bit of `a` instead, so the same
+// reduction takes about a thousand.
 fn bigint_mod(result: *BigInt, a: *BigInt, m: *BigInt) {
   if bigint_is_zero(m) != 0 {
     bigint_zero(result)
     return
   }
-  bigint_copy(result, a)
 
-  while bigint_compare(result, m) >= 0 {
-    bigint_sub(result, result, m)
+  // A value already smaller than the modulus is its own remainder, and this
+  // is the common case inside mod_exp.
+  if bigint_compare(a, m) < 0 {
+    bigint_copy(result, a)
+    return
   }
+
+  var remainder: BigInt = undefined
+  bigint_zero(&remainder)
+
+  var bits: u32 = bigint_bit_length(a)
+  while bits > 0 {
+    bits = bits - 1
+    bigint_shl1(&remainder)
+    if bigint_bit(a, bits) == 1 {
+      remainder.limbs[0] = remainder.limbs[0] | 1
+      if remainder.len == 0 { remainder.len = 1 }
+    }
+    if bigint_compare(&remainder, m) >= 0 {
+      bigint_sub(&remainder, &remainder, m)
+    }
+  }
+
+  bigint_copy(result, &remainder)
 }
 
 // Extended GCD: computes gcd(a, b) and coefficients x, y such that a*x + b*y = gcd(a, b)
@@ -510,20 +586,28 @@ export fn rsa_generate_keypair(public_key: *RsaPublicKey, private_key: *RsaPriva
 // PKCS#1 v1.5 PADDING
 // ============================================================================
 
+// Every store below goes through `@as(*u8, ...)`.
+//
+// A bare `@ptrFromInt(x).*` is a 64-bit pointer, so each of these wrote eight
+// bytes where one was meant: the two-byte header alone scribbled sixteen, the
+// 0xFF run wrote seven bytes past its own end, and the message copy read and
+// wrote in eight-byte units at one-byte strides. bigint_from_bytes carries a
+// comment about the same mistake in its own history — it is the shape of bug
+// this pointer syntax invites.
 fn pkcs1_pad(padded: *u8, padded_len: u32, msg: *u8, msg_len: u32, block_type: u8): u32 {
   // block_type 1 = signing, block_type 2 = encryption
   if msg_len + 11 > padded_len { return 1 }
 
   var ps_len: u32 = padded_len - msg_len - 3
 
-  @ptrFromInt(@intFromPtr(padded)).* = 0x00
-  @ptrFromInt(@intFromPtr(padded) + 1).* = block_type
+  @as(*u8, @ptrFromInt(@intFromPtr(padded))).* = 0x00
+  @as(*u8, @ptrFromInt(@intFromPtr(padded) + 1)).* = block_type
 
   var i: u32 = 0
   if block_type == 1 {
     // Signing: pad with 0xFF
     while i < ps_len {
-      @ptrFromInt(@intFromPtr(padded) + 2 + i).* = 0xFF
+      @as(*u8, @ptrFromInt(@intFromPtr(padded) + 2 + i)).* = 0xFF
       i = i + 1
     }
   } else {
@@ -531,17 +615,18 @@ fn pkcs1_pad(padded: *u8, padded_len: u32, msg: *u8, msg_len: u32, block_type: u
     while i < ps_len {
       var r: u8 = @intCast(prng_next() & 0xFF)
       if r == 0 { r = 1 }
-      @ptrFromInt(@intFromPtr(padded) + 2 + i).* = r
+      @as(*u8, @ptrFromInt(@intFromPtr(padded) + 2 + i)).* = r
       i = i + 1
     }
   }
 
-  @ptrFromInt(@intFromPtr(padded) + 2 + ps_len).* = 0x00
+  @as(*u8, @ptrFromInt(@intFromPtr(padded) + 2 + ps_len)).* = 0x00
 
   // Copy message
   i = 0
   while i < msg_len {
-    @ptrFromInt(@intFromPtr(padded) + 3 + ps_len + i).* = @ptrFromInt(@intFromPtr(msg) + i).*
+    @as(*u8, @ptrFromInt(@intFromPtr(padded) + 3 + ps_len + i)).* =
+      @as(*u8, @ptrFromInt(@intFromPtr(msg) + i)).*
     i = i + 1
   }
 
@@ -585,7 +670,8 @@ fn pkcs1_unpad(msg: *u8, msg_len: *u32, max_len: u32, padded: *u8, padded_len: u
 
   i = 0
   while i < data_len {
-    @ptrFromInt(@intFromPtr(msg) + i).* = @ptrFromInt(@intFromPtr(padded) + data_start + i).*
+    @as(*u8, @ptrFromInt(@intFromPtr(msg) + i)).* =
+      @as(*u8, @ptrFromInt(@intFromPtr(padded) + data_start + i)).*
     i = i + 1
   }
   msg_len.* = data_len
@@ -760,6 +846,24 @@ export fn rsa_verify(message: *u8, message_len: u32, signature: *u8, signature_l
 // ============================================================================
 // KEY IMPORT/EXPORT
 // ============================================================================
+
+// Build a private key from its modulus and private exponent.
+//
+// p, q, dp, dq and qinv are zeroed rather than left as whatever the caller's
+// storage held: rsa_sign does not use them today, and a key carrying garbage
+// in half its fields is a trap for whatever uses them tomorrow.
+export fn rsa_import_private_key(key: *RsaPrivateKey, n: *u8, n_len: u32,
+                                 d: *u8, d_len: u32): u32 {
+  bigint_from_bytes(&key.n, n, n_len)
+  bigint_from_bytes(&key.d, d, d_len)
+  bigint_zero(&key.p)
+  bigint_zero(&key.q)
+  bigint_zero(&key.dp)
+  bigint_zero(&key.dq)
+  bigint_zero(&key.qinv)
+  key.bits = n_len * 8
+  return 0
+}
 
 export fn rsa_import_public_key(key: *RsaPublicKey, n: *u8, n_len: u32, e: u32): u32 {
   bigint_from_bytes(&key.n, n, n_len)
