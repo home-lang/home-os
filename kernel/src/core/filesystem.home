@@ -1351,6 +1351,90 @@ export fn vfs_homefs_unlink(path: u64): u32 {
   return homefs_remove(path, 0)
 }
 
+// Remove a file's directory entry, and the file with it when nothing else
+// names it.
+//
+// The syscall this backs used to be `if path == 0 { return EINVAL }` followed
+// by `return 0` — an unlink that reported success and removed nothing, which
+// a caller cannot tell from one that worked. `rm` built on that deletes no
+// files and says it did.
+//
+// Returns 0 on success, nonzero otherwise.
+export fn vfs_unlink(path: u64): u32 {
+  if path == 0 { return 1 }
+  if homefs_path_offset(path) != 0 { return homefs_remove(path, 0) }
+
+  var ino: u32 = path_resolve(path)
+  if ino == 0 { return 1 }
+
+  // A directory is removed with rmdir, not unlink. Saying so beats unlinking
+  // one and leaving its contents unreachable.
+  var inode_ptr: u64 = inode_get(ino)
+  if inode_ptr == 0 { return 1 }
+  var inode: Inode = @as(*Inode, @ptrFromInt(inode_ptr)).*
+  if inode.file_type == FILE_TYPE_DIRECTORY { return 1 }
+
+  // The parent and the leaf, split the way link_into_parent splits them.
+  var len: u64 = 0
+  while @as(*u8, @ptrFromInt(path + len)).* != 0 {
+    len = len + 1
+  }
+  if len == 0 { return 1 }
+
+  var last_sep: u64 = 0
+  var found_sep: u32 = 0
+  var i: u64 = 0
+  while i < len {
+    if @as(*u8, @ptrFromInt(path + i)).* == 47 {
+      last_sep = i
+      found_sep = 1
+    }
+    i = i + 1
+  }
+
+  var parent: u32 = ROOT_INO
+  if found_sep == 1 and last_sep > 0 {
+    var saved: u8 = @as(*u8, @ptrFromInt(path + last_sep)).*
+    @as(*u8, @ptrFromInt(path + last_sep)).* = 0
+    parent = path_resolve(path)
+    @as(*u8, @ptrFromInt(path + last_sep)).* = saved
+    if parent == 0 { return 1 }
+  }
+
+  // Write permission on the parent is what governs removal — the file's own
+  // mode does not, which is why a read-only file in a writable directory can
+  // be removed.
+  var parent_ptr: u64 = inode_get(parent)
+  if parent_ptr != 0 {
+    var pnode: Inode = @as(*Inode, @ptrFromInt(parent_ptr)).*
+    if perms.can_write(&pnode, current_uid, current_gid) == 0 { return 1 }
+  }
+
+  var name_start: u64 = last_sep
+  if found_sep == 1 { name_start = last_sep + 1 }
+
+  var name_len: u32 = 0
+  var j: u64 = name_start
+  while j < len {
+    if name_len >= 255 { return 1 }
+    component[name_len] = @as(*u8, @ptrFromInt(path + j)).*
+    name_len = name_len + 1
+    j = j + 1
+  }
+  if name_len == 0 { return 1 }
+  component[name_len] = 0
+
+  if dir_remove_entry(parent, &component, name_len) != 0 { return 1 }
+
+  // The entry is gone; the file goes with it once no name is left. Through
+  // the table, not the copy above, or the count would be decremented on a
+  // value that is thrown away.
+  var live: *Inode = @ptrFromInt(inode_ptr)
+  if live.link_count > 0 { live.link_count = live.link_count - 1 }
+  if live.link_count == 0 { inode_free(ino) }
+  return 0
+}
+
 export fn vfs_mkdir(path: u64, mode: u32): u32 {
   if homefs_path_offset(path) != 0 { return homefs_mkdir(path, mode) }
 
