@@ -17,9 +17,9 @@ that has been written and parsed, but never run.
 
 ## Parse rate
 
-**416/416 kernel `.home` files parse (100%)**
+**419/419 kernel `.home` files parse (100%)**
 
-- Compiler: `home-lang/home` @ `33ae7855e`
+- Compiler: `home-lang/home` @ `bb52bd4ab`
 - Every kernel file parses. This is milestone A1.
 
 Parsing is not compiling. A file in this count has been accepted by the
@@ -33,7 +33,7 @@ Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the
 result in QEMU with the serial console captured.
 
-✅ **`boot-full-kernel`: PASS** — 86/86 init milestones reached, through to the end of init
+✅ **`boot-full-kernel`: PASS** — 186/186 init milestones reached, through to the end of init
 
 The line above measures the proof-of-life kernel: one file that prints and
 halts. This one measures the real kernel — every Appendix A file linked into
@@ -53,7 +53,7 @@ only the hardware gate can measure.
 
 ## Codegen ratchet
 
-**81/81 of the Minimum Viable Kernel file set reaches codegen.**
+**85/85 of the Minimum Viable Kernel file set reaches codegen.**
 
 This is the number to watch. The MVK set is
 [MASTER_PLAN Appendix A](docs/MASTER_PLAN.md#appendix-a--minimum-viable-kernel-file-set);
@@ -64,7 +64,7 @@ fall — `scripts/mvk-compiles.sh` fails the build if it does.
 Run `scripts/mvk-compiles.sh --list` to see what each remaining file is
 waiting on; the failures name the construct, not just the count.
 
-**81/81 of the same set reaches codegen for `aarch64`.**
+**85/85 of the same set reaches codegen for `aarch64`.**
 
 Kept as its own number rather than averaged in, because the two targets
 advance independently. The gap is not a compiler gap: the files that do
@@ -76,7 +76,7 @@ architecture-neutral is kernel work, not backend work.
 
 | Area | `.home` files | Lines |
 |------|--------------:|------:|
-| `kernel/` | 416 | 241,276 |
+| `kernel/` | 419 | 250,928 |
 | `apps/` | 125 | 16,048 |
 | `libs/` | 12 | 7,240 |
 | `installer/` | 1 | 1,026 |
@@ -94,16 +94,19 @@ CI gate (`scripts/stub-check.sh`).
 |---|------|------|--------:|--------|
 | S1 | silent hlt-stub fallback + dead `.zig` references | `scripts/build.sh` | 0 | **CLOSED** |
 | S3 | the RX path parses Ethernet, demuxes on ethertype, validates IPv4 and dispatches to arp/icmp/udp | `kernel/src/net/netdev.home` | 0 | **CLOSED** |
-| S4 | No free-space reclamation, no VFS integration, and no files — the tree is key/value, not directories and extents. Steps 1–3 of `docs/design/homefs.md` §9 are done: on-disk structures with blake2s checksums, a block device, copy-on-write B-trees, the commit protocol, and snapshots with rollback — a volume survives a reboot, `scripts/crash-gate.sh` kills QEMU mid-commit and remounts to prove it, and a snapshot survives a reboot too | `kernel/src/fs/homefs.home` | 1 | open — blocks Phase 2 storage; Phase 6 `snapshot-rollback` |
+| S4 | steps 1–6 of `docs/design/homefs.md` §9: on-disk structures with blake2s checksums, a block device, copy-on-write B-trees, the commit protocol, snapshots with rollback, objects (files, directories and extent trees), removal, ownership and mode, `fsck`, free-space reclamation, and VFS routing — a volume mounts at a path and `open`/`read`/`write`/`lseek`/`readdir`/`mkdir`/`rmdir` reach it, with permissions checked against the object's own mode and owner. A volume survives a reboot, `scripts/crash-gate.sh` kills QEMU mid-commit and remounts to prove it, and the boot gate runs 18 checks over the object layer plus an end-to-end round trip through /homefs | `kernel/src/fs/homefs.home` | 0 | **CLOSED** |
 | S5 | chacha20, poly1305, blake2s and curve25519 are implemented and checked against the vectors in RFC 8439, RFC 7693 and RFC 7748 | `kernel/src/crypto/` | 0 | **CLOSED** |
-| S6 | No HID driver, so still no USB keyboard, and no write path or VFS integration for USB storage. The host-controller driver and a mass-storage read path are done: enumeration through Configure Endpoint, Bulk-Only Transport, INQUIRY, READ CAPACITY(10) and READ(10) — the boot gate reads a known block off a USB disk and checks its contents | `kernel/src/drivers/usb.home` | 2 | open — blocks Phase 7a (keyboards, storage on metal) |
-| S7 | No AML interpreter and no power-state transitions, so there is still no S3 suspend/resume. Table discovery is done: RSDP from both permitted locations, checksums verified, RSDT/XSDT walked, FADT and MADT parsed | `kernel/src/drivers/acpi.home` | 1 | open — blocks Phase 7a (power, S3 suspend) |
+| S6 | the xHCI host controller, USB mass storage and USB HID. Enumeration walks every port and dispatches on interface class; Bulk-Only Transport carries INQUIRY, READ CAPACITY(10), READ(10) and WRITE(10); the disk is registered as `/dev/usb0` so paths reach it through the VFS; and HID runs in boot protocol with both the mouse and keyboard report layouts decoded. The boot gate reads a known block, writes another and checks the host image (a device accepting a write is not the same as the write reaching the media), reads that block back through `vfs_pread`, moves an emulated mouse and reads the movement off the interrupt endpoint, and — in a second run, because a usb-kbd takes keystrokes away from the PS/2 controller — presses a key and reads the keycode back | `kernel/src/drivers/usb.home` | 0 | **CLOSED** |
+| S7 | ACPI table discovery, the AML namespace and an interpreter, and S3 suspend/resume. The DSDT is parsed to the byte and shutdown takes its SLP_TYP from `\_S5_` instead of assuming 5; methods run within a stated integer subset and refuse anything outside it rather than guessing (15 of the 100 QEMU declares fall inside); and the machine suspends to RAM and comes back through a real-mode trampoline planted in the FACS waking vector. The boot gate requires the parser to reject a truncated and a corrupted DSDT, runs the interpreter against a hand-assembled method with exact expected values, and — in a run of its own, since suspending ends a run — suspends the machine, confirms from outside the guest that QEMU really slept, wakes it, and requires the kernel to report coming back | `kernel/src/drivers/acpi.home` | 0 | **CLOSED** |
 | S8 | `mmio_read32`/`mmio_write32` were inert, so every ARM64/Pi driver was too | `kernel/src/arch/arm64/arm64.home` | 0 | **CLOSED** |
 | S9 | Port-I/O wrappers halt the machine on ARM64 — the architecture has no I/O address space, so calling one is always a bug | `kernel/src/core/foundation.home` | 1 | open — blocks Phase 7b (only reachable from ARM64 code paths) |
 | S10 | SMAP's ARM64 counterpart (the PAN bit in PSTATE) is set up, so `asm_stac`/`asm_clac` move a real bit on both architectures | `kernel/src/core/foundation.home` | 0 | **CLOSED** |
 | S11 | `tcp_input()` validates a segment and hands it to the state machine, and netdev dispatches to it | `kernel/src/net/netdev.home` | 0 | **CLOSED** |
+| S12 | Job control is absent: `&`, `jobs`, `fg` and `bg` need a process that keeps running after the shell returns, which needs fork/exec (S13). Pipelines themselves now run, in stages rather than concurrently — each stage's output goes to a holding file and the next stage reads it, so for finite input the bytes and the exit status are what a concurrent pipe gives. A stage runs to completion before the next starts, so an unbounded producer never reaches its consumer, and the intermediate bytes live in a file rather than a kernel buffer | `kernel/src/console/den.home` | 2 | open — blocks Phase 3 `shell-suite` |
+| S13 | fork returns twice and the child has an address space of its own, but there is no scheduler: the child runs when the parent waits for it, on the parent's kernel stack, and a parent that never waits never runs its child. That is enough for fork-exec-wait and not enough for a parent and child that both expect to make progress. `sys_exec` still assigns rip and loads no image; the loader is reached through `run_user_elf` instead. Signals are absent, so job control is too (S12) | `kernel/src/core/process.home` | 2 | open — blocks Phase 3 (signals, job control); the scheduler is what remains |
+| S14 | Twenty syscalls under `// Stub syscall implementations` validate their arguments and `return 0` without doing the work: `stat`/`fstat`/`lstat` leave the caller's buffer untouched, `link`, `symlink`, `readlink`, `rename`, `access`, `chdir`, `getdents`, `getppid`, `nanosleep`, `signal`, `mprotect`, `send`, `recv`, `poll`, `epoll_wait`, `pipe` and `dup` likewise. A caller cannot tell any of them from one that worked — `mv` built on this rename moves nothing and reports success. `unlink` was among them and is now real (`vfs_unlink`); the rest are not | `kernel/src/sys/syscall.home` | 1 | open — blocks Phase 3 `coreutils-suite` (mv, ln, ls, stat); `pipe` also blocks S12 |
 
-4 of 10 entries open.
+4 of 13 entries open.
 
 ## Phase gates ([MASTER_PLAN §4](docs/MASTER_PLAN.md#4-the-phase-map))
 

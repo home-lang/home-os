@@ -296,7 +296,14 @@ srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", int(sys.argv[1])))
 srv.listen(4)
-srv.settimeout(180)
+# Long enough to outlast the whole command feed, not a round number that was
+# generous once. The guest reaches `netc` near the end of the list, and that
+# list has grown from around thirty commands to a hundred-odd — at two seconds
+# each the server was timing out and exiting before the kernel ever dialled,
+# which the gate then reported as the kernel failing to connect. The server is
+# killed at cleanup either way; this bound only exists so a stray process
+# cannot outlive a crashed run.
+srv.settimeout(1800)
 try:
     while True:
         conn, _ = srv.accept()
@@ -483,6 +490,7 @@ fi
 total=0
 reached=0
 missing=""
+missing_all=""
 last_pos=0
 while IFS= read -r line; do
     line="$(echo "$line" | sed 's/^ *//; s/ *$//')"
@@ -499,6 +507,11 @@ while IFS= read -r line; do
         last_pos=$((last_pos + pos + ${#line}))
     else
         [ -z "$missing" ] && missing="$line"
+        # Every one, not just the first. A run once reported 184/186 without
+        # naming either, which left nothing to act on: an intermittent gate
+        # that cannot say what it lost is indistinguishable from one hiding a
+        # regression.
+        missing_all="${missing_all}${line}"$'\n'
     fi
 done < "$MILESTONES"
 
@@ -757,6 +770,12 @@ echo "boot-gate: net-echo both ways, host client got 32 bytes back"
 echo "boot-gate: $reached/$total milestones reached"
 
 if [ "$reached" -lt "$total" ]; then
+    # On stdout as well as stderr. A caller redirecting only stdout — which is
+    # the ordinary way to capture a run — otherwise gets a count with no
+    # explanation of it.
+    echo ""
+    echo "boot-gate: milestones not reached ($(( total - reached ))):"
+    printf '%s' "$missing_all" | sed 's/^/  - /'
     echo "" >&2
     echo "RATCHET BROKEN: the boot stopped short." >&2
     echo "First milestone not reached: $missing" >&2
