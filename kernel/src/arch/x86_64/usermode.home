@@ -33,7 +33,7 @@ var syscalls_served: u64 = 0
 // pages it will actually run from.
 var load_buffer: [4096]u8 = undefined
 
-extern fn enter_usermode(rip: u64, rsp: u64)
+extern fn enter_usermode(rip: u64, rsp: u64, argc: u64, argv: u64)
 extern fn return_to_kernel()
 
 // ============================================================================
@@ -109,7 +109,10 @@ fn map_user_page(virt: u64): u64 {
 // enough to prove the privilege transition and the syscall path, which is
 // what the gate asks about. Returns nonzero if the program could not be
 // started; if it starts, this does not return.
-export fn run_user_program(path: u64): u32 {
+// `command_line` is the whole invocation — the program's own name first, the
+// way a shell passes it — and becomes the program's argv. A caller with
+// nothing to pass gives 0, and the program is entered with argc 0.
+export fn run_user_program(path: u64, command_line: u64 = 0): u32 {
   var fd: u32 = filesystem.vfs_open(path, 0)
   if fd == 0 {
     foundation.serial_write_string("[User] not found\n")
@@ -140,9 +143,7 @@ export fn run_user_program(path: u64): u32 {
     i = i + 1
   }
 
-  // Stack page, mapped one page below the top so the initial rsp is inside it.
-  var stack_phys: u64 = map_user_page(USER_STACK_TOP - 4096)
-  if stack_phys == 0 {
+  if map_user_stack() == 0 {
     foundation.serial_write_string("[User] could not map stack\n")
     return 1
   }
@@ -155,9 +156,106 @@ export fn run_user_program(path: u64): u32 {
 
   // Leave a little headroom below the top: the program is entered with an
   // empty stack and nothing pushed for it.
-  enter_usermode(USER_TEXT_BASE, USER_STACK_TOP - 64)
+  let stack_at: u64 = build_argv(command_line)
+  enter_usermode(USER_TEXT_BASE, stack_at, @as(u64, argv_count), argv_base)
 
   return 0
+}
+
+// ============================================================================
+// The argument vector
+//
+// A program is entered with argc in %rdi and argv in %rsi. The strings and
+// the pointer array they contain have to live somewhere the program can read
+// at ring 3, so they are built at the top of its own stack page and the
+// initial %rsp is set below them.
+//
+// Laid out downward from the top of the stack: the strings first, then the
+// array of pointers to them, then a null terminator. That order matters only
+// in that the pointers must be written after the strings are placed, since
+// they are the addresses the strings ended up at.
+// ============================================================================
+
+// How much stack a user program gets. One page was enough for hand-written
+// assembly and is not enough for compiled code: a program with a few nested
+// calls and a buffer or two runs off the bottom, and the argument vector at
+// the top takes a further kilobyte before the program starts. Sixteen
+// kilobytes is still small, and it is a number rather than an assumption.
+const USER_STACK_PAGES: u32 = 4
+
+// Map the stack, top page first so the argument vector can be written into it
+// before the rest exist. Returns 1 on success.
+fn map_user_stack(): u32 {
+  var i: u32 = 0
+  while i < USER_STACK_PAGES {
+    let at: u64 = USER_STACK_TOP - @as(u64, (i + 1) * 4096)
+    if map_user_page(at) == 0 { return 0 }
+    i = i + 1
+  }
+  return 1
+}
+
+const ARGV_MAX: u32 = 16
+const ARGV_BYTES_MAX: u32 = 1024
+
+// Where the argument array ended up, and how many entries it has. Written by
+// build_argv and read by the two launch paths.
+var argv_base: u64 = 0
+var argv_count: u32 = 0
+
+// Split a command line into arguments, copying it into the user stack.
+//
+// `line` is a NUL-terminated string in kernel memory; it is copied because
+// the program must be able to read it, and kernel memory at ring 3 is not
+// readable. Returns the address the initial stack pointer should take.
+fn build_argv(line: u64): u64 {
+  argv_base = 0
+  argv_count = 0
+
+  // Reserve the top of the stack for the strings, and the region below it
+  // for the pointer array. Both are inside the one mapped stack page.
+  let strings_top: u64 = USER_STACK_TOP - 16
+  var strings_at: u64 = strings_top - @as(u64, ARGV_BYTES_MAX)
+  let array_at: u64 = strings_at - @as(u64, (ARGV_MAX + 1) * 8)
+
+  var written: u32 = 0
+  var count: u32 = 0
+  var i: u32 = 0
+
+  if line != 0 {
+    loop {
+      if count >= ARGV_MAX { break }
+      // Skip the spaces before the next word.
+      while @as(*u8, @ptrFromInt(line + @as(u64, i))).* == 32 { i = i + 1 }
+      if @as(*u8, @ptrFromInt(line + @as(u64, i))).* == 0 { break }
+
+      // The word starts here; copy it, terminator included.
+      let word_at: u64 = strings_at + @as(u64, written)
+      loop {
+        let c: u8 = @as(*u8, @ptrFromInt(line + @as(u64, i))).*
+        if c == 0 or c == 32 { break }
+        if written + 1 >= ARGV_BYTES_MAX { break }
+        @as(*u8, @ptrFromInt(strings_at + @as(u64, written))).* = c
+        written = written + 1
+        i = i + 1
+      }
+      @as(*u8, @ptrFromInt(strings_at + @as(u64, written))).* = 0
+      written = written + 1
+
+      @as(*u64, @ptrFromInt(array_at + @as(u64, count) * 8)).* = word_at
+      count = count + 1
+    }
+  }
+
+  // A null after the last pointer, so a program can walk argv without
+  // consulting argc — which is what most of them do.
+  @as(*u64, @ptrFromInt(array_at + @as(u64, count) * 8)).* = 0
+
+  argv_base = array_at
+  argv_count = count
+  // Below the array, aligned to sixteen: the ABI's stack alignment, and the
+  // first thing a compiled prologue relies on.
+  return (array_at - 64) & ~@as(u64, 15)
 }
 
 // Load an ELF64 executable and run it at ring 3.
@@ -165,12 +263,11 @@ export fn run_user_program(path: u64): u32 {
 // Unlike run_user_program, the image says where it wants to live and what its
 // entry point is, so nothing here picks an address. Returns nonzero if it
 // could not be started; when it starts, this returns once the program exits.
-export fn run_user_elf(path: u64): u32 {
+export fn run_user_elf(path: u64, command_line: u64 = 0): u32 {
   var entry: u64 = elf.elf_load(path)
   if entry == 0 { return 1 }
 
-  var stack_phys: u64 = map_user_page(USER_STACK_TOP - 4096)
-  if stack_phys == 0 {
+  if map_user_stack() == 0 {
     foundation.serial_write_string("[User] could not map stack\n")
     return 1
   }
@@ -179,7 +276,8 @@ export fn run_user_elf(path: u64): u32 {
   foundation.serial_write_hex(entry)
   foundation.serial_write_string("\n")
 
-  enter_usermode(entry, USER_STACK_TOP - 64)
+  let stack_at: u64 = build_argv(command_line)
+  enter_usermode(entry, stack_at, @as(u64, argv_count), argv_base)
 
   return 0
 }

@@ -269,6 +269,17 @@ syscall_entry:
  * return. RFLAGS is set to 0x202 — reserved bit 1, plus IF, so the timer
  * keeps running once userspace is live.
  * ------------------------------------------------------------------------ */
+/* enter_usermode(rip, rsp, argc, argv) — rdi, rsi, rdx, rcx.
+ *
+ * argc and argv reach the program in %rdi and %rsi, which is home-os's
+ * process ABI. SysV puts them on the stack above the initial %rsp; this does
+ * not, because every program here is compiled by the Home compiler and a
+ * function's first two parameters already arrive in those registers — so
+ * `_start(argc, argv)` is an ordinary function rather than something that has
+ * to read its own stack before its prologue has run. A binary built by
+ * another toolchain would need the stack form; nothing builds one today, and
+ * that is the trade being made rather than an oversight.
+ */
 .global enter_usermode
 enter_usermode:
     /* Save the kernel context so exit() can come back to it. Without this a
@@ -282,6 +293,13 @@ enter_usermode:
     push %r15
     mov %rsp, saved_kernel_rsp(%rip)
 
+    /* Out of the argument registers before they are needed for other things,
+     * and before the iretq frame is built out of two of them. */
+    mov %rdi, %r8           /* rip  */
+    mov %rsi, %r9           /* rsp  */
+    mov %rdx, %r10          /* argc */
+    mov %rcx, %r11          /* argv */
+
     mov $0x23, %ax          /* user data selector, RPL 3 */
     mov %ax, %ds
     mov %ax, %es
@@ -289,10 +307,30 @@ enter_usermode:
     mov %ax, %gs
 
     push $0x23              /* ss */
-    push %rsi               /* rsp */
+    push %r9                /* rsp */
     push $0x202             /* rflags */
     push $0x1b              /* cs: user code selector, RPL 3 */
-    push %rdi               /* rip */
+    push %r8                /* rip */
+
+    mov %r10, %rdi          /* argc */
+    mov %r11, %rsi          /* argv */
+
+    /* Everything else is zeroed rather than left holding whatever the kernel
+     * had in it. A register carried across the privilege drop is a kernel
+     * value readable at ring 3, and the program has no use for any of them. */
+    xor %rax, %rax
+    xor %rbx, %rbx
+    xor %rcx, %rcx
+    xor %rdx, %rdx
+    xor %rbp, %rbp
+    xor %r8, %r8
+    xor %r9, %r9
+    xor %r10, %r10
+    xor %r11, %r11
+    xor %r12, %r12
+    xor %r13, %r13
+    xor %r14, %r14
+    xor %r15, %r15
     iretq
 
 /* return_to_kernel() — resume enter_usermode's caller.
