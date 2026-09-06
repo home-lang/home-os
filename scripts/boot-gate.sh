@@ -477,7 +477,11 @@ while IFS= read -r line; do
     case "$line" in ''|\#*) continue ;; esac
     total=$((total + 1))
     # Milestones must appear in order, so search only past the previous one.
-    pos="$(tail -c +"$((last_pos + 1))" "$log" | grep -bF -m1 "$line" 2>/dev/null | head -1 | cut -d: -f1)"
+    # -a: the log is a serial capture, so it may legitimately contain any
+    # byte. Without it grep answers "Binary file ... matches" instead of an
+    # offset, and the arithmetic below then evaluates the word "file" as a
+    # variable name and aborts the gate under set -u.
+    pos="$(tail -c +"$((last_pos + 1))" "$log" | grep -abF -m1 "$line" 2>/dev/null | head -1 | cut -d: -f1)"
     if [ -n "$pos" ]; then
         reached=$((reached + 1))
         last_pos=$((last_pos + pos + ${#line}))
@@ -600,7 +604,7 @@ done
 kill "$kbd_pid" 2>/dev/null
 wait "$kbd_pid" 2>/dev/null
 
-kbd_report="$(grep -F '[HID] keyboard report:' "$kbdlog" 2>/dev/null | head -1)"
+kbd_report="$(grep -aF '[HID] keyboard report:' "$kbdlog" 2>/dev/null | head -1)"
 if [ -z "$kbd_report" ]; then
     echo "" >&2
     echo "RATCHET BROKEN: the USB keyboard reported nothing." >&2
