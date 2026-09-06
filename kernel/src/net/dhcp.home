@@ -1,514 +1,352 @@
-// home-os DHCP Client
-// Dynamic Host Configuration Protocol (RFC 2131)
-// Complete implementation with DISCOVER/OFFER/REQUEST/ACK
+// home-os DHCP client — RFC 2131
+//
+// The wire format is written and read a byte at a time rather than by casting
+// a struct over the buffer. A BOOTP message is big-endian and this machine is
+// not, so a struct assignment like `flags = 0x8000` puts 00 80 on the wire and
+// means the opposite of what it says; and a struct laid over a received
+// packet reads every multi-byte field backwards. Both were true here, and
+// neither shows up as a failure — the exchange simply never completes.
+//
+// This module builds and parses. It does not transmit: a DHCP client has no
+// address yet, so its packets go out through the link layer as broadcasts,
+// and the exchange is driven by whoever owns the network device. Keeping the
+// send out of here is also what let the previous version call a udp_send that
+// had not existed for some time, with five arguments to its three.
 
 import "../core/foundation.home" as foundation
-import "../core/memory.home" as memory
-import "../security/random.home" as random
-import "udp.home" as udp
 
-// DHCP message types
-const DHCP_DISCOVER: u8 = 1
-const DHCP_OFFER: u8 = 2
-const DHCP_REQUEST: u8 = 3
-const DHCP_DECLINE: u8 = 4
-const DHCP_ACK: u8 = 5
-const DHCP_NAK: u8 = 6
-const DHCP_RELEASE: u8 = 7
-const DHCP_INFORM: u8 = 8
-
-// DHCP ports
 const DHCP_SERVER_PORT: u16 = 67
 const DHCP_CLIENT_PORT: u16 = 68
 
-// DHCP option codes
-const DHCP_OPT_SUBNET_MASK: u8 = 1
-const DHCP_OPT_ROUTER: u8 = 3
-const DHCP_OPT_DNS: u8 = 6
-const DHCP_OPT_HOSTNAME: u8 = 12
-const DHCP_OPT_REQUESTED_IP: u8 = 50
-const DHCP_OPT_LEASE_TIME: u8 = 51
-const DHCP_OPT_MESSAGE_TYPE: u8 = 53
-const DHCP_OPT_SERVER_ID: u8 = 54
-const DHCP_OPT_PARAM_LIST: u8 = 55
-const DHCP_OPT_RENEWAL_TIME: u8 = 58
-const DHCP_OPT_REBIND_TIME: u8 = 59
-const DHCP_OPT_END: u8 = 255
+const BOOTREQUEST: u8 = 1
+const BOOTREPLY: u8 = 2
+const HTYPE_ETHERNET: u8 = 1
+const HLEN_ETHERNET: u8 = 6
 
-// DHCP magic cookie
+// 99.130.83.99, the value that says the options field is DHCP and not
+// vendor-specific BOOTP data.
 const DHCP_MAGIC: u32 = 0x63825363
 
-// DHCP states
-const DHCP_STATE_INIT: u32 = 0
-const DHCP_STATE_SELECTING: u32 = 1
-const DHCP_STATE_REQUESTING: u32 = 2
-const DHCP_STATE_BOUND: u32 = 3
-const DHCP_STATE_RENEWING: u32 = 4
-const DHCP_STATE_REBINDING: u32 = 5
+export const DHCP_DISCOVER: u8 = 1
+export const DHCP_OFFER: u8 = 2
+export const DHCP_REQUEST: u8 = 3
+export const DHCP_DECLINE: u8 = 4
+export const DHCP_ACK: u8 = 5
+export const DHCP_NAK: u8 = 6
+export const DHCP_RELEASE: u8 = 7
 
-// DHCP packet structure
-struct DhcpPacket {
-  op: u8           // Message opcode: 1=request, 2=reply
-  htype: u8        // Hardware address type: 1=Ethernet
-  hlen: u8         // Hardware address length: 6 for Ethernet
-  hops: u8         // Hops
-  xid: u32         // Transaction ID
-  secs: u16        // Seconds elapsed
-  flags: u16       // Flags (0x8000 = broadcast)
-  ciaddr: u32      // Client IP address
-  yiaddr: u32      // Your IP address
-  siaddr: u32      // Server IP address
-  giaddr: u32      // Gateway IP address
-  chaddr: [16]u8   // Client hardware address
-  sname: [64]u8    // Server name
-  file: [128]u8    // Boot filename
-  magic: u32       // Magic cookie
-  options: [312]u8 // Options
+const OPT_PAD: u8 = 0
+const OPT_SUBNET_MASK: u8 = 1
+const OPT_ROUTER: u8 = 3
+const OPT_DNS: u8 = 6
+const OPT_REQUESTED_IP: u8 = 50
+const OPT_LEASE_TIME: u8 = 51
+const OPT_MESSAGE_TYPE: u8 = 53
+const OPT_SERVER_ID: u8 = 54
+const OPT_PARAM_REQUEST: u8 = 55
+const OPT_END: u8 = 255
+
+// Fixed offsets into a BOOTP message.
+const OFF_OP: u32 = 0
+const OFF_HTYPE: u32 = 1
+const OFF_HLEN: u32 = 2
+const OFF_HOPS: u32 = 3
+const OFF_XID: u32 = 4
+const OFF_SECS: u32 = 8
+const OFF_FLAGS: u32 = 10
+const OFF_CIADDR: u32 = 12
+const OFF_YIADDR: u32 = 16
+const OFF_SIADDR: u32 = 20
+const OFF_GIADDR: u32 = 24
+const OFF_CHADDR: u32 = 28
+const OFF_MAGIC: u32 = 236
+const OFF_OPTIONS: u32 = 240
+
+// The shortest message that can be parsed at all: everything up to and
+// including the magic cookie.
+const DHCP_MIN_LENGTH: u32 = 240
+
+export const DHCP_STATE_INIT: u32 = 0
+export const DHCP_STATE_SELECTING: u32 = 1
+export const DHCP_STATE_REQUESTING: u32 = 2
+export const DHCP_STATE_BOUND: u32 = 3
+
+var dhcp_state: u32 = 0
+var dhcp_xid: u32 = 0
+var client_mac: [u8; 6] = undefined
+var offered_ip: u32 = 0
+var server_ip: u32 = 0
+var leased_ip: u32 = 0
+var lease_mask: u32 = 0
+var lease_router: u32 = 0
+var lease_dns: u32 = 0
+var lease_seconds: u32 = 0
+
+export fn dhcp_state_now(): u32 { return dhcp_state }
+export fn dhcp_offered_ip(): u32 { return offered_ip }
+export fn dhcp_server_ip(): u32 { return server_ip }
+export fn dhcp_leased_ip(): u32 { return leased_ip }
+export fn dhcp_subnet_mask(): u32 { return lease_mask }
+export fn dhcp_router(): u32 { return lease_router }
+export fn dhcp_dns(): u32 { return lease_dns }
+export fn dhcp_lease_seconds(): u32 { return lease_seconds }
+export fn dhcp_client_port(): u16 { return DHCP_CLIENT_PORT }
+export fn dhcp_server_port(): u16 { return DHCP_SERVER_PORT }
+export fn dhcp_transaction_id(): u32 { return dhcp_xid }
+
+// ============================================================================
+// Byte order
+// ============================================================================
+
+fn put8(base: u64, offset: u32, value: u8) {
+  @as(*u8, @ptrFromInt(base + @as(u64, offset))).* = value
 }
 
-// DHCP client state
-struct DhcpClient {
-  state: u32
-  xid: u32
-  client_ip: u32
-  server_ip: u32
-  subnet_mask: u32
-  router_ip: u32
-  dns_ip: u32
-  lease_time: u32
-  renewal_time: u32
-  rebind_time: u32
-  lease_start: u64
-  mac_address: [6]u8
+fn get8(base: u64, offset: u32): u8 {
+  return @as(*u8, @ptrFromInt(base + @as(u64, offset))).*
 }
 
-var dhcp_client: DhcpClient = undefined
-var dhcp_initialized: u32 = 0
+fn put16(base: u64, offset: u32, value: u16) {
+  put8(base, offset, @as(u8, (value >> 8) & 0xFF))
+  put8(base, offset + 1, @as(u8, value & 0xFF))
+}
 
-// Initialize DHCP client
-export fn dhcp_init(mac_addr: *u8): u32 {
-  foundation.serial_write_string("[DHCP] Initializing client...\n")
+fn put32(base: u64, offset: u32, value: u32) {
+  put8(base, offset, @as(u8, (value >> 24) & 0xFF))
+  put8(base, offset + 1, @as(u8, (value >> 16) & 0xFF))
+  put8(base, offset + 2, @as(u8, (value >> 8) & 0xFF))
+  put8(base, offset + 3, @as(u8, value & 0xFF))
+}
 
-  dhcp_client.state = DHCP_STATE_INIT
-  dhcp_client.xid = generate_xid()
-  dhcp_client.client_ip = 0
-  dhcp_client.server_ip = 0
-  dhcp_client.subnet_mask = 0
-  dhcp_client.router_ip = 0
-  dhcp_client.dns_ip = 0
-  dhcp_client.lease_time = 0
-  dhcp_client.renewal_time = 0
-  dhcp_client.rebind_time = 0
-  dhcp_client.lease_start = 0
+fn get32(base: u64, offset: u32): u32 {
+  return (@as(u32, get8(base, offset)) << 24)
+    | (@as(u32, get8(base, offset + 1)) << 16)
+    | (@as(u32, get8(base, offset + 2)) << 8)
+    | @as(u32, get8(base, offset + 3))
+}
 
-  // Copy MAC address
+// ============================================================================
+// Client identity
+// ============================================================================
+
+// The transaction id ties a reply to a request. It must differ between runs,
+// or a reply left over from a previous exchange would be accepted as an
+// answer to this one.
+fn next_xid(seed: u32): u32 {
+  var x: u32 = seed
+  x = x ^ (x << 13)
+  x = x ^ (x >> 17)
+  x = x ^ (x << 5)
+  if x == 0 { return 0x5A5A1234 }
+  return x
+}
+
+export fn dhcp_init(mac_addr: u64): u32 {
   var i: u32 = 0
-  loop {
-    if i >= 6 { break }
-    dhcp_client.mac_address[i] = memory.read_u8(mac_addr as u64 + i as u64)
+  while i < 6 {
+    client_mac[i] = @as(*u8, @ptrFromInt(mac_addr + @as(u64, i))).*
+    i = i + 1
+  }
+  // Seeded from the MAC so two machines on one segment do not start with the
+  // same id, and stirred so successive runs on one machine differ.
+  dhcp_xid = next_xid((@as(u32, client_mac[2]) << 24)
+    | (@as(u32, client_mac[3]) << 16)
+    | (@as(u32, client_mac[4]) << 8)
+    | @as(u32, client_mac[5]))
+  dhcp_state = DHCP_STATE_INIT
+  offered_ip = 0
+  server_ip = 0
+  leased_ip = 0
+  lease_mask = 0
+  lease_router = 0
+  lease_dns = 0
+  lease_seconds = 0
+  return 1
+}
+
+// ============================================================================
+// Building
+// ============================================================================
+
+// The fixed part of a BOOTP request, shared by every message this sends.
+fn build_header(buf: u64, ciaddr: u32): u32 {
+  var i: u32 = 0
+  while i < OFF_OPTIONS {
+    put8(buf, i, 0)
     i = i + 1
   }
 
-  dhcp_initialized = 1
+  put8(buf, OFF_OP, BOOTREQUEST)
+  put8(buf, OFF_HTYPE, HTYPE_ETHERNET)
+  put8(buf, OFF_HLEN, HLEN_ETHERNET)
+  put8(buf, OFF_HOPS, 0)
+  put32(buf, OFF_XID, dhcp_xid)
+  put16(buf, OFF_SECS, 0)
+  // The broadcast flag. The server has no route to an address it has not
+  // assigned yet, so it must reply to the broadcast address — and this bit is
+  // how it is told so.
+  put16(buf, OFF_FLAGS, 0x8000)
+  put32(buf, OFF_CIADDR, ciaddr)
+  put32(buf, OFF_YIADDR, 0)
+  put32(buf, OFF_SIADDR, 0)
+  put32(buf, OFF_GIADDR, 0)
 
-  foundation.serial_write_string("[DHCP] Client initialized with MAC: ")
-  print_mac_address(&dhcp_client.mac_address[0])
-  foundation.serial_write_string("\n")
+  i = 0
+  while i < 6 {
+    put8(buf, OFF_CHADDR + i, client_mac[i])
+    i = i + 1
+  }
 
-  return 0
+  put32(buf, OFF_MAGIC, DHCP_MAGIC)
+  return OFF_OPTIONS
 }
 
-// Generate transaction ID.
+fn put_option(buf: u64, at: u32, code: u8, length: u8): u32 {
+  put8(buf, at, code)
+  put8(buf, at + 1, length)
+  return at + 2
+}
+
+// The options every request carries: what kind of message it is, and which
+// parameters the client wants back.
+fn put_common_options(buf: u64, at_in: u32, message_type: u8): u32 {
+  var at: u32 = put_option(buf, at_in, OPT_MESSAGE_TYPE, 1)
+  put8(buf, at, message_type)
+  at = at + 1
+
+  at = put_option(buf, at, OPT_PARAM_REQUEST, 4)
+  put8(buf, at, OPT_SUBNET_MASK)
+  put8(buf, at + 1, OPT_ROUTER)
+  put8(buf, at + 2, OPT_DNS)
+  put8(buf, at + 3, OPT_LEASE_TIME)
+  return at + 4
+}
+
+// A DHCPDISCOVER. Returns the message length.
+export fn dhcp_build_discover(buf: u64): u32 {
+  var at: u32 = build_header(buf, 0)
+  at = put_common_options(buf, at, DHCP_DISCOVER)
+  put8(buf, at, OPT_END)
+  at = at + 1
+  dhcp_state = DHCP_STATE_SELECTING
+  return at
+}
+
+// A DHCPREQUEST for the address a server offered. Both the requested address
+// and the server identifier are required: without them the message is a
+// renewal for an address this client does not hold.
+export fn dhcp_build_request(buf: u64): u32 {
+  var at: u32 = build_header(buf, 0)
+  at = put_common_options(buf, at, DHCP_REQUEST)
+
+  at = put_option(buf, at, OPT_REQUESTED_IP, 4)
+  put32(buf, at, offered_ip)
+  at = at + 4
+
+  at = put_option(buf, at, OPT_SERVER_ID, 4)
+  put32(buf, at, server_ip)
+  at = at + 4
+
+  put8(buf, at, OPT_END)
+  at = at + 1
+  dhcp_state = DHCP_STATE_REQUESTING
+  return at
+}
+
+// ============================================================================
+// Parsing
+// ============================================================================
+
+// Walk the options and return the DHCP message type, or 0.
 //
-// Previously returned the hardcoded constant 0x12345678 —
-// any network attacker could race the legitimate DHCP server with a
-// spoofed OFFER because the XID was predictable. We now derive the
-// XID from the kernel CSPRNG, re-seeded from system entropy each call.
-fn generate_xid(): u32 {
-  random.random_init()
-  return random.random_get_u32()
-}
-
-// Print MAC address
-fn print_mac_address(mac: *u8) {
-  var i: u32 = 0
-  loop {
-    if i >= 6 { break }
-    let byte: u8 = memory.read_u8(mac as u64 + i as u64)
-    foundation.serial_write_byte(to_hex((byte >> 4) & 0xF))
-    foundation.serial_write_byte(to_hex(byte & 0xF))
-    if i < 5 {
-      foundation.serial_write_string(":")
-    }
-    i = i + 1
-  }
-}
-
-fn to_hex(n: u8): u8 {
-  if n < 10 {
-    return ('0' as u8) + n
-  } else {
-    return ('a' as u8) + (n - 10)
-  }
-}
-
-// Send DHCP DISCOVER
-export fn dhcp_discover(): u32 {
-  foundation.serial_write_string("[DHCP] Sending DISCOVER...\n")
-
-  var packet: DhcpPacket = undefined
-
-  // zero exactly the struct, not a hardcoded 576 that
-  // doesn't match the layout and overflowed by 24 bytes.
-  memory.memset(&packet as u64, 0, @sizeOf(DhcpPacket))
-
-  // Fill BOOTP fields
-  packet.op = 1  // BOOTREQUEST
-  packet.htype = 1  // Ethernet
-  packet.hlen = 6
-  packet.hops = 0
-  packet.xid = dhcp_client.xid
-  packet.secs = 0
-  packet.flags = 0x8000  // Broadcast flag
-  packet.ciaddr = 0
-  packet.yiaddr = 0
-  packet.siaddr = 0
-  packet.giaddr = 0
-
-  // Copy MAC address to chaddr
-  var i: u32 = 0
-  loop {
-    if i >= 6 { break }
-    packet.chaddr[i] = dhcp_client.mac_address[i]
-    i = i + 1
-  }
-
-  // Magic cookie
-  packet.magic = DHCP_MAGIC
-
-  // Build options
-  var opt_offset: u32 = 0
-
-  // Option: DHCP Message Type (DISCOVER)
-  packet.options[opt_offset] = DHCP_OPT_MESSAGE_TYPE
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = 1  // Length
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = DHCP_DISCOVER
-  opt_offset = opt_offset + 1
-
-  // Option: Parameter Request List
-  packet.options[opt_offset] = DHCP_OPT_PARAM_LIST
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = 4  // Length
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = DHCP_OPT_SUBNET_MASK
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = DHCP_OPT_ROUTER
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = DHCP_OPT_DNS
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = DHCP_OPT_LEASE_TIME
-  opt_offset = opt_offset + 1
-
-  // End option
-  packet.options[opt_offset] = DHCP_OPT_END
-  opt_offset = opt_offset + 1
-
-  // Send via UDP broadcast
-  let result: u32 = udp.udp_send(
-    0xFFFFFFFF,  // Broadcast
-    DHCP_SERVER_PORT,
-    DHCP_CLIENT_PORT,
-    &packet as u64,
-    240 + opt_offset
-  )
-
-  if result == 0 {
-    foundation.serial_write_string("[DHCP] DISCOVER sent successfully\n")
-    dhcp_client.state = DHCP_STATE_SELECTING
-    return 0
-  } else {
-    foundation.serial_write_string("[DHCP] Failed to send DISCOVER\n")
-    return 1
-  }
-}
-
-// Send DHCP REQUEST
-export fn dhcp_request(offered_ip: u32, server_ip: u32): u32 {
-  foundation.serial_write_string("[DHCP] Sending REQUEST for ")
-  print_ip_address(offered_ip)
-  foundation.serial_write_string("\n")
-
-  var packet: DhcpPacket = undefined
-
-  // zero exactly the struct, not a hardcoded 576 that
-  // doesn't match the layout and overflowed by 24 bytes.
-  memory.memset(&packet as u64, 0, @sizeOf(DhcpPacket))
-
-  // Fill BOOTP fields
-  packet.op = 1
-  packet.htype = 1
-  packet.hlen = 6
-  packet.hops = 0
-  packet.xid = dhcp_client.xid
-  packet.secs = 0
-  packet.flags = 0x8000
-  packet.ciaddr = 0
-  packet.yiaddr = 0
-  packet.siaddr = 0
-  packet.giaddr = 0
-
-  // Copy MAC address
-  var i: u32 = 0
-  loop {
-    if i >= 6 { break }
-    packet.chaddr[i] = dhcp_client.mac_address[i]
-    i = i + 1
-  }
-
-  // Magic cookie
-  packet.magic = DHCP_MAGIC
-
-  // Build options
-  var opt_offset: u32 = 0
-
-  // Option: DHCP Message Type (REQUEST)
-  packet.options[opt_offset] = DHCP_OPT_MESSAGE_TYPE
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = 1
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = DHCP_REQUEST
-  opt_offset = opt_offset + 1
-
-  // Option: Requested IP Address
-  packet.options[opt_offset] = DHCP_OPT_REQUESTED_IP
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = 4
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = (offered_ip >> 24) as u8
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = (offered_ip >> 16) as u8
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = (offered_ip >> 8) as u8
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = offered_ip as u8
-  opt_offset = opt_offset + 1
-
-  // Option: Server Identifier
-  packet.options[opt_offset] = DHCP_OPT_SERVER_ID
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = 4
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = (server_ip >> 24) as u8
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = (server_ip >> 16) as u8
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = (server_ip >> 8) as u8
-  opt_offset = opt_offset + 1
-  packet.options[opt_offset] = server_ip as u8
-  opt_offset = opt_offset + 1
-
-  // End option
-  if opt_offset >= 312 { return 1 }  // bounds check before writing
-  packet.options[opt_offset] = DHCP_OPT_END
-
-  // Send via UDP broadcast (240 = BOOTP header size before options)
-  var pkt_len: u32 = 240 + opt_offset + 1  // +1 for DHCP_OPT_END byte
-  if pkt_len > @sizeOf(DhcpPacket) { pkt_len = @sizeOf(DhcpPacket) }
-  let result: u32 = udp.udp_send(
-    0xFFFFFFFF,
-    DHCP_SERVER_PORT,
-    DHCP_CLIENT_PORT,
-    &packet as u64,
-    pkt_len
-  )
-
-  if result == 0 {
-    foundation.serial_write_string("[DHCP] REQUEST sent successfully\n")
-    dhcp_client.state = DHCP_STATE_REQUESTING
-    return 0
-  } else {
-    foundation.serial_write_string("[DHCP] Failed to send REQUEST\n")
-    return 1
-  }
-}
-
-// Process received DHCP packet
-export fn dhcp_process_packet(packet: *u8, len: u32): u32 {
-  if len < 240 {
-    return 1  // Too small
-  }
-
-  let dhcp_packet: *DhcpPacket = packet as *DhcpPacket
-
-  // Verify XID matches
-  if dhcp_packet.xid != dhcp_client.xid {
-    return 1
-  }
-
-  // Verify magic cookie
-  if dhcp_packet.magic != DHCP_MAGIC {
-    return 1
-  }
-
-  // Parse options. Bounds-check every field read so a malicious
-  // DHCP server can't drive the parser off the end of the options
-  // buffer via a truncated length byte or a runaway option chain.
-  var opt_offset: u32 = 0
+// Options are a length-prefixed chain, and a length of zero would not advance
+// — so it ends the walk rather than spinning. Pad and End are the two codes
+// with no length byte at all.
+fn scan_options(buf: u64, length: u32): u8 {
   var message_type: u8 = 0
-
-  loop {
-    if opt_offset >= 312 { break }
-
-    let opt_code: u8 = dhcp_packet.options[opt_offset]
-
-    if opt_code == DHCP_OPT_END {
-      break
-    }
-
-    if opt_code == 0 {  // Padding
-      opt_offset = opt_offset + 1
+  var at: u32 = OFF_OPTIONS
+  while at < length {
+    let code: u8 = get8(buf, at)
+    if code == OPT_END { return message_type }
+    if code == OPT_PAD {
+      at = at + 1
       continue
     }
+    if at + 2 > length { return message_type }
+    let option_len: u32 = @as(u32, get8(buf, at + 1))
+    let value: u32 = at + 2
+    if value + option_len > length { return message_type }
 
-    // Need at least 2 bytes for code + length before reading len.
-    // also guard against u32 overflow on opt_offset + N
-    // before the comparison against 312.
-    if opt_offset > 310 { break }  // Prevent (opt_offset + 2) wrap.
-    if opt_offset + 2 > 312 { break }
-
-    let opt_len: u8 = dhcp_packet.options[opt_offset + 1]
-    opt_offset = opt_offset + 2
-
-    // Reject zero-length non-padding options (would infinite-loop
-    // because opt_offset wouldn't advance past them) and lengths
-    // that would read past the options buffer.
-    if opt_len == 0 { break }
-    if (opt_len as u32) > 255 { break }  // Defense-in-depth (u8 max).
-    if opt_offset + (opt_len as u32) > 312 { break }
-
-    if opt_code == DHCP_OPT_MESSAGE_TYPE {
-      if opt_len >= 1 { message_type = dhcp_packet.options[opt_offset] }
-    } else if opt_code == DHCP_OPT_SUBNET_MASK and opt_len >= 4 {
-      dhcp_client.subnet_mask = read_u32_be(&dhcp_packet.options[opt_offset])
-    } else if opt_code == DHCP_OPT_ROUTER and opt_len >= 4 {
-      dhcp_client.router_ip = read_u32_be(&dhcp_packet.options[opt_offset])
-    } else if opt_code == DHCP_OPT_DNS and opt_len >= 4 {
-      dhcp_client.dns_ip = read_u32_be(&dhcp_packet.options[opt_offset])
-    } else if opt_code == DHCP_OPT_LEASE_TIME and opt_len >= 4 {
-      dhcp_client.lease_time = read_u32_be(&dhcp_packet.options[opt_offset])
-    } else if opt_code == DHCP_OPT_SERVER_ID and opt_len >= 4 {
-      dhcp_client.server_ip = read_u32_be(&dhcp_packet.options[opt_offset])
+    if code == OPT_MESSAGE_TYPE and option_len >= 1 {
+      message_type = get8(buf, value)
+    }
+    if code == OPT_SUBNET_MASK and option_len >= 4 {
+      lease_mask = get32(buf, value)
+    }
+    if code == OPT_ROUTER and option_len >= 4 {
+      lease_router = get32(buf, value)
+    }
+    if code == OPT_DNS and option_len >= 4 {
+      lease_dns = get32(buf, value)
+    }
+    if code == OPT_SERVER_ID and option_len >= 4 {
+      server_ip = get32(buf, value)
+    }
+    if code == OPT_LEASE_TIME and option_len >= 4 {
+      lease_seconds = get32(buf, value)
     }
 
-    opt_offset = opt_offset + opt_len as u32
+    at = value + option_len
   }
+  return message_type
+}
 
-  // Handle message type
+// Take in a reply. Returns the message type it was, or 0 if it is not a
+// reply to this client's outstanding request.
+//
+// Three things have to match before anything in the packet is believed: it is
+// a BOOTREPLY, its transaction id is the one this client sent, and its magic
+// cookie says the options are DHCP. A reply for another client on the same
+// broadcast segment satisfies none of them.
+export fn dhcp_process_reply(buf: u64, length: u32): u8 {
+  if length < DHCP_MIN_LENGTH { return 0 }
+  if get8(buf, OFF_OP) != BOOTREPLY { return 0 }
+  if get32(buf, OFF_XID) != dhcp_xid { return 0 }
+  if get32(buf, OFF_MAGIC) != DHCP_MAGIC { return 0 }
+
+  let message_type: u8 = scan_options(buf, length)
+
   if message_type == DHCP_OFFER {
-    handle_dhcp_offer(dhcp_packet)
-  } else if message_type == DHCP_ACK {
-    handle_dhcp_ack(dhcp_packet)
-  } else if message_type == DHCP_NAK {
-    handle_dhcp_nak()
+    offered_ip = get32(buf, OFF_YIADDR)
+    if offered_ip == 0 { return 0 }
+    return DHCP_OFFER
   }
 
-  return 0
+  if message_type == DHCP_ACK {
+    leased_ip = get32(buf, OFF_YIADDR)
+    if leased_ip == 0 { return 0 }
+    dhcp_state = DHCP_STATE_BOUND
+    return DHCP_ACK
+  }
+
+  if message_type == DHCP_NAK {
+    // The server refused. Everything learned from the offer is void, and
+    // starting again from INIT is the only correct response.
+    dhcp_state = DHCP_STATE_INIT
+    offered_ip = 0
+    server_ip = 0
+    return DHCP_NAK
+  }
+
+  return message_type
 }
 
-// Handle DHCP OFFER
-fn handle_dhcp_offer(packet: *DhcpPacket) {
-  foundation.serial_write_string("[DHCP] Received OFFER: ")
-  print_ip_address(packet.yiaddr)
-  foundation.serial_write_string("\n")
-
-  // Send REQUEST for this IP
-  dhcp_request(packet.yiaddr, dhcp_client.server_ip)
-}
-
-// Handle DHCP ACK
-fn handle_dhcp_ack(packet: *DhcpPacket) {
-  dhcp_client.client_ip = packet.yiaddr
-
-  foundation.serial_write_string("[DHCP] Received ACK\n")
-  foundation.serial_write_string("[DHCP] IP Address:   ")
-  print_ip_address(dhcp_client.client_ip)
-  foundation.serial_write_string("\n")
-  foundation.serial_write_string("[DHCP] Subnet Mask:  ")
-  print_ip_address(dhcp_client.subnet_mask)
-  foundation.serial_write_string("\n")
-  foundation.serial_write_string("[DHCP] Router:       ")
-  print_ip_address(dhcp_client.router_ip)
-  foundation.serial_write_string("\n")
-  foundation.serial_write_string("[DHCP] DNS Server:   ")
-  print_ip_address(dhcp_client.dns_ip)
-  foundation.serial_write_string("\n")
-  foundation.serial_write_string("[DHCP] Lease Time:   ")
-  foundation.serial_write_u64(dhcp_client.lease_time)
-  foundation.serial_write_string(" seconds\n")
-
-  dhcp_client.state = DHCP_STATE_BOUND
-}
-
-// Handle DHCP NAK
-fn handle_dhcp_nak() {
-  foundation.serial_write_string("[DHCP] Received NAK - restarting\n")
-  dhcp_client.state = DHCP_STATE_INIT
-  dhcp_client.xid = generate_xid()
-}
-
-// Read 32-bit big-endian value
-fn read_u32_be(ptr: *u8): u32 {
-  let b0: u32 = memory.read_u8(ptr as u64) as u32
-  let b1: u32 = memory.read_u8(ptr as u64 + 1) as u32
-  let b2: u32 = memory.read_u8(ptr as u64 + 2) as u32
-  let b3: u32 = memory.read_u8(ptr as u64 + 3) as u32
-  return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
-}
-
-// Print IP address
-fn print_ip_address(ip: u32) {
-  foundation.serial_write_u64((ip >> 24) & 0xFF)
+export fn dhcp_print_address(ip: u32) {
+  foundation.serial_write_u64(@as(u64, (ip >> 24) & 0xFF))
   foundation.serial_write_string(".")
-  foundation.serial_write_u64((ip >> 16) & 0xFF)
+  foundation.serial_write_u64(@as(u64, (ip >> 16) & 0xFF))
   foundation.serial_write_string(".")
-  foundation.serial_write_u64((ip >> 8) & 0xFF)
+  foundation.serial_write_u64(@as(u64, (ip >> 8) & 0xFF))
   foundation.serial_write_string(".")
-  foundation.serial_write_u64(ip & 0xFF)
-}
-
-// Get current IP address
-export fn dhcp_get_ip(): u32 {
-  return dhcp_client.client_ip
-}
-
-// Get subnet mask
-export fn dhcp_get_subnet_mask(): u32 {
-  return dhcp_client.subnet_mask
-}
-
-// Get router IP
-export fn dhcp_get_router(): u32 {
-  return dhcp_client.router_ip
-}
-
-// Get DNS server IP
-export fn dhcp_get_dns(): u32 {
-  return dhcp_client.dns_ip
-}
-
-// Get current state
-export fn dhcp_get_state(): u32 {
-  return dhcp_client.state
-}
-
-// Release IP address
-export fn dhcp_release(): u32 {
-  foundation.serial_write_string("[DHCP] Releasing IP address\n")
-
-  dhcp_client.state = DHCP_STATE_INIT
-  dhcp_client.client_ip = 0
-
-  return 0
+  foundation.serial_write_u64(@as(u64, ip & 0xFF))
 }

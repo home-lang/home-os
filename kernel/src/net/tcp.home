@@ -232,6 +232,10 @@ var tcp_initialized: u32 = 0
 // 0xFFFFFFFF (empty) / 0xFFFFFFFE (tombstone).
 var tcp_conn_hash: [u32; 512] = undefined
 
+// The addresses this stack sends from. They start as placeholders and are
+// replaced by tcp_set_addresses once something has actually obtained a lease
+// — sending from an address nothing assigned produces segments the peer
+// cannot route a reply to.
 var local_ip: u32 = 0x0A000002   // 10.0.0.2
 var gateway_ip: u32 = 0x0A000001 // 10.0.0.1
 var local_mac: [u8; 6] = undefined
@@ -706,9 +710,14 @@ fn send_tcp_segment(conn_idx: u32, flags: u8, data: u64, data_len: u32): u32 {
   var packet: [u8; 1600]
   var pkt_len: u32 = build_tcp_packet(conn_idx, flags, data, data_len, @ptrFromInt(&packet))
 
+  // e1000_send_packet returns 0 on success. This read it as a boolean and
+  // treated every successful transmit as a failure: snd_nxt was never
+  // advanced, so the connection re-sent the same sequence number forever and
+  // no handshake could complete. The one path that appeared to work was the
+  // one where the card refused the frame.
   var result: u32 = e1000.e1000_send_packet(@ptrFromInt(&packet), pkt_len)
 
-  if result != 0 {
+  if result == 0 {
     tcp_connections[conn_idx].segments_sent = tcp_connections[conn_idx].segments_sent + 1
     tcp_stats.segments_sent = tcp_stats.segments_sent + 1
 
@@ -1301,6 +1310,16 @@ fn handle_tcp_packet(src_ip: u32, tcp_data: u64, tcp_len: u32) {
 // PUBLIC API
 // ============================================================================
 
+// Adopt the addresses a lease assigned. Connections already open keep the
+// address they were opened with: rewriting a live connection's source address
+// would break it more thoroughly than leaving it.
+export fn tcp_set_addresses(local: u32, gateway: u32) {
+  local_ip = local
+  gateway_ip = gateway
+}
+
+export fn tcp_local_ip(): u32 { return local_ip }
+
 export fn tcp_init() {
   if tcp_initialized == 1 { return }
 
@@ -1352,7 +1371,11 @@ export fn tcp_connect(host: u64, port: u16): u32 {
 
   tcp_connections[conn_idx].local_ip = local_ip
   tcp_connections[conn_idx].local_port = allocate_ephemeral_port()
-  tcp_connections[conn_idx].remote_ip = gateway_ip  // Simplified: use gateway
+  // The address the caller asked for. This used to substitute the gateway and
+  // call it a simplification, which meant every connection went to the same
+  // machine whatever address was passed — and looked correct whenever that
+  // machine happened to be the intended one.
+  tcp_connections[conn_idx].remote_ip = @as(u32, host)
   tcp_connections[conn_idx].remote_port = port
 
   // Register in the 5-tuple hash so RX path can find this connection O(1).
@@ -1424,6 +1447,15 @@ export fn tcp_listen(port: u16): u32 {
 // accept() is called will be dropped. A real backlog queue needs the listener
 // to allocate a child connection on SYN, which is a change to the segment
 // handler and is left for when the net-echo gate needs it.
+// Accept without asking for the peer's details. A caller that only wants the
+// connection should not have to supply a structure to ignore — and passing
+// none to tcp_accept, which requires one, is what opcua.home was doing.
+var accept_scratch: TCPConnectionInfo = undefined
+
+export fn tcp_accept_id(listen_id: u32): u32 {
+  return tcp_accept(listen_id, &accept_scratch)
+}
+
 export fn tcp_accept(listen_id: u32, out: *TCPConnectionInfo): u32 {
   if listen_id >= MAX_TCP_CONNECTIONS {
     return 0
@@ -1569,6 +1601,16 @@ export fn tcp_segments_received(): u64 {
 }
 
 export fn tcp_receive(conn_id: u32, buffer: u64, max_length: u32): u32 {
+  return tcp_receive_flags(conn_id, buffer, max_length, 0)
+}
+
+// Read buffered data, optionally without consuming it.
+//
+// `peek` is POSIX's MSG_PEEK: the bytes are copied out and left in the
+// receive buffer, so the next read returns them again. The receive window is
+// left alone too — the peer must not be told there is room that a peeked byte
+// still occupies, or it will send more than the buffer can hold.
+export fn tcp_receive_flags(conn_id: u32, buffer: u64, max_length: u32, peek: u32): u32 {
   if conn_id >= MAX_TCP_CONNECTIONS {
     return 0
   }
@@ -1590,6 +1632,12 @@ export fn tcp_receive(conn_id: u32, buffer: u64, max_length: u32): u32 {
   var src_base: u64 = tcp_connections[conn_id].recv_buffer
   memory.mem_copy(buffer, src_base, to_copy)
 
+  // A peek stops here: the bytes have been copied out and stay where they
+  // are, and the window is unchanged because they still occupy the buffer.
+  if peek != 0 {
+    return to_copy
+  }
+
   // Shift remaining buffered bytes down to the front. Skipped when the
   // buffer drained completely, since mem_copy on a zero-length range
   // still incurs call overhead.
@@ -1606,8 +1654,9 @@ export fn tcp_receive(conn_id: u32, buffer: u64, max_length: u32): u32 {
 
 // tcp_recv is the name the socket layer calls; tcp_receive is what this
 // module named it. One delegating to the other beats two receive paths.
-export fn tcp_recv(conn_id: u32, buffer: u64, max_length: u32): u32 {
-  return tcp_receive(conn_id, buffer, max_length)
+// `peek` defaults to 0, so an ordinary read needs no third thought about it.
+export fn tcp_recv(conn_id: u32, buffer: u64, max_length: u32, peek: u32 = 0): u32 {
+  return tcp_receive_flags(conn_id, buffer, max_length, peek)
 }
 
 // Is there data ready to read without blocking? Reports 1 or 0 and consumes

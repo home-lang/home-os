@@ -116,6 +116,11 @@ struct Socket {
 
   // TCP/UDP connection handle
   conn_handle: u32,
+  // For a datagram socket, the descriptor udp.home holds for it. This layer
+  // used to address UDP by port number, through an API that no longer exists:
+  // udp.home owns its own socket table now, so a socket here holds one of
+  // those rather than trying to name the same thing twice.
+  udp_handle: i32,
 
   // Options
   reuseaddr: u32,
@@ -216,6 +221,35 @@ fn fd_table_remove(fd: u32) {
 // SOCKET OPERATIONS
 // ============================================================================
 
+// Give a datagram socket a udp.home descriptor, creating and binding one on
+// first use. Bound to the port this layer already allocated, so the two
+// tables agree on which port the socket owns rather than each picking one.
+fn ensure_udp_handle(idx: u32): u32 {
+  if sockets[idx].udp_handle >= 0 { return 1 }
+  let handle: i32 = udp.udp_socket()
+  if handle < 0 { return 0 }
+  if sockets[idx].local_port == 0 {
+    sockets[idx].local_port = allocate_ephemeral_port()
+    if sockets[idx].local_port == 0 {
+      udp.udp_close(handle)
+      return 0
+    }
+  }
+  if udp.udp_bind(handle, sockets[idx].local_addr, sockets[idx].local_port) < 0 {
+    udp.udp_close(handle)
+    return 0
+  }
+  sockets[idx].udp_handle = handle
+  return 1
+}
+
+fn recvfrom_into(idx: u32, buf: u64, len: u32, src_ip: *u32, src_port: *u16): u64 {
+  let got: i32 = udp.udp_recvfrom(sockets[idx].udp_handle, @ptrFromInt(buf),
+                                  len, src_ip, src_port)
+  if got < 0 { return 0 }
+  return @as(u64, @as(u32, got))
+}
+
 export fn socket_create(domain: u32, sock_type: u32, protocol: u32): u32 {
   if socket_count >= MAX_SOCKETS {
     return 0  // No free sockets
@@ -255,6 +289,7 @@ export fn socket_create(domain: u32, sock_type: u32, protocol: u32): u32 {
   sockets[i].remote_addr = 0
   sockets[i].remote_port = 0
   sockets[i].conn_handle = 0
+  sockets[i].udp_handle = -1
   sockets[i].reuseaddr = 0
   sockets[i].keepalive = 0
   sockets[i].broadcast = 0
@@ -307,6 +342,12 @@ export fn socket_close(fd: u32): u32 {
     if sockets[idx].sock_type == SOCK_STREAM {
       tcp.tcp_close(sockets[idx].conn_handle)
     }
+  }
+  // And the datagram descriptor, which is a table entry in udp.home that
+  // nothing else will ever release.
+  if sockets[idx].udp_handle >= 0 {
+    udp.udp_close(sockets[idx].udp_handle)
+    sockets[idx].udp_handle = -1
   }
 
   // Free buffers and zero pointers to prevent double-free
@@ -384,7 +425,9 @@ export fn socket_listen(fd: u32, backlog: u32): u32 {
   return 0
 }
 
-export fn socket_accept(fd: u32, addr: u64, addrlen: u64): u32 {
+// A caller that does not want the peer's address passes neither, which POSIX
+// spells as a null pointer.
+export fn socket_accept(fd: u32, addr: u64 = 0, addrlen: u64 = 0): u32 {
   var idx: u32 = find_socket(fd)
   if idx == 0xFFFFFFFF {
     return 0
@@ -461,9 +504,11 @@ export fn socket_connect(fd: u32, addr: u64, addrlen: u32): u32 {
 
     if sockets[idx].sock_type == SOCK_STREAM {
       // TCP connect
+      // tcp_connect allocates the ephemeral source port itself, so passing
+      // one here was both redundant and, since it landed in the `host`
+      // parameter, the reason every connection went to the wrong address.
       var handle: u32 = tcp.tcp_connect(
-        sockets[idx].local_port,
-        sockets[idx].remote_addr,
+        @as(u64, sockets[idx].remote_addr),
         sockets[idx].remote_port
       )
       if handle == 0 {
@@ -485,7 +530,9 @@ export fn socket_connect(fd: u32, addr: u64, addrlen: u32): u32 {
   return 0
 }
 
-export fn socket_send(fd: u32, buf: u64, len: u64, flags: u32): u64 {
+// `flags` is POSIX's fourth argument to send(). It defaults to 0 so a plain
+// send need not mention it.
+export fn socket_send(fd: u32, buf: u64, len: u64, flags: u32 = 0): u64 {
   var idx: u32 = find_socket(fd)
   if idx == 0xFFFFFFFF {
     return 0xFFFFFFFFFFFFFFFF
@@ -503,19 +550,24 @@ export fn socket_send(fd: u32, buf: u64, len: u64, flags: u32): u64 {
   if sockets[idx].sock_type == SOCK_STREAM {
     return tcp.tcp_send(sockets[idx].conn_handle, buf, len)
   } else if sockets[idx].sock_type == SOCK_DGRAM {
-    return udp.udp_send(
-      sockets[idx].local_port,
+    if ensure_udp_handle(idx) == 0 { return 0 }
+    let sent: i32 = udp.udp_sendto(
+      sockets[idx].udp_handle,
+      @ptrFromInt(buf),
+      @intCast(len),
       sockets[idx].remote_addr,
-      sockets[idx].remote_port,
-      buf,
-      @intCast(len)
+      sockets[idx].remote_port
     )
+    if sent < 0 { return 0 }
+    return @as(u64, @as(u32, sent))
   }
 
   return 0
 }
 
-export fn socket_recv(fd: u32, buf: u64, len: u64, flags: u32): u64 {
+// `flags` carries MSG_PEEK, which reaches TCP as a real peek rather than
+// being dropped on the way.
+export fn socket_recv(fd: u32, buf: u64, len: u64, flags: u32 = 0): u64 {
   var idx: u32 = find_socket(fd)
   if idx == 0xFFFFFFFF {
     return 0xFFFFFFFFFFFFFFFF
@@ -542,8 +594,9 @@ export fn socket_recv(fd: u32, buf: u64, len: u64, flags: u32): u64 {
   } else if sockets[idx].sock_type == SOCK_DGRAM {
     var remote_addr: u32 = 0
     var remote_port: u16 = 0
-    return udp.udp_recv(
-      sockets[idx].local_port,
+    if ensure_udp_handle(idx) == 0 { return 0 }
+    return recvfrom_into(
+      idx,
       buf,
       @intCast(len),
       &remote_addr,
@@ -584,7 +637,11 @@ export fn socket_sendto(fd: u32, buf: u64, len: u64, flags: u32, dest_addr: u64,
     if sockets[idx].local_port == 0 { return 0xFFFFFFFFFFFFFFFF }
   }
 
-  return udp.udp_send(sockets[idx].local_port, remote_addr, remote_port, buf, @intCast(len))
+  if ensure_udp_handle(idx) == 0 { return 0xFFFFFFFFFFFFFFFF }
+  let sent: i32 = udp.udp_sendto(sockets[idx].udp_handle, @ptrFromInt(buf),
+                                 @intCast(len), remote_addr, remote_port)
+  if sent < 0 { return 0xFFFFFFFFFFFFFFFF }
+  return @as(u64, @as(u32, sent))
 }
 
 export fn socket_recvfrom(fd: u32, buf: u64, len: u64, flags: u32, src_addr: u64, addrlen: u64): u64 {
@@ -600,13 +657,9 @@ export fn socket_recvfrom(fd: u32, buf: u64, len: u64, flags: u32, src_addr: u64
   var remote_addr: u32 = 0
   var remote_port: u16 = 0
 
-  var received: u64 = udp.udp_recv(
-    sockets[idx].local_port,
-    buf,
-    @intCast(len),
-    &remote_addr,
-    &remote_port
-  )
+  if ensure_udp_handle(idx) == 0 { return 0xFFFFFFFFFFFFFFFF }
+  var received: u64 = recvfrom_into(idx, buf, @intCast(len), &remote_addr,
+                                    &remote_port)
 
   // Fill in source address if requested
   if src_addr != 0 and addrlen != 0 {

@@ -15,6 +15,7 @@
 import "../core/foundation.home" as foundation
 import "../drivers/e1000.home" as e1000
 import "netdev.home" as netdev
+import "dhcp.home" as dhcp
 
 const ETH_HEADER_SIZE: u32 = 14
 const ETHERTYPE_ARP: u16 = 0x0806
@@ -176,11 +177,21 @@ fn ipv4_header(source: u32, destination: u32, protocol: u8, payload_len: u32): u
 // its length in bytes.
 export fn link_send_udp(destination: u32, dest_mac: u64, source_port: u16,
                         dest_port: u16, payload: u64, payload_len: u32): u32 {
+  return link_send_udp_from(local_ip, destination, dest_mac, source_port,
+                            dest_port, payload, payload_len)
+}
+
+// The same, with the source address stated rather than taken from the
+// interface. A DHCP client has to send from 0.0.0.0 — it has no address yet,
+// and that is the whole point of the exchange.
+export fn link_send_udp_from(source: u32, destination: u32, dest_mac: u64,
+                             source_port: u16, dest_port: u16, payload: u64,
+                             payload_len: u32): u32 {
   if e1000.e1000_is_initialized() == 0 { return 0 }
   if payload_len + 42 > FRAME_MAX { return 0 }
 
   ethernet_header(dest_mac, ETHERTYPE_IPV4)
-  let udp: u32 = ipv4_header(local_ip, destination, IP_PROTO_UDP, 8 + payload_len)
+  let udp: u32 = ipv4_header(source, destination, IP_PROTO_UDP, 8 + payload_len)
 
   put16(udp, source_port)
   put16(udp + 2, dest_port)
@@ -247,4 +258,101 @@ export fn link_resolve(target: u32, tries: u32, budget: u32): u32 {
     attempt = attempt + 1
   }
   return 0
+}
+
+// ============================================================================
+// DHCP
+//
+// The exchange lives here rather than in dhcp.home because it needs the wire,
+// and dhcp.home is deliberately a builder and parser with no device
+// underneath it. What this adds is the four messages in order, the retries,
+// and taking the lease.
+// ============================================================================
+
+var dhcp_buffer: [u8; 576] = undefined
+
+// Look at a received frame and, if it is a UDP datagram to the DHCP client
+// port, hand its payload to the parser. Returns the DHCP message type, or 0.
+//
+// The frame is examined directly rather than through netdev's dispatch: at
+// this point the interface has no address, so netdev's IPv4 path would reject
+// the datagram as not addressed to us — which it is not, yet.
+fn dhcp_examine(length: u32): u8 {
+  if length < 42 { return 0 }
+  if (@as(u16, rx_frame[12]) << 8 | @as(u16, rx_frame[13])) != ETHERTYPE_IPV4 { return 0 }
+
+  let ihl: u32 = @as(u32, rx_frame[ETH_HEADER_SIZE] & 0x0F) * 4
+  if ihl < 20 { return 0 }
+  if rx_frame[ETH_HEADER_SIZE + 9] != IP_PROTO_UDP { return 0 }
+
+  let udp_at: u32 = ETH_HEADER_SIZE + ihl
+  if udp_at + 8 > length { return 0 }
+  let dest_port: u16 = (@as(u16, rx_frame[udp_at + 2]) << 8) | @as(u16, rx_frame[udp_at + 3])
+  if dest_port != dhcp.dhcp_client_port() { return 0 }
+
+  let udp_len: u32 = (@as(u32, rx_frame[udp_at + 4]) << 8) | @as(u32, rx_frame[udp_at + 5])
+  if udp_len < 8 { return 0 }
+  var payload_len: u32 = udp_len - 8
+  let payload_at: u32 = udp_at + 8
+  if payload_at + payload_len > length { payload_len = length - payload_at }
+
+  return dhcp.dhcp_process_reply(@intFromPtr(&rx_frame) + @as(u64, payload_at),
+                                 payload_len)
+}
+
+// Send one DHCP message and wait for a reply of the expected type. Returns 1
+// on success.
+fn dhcp_exchange(length: u32, expected: u8, tries: u32, budget: u32): u32 {
+  var attempt: u32 = 0
+  while attempt < tries {
+    if link_send_udp_from(0, 0xFFFFFFFF, 0, dhcp.dhcp_client_port(),
+                          dhcp.dhcp_server_port(),
+                          @intFromPtr(&dhcp_buffer), length) == 0 {
+      return 0
+    }
+    var polled: u32 = 0
+    while polled < budget {
+      let got: u32 = e1000.e1000_receive_packet(@intFromPtr(&rx_frame), FRAME_MAX)
+      if got > 0 {
+        frames_polled = frames_polled + 1
+        if dhcp_examine(got) == expected { return 1 }
+        // Not ours, or not the message being waited for. It still has to go
+        // through the ordinary receive path — an ARP request from the server
+        // arrives during this exchange and answering it is not optional.
+        netdev.receive_packet(@intFromPtr(&rx_frame), got)
+      }
+      polled = polled + 1
+    }
+    attempt = attempt + 1
+  }
+  return 0
+}
+
+// Obtain a lease: DISCOVER, OFFER, REQUEST, ACK. Returns 1 when bound, and
+// the address is then link_local_ip().
+export fn link_dhcp_configure(tries: u32, budget: u32): u32 {
+  if e1000.e1000_is_initialized() == 0 { return 0 }
+
+  var mac: [u8; 6] = undefined
+  var i: u32 = 0
+  while i < 6 {
+    mac[i] = e1000.e1000_mac_byte(i)
+    i = i + 1
+  }
+  if dhcp.dhcp_init(@intFromPtr(&mac)) == 0 { return 0 }
+
+  // Sending from 0.0.0.0 for the duration: the interface has no address
+  // until the ACK, and claiming one before then would put an address on the
+  // wire that no server has assigned.
+  link_set_address(0, 0, 0)
+
+  let discover_len: u32 = dhcp.dhcp_build_discover(@intFromPtr(&dhcp_buffer))
+  if dhcp_exchange(discover_len, dhcp.DHCP_OFFER, tries, budget) == 0 { return 0 }
+
+  let request_len: u32 = dhcp.dhcp_build_request(@intFromPtr(&dhcp_buffer))
+  if dhcp_exchange(request_len, dhcp.DHCP_ACK, tries, budget) == 0 { return 0 }
+
+  link_set_address(dhcp.dhcp_leased_ip(), dhcp.dhcp_subnet_mask(),
+                   dhcp.dhcp_router())
+  return 1
 }
