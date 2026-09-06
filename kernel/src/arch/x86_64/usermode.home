@@ -23,7 +23,9 @@ const PAGE_USER: u64 = 0x4
 // home-os's own numbering, from kernel/src/sys/syscall.home. Not Linux's:
 // this kernel defines its own ABI and userland/ is built against it.
 const SYS_EXIT: u64 = 0
+const SYS_READ: u64 = 2
 const SYS_WRITE: u64 = 3
+const SYS_OPEN: u64 = 4
 
 var user_exited: u32 = 0
 var user_exit_code: u64 = 0
@@ -40,14 +42,92 @@ extern fn return_to_kernel()
 // SYSCALLS
 // ============================================================================
 
+// ============================================================================
+// USER POINTER VALIDATION
+//
+// A syscall argument that is an address comes from ring 3, and ring 3 is not
+// a source of valid pointers. Until this existed, a user program that passed
+// a bad one page-faulted the *kernel*: `exec /bin/cp` halted the machine with
+//
+//   [Exception] vector=000000000000000E rip=0000000000100C02 cr2=000000004020F000
+//
+// — the kernel dereferencing an address two pages past the program's own BSS.
+// Any user program could do that, deliberately or by accident, so this is a
+// denial of service as much as a robustness gap.
+//
+// Validation covers the syscalls userspace actually reaches today: read,
+// write and open. A syscall that grows a pointer argument later must be added
+// here; the check is deliberately not silent about what it does not cover.
+// ============================================================================
+
+// The window this loader maps a program into: its image from USER_TEXT_BASE
+// and its stack below USER_STACK_TOP. An address outside it was never handed
+// out by the kernel and cannot be legitimate.
+const USER_ADDR_MIN: u64 = 0x0000_0000_4000_0000
+const USER_ADDR_MAX: u64 = 0x0000_0000_5000_0000
+
+// The largest buffer a single syscall may name. A length is as untrusted as
+// an address, and one that is merely enormous would otherwise walk the page
+// tables for a very long time before failing.
+const USER_XFER_MAX: u64 = 0x0010_0000
+
+// Whether every page of [addr, addr + len) is mapped. Checked a page at a
+// time rather than at the ends: a buffer may span an unmapped hole.
+fn user_range_ok(addr: u64, len: u64): u32 {
+  if len == 0 { return 1 }
+  if len > USER_XFER_MAX { return 0 }
+  if addr < USER_ADDR_MIN { return 0 }
+  if addr >= USER_ADDR_MAX { return 0 }
+
+  let end: u64 = addr + len
+  // A length that wraps past the top of the address space is not a length.
+  if end < addr { return 0 }
+  if end > USER_ADDR_MAX { return 0 }
+
+  var page: u64 = addr & 0xFFFF_FFFF_FFFF_F000
+  while page < end {
+    if memory.vmm_get_kernel_physical(page) == 0 { return 0 }
+    page = page + 4096
+  }
+  return 1
+}
+
+// Whether `addr` points at a NUL-terminated string that stays inside mapped
+// user memory. Returns 1 when a terminator was found before the limit.
+fn user_cstr_ok(addr: u64, max: u64): u32 {
+  if addr < USER_ADDR_MIN { return 0 }
+  if addr >= USER_ADDR_MAX { return 0 }
+
+  var i: u64 = 0
+  var checked_page: u64 = 0xFFFF_FFFF_FFFF_FFFF
+  while i < max {
+    let at: u64 = addr + i
+    if at >= USER_ADDR_MAX { return 0 }
+    let page: u64 = at & 0xFFFF_FFFF_FFFF_F000
+    // One page-table walk per page, not per byte.
+    if page != checked_page {
+      if memory.vmm_get_kernel_physical(page) == 0 { return 0 }
+      checked_page = page
+    }
+    if @as(*u8, @ptrFromInt(at)).* == 0 { return 1 }
+    i = i + 1
+  }
+  return 0
+}
+
+// What a syscall returns when it was handed an address it cannot use. Negative
+// so a caller testing for failure sees one, and -14 is EFAULT, which is what
+// this is.
+const USER_EFAULT: u64 = 0xFFFF_FFFF_FFFF_FFF2
+
 // Called from syscall_entry in idt_stubs.s. The name is unmangled because the
 // stub names it directly, and distinct from sys/syscall.home's
 // syscall_dispatch — this is the arch-level trampoline into that table, not a
 // second copy of it.
 //
-// Only the two calls the gate needs are implemented. Anything else returns
-// -ENOSYS rather than 0, so a program that depends on one fails visibly
-// instead of continuing on a fabricated success.
+// Anything the table does not implement returns -ENOSYS rather than 0, so a
+// program that depends on one fails visibly instead of continuing on a
+// fabricated success.
 export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64): u64 {
   syscalls_served = syscalls_served + 1
 
@@ -61,6 +141,29 @@ export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64): u64 {
     foundation.serial_write_u64(a1)
     foundation.serial_write_string(")\n")
     return_to_kernel()
+  }
+
+  // Every pointer argument is checked before anything dereferences it.
+  if nr == SYS_WRITE or nr == SYS_READ {
+    if user_range_ok(a2, a3) == 0 {
+      // The address and length are printed because a refused buffer is a bug
+      // in the program that passed it, and "EFAULT" alone says nothing about
+      // which buffer or how far out of range it was.
+      foundation.serial_write_string("[User] EFAULT: write/read buffer ")
+      foundation.serial_write_ptr(a2)
+      foundation.serial_write_string(" len ")
+      foundation.serial_write_u64(a3)
+      foundation.serial_write_string("\n")
+      return USER_EFAULT
+    }
+  }
+  if nr == SYS_OPEN {
+    if user_cstr_ok(a1, 4096) == 0 {
+      foundation.serial_write_string("[User] EFAULT: open path ")
+      foundation.serial_write_ptr(a1)
+      foundation.serial_write_string("\n")
+      return USER_EFAULT
+    }
   }
 
   // Writes to the standard streams go to the console. vfs_write already does

@@ -34,16 +34,25 @@ export fn arg_at(argv: u64, index: u32): u64 {
 // Strings
 // ============================================================================
 
+// The longest string this system produces: a path, a line, an argument. A
+// string that is not terminated within it is not a string.
+const STRLEN_MAX: u32 = 4096
+
 export fn strlen(s: u64): u32 {
   var n: u32 = 0
   // Bounded: a string that is not terminated would otherwise walk memory
   // until it faulted, and a fault in a coreutil is a worse report than a
   // truncated one.
-  while n < 65535 {
+  //
+  // Hitting the bound returns 0, not the bound. Returning 65535 was worse
+  // than faulting here: `error_line` handed that length straight to write(),
+  // and the kernel walked 64 KB from a pointer that had well under that
+  // mapped — a page fault in the *kernel*, from a coreutil's error path.
+  while n < STRLEN_MAX {
     if @as(*u8, @ptrFromInt(s + @as(u64, n))).* == 0 { return n }
     n = n + 1
   }
-  return n
+  return 0
 }
 
 export fn strcmp(a: u64, b: u64): i32 {
@@ -238,6 +247,104 @@ export fn read_line(out: u64, max: u32): u32 {
 
 export fn line_buffer_addr(): u64 { return @intFromPtr(&line_buffer) }
 export fn line_buffer_size(): u32 { return LINE_CAPACITY }
+
+// ============================================================================
+// Writing to a descriptor
+// ============================================================================
+
+// Write exactly `len` bytes, or fail. A short write is not an error the
+// caller can ignore — the bytes that did not go are gone — so this loops
+// until they have all gone or the descriptor stops accepting them.
+export fn write_all(fd: u64, buf: u64, len: u32): u32 {
+  var sent: u32 = 0
+  while sent < len {
+    let put: u64 = sys.sys_write(fd, buf + @as(u64, sent), @as(u64, len - sent))
+    if put == 0 { return 0 }
+    if put > @as(u64, len - sent) { return 0 }
+    sent = sent + @as(u32, put)
+  }
+  return 1
+}
+
+// ============================================================================
+// Holding the input
+//
+// Some utilities cannot stream: tac must see the last line before it prints
+// the first, and sort must see all of them. They share one store rather than
+// each keeping their own, and its limits are stated — a utility that runs out
+// says so instead of quietly dropping the rest.
+// ============================================================================
+
+const STORE_BYTES: u32 = 32768
+const STORE_LINES: u32 = 1024
+
+var store_text: [u8; 32768] = undefined
+var store_offset: [u32; 1024] = undefined
+var store_length: [u32; 1024] = undefined
+var store_used: u32 = 0
+var store_count: u32 = 0
+var store_full: u32 = 0
+
+export fn store_reset() {
+  store_used = 0
+  store_count = 0
+  store_full = 0
+}
+
+// Read every line of `fd` into the store. Returns 1 if all of it fitted.
+export fn store_read_all(fd: u64): u32 {
+  line_reader_open(fd)
+  loop {
+    let length: u32 = read_line(line_buffer_addr(), LINE_CAPACITY)
+    if length == 0xFFFFFFFF { break }
+    if store_count >= STORE_LINES or store_used + length > STORE_BYTES {
+      store_full = 1
+      break
+    }
+    var i: u32 = 0
+    while i < length {
+      store_text[store_used + i] = line_buffer[i]
+      i = i + 1
+    }
+    store_offset[store_count] = store_used
+    store_length[store_count] = length
+    store_used = store_used + length
+    store_count = store_count + 1
+  }
+  if store_full == 1 { return 0 }
+  return 1
+}
+
+export fn store_lines(): u32 { return store_count }
+export fn store_line_addr(index: u32): u64 {
+  if index >= store_count { return 0 }
+  return @intFromPtr(&store_text) + @as(u64, store_offset[index])
+}
+export fn store_line_length(index: u32): u32 {
+  if index >= store_count { return 0 }
+  return store_length[index]
+}
+
+// Compare two stored lines as byte strings, the way sort orders them without
+// a locale: shorter is smaller when one is a prefix of the other.
+export fn store_line_less(a: u32, b: u32): u32 {
+  let pa: u64 = store_line_addr(a)
+  let pb: u64 = store_line_addr(b)
+  let la: u32 = store_line_length(a)
+  let lb: u32 = store_line_length(b)
+  var shorter: u32 = la
+  if lb < shorter { shorter = lb }
+  var i: u32 = 0
+  while i < shorter {
+    let ca: u8 = @as(*u8, @ptrFromInt(pa + @as(u64, i))).*
+    let cb: u8 = @as(*u8, @ptrFromInt(pb + @as(u64, i))).*
+    if ca < cb { return 1 }
+    if ca > cb { return 0 }
+    i = i + 1
+  }
+  if la < lb { return 1 }
+  return 0
+}
 
 // ============================================================================
 // Numbers
