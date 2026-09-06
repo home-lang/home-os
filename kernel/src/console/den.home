@@ -1,0 +1,2753 @@
+// home-os — den, the native shell
+//
+// den is home-os's shell. The reference implementation lives at
+// ~/Code/Tools/den and is the conformance oracle for this one: the same
+// script run through both must produce the same bytes (scripts/den-conform.sh).
+// This is the home-os implementation of that language, written in Home,
+// running in the kernel and calling the subsystems directly.
+//
+// What was here before was a flat command dispatcher: one word, no arguments,
+// no quoting, no variables, no redirection. This replaces it with a shell:
+// a lexer that honours quoting and escapes, parameter expansion, aliases,
+// `;`/`&&`/`||` lists, and output redirection through the VFS.
+//
+// The line editor stays in serial_shell.home. That file owns the terminal;
+// this one owns the language.
+
+import "../core/foundation.home" as foundation
+import "../core/filesystem.home" as filesystem
+import "../arch/x86_64/usermode.home" as usermode
+
+// ============================================================================
+// LIMITS
+//
+// Every table is fixed. A shell that allocates is a shell that can fail to
+// parse a line under memory pressure, and this one runs before there is
+// anywhere to report that to.
+// ============================================================================
+
+const DEN_LINE_MAX: u32 = 512
+const DEN_MAX_TOKENS: u32 = 64
+const DEN_ARENA: u32 = 2048
+
+const DEN_MAX_VARS: u32 = 48
+const DEN_VAR_NAME_MAX: u32 = 32
+const DEN_VAR_VALUE_MAX: u32 = 128
+
+const DEN_MAX_ALIASES: u32 = 24
+const DEN_ALIAS_NAME_MAX: u32 = 32
+const DEN_ALIAS_VALUE_MAX: u32 = 128
+
+const DEN_HISTORY_MAX: u32 = 24
+const DEN_HISTORY_LINE_MAX: u32 = 128
+
+const DEN_PATH_MAX: u32 = 256
+const DEN_DIR_STACK: u32 = 8
+
+// source and eval run a line from inside a line. The limit is what stops a
+// script that sources itself from taking the kernel down with it.
+const DEN_MAX_NESTING: u32 = 8
+
+// Token kinds. A word carries text; every other kind is punctuation and its
+// arena span is empty.
+const TOK_WORD: u32 = 0
+const TOK_SEMI: u32 = 1
+const TOK_AND: u32 = 2      // &&
+const TOK_OR: u32 = 3       // ||
+const TOK_PIPE: u32 = 4
+const TOK_REDIR_IN: u32 = 5   // <
+const TOK_REDIR_OUT: u32 = 6  // >
+const TOK_REDIR_APP: u32 = 7  // >>
+
+// ============================================================================
+// STATE
+// ============================================================================
+
+var tok_kind: [64]u32 = undefined
+var tok_off: [64]u32 = undefined
+var tok_len: [64]u32 = undefined
+var tok_count: u32 = 0
+
+var arena: [2048]u8 = undefined
+var arena_used: u32 = 0
+
+var var_names: [1536]u8 = undefined    // DEN_MAX_VARS * DEN_VAR_NAME_MAX
+var var_values: [6144]u8 = undefined   // DEN_MAX_VARS * DEN_VAR_VALUE_MAX
+var var_exported: [48]u32 = undefined
+var var_readonly: [48]u32 = undefined
+var var_count: u32 = 0
+
+var alias_names: [768]u8 = undefined   // DEN_MAX_ALIASES * DEN_ALIAS_NAME_MAX
+var alias_values: [3072]u8 = undefined
+var alias_count: u32 = 0
+
+var hist_lines: [3072]u8 = undefined   // DEN_HISTORY_MAX * DEN_HISTORY_LINE_MAX
+var hist_count: u32 = 0
+
+var cwd: [256]u8 = undefined
+var last_status: u32 = 0
+var exit_requested: u32 = 0
+var umask_value: u32 = 18   // 022 octal
+
+// Scratch shared by path building and external command assembly. Separate
+// buffers so building a path does not clobber the command line being built.
+var path_buf: [256]u8 = undefined
+var scratch: [256]u8 = undefined
+
+var dir_stack: [2048]u8 = undefined   // DEN_DIR_STACK * DEN_PATH_MAX
+var dir_stack_depth: u32 = 0
+var nest_depth: u32 = 0
+
+// Output sink. `out_fd_active` selects between the serial console and an open
+// file descriptor; every builtin writes through den_putc so redirection works
+// for all of them rather than for the handful that remembered to check.
+var out_fd: u32 = 0
+var out_fd_active: u32 = 0
+var out_buf: [256]u8 = undefined
+var out_used: u32 = 0
+
+// ============================================================================
+// OUTPUT
+// ============================================================================
+
+fn den_flush() {
+  if out_used == 0 { return }
+  if out_fd_active == 1 {
+    filesystem.vfs_write(out_fd, @intFromPtr(&out_buf), @as(u64, out_used))
+  }
+  out_used = 0
+}
+
+export fn den_putc(c: u8) {
+  if out_fd_active == 0 {
+    foundation.serial_write_char(c)
+    return
+  }
+  out_buf[out_used] = c
+  out_used = out_used + 1
+  if out_used >= 256 { den_flush() }
+}
+
+// Write a NUL-terminated string. Takes an address so string literals and
+// buffers are both callable without a second entry point.
+export fn den_puts(s: u64) {
+  var i: u64 = 0
+  while i < 4096 {
+    var c: u8 = @as(*u8, @ptrFromInt(s + i)).*
+    if c == 0 { return }
+    den_putc(c)
+    i = i + 1
+  }
+}
+
+fn den_put_u64(value: u64) {
+  if value == 0 {
+    den_putc(48)
+    return
+  }
+  var digits: [24]u8 = undefined
+  var n: u32 = 0
+  var v: u64 = value
+  while v > 0 {
+    digits[n] = @as(u8, 48 + @as(u8, @truncate(v % 10)))
+    v = v / 10
+    n = n + 1
+  }
+  while n > 0 {
+    n = n - 1
+    den_putc(digits[n])
+  }
+}
+
+fn den_put_i64(value: i64) {
+  if value < 0 {
+    den_putc(45)
+    den_put_u64(@as(u64, @bitCast(0 - value)))
+    return
+  }
+  den_put_u64(@as(u64, @bitCast(value)))
+}
+
+// ============================================================================
+// STRING HELPERS
+//
+// Everything here is bounded. The line comes off a serial port, which is not
+// a source of well-formed strings.
+// ============================================================================
+
+fn cstr_len(s: u64): u32 {
+  var i: u32 = 0
+  while i < 4096 {
+    if @as(*u8, @ptrFromInt(s + @as(u64, i))).* == 0 { return i }
+    i = i + 1
+  }
+  return 4096
+}
+
+fn cstr_eq(a: u64, b: u64): u32 {
+  var i: u32 = 0
+  while i < 4096 {
+    var ca: u8 = @as(*u8, @ptrFromInt(a + @as(u64, i))).*
+    var cb: u8 = @as(*u8, @ptrFromInt(b + @as(u64, i))).*
+    if ca != cb { return 0 }
+    if ca == 0 { return 1 }
+    i = i + 1
+  }
+  return 1
+}
+
+// Copy at most max-1 bytes and terminate. Returns the length written.
+fn cstr_copy(dest: u64, src: u64, max: u32): u32 {
+  if max == 0 { return 0 }
+  var i: u32 = 0
+  while i < (max - 1) {
+    var c: u8 = @as(*u8, @ptrFromInt(src + @as(u64, i))).*
+    if c == 0 { break }
+    @as(*u8, @ptrFromInt(dest + @as(u64, i))).* = c
+    i = i + 1
+  }
+  @as(*u8, @ptrFromInt(dest + @as(u64, i))).* = 0
+  return i
+}
+
+fn is_space(c: u8): u32 {
+  if c == 32 { return 1 }
+  if c == 9 { return 1 }
+  return 0
+}
+
+fn is_digit(c: u8): u32 {
+  if c >= 48 and c <= 57 { return 1 }
+  return 0
+}
+
+// A character that may appear in a variable name after the first.
+fn is_name_char(c: u8): u32 {
+  if c >= 97 and c <= 122 { return 1 }
+  if c >= 65 and c <= 90 { return 1 }
+  if is_digit(c) == 1 { return 1 }
+  if c == 95 { return 1 }
+  return 0
+}
+
+fn parse_u64(s: u64, len: u32): u64 {
+  var v: u64 = 0
+  var i: u32 = 0
+  while i < len {
+    var c: u8 = @as(*u8, @ptrFromInt(s + @as(u64, i))).*
+    if is_digit(c) == 0 { return v }
+    v = v * 10 + @as(u64, c - 48)
+    i = i + 1
+  }
+  return v
+}
+
+fn parse_i64(s: u64, len: u32): i64 {
+  if len == 0 { return 0 }
+  var first: u8 = @as(*u8, @ptrFromInt(s)).*
+  if first == 45 {
+    return 0 - @as(i64, @bitCast(parse_u64(s + 1, len - 1)))
+  }
+  return @as(i64, @bitCast(parse_u64(s, len)))
+}
+
+// ============================================================================
+// TOKEN ACCESS
+// ============================================================================
+
+// The address of token i's text. Tokens are NUL-terminated in the arena so
+// they can be handed to anything that takes a C string.
+fn tok_addr(i: u32): u64 {
+  return @intFromPtr(&arena) + @as(u64, tok_off[i])
+}
+
+fn tok_eq(i: u32, lit: u64): u32 {
+  return cstr_eq(tok_addr(i), lit)
+}
+
+fn arena_putc(c: u8): u32 {
+  if arena_used >= DEN_ARENA { return 0 }
+  arena[arena_used] = c
+  arena_used = arena_used + 1
+  return 1
+}
+
+// ============================================================================
+// VARIABLES
+// ============================================================================
+
+fn var_name_addr(i: u32): u64 {
+  return @intFromPtr(&var_names) + @as(u64, i * DEN_VAR_NAME_MAX)
+}
+
+fn var_value_addr(i: u32): u64 {
+  return @intFromPtr(&var_values) + @as(u64, i * DEN_VAR_VALUE_MAX)
+}
+
+fn var_find(name: u64): u32 {
+  var i: u32 = 0
+  while i < var_count {
+    if cstr_eq(var_name_addr(i), name) == 1 { return i }
+    i = i + 1
+  }
+  return DEN_MAX_VARS
+}
+
+// Set a variable. Returns 0 on success, 1 when the table is full, 2 when the
+// variable is readonly.
+export fn den_setvar(name: u64, value: u64): u32 {
+  var idx: u32 = var_find(name)
+  if idx < DEN_MAX_VARS {
+    if var_readonly[idx] == 1 { return 2 }
+    cstr_copy(var_value_addr(idx), value, DEN_VAR_VALUE_MAX)
+    return 0
+  }
+  if var_count >= DEN_MAX_VARS { return 1 }
+  cstr_copy(var_name_addr(var_count), name, DEN_VAR_NAME_MAX)
+  cstr_copy(var_value_addr(var_count), value, DEN_VAR_VALUE_MAX)
+  var_exported[var_count] = 0
+  var_readonly[var_count] = 0
+  var_count = var_count + 1
+  return 0
+}
+
+// The value's address, or 0 when the variable is unset.
+export fn den_getvar(name: u64): u64 {
+  var idx: u32 = var_find(name)
+  if idx >= DEN_MAX_VARS { return 0 }
+  return var_value_addr(idx)
+}
+
+export fn den_unsetvar(name: u64): u32 {
+  var idx: u32 = var_find(name)
+  if idx >= DEN_MAX_VARS { return 0 }
+  if var_readonly[idx] == 1 { return 2 }
+  // Compact rather than tombstone: the table is walked far more often than
+  // it is modified, and a hole would have to be checked on every walk.
+  var i: u32 = idx
+  while i + 1 < var_count {
+    cstr_copy(var_name_addr(i), var_name_addr(i + 1), DEN_VAR_NAME_MAX)
+    cstr_copy(var_value_addr(i), var_value_addr(i + 1), DEN_VAR_VALUE_MAX)
+    var_exported[i] = var_exported[i + 1]
+    var_readonly[i] = var_readonly[i + 1]
+    i = i + 1
+  }
+  var_count = var_count - 1
+  return 0
+}
+
+// ============================================================================
+// ALIASES
+// ============================================================================
+
+fn alias_name_addr(i: u32): u64 {
+  return @intFromPtr(&alias_names) + @as(u64, i * DEN_ALIAS_NAME_MAX)
+}
+
+fn alias_value_addr(i: u32): u64 {
+  return @intFromPtr(&alias_values) + @as(u64, i * DEN_ALIAS_VALUE_MAX)
+}
+
+export fn den_alias_set(name: u64, value: u64): u32 {
+  var i: u32 = 0
+  while i < alias_count {
+    if cstr_eq(alias_name_addr(i), name) == 1 {
+      cstr_copy(alias_value_addr(i), value, DEN_ALIAS_VALUE_MAX)
+      return 0
+    }
+    i = i + 1
+  }
+  if alias_count >= DEN_MAX_ALIASES { return 1 }
+  cstr_copy(alias_name_addr(alias_count), name, DEN_ALIAS_NAME_MAX)
+  cstr_copy(alias_value_addr(alias_count), value, DEN_ALIAS_VALUE_MAX)
+  alias_count = alias_count + 1
+  return 0
+}
+
+export fn den_alias_get(name: u64): u64 {
+  var i: u32 = 0
+  while i < alias_count {
+    if cstr_eq(alias_name_addr(i), name) == 1 { return alias_value_addr(i) }
+    i = i + 1
+  }
+  return 0
+}
+
+export fn den_alias_remove(name: u64): u32 {
+  var i: u32 = 0
+  while i < alias_count {
+    if cstr_eq(alias_name_addr(i), name) == 1 {
+      var j: u32 = i
+      while j + 1 < alias_count {
+        cstr_copy(alias_name_addr(j), alias_name_addr(j + 1), DEN_ALIAS_NAME_MAX)
+        cstr_copy(alias_value_addr(j), alias_value_addr(j + 1), DEN_ALIAS_VALUE_MAX)
+        j = j + 1
+      }
+      alias_count = alias_count - 1
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+// ============================================================================
+// HISTORY
+// ============================================================================
+
+fn dir_stack_addr(i: u32): u64 {
+  return @intFromPtr(&dir_stack) + @as(u64, i * DEN_PATH_MAX)
+}
+
+fn hist_addr(i: u32): u64 {
+  return @intFromPtr(&hist_lines) + @as(u64, i * DEN_HISTORY_LINE_MAX)
+}
+
+fn hist_add(src: u64) {
+  if cstr_len(src) == 0 { return }
+  if hist_count >= DEN_HISTORY_MAX {
+    // Drop the oldest. The table is small and shifting it is cheaper than
+    // carrying a ring index through every reader.
+    var i: u32 = 0
+    while i + 1 < DEN_HISTORY_MAX {
+      cstr_copy(hist_addr(i), hist_addr(i + 1), DEN_HISTORY_LINE_MAX)
+      i = i + 1
+    }
+    hist_count = DEN_HISTORY_MAX - 1
+  }
+  cstr_copy(hist_addr(hist_count), src, DEN_HISTORY_LINE_MAX)
+  hist_count = hist_count + 1
+}
+
+export fn den_history_count(): u32 {
+  return hist_count
+}
+
+// ============================================================================
+// LEXER
+//
+// One pass over the line produces tokens whose text is already unquoted and
+// expanded. Doing expansion here rather than after parsing is what makes
+// `echo "$x"` and `echo $x` differ only in whether a space splits: the quote
+// state is known at the point the bytes are copied, and nowhere else.
+// ============================================================================
+
+var in_word: u32 = 0
+
+fn tok_begin() {
+  if in_word == 1 { return }
+  if tok_count >= DEN_MAX_TOKENS { return }
+  tok_kind[tok_count] = TOK_WORD
+  tok_off[tok_count] = arena_used
+  in_word = 1
+}
+
+fn tok_end() {
+  if in_word == 0 { return }
+  if tok_count >= DEN_MAX_TOKENS { return }
+  tok_len[tok_count] = arena_used - tok_off[tok_count]
+  arena_putc(0)
+  tok_count = tok_count + 1
+  in_word = 0
+}
+
+fn tok_operator(kind: u32) {
+  tok_end()
+  if tok_count >= DEN_MAX_TOKENS { return }
+  tok_kind[tok_count] = kind
+  tok_off[tok_count] = arena_used
+  tok_len[tok_count] = 0
+  arena_putc(0)
+  tok_count = tok_count + 1
+}
+
+// Append a variable's value, or nothing when it is unset. An unset variable
+// expanding to nothing rather than to its own name is what lets
+// `cd $HOME` fail cleanly instead of trying to enter a directory named `$HOME`.
+fn emit_var(name: u64) {
+  // `$?` is the previous command's status.
+  if @as(*u8, @ptrFromInt(name)).* == 63 {
+    var d: [24]u8 = undefined
+    var n: u32 = 0
+    var v: u64 = @as(u64, last_status)
+    if v == 0 {
+      arena_putc(48)
+      return
+    }
+    while v > 0 {
+      d[n] = @as(u8, 48 + @as(u8, @truncate(v % 10)))
+      v = v / 10
+      n = n + 1
+    }
+    while n > 0 {
+      n = n - 1
+      arena_putc(d[n])
+    }
+    return
+  }
+  var val: u64 = den_getvar(name)
+  if val == 0 { return }
+  var i: u32 = 0
+  while i < DEN_VAR_VALUE_MAX {
+    var c: u8 = @as(*u8, @ptrFromInt(val + @as(u64, i))).*
+    if c == 0 { return }
+    arena_putc(c)
+    i = i + 1
+  }
+}
+
+// Read a variable reference starting at `i` (the byte after `$`), append its
+// value, and return the index one past the reference.
+fn expand_dollar(src: u64, len: u32, at: u32): u32 {
+  var i: u32 = at
+  if i >= len {
+    arena_putc(36)   // a trailing `$` is a literal `$`
+    return i
+  }
+  var name: [40]u8 = undefined
+  var n: u32 = 0
+  var c: u8 = @as(*u8, @ptrFromInt(src + @as(u64, i))).*
+
+  if c == 123 {   // ${NAME}
+    i = i + 1
+    while i < len {
+      var b: u8 = @as(*u8, @ptrFromInt(src + @as(u64, i))).*
+      if b == 125 {
+        i = i + 1
+        break
+      }
+      if n < 39 {
+        name[n] = b
+        n = n + 1
+      }
+      i = i + 1
+    }
+    name[n] = 0
+    emit_var(@intFromPtr(&name))
+    return i
+  }
+
+  if c == 63 {    // $?
+    name[0] = 63
+    name[1] = 0
+    emit_var(@intFromPtr(&name))
+    return i + 1
+  }
+
+  if is_name_char(c) == 0 {
+    // `$` followed by anything that cannot start a name is a literal `$`.
+    arena_putc(36)
+    return i
+  }
+
+  while i < len {
+    var b: u8 = @as(*u8, @ptrFromInt(src + @as(u64, i))).*
+    if is_name_char(b) == 0 { break }
+    if n < 39 {
+      name[n] = b
+      n = n + 1
+    }
+    i = i + 1
+  }
+  name[n] = 0
+  emit_var(@intFromPtr(&name))
+  return i
+}
+
+// Tokenise `src[0..len]`. Returns 0 on success, 1 when the line overflows a
+// table, 2 when a quote is left open.
+fn den_lex(src: u64, len: u32): u32 {
+  tok_count = 0
+  arena_used = 0
+  in_word = 0
+
+  var i: u32 = 0
+  while i < len {
+    var c: u8 = @as(*u8, @ptrFromInt(src + @as(u64, i))).*
+
+    if is_space(c) == 1 {
+      tok_end()
+      i = i + 1
+      continue
+    }
+
+    // A `#` outside a word starts a comment that runs to end of line.
+    if c == 35 and in_word == 0 {
+      break
+    }
+
+    if c == 59 {   // ;
+      tok_operator(TOK_SEMI)
+      i = i + 1
+      continue
+    }
+
+    if c == 124 {  // | or ||
+      if (i + 1) < len and @as(*u8, @ptrFromInt(src + @as(u64, i + 1))).* == 124 {
+        tok_operator(TOK_OR)
+        i = i + 2
+        continue
+      }
+      tok_operator(TOK_PIPE)
+      i = i + 1
+      continue
+    }
+
+    if c == 38 {   // && ( a lone & is not backgrounding here: see den_exec )
+      if (i + 1) < len and @as(*u8, @ptrFromInt(src + @as(u64, i + 1))).* == 38 {
+        tok_operator(TOK_AND)
+        i = i + 2
+        continue
+      }
+      // A single `&` has no meaning without job control. Treat it as a word
+      // character so `echo a&b` prints `a&b` rather than silently dropping it.
+      tok_begin()
+      arena_putc(c)
+      i = i + 1
+      continue
+    }
+
+    if c == 60 {   // <
+      tok_operator(TOK_REDIR_IN)
+      i = i + 1
+      continue
+    }
+
+    if c == 62 {   // > or >>
+      if (i + 1) < len and @as(*u8, @ptrFromInt(src + @as(u64, i + 1))).* == 62 {
+        tok_operator(TOK_REDIR_APP)
+        i = i + 2
+        continue
+      }
+      tok_operator(TOK_REDIR_OUT)
+      i = i + 1
+      continue
+    }
+
+    if c == 39 {   // single quote: everything to the next quote is literal
+      tok_begin()
+      i = i + 1
+      var closed: u32 = 0
+      while i < len {
+        var b: u8 = @as(*u8, @ptrFromInt(src + @as(u64, i))).*
+        if b == 39 {
+          closed = 1
+          i = i + 1
+          break
+        }
+        arena_putc(b)
+        i = i + 1
+      }
+      if closed == 0 { return 2 }
+      continue
+    }
+
+    if c == 34 {   // double quote: expansion happens, splitting does not
+      tok_begin()
+      i = i + 1
+      var closed2: u32 = 0
+      while i < len {
+        var b: u8 = @as(*u8, @ptrFromInt(src + @as(u64, i))).*
+        if b == 34 {
+          closed2 = 1
+          i = i + 1
+          break
+        }
+        if b == 92 and (i + 1) < len {
+          // Inside double quotes a backslash only escapes these four.
+          var nxt: u8 = @as(*u8, @ptrFromInt(src + @as(u64, i + 1))).*
+          if nxt == 34 or nxt == 92 or nxt == 36 or nxt == 96 {
+            arena_putc(nxt)
+            i = i + 2
+            continue
+          }
+          arena_putc(b)
+          i = i + 1
+          continue
+        }
+        if b == 36 {
+          i = expand_dollar(src, len, i + 1)
+          continue
+        }
+        arena_putc(b)
+        i = i + 1
+      }
+      if closed2 == 0 { return 2 }
+      continue
+    }
+
+    if c == 92 {   // backslash escapes the next byte
+      tok_begin()
+      if (i + 1) < len {
+        arena_putc(@as(*u8, @ptrFromInt(src + @as(u64, i + 1))).*)
+        i = i + 2
+        continue
+      }
+      i = i + 1
+      continue
+    }
+
+    if c == 36 {   // $
+      tok_begin()
+      i = expand_dollar(src, len, i + 1)
+      continue
+    }
+
+    tok_begin()
+    arena_putc(c)
+    i = i + 1
+  }
+
+  tok_end()
+  if arena_used >= DEN_ARENA { return 1 }
+  if tok_count >= DEN_MAX_TOKENS { return 1 }
+  return 0
+}
+
+// ============================================================================
+// PATHS
+//
+// A shell without a working directory is a shell where every path is absolute,
+// which is not a shell anyone can use. Resolution happens here, once, so no
+// builtin has to remember to do it.
+// ============================================================================
+
+// Resolve `path` against the current directory into `out`, collapsing `.`
+// and `..`. Returns the length written.
+fn resolve_path(path: u64, out: u64, max: u32): u32 {
+  var buf: [256]u8 = undefined
+  var n: u32 = 0
+
+  var first: u8 = @as(*u8, @ptrFromInt(path)).*
+  if first == 47 {
+    buf[0] = 47
+    n = 1
+  } else {
+    // Start from the current directory.
+    var i: u32 = 0
+    while i < 255 {
+      var c: u8 = cwd[i]
+      if c == 0 { break }
+      buf[n] = c
+      n = n + 1
+      i = i + 1
+    }
+    if n == 0 {
+      buf[0] = 47
+      n = 1
+    }
+    if buf[n - 1] != 47 and n < 255 {
+      buf[n] = 47
+      n = n + 1
+    }
+  }
+
+  // Append the path, then normalise the whole thing in one pass.
+  var j: u32 = 0
+  while j < 255 {
+    var c: u8 = @as(*u8, @ptrFromInt(path + @as(u64, j))).*
+    if c == 0 { break }
+    if n < 255 {
+      buf[n] = c
+      n = n + 1
+    }
+    j = j + 1
+  }
+  buf[n] = 0
+
+  // Normalise: walk components, dropping `.` and popping on `..`.
+  var outn: u32 = 0
+  @as(*u8, @ptrFromInt(out)).* = 47
+  outn = 1
+
+  var k: u32 = 0
+  while k < n {
+    // Skip separators.
+    while k < n and buf[k] == 47 { k = k + 1 }
+    if k >= n { break }
+    var start: u32 = k
+    while k < n and buf[k] != 47 { k = k + 1 }
+    var seglen: u32 = k - start
+
+    if seglen == 1 and buf[start] == 46 { continue }          // "."
+    if seglen == 2 and buf[start] == 46 and buf[start + 1] == 46 {
+      // ".." — pop the last component, staying at the root.
+      if outn > 1 {
+        outn = outn - 1                                        // drop trailing /
+        while outn > 1 and @as(*u8, @ptrFromInt(out + @as(u64, outn - 1))).* != 47 {
+          outn = outn - 1
+        }
+      }
+      continue
+    }
+
+    var t: u32 = 0
+    while t < seglen {
+      if outn < (max - 2) {
+        @as(*u8, @ptrFromInt(out + @as(u64, outn))).* = buf[start + t]
+        outn = outn + 1
+      }
+      t = t + 1
+    }
+    if outn < (max - 2) {
+      @as(*u8, @ptrFromInt(out + @as(u64, outn))).* = 47
+      outn = outn + 1
+    }
+  }
+
+  // Drop the trailing separator, except on the root itself.
+  if outn > 1 and @as(*u8, @ptrFromInt(out + @as(u64, outn - 1))).* == 47 {
+    outn = outn - 1
+  }
+  @as(*u8, @ptrFromInt(out + @as(u64, outn))).* = 0
+  return outn
+}
+
+// ============================================================================
+// ARGUMENTS
+//
+// argv is a list of token indices rather than a copy: the text is already in
+// the arena, NUL-terminated, and copying it again would only add a second
+// place for the length to be wrong.
+// ============================================================================
+
+var argv_idx: [64]u32 = undefined
+var argc: u32 = 0
+
+fn arg_addr(i: u32): u64 {
+  if i >= argc { return 0 }
+  return tok_addr(argv_idx[i])
+}
+
+fn arg_eq(i: u32, lit: u64): u32 {
+  if i >= argc { return 0 }
+  return cstr_eq(arg_addr(i), lit)
+}
+
+// ============================================================================
+// test / [
+// ============================================================================
+
+fn file_exists(path: u64): u32 {
+  var full: [256]u8 = undefined
+  resolve_path(path, @intFromPtr(&full), 256)
+  return filesystem.vfs_exists(@intFromPtr(&full))
+}
+
+fn file_type_of(path: u64): u32 {
+  var full: [256]u8 = undefined
+  resolve_path(path, @intFromPtr(&full), 256)
+  return filesystem.vfs_get_type(@intFromPtr(&full))
+}
+
+// Evaluate a test expression over argv[from..to). Returns 1 for true.
+fn test_eval(from: u32, to: u32): u32 {
+  var n: u32 = to - from
+
+  if n == 0 { return 0 }
+
+  if n == 1 {
+    // A single argument is true when it is not empty.
+    if cstr_len(arg_addr(from)) == 0 { return 0 }
+    return 1
+  }
+
+  if n == 2 {
+    if arg_eq(from, "!") == 1 {
+      if cstr_len(arg_addr(from + 1)) == 0 { return 1 }
+      return 0
+    }
+    var op: u64 = arg_addr(from)
+    var target: u64 = arg_addr(from + 1)
+    if cstr_eq(op, "-z") == 1 {
+      if cstr_len(target) == 0 { return 1 }
+      return 0
+    }
+    if cstr_eq(op, "-n") == 1 {
+      if cstr_len(target) == 0 { return 0 }
+      return 1
+    }
+    if cstr_eq(op, "-e") == 1 { return file_exists(target) }
+    if cstr_eq(op, "-f") == 1 {
+      if file_exists(target) == 0 { return 0 }
+      if file_type_of(target) == 2 { return 0 }   // 2 is a directory here
+      return 1
+    }
+    if cstr_eq(op, "-d") == 1 {
+      if file_exists(target) == 0 { return 0 }
+      if file_type_of(target) == 2 { return 1 }
+      return 0
+    }
+    if cstr_eq(op, "-s") == 1 {
+      if file_exists(target) == 0 { return 0 }
+      var full: [256]u8 = undefined
+      resolve_path(target, @intFromPtr(&full), 256)
+      if filesystem.vfs_get_size(@intFromPtr(&full)) > 0 { return 1 }
+      return 0
+    }
+    // -r and -w: the VFS enforces permission at open, so asking it is the
+    // only answer that matches what an actual open would do.
+    if cstr_eq(op, "-r") == 1 {
+      var fr: [256]u8 = undefined
+      resolve_path(target, @intFromPtr(&fr), 256)
+      var fd: u32 = filesystem.vfs_open(@intFromPtr(&fr), 0, 0)
+      if fd == 0 { return 0 }
+      filesystem.vfs_close(fd)
+      return 1
+    }
+    if cstr_eq(op, "-w") == 1 {
+      var fw: [256]u8 = undefined
+      resolve_path(target, @intFromPtr(&fw), 256)
+      var fdw: u32 = filesystem.vfs_open(@intFromPtr(&fw), 1, 0)
+      if fdw == 0 { return 0 }
+      filesystem.vfs_close(fdw)
+      return 1
+    }
+    return 0
+  }
+
+  if n == 3 {
+    var lhs: u64 = arg_addr(from)
+    var op3: u64 = arg_addr(from + 1)
+    var rhs: u64 = arg_addr(from + 2)
+
+    if cstr_eq(op3, "=") == 1 { return cstr_eq(lhs, rhs) }
+    if cstr_eq(op3, "==") == 1 { return cstr_eq(lhs, rhs) }
+    if cstr_eq(op3, "!=") == 1 {
+      if cstr_eq(lhs, rhs) == 1 { return 0 }
+      return 1
+    }
+
+    var a: i64 = parse_i64(lhs, cstr_len(lhs))
+    var b: i64 = parse_i64(rhs, cstr_len(rhs))
+    if cstr_eq(op3, "-eq") == 1 {
+      if a == b { return 1 }
+      return 0
+    }
+    if cstr_eq(op3, "-ne") == 1 {
+      if a != b { return 1 }
+      return 0
+    }
+    if cstr_eq(op3, "-lt") == 1 {
+      if a < b { return 1 }
+      return 0
+    }
+    if cstr_eq(op3, "-le") == 1 {
+      if a <= b { return 1 }
+      return 0
+    }
+    if cstr_eq(op3, "-gt") == 1 {
+      if a > b { return 1 }
+      return 0
+    }
+    if cstr_eq(op3, "-ge") == 1 {
+      if a >= b { return 1 }
+      return 0
+    }
+    return 0
+  }
+
+  // `! expr` with more than two words.
+  if arg_eq(from, "!") == 1 {
+    if test_eval(from + 1, to) == 1 { return 0 }
+    return 1
+  }
+  return 0
+}
+
+// ============================================================================
+// BUILTINS
+// ============================================================================
+
+fn bi_echo(): u32 {
+  var i: u32 = 1
+  var newline: u32 = 1
+  if argc > 1 and arg_eq(1, "-n") == 1 {
+    newline = 0
+    i = 2
+  }
+  var first: u32 = 1
+  while i < argc {
+    if first == 0 { den_putc(32) }
+    den_puts(arg_addr(i))
+    first = 0
+    i = i + 1
+  }
+  if newline == 1 { den_putc(10) }
+  return 0
+}
+
+// printf with the conversions a shell script actually reaches for. An
+// unknown conversion is written through literally rather than swallowed:
+// silently dropping output is the failure mode that is hardest to notice.
+fn bi_printf(): u32 {
+  if argc < 2 { return 1 }
+  var fmt: u64 = arg_addr(1)
+  var next: u32 = 2
+  var i: u32 = 0
+  var n: u32 = cstr_len(fmt)
+
+  while i < n {
+    var c: u8 = @as(*u8, @ptrFromInt(fmt + @as(u64, i))).*
+
+    if c == 92 and (i + 1) < n {   // backslash escape
+      var e: u8 = @as(*u8, @ptrFromInt(fmt + @as(u64, i + 1))).*
+      if e == 110 {                                          // \n
+        den_putc(10)
+        i = i + 2
+        continue
+      }
+      if e == 116 {                                          // \t
+        den_putc(9)
+        i = i + 2
+        continue
+      }
+      if e == 114 {                                          // \r
+        den_putc(13)
+        i = i + 2
+        continue
+      }
+      if e == 92 {                                           // backslash
+        den_putc(92)
+        i = i + 2
+        continue
+      }
+      if e == 48 {                                           // \0
+        i = i + 2
+        continue
+      }
+      den_putc(c)
+      i = i + 1
+      continue
+    }
+
+    if c == 37 and (i + 1) < n {   // %
+      var f: u8 = @as(*u8, @ptrFromInt(fmt + @as(u64, i + 1))).*
+      if f == 37 {
+        den_putc(37)
+        i = i + 2
+        continue
+      }
+      if f == 115 {                                          // %s
+        if next < argc { den_puts(arg_addr(next)) }
+        next = next + 1
+        i = i + 2
+        continue
+      }
+      if f == 100 or f == 105 {                              // %d %i
+        if next < argc {
+          var a: u64 = arg_addr(next)
+          den_put_i64(parse_i64(a, cstr_len(a)))
+        }
+        next = next + 1
+        i = i + 2
+        continue
+      }
+      if f == 99 {                                           // %c
+        if next < argc { den_putc(@as(*u8, @ptrFromInt(arg_addr(next))).*) }
+        next = next + 1
+        i = i + 2
+        continue
+      }
+      den_putc(c)
+      i = i + 1
+      continue
+    }
+
+    den_putc(c)
+    i = i + 1
+  }
+  return 0
+}
+
+fn bi_pwd(): u32 {
+  den_puts(@intFromPtr(&cwd))
+  den_putc(10)
+  return 0
+}
+
+fn bi_cd(): u32 {
+  var target: u64 = @intFromPtr("/")
+  if argc > 1 {
+    target = arg_addr(1)
+  } else {
+    var home: u64 = den_getvar("HOME")
+    if home != 0 and cstr_len(home) > 0 { target = home }
+  }
+
+  var full: [256]u8 = undefined
+  resolve_path(target, @intFromPtr(&full), 256)
+
+  if filesystem.vfs_exists(@intFromPtr(&full)) == 0 {
+    den_puts("cd: no such file or directory: ")
+    den_puts(target)
+    den_putc(10)
+    return 1
+  }
+  if filesystem.vfs_get_type(@intFromPtr(&full)) != 2 {
+    den_puts("cd: not a directory: ")
+    den_puts(target)
+    den_putc(10)
+    return 1
+  }
+
+  // OLDPWD before the move, so `cd -` has somewhere to go back to.
+  den_setvar("OLDPWD", @intFromPtr(&cwd))
+  cstr_copy(@intFromPtr(&cwd), @intFromPtr(&full), 256)
+  den_setvar("PWD", @intFromPtr(&cwd))
+  return 0
+}
+
+fn bi_export(): u32 {
+  if argc == 1 {
+    var i: u32 = 0
+    while i < var_count {
+      if var_exported[i] == 1 {
+        den_puts("export ")
+        den_puts(var_name_addr(i))
+        den_putc(61)
+        den_puts(var_value_addr(i))
+        den_putc(10)
+      }
+      i = i + 1
+    }
+    return 0
+  }
+
+  var a: u32 = 1
+  var status: u32 = 0
+  while a < argc {
+    // NAME=VALUE, or a bare NAME that marks an existing variable exported.
+    var text: u64 = arg_addr(a)
+    var name: [40]u8 = undefined
+    var n: u32 = 0
+    var eq: u32 = 0
+    var j: u32 = 0
+    while j < 39 {
+      var c: u8 = @as(*u8, @ptrFromInt(text + @as(u64, j))).*
+      if c == 0 { break }
+      if c == 61 {
+        eq = 1
+        break
+      }
+      name[n] = c
+      n = n + 1
+      j = j + 1
+    }
+    name[n] = 0
+
+    if eq == 1 {
+      if den_setvar(@intFromPtr(&name), text + @as(u64, j) + 1) == 2 {
+        den_puts("export: readonly variable: ")
+        den_puts(@intFromPtr(&name))
+        den_putc(10)
+        status = 1
+        a = a + 1
+        continue
+      }
+    }
+    var idx: u32 = var_find(@intFromPtr(&name))
+    if idx < DEN_MAX_VARS {
+      var_exported[idx] = 1
+    } else {
+      den_setvar(@intFromPtr(&name), @intFromPtr(""))
+      var made: u32 = var_find(@intFromPtr(&name))
+      if made < DEN_MAX_VARS { var_exported[made] = 1 }
+    }
+    a = a + 1
+  }
+  return status
+}
+
+fn bi_unset(): u32 {
+  var a: u32 = 1
+  var status: u32 = 0
+  while a < argc {
+    if den_unsetvar(arg_addr(a)) == 2 {
+      den_puts("unset: readonly variable: ")
+      den_puts(arg_addr(a))
+      den_putc(10)
+      status = 1
+    }
+    a = a + 1
+  }
+  return status
+}
+
+fn bi_env(): u32 {
+  var i: u32 = 0
+  while i < var_count {
+    den_puts(var_name_addr(i))
+    den_putc(61)
+    den_puts(var_value_addr(i))
+    den_putc(10)
+    i = i + 1
+  }
+  return 0
+}
+
+fn bi_readonly(): u32 {
+  if argc == 1 { return bi_env() }
+  var a: u32 = 1
+  while a < argc {
+    var idx: u32 = var_find(arg_addr(a))
+    if idx < DEN_MAX_VARS { var_readonly[idx] = 1 }
+    a = a + 1
+  }
+  return 0
+}
+
+fn bi_alias(): u32 {
+  if argc == 1 {
+    var i: u32 = 0
+    while i < alias_count {
+      den_puts("alias ")
+      den_puts(alias_name_addr(i))
+      den_putc(61)
+      den_putc(39)
+      den_puts(alias_value_addr(i))
+      den_putc(39)
+      den_putc(10)
+      i = i + 1
+    }
+    return 0
+  }
+
+  var a: u32 = 1
+  while a < argc {
+    var text: u64 = arg_addr(a)
+    var name: [40]u8 = undefined
+    var n: u32 = 0
+    var eq: u32 = 0
+    var j: u32 = 0
+    while j < 39 {
+      var c: u8 = @as(*u8, @ptrFromInt(text + @as(u64, j))).*
+      if c == 0 { break }
+      if c == 61 {
+        eq = 1
+        break
+      }
+      name[n] = c
+      n = n + 1
+      j = j + 1
+    }
+    name[n] = 0
+
+    if eq == 0 {
+      var found: u64 = den_alias_get(@intFromPtr(&name))
+      if found == 0 {
+        den_puts("alias: not found: ")
+        den_puts(@intFromPtr(&name))
+        den_putc(10)
+        return 1
+      }
+      den_puts("alias ")
+      den_puts(@intFromPtr(&name))
+      den_putc(61)
+      den_putc(39)
+      den_puts(found)
+      den_putc(39)
+      den_putc(10)
+      a = a + 1
+      continue
+    }
+    den_alias_set(@intFromPtr(&name), text + @as(u64, j) + 1)
+    a = a + 1
+  }
+  return 0
+}
+
+fn bi_unalias(): u32 {
+  var a: u32 = 1
+  var status: u32 = 0
+  while a < argc {
+    if den_alias_remove(arg_addr(a)) != 0 { status = 1 }
+    a = a + 1
+  }
+  return status
+}
+
+fn bi_history(): u32 {
+  var i: u32 = 0
+  while i < hist_count {
+    den_put_u64(@as(u64, i + 1))
+    den_putc(32)
+    den_puts(hist_addr(i))
+    den_putc(10)
+    i = i + 1
+  }
+  return 0
+}
+
+fn bi_basename(): u32 {
+  if argc < 2 { return 1 }
+  var s: u64 = arg_addr(1)
+  var n: u32 = cstr_len(s)
+  // A trailing separator is not part of the name.
+  while n > 1 and @as(*u8, @ptrFromInt(s + @as(u64, n - 1))).* == 47 { n = n - 1 }
+  var start: u32 = 0
+  var i: u32 = 0
+  while i < n {
+    if @as(*u8, @ptrFromInt(s + @as(u64, i))).* == 47 { start = i + 1 }
+    i = i + 1
+  }
+  if start >= n {
+    den_putc(47)
+    den_putc(10)
+    return 0
+  }
+  var k: u32 = start
+  while k < n {
+    den_putc(@as(*u8, @ptrFromInt(s + @as(u64, k))).*)
+    k = k + 1
+  }
+  den_putc(10)
+  return 0
+}
+
+fn bi_dirname(): u32 {
+  if argc < 2 { return 1 }
+  var s: u64 = arg_addr(1)
+  var n: u32 = cstr_len(s)
+  while n > 1 and @as(*u8, @ptrFromInt(s + @as(u64, n - 1))).* == 47 { n = n - 1 }
+  var cut: u32 = 0
+  var found: u32 = 0
+  var i: u32 = 0
+  while i < n {
+    if @as(*u8, @ptrFromInt(s + @as(u64, i))).* == 47 {
+      cut = i
+      found = 1
+    }
+    i = i + 1
+  }
+  if found == 0 {
+    den_putc(46)
+    den_putc(10)
+    return 0
+  }
+  if cut == 0 {
+    den_putc(47)
+    den_putc(10)
+    return 0
+  }
+  var k: u32 = 0
+  while k < cut {
+    den_putc(@as(*u8, @ptrFromInt(s + @as(u64, k))).*)
+    k = k + 1
+  }
+  den_putc(10)
+  return 0
+}
+
+fn bi_realpath(): u32 {
+  if argc < 2 { return 1 }
+  var full: [256]u8 = undefined
+  resolve_path(arg_addr(1), @intFromPtr(&full), 256)
+  den_puts(@intFromPtr(&full))
+  den_putc(10)
+  return 0
+}
+
+// The reference den prints the sysname alone for a bare `uname` and
+// sysname/nodename/machine for `-a`. Matching that is the point of having an
+// oracle: a shell that is almost compatible is a shell scripts cannot target.
+fn bi_uname(): u32 {
+  if argc > 1 and arg_eq(1, "-a") == 1 {
+    den_puts("home-os home-os x86_64\n")
+    return 0
+  }
+  den_puts("home-os\n")
+  return 0
+}
+
+fn bi_whoami(): u32 {
+  var u: u64 = den_getvar("USER")
+  if u != 0 and cstr_len(u) > 0 {
+    den_puts(u)
+    den_putc(10)
+    return 0
+  }
+  den_puts("root\n")
+  return 0
+}
+
+fn bi_umask(): u32 {
+  if argc == 1 {
+    // Octal, zero-padded to three digits, as every other shell prints it.
+    den_putc(48)
+    den_putc(@as(u8, 48 + @as(u8, @truncate((umask_value / 64) % 8))))
+    den_putc(@as(u8, 48 + @as(u8, @truncate((umask_value / 8) % 8))))
+    den_putc(@as(u8, 48 + @as(u8, @truncate(umask_value % 8))))
+    den_putc(10)
+    return 0
+  }
+  var s: u64 = arg_addr(1)
+  var n: u32 = cstr_len(s)
+  var v: u32 = 0
+  var i: u32 = 0
+  while i < n {
+    var c: u8 = @as(*u8, @ptrFromInt(s + @as(u64, i))).*
+    if c < 48 or c > 55 { return 1 }
+    v = v * 8 + @as(u32, c - 48)
+    i = i + 1
+  }
+  umask_value = v
+  return 0
+}
+
+fn bi_cat(): u32 {
+  if argc < 2 { return 1 }
+  var a: u32 = 1
+  var status: u32 = 0
+  var buf: [256]u8 = undefined
+  while a < argc {
+    var full: [256]u8 = undefined
+    resolve_path(arg_addr(a), @intFromPtr(&full), 256)
+    var fd: u32 = filesystem.vfs_open(@intFromPtr(&full), 0, 0)
+    if fd == 0 {
+      den_puts("cat: cannot open: ")
+      den_puts(arg_addr(a))
+      den_putc(10)
+      status = 1
+      a = a + 1
+      continue
+    }
+    var guard: u32 = 0
+    while guard < 4096 {
+      var got: u64 = filesystem.vfs_read(fd, @intFromPtr(&buf), 256)
+      if got == 0 { break }
+      var k: u64 = 0
+      while k < got {
+        den_putc(buf[@as(u32, k)])
+        k = k + 1
+      }
+      guard = guard + 1
+    }
+    filesystem.vfs_close(fd)
+    a = a + 1
+  }
+  return status
+}
+
+fn bi_type(): u32 {
+  if argc < 2 { return 1 }
+  var a: u32 = 1
+  var status: u32 = 0
+  while a < argc {
+    var name: u64 = arg_addr(a)
+    var al: u64 = den_alias_get(name)
+    if al != 0 {
+      // The reference den's exact wording, backtick and closing quote
+      // included. Conformance is byte-for-byte or it is nothing.
+      den_puts(name)
+      den_puts(" is aliased to `")
+      den_puts(al)
+      den_putc(39)
+      den_putc(10)
+      a = a + 1
+      continue
+    }
+    if builtin_id(name) != 0 {
+      den_puts(name)
+      den_puts(" is a shell builtin\n")
+      a = a + 1
+      continue
+    }
+    var full: [256]u8 = undefined
+    if find_program(name, @intFromPtr(&full), 256) == 1 {
+      den_puts(name)
+      den_puts(" is ")
+      den_puts(@intFromPtr(&full))
+      den_putc(10)
+      a = a + 1
+      continue
+    }
+    den_puts(name)
+    den_puts(": not found\n")
+    status = 1
+    a = a + 1
+  }
+  return status
+}
+
+fn bi_which(): u32 {
+  if argc < 2 { return 1 }
+  var a: u32 = 1
+  var status: u32 = 0
+  while a < argc {
+    var full: [256]u8 = undefined
+    if find_program(arg_addr(a), @intFromPtr(&full), 256) == 1 {
+      den_puts(@intFromPtr(&full))
+      den_putc(10)
+    } else {
+      status = 1
+    }
+    a = a + 1
+  }
+  return status
+}
+
+// Set by the host console at init: a line listing commands the host adds on
+// top of the shell language. den prints it without knowing what is in it, so
+// the kernel's debug commands stay discoverable without den importing them.
+var extra_help: u64 = 0
+
+export fn den_set_extra_help(text: u64) {
+  extra_help = text
+}
+
+fn bi_help(): u32 {
+  den_puts("den — home-os shell\n")
+  den_puts("  . alias basename builtin cat cd clear command declare dirname\n")
+  den_puts("  dirs echo env eval exit export false help history let local\n")
+  den_puts("  popd printf pushd pwd readonly realpath set source test true\n")
+  den_puts("  type typeset umask uname unalias unset which whoami [\n")
+  den_puts("Operators: ; && || > >> 'quote' \"quote\" variables and #comment\n")
+  if extra_help != 0 { den_puts(extra_help) }
+  return 0
+}
+
+// ============================================================================
+// PROGRAM LOOKUP
+// ============================================================================
+
+// Find an executable for `name`. A name containing a separator is used as
+// given; anything else is looked for in /bin. Returns 1 when found, with the
+// resolved path in `out`.
+fn find_program(name: u64, out: u64, max: u32): u32 {
+  var has_slash: u32 = 0
+  var i: u32 = 0
+  var n: u32 = cstr_len(name)
+  while i < n {
+    if @as(*u8, @ptrFromInt(name + @as(u64, i))).* == 47 { has_slash = 1 }
+    i = i + 1
+  }
+
+  if has_slash == 1 {
+    resolve_path(name, out, max)
+    if filesystem.vfs_exists(out) == 1 { return 1 }
+    return 0
+  }
+
+  var probe: [256]u8 = undefined
+  probe[0] = 47
+  probe[1] = 98
+  probe[2] = 105
+  probe[3] = 110
+  probe[4] = 47
+  var k: u32 = 0
+  while k < n and (k + 5) < 255 {
+    probe[5 + k] = @as(*u8, @ptrFromInt(name + @as(u64, k))).*
+    k = k + 1
+  }
+  probe[5 + k] = 0
+  if filesystem.vfs_exists(@intFromPtr(&probe)) == 1 {
+    cstr_copy(out, @intFromPtr(&probe), max)
+    return 1
+  }
+  return 0
+}
+
+// ============================================================================
+// BUILTIN TABLE
+//
+// One place that answers "is this a builtin", so `type`, `command` and the
+// dispatcher cannot disagree about it — which is exactly how a shell ends up
+// reporting that a command exists and then failing to run it.
+// ============================================================================
+
+const BI_NONE: u32 = 0
+const BI_ECHO: u32 = 1
+const BI_PRINTF: u32 = 2
+const BI_TRUE: u32 = 3
+const BI_FALSE: u32 = 4
+const BI_PWD: u32 = 5
+const BI_CD: u32 = 6
+const BI_EXIT: u32 = 7
+const BI_EXPORT: u32 = 8
+const BI_UNSET: u32 = 9
+const BI_ENV: u32 = 10
+const BI_READONLY: u32 = 11
+const BI_ALIAS: u32 = 12
+const BI_UNALIAS: u32 = 13
+const BI_HISTORY: u32 = 14
+const BI_BASENAME: u32 = 15
+const BI_DIRNAME: u32 = 16
+const BI_REALPATH: u32 = 17
+const BI_UNAME: u32 = 18
+const BI_WHOAMI: u32 = 19
+const BI_UMASK: u32 = 20
+const BI_TEST: u32 = 21
+const BI_TYPE: u32 = 22
+const BI_WHICH: u32 = 23
+const BI_HELP: u32 = 24
+const BI_CAT: u32 = 25
+const BI_SET: u32 = 26
+const BI_SOURCE: u32 = 27
+const BI_EVAL: u32 = 28
+const BI_LET: u32 = 29
+const BI_PUSHD: u32 = 30
+const BI_POPD: u32 = 31
+const BI_DIRS: u32 = 32
+const BI_CLEAR: u32 = 33
+const BI_COMMAND: u32 = 34
+const BI_BUILTIN: u32 = 35
+const BI_DECLARE: u32 = 36
+
+fn builtin_id(name: u64): u32 {
+  if cstr_eq(name, "echo") == 1 { return BI_ECHO }
+  if cstr_eq(name, "printf") == 1 { return BI_PRINTF }
+  if cstr_eq(name, "true") == 1 { return BI_TRUE }
+  if cstr_eq(name, "false") == 1 { return BI_FALSE }
+  if cstr_eq(name, "pwd") == 1 { return BI_PWD }
+  if cstr_eq(name, "cd") == 1 { return BI_CD }
+  if cstr_eq(name, "exit") == 1 { return BI_EXIT }
+  if cstr_eq(name, "export") == 1 { return BI_EXPORT }
+  if cstr_eq(name, "unset") == 1 { return BI_UNSET }
+  if cstr_eq(name, "env") == 1 { return BI_ENV }
+  if cstr_eq(name, "readonly") == 1 { return BI_READONLY }
+  if cstr_eq(name, "alias") == 1 { return BI_ALIAS }
+  if cstr_eq(name, "unalias") == 1 { return BI_UNALIAS }
+  if cstr_eq(name, "history") == 1 { return BI_HISTORY }
+  if cstr_eq(name, "basename") == 1 { return BI_BASENAME }
+  if cstr_eq(name, "dirname") == 1 { return BI_DIRNAME }
+  if cstr_eq(name, "realpath") == 1 { return BI_REALPATH }
+  if cstr_eq(name, "uname") == 1 { return BI_UNAME }
+  if cstr_eq(name, "whoami") == 1 { return BI_WHOAMI }
+  if cstr_eq(name, "umask") == 1 { return BI_UMASK }
+  if cstr_eq(name, "test") == 1 { return BI_TEST }
+  if cstr_eq(name, "[") == 1 { return BI_TEST }
+  if cstr_eq(name, "type") == 1 { return BI_TYPE }
+  if cstr_eq(name, "which") == 1 { return BI_WHICH }
+  if cstr_eq(name, "help") == 1 { return BI_HELP }
+  if cstr_eq(name, "cat") == 1 { return BI_CAT }
+  if cstr_eq(name, "set") == 1 { return BI_SET }
+  if cstr_eq(name, "source") == 1 { return BI_SOURCE }
+  if cstr_eq(name, ".") == 1 { return BI_SOURCE }
+  if cstr_eq(name, "eval") == 1 { return BI_EVAL }
+  if cstr_eq(name, "let") == 1 { return BI_LET }
+  if cstr_eq(name, "pushd") == 1 { return BI_PUSHD }
+  if cstr_eq(name, "popd") == 1 { return BI_POPD }
+  if cstr_eq(name, "dirs") == 1 { return BI_DIRS }
+  if cstr_eq(name, "clear") == 1 { return BI_CLEAR }
+  if cstr_eq(name, "command") == 1 { return BI_COMMAND }
+  if cstr_eq(name, "builtin") == 1 { return BI_BUILTIN }
+  if cstr_eq(name, "declare") == 1 { return BI_DECLARE }
+  if cstr_eq(name, "typeset") == 1 { return BI_DECLARE }
+  if cstr_eq(name, "local") == 1 { return BI_DECLARE }
+  return BI_NONE
+}
+
+fn run_builtin(id: u32): u32 {
+  if id == BI_ECHO { return bi_echo() }
+  if id == BI_PRINTF { return bi_printf() }
+  if id == BI_TRUE { return 0 }
+  if id == BI_FALSE { return 1 }
+  if id == BI_PWD { return bi_pwd() }
+  if id == BI_CD { return bi_cd() }
+  if id == BI_EXIT {
+    exit_requested = 1
+    if argc > 1 {
+      var a: u64 = arg_addr(1)
+      return @as(u32, parse_u64(a, cstr_len(a)))
+    }
+    return last_status
+  }
+  if id == BI_EXPORT { return bi_export() }
+  if id == BI_UNSET { return bi_unset() }
+  if id == BI_ENV { return bi_env() }
+  if id == BI_SET { return bi_env() }
+  if id == BI_READONLY { return bi_readonly() }
+  if id == BI_ALIAS { return bi_alias() }
+  if id == BI_UNALIAS { return bi_unalias() }
+  if id == BI_HISTORY { return bi_history() }
+  if id == BI_BASENAME { return bi_basename() }
+  if id == BI_DIRNAME { return bi_dirname() }
+  if id == BI_REALPATH { return bi_realpath() }
+  if id == BI_UNAME { return bi_uname() }
+  if id == BI_WHOAMI { return bi_whoami() }
+  if id == BI_UMASK { return bi_umask() }
+  if id == BI_TYPE { return bi_type() }
+  if id == BI_WHICH { return bi_which() }
+  if id == BI_HELP { return bi_help() }
+  if id == BI_CAT { return bi_cat() }
+  if id == BI_SOURCE { return bi_source() }
+  if id == BI_EVAL { return bi_eval() }
+  if id == BI_LET { return bi_let() }
+  if id == BI_PUSHD { return bi_pushd() }
+  if id == BI_POPD { return bi_popd() }
+  if id == BI_DIRS { return bi_dirs() }
+  if id == BI_CLEAR { return bi_clear() }
+  if id == BI_DECLARE { return bi_declare() }
+  if id == BI_COMMAND { return bi_shift_and_run(0) }
+  if id == BI_BUILTIN { return bi_shift_and_run(1) }
+  if id == BI_TEST {
+    // `[` requires a closing `]`, and it is not part of the expression.
+    var to: u32 = argc
+    if arg_eq(0, "[") == 1 {
+      if argc < 2 or arg_eq(argc - 1, "]") == 0 {
+        den_puts("[: missing ]\n")
+        return 2
+      }
+      to = argc - 1
+    }
+    if test_eval(1, to) == 1 { return 0 }
+    return 1
+  }
+  return 127
+}
+
+// ============================================================================
+// EXECUTION
+// ============================================================================
+
+// Whether a word is `NAME=VALUE` with a name that could be a variable. A
+// leading `=`, or a `=` after something that cannot be in a name, is not an
+// assignment — `a-b=1` is a command name, however unlikely.
+// Split an alias body into words and append them to the token table, so they
+// can be addressed exactly like words that came off the input line. Returns
+// how many words were added; the first of them is at tok_count - result.
+//
+// Appending rather than re-lexing is deliberate: den_lex resets the table, and
+// the caller is in the middle of walking it.
+fn alias_words_append(body: u64): u32 {
+  var added: u32 = 0
+  var i: u32 = 0
+  var n: u32 = cstr_len(body)
+
+  while i < n {
+    while i < n and is_space(@as(*u8, @ptrFromInt(body + @as(u64, i))).*) == 1 {
+      i = i + 1
+    }
+    if i >= n { break }
+    if tok_count >= DEN_MAX_TOKENS { return added }
+
+    tok_kind[tok_count] = TOK_WORD
+    tok_off[tok_count] = arena_used
+
+    while i < n {
+      var c: u8 = @as(*u8, @ptrFromInt(body + @as(u64, i))).*
+      if is_space(c) == 1 { break }
+      if c == 39 {                       // single quote
+        i = i + 1
+        while i < n {
+          var q: u8 = @as(*u8, @ptrFromInt(body + @as(u64, i))).*
+          if q == 39 {
+            i = i + 1
+            break
+          }
+          arena_putc(q)
+          i = i + 1
+        }
+        continue
+      }
+      if c == 34 {                       // double quote
+        i = i + 1
+        while i < n {
+          var d: u8 = @as(*u8, @ptrFromInt(body + @as(u64, i))).*
+          if d == 34 {
+            i = i + 1
+            break
+          }
+          arena_putc(d)
+          i = i + 1
+        }
+        continue
+      }
+      arena_putc(c)
+      i = i + 1
+    }
+
+    tok_len[tok_count] = arena_used - tok_off[tok_count]
+    arena_putc(0)
+    tok_count = tok_count + 1
+    added = added + 1
+  }
+  return added
+}
+
+fn is_assignment(word: u64): u32 {
+  var i: u32 = 0
+  var n: u32 = cstr_len(word)
+  while i < n {
+    var c: u8 = @as(*u8, @ptrFromInt(word + @as(u64, i))).*
+    if c == 61 {
+      if i == 0 { return 0 }
+      return 1
+    }
+    if is_name_char(c) == 0 { return 0 }
+    if i == 0 and is_digit(c) == 1 { return 0 }
+    i = i + 1
+  }
+  return 0
+}
+
+fn apply_assignment(word: u64): u32 {
+  var name: [40]u8 = undefined
+  var n: u32 = 0
+  var i: u32 = 0
+  while i < 39 {
+    var c: u8 = @as(*u8, @ptrFromInt(word + @as(u64, i))).*
+    if c == 61 { break }
+    name[n] = c
+    n = n + 1
+    i = i + 1
+  }
+  name[n] = 0
+  var r: u32 = den_setvar(@intFromPtr(&name), word + @as(u64, i) + 1)
+  if r == 2 {
+    den_puts("den: readonly variable: ")
+    den_puts(@intFromPtr(&name))
+    den_putc(10)
+    return 1
+  }
+  if r == 1 {
+    den_puts("den: too many variables\n")
+    return 1
+  }
+  return 0
+}
+
+// Run one simple command: the word tokens in [from, to), with any redirection
+// operators in that span applied first and removed from argv.
+//
+// Redirection is set up around the call and torn down after it, so a builtin
+// never has to know whether its output is going to the console or a file.
+fn run_simple(from: u32, to: u32): u32 {
+  argc = 0
+
+  // Alias expansion appends its words to the token table, and the caller's
+  // walk is bounded by tok_count. Left grown, those words would be read as a
+  // further command once this one returned: `alias hi=printf` would run
+  // `printf` a second time with no arguments. The table is restored on the
+  // way out, once dispatch no longer needs the spliced words.
+  var entry_tok_count: u32 = tok_count
+  var entry_arena: u32 = arena_used
+
+  var redirect_out: u32 = 0
+  var redirect_append: u32 = 0
+  var redirect_target: u32 = DEN_MAX_TOKENS
+
+  var i: u32 = from
+  while i < to {
+    var k: u32 = tok_kind[i]
+    if k == TOK_WORD {
+      if argc < 64 {
+        argv_idx[argc] = i
+        argc = argc + 1
+      }
+      i = i + 1
+      continue
+    }
+    if k == TOK_REDIR_OUT or k == TOK_REDIR_APP {
+      if (i + 1) >= to or tok_kind[i + 1] != TOK_WORD {
+        den_puts("den: syntax error near redirection\n")
+        return 2
+      }
+      redirect_out = 1
+      if k == TOK_REDIR_APP { redirect_append = 1 }
+      redirect_target = i + 1
+      i = i + 2
+      continue
+    }
+    if k == TOK_REDIR_IN {
+      // Input redirection needs a command that reads a descriptor, and no
+      // builtin here does. Saying so beats opening the file and ignoring it.
+      // STUB(S12): input redirection needs a descriptor handed to a
+      // command that reads one, which needs fork/exec.
+      den_puts("den: < is not supported yet\n")
+      return 2
+    }
+    i = i + 1
+  }
+
+  if argc == 0 { return last_status }
+
+  // `NAME=VALUE` as a command is an assignment, not a program to look for.
+  // Checked before the alias table so an assignment cannot be shadowed.
+  if is_assignment(arg_addr(0)) == 1 {
+    var ai: u32 = 0
+    var st: u32 = 0
+    while ai < argc {
+      if is_assignment(arg_addr(ai)) == 0 { break }
+      if apply_assignment(arg_addr(ai)) != 0 { st = 1 }
+      ai = ai + 1
+    }
+    // A bare assignment list sets the variables and is done. An assignment
+    // followed by a command would prefix that command's environment, which
+    // needs a per-command environment this shell does not have yet, so the
+    // words after it are refused rather than silently dropped.
+    if ai < argc {
+      den_puts("den: VAR=value before a command is not supported yet\n")
+      return 2
+    }
+    return st
+  }
+
+  // An alias replaces the command word, and only the command word.
+  //
+  // The alias body is split into words here and spliced in front of the
+  // arguments the call already has. Rejoining the arguments into a string and
+  // re-lexing the result would strip their quoting a second time: after
+  // `alias say=printf`, the `"%s\n"` in `say "%s\n" x` has already become
+  // `%s\n`, and a second pass would read that backslash as an escape and
+  // print a bare `n`.
+  var alias_value: u64 = den_alias_get(arg_addr(0))
+  if alias_value != 0 {
+    var saved_argv: [64]u32 = undefined
+    var saved_argc: u32 = argc
+    var sv: u32 = 0
+    while sv < saved_argc {
+      saved_argv[sv] = argv_idx[sv]
+      sv = sv + 1
+    }
+
+    var added: u32 = alias_words_append(alias_value)
+    if added == 0 {
+      den_puts("den: alias expands to nothing: ")
+      den_puts(arg_addr(0))
+      den_putc(10)
+      return 1
+    }
+
+    // The alias's words, then everything after the original command word.
+    var first_new: u32 = tok_count - added
+    argc = 0
+    var na: u32 = 0
+    while na < added and argc < 64 {
+      argv_idx[argc] = first_new + na
+      argc = argc + 1
+      na = na + 1
+    }
+    var oa: u32 = 1
+    while oa < saved_argc and argc < 64 {
+      argv_idx[argc] = saved_argv[oa]
+      argc = argc + 1
+      oa = oa + 1
+    }
+
+    // Expansion is one level: control falls through to dispatch below without
+    // consulting the alias table again, so `alias ls='ls -l'` cannot loop.
+  }
+
+  // Set up redirection.
+  if redirect_out == 1 {
+    var full: [256]u8 = undefined
+    resolve_path(tok_addr(redirect_target), @intFromPtr(&full), 256)
+    // O_WRONLY | O_CREAT.
+    var fd: u32 = filesystem.vfs_open(@intFromPtr(&full), 65, 0o644)
+    if fd == 0 {
+      den_puts("den: cannot open for writing: ")
+      den_puts(tok_addr(redirect_target))
+      den_putc(10)
+      return 1
+    }
+    if redirect_append == 1 {
+      filesystem.vfs_lseek(fd, 0, 2)   // SEEK_END
+    } else {
+      // `>` shortens the file. Without this the new output is followed by
+      // whatever the old, longer file still had past the end of it.
+      filesystem.vfs_ftruncate(fd, 0)
+    }
+    out_fd = fd
+    out_fd_active = 1
+    out_used = 0
+  }
+
+  var status: u32 = 0
+  var id: u32 = builtin_id(arg_addr(0))
+  if id != BI_NONE {
+    status = run_builtin(id)
+  } else if redirect_out == 1 {
+    // An external program writes through its own descriptors, and this shell
+    // has no way to hand it one yet. Running it anyway would put the output on
+    // the console and leave the file empty — the redirect would look like it
+    // worked and the bytes would be somewhere else.
+    // STUB(S12): the program holds no descriptor from this shell.
+    den_puts("den: cannot redirect an external command yet: ")
+    den_puts(arg_addr(0))
+    den_putc(10)
+    status = 2
+  } else {
+    status = run_external()
+  }
+
+  if redirect_out == 1 {
+    den_flush()
+    filesystem.vfs_close(out_fd)
+    out_fd_active = 0
+    out_fd = 0
+  }
+
+  tok_count = entry_tok_count
+  arena_used = entry_arena
+  return status
+}
+
+// Run an external program. The command line is rebuilt from argv rather than
+// reusing the raw input, so the program sees the expanded, unquoted words.
+fn run_external(): u32 {
+  var full: [256]u8 = undefined
+  if find_program(arg_addr(0), @intFromPtr(&full), 256) == 0 {
+    den_puts("den: command not found: ")
+    den_puts(arg_addr(0))
+    den_putc(10)
+    return 127
+  }
+
+  var w: u32 = 0
+  var i: u32 = 0
+  while i < argc {
+    if i > 0 and w < 254 {
+      scratch[w] = 32
+      w = w + 1
+    }
+    var src: u64 = arg_addr(i)
+    var si: u32 = 0
+    while w < 254 {
+      var c: u8 = @as(*u8, @ptrFromInt(src + @as(u64, si))).*
+      if c == 0 { break }
+      scratch[w] = c
+      w = w + 1
+      si = si + 1
+    }
+    i = i + 1
+  }
+  scratch[w] = 0
+
+  // Output written by the program goes straight to the console, so anything
+  // this shell has buffered for a redirect must land first or it would appear
+  // after output that was produced later.
+  den_flush()
+
+  if usermode.run_user_program(@intFromPtr(&full), @intFromPtr(&scratch)) != 0 {
+    return 126
+  }
+  return @as(u32, usermode.get_user_exit_code())
+}
+
+// Run a tokenised line: a list of commands joined by `;`, `&&` and `||`.
+//
+// `&&` and `||` bind tighter than `;` in the sense that matters here: they
+// look only at the status of the command immediately before them, which is
+// what a left-to-right walk carrying `last_status` gives for free.
+fn den_exec_tokens(): u32 {
+  var i: u32 = 0
+  var status: u32 = last_status
+  var skip_next: u32 = 0
+
+  while i < tok_count {
+    // The span of one simple command: up to the next list separator. A
+    // redirection operator belongs to the command, so it does not end it.
+    var start: u32 = i
+    while i < tok_count {
+      var k: u32 = tok_kind[i]
+      if k == TOK_SEMI or k == TOK_AND or k == TOK_OR or k == TOK_PIPE { break }
+      i = i + 1
+    }
+
+    if skip_next == 0 {
+      if i > start { status = run_simple(start, i) }
+      last_status = status
+    }
+    skip_next = 0
+
+    if i >= tok_count { break }
+
+    var sep: u32 = tok_kind[i]
+    if sep == TOK_PIPE {
+      // A pipeline needs a second process to read the first one's output,
+      // and there is no fork yet. Refusing is honest; running only the left
+      // side and discarding the right would look like it worked.
+      // STUB(S12): a pipeline needs a second process reading the first
+      // one's output, which needs fork/exec.
+      den_puts("den: | is not supported yet\n")
+      last_status = 2
+      return 2
+    }
+    if sep == TOK_AND and status != 0 { skip_next = 1 }
+    if sep == TOK_OR and status == 0 { skip_next = 1 }
+    i = i + 1
+
+    if exit_requested == 1 { break }
+  }
+  return status
+}
+
+// Lex and run a line from inside a command that is itself running.
+//
+// The caller is part-way through walking the token table, so the table is
+// saved and restored around the nested parse. This is for raw text — a line
+// read from a file, or the arguments `eval` was asked to re-read — never for
+// words that have already been through the lexer once: those have had their
+// quoting removed, and a second pass would remove it again.
+fn den_run_nested(src: u64, len: u32): u32 {
+  if nest_depth >= DEN_MAX_NESTING {
+    den_puts("den: too deeply nested\n")
+    return 2
+  }
+  nest_depth = nest_depth + 1
+
+  var saved_kind: [64]u32 = undefined
+  var saved_off: [64]u32 = undefined
+  var saved_len: [64]u32 = undefined
+  var saved_argv: [64]u32 = undefined
+  var saved_count: u32 = tok_count
+  var saved_arena: u32 = arena_used
+  var saved_argc: u32 = argc
+  var i: u32 = 0
+  while i < saved_count {
+    saved_kind[i] = tok_kind[i]
+    saved_off[i] = tok_off[i]
+    saved_len[i] = tok_len[i]
+    i = i + 1
+  }
+  var a: u32 = 0
+  while a < saved_argc {
+    saved_argv[a] = argv_idx[a]
+    a = a + 1
+  }
+
+  var status: u32 = 0
+  var lex: u32 = den_lex(src, len)
+  if lex == 2 {
+    den_puts("den: unterminated quote\n")
+    status = 2
+  } else if lex != 0 {
+    den_puts("den: line too complex\n")
+    status = 2
+  } else {
+    status = den_exec_tokens()
+  }
+
+  tok_count = saved_count
+  arena_used = saved_arena
+  argc = saved_argc
+  var r: u32 = 0
+  while r < saved_count {
+    tok_kind[r] = saved_kind[r]
+    tok_off[r] = saved_off[r]
+    tok_len[r] = saved_len[r]
+    r = r + 1
+  }
+  var b: u32 = 0
+  while b < saved_argc {
+    argv_idx[b] = saved_argv[b]
+    b = b + 1
+  }
+
+  nest_depth = nest_depth - 1
+  return status
+}
+
+// Run every line of a file, as if each had been typed. Returns the status of
+// the last one, or 1 when the file cannot be read.
+fn bi_source(): u32 {
+  if argc < 2 {
+    den_puts("source: missing file\n")
+    return 1
+  }
+  var full: [256]u8 = undefined
+  resolve_path(arg_addr(1), @intFromPtr(&full), 256)
+  var fd: u32 = filesystem.vfs_open(@intFromPtr(&full), 0, 0)
+  if fd == 0 {
+    den_puts("source: cannot open: ")
+    den_puts(arg_addr(1))
+    den_putc(10)
+    return 1
+  }
+
+  var chunk: [256]u8 = undefined
+  var linebuf: [512]u8 = undefined
+  var used: u32 = 0
+  var status: u32 = 0
+  var guard: u32 = 0
+
+  while guard < 4096 {
+    var got: u64 = filesystem.vfs_read(fd, @intFromPtr(&chunk), 256)
+    if got == 0 { break }
+    var k: u64 = 0
+    while k < got {
+      var c: u8 = chunk[@as(u32, k)]
+      if c == 10 {
+        linebuf[used] = 0
+        if used > 0 { status = den_run_nested(@intFromPtr(&linebuf), used) }
+        used = 0
+        if exit_requested == 1 {
+          filesystem.vfs_close(fd)
+          return status
+        }
+      } else if used < 511 {
+        linebuf[used] = c
+        used = used + 1
+      }
+      k = k + 1
+    }
+    guard = guard + 1
+  }
+  // A last line with no newline is still a line.
+  if used > 0 {
+    linebuf[used] = 0
+    status = den_run_nested(@intFromPtr(&linebuf), used)
+  }
+  filesystem.vfs_close(fd)
+  return status
+}
+
+// eval joins its arguments and reads the result as a command. Re-reading
+// already-lexed words is exactly what eval is for, so the hazard that makes
+// alias splice its words instead does not apply here.
+fn bi_eval(): u32 {
+  if argc < 2 { return 0 }
+  var joined: [512]u8 = undefined
+  var w: u32 = 0
+  var i: u32 = 1
+  while i < argc {
+    if i > 1 and w < 510 {
+      joined[w] = 32
+      w = w + 1
+    }
+    var src: u64 = arg_addr(i)
+    var si: u32 = 0
+    while w < 510 {
+      var c: u8 = @as(*u8, @ptrFromInt(src + @as(u64, si))).*
+      if c == 0 { break }
+      joined[w] = c
+      w = w + 1
+      si = si + 1
+    }
+    i = i + 1
+  }
+  joined[w] = 0
+  if w == 0 { return 0 }
+  return den_run_nested(@intFromPtr(&joined), w)
+}
+
+// Integer arithmetic over the shell's variables: `let x = 2 + 3 * 4`.
+// Multiplication and division bind tighter than addition and subtraction;
+// nothing else is supported, and an unknown operator is an error rather than
+// a silently ignored term.
+var let_words: [64]u32 = undefined
+var let_n: u32 = 0
+var let_pos: u32 = 0
+var let_bad: u32 = 0
+
+fn let_value(i: u32): i64 {
+  var a: u64 = arg_addr(let_words[i])
+  var c: u8 = @as(*u8, @ptrFromInt(a)).*
+  if is_digit(c) == 1 or c == 45 { return parse_i64(a, cstr_len(a)) }
+  var v: u64 = den_getvar(a)
+  if v == 0 { return 0 }
+  return parse_i64(v, cstr_len(v))
+}
+
+fn let_term(): i64 {
+  if let_pos >= let_n {
+    let_bad = 1
+    return 0
+  }
+  var acc: i64 = let_value(let_pos)
+  let_pos = let_pos + 1
+  while let_pos + 1 < let_n {
+    var op: u64 = arg_addr(let_words[let_pos])
+    if cstr_eq(op, "*") == 0 and cstr_eq(op, "/") == 0 and cstr_eq(op, "%") == 0 {
+      return acc
+    }
+    var rhs: i64 = let_value(let_pos + 1)
+    if cstr_eq(op, "*") == 1 {
+      acc = acc * rhs
+    } else {
+      if rhs == 0 {
+        den_puts("let: division by zero\n")
+        let_bad = 1
+        return 0
+      }
+      if cstr_eq(op, "/") == 1 { acc = acc / rhs } else { acc = acc % rhs }
+    }
+    let_pos = let_pos + 2
+  }
+  return acc
+}
+
+fn let_expr(): i64 {
+  var acc: i64 = let_term()
+  while let_pos + 1 < let_n and let_bad == 0 {
+    var op: u64 = arg_addr(let_words[let_pos])
+    if cstr_eq(op, "+") == 1 {
+      let_pos = let_pos + 1
+      acc = acc + let_term()
+    } else if cstr_eq(op, "-") == 1 {
+      let_pos = let_pos + 1
+      acc = acc - let_term()
+    } else {
+      den_puts("let: unexpected operator: ")
+      den_puts(op)
+      den_putc(10)
+      let_bad = 1
+      return 0
+    }
+  }
+  return acc
+}
+
+fn bi_let(): u32 {
+  // `let NAME = expr`, and also `let NAME=expr` written as one word, which is
+  // how it is nearly always typed.
+  if argc < 2 {
+    den_puts("let: missing expression\n")
+    return 1
+  }
+
+  var name: [40]u8 = undefined
+  var n: u32 = 0
+  var first: u64 = arg_addr(1)
+  var j: u32 = 0
+  var packed_rhs: u32 = 0
+  while j < 39 {
+    var c: u8 = @as(*u8, @ptrFromInt(first + @as(u64, j))).*
+    if c == 0 { break }
+    if c == 61 {
+      packed_rhs = 1
+      break
+    }
+    name[n] = c
+    n = n + 1
+    j = j + 1
+  }
+  name[n] = 0
+  if n == 0 {
+    den_puts("let: missing variable name\n")
+    return 1
+  }
+
+  // Collect the expression's words: everything after `=`, whether the `=` was
+  // its own word or stuck to the name.
+  let_n = 0
+  let_pos = 0
+  let_bad = 0
+  var packed_value: [64]u8 = undefined
+  if packed_rhs == 1 {
+    var pv: u32 = 0
+    var q: u32 = j + 1
+    while pv < 63 {
+      var c2: u8 = @as(*u8, @ptrFromInt(first + @as(u64, q))).*
+      if c2 == 0 { break }
+      packed_value[pv] = c2
+      pv = pv + 1
+      q = q + 1
+    }
+    packed_value[pv] = 0
+    // A packed right-hand side is a single term; anything more needs spaces.
+    var out: [40]u8 = undefined
+    cstr_copy(@intFromPtr(&out), @intFromPtr(&packed_value), 40)
+    var val: i64 = parse_i64(@intFromPtr(&packed_value), cstr_len(@intFromPtr(&packed_value)))
+    var vv: u64 = den_getvar(@intFromPtr(&packed_value))
+    if vv != 0 { val = parse_i64(vv, cstr_len(vv)) }
+    return let_store(@intFromPtr(&name), val)
+  }
+
+  var a: u32 = 2
+  if arg_eq(2, "=") == 1 { a = 3 }
+  while a < argc and let_n < 64 {
+    let_words[let_n] = a
+    let_n = let_n + 1
+    a = a + 1
+  }
+  if let_n == 0 {
+    den_puts("let: missing expression\n")
+    return 1
+  }
+
+  var result: i64 = let_expr()
+  if let_bad == 1 { return 1 }
+  return let_store(@intFromPtr(&name), result)
+}
+
+fn let_store(name: u64, value: i64): u32 {
+  var text: [24]u8 = undefined
+  var n: u32 = 0
+  var v: u64 = 0
+  var neg: u32 = 0
+  if value < 0 {
+    neg = 1
+    v = @as(u64, @bitCast(0 - value))
+  } else {
+    v = @as(u64, @bitCast(value))
+  }
+  if v == 0 {
+    text[0] = 48
+    n = 1
+  } else {
+    var digits: [24]u8 = undefined
+    var d: u32 = 0
+    while v > 0 {
+      digits[d] = @as(u8, 48 + @as(u8, @truncate(v % 10)))
+      v = v / 10
+      d = d + 1
+    }
+    if neg == 1 {
+      text[0] = 45
+      n = 1
+    }
+    while d > 0 {
+      d = d - 1
+      text[n] = digits[d]
+      n = n + 1
+    }
+  }
+  text[n] = 0
+  if den_setvar(name, @intFromPtr(&text)) != 0 { return 1 }
+  return 0
+}
+
+// `command foo ...` and `builtin foo ...` both drop their own name and run
+// what follows. They differ in what they will accept: `builtin` runs only a
+// builtin, while `command` also runs an external — and both bypass aliases,
+// which is the reason either exists.
+fn bi_shift_and_run(builtin_only: u32): u32 {
+  if argc < 2 {
+    return 0
+  }
+  var i: u32 = 0
+  while i + 1 < argc {
+    argv_idx[i] = argv_idx[i + 1]
+    i = i + 1
+  }
+  argc = argc - 1
+
+  var id: u32 = builtin_id(arg_addr(0))
+  if id != BI_NONE { return run_builtin(id) }
+  if builtin_only == 1 {
+    den_puts("builtin: not a shell builtin: ")
+    den_puts(arg_addr(0))
+    den_putc(10)
+    return 1
+  }
+  return run_external()
+}
+
+// declare/typeset/local. Without functions there is no scope for `local` to be
+// local to, so all three set a variable — and `-r` marks it readonly, which is
+// the one attribute this shell can actually enforce.
+fn bi_declare(): u32 {
+  if argc == 1 { return bi_env() }
+  var a: u32 = 1
+  var mark_readonly: u32 = 0
+  while a < argc and arg_eq(a, "-r") == 1 {
+    mark_readonly = 1
+    a = a + 1
+  }
+  var status: u32 = 0
+  while a < argc {
+    var word: u64 = arg_addr(a)
+    if is_assignment(word) == 1 {
+      if apply_assignment(word) != 0 { status = 1 }
+    }
+    var name: [40]u8 = undefined
+    var n: u32 = 0
+    var j: u32 = 0
+    while j < 39 {
+      var c: u8 = @as(*u8, @ptrFromInt(word + @as(u64, j))).*
+      if c == 0 or c == 61 { break }
+      name[n] = c
+      n = n + 1
+      j = j + 1
+    }
+    name[n] = 0
+    var idx: u32 = var_find(@intFromPtr(&name))
+    if idx >= DEN_MAX_VARS {
+      den_setvar(@intFromPtr(&name), @intFromPtr(""))
+      idx = var_find(@intFromPtr(&name))
+    }
+    if mark_readonly == 1 and idx < DEN_MAX_VARS { var_readonly[idx] = 1 }
+    a = a + 1
+  }
+  return status
+}
+
+// The directory stack.
+fn bi_pushd(): u32 {
+  if argc < 2 {
+    den_puts("pushd: no other directory\n")
+    return 1
+  }
+  if dir_stack_depth >= DEN_DIR_STACK {
+    den_puts("pushd: directory stack full\n")
+    return 1
+  }
+  var here: [256]u8 = undefined
+  cstr_copy(@intFromPtr(&here), @intFromPtr(&cwd), 256)
+  if bi_cd() != 0 { return 1 }
+  cstr_copy(dir_stack_addr(dir_stack_depth), @intFromPtr(&here), DEN_PATH_MAX)
+  dir_stack_depth = dir_stack_depth + 1
+  return bi_dirs()
+}
+
+fn bi_popd(): u32 {
+  if dir_stack_depth == 0 {
+    den_puts("popd: directory stack empty\n")
+    return 1
+  }
+  dir_stack_depth = dir_stack_depth - 1
+  var back: [256]u8 = undefined
+  cstr_copy(@intFromPtr(&back), dir_stack_addr(dir_stack_depth), 256)
+  if filesystem.vfs_exists(@intFromPtr(&back)) == 0 {
+    den_puts("popd: gone: ")
+    den_puts(@intFromPtr(&back))
+    den_putc(10)
+    return 1
+  }
+  den_setvar("OLDPWD", @intFromPtr(&cwd))
+  cstr_copy(@intFromPtr(&cwd), @intFromPtr(&back), 256)
+  den_setvar("PWD", @intFromPtr(&cwd))
+  return bi_dirs()
+}
+
+fn bi_dirs(): u32 {
+  den_puts(@intFromPtr(&cwd))
+  var i: u32 = dir_stack_depth
+  while i > 0 {
+    i = i - 1
+    den_putc(32)
+    den_puts(dir_stack_addr(i))
+  }
+  den_putc(10)
+  return 0
+}
+
+fn bi_clear(): u32 {
+  // The two-sequence form every terminal understands: home the cursor, then
+  // erase from there to the end.
+  den_puts("\x1b[H\x1b[2J")
+  return 0
+}
+
+// ============================================================================
+// PUBLIC ENTRY POINTS
+// ============================================================================
+
+export fn den_init() {
+  var_count = 0
+  alias_count = 0
+  hist_count = 0
+  last_status = 0
+  exit_requested = 0
+  out_fd_active = 0
+  out_used = 0
+  umask_value = 18
+  dir_stack_depth = 0
+  nest_depth = 0
+
+  cwd[0] = 47
+  cwd[1] = 0
+
+  den_setvar("PWD", @intFromPtr(&cwd))
+  den_setvar("HOME", "/")
+  den_setvar("USER", "root")
+  den_setvar("SHELL", "/bin/den")
+  den_setvar("PATH", "/bin")
+
+  var pwd_idx: u32 = var_find("PWD")
+  if pwd_idx < DEN_MAX_VARS { var_exported[pwd_idx] = 1 }
+  var home_idx: u32 = var_find("HOME")
+  if home_idx < DEN_MAX_VARS { var_exported[home_idx] = 1 }
+  var path_idx: u32 = var_find("PATH")
+  if path_idx < DEN_MAX_VARS { var_exported[path_idx] = 1 }
+}
+
+// Run one line. `src` is the line's bytes, `len` its length; the line need not
+// be NUL-terminated. Returns the exit status.
+export fn den_run_line(src: u64, len: u32): u32 {
+  if len == 0 { return last_status }
+
+  var copy: [512]u8 = undefined
+  var n: u32 = len
+  if n > 511 { n = 511 }
+  var i: u32 = 0
+  while i < n {
+    copy[i] = @as(*u8, @ptrFromInt(src + @as(u64, i))).*
+    i = i + 1
+  }
+  copy[n] = 0
+
+  hist_add(@intFromPtr(&copy))
+
+  var lex: u32 = den_lex(@intFromPtr(&copy), n)
+  if lex == 2 {
+    den_puts("den: unterminated quote\n")
+    last_status = 2
+    return 2
+  }
+  if lex != 0 {
+    den_puts("den: line too complex\n")
+    last_status = 2
+    return 2
+  }
+
+  last_status = den_exec_tokens()
+  den_flush()
+  return last_status
+}
+
+// ============================================================================
+// THE INTERFACE THE REST OF THE TREE CALLS
+//
+// These are the entry points `lib/shell_syscall.home`, `apps/shell.home` and
+// `apps/terminal.home` were written against. They used to be served by
+// `lib/den_lib.home`, which simulated them: its `pwd` and `echo` printed
+// nothing, its external execution returned success without executing, and its
+// pipes and redirections were `return 0`. Anything calling it got a zero and
+// no output, which is indistinguishable from working.
+//
+// They are served here instead, by the shell that actually runs.
+// ============================================================================
+
+// Run a NUL-terminated command line. Returns its exit status.
+export fn den_execute(command_line: u64): u32 {
+  return den_run_line(command_line, cstr_len(command_line))
+}
+
+// The same, for a caller that already knows the length.
+export fn den_execute_command(command_line: u64, len: u32): u32 {
+  return den_run_line(command_line, len)
+}
+
+export fn den_get_cwd(): u64 {
+  return @intFromPtr(&cwd)
+}
+
+export fn den_set_cwd(path: u64): u32 {
+  var full: [256]u8 = undefined
+  resolve_path(path, @intFromPtr(&full), 256)
+  if filesystem.vfs_exists(@intFromPtr(&full)) == 0 { return 1 }
+  if filesystem.vfs_get_type(@intFromPtr(&full)) != 2 { return 1 }
+  den_setvar("OLDPWD", @intFromPtr(&cwd))
+  cstr_copy(@intFromPtr(&cwd), @intFromPtr(&full), 256)
+  den_setvar("PWD", @intFromPtr(&cwd))
+  return 0
+}
+
+export fn den_get_last_exit_code(): u32 {
+  return last_status
+}
+
+export fn den_set_last_exit_code(code: u32) {
+  last_status = code
+}
+
+export fn den_setenv(name: u64, value: u64): u32 {
+  return den_setvar(name, value)
+}
+
+export fn den_getenv(name: u64): u64 {
+  return den_getvar(name)
+}
+
+export fn den_unsetenv(name: u64): u32 {
+  return den_unsetvar(name)
+}
+
+export fn den_alias(name: u64, value: u64): u32 {
+  return den_alias_set(name, value)
+}
+
+export fn den_unalias(name: u64): u32 {
+  return den_alias_remove(name)
+}
+
+export fn den_history_add(command: u64, exit_code: u32): u32 {
+  hist_add(command)
+  last_status = exit_code
+  return 0
+}
+
+export fn den_history_get(index: u32): u64 {
+  if index >= hist_count { return 0 }
+  return hist_addr(index)
+}
+
+export fn den_history_clear(): u32 {
+  hist_count = 0
+  return 0
+}
+
+// Job control needs processes this shell can put in the background, which
+// needs fork. Refusing is the whole point: den_lib's versions returned a job
+// id for a job that was never created, and a caller could not tell.
+//
+// STUB(S12): background jobs need fork/exec.
+export fn den_job_add(command: u64, pid: u32, background: u32): u32 {
+  return 0
+}
+
+// STUB(S12): there are no background jobs to list.
+export fn den_job_list(): u32 {
+  den_puts("jobs: no job control in this shell yet\n")
+  return 1
+}
+
+export fn den_exit_requested(): u32 {
+  return exit_requested
+}
+
+export fn den_last_status(): u32 {
+  return last_status
+}
+
+// Whether `name` is a command den handles itself. serial_shell uses this to
+// decide whether a word belongs to the shell or to its own kernel-debug
+// commands, so there is one answer rather than two lists drifting apart.
+export fn den_handles(name: u64): u32 {
+  if builtin_id(name) != BI_NONE { return 1 }
+  if den_alias_get(name) != 0 { return 1 }
+  if is_assignment(name) == 1 { return 1 }
+  return 0
+}
+
+// Whether den should take this line rather than leaving it to the kernel's
+// own debug commands.
+//
+// den takes it when the first word is something den owns, or when the line
+// uses shell syntax at all — a quote, a variable, a redirect, a separator.
+// The second half is what matters: `disk` is not den's, but `disk > log` is a
+// redirection, and the debug dispatcher would write to the console and drop
+// the file on the floor without saying so.
+export fn den_should_handle(src: u64, len: u32): u32 {
+  var i: u32 = 0
+  while i < len {
+    var c: u8 = @as(*u8, @ptrFromInt(src + @as(u64, i))).*
+    if c == 39 or c == 34 { return 1 }        // quotes
+    if c == 36 { return 1 }                   // $
+    if c == 62 or c == 60 { return 1 }        // > <
+    if c == 59 { return 1 }                   // ;
+    if c == 35 { return 1 }                   // #
+    if c == 124 { return 1 }                  // |
+    if c == 92 { return 1 }                   // backslash
+    if c == 38 and (i + 1) < len {
+      if @as(*u8, @ptrFromInt(src + @as(u64, i + 1))).* == 38 { return 1 }
+    }
+    i = i + 1
+  }
+
+  // Otherwise it comes down to the first word.
+  var start: u32 = 0
+  while start < len and is_space(@as(*u8, @ptrFromInt(src + @as(u64, start))).*) == 1 {
+    start = start + 1
+  }
+  if start >= len { return 0 }
+  var end: u32 = start
+  while end < len and is_space(@as(*u8, @ptrFromInt(src + @as(u64, end))).*) == 0 {
+    end = end + 1
+  }
+
+  var word: [64]u8 = undefined
+  var n: u32 = end - start
+  if n > 63 { n = 63 }
+  var k: u32 = 0
+  while k < n {
+    word[k] = @as(*u8, @ptrFromInt(src + @as(u64, start + k))).*
+    k = k + 1
+  }
+  word[n] = 0
+  return den_handles(@intFromPtr(&word))
+}

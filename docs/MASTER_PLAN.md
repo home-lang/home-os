@@ -261,6 +261,7 @@ Bring-up order (each stage proven over serial before the next): serial-first deb
 | S10 | **CLOSED** — SMAP's ARM64 counterpart (the PAN bit in PSTATE) is set up, so `asm_stac`/`asm_clac` move a real bit on both architectures | `kernel/src/core/foundation.home` | P3 | Phase 7b hardening |
 
 | S11 | **CLOSED** — `tcp_input()` validates a segment and hands it to the state machine, and netdev dispatches to it | `kernel/src/net/netdev.home` | P1 | Phase 2 `net-echo` for TCP |
+| S12 | den refuses pipelines and input redirection rather than running half of them. Both need a second process reading a descriptor this shell can hand it, which needs fork/exec; output redirection works because the shell writes it itself. An external command with an output redirect is refused for the same reason — the program holds no descriptor from the shell | `kernel/src/console/den.home` | P2 | Phase 3 `shell-suite` |
 
 **Register rules:**
 1. A stub may not be closed without a runtime test exercising it.
@@ -451,6 +452,7 @@ This list is the ONLY compile target for Phases 0–1. A file may be added only 
 
 **Console (1)**
 - `kernel/src/console/serial_shell.home` — needed by `boot-to-shell`: the interactive serial console. Runs in the kernel and calls the subsystems directly; `apps/shell.home` is the userspace shell and needs an ELF loader and syscall path that do not exist yet.
+- `kernel/src/console/den.home` — needed by `boot-to-shell`: den, the shell itself. The home-os implementation of the language at `~/Code/Tools/den`, which is its conformance oracle (`scripts/den-conform.sh`). `serial_shell.home` owns the terminal and hands it every line that is shell; what stays there is this kernel's own debug commands, which are not part of the language.
 
 **Storage (2)**
 - `kernel/src/drivers/ata.home` — needed by `storage-roundtrip`: ATA PIO, with the capacity read out of the drive's IDENTIFY response.
@@ -540,8 +542,7 @@ out until its 26 type-checker diagnostics are resolved (it returns with
 `net-echo`, same terms as tcp/udp):
 - `kernel/src/net/dhcp.home`
 
-**Shell library (1)** — Phase 1 boot-to-shell (shell_syscall boots the den shell):
-- `kernel/src/lib/den_lib.home`
+
 
 **Timer (1)**
 - `kernel/src/time/clocksource.home`
@@ -593,7 +594,7 @@ Total: **74 source files + 1 linker script.**
 
 **Deliberately excluded — networking.** `net/socket.home`, `net/tcp.home`, and `net/udp.home` were in this list only because `main.home` imported them, and the simplification this section already recommended — shrink the entry's imports — was taken. `tcp` and `udp` were imported and never used; `socket` was used once, in an IRQ branch for interrupts a kernel with no NIC driver cannot receive. Servicing it dragged `drivers/e1000` in behind it. They return with the Phase 2 `net-echo` gate.
 
-**Deliberately excluded — libraries.** `kernel/src/integration.home`, which initializes the package manager (`lib/pantry_lib.home`), the den shell (`lib/den_lib.home`), and the Craft GUI toolkit (`lib/craft_lib.home`). Those are Phase 3 and Phase 4 concerns. It was in this list until the set was first linked, where it contributed 61 of 188 unresolved symbols — a *minimum* viable kernel does not reach into the package manager or the GUI toolkit. The call to it was removed from `main.home` in the same change.
+**Deliberately excluded — libraries.** `kernel/src/integration.home`, which initializes the package manager (`lib/pantry_lib.home`), the den shell (`console/den.home`), and the Craft GUI toolkit (`lib/craft_lib.home`). Those are Phase 3 and Phase 4 concerns. It was in this list until the set was first linked, where it contributed 61 of 188 unresolved symbols — a *minimum* viable kernel does not reach into the package manager or the GUI toolkit. The call to it was removed from `main.home` in the same change.
 
 **Known gaps:** this list was described as having none. That was wrong, and per-file compilation could not show it — linking the set together did. Two problems surfaced (see [#41](https://github.com/home-lang/home-os/issues/41)):
 
