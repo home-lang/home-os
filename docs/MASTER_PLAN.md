@@ -262,6 +262,7 @@ Bring-up order (each stage proven over serial before the next): serial-first deb
 
 | S11 | **CLOSED** — `tcp_input()` validates a segment and hands it to the state machine, and netdev dispatches to it | `kernel/src/net/netdev.home` | P1 | Phase 2 `net-echo` for TCP |
 | S12 | den refuses pipelines and input redirection rather than running half of them. Both need a second process reading a descriptor this shell can hand it, which needs fork/exec; output redirection works because the shell writes it itself. An external command with an output redirect is refused for the same reason — the program holds no descriptor from the shell | `kernel/src/console/den.home` | P2 | Phase 3 `shell-suite` |
+| S13 | `sys_fork` and `sys_exec` simulate. fork copies rsp/rbp/rflags into a fresh PCB and returns a pid, but clones no address space, never returns 0 in a child, and nothing schedules the result; exec assigns rip and loads no image. `sys_wait` then spins forever on a child that can never become a zombie. Real fork needs a per-process address space, and this kernel identity-maps itself and its user programs under the same PML4 entry, so that is a memory-model change and not a patch | `kernel/src/core/process.home` | P2 | Phase 3 (pipes, signals, fork/exec, job control); unblocks S12 |
 
 **Register rules:**
 1. A stub may not be closed without a runtime test exercising it.

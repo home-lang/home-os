@@ -125,12 +125,25 @@ _start:
     mov %eax, pdpt
     movl $0, pdpt + 4      # Clear upper 32 bits
 
-    /* PD entries: Map first 2GB using 1024 * 2MB huge pages */
-    /* This ensures kernel, stack, and all data are writable */
+    /* PD entries: identity map the first 1GB using 512 * 2MB huge pages.
+     *
+     * 512, not 1024. A PD page holds 512 entries; the loop wrote 1024 of
+     * them, so the second half ran 4KB past the end of `pd` and into
+     * stack_bottom — which is what the "page tables MUST come first"
+     * comment above is working around rather than fixing.
+     *
+     * Those 512 extra entries were never page tables in any case: they
+     * would have had to hang off PDPT[1], and nothing points PDPT[1]
+     * anywhere. The mapping this installs is and always was 1GB, so
+     * writing only what fits changes no mapping — it just stops writing
+     * into the stack. Anything above 1GB, including a user program at
+     * 0x40000000 and a device BAR, is mapped by vmm at runtime with 4KB
+     * pages and the right permissions.
+     */
     mov $pd, %edi
     mov $0x00000083, %eax  # Present + Writable + Huge (2MB pages)
     xor %edx, %edx         # Upper 32 bits = 0
-    mov $1024, %ecx        # Map 1024 * 2MB = 2GB
+    mov $512, %ecx         # Map 512 * 2MB = 1GB, which is one PD page
 
 .fill_pd:
     mov %eax, (%edi)       # Write lower 32 bits
