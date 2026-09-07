@@ -29,6 +29,9 @@ const SYS_OPEN: u64 = 4
 const SYS_FORK: u64 = 1
 const SYS_WAIT: u64 = 6
 const SYS_YIELD: u64 = 24
+const SYS_KILL_SIG: u64 = 9
+const SYS_SIGACTION: u64 = 63
+const SYS_SIGRETURN: u64 = 64
 
 // Every other call whose first argument is a path, and the three whose second
 // is one too. Taken from kernel/src/sys/syscall.home, which owns the numbering.
@@ -139,6 +142,156 @@ fn next_runnable(from: u32): u32 {
 }
 
 // Hand the CPU to another runnable task. Returns when one hands it back.
+// ============================================================================
+// SIGNALS
+//
+// A signal is delivered where a task's whole context already is: the frame the
+// syscall stub pushed. Delivery rewrites that frame so the iretq at the end of
+// the stub enters the handler instead of resuming the interrupted code, and
+// sigreturn puts the original frame back.
+//
+// That is the whole mechanism, and it is only possible because the frame is
+// reachable — which is what fork needed too. sys/signal.home's version does
+// the mask bookkeeping, prints that it is delivering, and then says "Would set
+// up the signal frame on the user stack here": it never enters a handler.
+// That path is registered as S16.
+//
+// Delivered on return from a syscall. A task computing without making one will
+// not see a signal until it does, which is a consequence of cooperative
+// scheduling rather than a separate limitation: the same task would not yield
+// either.
+// ============================================================================
+
+const MAX_SIGNALS: u32 = 32
+const SIGKILL: u32 = 9
+const SIGTERM: u32 = 15
+
+var task_pending: [4]u32 = undefined
+var task_sig_handler: [128]u64 = undefined       // task * MAX_SIGNALS + signal
+var task_trampoline: [4]u64 = undefined
+var task_sigframe: [60]u64 = undefined           // task * FORK_FRAME_WORDS
+var task_in_handler: [4]u32 = undefined
+
+fn signals_reset(task: u32) {
+  task_pending[task] = 0
+  task_trampoline[task] = 0
+  task_in_handler[task] = 0
+  var i: u32 = 0
+  while i < MAX_SIGNALS {
+    task_sig_handler[task * MAX_SIGNALS + i] = 0
+    i = i + 1
+  }
+}
+
+// Register a handler, and the address the handler returns through. The
+// trampoline is the program's: the kernel cannot invent code in a user
+// address space, so libc supplies a stub that calls sigreturn.
+fn do_signal(sig: u64, handler: u64, trampoline: u64): u64 {
+  if sig == 0 or sig >= @as(u64, MAX_SIGNALS) { return 0xFFFFFFFFFFFFFFFF }
+  // SIGKILL cannot be caught. A program that could catch it could refuse to
+  // die, and then nothing could stop it.
+  if sig == @as(u64, SIGKILL) { return 0xFFFFFFFFFFFFFFFF }
+  task_sig_handler[current_task * MAX_SIGNALS + @as(u32, sig)] = handler
+  task_trampoline[current_task] = trampoline
+  return 0
+}
+
+// Mark a signal pending on a task. It is delivered when that task next returns
+// from a syscall.
+fn do_kill(target: u64, sig: u64): u64 {
+  if target >= @as(u64, MAX_TASKS) { return 0xFFFFFFFFFFFFFFFF }
+  if sig == 0 or sig >= @as(u64, MAX_SIGNALS) { return 0xFFFFFFFFFFFFFFFF }
+  let task: u32 = @as(u32, target)
+  if task_state[task] == TASK_UNUSED or task_state[task] == TASK_DONE {
+    return 0xFFFFFFFFFFFFFFFF
+  }
+  task_pending[task] = task_pending[task] | (1 << @as(u32, sig))
+  return 0
+}
+
+// Rewrite the outgoing frame so the stub's iretq enters the handler.
+//
+// Returns 1 when the task was terminated and the caller must not return to it.
+// `result` is what the interrupted syscall was going to return. It is passed
+// in rather than read from the frame: the frame's first slot is the %rax the
+// stub pushed, which still held the syscall *number* at that point, not its
+// result. Saving that instead made a kill() that delivered a signal return 9
+// — its own syscall number — which is exactly what the test caught.
+fn deliver_signals(frame: u64, result: u64): u32 {
+  let task: u32 = current_task
+  if task_pending[task] == 0 { return 0 }
+  // One at a time, and not while already in a handler: re-entering would
+  // overwrite the frame the first delivery saved for sigreturn.
+  if task_in_handler[task] == 1 { return 0 }
+
+  var sig: u32 = 1
+  while sig < MAX_SIGNALS {
+    if (task_pending[task] & (1 << sig)) != 0 { break }
+    sig = sig + 1
+  }
+  if sig >= MAX_SIGNALS { return 0 }
+
+  task_pending[task] = task_pending[task] & ~(1 << sig)
+
+  let handler: u64 = task_sig_handler[task * MAX_SIGNALS + sig]
+  if handler == 0 {
+    // No handler. Terminating signals terminate; everything else is ignored,
+    // which is stated rather than silently assumed.
+    if sig == SIGKILL or sig == SIGTERM {
+      foundation.serial_write_string("[signal] task ")
+      foundation.serial_write_u64(@as(u64, task))
+      foundation.serial_write_string(" terminated by signal ")
+      foundation.serial_write_u64(@as(u64, sig))
+      foundation.serial_write_string("\n")
+      task_state[task] = TASK_DONE
+      task_exit[task] = 128 + @as(u64, sig)
+      return 1
+    }
+    return 0
+  }
+
+  // Save the interrupted frame whole, so sigreturn can put it back exactly.
+  var i: u32 = 0
+  while i < FORK_FRAME_WORDS {
+    task_sigframe[task * FORK_FRAME_WORDS + i] =
+      @as(*u64, @ptrFromInt(frame + @as(u64, i * 8))).*
+    i = i + 1
+  }
+  // The value the interrupted call returns, in the slot sigreturn reads back.
+  task_sigframe[task * FORK_FRAME_WORDS] = result
+
+  // The handler's return address goes on the task's own stack, which is
+  // mapped in the address space in force right now — this runs inside that
+  // task's syscall.
+  var user_rsp: u64 = @as(*u64, @ptrFromInt(frame + 13 * 8)).*
+  user_rsp = user_rsp - 8
+  @as(*u64, @ptrFromInt(user_rsp)).* = task_trampoline[task]
+
+  @as(*u64, @ptrFromInt(frame + 6 * 8)).* = @as(u64, sig)   // rdi: the signal
+  @as(*u64, @ptrFromInt(frame + 10 * 8)).* = handler        // rip
+  @as(*u64, @ptrFromInt(frame + 13 * 8)).* = user_rsp       // rsp
+  task_in_handler[task] = 1
+  return 0
+}
+
+// Put the interrupted frame back. The restored rax is the value the
+// interrupted syscall was going to return, so the program resumes as though
+// the handler had never run.
+// Put the interrupted frame back and return what the interrupted call was
+// going to return, so the program resumes as though the handler never ran.
+fn do_sigreturn(frame: u64): u64 {
+  let task: u32 = current_task
+  if task_in_handler[task] == 0 { return 0xFFFFFFFFFFFFFFFF }
+  var i: u32 = 0
+  while i < FORK_FRAME_WORDS {
+    @as(*u64, @ptrFromInt(frame + @as(u64, i * 8))).* =
+      task_sigframe[task * FORK_FRAME_WORDS + i]
+    i = i + 1
+  }
+  task_in_handler[task] = 0
+  return @as(*u64, @ptrFromInt(frame)).*
+}
+
 // Make the program the kernel is about to enter task 0.
 //
 // Both loaders call this. It lived inline in one of them and the other was
@@ -155,9 +308,11 @@ fn scheduler_reset() {
   task_kstack_top[0] = foundation.tss_get_rsp0()
   task_frame[0] = 0
   task_exit[0] = 0
+  signals_reset(0)
   var t: u32 = 1
   while t < MAX_TASKS {
     task_state[t] = TASK_UNUSED
+    signals_reset(t)
     t = t + 1
   }
 }
@@ -416,6 +571,11 @@ fn do_fork(frame: u64): u64 {
   task_frame[task] = @intFromPtr(&child_frame[slot])
   task_state[task] = TASK_RUNNABLE
   task_exit[task] = 0
+  // The child inherits none of the parent's handlers. POSIX says a child keeps
+  // them; this kernel cannot yet, because a handler address is only meaningful
+  // with the code that registered it and the child's copy has not been
+  // exercised. Saying so beats inheriting an address that may not be reached.
+  signals_reset(task)
   if task_count <= task { task_count = task + 1 }
 
   return @as(u64, slot + 1)
@@ -447,7 +607,37 @@ fn do_wait(pid: u64): u64 {
   return task_exit[task]
 }
 
+// Every syscall leaves through here, which is the only place a pending signal
+// can be delivered: delivery rewrites the frame the stub is about to return
+// through, so it has to happen after the work and before the return.
+//
+// This was one function, and the early returns for fork, kill and the rest
+// skipped the delivery at the bottom — so a signal was only ever delivered by
+// a syscall that happened to fall through to the generic table. kill(self)
+// returned 0 and the handler never ran.
 export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
+  let result: u64 = syscall_body(nr, a1, a2, a3, frame)
+
+  if deliver_signals(frame, result) == 1 {
+    // The signal terminated this task; there is nothing to return to.
+    let next: u32 = next_runnable(current_task)
+    if next != current_task {
+      let me: u32 = current_task
+      task_state[next] = TASK_RUNNING
+      current_task = next
+      foundation.tss_set_rsp0(task_kstack_top[next])
+      current_space = task_cr3[next]
+      process_switch(@intFromPtr(&task_kernel_rsp) + @as(u64, me * 8),
+                     task_kernel_rsp[next], task_cr3[next])
+    }
+    user_exit_code = task_exit[current_task]
+    return_to_kernel()
+  }
+
+  return result
+}
+
+fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
   syscalls_served = syscalls_served + 1
 
   // exit is handled here rather than in the table because it does not
@@ -538,6 +728,9 @@ export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64)
   }
 
   if nr == SYS_FORK { return do_fork(frame) }
+  if nr == SYS_SIGACTION { return do_signal(a1, a2, a3) }
+  if nr == SYS_KILL_SIG { return do_kill(a1, a2) }
+  if nr == SYS_SIGRETURN { return do_sigreturn(frame) }
   if nr == SYS_WAIT { return do_wait(a1) }
 
   // Reads from standard input come from wherever the shell attached it. With
