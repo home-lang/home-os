@@ -141,7 +141,12 @@ log="$workdir/serial.log"
     sleep 1
     while IFS= read -r cmd; do
         printf '%s\n' "$cmd"
-        sleep 1
+        # Two seconds, matching scripts/boot-gate.sh, which feeds the same
+        # console reliably. A whole line arrives at once and the 16550's
+        # receive FIFO is sixteen bytes deep, so how fast the kernel drains it
+        # matters — and the kernel now does more between lines than it did.
+        # This gate was intermittently losing every command with one second.
+        sleep 2
     done < "$workdir/feed.txt"
     sleep 3
 } | "$QEMU" -kernel "$workdir/kernel.bin" \
