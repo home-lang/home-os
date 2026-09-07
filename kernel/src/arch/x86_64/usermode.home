@@ -979,6 +979,148 @@ fn build_argv(line: u64): u64 {
 // Unlike run_user_program, the image says where it wants to live and what its
 // entry point is, so nothing here picks an address. Returns nonzero if it
 // could not be started; when it starts, this returns once the program exits.
+// ============================================================================
+// BACKGROUND JOBS
+//
+// A job is a task the shell starts and does not enter. It becomes runnable,
+// and it makes progress whenever something hands the CPU over — which the
+// console does between lines, and `fg` does until the job finishes.
+//
+// The program is loaded into the kernel's user window as usual and then copied
+// into an address space of its own, the same way fork copies a parent. Loading
+// straight into the new space would mean teaching the ELF loader to map
+// somewhere other than the space it is running in; copying reuses what fork
+// already proved.
+// ============================================================================
+
+// Start `path` as a background task. Returns its task id, or 0.
+export fn spawn_background(path: u64, command_line: u64 = 0): u32 {
+  var slot: u32 = 1
+  while slot < MAX_TASKS {
+    if task_state[slot] == TASK_UNUSED or task_state[slot] == TASK_DONE { break }
+    slot = slot + 1
+  }
+  if slot >= MAX_TASKS {
+    foundation.serial_write_string("[job] no free task slot\n")
+    return 0
+  }
+
+  // Load it where the loader can reach, then take a copy.
+  current_space = memory.vmm_kernel_space()
+  release_user_pages()
+
+  let entry: u64 = elf.elf_load(path)
+  if entry == 0 { return 0 }
+  if map_user_stack() == 0 {
+    foundation.serial_write_string("[job] could not map a stack\n")
+    return 0
+  }
+  let stack_at: u64 = build_argv(command_line)
+
+  let space: u64 = memory.vmm_create_user_space()
+  if space == 0 {
+    foundation.serial_write_string("[job] could not create an address space\n")
+    return 0
+  }
+  if copy_user_pages(memory.vmm_kernel_space(), space) == 0 {
+    foundation.serial_write_string("[job] could not copy the image\n")
+    memory.vmm_destroy_user_space(space)
+    return 0
+  }
+
+  // The frame a task starts from, in the shape process_first_run pops: the
+  // registers, then rip, cs, rflags, rsp, ss. Everything not named is zero
+  // rather than whatever the kernel had — a register carried across the
+  // privilege drop is a kernel value readable at ring 3.
+  var i: u32 = 0
+  while i < FORK_FRAME_WORDS {
+    child_frame[slot - 1][i] = 0
+    i = i + 1
+  }
+  child_frame[slot - 1][6] = @as(u64, argv_count)   // rdi: argc
+  child_frame[slot - 1][5] = argv_base              // rsi: argv
+  child_frame[slot - 1][10] = entry                 // rip
+  child_frame[slot - 1][11] = 0x1b                  // cs, ring 3
+  child_frame[slot - 1][12] = 0x202                 // rflags, interrupts on
+  child_frame[slot - 1][13] = stack_at              // rsp
+  child_frame[slot - 1][14] = 0x23                  // ss, ring 3
+
+  let ktop: u64 = @intFromPtr(&child_kstack) + @as(u64, slot * CHILD_KSTACK_BYTES)
+  let primed: u64 = ktop - 56
+  var z: u32 = 0
+  while z < 6 {
+    @as(*u64, @ptrFromInt(primed + @as(u64, z * 8))).* = 0
+    z = z + 1
+  }
+  @as(*u64, @ptrFromInt(primed + 40)).* = @intFromPtr(&child_frame[slot - 1])
+  @as(*u64, @ptrFromInt(primed + 48)).* = @intFromPtr(&process_first_run)
+
+  task_kernel_rsp[slot] = primed
+  task_cr3[slot] = space
+  task_kstack_top[slot] = ktop
+  task_frame[slot] = @intFromPtr(&child_frame[slot - 1])
+  task_state[slot] = TASK_RUNNABLE
+  task_exit[slot] = 0
+  child_space[slot - 1] = space
+  signals_reset(slot)
+  if task_count <= slot { task_count = slot + 1 }
+  if child_count <= slot - 1 { child_count = slot }
+
+  return slot
+}
+
+// Give a runnable task a turn, from the shell. Returns 1 if one ran.
+//
+// The shell is not a user program, but it is a kernel stack, which is all a
+// task needs to be switched away from and back to. Slot 0 stands for it here
+// exactly as it stands for a foreground program elsewhere.
+export fn scheduler_run_ready(): u32 {
+  let next: u32 = next_runnable(0)
+  if next == 0 { return 0 }
+  if next == current_task { return 0 }
+
+  current_task = next
+  task_state[next] = TASK_RUNNING
+  task_cr3[0] = memory.vmm_kernel_space()
+  task_kstack_top[0] = foundation.tss_get_rsp0()
+  task_state[0] = TASK_RUNNABLE
+
+  foundation.tss_set_rsp0(task_kstack_top[next])
+  current_space = task_cr3[next]
+  process_switch(@intFromPtr(&task_kernel_rsp), task_kernel_rsp[next], task_cr3[next])
+
+  // Back here when that task yielded or finished.
+  //
+  // Interrupts first. The task left through a syscall, which arrived by an
+  // interrupt gate and so cleared IF, and it switched away rather than
+  // returning through an iretq that would have restored it. Without this the
+  // shell resumes with interrupts masked and its idle loop halts forever:
+  // the prompt prints and the console never responds again.
+  foundation.sti()
+
+  current_task = 0
+  task_state[0] = TASK_RUNNING
+  current_space = memory.vmm_kernel_space()
+  memory.vmm_switch_user_space(current_space)
+  foundation.tss_set_rsp0(task_kstack_top[0])
+  return 1
+}
+
+// What a job is doing, for `jobs`: 0 unused, 1 runnable, 2 running, 3 done.
+export fn job_state(task: u32): u32 {
+  if task >= MAX_TASKS { return TASK_UNUSED }
+  return task_state[task]
+}
+
+export fn job_exit_code(task: u32): u64 {
+  if task >= MAX_TASKS { return 0 }
+  return task_exit[task]
+}
+
+export fn job_max(): u32 {
+  return MAX_TASKS
+}
+
 export fn run_user_elf(path: u64, command_line: u64 = 0): u32 {
   current_space = memory.vmm_kernel_space()
   scheduler_reset()

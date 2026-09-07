@@ -58,6 +58,7 @@ const TOK_PIPE: u32 = 4
 const TOK_REDIR_IN: u32 = 5   // <
 const TOK_REDIR_OUT: u32 = 6  // >
 const TOK_REDIR_APP: u32 = 7  // >>
+const TOK_BACKGROUND: u32 = 8 // &
 
 // ============================================================================
 // STATE
@@ -604,16 +605,13 @@ fn den_lex(src: u64, len: u32): u32 {
       continue
     }
 
-    if c == 38 {   // && ( a lone & is not backgrounding here: see den_exec )
+    if c == 38 {   // & or &&
       if (i + 1) < len and @as(*u8, @ptrFromInt(src + @as(u64, i + 1))).* == 38 {
         tok_operator(TOK_AND)
         i = i + 2
         continue
       }
-      // A single `&` has no meaning without job control. Treat it as a word
-      // character so `echo a&b` prints `a&b` rather than silently dropping it.
-      tok_begin()
-      arena_putc(c)
+      tok_operator(TOK_BACKGROUND)
       i = i + 1
       continue
     }
@@ -1456,6 +1454,61 @@ fn bi_cat(): u32 {
   return status
 }
 
+// The jobs this shell has started, and what each is doing.
+fn bi_jobs(): u32 {
+  var shown: u32 = 0
+  var t: u32 = 1
+  while t < usermode.job_max() {
+    let st: u32 = usermode.job_state(t)
+    if st != 0 {
+      den_putc(91)                       // [
+      den_put_u64(@as(u64, t))
+      den_puts("] ")
+      if st == 3 {
+        den_puts("done (")
+        den_put_u64(usermode.job_exit_code(t))
+        den_putc(41)                     // )
+      } else {
+        den_puts("running")
+      }
+      den_putc(10)
+      shown = shown + 1
+    }
+    t = t + 1
+  }
+  if shown == 0 { den_puts("no jobs\n") }
+  return 0
+}
+
+// Bring a job to the foreground: give it the CPU until it finishes.
+fn bi_fg(): u32 {
+  if argc < 2 {
+    den_puts("fg: a job number is required\n")
+    return 1
+  }
+  let n: u64 = parse_u64(arg_addr(1), cstr_len(arg_addr(1)))
+  if n == 0 or n >= @as(u64, usermode.job_max()) {
+    den_puts("fg: no such job\n")
+    return 1
+  }
+  let task: u32 = @as(u32, n)
+  if usermode.job_state(task) == 0 {
+    den_puts("fg: no such job\n")
+    return 1
+  }
+
+  var guard: u32 = 0
+  while usermode.job_state(task) != 3 and guard < 100000 {
+    if usermode.scheduler_run_ready() == 0 { break }
+    guard = guard + 1
+  }
+  if usermode.job_state(task) != 3 {
+    den_puts("fg: the job did not finish\n")
+    return 1
+  }
+  return @as(u32, usermode.job_exit_code(task))
+}
+
 fn bi_type(): u32 {
   if argc < 2 { return 1 }
   var a: u32 = 1
@@ -1620,6 +1673,12 @@ const BI_CLEAR: u32 = 33
 const BI_COMMAND: u32 = 34
 const BI_BUILTIN: u32 = 35
 const BI_DECLARE: u32 = 36
+// Next free id: 39. These are appended here, at the end, because they were
+// once added after BI_SET — which was not the end — and duplicated
+// BI_SOURCE and BI_EVAL. A repeated id does not fail to build: it silently
+// rebinds an existing builtin, and `eval` started running `fg`.
+const BI_JOBS: u32 = 37
+const BI_FG: u32 = 38
 
 fn builtin_id(name: u64): u32 {
   if cstr_eq(name, "echo") == 1 { return BI_ECHO }
@@ -1649,6 +1708,8 @@ fn builtin_id(name: u64): u32 {
   if cstr_eq(name, "help") == 1 { return BI_HELP }
   if cstr_eq(name, "cat") == 1 { return BI_CAT }
   if cstr_eq(name, "set") == 1 { return BI_SET }
+  if cstr_eq(name, "jobs") == 1 { return BI_JOBS }
+  if cstr_eq(name, "fg") == 1 { return BI_FG }
   if cstr_eq(name, "source") == 1 { return BI_SOURCE }
   if cstr_eq(name, ".") == 1 { return BI_SOURCE }
   if cstr_eq(name, "eval") == 1 { return BI_EVAL }
@@ -1684,6 +1745,8 @@ fn run_builtin(id: u32): u32 {
   if id == BI_UNSET { return bi_unset() }
   if id == BI_ENV { return bi_env() }
   if id == BI_SET { return bi_env() }
+  if id == BI_JOBS { return bi_jobs() }
+  if id == BI_FG { return bi_fg() }
   if id == BI_READONLY { return bi_readonly() }
   if id == BI_ALIAS { return bi_alias() }
   if id == BI_UNALIAS { return bi_unalias() }
@@ -1877,6 +1940,10 @@ fn run_simple(from: u32, to: u32): u32 {
       if k == TOK_REDIR_APP { redirect_append = 1 }
       redirect_target = i + 1
       i = i + 2
+      continue
+    }
+      if k == TOK_BACKGROUND {
+      i = i + 1
       continue
     }
     if k == TOK_REDIR_IN {
@@ -2099,6 +2166,70 @@ fn run_external(): u32 {
   return @as(u32, usermode.get_user_exit_code())
 }
 
+// Start the command in [from, to) as a background job.
+//
+// Only an external program can be a job: a builtin runs inside this shell and
+// has nothing to run it from. Saying so beats forking a shell to run `echo`.
+fn run_background(from: u32, to: u32): u32 {
+  argc = 0
+  var i: u32 = from
+  while i < to {
+    if tok_kind[i] == TOK_WORD and argc < 64 {
+      argv_idx[argc] = i
+      argc = argc + 1
+    }
+    i = i + 1
+  }
+  if argc == 0 { return last_status }
+
+  if builtin_id(arg_addr(0)) != BI_NONE {
+    den_puts("den: a builtin cannot be a background job: ")
+    den_puts(arg_addr(0))
+    den_putc(10)
+    return 1
+  }
+
+  var full: [256]u8 = undefined
+  if find_program(arg_addr(0), @intFromPtr(&full), 256) == 0 {
+    den_puts("den: command not found: ")
+    den_puts(arg_addr(0))
+    den_putc(10)
+    return 127
+  }
+
+  // The command line the program sees, rebuilt from the expanded words.
+  var w: u32 = 0
+  var a: u32 = 0
+  while a < argc {
+    if a > 0 and w < 254 {
+      scratch[w] = 32
+      w = w + 1
+    }
+    var src: u64 = arg_addr(a)
+    var si: u32 = 0
+    while w < 254 {
+      var c: u8 = @as(*u8, @ptrFromInt(src + @as(u64, si))).*
+      if c == 0 { break }
+      scratch[w] = c
+      w = w + 1
+      si = si + 1
+    }
+    a = a + 1
+  }
+  scratch[w] = 0
+
+  den_flush()
+  let job: u32 = usermode.spawn_background(@intFromPtr(&full), @intFromPtr(&scratch))
+  if job == 0 {
+    den_puts("den: could not start the job\n")
+    return 1
+  }
+  den_putc(91)
+  den_put_u64(@as(u64, job))
+  den_puts("] started\n")
+  return 0
+}
+
 // Run a pipeline of any length: the span [from, to) split at each `|`.
 //
 // Two processes running at once and passing bytes through a shared buffer
@@ -2234,8 +2365,24 @@ fn den_exec_tokens(): u32 {
     var start: u32 = i
     while i < tok_count {
       var k: u32 = tok_kind[i]
-      if k == TOK_SEMI or k == TOK_AND or k == TOK_OR or k == TOK_PIPE { break }
+      // `&` ends a command as surely as `;` does. It was missing here, so the
+      // scan ran past it, the backgrounding branch below never saw it, and a
+      // job ran in the foreground while `jobs` reported none.
+      if k == TOK_SEMI or k == TOK_AND or k == TOK_OR or k == TOK_PIPE or
+         k == TOK_BACKGROUND { break }
       i = i + 1
+    }
+
+    // A `&` at the end of a span makes it a job: started, not waited for.
+    if i < tok_count and tok_kind[i] == TOK_BACKGROUND {
+      if skip_next == 0 {
+        status = run_background(start, i)
+        last_status = status
+      }
+      skip_next = 0
+      i = i + 1
+      if exit_requested == 1 { break }
+      continue
     }
 
     // A pipeline has to be recognised before anything runs. Running the span
@@ -2939,9 +3086,10 @@ export fn den_should_handle(src: u64, len: u32): u32 {
     if c == 35 { return 1 }                   // #
     if c == 124 { return 1 }                  // |
     if c == 92 { return 1 }                   // backslash
-    if c == 38 and (i + 1) < len {
-      if @as(*u8, @ptrFromInt(src + @as(u64, i + 1))).* == 38 { return 1 }
-    }
+    // Any `&`, not just `&&`. A lone one used to be a word character; it is
+    // now backgrounding, and a line ending in it that did not reach den went
+    // to the kernel's debug commands, which reported the program as not found.
+    if c == 38 { return 1 }
     i = i + 1
   }
 
