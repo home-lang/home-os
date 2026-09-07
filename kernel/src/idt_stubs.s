@@ -361,6 +361,80 @@ enter_usermode:
     xor %r15, %r15
     iretq
 
+/* process_switch(save_slot, next_rsp, next_cr3) — swap kernel stacks.
+ *
+ * This is assembly because it cannot be anything else. A switch written as an
+ * ordinary function is undone by its own epilogue: the return address and
+ * locals live on the stack it is trying to leave, so restoring a frame pointer
+ * puts it straight back. core/process.home's context_switch does exactly that
+ * and is registered as S15.
+ *
+ *   rdi  where to store the outgoing task's kernel rsp
+ *   rsi  the incoming task's kernel rsp
+ *   rdx  the incoming task's CR3, or 0 to leave the address space alone
+ *
+ * The callee-saved registers are pushed before the save and popped after the
+ * load, so each task's are its own. Everything else belongs to the caller of
+ * whichever `yield` is being resumed, and is already on that task's stack.
+ *
+ * The address space changes while still on the outgoing stack. That is safe
+ * only because every address space maps the kernel identically — which is the
+ * property vmm_create_user_space is built to guarantee and the address-space
+ * self-test checks.
+ */
+.global process_switch
+process_switch:
+    push %rbx
+    push %rbp
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+
+    mov %rsp, (%rdi)
+
+    test %rdx, %rdx
+    jz .Lswitch_same_space
+    mov %rdx, %cr3
+.Lswitch_same_space:
+
+    mov %rsi, %rsp
+
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbp
+    pop %rbx
+    ret
+
+/* process_first_run — where a task that has never run begins.
+ *
+ * A new task's kernel stack is primed so process_switch's `ret` lands here.
+ * There is no syscall to return through, so this builds the return into user
+ * mode out of the task's saved frame instead.
+ *
+ * The frame arrives in %rbx. process_switch pops the callee-saved registers
+ * before its `ret`, so priming the %rbx slot of a new task's stack hands this
+ * code the pointer without a call — a `ret` carries no arguments, and calling
+ * back into Home for it would need the callee to keep an unmangled symbol,
+ * which is a contract between two files that has to be remembered in both.
+ */
+.global process_first_run
+process_first_run:
+    mov %rbx, %rsp
+    pop %rax
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rdx
+    pop %rsi
+    pop %rdi
+    pop %r11
+    pop %rcx
+    pop %rbp
+    iretq
+
 /* enter_usermode_resume(frame, cr3) — continue a user context that was saved
  * at a syscall, in the address space `cr3` names.
  *

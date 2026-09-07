@@ -28,6 +28,7 @@ const SYS_WRITE: u64 = 3
 const SYS_OPEN: u64 = 4
 const SYS_FORK: u64 = 1
 const SYS_WAIT: u64 = 6
+const SYS_YIELD: u64 = 24
 
 // Every other call whose first argument is a path, and the three whose second
 // is one too. Taken from kernel/src/sys/syscall.home, which owns the numbering.
@@ -98,6 +99,87 @@ const MAX_CHILDREN: u32 = 4
 // land on the parent's kernel stack and overwrite the frames the parent has
 // to return through. Flat rather than two-dimensional so the arithmetic for a
 // slot's stack is visible where it is used.
+// ============================================================================
+// COOPERATIVE SCHEDULING
+//
+// Tasks run until they yield. That is real concurrency — two tasks each making
+// progress, interleaved, in their own address spaces — and it is not
+// preemption: a task that never yields runs until it exits. Taking the CPU
+// away on a timer means switching from inside an interrupt handler, which
+// needs every task to be safe to stop anywhere. That is the next piece.
+//
+// A task is its kernel stack. Switching is choosing which one the CPU is on;
+// where the task was in its syscall and what it meant to return to are already
+// sitting on that stack.
+// ============================================================================
+
+const MAX_TASKS: u32 = 4
+const TASK_UNUSED: u32 = 0
+const TASK_RUNNABLE: u32 = 1
+const TASK_RUNNING: u32 = 2
+const TASK_DONE: u32 = 3
+
+var task_kernel_rsp: [4]u64 = undefined
+var task_cr3: [4]u64 = undefined
+var task_kstack_top: [4]u64 = undefined
+var task_frame: [4]u64 = undefined
+var task_state: [4]u32 = undefined
+var task_exit: [4]u64 = undefined
+var current_task: u32 = 0
+var task_count: u32 = 0
+
+fn next_runnable(from: u32): u32 {
+  var i: u32 = 1
+  while i <= MAX_TASKS {
+    let candidate: u32 = (from + i) % MAX_TASKS
+    if task_state[candidate] == TASK_RUNNABLE { return candidate }
+    i = i + 1
+  }
+  return from
+}
+
+// Hand the CPU to another runnable task. Returns when one hands it back.
+// Make the program the kernel is about to enter task 0.
+//
+// Both loaders call this. It lived inline in one of them and the other was
+// reached by `exec`, so a program started that way inherited task 0's state
+// from whichever program ran last — which by then was DONE, so the scheduler
+// could find nothing to switch back to and a child's exit unwound the kernel
+// carrying the child's status.
+fn scheduler_reset() {
+  current_task = 0
+  task_count = 1
+  child_count = 0
+  task_state[0] = TASK_RUNNING
+  task_cr3[0] = current_space
+  task_kstack_top[0] = foundation.tss_get_rsp0()
+  task_frame[0] = 0
+  task_exit[0] = 0
+  var t: u32 = 1
+  while t < MAX_TASKS {
+    task_state[t] = TASK_UNUSED
+    t = t + 1
+  }
+}
+
+fn scheduler_yield() {
+  let me: u32 = current_task
+  let next: u32 = next_runnable(me)
+  if next == me { return }
+
+  if task_state[me] == TASK_RUNNING { task_state[me] = TASK_RUNNABLE }
+  task_state[next] = TASK_RUNNING
+  current_task = next
+
+  // The incoming task's syscalls must land on its own kernel stack, not on
+  // whichever stack happened to be current when it was created.
+  foundation.tss_set_rsp0(task_kstack_top[next])
+  current_space = task_cr3[next]
+
+  process_switch(@intFromPtr(&task_kernel_rsp) + @as(u64, me * 8),
+                 task_kernel_rsp[next], task_cr3[next])
+}
+
 const CHILD_KSTACK_BYTES: u32 = 8192
 var child_kstack: [32768]u8 = undefined
 
@@ -120,6 +202,8 @@ var load_buffer: [4096]u8 = undefined
 
 extern fn enter_usermode(rip: u64, rsp: u64, argc: u64, argv: u64)
 extern fn enter_usermode_resume(frame: u64, cr3: u64)
+extern fn process_switch(save_slot: u64, next_rsp: u64, next_cr3: u64)
+extern fn process_first_run()
 extern fn return_to_kernel()
 
 // ============================================================================
@@ -302,49 +386,65 @@ fn do_fork(frame: u64): u64 {
   child_live[slot] = 1
   child_count = child_count + 1
 
-  foundation.serial_write_string("[fork] child ")
-  foundation.serial_write_u64(@as(u64, slot + 1))
-  foundation.serial_write_string(" forked\n")
+  // The child becomes a task the scheduler can run rather than something
+  // deferred until its parent waits. Its kernel stack is primed so that
+  // process_switch's `ret` lands in process_first_run: six callee-saved
+  // registers below a return address, which is exactly what that `ret` pops.
+  let task: u32 = slot + 1
+  if task >= MAX_TASKS {
+    foundation.serial_write_string("[fork] no task slot\n")
+    return 0xFFFFFFFFFFFFFFFF
+  }
+  let ktop: u64 = @intFromPtr(&child_kstack) +
+                  @as(u64, (slot + 1) * CHILD_KSTACK_BYTES)
+  let primed: u64 = ktop - 56
+  var z: u32 = 0
+  while z < 6 {
+    @as(*u64, @ptrFromInt(primed + @as(u64, z * 8))).* = 0
+    z = z + 1
+  }
+  // process_switch pops r15, r14, r13, r12, rbp, rbx and then returns, so the
+  // slot at 40 becomes %rbx and the slot at 48 is where the `ret` goes. The
+  // trampoline takes its frame from %rbx, which is how it learns which task
+  // it is entering without a call.
+  @as(*u64, @ptrFromInt(primed + 40)).* = @intFromPtr(&child_frame[slot])
+  @as(*u64, @ptrFromInt(primed + 48)).* = @intFromPtr(&process_first_run)
+
+  task_kernel_rsp[task] = primed
+  task_cr3[task] = space
+  task_kstack_top[task] = ktop
+  task_frame[task] = @intFromPtr(&child_frame[slot])
+  task_state[task] = TASK_RUNNABLE
+  task_exit[task] = 0
+  if task_count <= task { task_count = task + 1 }
+
   return @as(u64, slot + 1)
 }
 
-// wait(pid). Runs the child to completion and returns its exit status.
+// wait(pid). Yields until the child has finished, then returns its status.
+//
+// Yielding rather than running the child inline. Running it inline meant a
+// child could only ever run inside its parent's wait, so a parent that never
+// waited never ran its child at all. The child is runnable from the moment it
+// is forked; wait is what a parent does when it has nothing else to do.
 fn do_wait(pid: u64): u64 {
   if pid == 0 or pid > @as(u64, child_count) { return 0xFFFFFFFFFFFFFFFF }
-  let slot: u32 = @as(u32, pid - 1)
-  if child_live[slot] == 0 { return child_exit[slot] }
+  let task: u32 = @as(u32, pid)
+  if task >= MAX_TASKS { return 0xFFFFFFFFFFFFFFFF }
 
-  let parent_space: u64 = current_space
-  let parent_exited: u32 = user_exited
+  while task_state[task] != TASK_DONE {
+    // Nothing else runnable and the child unfinished means it can never
+    // finish. Saying so beats spinning until the gate times out.
+    if next_runnable(current_task) == current_task {
+      foundation.serial_write_string("[sched] nothing runnable and the child is unfinished\n")
+      return 0xFFFFFFFFFFFFFFFF
+    }
+    scheduler_yield()
+  }
 
-  current_space = child_space[slot]
-  user_exited = 0
-
-  // The child gets a kernel stack of its own for the duration. Stacks grow
-  // down, so the far end of its slot is the top.
-  let saved_rsp0: u64 = foundation.tss_get_rsp0()
-  foundation.tss_set_rsp0(@intFromPtr(&child_kstack) +
-                          @as(u64, (slot + 1) * CHILD_KSTACK_BYTES))
-
-  enter_usermode_resume(@intFromPtr(&child_frame[slot]), child_space[slot])
-
-  foundation.tss_set_rsp0(saved_rsp0)
-
-  // The child's exit lands here, through return_to_kernel.
-  child_exit[slot] = user_exit_code
-  child_live[slot] = 0
-
-  current_space = parent_space
-  user_exited = parent_exited
-  memory.vmm_switch_user_space(parent_space)
-
-  // The child is finished, so its address space and every page under it go
-  // back. Without this each fork costs a copy of the parent that is never
-  // returned.
-  memory.vmm_destroy_user_space(child_space[slot])
-  child_space[slot] = 0
-
-  return child_exit[slot]
+  memory.vmm_destroy_user_space(child_space[task - 1])
+  child_space[task - 1] = 0
+  return task_exit[task]
 }
 
 export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
@@ -359,7 +459,33 @@ export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64)
     foundation.serial_write_string("[User] exit(")
     foundation.serial_write_u64(a1)
     foundation.serial_write_string(")\n")
+
+    // A task that is not the one the kernel entered hands the CPU on rather
+    // than unwinding: return_to_kernel would return through the *entering*
+    // task's kernel stack, which is not this task's, and the program that is
+    // still running would be abandoned mid-syscall.
+    task_state[current_task] = TASK_DONE
+    task_exit[current_task] = a1
+    if current_task != 0 {
+      let next: u32 = next_runnable(current_task)
+      if next != current_task {
+        task_state[next] = TASK_RUNNING
+        let me: u32 = current_task
+        current_task = next
+        foundation.tss_set_rsp0(task_kstack_top[next])
+        current_space = task_cr3[next]
+        process_switch(@intFromPtr(&task_kernel_rsp) + @as(u64, me * 8),
+                       task_kernel_rsp[next], task_cr3[next])
+      }
+      // Nothing else to run: fall through and unwind, which returns to
+      // whoever started the program in the first place.
+    }
     return_to_kernel()
+  }
+
+  if nr == SYS_YIELD {
+    scheduler_yield()
+    return 0
   }
 
   // Every pointer argument is checked before anything dereferences it.
@@ -538,6 +664,8 @@ export fn run_user_program(path: u64, command_line: u64 = 0): u32 {
   // cleared between them. That window is what a fork copies out of.
   current_space = memory.vmm_kernel_space()
 
+  scheduler_reset()
+
   if map_user_stack() == 0 {
     foundation.serial_write_string("[User] could not map stack\n")
     return 1
@@ -659,6 +787,9 @@ fn build_argv(line: u64): u64 {
 // entry point is, so nothing here picks an address. Returns nonzero if it
 // could not be started; when it starts, this returns once the program exits.
 export fn run_user_elf(path: u64, command_line: u64 = 0): u32 {
+  current_space = memory.vmm_kernel_space()
+  scheduler_reset()
+
   // Before the loader maps anything: elf_load reuses a page that is already
   // mapped rather than allocating a fresh zeroed one, so without this the
   // program's .bss arrives holding the previous program's data.
