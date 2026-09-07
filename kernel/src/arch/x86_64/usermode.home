@@ -329,8 +329,6 @@ fn do_sigreturn(frame: u64): u64 {
 // carrying the child's status.
 fn scheduler_reset() {
   current_task = 0
-  task_count = 1
-  child_count = 0
   task_state[0] = TASK_RUNNING
   task_cr3[0] = current_space
   task_kstack_top[0] = foundation.tss_get_rsp0()
@@ -344,16 +342,37 @@ fn scheduler_reset() {
   // shell sets them around a program and restores them itself; slot 0's
   // attachment is the shell's business, not the scheduler's.
   signals_reset(0)
+
+  // A task that is still live is not swept up. This runs when a program is
+  // loaded, and a shell may have started tasks on purpose before loading it —
+  // the stages of a pipeline, or a background job. Marking those UNUSED
+  // discarded them before they had run a single instruction: a three-stage
+  // pipeline lost both of its spawned stages the moment the last one started,
+  // and a background job would have died the next time anything ran in the
+  // foreground.
   var t: u32 = 1
+  var live: u32 = 0
   while t < MAX_TASKS {
-    task_state[t] = TASK_UNUSED
-    task_parent[t] = 0
-    // A slot reused by a later job would otherwise inherit the ends of
-    // whatever ran in it last, and write its output into a closed pipe.
-    task_stdin[t] = 0
-    task_stdout[t] = 0
-    signals_reset(t)
+    if task_state[t] == TASK_RUNNABLE or task_state[t] == TASK_RUNNING {
+      live = live + 1
+    } else {
+      task_state[t] = TASK_UNUSED
+      task_parent[t] = 0
+      // A slot reused by a later job would otherwise inherit the ends of
+      // whatever ran in it last, and write its output into a closed pipe.
+      task_stdin[t] = 0
+      task_stdout[t] = 0
+      signals_reset(t)
+    }
     t = t + 1
+  }
+
+  // fork takes its slot from child_count, so winding that back while a task
+  // is using the slot it names would hand the same slot out twice. Only a
+  // table with nothing live in it can start counting again.
+  if live == 0 {
+    child_count = 0
+    task_count = 1
   }
 }
 
@@ -517,6 +536,49 @@ const USER_EPIPE: u64 = 0xFFFF_FFFF_FFFF_FFE0
 // Which end of a pipe a descriptor is, matching core/filesystem.home.
 const PIPE_END_READ: u32 = 1
 const PIPE_END_WRITE: u32 = 2
+
+// Read from a pipe end, waiting rather than reporting end of file when it is
+// merely empty. Only this layer can wait: waiting means yielding, and the VFS
+// below has no scheduler.
+fn pipe_read_waiting(fd: u32, buf: u64, count: u64): u64 {
+  loop {
+    let got: u64 = filesystem.vfs_read(fd, buf, count)
+    if got > 0 { return got }
+    if filesystem.vfs_pipe_fd_at_eof(fd) == 1 { return 0 }
+    // Empty, a writer still open, and nobody else to run. The writer can
+    // never write, so waiting would never end.
+    if next_runnable(current_task) == current_task {
+      foundation.serial_write_string("[pipe] read would block with nothing else runnable\n")
+      return 0
+    }
+    scheduler_yield()
+  }
+}
+
+// Write to a pipe end, waiting while it is full and a reader may yet drain
+// it. Returns what was written; USER_EPIPE when there is no reader at all,
+// because those bytes have nowhere to go and saying they went is the lie this
+// whole area was built to stop telling.
+fn pipe_write_waiting(fd: u32, buf: u64, count: u64): u64 {
+  var written: u64 = 0
+  while written < count {
+    let put: u64 = filesystem.vfs_write(fd, buf + written, count - written)
+    if put > 0 {
+      written = written + put
+    } else {
+      if filesystem.vfs_pipe_fd_has_reader(fd) == 0 {
+        if written > 0 { return written }
+        return USER_EPIPE
+      }
+      if next_runnable(current_task) == current_task {
+        foundation.serial_write_string("[pipe] write would block with nothing else runnable\n")
+        return written
+      }
+      scheduler_yield()
+    }
+  }
+  return written
+}
 
 // Called from syscall_entry in idt_stubs.s. The name is unmangled because the
 // stub names it directly, and distinct from sys/syscall.home's
@@ -715,6 +777,16 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
     // still running would be abandoned mid-syscall.
     task_state[current_task] = TASK_DONE
     task_exit[current_task] = a1
+    // A task's descriptors close when it exits, and for a pipe end that is
+    // what the other end is waiting for: a reader learns there will be no
+    // more bytes because the last writer went away. Without this the writer's
+    // end stays counted for ever and the reader waits on a process that has
+    // already finished.
+    //
+    // Only pipe ends. A file this task was reading belongs to whoever opened
+    // it — closing that here would take it away from a shell that is about to
+    // read it too.
+    release_task_pipe_ends(current_task)
     if current_task != 0 {
       let next: u32 = next_runnable(current_task)
       if next != current_task {
@@ -858,8 +930,18 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
   // given no input finishes instead of hanging.
   if nr == SYS_READ {
     if a1 == 0 {
-      if task_stdin[current_task] == 0 { return 0 }
-      return filesystem.vfs_read(task_stdin[current_task], a2, a3)
+      let in_fd: u32 = task_stdin[current_task]
+      if in_fd == 0 { return 0 }
+      // A program reading "standard input" passes fd 0, not the descriptor
+      // its input is attached to — so the pipe-aware path below, which keys
+      // on the fd the program named, never sees this. Without the wait here a
+      // stage read its empty pipe once, took the zero for end of file, and
+      // exited before the stage feeding it had run at all: every stage of the
+      // pipeline exited 0 and the pipeline produced nothing.
+      if filesystem.vfs_fd_pipe_end(in_fd) == PIPE_END_READ {
+        return pipe_read_waiting(in_fd, a2, a3)
+      }
+      return filesystem.vfs_read(in_fd, a2, a3)
     }
   }
 
@@ -869,7 +951,11 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
   // failure was about.
   if nr == SYS_WRITE {
     if a1 == 1 and task_stdout[current_task] != 0 {
-      return filesystem.vfs_write(task_stdout[current_task], a2, a3)
+      let out_fd: u32 = task_stdout[current_task]
+      if filesystem.vfs_fd_pipe_end(out_fd) == PIPE_END_WRITE {
+        return pipe_write_waiting(out_fd, a2, a3)
+      }
+      return filesystem.vfs_write(out_fd, a2, a3)
     }
     if a1 < 3 {
       return write_console(a2, a3)
@@ -883,47 +969,13 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
   // it needs: is the pipe finished, and does it still have a reader.
   if nr == SYS_READ {
     if filesystem.vfs_fd_pipe_end(@as(u32, a1)) == PIPE_END_READ {
-      loop {
-        let got: u64 = filesystem.vfs_read(@as(u32, a1), a2, a3)
-        if got > 0 { return got }
-        if filesystem.vfs_pipe_fd_at_eof(@as(u32, a1)) == 1 { return 0 }
-        // Empty, a writer still open, and nobody else to run. The writer can
-        // never write, so waiting would never end; saying so beats hanging
-        // the machine, and short output with a line in the log beats a
-        // kernel that stopped answering.
-        if next_runnable(current_task) == current_task {
-          foundation.serial_write_string("[pipe] read would block with nothing else runnable\n")
-          return 0
-        }
-        scheduler_yield()
-      }
+      return pipe_read_waiting(@as(u32, a1), a2, a3)
     }
   }
 
   if nr == SYS_WRITE {
     if filesystem.vfs_fd_pipe_end(@as(u32, a1)) == PIPE_END_WRITE {
-      var written: u64 = 0
-      while written < a3 {
-        let put: u64 = filesystem.vfs_write(@as(u32, a1), a2 + written, a3 - written)
-        if put > 0 {
-          written = written + put
-        } else {
-          // Nothing moved. Either the pipe is full and a reader may yet drain
-          // it, or there is no reader at all — in which case these bytes have
-          // nowhere to go and the writer has to be told, rather than being
-          // handed a count it did not achieve.
-          if filesystem.vfs_pipe_fd_has_reader(@as(u32, a1)) == 0 {
-            if written > 0 { return written }
-            return USER_EPIPE
-          }
-          if next_runnable(current_task) == current_task {
-            foundation.serial_write_string("[pipe] write would block with nothing else runnable\n")
-            return written
-          }
-          scheduler_yield()
-        }
-      }
-      return written
+      return pipe_write_waiting(@as(u32, a1), a2, a3)
     }
   }
 
@@ -1237,6 +1289,26 @@ export fn spawn_background(path: u64, command_line: u64 = 0): u32 {
   if child_count <= slot - 1 { child_count = slot }
 
   return slot
+}
+
+// Close whichever of a task's standard ends are pipe ends, and forget them.
+// Called when a task exits, and by the shell when it takes an end back.
+export fn release_task_pipe_ends(task: u32) {
+  if task >= MAX_TASKS { return }
+  let in_fd: u32 = task_stdin[task]
+  if in_fd != 0 {
+    if filesystem.vfs_fd_pipe_end(in_fd) != 0 {
+      filesystem.vfs_close(in_fd)
+      task_stdin[task] = 0
+    }
+  }
+  let out_fd: u32 = task_stdout[task]
+  if out_fd != 0 {
+    if filesystem.vfs_fd_pipe_end(out_fd) != 0 {
+      filesystem.vfs_close(out_fd)
+      task_stdout[task] = 0
+    }
+  }
 }
 
 // Give a runnable task a turn, from the shell. Returns 1 if one ran.

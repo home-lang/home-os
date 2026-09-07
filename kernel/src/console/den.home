@@ -118,7 +118,26 @@ var out_used: u32 = 0
 fn den_flush() {
   if out_used == 0 { return }
   if out_fd_active == 1 {
-    filesystem.vfs_write(out_fd, @intFromPtr(&out_buf), @as(u64, out_used))
+    // A file takes everything at once. A pipe holds four kilobytes, so a
+    // builtin feeding one can fill it, and the write moves what fits and
+    // stops — the rest has to wait for the stage on the other end to run and
+    // drain it. Writing once and discarding the remainder would truncate a
+    // pipeline silently, which is the failure this shell keeps finding.
+    var done: u64 = 0
+    let want: u64 = @as(u64, out_used)
+    while done < want {
+      let put: u64 = filesystem.vfs_write(out_fd, @intFromPtr(&out_buf) + done, want - done)
+      if put > 0 {
+        done = done + put
+      } else {
+        // Nothing moved. If the reader has gone there is nowhere for these
+        // bytes and no amount of waiting will help; otherwise give the reader
+        // a turn and try again. A shell that cannot give anyone a turn has
+        // nobody to wait for either.
+        if filesystem.vfs_pipe_fd_has_reader(out_fd) == 0 { break }
+        if usermode.scheduler_run_ready() == 0 { break }
+      }
+    }
   }
   out_used = 0
 }
@@ -2230,6 +2249,65 @@ fn run_background(from: u32, to: u32): u32 {
   return 0
 }
 
+// Start the stage in [from, to) as a task of its own, with `in_fd` as its
+// standard input and `out_fd` as its standard output. Returns the task, or 0.
+//
+// The ends belong to the task from here: it closes them when it exits, which
+// is what lets the stage after it see end of file. This shell must not close
+// them itself — a descriptor is an open-file slot and there is only one copy,
+// so closing it here would take it out from under a task that is about to
+// read or write through it.
+fn spawn_stage(from: u32, to: u32, in_fd: u32, out_fd: u32): u32 {
+  argc = 0
+  var i: u32 = from
+  while i < to {
+    if tok_kind[i] == TOK_WORD and argc < 64 {
+      argv_idx[argc] = i
+      argc = argc + 1
+    }
+    i = i + 1
+  }
+  if argc == 0 { return 0 }
+
+  var full: [256]u8 = undefined
+  if find_program(arg_addr(0), @intFromPtr(&full), 256) == 0 {
+    den_puts("den: command not found: ")
+    den_puts(arg_addr(0))
+    den_putc(10)
+    return 0
+  }
+
+  var w: u32 = 0
+  var a: u32 = 0
+  while a < argc {
+    if a > 0 and w < 254 {
+      scratch[w] = 32
+      w = w + 1
+    }
+    var src: u64 = arg_addr(a)
+    var si: u32 = 0
+    while w < 254 {
+      var c: u8 = @as(*u8, @ptrFromInt(src + @as(u64, si))).*
+      if c == 0 { break }
+      scratch[w] = c
+      w = w + 1
+      si = si + 1
+    }
+    a = a + 1
+  }
+  scratch[w] = 0
+
+  den_flush()
+  let task: u32 = usermode.spawn_background(@intFromPtr(&full), @intFromPtr(&scratch))
+  if task == 0 { return 0 }
+
+  // Attached after the spawn and before anything runs. Nothing is scheduled
+  // between the two — this shell is running and scheduling is cooperative —
+  // so the task has its ends before its first instruction.
+  usermode.set_task_stdio(task, in_fd, out_fd)
+  return task
+}
+
 // Run a pipeline of any length: the span [from, to) split at each `|`.
 //
 // Two processes running at once and passing bytes through a shared buffer
@@ -2245,7 +2323,157 @@ fn run_background(from: u32, to: u32): u32 {
 // What differs from a real pipe is stated rather than hidden: a stage runs to
 // completion before the next starts, so an unbounded producer never reaches
 // its consumer, and the intermediate bytes live in a file. S12 keeps that.
+// Run a pipeline with real pipes: every stage a task of its own, passing
+// bytes through a kernel buffer rather than through a file, and running at
+// the same time rather than one after another.
+//
+// This is what `|` is supposed to mean. The staged version below is kept as a
+// fallback, not as history: it is what runs when a pipeline is a shape this
+// cannot take, and it gives the same bytes and the same exit status for input
+// that ends.
+//
+// The shapes this takes: every stage an external program, except that the
+// first may be a builtin. The restriction is about who can wait. A program at
+// ring 3 reads and writes through syscalls, and the syscall layer yields when
+// a pipe is empty or full. A builtin runs inside this shell and reaches the
+// VFS directly, so it cannot wait for anyone — except when writing, where
+// den_flush gives the reader a turn. So a builtin can feed a pipeline, and
+// anything else in a non-final position, or a builtin at the end, falls back.
+//
+// Bounded by the task table: slot 0 is this shell, leaving three for stages.
+const PIPE_MAX_STAGES: u32 = 4
+
 fn run_pipeline(from: u32, to: u32): u32 {
+  var starts: [4]u32 = undefined
+  var ends: [4]u32 = undefined
+  var n: u32 = 0
+
+  var at: u32 = from
+  loop {
+    var stop: u32 = at
+    while stop < to and tok_kind[stop] != TOK_PIPE {
+      stop = stop + 1
+    }
+    if stop == at {
+      den_puts("den: syntax error near |\n")
+      return 2
+    }
+    if n >= PIPE_MAX_STAGES {
+      // More stages than there are tasks to run them in.
+      return run_pipeline_staged(from, to)
+    }
+    starts[n] = at
+    ends[n] = stop
+    n = n + 1
+    if stop >= to { break }
+    at = stop + 1
+  }
+  if n < 2 { return run_simple(from, to) }
+
+  // Every stage must be a program, except that the first may be a builtin.
+  var k: u32 = 0
+  while k < n {
+    if stage_is_builtin(starts[k], ends[k]) == 1 {
+      if k != 0 { return run_pipeline_staged(from, to) }
+    }
+    k = k + 1
+  }
+
+  // One pipe between each pair of stages. A pipe that cannot be made is not
+  // an error: the staged path still runs the pipeline, so the shell falls
+  // back rather than failing a command it knows how to run.
+  var rfd: [4]u32 = undefined
+  var wfd: [4]u32 = undefined
+  var made: u32 = 0
+  while made < n - 1 {
+    var r: u32 = 0
+    var w: u32 = 0
+    if filesystem.vfs_pipe(&r, &w) != 0 {
+      var u: u32 = 0
+      while u < made {
+        filesystem.vfs_close(rfd[u])
+        filesystem.vfs_close(wfd[u])
+        u = u + 1
+      }
+      return run_pipeline_staged(from, to)
+    }
+    rfd[made] = r
+    wfd[made] = w
+    made = made + 1
+  }
+
+  var prev_read: u32 = 0
+  var status: u32 = 0
+
+  k = 0
+  while k < n - 1 {
+    if k == 0 and stage_is_builtin(starts[0], ends[0]) == 1 {
+      // Inline, writing into the pipe. den_flush waits for the reader when
+      // the buffer fills, and this shell owns both ends of that write, so it
+      // closes the write end afterwards — which is how the next stage learns
+      // there is nothing more coming.
+      den_flush()
+      out_fd = wfd[0]
+      out_fd_active = 1
+      out_used = 0
+      status = run_simple(starts[0], ends[0])
+      den_flush()
+      out_fd_active = 0
+      out_fd = 0
+      filesystem.vfs_close(wfd[0])
+    } else {
+      let task: u32 = spawn_stage(starts[k], ends[k], prev_read, wfd[k])
+      if task == 0 {
+        // The ends this shell still holds have to go, or the stages already
+        // started would wait on a writer that will never exist.
+        var c: u32 = k
+        while c < n - 1 {
+          filesystem.vfs_close(wfd[c])
+          c = c + 1
+        }
+        if prev_read != 0 { filesystem.vfs_close(prev_read) }
+        while usermode.scheduler_run_ready() == 1 { }
+        return 127
+      }
+      // The task owns prev_read and wfd[k] from here and closes them when it
+      // exits. Closing either of them in this shell would take a descriptor
+      // out from under a task that is about to use it — there is one copy of
+      // each, not one per holder.
+    }
+    prev_read = rfd[k]
+    k = k + 1
+  }
+
+  // The last stage runs in the foreground, so its output goes where the
+  // pipeline's output goes and its status is the pipeline's status.
+  var saved_in: u32 = usermode.set_user_stdin(prev_read)
+  stdin_fd = prev_read
+  status = run_simple(starts[n - 1], ends[n - 1])
+  usermode.set_user_stdin(saved_in)
+  stdin_fd = 0
+  if prev_read != 0 { filesystem.vfs_close(prev_read) }
+
+  // Anything still runnable is a stage that has not finished. Give it the CPU
+  // until it does, so its exit is collected here rather than surfacing in the
+  // middle of the next command.
+  while usermode.scheduler_run_ready() == 1 { }
+  return status
+}
+
+// Whether the stage in [from, to) names a builtin rather than a program.
+fn stage_is_builtin(from: u32, to: u32): u32 {
+  var i: u32 = from
+  while i < to {
+    if tok_kind[i] == TOK_WORD {
+      if builtin_id(tok_addr(i)) != BI_NONE { return 1 }
+      return 0
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+fn run_pipeline_staged(from: u32, to: u32): u32 {
   // Two holding files, used alternately: a stage reads one and writes the
   // other, so neither is ever open for both at once.
   let hold_a: u64 = @intFromPtr("/den.pipe.a")
