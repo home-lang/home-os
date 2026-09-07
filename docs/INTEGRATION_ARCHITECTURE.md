@@ -93,7 +93,6 @@ den_setenv(name, value) -> u32
 den_getenv(name) -> u64
 den_alias(name, value) -> u32
 den_history_add(command, exit_code) -> u32
-den_job_add(command, pid, background) -> u32
 den_job_list() -> u32
 den_get_cwd() -> u64
 den_set_cwd(path) -> u32

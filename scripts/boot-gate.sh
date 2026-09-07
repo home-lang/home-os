@@ -23,11 +23,19 @@ MILESTONES="$REPO_ROOT/scripts/boot-milestones.txt"
 # How long a run may take before it is treated as hung. This is a *timeout*,
 # not a schedule: the wait loop below exits the moment the last milestone
 # appears, so a healthy run never spends it and raising it costs nothing.
-# It was 45s, which the boot had quietly grown up against — the deadline
-# started firing while the serial shell still had commands queued, and the
-# gate reported the *symptom* ("written.txt not present") rather than "the run
-# was cut short", which is a much harder thing to read.
-BOOT_TIMEOUT="${BOOT_TIMEOUT:-120}"
+#
+# It was 45s, then 120s, and the boot grew up against both — the deadline
+# fired while the serial shell still had commands queued, and the gate
+# reported the *symptom* ("written.txt not present") rather than "the run was
+# cut short", which is a much harder thing to read. Guessing a bigger number a
+# third time would only postpone the third time this happens, so it is now
+# derived from the thing that actually grows: the command feed sends one line
+# every two seconds, so the floor is two seconds a line plus slack for the
+# boot itself and for the last command to run. And the wait loop below now
+# says outright when it hit the deadline, so a short run never again has to be
+# diagnosed from its consequences.
+_feed_lines="$(grep -cvE '^[[:space:]]*(#|$)' "$SCRIPT_DIR/boot-commands.txt" 2>/dev/null || echo 0)"
+BOOT_TIMEOUT="${BOOT_TIMEOUT:-$(( _feed_lines * 2 + 120 ))}"
 
 VERBOSE=0
 KEEP=0
@@ -469,12 +477,21 @@ last_milestone="$(grep -vE '^\s*(#|$)' "$MILESTONES" | tail -n 1 | sed 's/^ *//;
 [ -n "$last_milestone" ] || { echo "error: $MILESTONES has no entries" >&2; exit 2; }
 
 deadline=$(( $(date +%s) + $BOOT_TIMEOUT ))
+cut_short=1
 while kill -0 "$qemu_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
     if [ -s "$log" ] && grep -qF "$last_milestone" "$log" 2>/dev/null; then
+        cut_short=0
         break
     fi
     sleep 1
 done
+if [ "$cut_short" = 1 ]; then
+    # Say this before any check runs. Every failure that follows is a
+    # consequence of the run ending early, and reading them as defects in what
+    # they name has cost this gate two separate debugging sessions.
+    echo "boot-gate: the run hit its ${BOOT_TIMEOUT}s deadline without reaching the last milestone." >&2
+    echo "boot-gate: every failure below may be a command that never ran. Raise BOOT_TIMEOUT and re-run before believing any of them." >&2
+fi
 kill "$qemu_pid" 2>/dev/null
 wait "$qemu_pid" 2>/dev/null
 kill "$keypress_pid" 2>/dev/null
