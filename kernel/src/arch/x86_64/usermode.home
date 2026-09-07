@@ -1311,6 +1311,73 @@ export fn release_task_pipe_ends(task: u32) {
   }
 }
 
+// ============================================================================
+// PREEMPTION (MASTER_PLAN §7, S13)
+//
+// The timer interrupt may take the CPU away from a task that has not asked to
+// give it up. Until this, a task ran until it made a syscall that waited or
+// exited: a program with a loop in it held the machine, and every other task
+// waited for it to finish.
+// ============================================================================
+
+// The ring-3 code selector. An interrupted CS equal to this means the task
+// was running its own instructions, and nothing of the kernel's was in
+// progress on its stack.
+const USER_CS: u64 = 0x1b
+
+var preemptions: u64 = 0
+
+// Called from the timer interrupt with the CS it interrupted.
+//
+// Only ring 3 is preempted, and that restriction is the whole safety
+// argument. This kernel has no locks: interrupt a task inside a syscall — mid
+// directory walk, mid page-table edit — switch away, and let another task
+// call into the same code, and the two share every structure with nothing to
+// serialise them. Interrupting ring 3 means the task holds nothing, so
+// switching is exactly as safe as the cooperative switch it borrows.
+//
+// The consequence is stated rather than hidden: a *kernel* loop still cannot
+// be preempted. A syscall that does not return keeps the machine, which is
+// why the pipe waits and do_wait check for nothing else runnable rather than
+// spinning on the assumption that someone will interrupt them.
+export fn preempt_from_irq(cs: u64): u32 {
+  if cs != USER_CS { return 0 }
+  if current_task >= MAX_TASKS { return 0 }
+
+  let me: u32 = current_task
+  let next: u32 = next_runnable(me)
+  if next == me { return 0 }
+
+  if task_state[me] == TASK_RUNNING { task_state[me] = TASK_RUNNABLE }
+  task_state[next] = TASK_RUNNING
+  current_task = next
+  preemptions = preemptions + 1
+
+  foundation.tss_set_rsp0(task_kstack_top[next])
+  current_space = task_cr3[next]
+
+  // The same switch the cooperative path uses. What differs is only where it
+  // is called from: this task's kernel stack holds an interrupt frame rather
+  // than a syscall frame, so when it is scheduled again it returns through
+  // the stub and iretq's back into the instruction the timer interrupted.
+  process_switch(@intFromPtr(&task_kernel_rsp) + @as(u64, me * 8),
+                 task_kernel_rsp[next], task_cr3[next])
+  return 1
+}
+
+// How many times the timer has taken the CPU from a task that did not offer
+// it. Zero means preemption is not happening, which is a thing a test can
+// tell apart from a scheduler that merely looks like it works.
+export fn preemption_count(): u64 {
+  return preemptions
+}
+
+// Hand the interrupt table our preemption decision. Called once at startup by
+// something that imports both.
+export fn install_preemption(): u64 {
+  return @intFromPtr(&preempt_from_irq)
+}
+
 // Give a runnable task a turn, from the shell. Returns 1 if one ran.
 //
 // The shell is not a user program, but it is a kernel stack, which is all a

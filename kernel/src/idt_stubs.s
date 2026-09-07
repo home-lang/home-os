@@ -159,10 +159,16 @@ isr_common_stub:
      * Offsets from %rsp, after 15 register pushes (120 bytes):
      *   120 vector, 128 error code, 136 RIP, 144 CS, 152 RFLAGS, 160 RSP,
      *   168 SS
+     *
+     * CS is the fourth, and it is here because preemption needs it: a timer
+     * interrupt may switch tasks only when it interrupted ring 3. Interrupt
+     * a task inside a syscall and switching away leaves kernel state half
+     * changed with no lock to say so, and this kernel has no locks.
      */
     mov 120(%rsp), %rdi  /* vector */
     mov 128(%rsp), %rsi  /* error code */
     mov 136(%rsp), %rdx  /* RIP */
+    mov 144(%rsp), %rcx  /* CS — which ring was interrupted */
 
     /* Align to 16 bytes for the System V ABI, keeping the old %rsp to
      * restore from — `and` cannot be undone. */
