@@ -343,8 +343,17 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
     # framebuffer adds seconds, and feeding commands before the console is
     # polling loses them — the 16550 receive FIFO is sixteen bytes deep.
     waited=0
+# The console banner is not the moment the kernel starts reading. It prints
+# "[Shell] serial console ready" and a prompt, and then runs another forty
+# lines of self-tests — net, crypto, ACPI, FPU, homefs, and an RSA signature —
+# before it enters the loop that drains the serial port. Feeding at the banner
+# sends commands into a sixteen-byte FIFO that nobody is emptying, and they
+# are simply lost: the failure looks like a shell that diverged on the first
+# few commands of a script.
+#
+# "[Kernel] Entering main loop" is the line that means input will be read.
     while [ "$waited" -lt "$BOOT_TIMEOUT" ]; do
-        if [ -s "$log" ] && grep -qF '[Shell] serial console ready' "$log" 2>/dev/null; then
+        if [ -s "$log" ] && grep -qaF '[Kernel] Entering main loop' "$log" 2>/dev/null; then
             break
         fi
         sleep 1
@@ -384,7 +393,7 @@ qemu_pid=$!
     # counter the gate asserts on stays at zero.
     kwait=0
     while [ "$kwait" -lt "$BOOT_TIMEOUT" ]; do
-        if [ -s "$log" ] && grep -qF '[Shell] serial console ready' "$log" 2>/dev/null; then
+        if [ -s "$log" ] && grep -qaF '[Kernel] Entering main loop' "$log" 2>/dev/null; then
             break
         fi
         sleep 1
@@ -632,7 +641,7 @@ KBD_MONITOR_PORT=$(( MONITOR_PORT + 1 ))
 {
     kwait=0
     while [ "$kwait" -lt "$BOOT_TIMEOUT" ]; do
-        if [ -s "$kbdlog" ] && grep -qF '[Shell] serial console ready' "$kbdlog" 2>/dev/null; then
+        if [ -s "$kbdlog" ] && grep -qaF '[Kernel] Entering main loop' "$kbdlog" 2>/dev/null; then
             break
         fi
         sleep 1
@@ -717,7 +726,7 @@ S3_MONITOR_PORT=$(( MONITOR_PORT + 2 ))
 {
     swait=0
     while [ "$swait" -lt "$BOOT_TIMEOUT" ]; do
-        if [ -s "$s3log" ] && grep -qF '[Shell] serial console ready' "$s3log" 2>/dev/null; then
+        if [ -s "$s3log" ] && grep -qaF '[Kernel] Entering main loop' "$s3log" 2>/dev/null; then
             break
         fi
         sleep 1

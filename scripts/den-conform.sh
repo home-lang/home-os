@@ -131,8 +131,17 @@ done
 log="$workdir/serial.log"
 {
     waited=0
+# The console banner is not the moment the kernel starts reading. It prints
+# "[Shell] serial console ready" and a prompt, and then runs another forty
+# lines of self-tests — net, crypto, ACPI, FPU, homefs, and an RSA signature —
+# before it enters the loop that drains the serial port. Feeding at the banner
+# sends commands into a sixteen-byte FIFO that nobody is emptying, and they
+# are simply lost: the failure looks like a shell that diverged on the first
+# few commands of a script.
+#
+# "[Kernel] Entering main loop" is the line that means input will be read.
     while [ "$waited" -lt "$BOOT_TIMEOUT" ]; do
-        if [ -s "$log" ] && grep -qF '[Shell] serial console ready' "$log" 2>/dev/null; then
+        if [ -s "$log" ] && grep -qaF '[Kernel] Entering main loop' "$log" 2>/dev/null; then
             break
         fi
         sleep 1
@@ -166,7 +175,7 @@ qemu_pid=$!
 # reported that the shell had diverged.
 ready=0
 while [ "$ready" -lt "$BOOT_TIMEOUT" ]; do
-    if [ -s "$log" ] && grep -qaF '[Shell] serial console ready' "$log" 2>/dev/null; then
+    if [ -s "$log" ] && grep -qaF '[Kernel] Entering main loop' "$log" 2>/dev/null; then
         break
     fi
     sleep 1
