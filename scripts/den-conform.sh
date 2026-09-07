@@ -152,6 +152,22 @@ qemu_pid=$!
 # it waits forever. Wait for the log to go quiet instead — the feed has a
 # definite end, and once the last command's output has landed nothing more is
 # coming — then stop the machine.
+# Wait for the console before watching for quiet.
+#
+# Quiet is only evidence that the session is over once there is a session. The
+# boot computes silently in places — the RSA self-test signs with a 1024-bit
+# key, which takes longer than the quiet threshold and prints nothing while it
+# does — so watching from the start killed the machine mid-boot and then
+# reported that the shell had diverged.
+ready=0
+while [ "$ready" -lt "$BOOT_TIMEOUT" ]; do
+    if [ -s "$log" ] && grep -qaF '[Shell] serial console ready' "$log" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+    ready=$(( ready + 1 ))
+done
+
 quiet=0
 elapsed=0
 last_size=-1
