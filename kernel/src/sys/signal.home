@@ -185,6 +185,23 @@ export fn signal_set_handler(pid: u32, signum: u32, handler: u64, flags: u32, ma
     return 1
   }
 
+  // SIG_DFL and SIG_IGN only. This module cannot enter a user handler: doing
+  // so means rewriting the frame the CPU will return through, and the frame
+  // belongs to whatever took the trap — a syscall stub, or an exception —
+  // not to a pid in this table. arch/x86_64/usermode.home does that, keyed by
+  // the task whose frame it holds, and it is where a ring-3 sigaction lands.
+  //
+  // Accepting an address here and never jumping to it is what MASTER_PLAN §7
+  // S16 registered: the log said a signal was delivered while the handler was
+  // never entered, and the process carried on as though it had been. Refusing
+  // is the difference between a signal that cannot be caught and one that is
+  // silently swallowed.
+  if handler != SIG_DFL and handler != SIG_IGN {
+    foundation.serial_write_string("[Signal] refusing a handler this module cannot enter; ")
+    foundation.serial_write_string("ring-3 handlers are installed through the syscall path\n")
+    return 1
+  }
+
   signal_states[pid].actions[signum].handler = handler
   signal_states[pid].actions[signum].flags = flags
   signal_states[pid].actions[signum].mask = mask
@@ -402,8 +419,12 @@ export fn signal_deliver(pid: u32): u32 {
     dequeue_signal(pid, signum)
     return 0
   } else {
-    // User handler - set up signal frame
-    return signal_setup_frame(pid, signum, handler)
+    // Unreachable while signal_set_handler refuses anything but SIG_DFL and
+    // SIG_IGN. Kept as a floor rather than a comment: if a handler ever does
+    // get into this table, the signal takes its default action instead of
+    // disappearing into a jump that does not happen.
+    foundation.serial_write_string("[Signal] handler present but unenterable; taking the default action\n")
+    return signal_do_default(pid, signum)
   }
 }
 
@@ -457,44 +478,6 @@ fn signal_do_default(pid: u32, signum: u32): u32 {
   return 0
 }
 
-// STUB(S16): this sets up no frame. It does the mask bookkeeping, prints that
-// it is delivering, and returns — so a caller, and the log, are told a signal
-// reached a handler that was never entered. Real delivery is in
-// arch/x86_64/usermode.home, which rewrites the frame the syscall stub is
-// about to return through.
-fn signal_setup_frame(pid: u32, signum: u32, handler: u64): u32 {
-  dequeue_signal(pid, signum)
-
-  // Block additional signals during handler (add signal mask)
-  var action_mask: u64 = signal_states[pid].actions[signum].mask
-  var old_blocked: u64 = signal_states[pid].blocked_mask
-
-  // Also block the signal itself unless SA_NODEFER is set
-  if (signal_states[pid].actions[signum].flags & SA_NODEFER) == 0 {
-    signal_states[pid].blocked_mask = signal_states[pid].blocked_mask | (1 << signum)
-  }
-  signal_states[pid].blocked_mask = signal_states[pid].blocked_mask | action_mask
-
-  // Reset handler if SA_RESETHAND is set
-  if (signal_states[pid].actions[signum].flags & SA_RESETHAND) != 0 {
-    signal_states[pid].actions[signum].handler = SIG_DFL
-  }
-
-  foundation.serial_write_string("[Signal] Delivering signal ")
-  foundation.serial_write_hex(signum)
-  foundation.serial_write_string(" to process ")
-  foundation.serial_write_hex(pid)
-  foundation.serial_write_string("\n")
-
-  // Would set up the signal frame on the user stack here:
-  // 1. Save current CPU state
-  // 2. Push signal number and siginfo
-  // 3. Set RIP to handler
-  // 4. Set up return trampoline
-
-  return 0
-}
-
 fn signal_wake_process(pid: u32) {
   // Wake up process if it's blocked in a system call
   var state: u32 = process.process_get_state(pid)
@@ -502,21 +485,6 @@ fn signal_wake_process(pid: u32) {
     // Check if blocked in interruptible sleep
     process.process_set_state(pid, 1)  // READY
   }
-}
-
-// ============================================================================
-// SIGNAL RETURN
-// ============================================================================
-
-// Called when returning from signal handler
-export fn signal_return(pid: u32) {
-  if pid >= MAX_PROCESSES { return }
-
-  // Would restore CPU state from signal frame
-  // Would restore blocked signal mask
-
-  // Check for more pending signals
-  signal_deliver(pid)
 }
 
 // ============================================================================
@@ -695,19 +663,25 @@ export fn signal_deliver_pending(pid: u32): u32 {
 
   spinlock.spinlock_release(&signal_locks[pid])
 
-  // Default dispositions for the signals the entry path can hit.
-  // SIGKILL/SIGSTOP cannot be caught or ignored; default-terminate.
+  // Take the action, rather than returning a code describing one.
+  //
+  // This used to answer 2 for "terminate" and 1 for "a userspace handler runs
+  // above" — and both call sites in main.home discard the result, so a
+  // SIGKILL arriving here printed "fatal" and the process carried on. Nothing
+  // ran above either: this module has never been able to enter a handler.
+  //
+  // signal_do_default is what actually terminates, stops, continues or
+  // ignores, through process.home. It re-runs dequeue_signal on a signal this
+  // function has already consumed, which is harmless — dequeueing a signal
+  // that is no longer pending clears bits that are already clear.
   if handler == SIG_DFL or handler == SIG_IGN {
-    if signum == SIGKILL or signum == SIGSTOP {
-      foundation.serial_write_string("[Signal] fatal ")
-      foundation.serial_write_u64(signum as u64)
-      foundation.serial_write_string(" pid ")
-      foundation.serial_write_u64(pid as u64)
-      foundation.serial_write_string("\n")
-      return 2  // terminate
-    }
-    return 0      // ignored default
+    return signal_do_default(pid, signum)
   }
 
-  return 1       // userspace handler; trap frame dispatch happens above
+  // Unreachable while signal_set_handler refuses anything but SIG_DFL and
+  // SIG_IGN, and a floor rather than a comment if that ever changes: the
+  // signal takes its default action instead of being dropped on the way to a
+  // handler nothing jumps to.
+  foundation.serial_write_string("[Signal] handler present but unenterable; taking the default action\n")
+  return signal_do_default(pid, signum)
 }
