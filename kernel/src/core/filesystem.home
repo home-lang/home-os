@@ -69,7 +69,16 @@ struct OpenFile {
   homefs_object: u64,
   // The devfs device id, plus one — device id 0 is a real device, so 0 here
   // has to keep meaning "not a device node".
-  device_id: u32
+  device_id: u32,
+  // The pipe this descriptor is an end of, plus one. Zero means it is not a
+  // pipe end. A descriptor is exactly one of the four kinds — inode, homefs
+  // object, device node, pipe end — and every operation branches on that
+  // rather than keeping them in step.
+  pipe_id: u32,
+  // Which end. 1 = the read end, 2 = the write end. Only meaningful when
+  // pipe_id is non-zero, and it is what decides which side of the pipe is
+  // released when this descriptor closes.
+  pipe_end: u32
 }
 
 // ============================================================================
@@ -853,6 +862,8 @@ fn dev_open(path: u64, flags: u32): u32 {
       // Stored one past the id so that 0 keeps meaning "not a device", the
       // same convention homefs_object uses. Device id 0 is a real device.
       open_files[i].device_id = device + 1
+      open_files[i].pipe_id = 0
+      open_files[i].pipe_end = 0
       open_file_count = open_file_count + 1
       return i + 3
     }
@@ -925,6 +936,8 @@ fn homefs_open(path: u64, flags: u32, mode: u32): u32 {
       open_files[i].ref_count = 1
       open_files[i].homefs_object = object
       open_files[i].device_id = 0
+      open_files[i].pipe_id = 0
+      open_files[i].pipe_end = 0
       open_file_count = open_file_count + 1
       return i + 3
     }
@@ -1061,6 +1074,8 @@ export fn vfs_open(path: u64, flags: u32, mode: u32 = 0): u32 {
       // this descriptor's reads to whatever used the slot before it.
       open_files[i].homefs_object = 0
       open_files[i].device_id = 0
+      open_files[i].pipe_id = 0
+      open_files[i].pipe_end = 0
 
       open_file_count = open_file_count + 1
 
@@ -1091,10 +1106,18 @@ export fn vfs_close(fd: u32): u32 {
     
     if open_files[idx].ref_count == 0 {
       open_file_count = open_file_count - 1
+      // A pipe end is released before the slot is cleared, or the pipe would
+      // keep counting a reader or writer that no longer exists — and a reader
+      // waiting on a writer that has gone would wait for ever.
+      if open_files[idx].pipe_id != 0 {
+        pipe_release(open_files[idx].pipe_id, open_files[idx].pipe_end)
+      }
       // The slot is free for reuse, and a stale object or device id in it
       // would send the next descriptor's reads to this file.
       open_files[idx].homefs_object = 0
       open_files[idx].device_id = 0
+      open_files[idx].pipe_id = 0
+      open_files[idx].pipe_end = 0
     }
     
     return 0
@@ -1110,6 +1133,15 @@ export fn vfs_read(fd: u32, buffer: u64, count: u64): u64 {
   if idx >= MAX_OPEN_FILES { return 0 }
 
   if open_files[idx].ref_count == 0 { return 0 }
+
+  // A pipe end has no offset and no inode: the bytes are in the pipe, and a
+  // read that finds none is either waiting or finished — vfs_pipe_fd_at_eof
+  // is what tells those apart, and the syscall layer above asks it, because
+  // waiting means yielding and this layer cannot.
+  if open_files[idx].pipe_id != 0 {
+    if open_files[idx].pipe_end != PIPE_END_READ { return 0 }
+    return pipe_read_bytes(open_files[idx].pipe_id, buffer, count)
+  }
 
   if open_files[idx].device_id != 0 {
     let moved: u32 = devfs.devfs_read(open_files[idx].device_id - 1, buffer,
@@ -1203,6 +1235,11 @@ export fn vfs_write(fd: u32, buffer: u64, count: u64): u64 {
   if idx >= MAX_OPEN_FILES { return 0 }
 
   if open_files[idx].ref_count == 0 { return 0 }
+
+  if open_files[idx].pipe_id != 0 {
+    if open_files[idx].pipe_end != PIPE_END_WRITE { return 0 }
+    return pipe_write_bytes(open_files[idx].pipe_id, buffer, count)
+  }
 
   if open_files[idx].device_id != 0 {
     let moved: u32 = devfs.devfs_write(open_files[idx].device_id - 1, buffer,
@@ -1847,6 +1884,218 @@ export fn vfs_get_mount_info(index: u32, path: *[u8; 64], device: *[u8; 32],
   block_size.* = mount_table[index].block_size
 
   return 0
+}
+
+// ============================================================================
+// PIPES
+//
+// A pipe is a kernel buffer with a reader and a writer. sys_pipe used to hand
+// back descriptor numbers 200, 201, 202… counted up from a global that
+// nothing answered to: a write to the write end went nowhere and a read from
+// the read end returned 0, which reads as end of file, so a shell built on it
+// saw every pipeline produce empty output and no error (MASTER_PLAN §7, S14).
+//
+// A ring buffer, so a reader that keeps up lets a writer keep going without
+// either end moving bytes about. The two ends are two open-file slots naming
+// the same pipe; there is no descriptor indirection here, so they cannot be
+// dup'd — dup needs the open-file table reference-counted from the descriptor
+// side, which is a separate change and is why dup still refuses.
+// ============================================================================
+
+const PIPE_CAPACITY: u32 = 4096
+const MAX_PIPES: u32 = 16
+
+const PIPE_END_READ: u32 = 1
+const PIPE_END_WRITE: u32 = 2
+
+struct Pipe {
+  data: [u8; 4096],
+  head: u32,        // where the next read comes from
+  count: u32,       // bytes held; the write position is (head + count) % capacity
+  readers: u32,
+  writers: u32,
+  used: u32
+}
+
+var pipes: [Pipe; 16] = undefined
+
+// A free pipe, opened with one reader and one writer. Returns its id plus
+// one, or 0 when there is none — the plus one is so that 0 keeps meaning "not
+// a pipe" in a descriptor.
+fn pipe_alloc(): u32 {
+  var i: u32 = 0
+  while i < MAX_PIPES {
+    if pipes[i].used == 0 {
+      pipes[i].used = 1
+      pipes[i].head = 0
+      pipes[i].count = 0
+      pipes[i].readers = 1
+      pipes[i].writers = 1
+      return i + 1
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Bytes moved into the pipe, which may be fewer than asked for when it fills.
+// Returns 0 when no reader is left: those bytes would have nowhere to go, and
+// a writer needs to be able to tell that from a pipe that is merely full.
+fn pipe_write_bytes(id: u32, buf: u64, count: u64): u64 {
+  if id == 0 or id > MAX_PIPES { return 0 }
+  let p: u32 = id - 1
+  if pipes[p].used == 0 { return 0 }
+  if pipes[p].readers == 0 { return 0 }
+
+  var moved: u64 = 0
+  while moved < count {
+    if pipes[p].count >= PIPE_CAPACITY { break }
+    let at: u32 = (pipes[p].head + pipes[p].count) % PIPE_CAPACITY
+    pipes[p].data[at] = @as(*u8, @ptrFromInt(buf + moved)).*
+    pipes[p].count = pipes[p].count + 1
+    moved = moved + 1
+  }
+  return moved
+}
+
+// Bytes moved out. 0 means the pipe is empty; whether that is end-of-file or
+// a reader that should wait is pipe_read_eof's question, not this one's.
+fn pipe_read_bytes(id: u32, buf: u64, count: u64): u64 {
+  if id == 0 or id > MAX_PIPES { return 0 }
+  let p: u32 = id - 1
+  if pipes[p].used == 0 { return 0 }
+
+  var moved: u64 = 0
+  while moved < count {
+    if pipes[p].count == 0 { break }
+    @as(*u8, @ptrFromInt(buf + moved)).* = pipes[p].data[pipes[p].head]
+    pipes[p].head = (pipes[p].head + 1) % PIPE_CAPACITY
+    pipes[p].count = pipes[p].count - 1
+    moved = moved + 1
+  }
+  return moved
+}
+
+// Whether a reader finding the pipe empty has reached the end rather than
+// somewhere to wait. Empty with no writer left is end of file; empty with a
+// writer still open means more may arrive.
+fn pipe_at_eof(id: u32): u32 {
+  if id == 0 or id > MAX_PIPES { return 1 }
+  let p: u32 = id - 1
+  if pipes[p].used == 0 { return 1 }
+  if pipes[p].count > 0 { return 0 }
+  if pipes[p].writers > 0 { return 0 }
+  return 1
+}
+
+// Whether a writer finding the pipe full has somewhere to wait for. Full with
+// no reader left is a broken pipe, and waiting on it would never end.
+fn pipe_has_reader(id: u32): u32 {
+  if id == 0 or id > MAX_PIPES { return 0 }
+  let p: u32 = id - 1
+  if pipes[p].used == 0 { return 0 }
+  if pipes[p].readers > 0 { return 1 }
+  return 0
+}
+
+// Release one end. The pipe itself goes when both ends are gone — not when
+// either is, or a reader still holding buffered bytes would lose them the
+// moment the writer finished.
+fn pipe_release(id: u32, end: u32) {
+  if id == 0 or id > MAX_PIPES { return }
+  let p: u32 = id - 1
+  if pipes[p].used == 0 { return }
+
+  if end == PIPE_END_READ {
+    if pipes[p].readers > 0 { pipes[p].readers = pipes[p].readers - 1 }
+  } else if end == PIPE_END_WRITE {
+    if pipes[p].writers > 0 { pipes[p].writers = pipes[p].writers - 1 }
+  }
+
+  if pipes[p].readers == 0 and pipes[p].writers == 0 {
+    pipes[p].used = 0
+    pipes[p].head = 0
+    pipes[p].count = 0
+  }
+}
+
+// Open a pipe and return its two ends as descriptors: the read end through
+// `read_fd`, the write end through `write_fd`. Returns 0 on success.
+export fn vfs_pipe(read_fd: *u32, write_fd: *u32): u32 {
+  let id: u32 = pipe_alloc()
+  if id == 0 { return 1 }
+
+  let r: u32 = pipe_open_end(id, PIPE_END_READ)
+  if r == 0 {
+    pipe_release(id, PIPE_END_READ)
+    pipe_release(id, PIPE_END_WRITE)
+    return 1
+  }
+  let w: u32 = pipe_open_end(id, PIPE_END_WRITE)
+  if w == 0 {
+    // The read end is already a live descriptor; closing it releases its half
+    // and the write half goes with the pipe.
+    vfs_close(r)
+    pipe_release(id, PIPE_END_WRITE)
+    return 1
+  }
+
+  read_fd.* = r
+  write_fd.* = w
+  return 0
+}
+
+// One end of `id` as a descriptor, or 0 when there is no free slot.
+fn pipe_open_end(id: u32, end: u32): u32 {
+  var i: u32 = 0
+  while i < MAX_OPEN_FILES {
+    if open_files[i].ref_count == 0 {
+      open_files[i].ino = 0
+      open_files[i].offset = 0
+      open_files[i].flags = 0
+      open_files[i].ref_count = 1
+      open_files[i].homefs_object = 0
+      open_files[i].device_id = 0
+      open_files[i].pipe_id = id
+      open_files[i].pipe_end = end
+      open_file_count = open_file_count + 1
+      return i + 3
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Whether `fd` is a pipe end, and which. Callers above the VFS need this
+// because a read that finds a pipe empty has to wait rather than report end
+// of file, and only the syscall layer can yield.
+export fn vfs_fd_pipe_end(fd: u32): u32 {
+  if fd < 3 { return 0 }
+  let idx: u32 = fd - 3
+  if idx >= MAX_OPEN_FILES { return 0 }
+  if open_files[idx].ref_count == 0 { return 0 }
+  if open_files[idx].pipe_id == 0 { return 0 }
+  return open_files[idx].pipe_end
+}
+
+// Whether a read on this pipe descriptor that returned nothing has reached
+// the end of the data, rather than a point to wait at.
+export fn vfs_pipe_fd_at_eof(fd: u32): u32 {
+  if fd < 3 { return 1 }
+  let idx: u32 = fd - 3
+  if idx >= MAX_OPEN_FILES { return 1 }
+  if open_files[idx].ref_count == 0 { return 1 }
+  return pipe_at_eof(open_files[idx].pipe_id)
+}
+
+// Whether a write on this pipe descriptor that moved nothing was blocked by a
+// full pipe someone may yet drain, rather than by having no reader at all.
+export fn vfs_pipe_fd_has_reader(fd: u32): u32 {
+  if fd < 3 { return 0 }
+  let idx: u32 = fd - 3
+  if idx >= MAX_OPEN_FILES { return 0 }
+  if open_files[idx].ref_count == 0 { return 0 }
+  return pipe_has_reader(open_files[idx].pipe_id)
 }
 
 // ============================================================================

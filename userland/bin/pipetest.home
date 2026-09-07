@@ -1,0 +1,200 @@
+// pipetest — execute pipe() and check what comes out the other end.
+//
+// sys_pipe used to hand back descriptor numbers 200, 201, 202… counted up
+// from a global that nothing in the VFS answered to: a write to the write end
+// went nowhere and a read from the read end returned 0, which reads as end of
+// file. Every check below therefore asserts a *value* — the bytes, the count,
+// the descriptor numbers being different — because "the call returned 0"
+// would have passed against that.
+//
+// The last line is `pipe-suite: P/T passed`, which the boot gate asserts.
+
+import "../lib/libc.home" as libc
+import "../lib/sys.home" as sys
+
+var passed: u32 = 0
+var total: u32 = 0
+
+fn check(name: u64, ok: u32) {
+  total = total + 1
+  if ok == 1 {
+    passed = passed + 1
+    return
+  }
+  libc.puts("pipe-suite FAIL: ")
+  libc.puts(name)
+  libc.putc(10)
+}
+
+fn check_u64(name: u64, got: u64, want: u64) {
+  if got == want {
+    check(name, 1)
+    return
+  }
+  libc.puts("pipe-suite FAIL: ")
+  libc.puts(name)
+  libc.puts(" got ")
+  libc.put_u64(got)
+  libc.puts(" want ")
+  libc.put_u64(want)
+  libc.putc(10)
+  total = total + 1
+}
+
+var fds: [u32; 2] = undefined
+var buf: [u8; 64] = undefined
+
+fn poison_buf() {
+  var i: u32 = 0
+  while i < 64 {
+    buf[i] = 0xEE
+    i = i + 1
+  }
+}
+
+fn bytes_are(addr: u64, len: u32, want: u64): u32 {
+  var i: u32 = 0
+  while i < len {
+    if @as(*u8, @ptrFromInt(addr + @as(u64, i))).* != @as(*u8, @ptrFromInt(want + @as(u64, i))).* {
+      return 0
+    }
+    i = i + 1
+  }
+  return 1
+}
+
+fn test_roundtrip() {
+  fds[0] = 0
+  fds[1] = 0
+  check_u64(@intFromPtr("pipe returns 0"), sys.sys_pipe(@intFromPtr(&fds)), 0)
+
+  // Two ends, and they are not the same descriptor. The old version counted
+  // 200, 201 from a global, so this check alone would not have caught it —
+  // the next two would.
+  var distinct: u32 = 0
+  if fds[0] != fds[1] { distinct = 1 }
+  check(@intFromPtr("the two ends are different descriptors"), distinct)
+  var live: u32 = 0
+  if fds[0] >= 3 { if fds[1] >= 3 { live = 1 } }
+  check(@intFromPtr("both ends are real descriptors"), live)
+
+  check_u64(@intFromPtr("write puts every byte in"),
+            sys.sys_write(@as(u64, fds[1]), @intFromPtr("pipe bytes"), 10), 10)
+
+  poison_buf()
+  check_u64(@intFromPtr("read takes them out"),
+            sys.sys_read(@as(u64, fds[0]), @intFromPtr(&buf), 10), 10)
+  check(@intFromPtr("and they are the bytes that went in"),
+        bytes_are(@intFromPtr(&buf), 10, @intFromPtr("pipe bytes")))
+}
+
+fn test_eof() {
+  // With the write end closed and the pipe drained, a read is end of file.
+  // With it still open, a read that finds nothing must *not* say so — that
+  // was the old behaviour and it truncated every pipeline silently.
+  libc.close(@as(u64, fds[1]))
+  poison_buf()
+  check_u64(@intFromPtr("a drained pipe with no writer is end of file"),
+            sys.sys_read(@as(u64, fds[0]), @intFromPtr(&buf), 10), 0)
+  libc.close(@as(u64, fds[0]))
+}
+
+fn test_buffered_bytes_survive_the_writer() {
+  // Closing the write end must not discard what is already in the pipe: the
+  // reader is entitled to everything that was written before the close.
+  check_u64(@intFromPtr("second pipe opens"), sys.sys_pipe(@intFromPtr(&fds)), 0)
+  check_u64(@intFromPtr("write before closing"),
+            sys.sys_write(@as(u64, fds[1]), @intFromPtr("left behind"), 11), 11)
+  libc.close(@as(u64, fds[1]))
+
+  poison_buf()
+  check_u64(@intFromPtr("the bytes are still there"),
+            sys.sys_read(@as(u64, fds[0]), @intFromPtr(&buf), 11), 11)
+  check(@intFromPtr("and unchanged"),
+        bytes_are(@intFromPtr(&buf), 11, @intFromPtr("left behind")))
+  check_u64(@intFromPtr("then end of file"),
+            sys.sys_read(@as(u64, fds[0]), @intFromPtr(&buf), 11), 0)
+  libc.close(@as(u64, fds[0]))
+}
+
+fn test_broken_pipe() {
+  // A write with no reader left has nowhere to put the bytes. Reporting the
+  // count it was asked for would be the same lie the old version told.
+  check_u64(@intFromPtr("third pipe opens"), sys.sys_pipe(@intFromPtr(&fds)), 0)
+  libc.close(@as(u64, fds[0]))
+  var refused: u32 = 0
+  if sys.sys_write(@as(u64, fds[1]), @intFromPtr("nowhere"), 7) != 7 { refused = 1 }
+  check(@intFromPtr("a write with no reader does not report success"), refused)
+  libc.close(@as(u64, fds[1]))
+}
+
+fn test_partial_read() {
+  // A reader asking for less than is there gets what it asked for, and the
+  // rest stays queued — a ring buffer that dropped the remainder would pass
+  // every check above.
+  check_u64(@intFromPtr("fourth pipe opens"), sys.sys_pipe(@intFromPtr(&fds)), 0)
+  check_u64(@intFromPtr("write nine"),
+            sys.sys_write(@as(u64, fds[1]), @intFromPtr("abcdefghi"), 9), 9)
+
+  poison_buf()
+  check_u64(@intFromPtr("read four"),
+            sys.sys_read(@as(u64, fds[0]), @intFromPtr(&buf), 4), 4)
+  check(@intFromPtr("the first four"),
+        bytes_are(@intFromPtr(&buf), 4, @intFromPtr("abcd")))
+
+  poison_buf()
+  check_u64(@intFromPtr("read the rest"),
+            sys.sys_read(@as(u64, fds[0]), @intFromPtr(&buf), 8), 5)
+  check(@intFromPtr("which is what was left"),
+        bytes_are(@intFromPtr(&buf), 5, @intFromPtr("efghi")))
+
+  libc.close(@as(u64, fds[1]))
+  libc.close(@as(u64, fds[0]))
+}
+
+fn test_across_fork() {
+  // The point of a pipe: bytes written by one process read by another. The
+  // child writes and exits; the parent reads after waiting, so the bytes have
+  // to have survived in the kernel rather than in the child's memory.
+  check_u64(@intFromPtr("fifth pipe opens"), sys.sys_pipe(@intFromPtr(&fds)), 0)
+
+  let pid: u64 = sys.sys_fork()
+  if pid == 0 {
+    sys.sys_write(@as(u64, fds[1]), @intFromPtr("through a fork"), 14)
+    sys.sys_exit(0)
+  }
+  sys.sys_wait(pid)
+
+  poison_buf()
+  check_u64(@intFromPtr("the parent reads what the child wrote"),
+            sys.sys_read(@as(u64, fds[0]), @intFromPtr(&buf), 14), 14)
+  check(@intFromPtr("byte for byte"),
+        bytes_are(@intFromPtr(&buf), 14, @intFromPtr("through a fork")))
+
+  libc.close(@as(u64, fds[1]))
+  libc.close(@as(u64, fds[0]))
+}
+
+export fn _start(argc: u64, argv: u64): never {
+  test_roundtrip()
+  test_eof()
+  test_buffered_bytes_survive_the_writer()
+  test_broken_pipe()
+  test_partial_read()
+  test_across_fork()
+
+  libc.puts("pipe-suite: ")
+  libc.put_u64(@as(u64, passed))
+  libc.putc(47)
+  libc.put_u64(@as(u64, total))
+  libc.puts(" passed\n")
+
+  if passed == total {
+    libc.puts("pipe-suite: every check passed\n")
+    libc.flush()
+    libc.exit(0)
+  }
+  libc.puts("pipe-suite: some checks failed\n")
+  libc.flush()
+  libc.exit(1)
+}

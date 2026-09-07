@@ -483,6 +483,14 @@ fn takes_path_in_arg1(nr: u64): u32 {
 // this is.
 const USER_EFAULT: u64 = 0xFFFF_FFFF_FFFF_FFF2
 
+// What a write to a pipe with no reader returns. -32 is EPIPE, and negative
+// so a caller testing for failure sees one.
+const USER_EPIPE: u64 = 0xFFFF_FFFF_FFFF_FFE0
+
+// Which end of a pipe a descriptor is, matching core/filesystem.home.
+const PIPE_END_READ: u32 = 1
+const PIPE_END_WRITE: u32 = 2
+
 // Called from syscall_entry in idt_stubs.s. The name is unmangled because the
 // stub names it directly, and distinct from sys/syscall.home's
 // syscall_dispatch — this is the arch-level trampoline into that table, not a
@@ -833,6 +841,57 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
     }
     if a1 < 3 {
       return write_console(a2, a3)
+    }
+  }
+
+  // A pipe end is the one descriptor whose read can find nothing and not be
+  // finished, and whose write can move nothing and not be broken. Waiting
+  // means yielding, and only this layer can yield — the VFS below has no
+  // scheduler — so the loop lives here and the VFS answers the two questions
+  // it needs: is the pipe finished, and does it still have a reader.
+  if nr == SYS_READ {
+    if filesystem.vfs_fd_pipe_end(@as(u32, a1)) == PIPE_END_READ {
+      loop {
+        let got: u64 = filesystem.vfs_read(@as(u32, a1), a2, a3)
+        if got > 0 { return got }
+        if filesystem.vfs_pipe_fd_at_eof(@as(u32, a1)) == 1 { return 0 }
+        // Empty, a writer still open, and nobody else to run. The writer can
+        // never write, so waiting would never end; saying so beats hanging
+        // the machine, and short output with a line in the log beats a
+        // kernel that stopped answering.
+        if next_runnable(current_task) == current_task {
+          foundation.serial_write_string("[pipe] read would block with nothing else runnable\n")
+          return 0
+        }
+        scheduler_yield()
+      }
+    }
+  }
+
+  if nr == SYS_WRITE {
+    if filesystem.vfs_fd_pipe_end(@as(u32, a1)) == PIPE_END_WRITE {
+      var written: u64 = 0
+      while written < a3 {
+        let put: u64 = filesystem.vfs_write(@as(u32, a1), a2 + written, a3 - written)
+        if put > 0 {
+          written = written + put
+        } else {
+          // Nothing moved. Either the pipe is full and a reader may yet drain
+          // it, or there is no reader at all — in which case these bytes have
+          // nowhere to go and the writer has to be told, rather than being
+          // handed a count it did not achieve.
+          if filesystem.vfs_pipe_fd_has_reader(@as(u32, a1)) == 0 {
+            if written > 0 { return written }
+            return USER_EPIPE
+          }
+          if next_runnable(current_task) == current_task {
+            foundation.serial_write_string("[pipe] write would block with nothing else runnable\n")
+            return written
+          }
+          scheduler_yield()
+        }
+      }
+      return written
     }
   }
 
