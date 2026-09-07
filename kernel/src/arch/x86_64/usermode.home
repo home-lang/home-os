@@ -64,21 +64,38 @@ const SYS_CHOWN: u64 = 39
 // of a pipeline reach files instead. This is what those need — not fork. A
 // program reading its own stdin and writing its own stdout does not care
 // whether a second process exists, only where the two ends are attached.
-var user_stdin_fd: u32 = 0
-var user_stdout_fd: u32 = 0
+// Per task, not one pair for the machine. Two stages of a pipeline are two
+// tasks alive at once, each with its own ends attached — one pair between
+// them would mean whichever ran last decided where both of them read and
+// wrote. They were a single pair while only one program ran at a time, and
+// that stopped being true when a pipeline became concurrent.
+var task_stdin: [4]u32 = undefined
+var task_stdout: [4]u32 = undefined
 
 // Set before running a program, cleared after. Returning the previous value
 // lets a caller nest them without keeping its own stack of what to restore.
+// These act on the *current* task, which is the shell when a shell is what is
+// running — so a shell still sets them around a foreground program exactly as
+// it did.
 export fn set_user_stdin(fd: u32): u32 {
-  let previous: u32 = user_stdin_fd
-  user_stdin_fd = fd
+  let previous: u32 = task_stdin[current_task]
+  task_stdin[current_task] = fd
   return previous
 }
 
 export fn set_user_stdout(fd: u32): u32 {
-  let previous: u32 = user_stdout_fd
-  user_stdout_fd = fd
+  let previous: u32 = task_stdout[current_task]
+  task_stdout[current_task] = fd
   return previous
+}
+
+// The same, for a task that is not the one running: a shell attaches a
+// background stage's ends before that stage has ever been scheduled.
+export fn set_task_stdio(task: u32, in_fd: u32, out_fd: u32): u32 {
+  if task >= MAX_TASKS { return 1 }
+  task_stdin[task] = in_fd
+  task_stdout[task] = out_fd
+  return 0
 }
 
 // ============================================================================
@@ -320,11 +337,21 @@ fn scheduler_reset() {
   task_frame[0] = 0
   task_exit[0] = 0
   task_parent[0] = 0
+  // Deliberately *not* clearing task 0's stdin and stdout. This runs when a
+  // program is loaded, which is after the shell has attached that program's
+  // ends — clearing them here sent every redirection and every pipeline stage
+  // back to the console, and the gate lost seven milestones at once. The
+  // shell sets them around a program and restores them itself; slot 0's
+  // attachment is the shell's business, not the scheduler's.
   signals_reset(0)
   var t: u32 = 1
   while t < MAX_TASKS {
     task_state[t] = TASK_UNUSED
     task_parent[t] = 0
+    // A slot reused by a later job would otherwise inherit the ends of
+    // whatever ran in it last, and write its output into a closed pipe.
+    task_stdin[t] = 0
+    task_stdout[t] = 0
     signals_reset(t)
     t = t + 1
   }
@@ -573,6 +600,11 @@ fn do_fork(frame: u64): u64 {
   // registers below a return address, which is exactly what that `ret` pops.
   let task: u32 = slot + 1
   task_parent[task] = current_task
+  // A child inherits where its parent's standard input and output are
+  // attached, which is what makes `cmd > file` still redirect after a fork
+  // and what lets a pipeline stage fork without losing its end of the pipe.
+  task_stdin[task] = task_stdin[current_task]
+  task_stdout[task] = task_stdout[current_task]
   if task >= MAX_TASKS {
     foundation.serial_write_string("[fork] no task slot\n")
     return 0xFFFFFFFFFFFFFFFF
@@ -826,8 +858,8 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
   // given no input finishes instead of hanging.
   if nr == SYS_READ {
     if a1 == 0 {
-      if user_stdin_fd == 0 { return 0 }
-      return filesystem.vfs_read(user_stdin_fd, a2, a3)
+      if task_stdin[current_task] == 0 { return 0 }
+      return filesystem.vfs_read(task_stdin[current_task], a2, a3)
     }
   }
 
@@ -836,8 +868,8 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
   // program's complaint about a failure should not vanish into the file the
   // failure was about.
   if nr == SYS_WRITE {
-    if a1 == 1 and user_stdout_fd != 0 {
-      return filesystem.vfs_write(user_stdout_fd, a2, a3)
+    if a1 == 1 and task_stdout[current_task] != 0 {
+      return filesystem.vfs_write(task_stdout[current_task], a2, a3)
     }
     if a1 < 3 {
       return write_console(a2, a3)
