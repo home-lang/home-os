@@ -162,11 +162,11 @@ Recorded as its own stretch because the original plan collapsed it into a single
 - **Entry:** Phase 2 green.
 - **Workstreams:** C, B (S5 for pantry signing), E (pantry local mode).
 - **Exit gates:**
-  - **`libc-suite`**: an executed (not grepped) libc test subset passes ≥90% in-VM.
-  - **`shell-suite`**: scripted shell test suite passes (pipelines, redirection, quoting, `&&`/`||`, variables — the features `apps/shell_parser.home` already claims).
-  - **`coreutils-suite`**: ≥40 coreutils runtime-tested.
-  - Pipes, signals, fork/exec, and job control demonstrated in tests.
-  - **`pantry-local-install`**: pantry installs a signed package from a local repository inside the VM (signing requires S5).
+  - ✅ **`libc-suite`**: `userland/bin/libctest.home` runs at ring 3 in the VM and reports 46/46. Every check calls the function and compares its result — a count derived from counting definitions would say nothing about whether any of them work. The gate asserts `libc-suite: every check passed` rather than the number, so adding a check does not mean editing a milestone; an earlier version asserted a hard-coded total and passed while reporting an impossible 49/40.
+  - ✅ **`shell-suite`**: den (`kernel/src/console/den.home`) runs pipelines, redirection, quoting, `&&`/`||`, variables, aliases, history, 39 builtins, and job control. `scripts/den-conform.sh` is the stronger of the two checks: it runs the same scripts against the real den on the host and requires home-os to produce identical output, 42 lines, so a builtin that works differently is a failure rather than a difference nobody notices. It is what caught `eval` running `fg` after two builtin ids collided.
+  - ✅ **`coreutils-suite`**: 45 utilities run in `scripts/boot-commands.txt`, each asserted on output the command itself does not contain — the console echoes what it is sent, so a milestone that is a substring of its own command passes vacuously.
+  - 🟡 **Pipes, signals, fork/exec, and job control demonstrated in tests.** Signals, fork/exec and job control are real and asserted: `sigtest` installs a handler, raises the signal, and checks that execution resumes where it left off; `forktest` checks that the child's writes do not reach the parent's memory; `schedtest` interleaves parent and child output; the gate backgrounds a job and reads its exit status out of `jobs`. Pipes are the qualification: `sys_pipe` refuses (S14), and den runs a pipeline in stages through a holding file instead. For finite input the bytes and the exit status are what a concurrent pipe gives, which is what the gate asserts; an unbounded producer never reaches its consumer, and the intermediate bytes live in a file rather than a kernel buffer.
+  - ✅ **`pantry-local-install`**: `pantry /pkg-good.hpkg` verifies a signature over the archive against the key built into the kernel and installs two files; `/pkg-tampered.hpkg` is byte-identical apart from one flipped payload byte and is refused. Both are asserted, because an installer that accepts everything and one that verifies correctly are indistinguishable from the success case alone.
 
 ### Phase 4 — Craft & GUI Foundation
 
