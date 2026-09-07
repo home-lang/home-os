@@ -183,57 +183,16 @@ fn inode_find(ino: u32): u32 {
 
 // Look up path and return inode number
 // Simple implementation: parse path components and traverse directory tree
+// The inode a path names.
+//
+// This was a second path walker, written before path_resolve and never
+// retired: it handled neither `.` nor `..`, and once symlinks existed it
+// would not have followed one either. Two walkers meant `stat /a/./b` and
+// `open /a/./b` could disagree about whether the file was there — the kind of
+// difference that shows up as one command working and another not, on the
+// same path. There is now one walk, and this is a name for it.
 fn inode_lookup(path: u64): u32 {
-  var path_str: *u8 = @ptrFromInt(path)
-
-  // Empty path or null
-  if path_str == null { return 0 }
-  if path_str[0] == 0 { return 0 }
-
-  // Root path
-  if path_str[0] == '/' and path_str[1] == 0 {
-    return 1  // Root inode is always 1
-  }
-
-  // Start at root
-  var current_ino: u32 = 1
-  var pos: u32 = 0
-
-  // Skip leading slash
-  if path_str[0] == '/' {
-    pos = 1
-  }
-
-  // Parse each path component
-  var component: [u8; 256] = undefined
-  var comp_len: u32 = 0
-
-  while path_str[pos] != 0 {
-    // Extract component
-    comp_len = 0
-    while path_str[pos] != 0 and path_str[pos] != '/' and comp_len < 255 {
-      component[comp_len] = path_str[pos]
-      comp_len = comp_len + 1
-      pos = pos + 1
-    }
-    component[comp_len] = 0
-
-    // Skip trailing slash
-    if path_str[pos] == '/' {
-      pos = pos + 1
-    }
-
-    // Look up component in current directory
-    if comp_len > 0 {
-      var found_ino: u32 = dir_lookup(current_ino, &component, comp_len)
-      if found_ino == 0 {
-        return 0  // Component not found
-      }
-      current_ino = found_ino
-    }
-  }
-
-  return current_ino
+  return path_resolve(path)
 }
 
 // Look up a name in a directory inode
@@ -356,7 +315,36 @@ export fn dir_add_entry(dir_ino: u32, name: *[u8; 256], name_len: u32, entry_ino
       var entry_ptr: *u8 = @ptrFromInt(block_addr + offset)
       var existing_ino: u32 = @ptrCast(*u32, entry_ptr).*
 
+      // A slot with no inode is either a hole a removal left or the unused
+      // tail of the block, and the two cannot be treated alike.
+      //
+      // A hole keeps the name length of the name that used to be there, and
+      // that length is the record's *stride* — every scan in this file steps
+      // by it. Writing a shorter name into a longer hole shrinks the stride
+      // and leaves the tail of the old record behind, so the next step lands
+      // in the middle of it and reads a name length out of stale bytes;
+      // writing a longer name into a shorter one overwrites the entry after
+      // it. Either way the rest of the directory stops being readable, which
+      // is what `rm` followed by `ls` was showing.
+      //
+      // So a hole is reused only when it is exactly the size wanted. One of
+      // the wrong size is stepped over and left for a name that fits it.
+      // Space is not reclaimed as eagerly as it could be; a directory that
+      // could be read is worth more than one that packs well.
+      var reusable: u32 = 0
       if existing_ino == 0 {
+        var hole_name_len: u32 = @ptrCast(*u32, entry_ptr + 4).*
+        if hole_name_len == 0 {
+          // Never written: the block is zeroed when it is allocated, so this
+          // is fresh space and takes an entry of any size.
+          reusable = 1
+        } else {
+          var hole_size: u32 = (8 + hole_name_len + 3) & ~3
+          if hole_size == entry_size { reusable = 1 }
+        }
+      }
+
+      if reusable == 1 {
         // Found free slot, write entry
         @ptrCast(*u32, entry_ptr).* = entry_ino
         @ptrCast(*u32, entry_ptr + 4).* = name_len
@@ -540,18 +528,104 @@ fn link_into_parent(path: u64, ino: u32): u32 {
 // `.` and `..` are handled here rather than stored as directory entries, so
 // no directory has to carry them.
 export fn path_resolve(path: u64): u32 {
+  return resolve_walk(path, 1)
+}
+
+// The same walk, except that a symlink named by the *last* component is
+// returned rather than followed. Every earlier component is still followed:
+// reaching `b` in `/a/link/b` means walking through `link`, and only the leaf
+// is left alone. This is what separates lstat from stat, and what lets a
+// symlink be removed rather than the file it points at.
+export fn path_resolve_nofollow(path: u64): u32 {
+  return resolve_walk(path, 0)
+}
+
+// How many symlinks one resolution may follow. A link pointing at itself is a
+// loop with no natural end, so the walk gives up rather than running forever.
+const SYMLINK_MAX_DEPTH: u32 = 8
+
+// Following a link means walking a path built out of the link's target and
+// whatever was left of the original — which cannot be assembled in the buffer
+// currently being read. Two buffers, used alternately, so the source of one
+// hop is never the destination of the next.
+var resolve_path_a: [u8; 512] = undefined
+var resolve_path_b: [u8; 512] = undefined
+
+// Whether `ino` names a symbolic link.
+fn inode_is_symlink(ino: u32): u32 {
+  let ptr: u64 = inode_get(ino)
+  if ptr == 0 { return 0 }
+  if @as(*Inode, @ptrFromInt(ptr)).*.file_type == FILE_TYPE_SYMLINK { return 1 }
+  return 0
+}
+
+// Build `target + rest` into buffer `which` (1 = a, 0 = b) and return 0.
+//
+// Only an absolute target is followed. A relative one would have to be
+// resolved against the directory the link sits in, and this walk does not
+// carry that directory — a link with a relative target therefore fails to
+// resolve rather than resolving against the wrong place, which is the failure
+// a caller can see.
+fn build_link_path(link_ino: u32, rest: u64, which: u32): u32 {
+  let ptr: u64 = inode_get(link_ino)
+  if ptr == 0 { return 1 }
+  var node: Inode = @as(*Inode, @ptrFromInt(ptr)).*
+  if node.size == 0 or node.size > 255 { return 1 }
+  if node.data_blocks[0] == 0 { return 1 }
+  if @as(*u8, @ptrFromInt(node.data_blocks[0])).* != 47 { return 1 }
+
+  var out: u64 = @intFromPtr(&resolve_path_b)
+  if which == 1 { out = @intFromPtr(&resolve_path_a) }
+
+  var n: u64 = 0
+  while n < node.size {
+    @as(*u8, @ptrFromInt(out + n)).* = @as(*u8, @ptrFromInt(node.data_blocks[0] + n)).*
+    n = n + 1
+  }
+
+  // Whatever the outer walk had not consumed yet, joined with one separator.
+  if rest != 0 {
+    if @as(*u8, @ptrFromInt(rest)).* != 0 {
+      if n >= 511 { return 1 }
+      @as(*u8, @ptrFromInt(out + n)).* = 47
+      n = n + 1
+      var r: u64 = 0
+      loop {
+        let c: u8 = @as(*u8, @ptrFromInt(rest + r)).*
+        if c == 0 { break }
+        if n >= 511 { return 1 }
+        @as(*u8, @ptrFromInt(out + n)).* = c
+        n = n + 1
+        r = r + 1
+      }
+    }
+  }
+
+  @as(*u8, @ptrFromInt(out + n)).* = 0
+  return 0
+}
+
+fn resolve_walk(path: u64, follow_leaf: u32): u32 {
   if path == 0 { return 0 }
+
+  // The path being walked. Following a link replaces it with the link's
+  // target joined to whatever had not been consumed, and the walk starts
+  // again from the root — which is one loop, not two, so that `continue`
+  // below means what it did before symlinks existed.
+  var work: u64 = path
+  var depth: u32 = 0
+  var next_buffer: u32 = 1
 
   var cur: u32 = ROOT_INO
   var i: u64 = 0
 
   // Skip leading slashes; "/" alone is the root.
-  while @as(*u8, @ptrFromInt(path + i)).* == 47 {
+  while @as(*u8, @ptrFromInt(work + i)).* == 47 {
     i = i + 1
   }
 
   loop {
-    var c: u8 = @as(*u8, @ptrFromInt(path + i)).*
+    var c: u8 = @as(*u8, @ptrFromInt(work + i)).*
     if c == 0 { return cur }
 
     // Copy one component.
@@ -562,12 +636,12 @@ export fn path_resolve(path: u64): u32 {
       component[len] = c
       len = len + 1
       i = i + 1
-      c = @as(*u8, @ptrFromInt(path + i)).*
+      c = @as(*u8, @ptrFromInt(work + i)).*
     }
     component[len] = 0
 
     // Skip the separator run before the next component.
-    while @as(*u8, @ptrFromInt(path + i)).* == 47 {
+    while @as(*u8, @ptrFromInt(work + i)).* == 47 {
       i = i + 1
     }
 
@@ -592,6 +666,34 @@ export fn path_resolve(path: u64): u32 {
 
     var next: u32 = dir_lookup(cur, &component, len)
     if next == 0 { return 0 }
+
+    if inode_is_symlink(next) == 1 {
+      // The leaf is whatever has nothing after it. A trailing slash counts as
+      // nothing, so `/a/link/` follows — which is what POSIX asks for, since
+      // the slash asserts the name is a directory.
+      var at_leaf: u32 = 0
+      if @as(*u8, @ptrFromInt(work + i)).* == 0 { at_leaf = 1 }
+      if at_leaf == 1 and follow_leaf == 0 { return next }
+
+      if depth >= SYMLINK_MAX_DEPTH { return 0 }
+      depth = depth + 1
+      if build_link_path(next, work + i, next_buffer) != 0 { return 0 }
+      if next_buffer == 1 {
+        work = @intFromPtr(&resolve_path_a)
+        next_buffer = 0
+      } else {
+        work = @intFromPtr(&resolve_path_b)
+        next_buffer = 1
+      }
+
+      cur = ROOT_INO
+      i = 0
+      while @as(*u8, @ptrFromInt(work + i)).* == 47 {
+        i = i + 1
+      }
+      continue
+    }
+
     cur = next
   }
 }
@@ -1383,7 +1485,9 @@ export fn vfs_unlink(path: u64): u32 {
   if path == 0 { return 1 }
   if homefs_path_offset(path) != 0 { return homefs_remove(path, 0) }
 
-  var ino: u32 = path_resolve(path)
+  // The link, not what it points at: `rm link` removes the name given, and
+  // following it would delete the file the user did not name.
+  var ino: u32 = path_resolve_nofollow(path)
   if ino == 0 { return 1 }
 
   // A directory is removed with rmdir, not unlink. Saying so beats unlinking
@@ -1746,6 +1850,284 @@ export fn vfs_get_mount_info(index: u32, path: *[u8; 64], device: *[u8; 32],
 }
 
 // ============================================================================
+// FILE METADATA
+// ============================================================================
+
+// What `stat` reports about one file. This is the VFS's own shape, not the
+// POSIX struct: sys/syscall.home lays those bytes out for userspace, and
+// keeping the two apart means a change to the ABI does not reach in here.
+export struct StatInfo {
+  ino: u32,
+  file_type: u32,       // FILE_TYPE_REGULAR / FILE_TYPE_DIRECTORY / ...
+  mode: u32,            // permission bits
+  uid: u32,
+  gid: u32,
+  link_count: u32,
+  size: u64,
+  blocks: u32,
+  atime: u64,
+  mtime: u64,
+  ctime: u64
+}
+
+// Fill `out` with what is known about `path`. Returns 0 on success, non-zero
+// if the path does not resolve.
+//
+// A file lives in one of two disjoint namespaces — the in-memory inode table
+// or a mounted homefs volume — so this branches the way every other path
+// operation in this file does rather than trying to keep one in step with the
+// other. homefs carries no timestamps yet, so those come back zero: a zero
+// mtime is visibly not a time, where a fabricated one would be believed.
+// One place where an inode becomes a StatInfo. stat, lstat and fstat all end
+// here, so the three cannot come to disagree about what a field means.
+fn stat_from_inode(ino: u32, out: *StatInfo): u32 {
+  let idx: u32 = inode_find(ino)
+  if idx >= MAX_INODES { return 1 }
+
+  out.*.ino = inode_table[idx].ino
+  out.*.file_type = inode_table[idx].file_type
+  out.*.mode = inode_table[idx].mode
+  out.*.uid = inode_table[idx].uid
+  out.*.gid = inode_table[idx].gid
+  out.*.link_count = inode_table[idx].link_count
+  out.*.size = inode_table[idx].size
+  out.*.blocks = inode_table[idx].blocks
+  out.*.atime = inode_table[idx].atime
+  out.*.mtime = inode_table[idx].mtime
+  out.*.ctime = inode_table[idx].ctime
+  return 0
+}
+
+export fn vfs_stat(path: u64, out: *StatInfo): u32 {
+  if path == 0 { return 1 }
+
+  if homefs_path_offset(path) != 0 {
+    let object: u64 = vfs_homefs_resolve(path)
+    if object == 0 { return 1 }
+
+    out.*.ino = @truncate(object, u32)
+    if homefs.homefs_object_kind(object) == homefs.OBJ_KIND_DIR {
+      out.*.file_type = FILE_TYPE_DIRECTORY
+    } else {
+      out.*.file_type = FILE_TYPE_REGULAR
+    }
+    out.*.mode = homefs.homefs_object_mode(object)
+    out.*.uid = homefs.homefs_object_uid(object)
+    out.*.gid = homefs.homefs_object_gid(object)
+    out.*.link_count = 1
+    out.*.size = homefs.homefs_object_size(object)
+    out.*.blocks = @truncate((out.*.size + 511) / 512, u32)
+    out.*.atime = 0
+    out.*.mtime = 0
+    out.*.ctime = 0
+    return 0
+  }
+
+  let ino: u32 = inode_lookup(path)
+  if ino == 0 { return 1 }
+  return stat_from_inode(ino, out)
+}
+
+// The same, for an open descriptor. A descriptor belongs to exactly one
+// namespace — homefs_object is non-zero or it is an inode — so there is no
+// path to re-resolve and no chance of resolving to a different file than the
+// one the descriptor was opened on.
+export fn vfs_fstat(fd: u32, out: *StatInfo): u32 {
+  if fd < 3 { return 1 }
+  let idx: u32 = fd - 3
+  if idx >= MAX_OPEN_FILES { return 1 }
+  if open_files[idx].ref_count == 0 { return 1 }
+
+  let object: u64 = open_files[idx].homefs_object
+  if object != 0 {
+    out.*.ino = @truncate(object, u32)
+    if homefs.homefs_object_kind(object) == homefs.OBJ_KIND_DIR {
+      out.*.file_type = FILE_TYPE_DIRECTORY
+    } else {
+      out.*.file_type = FILE_TYPE_REGULAR
+    }
+    out.*.mode = homefs.homefs_object_mode(object)
+    out.*.uid = homefs.homefs_object_uid(object)
+    out.*.gid = homefs.homefs_object_gid(object)
+    out.*.link_count = 1
+    out.*.size = homefs.homefs_object_size(object)
+    out.*.blocks = @truncate((out.*.size + 511) / 512, u32)
+    out.*.atime = 0
+    out.*.mtime = 0
+    out.*.ctime = 0
+    return 0
+  }
+
+  return stat_from_inode(open_files[idx].ino, out)
+}
+
+// stat follows a symlink; lstat reports on the link itself. The only
+// difference is which walk resolves the leaf.
+export fn vfs_lstat(path: u64, out: *StatInfo): u32 {
+  if path == 0 { return 1 }
+
+  // A homefs volume holds no symlinks, so there is nothing there for lstat to
+  // report differently and stat's answer is already the right one.
+  if homefs_path_offset(path) != 0 { return vfs_stat(path, out) }
+
+  let ino: u32 = path_resolve_nofollow(path)
+  if ino == 0 { return 1 }
+  return stat_from_inode(ino, out)
+}
+
+// ============================================================================
+// LINKS
+// ============================================================================
+
+// A second name for an existing file.
+//
+// The inode already counts its names — vfs_unlink decrements link_count and
+// frees the file only when it reaches zero — so a hard link is one directory
+// entry pointing at an inode that already has one, and nothing else has to
+// change. Directories are refused: a directory with two names has no single
+// parent, and `..` would have to pick one.
+export fn vfs_link(oldpath: u64, newpath: u64): u32 {
+  if oldpath == 0 or newpath == 0 { return 1 }
+
+  // homefs objects are addressed by id and its directory tree stores one name
+  // per object; giving an object a second name is a homefs change, not a VFS
+  // one, so this refuses rather than pretending.
+  if homefs_path_offset(oldpath) != 0 { return 1 }
+  if homefs_path_offset(newpath) != 0 { return 1 }
+
+  let ino: u32 = path_resolve(oldpath)
+  if ino == 0 { return 1 }
+
+  let ptr: u64 = inode_get(ino)
+  if ptr == 0 { return 1 }
+  var live: *Inode = @ptrFromInt(ptr)
+  if live.file_type == FILE_TYPE_DIRECTORY { return 1 }
+
+  // Refuse a name that is already taken, rather than adding a second entry
+  // under it and leaving a directory with two entries of the same name.
+  if path_resolve_nofollow(newpath) != 0 { return 1 }
+
+  if link_into_parent(newpath, ino) != 0 { return 1 }
+  live.link_count = live.link_count + 1
+  return 0
+}
+
+// A symlink is a file whose contents are the path it points at. One page
+// holds it, the same way a small regular file is held, and path_resolve reads
+// it back when it walks through the link.
+export fn vfs_symlink(target: u64, linkpath: u64): u32 {
+  if target == 0 or linkpath == 0 { return 1 }
+  if homefs_path_offset(linkpath) != 0 { return 1 }
+
+  var len: u64 = 0
+  while @as(*u8, @ptrFromInt(target + len)).* != 0 {
+    len = len + 1
+  }
+  // 255 is what build_link_path will read back, so refusing a longer target
+  // here beats storing one that can never be followed.
+  if len == 0 or len > 255 { return 1 }
+
+  if path_resolve_nofollow(linkpath) != 0 { return 1 }
+
+  let ino: u32 = inode_alloc(FILE_TYPE_SYMLINK, 0o777)
+  if ino == 0 { return 1 }
+
+  let ptr: u64 = inode_get(ino)
+  if ptr == 0 { return 1 }
+  var live: *Inode = @ptrFromInt(ptr)
+
+  let page: u64 = memory.pmm_alloc_page()
+  if page == 0 {
+    inode_free(ino)
+    return 1
+  }
+  var n: u64 = 0
+  while n < len {
+    @as(*u8, @ptrFromInt(page + n)).* = @as(*u8, @ptrFromInt(target + n)).*
+    n = n + 1
+  }
+  live.data_blocks[0] = page
+  live.blocks = 1
+  live.size = len
+
+  if link_into_parent(linkpath, ino) != 0 {
+    memory.pmm_free_page(page)
+    inode_free(ino)
+    return 1
+  }
+  return 0
+}
+
+// Read a symlink's target into `buf`. Returns the number of bytes written, or
+// 0 if the path is not a symlink — a plain file is not a link and saying so
+// is what tells `ls -l` there is nothing to print after the arrow.
+//
+// No terminator is written, which is what readlink(2) promises: the caller is
+// given a length and the buffer holds exactly that many bytes.
+export fn vfs_readlink(path: u64, buf: u64, size: u64): u64 {
+  if path == 0 or buf == 0 or size == 0 { return 0 }
+  if homefs_path_offset(path) != 0 { return 0 }
+
+  let ino: u32 = path_resolve_nofollow(path)
+  if ino == 0 { return 0 }
+  let ptr: u64 = inode_get(ino)
+  if ptr == 0 { return 0 }
+  var node: Inode = @as(*Inode, @ptrFromInt(ptr)).*
+  if node.file_type != FILE_TYPE_SYMLINK { return 0 }
+  if node.data_blocks[0] == 0 { return 0 }
+
+  var n: u64 = node.size
+  if n > size { n = size }
+  var i: u64 = 0
+  while i < n {
+    @as(*u8, @ptrFromInt(buf + i)).* = @as(*u8, @ptrFromInt(node.data_blocks[0] + i)).*
+    i = i + 1
+  }
+  return n
+}
+
+// Give a file a different name.
+//
+// Done as link-then-unlink, which is what the operation is: the file gains a
+// second name, then loses its first. It is not atomic — a crash between the
+// two leaves the file under both names — and homefs's commit protocol is what
+// would make it so, which is why this is refused for homefs paths rather than
+// done there badly.
+//
+// The symlink itself is renamed, not what it points at: resolving the old
+// name follows nothing at the leaf, so `mv link other` moves the link.
+export fn vfs_rename(oldpath: u64, newpath: u64): u32 {
+  if oldpath == 0 or newpath == 0 { return 1 }
+  if homefs_path_offset(oldpath) != 0 { return 1 }
+  if homefs_path_offset(newpath) != 0 { return 1 }
+
+  let ino: u32 = path_resolve_nofollow(oldpath)
+  if ino == 0 { return 1 }
+
+  let ptr: u64 = inode_get(ino)
+  if ptr == 0 { return 1 }
+  var live: *Inode = @ptrFromInt(ptr)
+  // Moving a directory would move its subtree under a new parent, and with no
+  // parent pointers stored there is nothing to update — `..` already resolves
+  // to the root from anywhere. Refused until inodes carry a parent.
+  if live.file_type == FILE_TYPE_DIRECTORY { return 1 }
+
+  if path_resolve_nofollow(newpath) != 0 { return 1 }
+
+  if link_into_parent(newpath, ino) != 0 { return 1 }
+  live.link_count = live.link_count + 1
+
+  // The old name goes. link_count is 2 here, so unlink drops it to 1 and the
+  // file is not freed — which is the whole reason the link is added first.
+  if vfs_unlink(oldpath) != 0 {
+    // The new name is already in place; leaving it and reporting failure
+    // would give the file two names and tell the caller nothing happened.
+    return 1
+  }
+  return 0
+}
+
+// ============================================================================
 // DIRECTORY READING
 // ============================================================================
 
@@ -1835,10 +2217,16 @@ export fn vfs_readdir(path: u64, entries: *[DirEntryInfo; 256], max_entries: u32
       var entry_ino: u32 = @as(*u32, @ptrFromInt(block_addr + offset)).*
       var name_len: u32 = @as(*u32, @ptrFromInt(block_addr + offset + 4)).*
 
+      // A removed entry keeps its length so the walk can step over it, which
+      // is what dir_lookup and dir_remove_entry already do. This scan did
+      // not: it treated the hole as the end of the block, so removing a file
+      // hid every entry after it — `rm` in a directory made the rest of the
+      // directory disappear from `ls`, and reappear on the next boot.
+      // Only a slot with neither an inode nor a length is genuinely unused.
       if entry_ino == 0 {
-        // A free slot ends the used part of the block: dir_add_entry fills
-        // from the front and never leaves a hole behind a live entry.
-        break
+        if name_len == 0 { break }
+        offset = offset + ((8 + name_len + 3) & ~3)
+        continue
       }
       if name_len == 0 { break }
       if name_len > 255 { break }
@@ -1909,6 +2297,8 @@ export fn vfs_get_type(path: u64): u32 {
   return inode_table[idx].file_type
 }
 
+var tree_size_scratch: [DirEntryInfo; 256] = undefined
+
 // Get total size of directory tree (recursive)
 export fn vfs_get_tree_size(path: u64): u64 {
   var ino: u32 = inode_lookup(path)
@@ -1921,12 +2311,15 @@ export fn vfs_get_tree_size(path: u64): u64 {
 
   // If it's a directory, add child sizes
   if inode_table[idx].file_type == FILE_TYPE_DIRECTORY {
-    var entries: [DirEntryInfo; 256] = undefined
-    var count: u32 = vfs_readdir(path, &entries, 256)
+    // Static, not a local: a DirEntryInfo is 272 bytes and 256 of them are
+    // 69KB, which is more than the kernel stack has. Nothing calls this
+    // function yet, so the frame has never actually been built — it would
+    // have taken the stack out the first time something did.
+    var count: u32 = vfs_readdir(path, &tree_size_scratch, 256)
 
     var i: u32 = 0
     while i < count {
-      total = total + entries[i].size
+      total = total + tree_size_scratch[i].size
       i = i + 1
     }
   }
