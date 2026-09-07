@@ -28,10 +28,12 @@ const SYS_WRITE: u64 = 3
 const SYS_OPEN: u64 = 4
 const SYS_FORK: u64 = 1
 const SYS_WAIT: u64 = 6
-const SYS_YIELD: u64 = 24
+const SYS_YIELD: u64 = 108
 const SYS_KILL_SIG: u64 = 9
+const SYS_GETPID: u64 = 8
+const SYS_GETPPID: u64 = 48
 const SYS_SIGACTION: u64 = 63
-const SYS_SIGRETURN: u64 = 64
+const SYS_SIGRETURN: u64 = 109
 
 // Every other call whose first argument is a path, and the three whose second
 // is one too. Taken from kernel/src/sys/syscall.home, which owns the numbering.
@@ -47,6 +49,11 @@ const SYS_SYMLINK: u64 = 34
 const SYS_READLINK: u64 = 35
 const SYS_RENAME: u64 = 36
 const SYS_ACCESS: u64 = 37
+const SYS_TRUNCATE: u64 = 42
+const SYS_CHDIR: u64 = 44
+const SYS_GETCWD: u64 = 46
+const SYS_GETDENTS: u64 = 47
+const SYS_NANOSLEEP: u64 = 62
 const SYS_CHMOD: u64 = 38
 const SYS_CHOWN: u64 = 39
 
@@ -127,6 +134,10 @@ var task_cr3: [4]u64 = undefined
 var task_kstack_top: [4]u64 = undefined
 var task_frame: [4]u64 = undefined
 var task_state: [4]u32 = undefined
+// Which task forked each one. Task 0 is the shell, which nothing forked, so
+// it is its own parent — the same answer init gives, and the reason getppid
+// never has to say "none".
+var task_parent: [4]u32 = undefined
 var task_exit: [4]u64 = undefined
 var current_task: u32 = 0
 var task_count: u32 = 0
@@ -308,10 +319,12 @@ fn scheduler_reset() {
   task_kstack_top[0] = foundation.tss_get_rsp0()
   task_frame[0] = 0
   task_exit[0] = 0
+  task_parent[0] = 0
   signals_reset(0)
   var t: u32 = 1
   while t < MAX_TASKS {
     task_state[t] = TASK_UNUSED
+    task_parent[t] = 0
     signals_reset(t)
     t = t + 1
   }
@@ -457,6 +470,11 @@ fn takes_path_in_arg1(nr: u64): u32 {
   if nr == SYS_ACCESS { return 1 }
   if nr == SYS_CHMOD { return 1 }
   if nr == SYS_CHOWN { return 1 }
+  // getdents reads a directory named by a path — a descriptor does not carry
+  // the path it was opened on, so there is nothing else it could take.
+  if nr == SYS_GETDENTS { return 1 }
+  if nr == SYS_CHDIR { return 1 }
+  if nr == SYS_TRUNCATE { return 1 }
   return 0
 }
 
@@ -546,6 +564,7 @@ fn do_fork(frame: u64): u64 {
   // process_switch's `ret` lands in process_first_run: six callee-saved
   // registers below a return address, which is exactly what that `ret` pops.
   let task: u32 = slot + 1
+  task_parent[task] = current_task
   if task >= MAX_TASKS {
     foundation.serial_write_string("[fork] no task slot\n")
     return 0xFFFFFFFFFFFFFFFF
@@ -719,13 +738,73 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
   // not known here, so a page is required to be there — which is what the
   // structure lives in, and is enough to stop a wild pointer.
   if nr == SYS_STAT or nr == SYS_LSTAT {
-    if user_range_ok(a2, 8) == 0 {
+    if user_range_ok(a2, 88) == 0 {
       foundation.serial_write_string("[User] EFAULT: stat buffer ")
       foundation.serial_write_ptr(a2)
       foundation.serial_write_string("\n")
       return USER_EFAULT
     }
   }
+
+  // getdents and readlink write as far as the *caller's* stated length, so
+  // that length is what has to be mapped — checking a fixed eight bytes would
+  // have let a program name a buffer one page long and a count reaching past
+  // it, and the kernel would have written the difference. The syscall caps
+  // getdents at 256 entries, so this multiply cannot run away.
+  if nr == SYS_GETDENTS {
+    if a3 > 256 { return USER_EFAULT }
+    if user_range_ok(a2, a3 * 280) == 0 {
+      foundation.serial_write_string("[User] EFAULT: getdents buffer ")
+      foundation.serial_write_ptr(a2)
+      foundation.serial_write_string("\n")
+      return USER_EFAULT
+    }
+  }
+
+  if nr == SYS_READLINK {
+    if a3 == 0 or a3 > 4096 { return USER_EFAULT }
+    if user_range_ok(a2, a3) == 0 {
+      foundation.serial_write_string("[User] EFAULT: readlink buffer ")
+      foundation.serial_write_ptr(a2)
+      foundation.serial_write_string("\n")
+      return USER_EFAULT
+    }
+  }
+
+  // getcwd writes its answer through the *first* argument, so it is a buffer
+  // where every call above has a path — putting it in the list beside them
+  // would run a string scan over memory that holds no string yet.
+  if nr == SYS_GETCWD {
+    if a2 == 0 or a2 > 4096 { return USER_EFAULT }
+    if user_range_ok(a1, a2) == 0 {
+      foundation.serial_write_string("[User] EFAULT: getcwd buffer ")
+      foundation.serial_write_ptr(a1)
+      foundation.serial_write_string("\n")
+      return USER_EFAULT
+    }
+  }
+
+  // nanosleep reads two u64s through arg1. arg2 is where what is left of the
+  // sleep would be written, and 0 there means the caller does not want it —
+  // which is why it is checked only when it is not 0.
+  if nr == SYS_NANOSLEEP {
+    if user_range_ok(a1, 16) == 0 {
+      foundation.serial_write_string("[User] EFAULT: nanosleep request ")
+      foundation.serial_write_ptr(a1)
+      foundation.serial_write_string("\n")
+      return USER_EFAULT
+    }
+    if a2 != 0 {
+      if user_range_ok(a2, 16) == 0 { return USER_EFAULT }
+    }
+  }
+
+  // A pid here is a task index, which is what fork returns and what wait and
+  // kill take. sys/syscall.home answers these from `current_pid`, which
+  // nothing sets for a ring-3 program — so getpid() was 0 for every process
+  // and getppid() was 1 for every process, whoever asked.
+  if nr == SYS_GETPID { return @as(u64, current_task) }
+  if nr == SYS_GETPPID { return @as(u64, task_parent[current_task]) }
 
   if nr == SYS_FORK { return do_fork(frame) }
   if nr == SYS_SIGACTION { return do_signal(a1, a2, a3) }

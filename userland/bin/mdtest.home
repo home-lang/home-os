@@ -1,0 +1,373 @@
+// mdtest — execute the metadata syscalls and check what they report.
+//
+// These are the calls MASTER_PLAN §7 S14 registered: twenty that validated
+// their arguments and returned 0 without doing the work, so that a caller
+// could not tell any of them from one that worked. Every check below is
+// therefore written to assert a *value* — a size, a link count, a parent pid,
+// a working directory — because a check that only asked "did it fail?" would
+// have passed against all twenty of them.
+//
+// The last line is `md-suite: P/T passed`, which the boot gate asserts.
+
+import "../lib/libc.home" as libc
+import "../lib/sys.home" as sys
+
+var passed: u32 = 0
+var total: u32 = 0
+
+fn check(name: u64, ok: u32) {
+  total = total + 1
+  if ok == 1 {
+    passed = passed + 1
+    return
+  }
+  libc.puts("md-suite FAIL: ")
+  libc.puts(name)
+  libc.putc(10)
+}
+
+// Most of what is asserted here is "this call failed", which is a comparison
+// rather than a flag. Naming it keeps the checks readable without reaching
+// for a ternary — nothing else in userland uses one, and a test is a poor
+// place to find out whether the backend lowers it correctly.
+fn check_failed(name: u64, rc: u64) {
+  var ok: u32 = 0
+  if rc != 0 { ok = 1 }
+  check(name, ok)
+}
+
+fn check_u64(name: u64, got: u64, want: u64) {
+  if got == want {
+    check(name, 1)
+    return
+  }
+  libc.puts("md-suite FAIL: ")
+  libc.puts(name)
+  libc.puts(" got ")
+  libc.put_u64(got)
+  libc.puts(" want ")
+  libc.put_u64(want)
+  libc.putc(10)
+  total = total + 1
+}
+
+var st: [u8; 88] = undefined
+var cwd: [u8; 64] = undefined
+var linkbuf: [u8; 64] = undefined
+var sleepreq: [u64; 2] = undefined
+var entries: [u8; 8960] = undefined     // 32 * DIRENT_SIZE
+
+fn st_field(offset: u64): u64 {
+  return @as(*u64, @ptrFromInt(@intFromPtr(&st) + offset)).*
+}
+
+// stat writes into the caller's buffer, and the failure being tested for is
+// that it writes nothing. Filling the buffer with a value stat would never
+// produce means a check cannot pass on what was already there.
+fn poison_st() {
+  var i: u32 = 0
+  while i < 88 {
+    st[i] = 0xEE
+    i = i + 1
+  }
+}
+
+fn test_stat() {
+  poison_st()
+  check_u64(@intFromPtr("stat /etc/motd returns 0"),
+            sys.sys_stat(@intFromPtr("/etc/motd"), @intFromPtr(&st)), 0)
+  check_u64(@intFromPtr("stat reports the size"), st_field(sys.ST_SIZE), 24)
+  check_u64(@intFromPtr("stat reports a regular file"), st_field(sys.ST_KIND),
+            sys.KIND_REGULAR)
+  check_u64(@intFromPtr("stat reports one link"), st_field(sys.ST_NLINK), 1)
+
+  // A path that is not there must not report success — the whole family used
+  // to, which is how `mv` came to move nothing and say it had.
+  poison_st()
+  check_failed(@intFromPtr("stat of a missing file fails"),
+               sys.sys_stat(@intFromPtr("/etc/not-here"), @intFromPtr(&st)))
+
+  // fstat has to agree with stat about the same file, reached the other way.
+  let fd: u64 = libc.open_read(@intFromPtr("/etc/motd"))
+  if fd == 0 {
+    check(@intFromPtr("open /etc/motd for fstat"), 0)
+    return
+  }
+  poison_st()
+  check_u64(@intFromPtr("fstat returns 0"), sys.sys_fstat(fd, @intFromPtr(&st)), 0)
+  check_u64(@intFromPtr("fstat agrees with stat on size"), st_field(sys.ST_SIZE), 24)
+  sys.sys_close(fd)
+}
+
+fn test_links() {
+  // A hard link is a second name for the same file, so the link count rises
+  // and the size is the same file's size.
+  check_u64(@intFromPtr("link creates a second name"),
+            sys.sys_link(@intFromPtr("/etc/motd"), @intFromPtr("/mdtest.hard")), 0)
+  poison_st()
+  check_u64(@intFromPtr("stat the new name"),
+            sys.sys_stat(@intFromPtr("/mdtest.hard"), @intFromPtr(&st)), 0)
+  check_u64(@intFromPtr("the link has the file's size"), st_field(sys.ST_SIZE), 24)
+  check_u64(@intFromPtr("two names now"), st_field(sys.ST_NLINK), 2)
+
+  // And the original agrees: the count belongs to the file, not to a name.
+  poison_st()
+  sys.sys_stat(@intFromPtr("/etc/motd"), @intFromPtr(&st))
+  check_u64(@intFromPtr("the original counts two as well"), st_field(sys.ST_NLINK), 2)
+
+  // Removing one name leaves the other, with the count back down.
+  check_u64(@intFromPtr("unlink one name"),
+            sys.sys_unlink(@intFromPtr("/mdtest.hard")), 0)
+  poison_st()
+  sys.sys_stat(@intFromPtr("/etc/motd"), @intFromPtr(&st))
+  check_u64(@intFromPtr("one name again"), st_field(sys.ST_NLINK), 1)
+}
+
+fn test_symlink() {
+  check_u64(@intFromPtr("symlink is created"),
+            sys.sys_symlink(@intFromPtr("/etc/motd"), @intFromPtr("/mdtest.soft")), 0)
+
+  // lstat sees the link; stat sees through it. The two disagreeing is the
+  // whole point of having both.
+  poison_st()
+  check_u64(@intFromPtr("lstat the link"),
+            sys.sys_lstat(@intFromPtr("/mdtest.soft"), @intFromPtr(&st)), 0)
+  check_u64(@intFromPtr("lstat says symlink"), st_field(sys.ST_KIND), sys.KIND_SYMLINK)
+  check_u64(@intFromPtr("the link holds its target"), st_field(sys.ST_SIZE), 9)
+
+  poison_st()
+  check_u64(@intFromPtr("stat follows the link"),
+            sys.sys_stat(@intFromPtr("/mdtest.soft"), @intFromPtr(&st)), 0)
+  check_u64(@intFromPtr("stat says regular"), st_field(sys.ST_KIND), sys.KIND_REGULAR)
+  check_u64(@intFromPtr("stat reports the target's size"), st_field(sys.ST_SIZE), 24)
+
+  check_u64(@intFromPtr("readlink returns the target's length"),
+            sys.sys_readlink(@intFromPtr("/mdtest.soft"), @intFromPtr(&linkbuf), 64), 9)
+  linkbuf[9] = 0
+  check_u64(@intFromPtr("readlink returns the target"),
+            @as(u64, libc.strcmp(@intFromPtr(&linkbuf), @intFromPtr("/etc/motd"))), 0)
+
+  // Reading through the link reaches the file it names.
+  let fd: u64 = libc.open_read(@intFromPtr("/mdtest.soft"))
+  if fd == 0 {
+    check(@intFromPtr("open through the symlink"), 0)
+  } else {
+    check_u64(@intFromPtr("read through the symlink"),
+              sys.sys_read(fd, libc.read_buffer_addr(), 24), 24)
+    sys.sys_close(fd)
+  }
+
+  // Removing the link removes the link, not the file it points at. This is
+  // the check that fails if unlink resolves the leaf.
+  check_u64(@intFromPtr("unlink the link"),
+            sys.sys_unlink(@intFromPtr("/mdtest.soft")), 0)
+  poison_st()
+  check_u64(@intFromPtr("the target survives"),
+            sys.sys_stat(@intFromPtr("/etc/motd"), @intFromPtr(&st)), 0)
+  check_u64(@intFromPtr("the target is untouched"), st_field(sys.ST_SIZE), 24)
+}
+
+fn test_rename() {
+  let fd: u64 = libc.open_write(@intFromPtr("/mdtest.from"))
+  if fd == 0 {
+    check(@intFromPtr("create a file to rename"), 0)
+    return
+  }
+  libc.write_all(fd, @intFromPtr("renamed\n"), 8)
+  sys.sys_close(fd)
+
+  check_u64(@intFromPtr("rename returns 0"),
+            sys.sys_rename(@intFromPtr("/mdtest.from"), @intFromPtr("/mdtest.to")), 0)
+
+  // Both halves: the new name is there with the content, and the old is gone.
+  // rename returning 0 while doing nothing passes the first half only if the
+  // old name is also checked.
+  poison_st()
+  check_u64(@intFromPtr("the new name is there"),
+            sys.sys_stat(@intFromPtr("/mdtest.to"), @intFromPtr(&st)), 0)
+  check_u64(@intFromPtr("with the content"), st_field(sys.ST_SIZE), 8)
+  check_failed(@intFromPtr("the old name is gone"),
+               sys.sys_stat(@intFromPtr("/mdtest.from"), @intFromPtr(&st)))
+
+  sys.sys_unlink(@intFromPtr("/mdtest.to"))
+}
+
+fn test_access() {
+  check_u64(@intFromPtr("access F_OK on a file that exists"),
+            sys.sys_access(@intFromPtr("/etc/motd"), sys.F_OK), 0)
+  check_failed(@intFromPtr("access F_OK on one that does not"),
+               sys.sys_access(@intFromPtr("/etc/not-here"), sys.F_OK))
+  check_u64(@intFromPtr("access R_OK on a readable file"),
+            sys.sys_access(@intFromPtr("/etc/motd"), sys.R_OK), 0)
+}
+
+fn test_cwd() {
+  // getcwd used to answer "/" whatever chdir had done, so a chdir that
+  // succeeded was invisible from the other side.
+  check_u64(@intFromPtr("chdir to a directory"),
+            sys.sys_chdir(@intFromPtr("/etc")), 0)
+  var got_buf: u32 = 0
+  if sys.sys_getcwd(@intFromPtr(&cwd), 64) == @intFromPtr(&cwd) { got_buf = 1 }
+  check(@intFromPtr("getcwd returns its buffer"), got_buf)
+  check_u64(@intFromPtr("getcwd reports where chdir went"),
+            @as(u64, libc.strcmp(@intFromPtr(&cwd), @intFromPtr("/etc"))), 0)
+  check_failed(@intFromPtr("chdir to a file fails"),
+               sys.sys_chdir(@intFromPtr("/etc/motd")))
+}
+
+fn test_getdents() {
+  // /etc holds more than one file, and its own name is not among them.
+  let n: u64 = sys.sys_getdents_path(@intFromPtr("/etc"), @intFromPtr(&entries), 32)
+  var many: u32 = 0
+  if n > 1 { many = 1 }
+  check(@intFromPtr("getdents reads more than one entry"), many)
+
+  var found: u32 = 0
+  var i: u64 = 0
+  while i < n {
+    let name: u64 = @intFromPtr(&entries) + i * sys.DIRENT_SIZE + sys.DE_NAME
+    if libc.strcmp(name, @intFromPtr("motd")) == 0 {
+      found = 1
+      let size: u64 = @as(*u64, @ptrFromInt(@intFromPtr(&entries) + i * sys.DIRENT_SIZE + sys.DE_SIZE)).*
+      check_u64(@intFromPtr("the entry carries the file's size"), size, 24)
+    }
+    i = i + 1
+  }
+  check(@intFromPtr("motd is among the entries"), found)
+}
+
+// Removing a name must not hide the names after it. The directory scan used
+// to stop at the hole a removal leaves, so `rm` made the rest of the
+// directory disappear — and the file was still there, which is why nothing
+// noticed until something listed a directory it had removed from.
+fn test_removal_leaves_a_hole() {
+  libc.close(libc.open_write(@intFromPtr("/mdh1")))
+  libc.close(libc.open_write(@intFromPtr("/mdh2")))
+  libc.close(libc.open_write(@intFromPtr("/mdh3")))
+  check_u64(@intFromPtr("remove the middle name"),
+            sys.sys_unlink(@intFromPtr("/mdh2")), 0)
+
+  let n: u64 = sys.sys_getdents_path(@intFromPtr("/"), @intFromPtr(&entries), 32)
+  var saw_first: u32 = 0
+  var saw_last: u32 = 0
+  var i: u64 = 0
+  while i < n {
+    let name: u64 = @intFromPtr(&entries) + i * sys.DIRENT_SIZE + sys.DE_NAME
+    if libc.strcmp(name, @intFromPtr("mdh1")) == 0 { saw_first = 1 }
+    if libc.strcmp(name, @intFromPtr("mdh3")) == 0 { saw_last = 1 }
+    i = i + 1
+  }
+  check(@intFromPtr("the name before the hole is listed"), saw_first)
+  check(@intFromPtr("the name after the hole is listed"), saw_last)
+
+  // And the file after the hole is still reachable by name, which is the
+  // half that always worked — dir_lookup steps over holes already.
+  check_u64(@intFromPtr("the file after the hole still opens"),
+            sys.sys_stat(@intFromPtr("/mdh3"), @intFromPtr(&st)), 0)
+
+  sys.sys_unlink(@intFromPtr("/mdh1"))
+  sys.sys_unlink(@intFromPtr("/mdh3"))
+}
+
+fn test_getppid() {
+  // A pid here is a task index, and the shell this program runs under is task
+  // zero — so "the child's parent is me" is 0 == 0, which a getppid that
+  // always answered 0 would also satisfy. Neither child is asked whether two
+  // numbers match; each reports a number back through its exit status, and
+  // the parent checks it against something only a working call could produce.
+
+  // The first child exits with its own pid. The parent already knows what
+  // that should be: it is what fork returned. A getpid stuck at a constant
+  // gives the wrong number for at least one of the two children.
+  let first: u64 = sys.sys_fork()
+  if first == 0 {
+    sys.sys_exit(sys.sys_getpid())
+  }
+  check_u64(@intFromPtr("the child's own pid is the one fork returned"),
+            sys.sys_wait(first), first)
+
+  // The second exits with its parent's pid, offset so that a getppid stuck at
+  // 1 — which is what it used to answer for everyone — comes back as 101 and
+  // fails, rather than being indistinguishable from a correct 0.
+  let second: u64 = sys.sys_fork()
+  if second == 0 {
+    sys.sys_exit(sys.sys_getppid() + 100)
+  }
+  check_u64(@intFromPtr("the child sees this process as its parent"),
+            sys.sys_wait(second), sys.sys_getpid() + 100)
+
+  // And the two are different processes: a second fork must not hand back the
+  // pid the first one used, or wait would be collecting the wrong child.
+  var distinct: u32 = 0
+  if first != second { distinct = 1 }
+  check(@intFromPtr("two forks are two processes"), distinct)
+}
+
+fn test_truncate() {
+  let fd: u64 = libc.open_write(@intFromPtr("/mdtest.trunc"))
+  if fd == 0 {
+    check(@intFromPtr("create a file to truncate"), 0)
+    return
+  }
+  libc.write_all(fd, @intFromPtr("0123456789"), 10)
+  sys.sys_close(fd)
+
+  check_u64(@intFromPtr("truncate returns 0"),
+            sys.sys_truncate(@intFromPtr("/mdtest.trunc"), 4), 0)
+  poison_st()
+  sys.sys_stat(@intFromPtr("/mdtest.trunc"), @intFromPtr(&st))
+  check_u64(@intFromPtr("the file is shorter"), st_field(sys.ST_SIZE), 4)
+  sys.sys_unlink(@intFromPtr("/mdtest.trunc"))
+}
+
+// nanosleep refuses, and the reason is worth a check of its own: it used to
+// return 0 at once, so a program that polled something with a sleep between
+// tries became a busy loop that looked like it was pacing itself.
+fn test_nanosleep() {
+  sleepreq[0] = 0
+  sleepreq[1] = 20_000_000        // 20ms
+  check_failed(@intFromPtr("nanosleep refuses rather than not sleeping"),
+               sys.sys_nanosleep(@intFromPtr(&sleepreq), 0))
+}
+
+// The calls that are not implemented must say so. Returning 0 is what the
+// register was about: a caller has to be able to tell.
+fn test_refusals() {
+  var pipefd: [u32; 2] = undefined
+  check_failed(@intFromPtr("pipe refuses rather than inventing descriptors"),
+               sys.sys_pipe(@intFromPtr(&pipefd)))
+  check_failed(@intFromPtr("dup refuses rather than returning a number"),
+               sys.sys_dup(1))
+  check_failed(@intFromPtr("socket refuses rather than returning 0"),
+               sys.sys_socket(2, 1, 0))
+}
+
+export fn _start(argc: u64, argv: u64): never {
+  test_stat()
+  test_links()
+  test_symlink()
+  test_rename()
+  test_access()
+  test_cwd()
+  test_getdents()
+  test_removal_leaves_a_hole()
+  test_getppid()
+  test_truncate()
+  test_nanosleep()
+  test_refusals()
+
+  libc.puts("md-suite: ")
+  libc.put_u64(@as(u64, passed))
+  libc.putc(47)
+  libc.put_u64(@as(u64, total))
+  libc.puts(" passed\n")
+
+  if passed == total {
+    libc.puts("md-suite: every check passed\n")
+    libc.flush()
+    libc.exit(0)
+  }
+  libc.puts("md-suite: some checks failed\n")
+  libc.flush()
+  libc.exit(1)
+}

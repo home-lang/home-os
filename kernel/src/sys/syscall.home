@@ -11,6 +11,7 @@ import "../security/seccomp.home" as seccomp
 import "../security/audit.home" as audit
 import "../security/ptr_safety.home" as ptr_safety
 import "../perf/async_io.home" as async_io
+import "../drivers/timer.home" as timer
 
 // Seccomp return values for reference
 const SECCOMP_RET_ALLOW: u32 = 0x7FFF0000
@@ -66,6 +67,16 @@ const SYS_MKNOD: u32 = 21
 const SYS_SOCKET: u32 = 22
 const SYS_BIND: u32 = 23
 const SYS_IOCTL: u32 = 24
+// Two calls userspace makes that this table did not name. They worked only
+// because arch/x86_64/usermode.home answers them before falling through to
+// the dispatcher here — but the numbers they used were 24 and 64, which this
+// table already spends on ioctl and sigprocmask. userland/lib/sys.home says
+// the two lists are the ABI; a number meaning one thing in one and something
+// else in the other is that promise broken, and it would have come due the
+// first time an interception moved.
+const SYS_YIELD: u32 = 108
+const SYS_SIGRETURN: u32 = 109
+
 const SYS_CAPGET: u32 = 25
 const SYS_CAPSET: u32 = 26
 const SYS_SETTIMEOFDAY: u32 = 27
@@ -705,8 +716,11 @@ export fn syscall_handler(syscall_num: u32, arg1: u64, arg2: u64, arg3: u64, arg
   return ENOSYS  // Function not implemented
 }
 
-// STUB(S14): the block below validates arguments and returns 0 without doing
-// the work. Each one is indistinguishable from success to its caller.
+// Below here are the calls that used to validate their arguments and return 0
+// without doing the work — indistinguishable from success to a caller. Each
+// is now one of two things: implemented against the VFS, the process table or
+// the timer, or ENOSYS with the reason stated at the site. Nothing here
+// reports having done something it did not do.
 fn sys_reboot(cmd: u32): u64 {
   foundation.serial_write_string("[Syscall] Reboot requested with cmd: ")
   foundation.serial_write_hex(cmd)
@@ -715,56 +729,102 @@ fn sys_reboot(cmd: u32): u64 {
   return 0
 }
 
-fn sys_bind(sockfd: u64, port: u64, addr: u64): u64 {
-  // Placeholder for socket bind
-  return 0
-}
-
+// No socket table joins a descriptor to a connection, so socket() has no
+// descriptor to return and bind() has nothing to bind. socket() returning 0
+// was worse than useless: 0 is standard input, so a program that took the
+// result as a descriptor read the console.
 fn sys_socket(domain: u32, sock_type: u32, protocol: u32): u64 {
-  // Placeholder for socket creation
-  return 0
+  return ENOSYS
 }
 
+fn sys_bind(sockfd: u64, port: u64, addr: u64): u64 {
+  return ENOSYS
+}
+
+// No driver here exposes an ioctl table, so every request is one this kernel
+// does not know — which is what ENOSYS says.
 fn sys_ioctl(fd: u64, cmd: u32, arg: u64): u64 {
-  // Placeholder for ioctl
-  return 0
+  return ENOSYS
 }
 
+// system_time_sec is read by gettimeofday and written by nothing. Accepting a
+// new time and discarding it would make a clock that could be set and never
+// changed.
 fn sys_settimeofday(tv: u64, tz: u64): u64 {
-  // Placeholder for setting time
-  return 0
+  return ENOSYS
 }
 
+// Nothing enforces a resource limit, so accepting one would be a promise
+// about memory and descriptors that nothing keeps.
 fn sys_setrlimit(resource: u32, rlim: u64): u64 {
-  // Placeholder for setting resource limits
-  return 0
+  return ENOSYS
 }
 
 // ============================================================================
 // POSIX File Operations
 // ============================================================================
 
-// Stat structure layout (matches POSIX struct stat)
-const STAT_SIZE: u32 = 144  // Size of stat structure
+// The bytes `stat` writes back. This is home-os's own layout, not Linux's,
+// and userland/lib/sys.home repeats it — the two are the ABI, and a
+// disagreement between them is a field read from the wrong offset.
+//
+//   0  ino        u64
+//   8  mode       u64   permission bits only; the type is its own field
+//   16 kind       u64   1 regular, 2 directory, 3 symlink, 4 device
+//   24 uid        u64
+//   32 gid        u64
+//   40 nlink      u64
+//   48 size       u64
+//   56 blocks     u64
+//   64 atime      u64
+//   72 mtime      u64
+//   80 ctime      u64
+const STAT_SIZE: u32 = 88
+
+// Copy one StatInfo out to a user buffer that has already been range-checked.
+fn stat_write(statbuf: u64, info: *filesystem.StatInfo): u64 {
+  if ptr_safety.ptr_safe_write_u64(statbuf +  0, @as(u64, info.*.ino)) != 0 { return EINVAL }
+  if ptr_safety.ptr_safe_write_u64(statbuf +  8, @as(u64, info.*.mode)) != 0 { return EINVAL }
+  if ptr_safety.ptr_safe_write_u64(statbuf + 16, @as(u64, info.*.file_type)) != 0 { return EINVAL }
+  if ptr_safety.ptr_safe_write_u64(statbuf + 24, @as(u64, info.*.uid)) != 0 { return EINVAL }
+  if ptr_safety.ptr_safe_write_u64(statbuf + 32, @as(u64, info.*.gid)) != 0 { return EINVAL }
+  if ptr_safety.ptr_safe_write_u64(statbuf + 40, @as(u64, info.*.link_count)) != 0 { return EINVAL }
+  if ptr_safety.ptr_safe_write_u64(statbuf + 48, info.*.size) != 0 { return EINVAL }
+  if ptr_safety.ptr_safe_write_u64(statbuf + 56, @as(u64, info.*.blocks)) != 0 { return EINVAL }
+  if ptr_safety.ptr_safe_write_u64(statbuf + 64, info.*.atime) != 0 { return EINVAL }
+  if ptr_safety.ptr_safe_write_u64(statbuf + 72, info.*.mtime) != 0 { return EINVAL }
+  if ptr_safety.ptr_safe_write_u64(statbuf + 80, info.*.ctime) != 0 { return EINVAL }
+  return 0
+}
 
 fn sys_stat(path: u64, statbuf: u64): u64 {
-  // Get file metadata by path
   if path == 0 or statbuf == 0 { return EINVAL }
-  // Would query VFS for inode info and populate statbuf
-  return 0
+  if ptr_safety.ptr_check_range(statbuf, @as(u64, STAT_SIZE)) == 0 { return EINVAL }
+
+  var info: filesystem.StatInfo = undefined
+  if filesystem.vfs_stat(path, &info) != 0 { return ENOENT }
+  return stat_write(statbuf, &info)
 }
 
 fn sys_fstat(fd: u32, statbuf: u64): u64 {
-  // Get file metadata by file descriptor
   if statbuf == 0 { return EINVAL }
-  // Would query VFS for inode info from fd table
-  return 0
+  if ptr_safety.ptr_check_range(statbuf, @as(u64, STAT_SIZE)) == 0 { return EINVAL }
+
+  var info: filesystem.StatInfo = undefined
+  if filesystem.vfs_fstat(fd, &info) != 0 { return ENOENT }
+  return stat_write(statbuf, &info)
 }
 
+// lstat reports on the link itself where stat reports on what it points at.
+// path_resolve follows a symlink at every component including the last, so
+// the difference is made by resolving with following turned off for the leaf.
 fn sys_lstat(path: u64, statbuf: u64): u64 {
-  // Like stat but doesn't follow symlinks
   if path == 0 or statbuf == 0 { return EINVAL }
-  return 0
+  if ptr_safety.ptr_check_range(statbuf, @as(u64, STAT_SIZE)) == 0 { return EINVAL }
+
+  var info: filesystem.StatInfo = undefined
+  if filesystem.vfs_lstat(path, &info) != 0 { return ENOENT }
+  return stat_write(statbuf, &info)
 }
 
 fn sys_unlink(path: u64): u64 {
@@ -776,54 +836,89 @@ fn sys_unlink(path: u64): u64 {
 }
 
 fn sys_link(oldpath: u64, newpath: u64): u64 {
-  // Create a hard link
   if oldpath == 0 or newpath == 0 { return EINVAL }
+  if filesystem.vfs_link(oldpath, newpath) != 0 { return EPERM }
   return 0
 }
 
 fn sys_symlink(target: u64, linkpath: u64): u64 {
-  // Create a symbolic link
   if target == 0 or linkpath == 0 { return EINVAL }
+  if filesystem.vfs_symlink(target, linkpath) != 0 { return EPERM }
   return 0
 }
 
+// The count of bytes written, as readlink(2) gives it — not a status. A path
+// that is not a symlink writes nothing and reports nothing written, which is
+// how a caller tells a link from a file.
 fn sys_readlink(path: u64, buf: u64, bufsiz: u64): u64 {
-  // Read value of a symbolic link
   if path == 0 or buf == 0 { return EINVAL }
-  return 0
+  if bufsiz == 0 { return EINVAL }
+  if ptr_safety.ptr_check_range(buf, bufsiz) == 0 { return EINVAL }
+  return filesystem.vfs_readlink(path, buf, bufsiz)
 }
 
 fn sys_rename(oldpath: u64, newpath: u64): u64 {
-  // Rename a file
   if oldpath == 0 or newpath == 0 { return EINVAL }
+  if filesystem.vfs_rename(oldpath, newpath) != 0 { return EPERM }
   return 0
 }
+
+// R_OK / W_OK / X_OK, checked against the file's own mode and owner. F_OK is
+// mode 0 and asks only whether the path resolves.
+const R_OK: u32 = 4
+const W_OK: u32 = 2
+const X_OK: u32 = 1
 
 fn sys_access(path: u64, mode: u32): u64 {
-  // Check file accessibility
   if path == 0 { return EINVAL }
-  // Would check permissions against current uid/gid
+
+  var info: filesystem.StatInfo = undefined
+  if filesystem.vfs_stat(path, &info) != 0 { return ENOENT }
+  if mode == 0 { return 0 }
+
+  // Which triad applies: owner, group, or other. root is not special here
+  // because there is no root — uid 0 is the only user there is, and giving it
+  // a bypass would make every check pass and mean nothing.
+  var bits: u32 = info.mode & 7
+  if info.uid == @as(u32, sys_getuid()) {
+    bits = (info.mode >> 6) & 7
+  } else if info.gid == @as(u32, sys_getgid()) {
+    bits = (info.mode >> 3) & 7
+  }
+
+  if (mode & R_OK) != 0 { if (bits & 4) == 0 { return EPERM } }
+  if (mode & W_OK) != 0 { if (bits & 2) == 0 { return EPERM } }
+  if (mode & X_OK) != 0 { if (bits & 1) == 0 { return EPERM } }
   return 0
 }
 
+// The VFS changes mode and owner by path, and a descriptor does not carry the
+// path it was opened on — resolving one again could reach a different file,
+// which is the exact race fchmod exists to avoid. Refused rather than done
+// against the wrong file.
 fn sys_fchmod(fd: u32, mode: u32): u64 {
-  // Change mode of file by fd
-  return 0
+  return ENOSYS
 }
 
 fn sys_fchown(fd: u32, owner: u32, group: u32): u64 {
-  // Change owner of file by fd
-  return 0
+  return ENOSYS
 }
 
 fn sys_truncate(path: u64, length: u64): u64 {
-  // Truncate file to length by path
   if path == 0 { return EINVAL }
+  let fd: u32 = filesystem.vfs_open(path, 1, 0)   // O_WRONLY
+  if fd == 0 { return ENOENT }
+  let rc: u32 = filesystem.vfs_ftruncate(fd, length)
+  filesystem.vfs_close(fd)
+  // vfs_ftruncate answers 1 for success, not 0 — the opposite of vfs_unlink
+  // and vfs_link beside it. Reading it the other way would have turned every
+  // successful truncate into EPERM, and every failure into success.
+  if rc == 0 { return EPERM }
   return 0
 }
 
 fn sys_ftruncate(fd: u32, length: u64): u64 {
-  // Truncate file to length by fd
+  if filesystem.vfs_ftruncate(fd, length) == 0 { return EPERM }
   return 0
 }
 
@@ -835,16 +930,36 @@ fn sys_ftruncate(fd: u32, length: u64): u64 {
 var process_cwd: [256][256]u8 = undefined  // CWD for each process
 var process_cwd_len: [256]u32 = undefined  // Length of CWD
 
+// The working directory is remembered here and reported by getcwd. It is not
+// yet *used*: path_resolve walks from the root and has no notion of a
+// relative path, so chdir changes what getcwd says and nothing else. That is
+// stated rather than hidden — a shell can track its own directory against
+// this, and a relative open still fails to resolve rather than resolving
+// somewhere unintended.
 fn sys_chdir(path: u64): u64 {
-  // Change current directory
   if path == 0 { return EINVAL }
-  // Would verify path exists and is directory, then update process CWD
+  if current_pid >= 256 { return EINVAL }
+
+  var info: filesystem.StatInfo = undefined
+  if filesystem.vfs_stat(path, &info) != 0 { return ENOENT }
+  if info.file_type != 2 { return EINVAL }   // FILE_TYPE_DIRECTORY
+
+  var n: u32 = 0
+  loop {
+    if n >= 255 { return EINVAL }
+    let c: u8 = @as(*u8, @ptrFromInt(path + @as(u64, n))).*
+    process_cwd[current_pid][n] = c
+    if c == 0 { break }
+    n = n + 1
+  }
+  process_cwd_len[current_pid] = n
   return 0
 }
 
+// A descriptor does not carry the path it was opened on, so there is nothing
+// here to record as the working directory.
 fn sys_fchdir(fd: u32): u64 {
-  // Change directory by file descriptor
-  return 0
+  return ENOSYS
 }
 
 fn sys_getcwd(buf: u64, size: u64): u64 {
@@ -862,22 +977,83 @@ fn sys_getcwd(buf: u64, size: u64): u64 {
     return EINVAL
   }
 
-  // Safe write to user buffer
-  if ptr_safety.ptr_safe_write_u8(buf, '/') != 0 {
-    return EINVAL
-  }
-  if ptr_safety.ptr_safe_write_u8(buf + 1, 0) != 0 {
-    return EINVAL
+  // Whatever chdir last recorded, or "/" for a process that has not called
+  // it. This used to answer "/" unconditionally, so a chdir that succeeded
+  // was invisible from the other side.
+  if current_pid >= 256 { return EINVAL }
+  var len: u32 = process_cwd_len[current_pid]
+  if len == 0 {
+    if size < 2 { return EINVAL }
+    if ptr_safety.ptr_safe_write_u8(buf, '/') != 0 { return EINVAL }
+    if ptr_safety.ptr_safe_write_u8(buf + 1, 0) != 0 { return EINVAL }
+    return buf
   }
 
-  return buf  // Return buf on success
+  if @as(u64, len) + 1 > size { return EINVAL }
+  var i: u32 = 0
+  while i < len {
+    if ptr_safety.ptr_safe_write_u8(buf + @as(u64, i), process_cwd[current_pid][i]) != 0 {
+      return EINVAL
+    }
+    i = i + 1
+  }
+  if ptr_safety.ptr_safe_write_u8(buf + @as(u64, len), 0) != 0 { return EINVAL }
+  return buf
 }
 
-fn sys_getdents(fd: u32, dirp: u64, count: u32): u64 {
-  // Read directory entries
-  if dirp == 0 { return EINVAL }
-  // Would read directory entries from VFS
-  return 0
+// One entry as getdents writes it back, and as userland/lib/sys.home reads
+// it. Fixed-width, so a caller steps through with an index rather than
+// chasing a record length — the variable-length form buys nothing here and
+// costs a field that has to be trusted.
+//
+//   0   ino     u64
+//   8   kind    u64   1 regular, 2 directory, 3 symlink, 4 device
+//   16  size    u64
+//   24  name    256 bytes, NUL-terminated
+const DIRENT_SIZE: u64 = 280
+
+// Where vfs_readdir puts its answer before it is copied out. Static, not a
+// local: a DirEntryInfo is 272 bytes and 256 of them are 69KB, which is more
+// than the kernel stack has. Only one syscall runs at a time, so there is one
+// of these.
+var getdents_scratch: [filesystem.DirEntryInfo; 256] = undefined
+
+// Read a directory by path rather than by descriptor: vfs_readdir takes a
+// path, and a descriptor does not carry the one it was opened on. `dirfd` is
+// therefore the path, which is why this is spelled getdents_path in
+// userland/lib/sys.home — calling it getdents and taking a path would be a
+// name that lies about its argument.
+fn sys_getdents(path: u64, dirp: u64, count: u32): u64 {
+  if path == 0 or dirp == 0 { return EINVAL }
+  if count == 0 { return 0 }
+  // The caller says how many entries its buffer holds, and that number is
+  // what decides how far this writes. Refuse one larger than the scratch
+  // below can fill, so the count can never name more than the multiply used
+  // in the range check accounts for.
+  if count > 256 { return EINVAL }
+  if ptr_safety.ptr_check_range(dirp, @as(u64, count) * DIRENT_SIZE) == 0 {
+    return EINVAL
+  }
+
+  var got: u32 = filesystem.vfs_readdir(path, &getdents_scratch, 256)
+  if got > count { got = count }
+
+  var i: u32 = 0
+  while i < got {
+    let out: u64 = dirp + @as(u64, i) * DIRENT_SIZE
+    if ptr_safety.ptr_safe_write_u64(out, @as(u64, getdents_scratch[i].ino)) != 0 { return EINVAL }
+    if ptr_safety.ptr_safe_write_u64(out + 8, @as(u64, getdents_scratch[i].file_type)) != 0 { return EINVAL }
+    if ptr_safety.ptr_safe_write_u64(out + 16, getdents_scratch[i].size) != 0 { return EINVAL }
+    var n: u32 = 0
+    while n < 256 {
+      let c: u8 = getdents_scratch[i].name[n]
+      if ptr_safety.ptr_safe_write_u8(out + 24 + @as(u64, n), c) != 0 { return EINVAL }
+      if c == 0 { break }
+      n = n + 1
+    }
+    i = i + 1
+  }
+  return @as(u64, got)
 }
 
 // ============================================================================
@@ -893,9 +1069,10 @@ var process_pgid: [256]u32 = undefined
 var process_sid: [256]u32 = undefined
 
 fn sys_getppid(): u64 {
-  // Get parent process ID
-  // Would look up parent_pid from process table
-  return 1  // Return init as default parent
+  // The process table's answer, not a constant. Returning 1 unconditionally
+  // told every child that init was its parent, which is only true of init's
+  // own children — a process could not tell who forked it.
+  return @as(u64, process.process_get_parent(current_pid))
 }
 
 fn sys_getuid(): u64 {
@@ -960,17 +1137,16 @@ fn sys_getsid(pid: u32): u64 {
   return @as(u64, process_sid[target_pid])
 }
 
+// A process has a uid and a gid and no supplementary groups: there is no list
+// to report, and reporting a count of zero is the true answer rather than a
+// stub. Setting one is refused, because a permission check that consulted a
+// list nothing stores would pass or fail at random.
 fn sys_getgroups(size: u32, list: u64): u64 {
-  // Get supplementary group IDs
-  if size == 0 {
-    return 0  // Return count of groups
-  }
   return 0
 }
 
 fn sys_setgroups(size: u32, list: u64): u64 {
-  // Set supplementary group IDs (requires CAP_SETGID)
-  return 0
+  return ENOSYS
 }
 
 // ============================================================================
@@ -1074,10 +1250,28 @@ fn sys_clock_getres(clk_id: u32, res: u64): u64 {
   return 0
 }
 
+// Sleeping needs a clock that runs while the sleeper does not, and a state to
+// be put into meanwhile. There is neither.
+//
+// timer_ticks advances in irq_handler on IRQ0, and a syscall arrives through
+// an interrupt gate, which clears IF — so nothing ticks between entering this
+// call and leaving it. A spin on the tick count is not a slow sleep, it is a
+// hang: the value being waited for is the one thing that cannot change while
+// the wait runs. Halting instead is worse, since hlt with interrupts masked
+// never wakes at all.
+//
+// Enabling interrupts for the duration would let the clock run, and would
+// also let the timer land on this kernel stack with a syscall frame live on
+// it, which is the thing the interrupt gate exists to prevent. That is a
+// scheduler change (S13), not a nanosleep change.
+//
+// So this refuses. Returning 0 at once — which is what it did — told a
+// program it had slept when no time had passed, and a program that polls
+// something with a sleep between tries became a busy loop that looked
+// correct.
 fn sys_nanosleep(req: u64, rem: u64): u64 {
   if req == 0 { return EINVAL }
-  // Would sleep for specified duration using timer
-  return 0
+  return ENOSYS
 }
 
 // ============================================================================
@@ -1101,23 +1295,26 @@ const SA_SIGINFO: u32 = 4
 const SA_RESTART: u32 = 0x10000000
 const SA_RESETHAND: u32 = 0x80000000
 
+// Signal delivery is in arch/x86_64/usermode.home, which rewrites the frame
+// the syscall stub returns through — that is the path a ring-3 program\'s
+// sigaction reaches, because the dispatcher there handles it before falling
+// through to this table. Installing a handler here would record it where
+// nothing consults it, and the program would wait for a signal that this
+// module alone believed was armed.
 fn sys_sigaction(signum: u32, act: u64, oldact: u64): u64 {
   if signum == SIGKILL or signum == SIGSTOP {
     return EINVAL  // Cannot change SIGKILL or SIGSTOP
   }
-  // Would install signal handler
-  return 0
+  return ENOSYS
 }
 
 fn sys_sigprocmask(how: u32, set: u64, oldset: u64): u64 {
-  // Change blocked signals
-  return 0
+  return ENOSYS
 }
 
 fn sys_sigpending(set: u64): u64 {
-  // Get pending signals
   if set == 0 { return EINVAL }
-  return 0
+  return ENOSYS
 }
 
 fn sys_sigsuspend(mask: u64): u64 {
@@ -1147,11 +1344,14 @@ const MADV_SEQUENTIAL: u32 = 2
 const MADV_WILLNEED: u32 = 3
 const MADV_DONTNEED: u32 = 4
 
+// Changing protection means rewriting the present/writable/no-execute bits on
+// every page in the range and flushing the TLB. memory.home maps and unmaps
+// pages but does not re-flag one in place, so there is nothing here to call.
+// Returning success left a program believing a page had been made read-only
+// and writing to it anyway.
 fn sys_mprotect(addr: u64, len: u64, prot: u32): u64 {
-  // Change memory protection
-  if (addr & 0xFFF) != 0 { return EINVAL }  // Must be page-aligned
-  // Would update page table entries
-  return 0
+  if (addr & 0xFFF) != 0 { return EINVAL }
+  return ENOSYS
 }
 
 fn sys_msync(addr: u64, length: u64, flags: u32): u64 {
@@ -1207,29 +1407,36 @@ fn sys_accept(sockfd: u32, addr: u64, addrlen: u64): u64 {
   return 0
 }
 
+// There is a TCP stack and a UDP stack, and there is no socket table joining
+// a descriptor to a connection in either — sys_socket below hands out no
+// descriptor to join. So these four have nothing to send on and nothing to
+// receive from.
+//
+// send returning `len` was the worst of the twenty: a program that sent a
+// buffer was told every byte went out. recv returning 0 was read as a closed
+// connection, so a reader stopped rather than hung — the same wrong answer,
+// quieter.
 fn sys_send(sockfd: u32, buf: u64, len: u64, flags: u32): u64 {
   if buf == 0 { return EINVAL }
-  return len  // Would send data
+  return ENOSYS
 }
 
 fn sys_recv(sockfd: u32, buf: u64, len: u64, flags: u32): u64 {
   if buf == 0 { return EINVAL }
-  return 0  // Would receive data
+  return ENOSYS
 }
 
 fn sys_sendto(sockfd: u32, buf: u64, len: u64, flags: u32): u64 {
-  // Send to specific address (UDP)
-  return len
+  return ENOSYS
 }
 
 fn sys_recvfrom(sockfd: u32, buf: u64, len: u64, flags: u32): u64 {
-  // Receive with sender address (UDP)
-  return 0
+  return ENOSYS
 }
 
 fn sys_shutdown(sockfd: u32, how: u32): u64 {
   if how > SHUT_RDWR { return EINVAL }
-  return 0
+  return ENOSYS
 }
 
 fn sys_getsockopt(sockfd: u32, level: u32, optname: u32, optval: u64): u64 {
@@ -1282,15 +1489,17 @@ const EPOLLET: u32 = 0x80000000
 var epoll_instances: [64]u32 = undefined
 var epoll_count: u32 = 0
 
+// Waiting for a descriptor to become ready needs descriptors that can be not
+// ready. Every file here reads immediately and every write completes, so
+// there is nothing to wait on — and 0 means "timed out, nothing ready",
+// which a caller loops on forever.
 fn sys_poll(fds: u64, nfds: u32, timeout: i32): u64 {
   if fds == 0 and nfds > 0 { return EINVAL }
-  // Would poll file descriptors for events
-  return 0
+  return ENOSYS
 }
 
 fn sys_select(nfds: u32, readfds: u64, writefds: u64, exceptfds: u64): u64 {
-  // Select on file descriptors
-  return 0
+  return ENOSYS
 }
 
 fn sys_epoll_create(size: u32): u64 {
@@ -1310,8 +1519,7 @@ fn sys_epoll_ctl(epfd: u32, op: u32, fd: u32, event: u64): u64 {
 
 fn sys_epoll_wait(epfd: u32, events: u64, maxevents: u32, timeout: i32): u64 {
   if events == 0 or maxevents == 0 { return EINVAL }
-  // Would wait for events
-  return 0
+  return ENOSYS
 }
 
 fn sys_eventfd(initval: u32, flags: u32): u64 {
@@ -1338,62 +1546,43 @@ fn sys_timerfd_gettime(fd: u32, curr_value: u64): u64 {
 // File Descriptor Operations
 // ============================================================================
 
+// A duplicate is a second descriptor onto the same open file, sharing its
+// offset — which needs the open-file table to be reference-counted from the
+// descriptor side, and it is not: closing either copy would close the file
+// under the other. dup2 returning `newfd` was the plausible-looking lie, since
+// the number it returns is the number the caller asked for.
 fn sys_dup(oldfd: u32): u64 {
-  // Duplicate file descriptor
-  return 0  // Would return new fd
+  return ENOSYS
 }
 
 fn sys_dup2(oldfd: u32, newfd: u32): u64 {
-  // Duplicate to specific fd
-  return @as(u64, newfd)
+  return ENOSYS
 }
 
 fn sys_dup3(oldfd: u32, newfd: u32, flags: u32): u64 {
-  // Duplicate with flags
   if oldfd == newfd { return EINVAL }
-  return @as(u64, newfd)
+  return ENOSYS
 }
 
 // Pipe tracking
 var pipe_count: u32 = 0
 
+// A pipe is a kernel buffer with a reader and a writer, and there is no
+// object here to be one: this handed back descriptor numbers 200, 201, 202…
+// counted up from a global, and nothing in the VFS answered to them. A write
+// to the write end went nowhere and a read from the read end returned 0,
+// which reads as end-of-file — so a shell built on this saw every pipeline
+// produce empty output and no error.
+//
+// den's pipelines run in stages through a holding file instead, which is why
+// this being absent does not stop them (MASTER_PLAN §7, S12).
 fn sys_pipe(pipefd: u64): u64 {
   if pipefd == 0 { return EINVAL }
-
-  // Validate user-space pointer
-  if ptr_safety.ptr_is_user(pipefd) == 0 {
-    foundation.serial_write_string("[Syscall] pipe: invalid user buffer\n")
-    return EINVAL
-  }
-
-  // Validate range for two u32 values (8 bytes)
-  if ptr_safety.ptr_check_range(pipefd, 8) == 0 {
-    return EINVAL
-  }
-
-  // Validate alignment for u32 access
-  if ptr_safety.ptr_is_aligned_u32(pipefd) == 0 {
-    foundation.serial_write_string("[Syscall] pipe: unaligned buffer\n")
-    return EINVAL
-  }
-
-  // Safe write to user buffer
-  var read_fd: u32 = 200 + pipe_count * 2      // Read end
-  var write_fd: u32 = 200 + pipe_count * 2 + 1 // Write end
-
-  if ptr_safety.ptr_safe_write_u32(pipefd, read_fd) != 0 {
-    return EINVAL
-  }
-  if ptr_safety.ptr_safe_write_u32(pipefd + 4, write_fd) != 0 {
-    return EINVAL
-  }
-
-  pipe_count = pipe_count + 1
-  return 0
+  return ENOSYS
 }
 
 fn sys_pipe2(pipefd: u64, flags: u32): u64 {
-  return sys_pipe(pipefd)  // Would handle flags
+  return sys_pipe(pipefd)
 }
 
 // Fcntl commands
