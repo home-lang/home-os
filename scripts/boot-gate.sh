@@ -34,8 +34,16 @@ MILESTONES="$REPO_ROOT/scripts/boot-milestones.txt"
 # boot itself and for the last command to run. And the wait loop below now
 # says outright when it hit the deadline, so a short run never again has to be
 # diagnosed from its consequences.
+BOOT_TIMEOUT="${BOOT_TIMEOUT:-120}"
+
+# The main run is the exception: it feeds boot-commands.txt one line every two
+# seconds, so its deadline has to outlast the feed and grows with the file.
+# The other phases below — the USB keyboard run, the S3 suspend run — send a
+# keystroke or a monitor command and wait for one line, so giving them the
+# feed's deadline only made a phase that fails take three times as long to
+# say so.
 _feed_lines="$(grep -cvE '^[[:space:]]*(#|$)' "$SCRIPT_DIR/boot-commands.txt" 2>/dev/null || echo 0)"
-BOOT_TIMEOUT="${BOOT_TIMEOUT:-$(( _feed_lines * 2 + 120 ))}"
+FEED_TIMEOUT="${FEED_TIMEOUT:-$(( _feed_lines * 2 + 120 ))}"
 
 VERBOSE=0
 KEEP=0
@@ -349,7 +357,7 @@ SHOT="${BOOT_SCREENSHOT:-$workdir/screen.ppm}"
         printf '%s\n' "$cmd"
         sleep 2
     done < "$SCRIPT_DIR/boot-commands.txt"
-    sleep "$BOOT_TIMEOUT"
+    sleep "$FEED_TIMEOUT"
 } | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" \
     -drive file="$disk",format=raw,if=ide,index=0 \
     -drive file="$fsdisk",format=raw,if=ide,index=1,cache=writethrough \
@@ -429,18 +437,28 @@ keypress_pid=$!
 # starts listening when the shell reaches the `nets` command.
 (
     nwait=0
-    while [ "$nwait" -lt "$BOOT_TIMEOUT" ]; do
+    # The guest reaches `nets` at the very end of boot-commands.txt, so this
+    # has to outlast the whole feed — BOOT_TIMEOUT is what one boot takes, not
+    # what the command list takes, and with it this loop gave up while the
+    # kernel still had sixty commands to go and then dialled a port nothing
+    # was listening on.
+    while [ "$nwait" -lt "$FEED_TIMEOUT" ]; do
         if [ -s "$log" ] && grep -qF '[NET] listening on 7002' "$log" 2>/dev/null; then
             break
         fi
         sleep 1
         nwait=$(( nwait + 1 ))
     done
-    python3 - "$ECHO_FWD_PORT" > "$workdir/echo-client.log" 2>&1 <<'ECHOCLI'
+    python3 - "$ECHO_FWD_PORT" "$FEED_TIMEOUT" > "$workdir/echo-client.log" 2>&1 <<'ECHOCLI'
 import socket, sys, time
 # The same pattern the kernel builds: 'A' + (i * 7) % 26, 32 bytes.
 payload = bytes((65 + (i * 7) % 26) for i in range(32))
-deadline = time.time() + 60
+# How long to keep trying, handed in rather than guessed. Sixty seconds was
+# generous when the command list was thirty commands long; it is now a
+# hundred-odd at two seconds each, and the client was giving up long before
+# the guest reached the command that listens. The echo server above already
+# carries the same lesson in its own comment.
+deadline = time.time() + float(sys.argv[2])
 while time.time() < deadline:
     try:
         c = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5)
@@ -476,10 +494,10 @@ echo_client_pid=$!
 last_milestone="$(grep -vE '^\s*(#|$)' "$MILESTONES" | tail -n 1 | sed 's/^ *//; s/ *$//')"
 [ -n "$last_milestone" ] || { echo "error: $MILESTONES has no entries" >&2; exit 2; }
 
-deadline=$(( $(date +%s) + $BOOT_TIMEOUT ))
+deadline=$(( $(date +%s) + $FEED_TIMEOUT ))
 cut_short=1
 while kill -0 "$qemu_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
-    if [ -s "$log" ] && grep -qF "$last_milestone" "$log" 2>/dev/null; then
+    if [ -s "$log" ] && grep -qF -e "$last_milestone" "$log" 2>/dev/null; then
         cut_short=0
         break
     fi
@@ -489,8 +507,8 @@ if [ "$cut_short" = 1 ]; then
     # Say this before any check runs. Every failure that follows is a
     # consequence of the run ending early, and reading them as defects in what
     # they name has cost this gate two separate debugging sessions.
-    echo "boot-gate: the run hit its ${BOOT_TIMEOUT}s deadline without reaching the last milestone." >&2
-    echo "boot-gate: every failure below may be a command that never ran. Raise BOOT_TIMEOUT and re-run before believing any of them." >&2
+    echo "boot-gate: the run hit its ${FEED_TIMEOUT}s deadline without reaching the last milestone." >&2
+    echo "boot-gate: every failure below may be a command that never ran. Raise FEED_TIMEOUT and re-run before believing any of them." >&2
 fi
 kill "$qemu_pid" 2>/dev/null
 wait "$qemu_pid" 2>/dev/null
@@ -518,7 +536,13 @@ while IFS= read -r line; do
     # byte. Without it grep answers "Binary file ... matches" instead of an
     # offset, and the arithmetic below then evaluates the word "file" as a
     # variable name and aborts the gate under set -u.
-    pos="$(tail -c +"$((last_pos + 1))" "$log" | grep -abF -m1 "$line" 2>/dev/null | head -1 | cut -d: -f1)"
+    # -e, not a bare argument: a milestone may begin with a dash, and grep
+    # reads that as an option rather than a pattern. `- 26 linktarget.txt`
+    # made it error out and report nothing found — which is indistinguishable
+    # here from the kernel never printing the line, so a whole class of
+    # milestone strings was silently unmatchable and looked like a failing
+    # kernel instead of a failing gate.
+    pos="$(tail -c +"$((last_pos + 1))" "$log" | grep -abF -m1 -e "$line" 2>/dev/null | head -1 | cut -d: -f1)"
     if [ -n "$pos" ]; then
         reached=$((reached + 1))
         last_pos=$((last_pos + pos + ${#line}))
