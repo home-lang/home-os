@@ -29,9 +29,18 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Resolved the way every other gate resolves it. This one alone demanded the
+# variable be set, so running the gates in a row worked for six of them and
+# stopped at this one with an error that reads like a missing toolchain rather
+# than a script that declined to look.
 HOME_COMPILER="${HOME_COMPILER:-}"
-[ -n "$HOME_COMPILER" ] && [ -x "$HOME_COMPILER" ] || {
-    echo "error: set HOME_COMPILER to the Home compiler" >&2; exit 2; }
+if [ -z "$HOME_COMPILER" ]; then
+    for root in "${HOME_REPO:-}" "$REPO_ROOT/../home" "$REPO_ROOT/../lang"; do
+        [ -z "$root" ] && continue
+        if [ -x "$root/zig-out/bin/home" ]; then HOME_COMPILER="$root/zig-out/bin/home"; break; fi
+    done
+fi
+[ -x "$HOME_COMPILER" ] || { echo "error: home compiler not found (set HOME_COMPILER)" >&2; exit 2; }
 
 QEMU="${QEMU:-}"
 if [ -z "$QEMU" ]; then
