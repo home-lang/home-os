@@ -21,7 +21,14 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BOOT_TIMEOUT="${BOOT_TIMEOUT:-120}"
+# How long to wait for the console prompt before giving up.
+#
+# 120 was enough when the boot was shorter. It is not now — the boot runs more
+# self-tests than it did, including a modular exponentiation — and when the
+# wait expired this script fed its whole script into a machine that was not
+# listening and reported that every command was missing. A gate that blames
+# the shell for its own impatience is worse than a slow one.
+BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"
 
 VERBOSE=0
 KEEP=0
@@ -186,6 +193,12 @@ PROMPT = 'home-os> '
 # boot log that arrived while the console sat idle.
 out = []
 cursor = 0
+if PROMPT not in raw:
+    out.append('<<den-conform: the console never reached a prompt. The boot may '
+               'have taken longer than BOOT_TIMEOUT, in which case the script '
+               'was fed to a machine that was not listening yet.>>')
+    commands = []
+
 for cmd in commands:
     echo = raw.find(cmd + '\n', cursor)
     if echo < 0:
