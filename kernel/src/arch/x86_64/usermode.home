@@ -10,6 +10,7 @@ import "../../core/memory.home" as memory
 import "../../core/filesystem.home" as filesystem
 import "../../sys/syscall.home" as syscall
 import "../../loader/elf.home" as elf
+import "../../drivers/timer.home" as timer
 
 // Where a user program is mapped. Well clear of the identity-mapped kernel,
 // and inside the first PML4 slot so the existing tables are reused.
@@ -54,6 +55,7 @@ const SYS_CHDIR: u64 = 44
 const SYS_GETCWD: u64 = 46
 const SYS_GETDENTS: u64 = 47
 const SYS_NANOSLEEP: u64 = 62
+const SYS_CLOCK_GETTIME: u64 = 60
 const SYS_CHMOD: u64 = 38
 const SYS_CHOWN: u64 = 39
 
@@ -533,6 +535,10 @@ const USER_EFAULT: u64 = 0xFFFF_FFFF_FFFF_FFF2
 // so a caller testing for failure sees one.
 const USER_EPIPE: u64 = 0xFFFF_FFFF_FFFF_FFE0
 
+// -22, EINVAL: an argument that is the wrong shape rather than the wrong
+// address.
+const USER_EINVAL: u64 = 0xFFFF_FFFF_FFFF_FFEA
+
 // Which end of a pipe a descriptor is, matching core/filesystem.home.
 const PIPE_END_READ: u32 = 1
 const PIPE_END_WRITE: u32 = 2
@@ -896,6 +902,16 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
     }
   }
 
+  // clock_gettime writes two u64s through arg2.
+  if nr == SYS_CLOCK_GETTIME {
+    if user_range_ok(a2, 16) == 0 {
+      foundation.serial_write_string("[User] EFAULT: clock buffer ")
+      foundation.serial_write_ptr(a2)
+      foundation.serial_write_string("\n")
+      return USER_EFAULT
+    }
+  }
+
   // nanosleep reads two u64s through arg1. arg2 is where what is left of the
   // sleep would be written, and 0 there means the caller does not want it —
   // which is why it is checked only when it is not 0.
@@ -917,6 +933,22 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
   // and getppid() was 1 for every process, whoever asked.
   if nr == SYS_GETPID { return @as(u64, current_task) }
   if nr == SYS_GETPPID { return @as(u64, task_parent[current_task]) }
+
+  // Sleeping needs a clock that runs while the sleeper does not.
+  //
+  // This refused until the timer could preempt, and the reason was exact:
+  // timer_ticks advances in the interrupt handler, a syscall arrives through
+  // an interrupt gate, which clears IF, and so nothing ticked between
+  // entering the call and leaving it. Spinning on the tick count waited on
+  // the one value that could not change.
+  //
+  // What changed is that interrupts can now be let in *here* safely. A timer
+  // interrupt arriving inside a syscall finds CS at ring 0 and does not
+  // switch tasks — preempt_from_irq refuses anything but ring 3 — so it
+  // advances the clock and returns to this loop, which is all that was
+  // missing. The frame's own RFLAGS is what iretq restores on the way out, so
+  // letting them in here does not leak out of the call.
+  if nr == SYS_NANOSLEEP { return do_nanosleep(a1, a2) }
 
   if nr == SYS_FORK { return do_fork(frame) }
   if nr == SYS_SIGACTION { return do_signal(a1, a2, a3) }
@@ -1309,6 +1341,62 @@ export fn release_task_pipe_ends(task: u32) {
       task_stdout[task] = 0
     }
   }
+}
+
+// Sleep for the interval at `req`: two u64s, seconds then nanoseconds.
+//
+// Interrupts are let in for the duration so the clock advances, and other
+// runnable tasks are given the CPU rather than burned through — a sleeping
+// task has nothing to do, and holding the machine while waiting is the thing
+// sleeping is supposed to avoid.
+fn do_nanosleep(req: u64, rem: u64): u64 {
+  if req == 0 { return USER_EFAULT }
+
+  let sec: u64 = @as(*u64, @ptrFromInt(req)).*
+  let nsec: u64 = @as(*u64, @ptrFromInt(req + 8)).*
+  if nsec >= 1_000_000_000 { return USER_EINVAL }
+
+  let want_ms: u64 = sec * 1000 + nsec / 1_000_000
+  if want_ms == 0 { return 0 }
+
+  let start: u64 = timer.timer_get_milliseconds()
+  foundation.sti()
+
+  // If the clock does not move, this must not wait for ever. It did once:
+  // the driver's tick was advanced only from a handler nothing called, so
+  // timer_get_milliseconds answered with the same number every time and this
+  // loop had no way out. A sleep that gives up and says so costs a program
+  // its pacing; a sleep that never returns costs the machine.
+  var spins: u64 = 0
+  loop {
+    if timer.timer_get_milliseconds() - start >= want_ms { break }
+    if spins > 200_000_000 {
+      foundation.cli()
+      foundation.serial_write_string("[sleep] the clock is not advancing\n")
+      return USER_EINVAL
+    }
+    spins = spins + 1
+
+    // Someone else's turn. next_runnable answering with this task means
+    // there is nobody else, and then the wait is simply spent here.
+    //
+    // The switch itself runs with interrupts off, as every other switch
+    // does: process_switch changes stacks, and a timer landing halfway
+    // through that would be running on neither of them.
+    if next_runnable(current_task) != current_task {
+      foundation.cli()
+      scheduler_yield()
+      foundation.sti()
+    }
+  }
+  foundation.cli()
+
+  // Nothing interrupts this sleep, so nothing is ever left of it.
+  if rem != 0 {
+    @as(*u64, @ptrFromInt(rem)).* = 0
+    @as(*u64, @ptrFromInt(rem + 8)).* = 0
+  }
+  return 0
 }
 
 // ============================================================================
