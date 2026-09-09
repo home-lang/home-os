@@ -27,16 +27,23 @@ LIST=0
 # Rows look like:  | S2 | description | `path/to/file` | P1 | gate |
 # CLOSED entries are marked in the description and are not expected in source.
 declare -a IDS PATHS
+# Rows read, open or closed. Counted separately from the open ones because an
+# empty IDS means two very different things: a register in which every entry
+# is closed, which is the goal, and a table this script could not read, which
+# is a broken gate. It reported the second for the first the day S9 closed and
+# the last open entry went away.
+rows=0
 while IFS='|' read -r _ id desc path _rest; do
     id="$(echo "$id" | tr -d ' ')"
     case "$id" in S[0-9]*) ;; *) continue ;; esac
+    rows=$(( rows + 1 ))
     path="$(echo "$path" | tr -d ' `')"
     if echo "$desc" | grep -qi 'closed'; then continue; fi
     IDS+=("$id")
     PATHS+=("$path")
 done < <(grep -E '^\| S[0-9]+ \|' "$PLAN")
 
-if [ "${#IDS[@]}" -eq 0 ]; then
+if [ "$rows" -eq 0 ]; then
     echo "error: no stub-register rows parsed from $PLAN §7" >&2
     exit 2
 fi
@@ -102,5 +109,9 @@ if [ "$violations" -gt 0 ]; then
     exit 1
 fi
 
-echo "stub-register OK — ${#IDS[@]} open entries, all marked and placed correctly"
+if [ "${#IDS[@]}" -eq 0 ]; then
+    echo "stub-register OK — $rows entries, none open"
+    exit 0
+fi
+echo "stub-register OK — ${#IDS[@]} of $rows entries open, all marked and placed correctly"
 exit 0

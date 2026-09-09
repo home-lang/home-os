@@ -31,8 +31,8 @@ export fn hlt() {
 // memory-mapped registers. There is nothing to emulate here, and returning a
 // plausible value would leave a driver that reads as working and touches no
 // hardware — the exact failure this tree registers stubs to avoid. The ARM64
-// branch stops the machine instead, and the fix is that ARM64 code paths do
-// not call these at all. See STUB(S9).
+// branch stops the machine instead — saying so on the way down — and the fix
+// is that ARM64 code paths do not call these at all.
 export fn outb(port: u16, value: u8) {
   if @targetIs("x86_64") {
     asm volatile ("outb %[value], %[port]"
@@ -114,11 +114,24 @@ export fn outl(port: u16, value: u32) {
   }
 }
 
-// STUB(S9): reached only when ARM64 code calls a port-I/O wrapper, which is
-// always a bug — the architecture has no I/O address space. Stopping is the
-// loudest thing available here: this module has no serial output of its own
-// on ARM64 yet, so there is nothing to print the reason to.
+// Reached only when ARM64 code calls a port-I/O wrapper, which is always a
+// bug — the architecture has no I/O address space. Stopping is still the right
+// answer, and it is not the part that was wrong: what was wrong is that it
+// stopped in silence, because every serial write in this file went through
+// outb and would have come straight back here. The ARM64 branch of
+// serial_write_char no longer does, so there is somewhere to say it now.
+//
+// The guard is for the day that stops being true. If anything on the way to
+// the UART ever reaches for a port again, the second entry halts instead of
+// recursing until the stack is gone — and a stack overflow is a much worse
+// report than the one line above it.
+var port_io_trapped: u32 = 0
+
 fn port_io_unavailable() {
+  if port_io_trapped == 0 {
+    port_io_trapped = 1
+    serial_write_string("[Foundation] port I/O where there is no I/O address space; halted\n")
+  }
   loop {
     arch_halt()
   }
@@ -592,8 +605,34 @@ export fn serial_read_char(): u8 {
   return inb(COM1_PORT)
 }
 
+// Where the ARM64 UART is.
+//
+// x86 has one place a serial port lives and a fixed I/O port to reach it.
+// ARM64 has neither: the PL011 sits at 0x09000000 on QEMU's virt machine,
+// 0xFE201000 on a Pi 4 and behind RP1 on a Pi 5 — the same register layout at
+// three different addresses. So the address is a variable that board init
+// sets, defaulting to virt's, which is what the boot gate runs on.
+//
+// Nothing is initialised here. Programming the baud rate needs the reference
+// clock, which only the board knows; this writes to whatever the board has
+// already enabled, which is what a boot log does before init everywhere.
+var arm64_uart_base: u64 = 0x0900_0000
+
+export fn arm64_set_uart_base(base: u64) {
+  arm64_uart_base = base
+}
+
+// PL011 offsets, and the one flag bit this needs.
+const PL011_DR: u64 = 0x00
+const PL011_FR: u64 = 0x18
+const PL011_FR_TXFF: u32 = 0x20
+
 fn serial_transmit_ready(): u32 {
-  return (inb(COM1_PORT + 5) & 0x20) != 0
+  if @targetIs("x86_64") {
+    return (inb(COM1_PORT + 5) & 0x20) != 0
+  }
+  // TXFF is set while the transmit FIFO has no room.
+  return (arch_mmio_read32(arm64_uart_base + PL011_FR) & PL011_FR_TXFF) == 0
 }
 
 // Kernel log buffer.
@@ -644,7 +683,11 @@ export fn boot_log_truncated(): u32 {
 export fn serial_write_char(c: u8) {
   boot_log_append(c)
   while serial_transmit_ready() == 0 {}
-  outb(COM1_PORT, c)
+  if @targetIs("x86_64") {
+    outb(COM1_PORT, c)
+  } else {
+    arch_mmio_write32(arm64_uart_base + PL011_DR, @as(u32, c))
+  }
 }
 
 export fn serial_write_string(s: u64) {
