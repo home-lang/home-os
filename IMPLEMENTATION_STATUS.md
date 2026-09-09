@@ -27,7 +27,7 @@ parser; it has not been typechecked, code-generated, linked, or run.
 
 ## Boot status
 
-✅ **`boot-qemu-x86_64`: PASS** — serial says `qemu-system-x86_64: multiboot knows VBE. we don't`
+✅ **`boot-qemu-x86_64`: PASS** — serial says `HomeOS v0.1: kernel_main reached`
 
 Measured by building `kernel/src/mvk_poc.home` through the Home compiler,
 linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the

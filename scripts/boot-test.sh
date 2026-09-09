@@ -74,7 +74,7 @@ echo ""
     -display none \
     -no-reboot \
     -m 128M \
-    > "$LOG" 2>&1 &
+    > "$LOG" 2> "$LOG.qemu" &
 qemu_pid=$!
 
 deadline=$(( SECONDS + TIMEOUT ))
@@ -95,9 +95,25 @@ done
 kill "$qemu_pid" 2>/dev/null
 wait "$qemu_pid" 2>/dev/null
 
+# The guest's serial console, and only that.
+#
+# QEMU's own diagnostics used to be merged in here with `2>&1`, so the first
+# line under this heading was usually QEMU complaining that multiboot knows
+# VBE and it does not — which is not something the kernel said. Anything
+# reading this block for "what the kernel printed" read that instead, and
+# scripts/generate_status.py did exactly that, quoting it on the status page
+# as the serial output of a boot it was reporting on.
 echo "--- serial output ---"
 cat "$LOG"
 echo "---------------------"
+
+# QEMU's own words, under their own heading, so they are still there for
+# anyone debugging a boot without being mistaken for the guest's.
+if [ -s "$LOG.qemu" ]; then
+    echo "--- qemu diagnostics ---"
+    cat "$LOG.qemu"
+    echo "------------------------"
+fi
 
 if [ "$found" -eq 0 ]; then
     echo ""
