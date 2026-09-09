@@ -19,8 +19,10 @@ Usage: scripts/generate_status.py [--no-boot] [--check]
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLAN = os.path.join(REPO, "docs", "MASTER_PLAN.md")
@@ -326,7 +328,7 @@ def run_stub_gate():
     return ("PASS" if r.returncode == 0 else "FAIL"), line[0]
 
 
-def run_full_boot_gate(home):
+def run_full_boot_gate(home, keep_kernel=None):
     """Boot the whole Appendix A kernel. Returns (state, detail, output).
 
     run_boot_gate below measures the proof-of-life kernel — one file that
@@ -338,8 +340,14 @@ def run_full_boot_gate(home):
     evidence for most of the Phase 1-3 gates: the ext2 round trip, the echo in
     both directions and the framebuffer capture are all lines this run prints,
     and phase_gate_rows below reads them rather than booting three more times.
+
+    `keep_kernel` is a path the gate copies its built image to. den-conform
+    runs next and wants the same kernel; building it once is both faster and
+    the only way to be sure the shell it measures is the shell this booted.
     """
     env = dict(os.environ, HOME_COMPILER=home)
+    if keep_kernel:
+        env["BUILD_OUT"] = keep_kernel
     r = subprocess.run([os.path.join(REPO, "scripts", "boot-gate.sh")],
                        capture_output=True, text=True, env=env, cwd=REPO)
     out = (r.stdout or "") + (r.stderr or "")
@@ -360,16 +368,24 @@ def run_full_boot_gate(home):
     return "FAIL", detail, out
 
 
-def run_den_conform():
+def run_den_conform(kernel_bin=None):
     """Run the shell conformance gate. Returns (state, detail).
 
     Its own run rather than a reading of the boot gate's: den-conform is what
     enforces `shell-suite`, and it asserts something the boot gate does not —
     that home-os's shell produces the same bytes as the reference den, line
     for line, rather than merely that some builtin printed something.
+
+    It does not need its own kernel, though. Given the image the boot gate
+    just built, it measures the shell that booted a moment ago instead of a
+    second build of the same tree — which is both a build shorter and one
+    fewer thing that can differ.
     """
+    env = dict(os.environ)
+    if kernel_bin and os.path.exists(kernel_bin):
+        env["KERNEL_BIN"] = kernel_bin
     r = subprocess.run([os.path.join(REPO, "scripts", "den-conform.sh")],
-                       capture_output=True, text=True, cwd=REPO)
+                       capture_output=True, text=True, cwd=REPO, env=env)
     out = (r.stdout or "") + (r.stderr or "")
     m = re.search(r"den-conform: (\d+) lines identical to the reference shell"
                   r" \((\d+) script", out)
@@ -426,13 +442,21 @@ def main():
         full_state, full_detail = "UNVERIFIED", "skipped (--no-boot)"
         boot_out = ""
         arm_state, arm_detail = "UNVERIFIED", "skipped (--no-boot)"
+        den = ("UNVERIFIED", "skipped (--no-boot)")
     else:
         boot_state, boot_detail = run_boot_gate(home)
-        full_state, full_detail, boot_out = run_full_boot_gate(home)
-        arm_state, arm_detail = run_boot_gate_aarch64(home)
-
-    den = (("UNVERIFIED", "skipped (--no-boot)") if no_boot
-           else run_den_conform())
+        # One kernel for the two gates that need a whole one. den-conform
+        # builds its own when handed nothing, and that build is by far the
+        # longest part of it — and a second build of the same tree is one more
+        # thing that can differ from what was actually booted here.
+        scratch = tempfile.mkdtemp(prefix="home-os-status-")
+        try:
+            kernel = os.path.join(scratch, "boot-gate.bin")
+            full_state, full_detail, boot_out = run_full_boot_gate(home, kernel)
+            arm_state, arm_detail = run_boot_gate_aarch64(home)
+            den = run_den_conform(kernel)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
     stub_state, stub_detail = run_stub_gate()
     ratchet = None if no_boot else run_codegen_ratchet(home)
     ratchet_arm = None if no_boot else run_codegen_ratchet(home, "aarch64")

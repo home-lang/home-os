@@ -134,9 +134,25 @@ if ! "$ZIG" build-exe "$REPO_ROOT/kernel/src/boot.s" "$REPO_ROOT/kernel/src/idt_
 fi
 "$ZIG" objcopy -O binary "$workdir/boot-gate.elf" "$workdir/boot-gate.bin"
 
+# Hand the image to the caller if it asked for one.
+#
+# Not only under --build-only. A caller that runs this gate and then another
+# against the same kernel — scripts/generate_status.py runs den-conform after
+# this — would otherwise build it a second time, which is the longest part of
+# either gate and invites the two builds to differ. The workdir is removed on
+# exit, so a copy is the only way out.
+if [ -n "${BUILD_OUT:-}" ]; then
+    cp "$workdir/boot-gate.bin" "$BUILD_OUT"
+fi
+
 if [ "$BUILD_ONLY" = 1 ]; then
-    cp "$workdir/boot-gate.bin" "${BUILD_OUT:-$workdir/boot-gate.bin}"
-    echo "boot-gate: built ${BUILD_OUT:-$workdir/boot-gate.bin}"
+    # Without BUILD_OUT there is nowhere for it to go: the workdir is about to
+    # be removed. Say so rather than reporting a path that will not exist.
+    if [ -z "${BUILD_OUT:-}" ]; then
+        echo "boot-gate: built, but BUILD_OUT is unset so nothing was kept" >&2
+        exit 2
+    fi
+    echo "boot-gate: built $BUILD_OUT"
     exit 0
 fi
 
