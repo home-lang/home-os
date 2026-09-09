@@ -387,6 +387,19 @@ qemu_pid=$!
 # nothing else will ever press one. sendkey goes through QEMU's monitor,
 # reached over a loopback socket because bash can open one without any extra
 # tool being installed.
+#
+# Shift, not a letter. This used to press `a` and `b`, which was harmless for
+# as long as a key press did nothing: the scancode was read and dropped. Now
+# that the driver decodes it and the shell reads the buffer, a letter pressed
+# here is console input — and this subshell and the command feed both start
+# on `Entering main loop`, so those two letters landed inside the first
+# command and `uname -a` became something den does not know. A modifier is
+# what this phase actually wants: the controller raises IRQ 1 for the make
+# and again for the break, so the counter moves, and keyboard_process_scancode
+# returns before the buffer for a modifier, so nothing is typed. Whether a
+# *character* reaches the shell is the ps2 run's question, further down, and
+# it gets a boot of its own precisely so it does not have to share a line
+# with the feed.
 (
     # Wait for the shell, as the command feed does. Sending keys before the
     # kernel has enabled interrupts delivers them to a masked line, and the
@@ -400,9 +413,9 @@ qemu_pid=$!
         kwait=$(( kwait + 1 ))
     done
     exec 3<>"/dev/tcp/127.0.0.1/$MONITOR_PORT" 2>/dev/null || exit 0
-    printf 'sendkey a\n' >&3
+    printf 'sendkey shift\n' >&3
     sleep 1
-    printf 'sendkey b\n' >&3
+    printf 'sendkey shift\n' >&3
 
     # Move the emulated mouse so the HID device has something to report. A
     # HID endpoint NAKs until something changes, so without this the `hid`
@@ -710,6 +723,65 @@ if [ "${kbd_key:-0}" = "0" ]; then
     exit 1
 fi
 echo "boot-gate: usb keyboard reported keycode $kbd_key"
+
+# Another run: does pressing a key on the machine's own keyboard reach the
+# shell?
+#
+# Its own boot, and no usb-kbd on the bus, because a usb-kbd takes keystrokes
+# away from the PS/2 controller — the same reason the run above needs one of
+# its own. And no command feed, because the point is that the *keyboard* is
+# the input: keys sent while a script is being fed would interleave with it,
+# and a gate that depends on which lands first is asserting on a race.
+#
+# The keys spell `uname -a`, which den answers with a line nothing else in
+# this run prints — and `-a` is the half that matters: bare `uname` prints
+# `home-os`, which is also the prompt's first word, so a gate asserting on it
+# would pass on a shell that never saw a key. Asserting a scancode arrived
+# would only prove the controller works; asserting the shell answered proves
+# the whole path — interrupt, decode, buffer, console, command.
+ps2log="$workdir/ps2.log"
+PS2_MONITOR_PORT=$(( MONITOR_PORT + 3 ))
+(
+    kwait=0
+    while [ "$kwait" -lt "$BOOT_TIMEOUT" ]; do
+        if [ -s "$ps2log" ] && grep -qaF '[Kernel] Entering main loop' "$ps2log" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        kwait=$(( kwait + 1 ))
+    done
+    sleep 2
+    exec 5<>"/dev/tcp/127.0.0.1/$PS2_MONITOR_PORT" 2>/dev/null || exit 0
+    for k in u n a m e spc minus a ret; do
+        printf 'sendkey %s\n' "$k" >&5
+        sleep 1
+    done
+    sleep 3
+) | "$QEMU" -kernel "$workdir/boot-gate.bin" -initrd "$initrd" \
+    -drive file="$disk",format=raw,if=ide,index=0 \
+    -serial stdio \
+    -monitor "telnet:127.0.0.1:$PS2_MONITOR_PORT,server,nowait" \
+    -display none -vga std -no-reboot -m 256M > "$ps2log" 2>&1 &
+ps2_pid=$!
+
+ps2_deadline=$(( $(date +%s) + BOOT_TIMEOUT ))
+while kill -0 "$ps2_pid" 2>/dev/null && [ "$(date +%s)" -lt "$ps2_deadline" ]; do
+    if [ -s "$ps2log" ] && grep -qaF 'home-os home-os x86_64' "$ps2log" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+kill "$ps2_pid" 2>/dev/null
+wait "$ps2_pid" 2>/dev/null
+
+if ! grep -qaF 'home-os home-os x86_64' "$ps2log" 2>/dev/null; then
+    echo "" >&2
+    echo "RATCHET BROKEN: keys typed on the PS/2 keyboard did not reach the shell." >&2
+    echo "Last 15 lines of that run's serial output:" >&2
+    tail -15 "$ps2log" >&2
+    exit 1
+fi
+echo "boot-gate: ps2 keyboard typed a command and the shell ran it"
 
 # A third run: suspend to RAM and come back.
 #
