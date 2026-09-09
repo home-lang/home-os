@@ -11,6 +11,7 @@ import "../../core/filesystem.home" as filesystem
 import "../../sys/syscall.home" as syscall
 import "../../loader/elf.home" as elf
 import "../../drivers/timer.home" as timer
+import "../../security/seccomp.home" as seccomp
 
 // Where a user program is mapped. Well clear of the identity-mapped kernel,
 // and inside the first PML4 slot so the existing tables are reused.
@@ -35,6 +36,11 @@ const SYS_GETPID: u64 = 8
 const SYS_GETPPID: u64 = 48
 const SYS_SIGACTION: u64 = 63
 const SYS_SIGRETURN: u64 = 109
+// Install a filter on the calling task. 110 is the next free number in
+// sys/syscall.home, which is where the ABI is defined; this one is answered
+// here rather than there because the filter it installs is keyed on the task,
+// and the kernel's table has no idea which task it is serving.
+const SYS_SECCOMP: u64 = 110
 
 // Every other call whose first argument is a path, and the three whose second
 // is one too. Taken from kernel/src/sys/syscall.home, which owns the numbering.
@@ -344,6 +350,9 @@ fn scheduler_reset() {
   // shell sets them around a program and restores them itself; slot 0's
   // attachment is the shell's business, not the scheduler's.
   signals_reset(0)
+  // And its filter, for the same reason: this slot is about to run a program
+  // that did not ask to be restricted by the one that ran here last.
+  seccomp.seccomp_task_reset(0)
 
   // A task that is still live is not swept up. This runs when a program is
   // loaded, and a shell may have started tasks on purpose before loading it —
@@ -365,6 +374,7 @@ fn scheduler_reset() {
       task_stdin[t] = 0
       task_stdout[t] = 0
       signals_reset(t)
+      seccomp.seccomp_task_reset(t)
     }
     t = t + 1
   }
@@ -539,6 +549,14 @@ const USER_EPIPE: u64 = 0xFFFF_FFFF_FFFF_FFE0
 // address.
 const USER_EINVAL: u64 = 0xFFFF_FFFF_FFFF_FFEA
 
+// -1, EPERM: the call was understood and refused. What a task's own seccomp
+// filter returns for a call it does not permit.
+const USER_EPERM: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+// The longest whitelist a task may install, matching MAX_WHITELIST_SIZE in
+// security/seccomp.home. A length is as untrusted as the pointer beside it.
+const SECCOMP_LIST_MAX: u64 = 64
+
 // Which end of a pipe a descriptor is, matching core/filesystem.home.
 const PIPE_END_READ: u32 = 1
 const PIPE_END_WRITE: u32 = 2
@@ -626,6 +644,49 @@ fn copy_user_pages(from_space: u64, to_space: u64): u32 {
 
 // fork(). Returns the child's index plus one to the parent, and 0 to the child
 // when it is later resumed. Returns -1 as a u64 when it cannot.
+// seccomp(list, count) — restrict the calling task to the syscalls it names.
+//
+// `list` is `count` u32 syscall numbers in the caller's own memory. A task
+// asks for this on itself and no other: a filter one process can hang on
+// another is a different feature with a different set of questions, and this
+// one has no answer for who is allowed to.
+//
+// One way. Nothing lifts a filter and a second install is refused, because a
+// filter a program can widen is not a filter — it would be one call away from
+// permitting everything again. The task slot is cleared when the loader
+// starts a new program in it, which is the only thing that ever clears one.
+fn do_seccomp(list: u64, count: u64): u64 {
+  if count == 0 or count > SECCOMP_LIST_MAX { return USER_EINVAL }
+  if seccomp.seccomp_is_enabled(current_task) == 1 { return USER_EPERM }
+  if user_range_ok(list, count * 4) == 0 { return USER_EFAULT }
+
+  var i: u64 = 0
+  while i < count {
+    let nr: u32 = @as(*u32, @ptrFromInt(list + i * 4)).*
+    if seccomp.seccomp_whitelist_add(current_task, nr) == 0 {
+      // The list did not fit. Leave the task unfiltered rather than filtered
+      // by the part of it that landed: a filter built from half a list
+      // forbids calls the caller asked to allow, which is a worse failure
+      // than refusing to install one.
+      seccomp.seccomp_task_reset(current_task)
+      return USER_EINVAL
+    }
+    i = i + 1
+  }
+
+  // Enabled last. The whitelist is consulted from the moment it is switched
+  // on, so switching it on before the numbers are in it would refuse this
+  // very call's remaining work.
+  //
+  // Audit logging is deliberately left off. It prints a line per denial to
+  // the kernel console, and the calls being denied are made by the filtered
+  // program at whatever rate it likes — a loop around a forbidden syscall
+  // would be a user program saturating the console. The flag is still there
+  // for kernel code that wants it on a particular task.
+  seccomp.seccomp_whitelist_enable(current_task)
+  return 0
+}
+
 fn do_fork(frame: u64): u64 {
   if child_count >= MAX_CHILDREN {
     foundation.serial_write_string("[fork] too many children\n")
@@ -703,6 +764,9 @@ fn do_fork(frame: u64): u64 {
   // with the code that registered it and the child's copy has not been
   // exercised. Saying so beats inheriting an address that may not be reached.
   signals_reset(task)
+  // It does inherit the filter, and that one is not a convenience: a filter a
+  // task sheds by forking is not a filter, it is a delay.
+  seccomp.seccomp_inherit(current_task, task)
   if task_count <= task { task_count = task + 1 }
 
   return @as(u64, slot + 1)
@@ -742,15 +806,34 @@ fn do_wait(pid: u64): u64 {
 // skipped the delivery at the bottom — so a signal was only ever delivered by
 // a syscall that happened to fall through to the generic table. kill(self)
 // returned 0 and the handler never ran.
-// STUB(S18): no seccomp filter runs here. syscall_dispatch applies one to
-// every call that reaches the kernel's table, and syscall_body answers a
-// couple of dozen before falling through to it — so a filter that forbids
-// `write` does not stop a write. Those calls are intercepted because they
-// need the caller's frame or address space, which the table does not hold;
-// the filter has to move to this entry point rather than the calls moving
-// back to the table.
+// A task's seccomp filter is applied here, because this is where the calls
+// are. sys/syscall.home used to be the only place that filtered, and two
+// dozen calls — write, read, exit, fork, wait, kill, getpid, nanosleep, the
+// signal calls and the pipe paths — are answered by syscall_body before ever
+// reaching that table, so a filter forbidding `write` did not stop a write
+// (S18). Worse, the table filtered on `current_pid`, which nothing sets for a
+// ring-3 task: it was asking about the wrong task as well as the wrong calls.
+//
+// Exit and sigreturn are never refused. A task that cannot exit cannot be
+// stopped, and one that cannot return from a signal handler resumes nowhere;
+// refusing either turns a filter into a hang rather than a denial.
+fn seccomp_permits_call(nr: u64): u32 {
+  if nr == SYS_EXIT or nr == SYS_SIGRETURN { return 1 }
+  // A number too large to be a syscall is not one this filter has an opinion
+  // about; syscall_body answers it, and the table below it rejects anything
+  // above its own ceiling.
+  if nr > 0xFFFF_FFFF { return 1 }
+  return seccomp.seccomp_permits(current_task, @as(u32, nr))
+}
+
 export fn syscall_entry_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
-  let result: u64 = syscall_body(nr, a1, a2, a3, frame)
+  // A refused call still leaves through the rest of this function: a signal
+  // that arrived while the task was inside a denied call is still pending,
+  // and delivery happens on the way out of a syscall or not at all.
+  var result: u64 = USER_EPERM
+  if seccomp_permits_call(nr) == 1 {
+    result = syscall_body(nr, a1, a2, a3, frame)
+  }
 
   if deliver_signals(frame, result) == 1 {
     // The signal terminated this task; there is nothing to return to.
@@ -956,6 +1039,8 @@ fn syscall_body(nr: u64, a1: u64, a2: u64, a3: u64, frame: u64): u64 {
   // missing. The frame's own RFLAGS is what iretq restores on the way out, so
   // letting them in here does not leak out of the call.
   if nr == SYS_NANOSLEEP { return do_nanosleep(a1, a2) }
+
+  if nr == SYS_SECCOMP { return do_seccomp(a1, a2) }
 
   if nr == SYS_FORK { return do_fork(frame) }
   if nr == SYS_SIGACTION { return do_signal(a1, a2, a3) }

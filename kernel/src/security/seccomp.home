@@ -46,6 +46,14 @@ export fn seccomp_init() {
   while i < MAX_PROCESSES {
     process_filters[i].mode = SECCOMP_MODE_DISABLED
     process_filters[i].instruction_count = 0
+    // The whitelist table is declared `undefined` and was never cleared here,
+    // which did not matter for as long as nothing consulted it on a live
+    // path. It does now: a non-zero `enabled` in whatever the loader left
+    // behind would refuse every call a task made, and an empty whitelist
+    // refuses all of them.
+    process_whitelists[i].enabled = 0
+    process_whitelists[i].count = 0
+    process_whitelists[i].audit = 0
     i = i + 1
   }
   
@@ -128,8 +136,14 @@ export fn seccomp_check_syscall(pid: u32, syscall_nr: u32): u32 {
   }
   
   if mode == SECCOMP_MODE_STRICT {
-    // Strict mode: only allow read, write, exit, sigreturn
-    if syscall_nr == 0 or syscall_nr == 1 or syscall_nr == 60 or syscall_nr == 15 {
+    // Strict mode: only exit, read, write and sigreturn.
+    //
+    // These are home-os's numbers, from sys/syscall.home. They were Linux's
+    // — 0, 1, 60, 15 — which in this kernel name exit, *fork*, clock_gettime
+    // and rmdir: strict mode permitted forking and refused writing. Nothing
+    // consulted it on a live path, so the wrong list cost nothing until now.
+    if syscall_nr == SYS_EXIT or syscall_nr == SYS_READ or
+       syscall_nr == SYS_WRITE or syscall_nr == SYS_SIGRETURN {
       return SECCOMP_RET_ALLOW
     }
     
@@ -222,6 +236,12 @@ export fn seccomp_is_enabled(pid: u32): u32 {
   if process_filters[pid].mode != SECCOMP_MODE_DISABLED {
     return 1
   }
+  // A whitelist is a filter too. This reported "not filtered" for a task
+  // whose every call was being checked against one, which is the wrong answer
+  // to give the code that decides whether a second filter may be installed.
+  if process_whitelists[pid].enabled == 1 {
+    return 1
+  }
   return 0
 }
 
@@ -296,6 +316,9 @@ const SYS_MUNMAP: u32 = 11
 const SYS_LSEEK: u32 = 13
 const SYS_MKDIR: u32 = 14
 const SYS_RMDIR: u32 = 15
+// Not a profile's business, but strict mode's: a task that cannot return from
+// a signal handler resumes nowhere.
+const SYS_SIGRETURN: u32 = 109
 
 // Simple whitelist-based filter (more practical than BPF for simple cases)
 const MAX_WHITELIST_SIZE: u32 = 64
@@ -523,6 +546,35 @@ export fn seccomp_filter_syscall(pid: u32, syscall_nr: u32): u32 {
 
   // Then check BPF filter mode
   return seccomp_check_syscall(pid, syscall_nr)
+}
+
+// Is this task allowed to make this call? 1 = yes, 0 = no.
+//
+// The RET_* encoding stays in this module. What the syscall entry point wants
+// is a verdict, not a filter action, and every non-allow action becomes a
+// refusal there: this kernel answers a denied call with EPERM rather than
+// killing the caller. That is the weaker of the two, and it is said here
+// rather than implied — nothing installs strict mode, the only mode that asks
+// for a kill, from ring 3.
+export fn seccomp_permits(pid: u32, syscall_nr: u32): u32 {
+  if seccomp_filter_syscall(pid, syscall_nr) == SECCOMP_RET_ALLOW { return 1 }
+  return 0
+}
+
+// Forget everything a task slot was filtered by.
+//
+// A filter belongs to the program that installed it, and task slots are
+// reused by the next program the loader runs. Without this, one filtered
+// program would leave every later one in that slot refusing calls it never
+// asked to have refused — the scheduler resets a slot's signals for the same
+// reason and at the same moment.
+export fn seccomp_task_reset(pid: u32) {
+  if pid >= MAX_PROCESSES { return }
+  process_filters[pid].mode = SECCOMP_MODE_DISABLED
+  process_filters[pid].instruction_count = 0
+  process_whitelists[pid].enabled = 0
+  process_whitelists[pid].count = 0
+  process_whitelists[pid].audit = 0
 }
 
 // Copy seccomp settings on fork

@@ -7,16 +7,10 @@ import "../core/memory.home" as memory
 import "../core/process.home" as process
 import "../core/filesystem.home" as filesystem
 import "../security/capabilities.home" as capabilities
-import "../security/seccomp.home" as seccomp
 import "../security/audit.home" as audit
 import "../security/ptr_safety.home" as ptr_safety
 import "../perf/async_io.home" as async_io
 import "../drivers/timer.home" as timer
-
-// Seccomp return values for reference
-const SECCOMP_RET_ALLOW: u32 = 0x7FFF0000
-const SECCOMP_RET_ERRNO: u32 = 0x00050000
-const SECCOMP_RET_KILL_PROCESS: u32 = 0x80000000
 
 // Capability bits (match capabilities.home)
 const CAP_KILL: u64 = 1 << 5
@@ -76,6 +70,10 @@ const SYS_IOCTL: u32 = 24
 // first time an interception moved.
 const SYS_YIELD: u32 = 108
 const SYS_SIGRETURN: u32 = 109
+// Answered by arch/x86_64/usermode.home, not by the table below: the filter
+// it installs is keyed on the calling task, which this layer does not know.
+// Listed here because this file is where the ABI is written down.
+const SYS_SECCOMP: u32 = 110
 
 const SYS_CAPGET: u32 = 25
 const SYS_CAPSET: u32 = 26
@@ -221,8 +219,8 @@ fn audit_syscall(syscall_num: u32, result: i32) {
 // highest-numbered entry and the io_uring range tops out at 427. Any
 // number above that is an unknown syscall and must be rejected before
 // we let it reach the dispatch branches — otherwise a malicious user
-// could trigger a seccomp check with a garbage number and leak timing
-// information about what handlers exist.
+// could probe with garbage numbers and learn from the timing which
+// handlers exist.
 const MAX_SYSCALL_NUM: u32 = 427
 
 export fn syscall_handler(syscall_num: u32, arg1: u64, arg2: u64, arg3: u64, arg4: u64): u64 {
@@ -234,28 +232,22 @@ export fn syscall_handler(syscall_num: u32, arg1: u64, arg2: u64, arg3: u64, arg
     return ENOSYS
   }
 
-  // ========================================================================
-  // Step 1: Seccomp filtering (before any syscall processing)
-  // ========================================================================
-  var seccomp_result: u32 = seccomp.seccomp_filter_syscall(current_pid, syscall_num)
-
-  if seccomp_result == SECCOMP_RET_KILL_PROCESS {
-    foundation.serial_write_string("[Syscall] Seccomp killed process ")
-    foundation.serial_write_hex(current_pid)
-    foundation.serial_write_string(" for syscall ")
-    foundation.serial_write_hex(syscall_num)
-    foundation.serial_write_string("\n")
-    process.sys_exit(139)  // SIGSEGV
-    return EPERM
-  }
-
-  if seccomp_result != SECCOMP_RET_ALLOW {
-    // Syscall blocked by seccomp filter
-    return EPERM
-  }
+  // The seccomp filter used to be applied here and is not any more. It was in
+  // the wrong place twice over (MASTER_PLAN §7, S18): two dozen calls are
+  // answered by `syscall_body` in arch/x86_64/usermode.home before they ever
+  // reach this table, so a filter forbidding `write` did not stop a write —
+  // and it was keyed on `current_pid`, which nothing sets for a ring-3 task,
+  // so with tasks running it would have applied task 0's filter to whichever
+  // task happened to fall through to here.
+  //
+  // It now runs at the one place every ring-3 call passes through, which is
+  // also the place that knows which task is making it. Kernel-internal
+  // callers of this function are not crossing a trust boundary and are not
+  // filtered, which is the same argument that puts the pointer checks at that
+  // entry point rather than here.
 
   // ========================================================================
-  // Step 2: Syscall dispatch with capability enforcement
+  // Syscall dispatch with capability enforcement
   // ========================================================================
 
   // Unprivileged syscalls - no capability check needed
