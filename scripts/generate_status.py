@@ -167,6 +167,157 @@ def run_boot_gate_aarch64(home):
     return "FAIL", "the ARM64 kernel did not reach its boot milestones"
 
 
+# --- Phase gates ------------------------------------------------------------
+#
+# What enforces each Phase 1-3 gate, and the artefact a run of it leaves
+# behind. This is not a reading of MASTER_PLAN §4's ticks: the plan says what
+# is meant to be true, and a page that copied it would go green on an edit to
+# a sentence. Each probe below names something a gate script actually prints,
+# so a gate that stops holding turns red here on the next run.
+#
+# Three kinds:
+#   boot-line  a line the boot gate itself prints, which it only prints after
+#              checking the thing from outside the guest
+#   milestone  a line of scripts/boot-milestones.txt. The boot gate asserts
+#              every line of that file, in order, and fails if one is missing
+#              — so "the gate passed and this line is in the list" means it
+#              appeared. Deleting the milestone turns the gate red here too,
+#              which is the point of naming it rather than the section.
+#   script     a gate script of its own, run and read separately
+#
+# Phases 4-6 have no entries because nothing enforces them yet. That absence
+# is what "not started" means on this page, and it is measured the same way:
+# no probe, no claim.
+PHASE_GATE_PROBES = {
+    "boot-to-shell": ("boot-pass", None),
+    "storage-roundtrip": ("boot-line", "fsck OK:"),
+    "net-echo": ("boot-line", "net-echo both ways"),
+    "fb-boot-log": ("boot-line", "boot-gate: framebuffer "),
+    "libc-suite": ("milestone", "libc-suite: every check passed"),
+    "shell-suite": ("script", "den-conform"),
+    "coreutils-suite": ("coreutils", None),
+    "pantry-local-install": ("milestone", "[pantry] REFUSED: signature does not verify"),
+}
+
+
+def tier1_job_names():
+    """The gate names, read from MASTER_PLAN §11 rather than repeated here.
+
+    The plan says the Tier-1 job names ARE the phase gates, so that sentence
+    is the list. Reading it is what lets the table notice a gate the plan
+    gained or renamed instead of quietly omitting it.
+    """
+    try:
+        text = open(PLAN, encoding="utf-8").read()
+    except OSError:
+        return []
+    m = re.search(r"The Tier-1 job names ARE the phase gates:(.+?)\.\s*$",
+                  text, re.M | re.S)
+    if not m:
+        return []
+    return re.findall(r"`([a-z0-9_-]+)`", m.group(1))
+
+
+def milestone_lines():
+    """Every asserted line of the x86 milestone list, comments dropped."""
+    path = os.path.join(REPO, "scripts", "boot-milestones.txt")
+    try:
+        raw = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return []
+    return [l for l in raw if l.strip() and not l.lstrip().startswith("#")]
+
+
+def coreutils_count():
+    """How many distinct programs the boot gate's command feed runs from /bin.
+
+    Measured from the feed rather than from a count in a sentence, because the
+    sentence is what drifts. This is deliberately not "the coreutils": it
+    counts every program the feed execs, test programs included, because
+    deciding which of them is a coreutil would be a judgement this script
+    cannot make and would quietly get wrong. The row says what was counted.
+    """
+    path = os.path.join(REPO, "scripts", "boot-commands.txt")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return 0
+    names = set()
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        names.update(re.findall(r"/bin/([A-Za-z0-9_.-]+)", line))
+    return len(names)
+
+
+def phase_gate_order():
+    """Which gates belong to which phase, read out of MASTER_PLAN §4.
+
+    Derived rather than repeated so a gate the plan moves between phases, or
+    adds to one, moves here too. Only phases 1-6: the Phase 0 and 0.5 rows
+    have measurements of their own above, and Phase 7 is excluded by the same
+    bound — it is where §11's list of every job name lives, and scanning it
+    would pull the whole list into one phase.
+    """
+    try:
+        text = open(PLAN, encoding="utf-8").read()
+    except OSError:
+        return []
+    names = set(tier1_job_names())
+    order, seen, phase = [], set(), None
+    for line in text.splitlines():
+        h = re.match(r"^### Phase ([0-9.]+)", line)
+        if h:
+            try:
+                phase = float(h.group(1))
+            except ValueError:
+                phase = None
+            continue
+        if phase is None or not (1 <= phase <= 6):
+            continue
+        for g in re.findall(r"`([a-z0-9_-]+)`", line):
+            if g in names and g not in seen:
+                seen.add(g)
+                order.append((int(phase), g))
+    return order
+
+
+def phase_gate_status(gate, full_state, boot_out, den):
+    """Measure one Phase 1-3 gate. Returns (icon, text) or None if unprobed."""
+    probe = PHASE_GATE_PROBES.get(gate)
+    if probe is None:
+        return None
+    kind, needle = probe
+    # Everything but `shell-suite` rests on the boot gate having passed: these
+    # are assertions made during that run, and an unfinished run has not made
+    # them. Saying "unverified" beats inheriting its silence as a pass.
+    if kind != "script" and full_state != "PASS":
+        if full_state == "UNVERIFIED":
+            return "⬜", "unverified — the boot gate did not run"
+        return "❌", "the boot gate did not pass"
+    if kind == "boot-pass":
+        return "✅", "green"
+    if kind == "boot-line":
+        for line in boot_out.splitlines():
+            if needle in line:
+                return "✅", "green — " + line.strip().replace("boot-gate: ", "")
+        return "❌", f"the boot gate printed no `{needle}` line"
+    if kind == "milestone":
+        if needle in milestone_lines():
+            return "✅", f"green — asserted as `{needle}`"
+        return "❌", f"`{needle}` is no longer asserted"
+    if kind == "coreutils":
+        n = coreutils_count()
+        if n:
+            return "✅", f"green — {n} distinct programs run from /bin under the boot gate"
+        return "❌", "the command feed runs nothing from /bin"
+    if kind == "script":
+        den_state, den_detail = den
+        icon = {"PASS": "✅", "FAIL": "❌", "UNVERIFIED": "⬜"}[den_state]
+        return icon, ("green — " if den_state == "PASS" else "") + den_detail
+    return None
+
+
 def run_stub_gate():
     """Run the stub-register gate. Returns (state, detail)."""
     r = subprocess.run([os.path.join(REPO, "scripts", "stub-check.sh")],
@@ -176,12 +327,17 @@ def run_stub_gate():
 
 
 def run_full_boot_gate(home):
-    """Boot the whole Appendix A kernel. Returns (state, detail).
+    """Boot the whole Appendix A kernel. Returns (state, detail, output).
 
     run_boot_gate below measures the proof-of-life kernel — one file that
     prints and halts. This measures the real one: every Appendix A file,
     linked into one image and booted, checked against the milestone list in
     scripts/boot-milestones.txt.
+
+    The run's own output comes back with the verdict because one boot is the
+    evidence for most of the Phase 1-3 gates: the ext2 round trip, the echo in
+    both directions and the framebuffer capture are all lines this run prints,
+    and phase_gate_rows below reads them rather than booting three more times.
     """
     env = dict(os.environ, HOME_COMPILER=home)
     r = subprocess.run([os.path.join(REPO, "scripts", "boot-gate.sh")],
@@ -189,17 +345,39 @@ def run_full_boot_gate(home):
     out = (r.stdout or "") + (r.stderr or "")
     m = re.search(r"boot-gate: (\d+)/(\d+) milestones reached", out)
     if "qemu-system-x86_64 not found" in out or "home compiler not found" in out:
-        return "UNVERIFIED", "QEMU not available in this run"
+        return "UNVERIFIED", "QEMU not available in this run", out
     if not m:
-        return "FAIL", "boot gate produced no milestone count"
+        return "FAIL", "boot gate produced no milestone count", out
     reached, total = int(m.group(1)), int(m.group(2))
     if r.returncode == 0 and reached == total:
-        return "PASS", f"{reached}/{total} init milestones reached, through to the end of init"
+        return ("PASS",
+                f"{reached}/{total} init milestones reached, through to the end of init",
+                out)
     stopped = re.search(r"First milestone not reached: (.+)", out)
     detail = f"{reached}/{total} init milestones reached"
     if stopped:
         detail += f"; stopped before `{stopped.group(1).strip()}`"
-    return "FAIL", detail
+    return "FAIL", detail, out
+
+
+def run_den_conform():
+    """Run the shell conformance gate. Returns (state, detail).
+
+    Its own run rather than a reading of the boot gate's: den-conform is what
+    enforces `shell-suite`, and it asserts something the boot gate does not —
+    that home-os's shell produces the same bytes as the reference den, line
+    for line, rather than merely that some builtin printed something.
+    """
+    r = subprocess.run([os.path.join(REPO, "scripts", "den-conform.sh")],
+                       capture_output=True, text=True, cwd=REPO)
+    out = (r.stdout or "") + (r.stderr or "")
+    m = re.search(r"den-conform: (\d+) lines identical to the reference shell"
+                  r" \((\d+) script", out)
+    if r.returncode == 0 and m:
+        return "PASS", f"{m.group(1)} lines identical to the reference den, {m.group(2)} script(s)"
+    if "kernel build failed" in out:
+        return "UNVERIFIED", "the kernel would not build in this run"
+    return "FAIL", "home-os's shell diverged from the reference den"
 
 
 def run_boot_gate(home):
@@ -246,12 +424,15 @@ def main():
     if no_boot:
         boot_state, boot_detail = "UNVERIFIED", "skipped (--no-boot)"
         full_state, full_detail = "UNVERIFIED", "skipped (--no-boot)"
+        boot_out = ""
         arm_state, arm_detail = "UNVERIFIED", "skipped (--no-boot)"
     else:
         boot_state, boot_detail = run_boot_gate(home)
-        full_state, full_detail = run_full_boot_gate(home)
+        full_state, full_detail, boot_out = run_full_boot_gate(home)
         arm_state, arm_detail = run_boot_gate_aarch64(home)
 
+    den = (("UNVERIFIED", "skipped (--no-boot)") if no_boot
+           else run_den_conform())
     stub_state, stub_detail = run_stub_gate()
     ratchet = None if no_boot else run_codegen_ratchet(home)
     ratchet_arm = None if no_boot else run_codegen_ratchet(home, "aarch64")
@@ -412,8 +593,13 @@ def main():
     # --- Phase gates --------------------------------------------------------
     w("## Phase gates ([MASTER_PLAN §4](docs/MASTER_PLAN.md#4-the-phase-map))")
     w("")
-    w("A gate is green only when its CI job passes on `main`. Gates below the")
-    w("first red one are blocked by definition — they are not being worked yet.")
+    w("One row per Tier-1 job name in [MASTER_PLAN §11](docs/MASTER_PLAN.md),")
+    w("assigned to the phase §4 lists it under. A gate is green here because")
+    w("something in this run produced the evidence for it — a line the boot gate")
+    w("prints after checking from outside the guest, a milestone it asserted, or")
+    w("a gate script of its own — never because the plan says it should be. A")
+    w("gate with no probe has nothing enforcing it yet, and that is what \"not")
+    w("started\" means below.")
     w("")
     w("| Phase | Gate | Status |")
     w("|-------|------|--------|")
@@ -425,16 +611,34 @@ def main():
         ok_n, total_n = ratchet
         done = "✅ green" if ok_n == total_n else f"🟡 {ok_n}/{total_n}"
         w(f"| 0.5 | `mvk-compiles` | {done} |")
-    for phase, gate in [
-        (1, "`boot-to-shell`"),
-        (2, "`storage-roundtrip` / `net-echo` / `fb-boot-log`"),
-        (3, "`libc-suite` / `shell-suite` / `coreutils-suite` / `pantry-local-install`"),
-        (4, "`craft-demo` / `wm-layouts`"),
-        (5, "`iso-install` / `desktop-parity-suite` — **v1.0**"),
-        (6, "`snapshot-rollback` / `agent-cli-suite`"),
-    ]:
-        w(f"| {phase} | {gate} | ⬜ not started |")
+    # One row per gate, measured. This was a literal list with "⬜ not started"
+    # written into every row, which had been wrong for three phases: the boot
+    # gate has been round-tripping ext2, echoing TCP both ways, capturing the
+    # framebuffer and running the libc, shell, coreutils and pantry suites for
+    # a long time, and the page said none of it had started — while linking to
+    # the plan section that ticks all seven.
+    covered = set(PHASE_GATE_PROBES) | {
+        "parse-rate", "stub-register", "boot-qemu-x86_64", "mvk-compiles"}
+    gate_order = phase_gate_order()
+    for phase, gate in gate_order:
+        measured = phase_gate_status(gate, full_state, boot_out, den)
+        if measured:
+            icon, text = measured
+        else:
+            icon, text = "⬜", "not started — nothing enforces it yet"
+        w(f"| {phase} | `{gate}` | {icon} {text} |")
     w("")
+    # A gate the plan has and this table does not. Shown rather than dropped:
+    # a gate missing from a status page is exactly the drift the page exists
+    # to prevent, and it cannot report what it does not know it is missing.
+    listed = {g for _, g in gate_order} | covered
+    unlisted = [g for g in tier1_job_names() if g not in listed]
+    if unlisted:
+        w("> **Gates in [MASTER_PLAN §11](docs/MASTER_PLAN.md) that this table does")
+        w("> not cover:** " + ", ".join(f"`{g}`" for g in unlisted) + ". Add them to")
+        w("> MASTER_PLAN §4 under a phase heading, or give them a probe in")
+        w("> `scripts/generate_status.py`.")
+        w("")
 
     text = "\n".join(L) + "\n"
 

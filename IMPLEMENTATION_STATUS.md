@@ -114,8 +114,13 @@ CI gate (`scripts/stub-check.sh`).
 
 ## Phase gates ([MASTER_PLAN §4](docs/MASTER_PLAN.md#4-the-phase-map))
 
-A gate is green only when its CI job passes on `main`. Gates below the
-first red one are blocked by definition — they are not being worked yet.
+One row per Tier-1 job name in [MASTER_PLAN §11](docs/MASTER_PLAN.md),
+assigned to the phase §4 lists it under. A gate is green here because
+something in this run produced the evidence for it — a line the boot gate
+prints after checking from outside the guest, a milestone it asserted, or
+a gate script of its own — never because the plan says it should be. A
+gate with no probe has nothing enforcing it yet, and that is what "not
+started" means below.
 
 | Phase | Gate | Status |
 |-------|------|--------|
@@ -123,10 +128,18 @@ first red one are blocked by definition — they are not being worked yet.
 | 0 | `stub-register` | ✅ pass — stub-register OK — 17 entries, none open |
 | 0 | `boot-qemu-x86_64` | ✅ pass |
 | 0.5 | `mvk-compiles` | ✅ green |
-| 1 | `boot-to-shell` | ⬜ not started |
-| 2 | `storage-roundtrip` / `net-echo` / `fb-boot-log` | ⬜ not started |
-| 3 | `libc-suite` / `shell-suite` / `coreutils-suite` / `pantry-local-install` | ⬜ not started |
-| 4 | `craft-demo` / `wm-layouts` | ⬜ not started |
-| 5 | `iso-install` / `desktop-parity-suite` — **v1.0** | ⬜ not started |
-| 6 | `snapshot-rollback` / `agent-cli-suite` | ⬜ not started |
+| 1 | `boot-to-shell` | ✅ green |
+| 2 | `storage-roundtrip` | ✅ green — fsck OK: 8192 blocks, 3 file(s) [hello.txt, second.txt, written.txt], 8175 free blocks, clean |
+| 2 | `net-echo` | ✅ green — net-echo both ways, host client got 32 bytes back |
+| 2 | `fb-boot-log` | ✅ green — framebuffer 2359312 bytes, 3 distinct byte values |
+| 3 | `libc-suite` | ✅ green — asserted as `libc-suite: every check passed` |
+| 3 | `shell-suite` | ✅ green — 42 lines identical to the reference den, 2 script(s) |
+| 3 | `coreutils-suite` | ✅ green — 56 distinct programs run from /bin under the boot gate |
+| 3 | `pantry-local-install` | ✅ green — asserted as `[pantry] REFUSED: signature does not verify` |
+| 4 | `craft-demo` | ⬜ not started — nothing enforces it yet |
+| 4 | `wm-layouts` | ⬜ not started — nothing enforces it yet |
+| 5 | `iso-install` | ⬜ not started — nothing enforces it yet |
+| 5 | `desktop-parity-suite` | ⬜ not started — nothing enforces it yet |
+| 6 | `snapshot-rollback` | ⬜ not started — nothing enforces it yet |
+| 6 | `agent-cli-suite` | ⬜ not started — nothing enforces it yet |
 
