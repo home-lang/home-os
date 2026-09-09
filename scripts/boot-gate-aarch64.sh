@@ -57,7 +57,20 @@ fi
 
 ZIG="${ZIG:-}"
 if [ -z "$ZIG" ]; then
-    command -v zig >/dev/null 2>&1 && ZIG="zig"
+    if command -v zig >/dev/null 2>&1; then
+        ZIG="zig"
+    else
+        # The Home repo's own pantry, the same fallback scripts/boot-gate.sh
+        # uses. Without it this gate reported "zig not found" — and therefore
+        # UNVERIFIED — on a machine that has zig, whenever the caller did not
+        # export ZIG itself. scripts/generate_status.py is such a caller, so
+        # the status page recorded an unverified ARM64 boot for a gate that
+        # passes.
+        for root in "${HOME_REPO:-}" "$REPO_ROOT/../home" "$REPO_ROOT/../lang"; do
+            [ -z "$root" ] && continue
+            if [ -x "$root/pantry/.bin/zig" ]; then ZIG="$root/pantry/.bin/zig"; break; fi
+        done
+    fi
 fi
 [ -n "$ZIG" ] && command -v "$ZIG" >/dev/null 2>&1 || \
     fail "zig not found (set ZIG); it is the cross-assembler and linker, no kernel logic is written in it"

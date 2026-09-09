@@ -314,8 +314,13 @@ def main():
     # --- Boot status --------------------------------------------------------
     w("## Boot status")
     w("")
-    icon = {"PASS": "✅", "FAIL": "❌", "UNVERIFIED": "⬜"}[boot_state]
-    w(f"{icon} **`boot-qemu-x86_64`: {boot_state}** — {boot_detail}")
+    # Named rather than reused: `icon` is reassigned for the full-kernel and
+    # ARM64 lines below, and the phase-gate table further down read it back
+    # long after that. It printed the ARM64 run's icon beside the x86_64 run's
+    # word, which is how a page whose whole purpose is to not drift came to
+    # say "⬜ pass".
+    boot_icon = {"PASS": "✅", "FAIL": "❌", "UNVERIFIED": "⬜"}[boot_state]
+    w(f"{boot_icon} **`boot-qemu-x86_64`: {boot_state}** — {boot_detail}")
     w("")
     w("Measured by building `kernel/src/mvk_poc.home` through the Home compiler,")
     w("linking it with `kernel/src/boot.s` via `kernel/linker.ld`, and booting the")
@@ -415,7 +420,7 @@ def main():
     w(f"| 0 | `parse-rate` | {'✅ green' if pct == 100 else f'❌ {pct}%'} |")
     stub_icon = {"PASS": "✅", "FAIL": "❌"}[stub_state]
     w(f"| 0 | `stub-register` | {stub_icon} {stub_state.lower()} — {stub_detail} |")
-    w(f"| 0 | `boot-qemu-x86_64` | {icon} {boot_state.lower()} |")
+    w(f"| 0 | `boot-qemu-x86_64` | {boot_icon} {boot_state.lower()} |")
     if ratchet:
         ok_n, total_n = ratchet
         done = "✅ green" if ok_n == total_n else f"🟡 {ok_n}/{total_n}"
