@@ -1,0 +1,356 @@
+// home-os SHA-512
+// FIPS 180-4, plus HMAC (RFC 2104) and HKDF (RFC 5869) over it.
+//
+// SHA-256's shape with 64-bit words: 80 rounds instead of 64, a 128-byte
+// block, and different rotation amounts. The length is a 128-bit field; this
+// implementation keeps the low 64 bits of the bit count and writes the high
+// half as zero, which is exact for any message under 2^61 bytes and therefore
+// for every message a kernel will hash.
+//
+// AirPlay pairing is what wants this: HKDF-SHA512 derives the session keys and
+// the SRP verifier hashes with SHA-512, so neither can be written until this
+// exists.
+
+import "../core/foundation.home" as foundation
+
+export const SHA512_BLOCK_SIZE: u32 = 128
+export const SHA512_DIGEST_SIZE: u32 = 64
+
+// First 64 bits of the fractional parts of the square roots of the first
+// eight primes.
+const H0: u64 = 0x6a09e667f3bcc908
+const H1: u64 = 0xbb67ae8584caa73b
+const H2: u64 = 0x3c6ef372fe94f82b
+const H3: u64 = 0xa54ff53a5f1d36f1
+const H4: u64 = 0x510e527fade682d1
+const H5: u64 = 0x9b05688c2b3e6c1f
+const H6: u64 = 0x1f83d9abfb41bd6b
+const H7: u64 = 0x5be0cd19137e2179
+
+// First 64 bits of the fractional parts of the cube roots of the first eighty
+// primes.
+const K: [u64; 80] = [
+  0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
+  0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
+  0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
+  0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
+  0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+  0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
+  0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
+  0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
+  0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
+  0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+  0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
+  0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
+  0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
+  0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
+  0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+  0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
+  0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
+  0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
+  0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
+  0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817
+]
+
+export struct Sha512Context {
+  state: [u64; 8],
+  count: u64,           // message length in bits
+  buffer: [u8; 128],
+  buffer_len: u32
+}
+
+var sha512_hashes: u64 = 0
+
+fn rotr64(x: u64, n: u64): u64 {
+  return (x >> n) | (x << (64 - n))
+}
+
+fn ch(x: u64, y: u64, z: u64): u64 {
+  return (x & y) ^ ((~x) & z)
+}
+
+fn maj(x: u64, y: u64, z: u64): u64 {
+  return (x & y) ^ (x & z) ^ (y & z)
+}
+
+fn big_sigma0(x: u64): u64 {
+  return rotr64(x, 28) ^ rotr64(x, 34) ^ rotr64(x, 39)
+}
+
+fn big_sigma1(x: u64): u64 {
+  return rotr64(x, 14) ^ rotr64(x, 18) ^ rotr64(x, 41)
+}
+
+fn small_sigma0(x: u64): u64 {
+  return rotr64(x, 1) ^ rotr64(x, 8) ^ (x >> 7)
+}
+
+fn small_sigma1(x: u64): u64 {
+  return rotr64(x, 19) ^ rotr64(x, 61) ^ (x >> 6)
+}
+
+fn load_be64(data: *u8, offset: u32): u64 {
+  var value: u64 = 0
+  var i: u32 = 0
+  while i < 8 {
+    let byte: u64 = @as(u64, @as(*u8, @ptrFromInt(@intFromPtr(data) + offset + i)).*)
+    value = (value << 8) | byte
+    i = i + 1
+  }
+  return value
+}
+
+fn store_be64(out: *u8, offset: u32, value: u64) {
+  var i: u32 = 0
+  while i < 8 {
+    let shift: u64 = @as(u64, (7 - i) * 8)
+    @as(*u8, @ptrFromInt(@intFromPtr(out) + offset + i)).* = @as(u8, (value >> shift) & 0xFF)
+    i = i + 1
+  }
+}
+
+fn sha512_compress(ctx: *Sha512Context, block: *u8) {
+  var w: [u64; 80]
+
+  var t: u32 = 0
+  while t < 16 {
+    w[t] = load_be64(block, t * 8)
+    t = t + 1
+  }
+  while t < 80 {
+    w[t] = small_sigma1(w[t - 2]) + w[t - 7] + small_sigma0(w[t - 15]) + w[t - 16]
+    t = t + 1
+  }
+
+  var a: u64 = ctx.state[0]
+  var b: u64 = ctx.state[1]
+  var c: u64 = ctx.state[2]
+  var d: u64 = ctx.state[3]
+  var e: u64 = ctx.state[4]
+  var f: u64 = ctx.state[5]
+  var g: u64 = ctx.state[6]
+  var h: u64 = ctx.state[7]
+
+  t = 0
+  while t < 80 {
+    let t1: u64 = h + big_sigma1(e) + ch(e, f, g) + K[t] + w[t]
+    let t2: u64 = big_sigma0(a) + maj(a, b, c)
+    h = g
+    g = f
+    f = e
+    e = d + t1
+    d = c
+    c = b
+    b = a
+    a = t1 + t2
+    t = t + 1
+  }
+
+  ctx.state[0] = ctx.state[0] + a
+  ctx.state[1] = ctx.state[1] + b
+  ctx.state[2] = ctx.state[2] + c
+  ctx.state[3] = ctx.state[3] + d
+  ctx.state[4] = ctx.state[4] + e
+  ctx.state[5] = ctx.state[5] + f
+  ctx.state[6] = ctx.state[6] + g
+  ctx.state[7] = ctx.state[7] + h
+}
+
+export fn sha512_ctx_init(ctx: *Sha512Context) {
+  ctx.state[0] = H0
+  ctx.state[1] = H1
+  ctx.state[2] = H2
+  ctx.state[3] = H3
+  ctx.state[4] = H4
+  ctx.state[5] = H5
+  ctx.state[6] = H6
+  ctx.state[7] = H7
+  ctx.count = 0
+  ctx.buffer_len = 0
+}
+
+export fn sha512_update(ctx: *Sha512Context, data: *u8, len: u32) {
+  var i: u32 = 0
+  while i < len {
+    ctx.buffer[ctx.buffer_len] = @as(*u8, @ptrFromInt(@intFromPtr(data) + i)).*
+    ctx.buffer_len = ctx.buffer_len + 1
+    ctx.count = ctx.count + 8
+
+    if ctx.buffer_len == SHA512_BLOCK_SIZE {
+      sha512_compress(ctx, &ctx.buffer as *u8)
+      ctx.buffer_len = 0
+    }
+    i = i + 1
+  }
+}
+
+export fn sha512_final(ctx: *Sha512Context, digest: *u8) {
+  let bit_count: u64 = ctx.count
+
+  // Pad with 0x80 then zeros until sixteen bytes remain in the block.
+  ctx.buffer[ctx.buffer_len] = 0x80
+  ctx.buffer_len = ctx.buffer_len + 1
+
+  if ctx.buffer_len > 112 {
+    while ctx.buffer_len < SHA512_BLOCK_SIZE {
+      ctx.buffer[ctx.buffer_len] = 0
+      ctx.buffer_len = ctx.buffer_len + 1
+    }
+    sha512_compress(ctx, &ctx.buffer as *u8)
+    ctx.buffer_len = 0
+  }
+
+  while ctx.buffer_len < 112 {
+    ctx.buffer[ctx.buffer_len] = 0
+    ctx.buffer_len = ctx.buffer_len + 1
+  }
+
+  // Length is 128 bits big-endian; the high half is always zero here.
+  var i: u32 = 0
+  while i < 8 {
+    ctx.buffer[112 + i] = 0
+    i = i + 1
+  }
+  store_be64(&ctx.buffer as *u8, 120, bit_count)
+
+  sha512_compress(ctx, &ctx.buffer as *u8)
+
+  i = 0
+  while i < 8 {
+    store_be64(digest, i * 8, ctx.state[i])
+    i = i + 1
+  }
+
+  sha512_hashes = sha512_hashes + 1
+}
+
+export fn sha512_hash(data: *u8, len: u32, digest: *u8) {
+  var ctx: Sha512Context
+  sha512_ctx_init(&ctx)
+  sha512_update(&ctx, data, len)
+  sha512_final(&ctx, digest)
+}
+
+// ============================================================================
+// HMAC-SHA512 (RFC 2104)
+// ============================================================================
+
+export fn hmac_sha512(key: *u8, key_len: u32, data: *u8, data_len: u32, mac: *u8) {
+  var block_key: [u8; 128]
+  var i: u32 = 0
+
+  // A key longer than the block is replaced by its own digest; a shorter one
+  // is zero-padded.
+  if key_len > SHA512_BLOCK_SIZE {
+    var shortened: [u8; 64]
+    sha512_hash(key, key_len, &shortened as *u8)
+    while i < 64 {
+      block_key[i] = shortened[i]
+      i = i + 1
+    }
+    while i < SHA512_BLOCK_SIZE {
+      block_key[i] = 0
+      i = i + 1
+    }
+  } else {
+    while i < key_len {
+      block_key[i] = @as(*u8, @ptrFromInt(@intFromPtr(key) + i)).*
+      i = i + 1
+    }
+    while i < SHA512_BLOCK_SIZE {
+      block_key[i] = 0
+      i = i + 1
+    }
+  }
+
+  var ipad: [u8; 128]
+  var opad: [u8; 128]
+  i = 0
+  while i < SHA512_BLOCK_SIZE {
+    ipad[i] = block_key[i] ^ 0x36
+    opad[i] = block_key[i] ^ 0x5C
+    i = i + 1
+  }
+
+  var inner: [u8; 64]
+  var ctx: Sha512Context
+  sha512_ctx_init(&ctx)
+  sha512_update(&ctx, &ipad as *u8, SHA512_BLOCK_SIZE)
+  sha512_update(&ctx, data, data_len)
+  sha512_final(&ctx, &inner as *u8)
+
+  sha512_ctx_init(&ctx)
+  sha512_update(&ctx, &opad as *u8, SHA512_BLOCK_SIZE)
+  sha512_update(&ctx, &inner as *u8, SHA512_DIGEST_SIZE)
+  sha512_final(&ctx, mac)
+}
+
+// ============================================================================
+// HKDF-SHA512 (RFC 5869)
+// ============================================================================
+
+export fn hkdf_sha512_extract(salt: *u8, salt_len: u32, ikm: *u8, ikm_len: u32, prk: *u8) {
+  hmac_sha512(salt, salt_len, ikm, ikm_len, prk)
+}
+
+// Expand to at most 255 * 64 bytes, which every AirPlay key derivation is
+// comfortably inside. Returns 0 if more was asked for than HKDF can produce.
+export fn hkdf_sha512_expand(prk: *u8, info: *u8, info_len: u32, okm: *u8, okm_len: u32): u32 {
+  if okm_len > 255 * SHA512_DIGEST_SIZE { return 0 }
+
+  // T(0) is the empty string. `previous` is only read once counter > 1, by
+  // which point HMAC has filled it, but zeroing it keeps that reasoning local
+  // instead of spread across the loop.
+  var previous: [u8; 64]
+  var zero: u32 = 0
+  while zero < SHA512_DIGEST_SIZE {
+    previous[zero] = 0
+    zero = zero + 1
+  }
+
+  var block: [u8; 256]
+  var written: u32 = 0
+  var counter: u8 = 1
+
+  while written < okm_len {
+    var block_len: u32 = 0
+
+    // T(n) = HMAC(PRK, T(n-1) | info | n), and T(0) is empty.
+    if counter > 1 {
+      var i: u32 = 0
+      while i < SHA512_DIGEST_SIZE {
+        block[block_len + i] = previous[i]
+        i = i + 1
+      }
+      block_len = block_len + SHA512_DIGEST_SIZE
+    }
+
+    var j: u32 = 0
+    while j < info_len {
+      block[block_len + j] = @as(*u8, @ptrFromInt(@intFromPtr(info) + j)).*
+      j = j + 1
+    }
+    block_len = block_len + info_len
+
+    block[block_len] = counter
+    block_len = block_len + 1
+
+    hmac_sha512(prk, SHA512_DIGEST_SIZE, &block as *u8, block_len, &previous as *u8)
+
+    var take: u32 = SHA512_DIGEST_SIZE
+    if written + take > okm_len { take = okm_len - written }
+    var k: u32 = 0
+    while k < take {
+      @as(*u8, @ptrFromInt(@intFromPtr(okm) + written + k)).* = previous[k]
+      k = k + 1
+    }
+    written = written + take
+    counter = counter + 1
+  }
+
+  return 1
+}
+
+export fn sha512_hashes_computed(): u64 {
+  return sha512_hashes
+}
