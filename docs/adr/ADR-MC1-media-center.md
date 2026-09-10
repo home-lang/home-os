@@ -133,7 +133,8 @@ below. Saying so here, once, prevents the question being relitigated in nine dow
 - **Games.**
 - **Wi-Fi as the only link.** Ethernet first; Wi-Fi may exist but the product is specified,
   budgeted and gated on wired networking.
-- **AirPlay / Cast receivers.** Post-v1 research.
+- **Cast (Chromecast) receiver.** Still post-v1 research. AirPlay moved into scope in v1.1
+  below; Cast did not.
 - **HDR tone-mapping.** Passthrough only (see ADR-MC5).
 - **V3D / GPU 3D acceleration.** The UI is composed by the HVS, not rendered by a 3D pipeline.
 
@@ -194,7 +195,8 @@ is equivalent.
 | Third-party app store | yes | add-on repos | **no** | dropped by policy (D1/D4) |
 | Web browser | limited | add-on | **no** | dropped |
 | Games | yes | add-on | **no** | dropped |
-| AirPlay / Cast receiver | yes (AirPlay) | add-on | **no** | post-v1 research |
+| AirPlay receiver | yes | add-on | **yes (v1.1)** | match |
+| Cast (Chromecast) receiver | no | add-on | **no** | post-v1 research |
 | Streaming-service apps (Netflix etc.) | yes | no (DRM) | **no** | dropped — DRM, no third-party userland |
 | PVR / live TV | no | yes | **no** | dropped for v1 |
 | 3D GPU-accelerated UI effects | yes | yes | **no (HVS composition)** | dropped by design |
@@ -272,6 +274,47 @@ Reopen this decision if any of the following becomes true:
 
 ---
 
+## Amendment 1.1 — AirPlay receiver moves into scope
+
+AirPlay was listed as a non-goal on the grounds that it was unresearched, not that it was
+infeasible. It is now in scope for the TV profile: an iPhone, iPad or Mac can send video, audio,
+photos and screen mirroring to the Pi, which is the one living-room capability an Apple TV has that
+a Kodi-class box does not, and the feature most likely to make this box the one people actually
+plug in.
+
+The protocol work is ours to write, in Home, like everything else. Part of the cryptography is
+already in the tree: `crypto/curve25519` gives the pairing key agreement and
+`crypto/chacha20` + `crypto/poly1305` give the session AEAD. Two primitives are missing and have to
+be written before pairing can complete — **Ed25519** signing and **SHA-512** (which HKDF and the
+SRP verifier both need). Those are the only new primitives; the rest is protocol and transport.
+
+### What this does not change
+
+AirPlay is not a route around [the streaming-app decision](#non-goals-for-v1), and this amendment
+must not be read as softening it. A sender only transmits DRM-protected content to a receiver that
+is certified for it; Apple TV+, and anything else behind FairPlay or Widevine, refuses to mirror to
+an uncertified receiver or arrives as a black frame. That is deliberate on the sender's side and
+not a defect on ours. AirPlay here carries the user's own media, photos, music, and the many apps
+that do not protect their output.
+
+Playing an Apple TV+ or Apple TV Sports library on this box remains impossible for the reason the
+original ADR gave: FairPlay is licensed to Apple's own platforms and to certified partner hardware
+with a secure video path, and is not obtainable for a third-party OS. The lawful ways to watch that
+content on the same television are an Apple TV box on another HDMI input, or AirPlay from a
+licensed Apple device to a certified receiver — not this one.
+
+### Scope of the AirPlay work
+
+- **In**: service discovery, pairing, session encryption, audio receive, video receive, screen
+  mirroring, sender-driven playback control.
+- **Out**: acting as an AirPlay *sender*; AirPlay 2 multi-room audio sync; any attempt to receive
+  protected content.
+- **Constraint that shapes it**: mirroring is H.264, and the Pi 5 has no H.264 hardware decoder
+  (see the codec floor above). The 1080p software/NEON path is what mirroring rides on, and the
+  frame-rate budget for mirroring must be measured against it rather than assumed.
+
+---
+
 ## Related decisions
 
 - [ADR-MC2](ADR-MC2-aarch64-codegen.md) — aarch64 kernel codegen strategy (the compiler that makes
@@ -297,3 +340,4 @@ Reopen this decision if any of the following becomes true:
 | Version | Date | Author | Changes |
 |---|---|---|---|
 | 1.0 | 2026-09-02 | Core Team | Initial decision (from #43) |
+| 1.1 | 2026-09-09 | Core Team | AirPlay receiver moved from non-goal into v1 scope; Cast stays post-v1; restated the DRM boundary AirPlay does not cross |
