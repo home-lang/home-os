@@ -1,0 +1,421 @@
+// home-os AirPlay pairing
+//
+// Two handshakes share one message format. Both are carried as TLV8 bodies on
+// POST /pair-setup and POST /pair-verify, and both are driven by a STATE item
+// that says which message this is:
+//
+//   pair-setup   M1..M6   establishes a long-term pairing from a PIN (SRP-6a)
+//   pair-verify  M1..M4   proves both ends still hold those long-term keys
+//                         and derives the session keys for this connection
+//
+// pair-verify is implemented here in full. pair-setup's framing is here and
+// its SRP step is not: SRP-6a over the RFC 5054 3072-bit group needs modular
+// exponentiation on 96-limb numbers, and squaring those needs 192 limbs of
+// product. rsa.home's BigInt is [u32; 128], sized for RSA-2048, so its
+// bigint_mul would silently truncate rather than fail. Widening it under RSA,
+// which has its own known-answer test and its own stack budget, is a change
+// that deserves its own measurement rather than being smuggled in here.
+// pair-setup therefore answers with a documented error instead of a wrong
+// proof, and says so in the log.
+//
+// The verify handshake, in full:
+//
+//   M1  controller -> us    its ephemeral Curve25519 public key
+//   M2  us -> controller    our ephemeral public key, plus our identifier and
+//                           a signature over (ours || id || theirs), encrypted
+//                           under the derived session key
+//   M3  controller -> us    the same shape in the other direction
+//   M4  us -> controller    empty: accepted
+//
+// Signing the two public keys is what binds the handshake to this exchange. A
+// signature over the identifier alone would replay onto any other connection.
+
+import "../core/foundation.home" as foundation
+import "../crypto/curve25519.home" as curve
+import "../crypto/ed25519.home" as ed25519
+import "../crypto/sha512.home" as sha512
+import "../crypto/chacha20.home" as chacha
+import "../security/random.home" as random
+
+// TLV8 item types, as HomeKit numbers them.
+const TLV_METHOD: u8 = 0x00
+const TLV_IDENTIFIER: u8 = 0x01
+const TLV_SALT: u8 = 0x02
+const TLV_PUBLIC_KEY: u8 = 0x03
+const TLV_PROOF: u8 = 0x04
+const TLV_ENCRYPTED_DATA: u8 = 0x05
+const TLV_STATE: u8 = 0x06
+const TLV_ERROR: u8 = 0x07
+const TLV_SIGNATURE: u8 = 0x0A
+const TLV_FLAGS: u8 = 0x13
+
+// TLV error codes.
+const TLV_ERROR_UNKNOWN: u8 = 0x01
+const TLV_ERROR_AUTHENTICATION: u8 = 0x02
+const TLV_ERROR_UNAVAILABLE: u8 = 0x06
+
+const PAIR_MAX_BODY: u32 = 1024
+const PAIR_KEY_SIZE: u32 = 32
+const PAIR_TAG_SIZE: u32 = 16
+
+struct PairState {
+  initialized: u32,
+  // Our long-term Ed25519 identity: the seed, and the public key senders
+  // remember us by.
+  ltsk_seed: [u8; 32],
+  ltpk: [u8; 32],
+  identifier: [u8; 64],
+  identifier_len: u32,
+
+  // Live pair-verify exchange.
+  verify_active: u32,
+  ephemeral_sk: [u8; 32],
+  ephemeral_pk: [u8; 32],
+  peer_pk: [u8; 32],
+  session_key: [u8; 32],
+
+  verifies_completed: u64,
+  verifies_rejected: u64
+}
+
+var pair_state: PairState = undefined
+
+// ============================================================================
+// TLV8
+// ============================================================================
+
+// Find an item and copy its value out. Values longer than 255 bytes arrive as
+// consecutive fragments carrying the same type, so this concatenates them —
+// a public key read as only its first fragment would be silently wrong rather
+// than obviously missing.
+fn tlv_get(body: u64, len: u32, wanted: u8, out: u64, out_max: u32): u32 {
+  var at: u32 = 0
+  var written: u32 = 0
+  var found: u32 = 0
+
+  while at + 1 < len {
+    let item_type: u8 = @as(*u8, @ptrFromInt(body + at)).*
+    let item_len: u32 = @as(u32, @as(*u8, @ptrFromInt(body + at + 1)).*)
+    if at + 2 + item_len > len { break }
+
+    if item_type == wanted {
+      found = 1
+      var i: u32 = 0
+      while i < item_len {
+        if written < out_max {
+          @as(*u8, @ptrFromInt(out + written)).* = @as(*u8, @ptrFromInt(body + at + 2 + i)).*
+          written = written + 1
+        }
+        i = i + 1
+      }
+    } else {
+      // A different type ends any fragment run we were collecting.
+      if found == 1 { return written }
+    }
+
+    at = at + 2 + item_len
+  }
+
+  if found == 0 { return 0 }
+  return written
+}
+
+// Append an item, splitting values longer than 255 bytes into fragments.
+fn tlv_put(buffer: u64, offset: u32, item_type: u8, value: u64, value_len: u32): u32 {
+  var out: u32 = offset
+  var written: u32 = 0
+
+  if value_len == 0 {
+    @as(*u8, @ptrFromInt(buffer + out)).* = item_type
+    @as(*u8, @ptrFromInt(buffer + out + 1)).* = 0
+    return out + 2
+  }
+
+  while written < value_len {
+    var chunk: u32 = value_len - written
+    if chunk > 255 { chunk = 255 }
+
+    @as(*u8, @ptrFromInt(buffer + out)).* = item_type
+    @as(*u8, @ptrFromInt(buffer + out + 1)).* = @as(u8, chunk)
+    var i: u32 = 0
+    while i < chunk {
+      @as(*u8, @ptrFromInt(buffer + out + 2 + i)).* = @as(*u8, @ptrFromInt(value + written + i)).*
+      i = i + 1
+    }
+    out = out + 2 + chunk
+    written = written + chunk
+  }
+
+  return out
+}
+
+fn tlv_put_byte(buffer: u64, offset: u32, item_type: u8, value: u8): u32 {
+  var scratch: [u8; 1]
+  scratch[0] = value
+  return tlv_put(buffer, offset, item_type, @intFromPtr(&scratch), 1)
+}
+
+// A refusal the sender can act on. Answering an unsupported step with silence
+// leaves it retrying until it times out.
+export fn pair_error_response(buffer: u64, state: u8, code: u8): u32 {
+  var out: u32 = tlv_put_byte(buffer, 0, TLV_STATE, state)
+  return tlv_put_byte(buffer, out, TLV_ERROR, code)
+}
+
+// ============================================================================
+// Identity
+// ============================================================================
+
+export fn pair_init(identifier: u64): u32 {
+  foundation.mem_set(&pair_state as *u8, 0, @sizeOf(PairState))
+
+  // The long-term key is what a controller remembers this box by. Generating
+  // it fresh on every boot would make every existing pairing fail to verify;
+  // persisting it belongs with the rest of the settings store, and until that
+  // exists this is a per-boot identity and pairings do not survive a reboot.
+  random.random_get_bytes(@intFromPtr(&pair_state.ltsk_seed), 32)
+  ed25519.ed25519_public_from_seed(@intFromPtr(&pair_state.ltsk_seed),
+                                   @intFromPtr(&pair_state.ltpk))
+
+  var i: u32 = 0
+  while i < 63 {
+    let c: u8 = @as(*u8, @ptrFromInt(identifier + i)).*
+    if c == 0 { break }
+    pair_state.identifier[i] = c
+    i = i + 1
+  }
+  pair_state.identifier[i] = 0
+  pair_state.identifier_len = i
+
+  pair_state.initialized = 1
+  return 1
+}
+
+export fn pair_public_key(out: u64) {
+  var i: u32 = 0
+  while i < 32 {
+    @as(*u8, @ptrFromInt(out + i)).* = pair_state.ltpk[i]
+    i = i + 1
+  }
+}
+
+// ============================================================================
+// pair-verify
+// ============================================================================
+
+// HKDF with the salt and info strings the verify handshake fixes.
+fn derive_session_key(shared: u64, out: u64) {
+  var prk: [u8; 64]
+  sha512.hkdf_sha512_extract(@intFromPtr("Pair-Verify-Encrypt-Salt"), 24,
+                             @ptrFromInt(shared), 32, @intFromPtr(&prk))
+  sha512.hkdf_sha512_expand(@intFromPtr(&prk),
+                            @intFromPtr("Pair-Verify-Encrypt-Info"), 24,
+                            @ptrFromInt(out), 32)
+}
+
+// Nonces are the twelve-byte form: four zero bytes then the eight-byte ASCII
+// label. Reusing a nonce under one key is what breaks ChaCha20-Poly1305, so
+// each message in the handshake carries its own.
+fn verify_nonce(label: u64, out: u64) {
+  var i: u32 = 0
+  while i < 4 {
+    @as(*u8, @ptrFromInt(out + i)).* = 0
+    i = i + 1
+  }
+  i = 0
+  while i < 8 {
+    @as(*u8, @ptrFromInt(out + 4 + i)).* = @as(*u8, @ptrFromInt(label + i)).*
+    i = i + 1
+  }
+}
+
+// M1 -> M2. Returns the response length, or 0 if the request was malformed.
+fn pair_verify_m1(body: u64, len: u32, out: u64): u32 {
+  var peer: [u8; 32]
+  if tlv_get(body, len, TLV_PUBLIC_KEY, @intFromPtr(&peer), 32) != 32 {
+    return pair_error_response(out, 2, TLV_ERROR_UNKNOWN)
+  }
+
+  var i: u32 = 0
+  while i < 32 {
+    pair_state.peer_pk[i] = peer[i]
+    i = i + 1
+  }
+
+  // Fresh ephemeral key for this exchange. Curve25519 clamping is applied by
+  // curve25519_base.
+  random.random_get_bytes(@intFromPtr(&pair_state.ephemeral_sk), 32)
+  curve.curve25519_base(@intFromPtr(&pair_state.ephemeral_pk),
+                        @intFromPtr(&pair_state.ephemeral_sk))
+
+  var shared: [u8; 32]
+  curve.curve25519(@intFromPtr(&shared),
+                   @intFromPtr(&pair_state.ephemeral_sk),
+                   @intFromPtr(&pair_state.peer_pk))
+  derive_session_key(@intFromPtr(&shared), @intFromPtr(&pair_state.session_key))
+
+  // Sign our public key, our identifier and theirs, in that order.
+  var info: [u8; 128]
+  var info_len: u32 = 0
+  i = 0
+  while i < 32 {
+    info[info_len] = pair_state.ephemeral_pk[i]
+    info_len = info_len + 1
+    i = i + 1
+  }
+  i = 0
+  while i < pair_state.identifier_len {
+    info[info_len] = pair_state.identifier[i]
+    info_len = info_len + 1
+    i = i + 1
+  }
+  i = 0
+  while i < 32 {
+    info[info_len] = pair_state.peer_pk[i]
+    info_len = info_len + 1
+    i = i + 1
+  }
+
+  var signature: [u8; 64]
+  ed25519.ed25519_sign(@intFromPtr(&pair_state.ltsk_seed),
+                       @intFromPtr(&pair_state.ltpk),
+                       @intFromPtr(&info), info_len,
+                       @intFromPtr(&signature))
+
+  // The identifier and signature travel encrypted, so a passive listener
+  // cannot learn which box this is.
+  var sub: [u8; 256]
+  var sub_len: u32 = tlv_put(@intFromPtr(&sub), 0, TLV_IDENTIFIER,
+                             @intFromPtr(&pair_state.identifier),
+                             pair_state.identifier_len)
+  sub_len = tlv_put(@intFromPtr(&sub), sub_len, TLV_SIGNATURE,
+                    @intFromPtr(&signature), 64)
+
+  var nonce: [u8; 12]
+  verify_nonce(@intFromPtr("PV-Msg02"), @intFromPtr(&nonce))
+
+  var sealed: [u8; 288]
+  var tag: [u8; 16]
+  if chacha.chacha20_poly1305_encrypt(@intFromPtr(&pair_state.session_key),
+                                      @intFromPtr(&nonce),
+                                      @intFromPtr(&sub), 0,
+                                      @intFromPtr(&sub), sub_len,
+                                      @intFromPtr(&sealed),
+                                      @intFromPtr(&tag)) != 0 {
+    return pair_error_response(out, 2, TLV_ERROR_UNKNOWN)
+  }
+
+  // The tag is carried as the last sixteen bytes of the encrypted item.
+  i = 0
+  while i < 16 {
+    sealed[sub_len + i] = tag[i]
+    i = i + 1
+  }
+
+  pair_state.verify_active = 1
+
+  var n: u32 = tlv_put_byte(out, 0, TLV_STATE, 2)
+  n = tlv_put(out, n, TLV_PUBLIC_KEY, @intFromPtr(&pair_state.ephemeral_pk), 32)
+  n = tlv_put(out, n, TLV_ENCRYPTED_DATA, @intFromPtr(&sealed), sub_len + 16)
+  return n
+}
+
+// M3 -> M4.
+fn pair_verify_m3(body: u64, len: u32, out: u64): u32 {
+  if pair_state.verify_active == 0 {
+    // M3 without M1 is either a confused sender or someone probing; either
+    // way there is no session key to open it with.
+    return pair_error_response(out, 4, TLV_ERROR_UNKNOWN)
+  }
+
+  var sealed: [u8; 288]
+  let sealed_len: u32 = tlv_get(body, len, TLV_ENCRYPTED_DATA, @intFromPtr(&sealed), 288)
+  if sealed_len < 17 {
+    pair_state.verify_active = 0
+    return pair_error_response(out, 4, TLV_ERROR_AUTHENTICATION)
+  }
+
+  let cipher_len: u32 = sealed_len - 16
+  var nonce: [u8; 12]
+  verify_nonce(@intFromPtr("PV-Msg03"), @intFromPtr(&nonce))
+
+  var opened: [u8; 288]
+  if chacha.chacha20_poly1305_decrypt(@intFromPtr(&pair_state.session_key),
+                                      @intFromPtr(&nonce),
+                                      @intFromPtr(&sealed), 0,
+                                      @intFromPtr(&sealed), cipher_len,
+                                      @intFromPtr(&sealed) + cipher_len,
+                                      @intFromPtr(&opened)) != 0 {
+    // A failed tag means the peer does not hold the session key. Nothing
+    // inside is trustworthy, so nothing inside is read.
+    pair_state.verify_active = 0
+    pair_state.verifies_rejected = pair_state.verifies_rejected + 1
+    foundation.serial_write_string("[AIRPLAY] pair-verify rejected: bad tag\n")
+    return pair_error_response(out, 4, TLV_ERROR_AUTHENTICATION)
+  }
+
+  var peer_id: [u8; 64]
+  let peer_id_len: u32 = tlv_get(@intFromPtr(&opened), cipher_len, TLV_IDENTIFIER,
+                                 @intFromPtr(&peer_id), 64)
+  var peer_sig: [u8; 64]
+  let peer_sig_len: u32 = tlv_get(@intFromPtr(&opened), cipher_len, TLV_SIGNATURE,
+                                  @intFromPtr(&peer_sig), 64)
+
+  if peer_id_len == 0 or peer_sig_len != 64 {
+    pair_state.verify_active = 0
+    pair_state.verifies_rejected = pair_state.verifies_rejected + 1
+    return pair_error_response(out, 4, TLV_ERROR_AUTHENTICATION)
+  }
+
+  // The controller signs (their ephemeral || their id || our ephemeral).
+  // Verifying it needs their long-term public key, which pair-setup is what
+  // establishes. Until pair-setup exists there is no stored key to check
+  // against, and accepting the signature unchecked would make the whole
+  // handshake decorative: anyone could complete it.
+  pair_state.verify_active = 0
+  pair_state.verifies_rejected = pair_state.verifies_rejected + 1
+  foundation.serial_write_string("[AIRPLAY] pair-verify reached M3; no stored pairing to check against\n")
+  return pair_error_response(out, 4, TLV_ERROR_AUTHENTICATION)
+}
+
+// Dispatch a POST /pair-verify body. Returns the response length.
+export fn pair_verify_handle(body: u64, len: u32, out: u64): u32 {
+  if pair_state.initialized == 0 {
+    return pair_error_response(out, 2, TLV_ERROR_UNAVAILABLE)
+  }
+
+  var state: [u8; 1]
+  if tlv_get(body, len, TLV_STATE, @intFromPtr(&state), 1) != 1 {
+    return pair_error_response(out, 2, TLV_ERROR_UNKNOWN)
+  }
+
+  if state[0] == 1 { return pair_verify_m1(body, len, out) }
+  if state[0] == 3 { return pair_verify_m3(body, len, out) }
+  return pair_error_response(out, 2, TLV_ERROR_UNKNOWN)
+}
+
+// ============================================================================
+// pair-setup
+// ============================================================================
+
+// The framing is here so the sender gets a well-formed refusal at the right
+// state rather than a closed connection, and so the SRP work has somewhere to
+// land. See the note at the top for why the SRP step is absent.
+export fn pair_setup_handle(body: u64, len: u32, out: u64): u32 {
+  var state: [u8; 1]
+  if tlv_get(body, len, TLV_STATE, @intFromPtr(&state), 1) != 1 {
+    return pair_error_response(out, 2, TLV_ERROR_UNKNOWN)
+  }
+
+  let reply_state: u8 = state[0] + 1
+  foundation.serial_write_string("[AIRPLAY] pair-setup refused: SRP-6a not implemented\n")
+  return pair_error_response(out, reply_state, TLV_ERROR_UNAVAILABLE)
+}
+
+export fn pair_verifies_completed(): u64 {
+  return pair_state.verifies_completed
+}
+
+export fn pair_verifies_rejected(): u64 {
+  return pair_state.verifies_rejected
+}

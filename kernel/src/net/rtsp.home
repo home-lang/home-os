@@ -1,0 +1,434 @@
+// home-os RTSP server (AirPlay control channel)
+//
+// AirPlay's control channel is RTSP-shaped: request line, headers, optional
+// body, and a response that echoes CSeq. It is not RFC 2326 RTSP — senders
+// issue HTTP verbs (GET, POST) down the same connection as RTSP ones (SETUP,
+// RECORD, TEARDOWN), and the interesting payloads are binary rather than SDP.
+// Both are parsed here because both arrive on port 7000.
+//
+// This module owns framing and dispatch. The pairing handshake it hands off
+// to airplay_pair.home; the media transports SETUP negotiates are not built
+// yet, and SETUP says so rather than pretending.
+//
+// One connection at a time. A sender opens a single control channel and keeps
+// it, so a connection table would be unused capacity with more states to get
+// wrong.
+
+import "../core/foundation.home" as foundation
+import "tcp.home" as tcp
+import "airplay_pair.home" as pairing
+
+export const RTSP_PORT: u16 = 7000
+
+// tcp_listen and tcp_accept_id both hand back a connection index, and index 0
+// is a perfectly ordinary connection. They signal "none" with 0xFFFFFFFF, so
+// that is the only value that may be read as absence here.
+const RTSP_NO_CONN: u32 = 0xFFFFFFFF
+
+const RTSP_MAX_REQUEST: u32 = 8192
+const RTSP_MAX_HEADER: u32 = 128
+const RTSP_MAX_METHOD: u32 = 24
+const RTSP_MAX_URI: u32 = 256
+
+// What the request line asked for.
+const RTSP_METHOD_UNKNOWN: u32 = 0
+const RTSP_METHOD_GET: u32 = 1
+const RTSP_METHOD_POST: u32 = 2
+const RTSP_METHOD_OPTIONS: u32 = 3
+const RTSP_METHOD_SETUP: u32 = 4
+const RTSP_METHOD_RECORD: u32 = 5
+const RTSP_METHOD_TEARDOWN: u32 = 6
+const RTSP_METHOD_FLUSH: u32 = 7
+const RTSP_METHOD_SET_PARAMETER: u32 = 8
+const RTSP_METHOD_GET_PARAMETER: u32 = 9
+
+struct RtspRequest {
+  method: u32,
+  uri: [u8; 256],
+  cseq: [u8; 32],
+  content_length: u32,
+  body_at: u32,
+  body_len: u32
+}
+
+struct RtspState {
+  initialized: u32,
+  listen_id: u32,
+  conn_id: u32,
+  requests_served: u64,
+  buffer: [u8; 8192],
+  buffered: u32
+}
+
+var rtsp_state: RtspState = undefined
+
+// ============================================================================
+// Byte helpers
+// ============================================================================
+
+fn rtsp_is_space(c: u8): u32 {
+  if c == 0x20 or c == 0x09 { return 1 }
+  return 0
+}
+
+fn rtsp_lower(c: u8): u8 {
+  if c >= 'A' and c <= 'Z' { return c + 32 }
+  return c
+}
+
+// Case-insensitive compare of buffer[at..at+len] against a NUL-terminated
+// literal. Header names arrive in whatever case the sender felt like.
+fn rtsp_token_eq(buffer: u64, at: u32, len: u32, literal: u64): u32 {
+  var i: u32 = 0
+  while i < len {
+    let l: u8 = @as(*u8, @ptrFromInt(literal + i)).*
+    if l == 0 { return 0 }
+    if rtsp_lower(@as(*u8, @ptrFromInt(buffer + at + i)).*) != rtsp_lower(l) { return 0 }
+    i = i + 1
+  }
+  if @as(*u8, @ptrFromInt(literal + len)).* != 0 { return 0 }
+  return 1
+}
+
+fn rtsp_parse_uint(buffer: u64, at: u32, len: u32): u32 {
+  var value: u32 = 0
+  var i: u32 = 0
+  while i < len {
+    let c: u8 = @as(*u8, @ptrFromInt(buffer + at + i)).*
+    if c < '0' or c > '9' { break }
+    value = value * 10 + @as(u32, c - '0')
+    i = i + 1
+  }
+  return value
+}
+
+fn rtsp_method_of(buffer: u64, at: u32, len: u32): u32 {
+  if rtsp_token_eq(buffer, at, len, "GET") == 1 { return RTSP_METHOD_GET }
+  if rtsp_token_eq(buffer, at, len, "POST") == 1 { return RTSP_METHOD_POST }
+  if rtsp_token_eq(buffer, at, len, "OPTIONS") == 1 { return RTSP_METHOD_OPTIONS }
+  if rtsp_token_eq(buffer, at, len, "SETUP") == 1 { return RTSP_METHOD_SETUP }
+  if rtsp_token_eq(buffer, at, len, "RECORD") == 1 { return RTSP_METHOD_RECORD }
+  if rtsp_token_eq(buffer, at, len, "TEARDOWN") == 1 { return RTSP_METHOD_TEARDOWN }
+  if rtsp_token_eq(buffer, at, len, "FLUSH") == 1 { return RTSP_METHOD_FLUSH }
+  if rtsp_token_eq(buffer, at, len, "SET_PARAMETER") == 1 { return RTSP_METHOD_SET_PARAMETER }
+  if rtsp_token_eq(buffer, at, len, "GET_PARAMETER") == 1 { return RTSP_METHOD_GET_PARAMETER }
+  return RTSP_METHOD_UNKNOWN
+}
+
+// Does the request URI equal this path? Compared whole rather than by prefix:
+// "/pair-verify-something" must not route to the pair-verify handler.
+fn rtsp_uri_is(request: *RtspRequest, path: u64): u32 {
+  var i: u32 = 0
+  while i < RTSP_MAX_URI {
+    let a: u8 = request.uri[i]
+    let b: u8 = @as(*u8, @ptrFromInt(path + i)).*
+    if a != b { return 0 }
+    if a == 0 { return 1 }
+    i = i + 1
+  }
+  return 0
+}
+
+// ============================================================================
+// Request parsing
+// ============================================================================
+
+// Find the end of the header block. Returns the offset just past the blank
+// line, or 0 when the headers have not all arrived yet.
+fn rtsp_headers_end(buffer: u64, len: u32): u32 {
+  var i: u32 = 0
+  while i + 3 < len {
+    if @as(*u8, @ptrFromInt(buffer + i)).* == 0x0D and
+       @as(*u8, @ptrFromInt(buffer + i + 1)).* == 0x0A and
+       @as(*u8, @ptrFromInt(buffer + i + 2)).* == 0x0D and
+       @as(*u8, @ptrFromInt(buffer + i + 3)).* == 0x0A {
+      return i + 4
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Parse a complete request out of the buffer. Returns 1 when `out` describes
+// a whole request, 0 when more bytes are needed.
+fn rtsp_parse(buffer: u64, len: u32, out: *RtspRequest): u32 {
+  let header_end: u32 = rtsp_headers_end(buffer, len)
+  if header_end == 0 { return 0 }
+
+  out.method = RTSP_METHOD_UNKNOWN
+  out.content_length = 0
+  out.uri[0] = 0
+  out.cseq[0] = 0
+
+  // Request line: METHOD SP URI SP VERSION
+  var at: u32 = 0
+  while at < header_end and rtsp_is_space(@as(*u8, @ptrFromInt(buffer + at)).*) == 0 {
+    at = at + 1
+  }
+  out.method = rtsp_method_of(buffer, 0, at)
+
+  while at < header_end and rtsp_is_space(@as(*u8, @ptrFromInt(buffer + at)).*) == 1 {
+    at = at + 1
+  }
+  var uri_len: u32 = 0
+  while at + uri_len < header_end {
+    let c: u8 = @as(*u8, @ptrFromInt(buffer + at + uri_len)).*
+    if rtsp_is_space(c) == 1 or c == 0x0D { break }
+    if uri_len < RTSP_MAX_URI - 1 {
+      out.uri[uri_len] = c
+    }
+    uri_len = uri_len + 1
+  }
+  if uri_len >= RTSP_MAX_URI { uri_len = RTSP_MAX_URI - 1 }
+  out.uri[uri_len] = 0
+
+  // Headers, one per line until the blank line.
+  var line: u32 = 0
+  while line < header_end {
+    // Advance to the start of the next line.
+    while line + 1 < header_end {
+      if @as(*u8, @ptrFromInt(buffer + line)).* == 0x0A { break }
+      line = line + 1
+    }
+    line = line + 1
+    if line >= header_end { break }
+
+    // Name runs to the colon.
+    var name_len: u32 = 0
+    while line + name_len < header_end {
+      let c: u8 = @as(*u8, @ptrFromInt(buffer + line + name_len)).*
+      if c == 0x3A or c == 0x0D { break }
+      name_len = name_len + 1
+    }
+    if line + name_len >= header_end { break }
+    if @as(*u8, @ptrFromInt(buffer + line + name_len)).* != 0x3A { continue }
+
+    var value_at: u32 = line + name_len + 1
+    while value_at < header_end and rtsp_is_space(@as(*u8, @ptrFromInt(buffer + value_at)).*) == 1 {
+      value_at = value_at + 1
+    }
+    var value_len: u32 = 0
+    while value_at + value_len < header_end {
+      let c: u8 = @as(*u8, @ptrFromInt(buffer + value_at + value_len)).*
+      if c == 0x0D or c == 0x0A { break }
+      value_len = value_len + 1
+    }
+
+    if rtsp_token_eq(buffer, line, name_len, "Content-Length") == 1 {
+      out.content_length = rtsp_parse_uint(buffer, value_at, value_len)
+    }
+    if rtsp_token_eq(buffer, line, name_len, "CSeq") == 1 {
+      var k: u32 = 0
+      while k < value_len and k < 31 {
+        out.cseq[k] = @as(*u8, @ptrFromInt(buffer + value_at + k)).*
+        k = k + 1
+      }
+      out.cseq[k] = 0
+    }
+  }
+
+  // The body has to be here too, or this is still a partial request.
+  if len < header_end + out.content_length { return 0 }
+  out.body_at = header_end
+  out.body_len = out.content_length
+  return 1
+}
+
+// ============================================================================
+// Responses
+// ============================================================================
+
+fn rtsp_append(buffer: u64, offset: u32, text: u64): u32 {
+  var i: u32 = 0
+  while i < 512 {
+    let c: u8 = @as(*u8, @ptrFromInt(text + i)).*
+    if c == 0 { break }
+    @as(*u8, @ptrFromInt(buffer + offset + i)).* = c
+    i = i + 1
+  }
+  return offset + i
+}
+
+fn rtsp_append_uint(buffer: u64, offset: u32, value: u32): u32 {
+  if value == 0 {
+    @as(*u8, @ptrFromInt(buffer + offset)).* = '0'
+    return offset + 1
+  }
+  var digits: [u8; 10]
+  var n: u32 = 0
+  var v: u32 = value
+  while v > 0 {
+    digits[n] = @as(u8, (v % 10) + 48)
+    v = v / 10
+    n = n + 1
+  }
+  var out: u32 = offset
+  while n > 0 {
+    n = n - 1
+    @as(*u8, @ptrFromInt(buffer + out)).* = digits[n]
+    out = out + 1
+  }
+  return out
+}
+
+// Send a response, echoing CSeq. A sender that does not see its own sequence
+// number back treats the reply as belonging to some other request and stalls,
+// so this is not optional politeness.
+fn rtsp_respond(status: u64, request: *RtspRequest, body: u64, body_len: u32) {
+  var out: [u8; 2048]
+  let base: u64 = @intFromPtr(&out)
+
+  var n: u32 = rtsp_append(base, 0, "RTSP/1.0 ")
+  n = rtsp_append(base, n, status)
+  n = rtsp_append(base, n, "\r\nCSeq: ")
+  n = rtsp_append(base, n, @intFromPtr(&request.cseq))
+  n = rtsp_append(base, n, "\r\nServer: HomeOS/1.0\r\nContent-Length: ")
+  n = rtsp_append_uint(base, n, body_len)
+  n = rtsp_append(base, n, "\r\n\r\n")
+
+  var i: u32 = 0
+  while i < body_len {
+    @as(*u8, @ptrFromInt(base + n + i)).* = @as(*u8, @ptrFromInt(body + i)).*
+    i = i + 1
+  }
+  n = n + body_len
+
+  tcp.tcp_send(rtsp_state.conn_id, base, n)
+}
+
+fn rtsp_respond_status(status: u64, request: *RtspRequest) {
+  rtsp_respond(status, request, @intFromPtr(&rtsp_state.buffer), 0)
+}
+
+// ============================================================================
+// Dispatch
+// ============================================================================
+
+fn rtsp_handle(request: *RtspRequest) {
+  rtsp_state.requests_served = rtsp_state.requests_served + 1
+
+  // Pairing. Both handshakes are POSTs carrying TLV8 bodies, and both answer
+  // 200 even when the answer inside is a refusal: the TLV error is the
+  // protocol's way of saying no, and an HTTP-level error would have the
+  // sender retry the transport instead of reading it.
+  if request.method == RTSP_METHOD_POST {
+    var reply: [u8; 1024]
+    if rtsp_uri_is(request, "/pair-setup") == 1 {
+      let n: u32 = pairing.pair_setup_handle(
+        @intFromPtr(&rtsp_state.buffer) + request.body_at,
+        request.body_len, @intFromPtr(&reply))
+      rtsp_respond("200 OK", request, @intFromPtr(&reply), n)
+      return
+    }
+    if rtsp_uri_is(request, "/pair-verify") == 1 {
+      let n: u32 = pairing.pair_verify_handle(
+        @intFromPtr(&rtsp_state.buffer) + request.body_at,
+        request.body_len, @intFromPtr(&reply))
+      rtsp_respond("200 OK", request, @intFromPtr(&reply), n)
+      return
+    }
+  }
+
+  if request.method == RTSP_METHOD_OPTIONS {
+    rtsp_respond_status("200 OK", request)
+    foundation.serial_write_string("[AIRPLAY] OPTIONS\n")
+    return
+  }
+
+  if request.method == RTSP_METHOD_TEARDOWN {
+    rtsp_respond_status("200 OK", request)
+    foundation.serial_write_string("[AIRPLAY] TEARDOWN\n")
+    return
+  }
+
+  // Everything below needs a working media path or a pairing implementation.
+  // Answering 200 to a SETUP we cannot honour would have the sender open
+  // streams into a receiver that never reads them, and the failure would
+  // surface as a picture that never appears rather than as a refusal.
+  if request.method == RTSP_METHOD_SETUP or
+     request.method == RTSP_METHOD_RECORD or
+     request.method == RTSP_METHOD_FLUSH {
+    rtsp_respond_status("501 Not Implemented", request)
+    foundation.serial_write_string("[AIRPLAY] refused a stream request: no media path yet\n")
+    return
+  }
+
+  rtsp_respond_status("501 Not Implemented", request)
+}
+
+// ============================================================================
+// Server loop
+// ============================================================================
+
+export fn rtsp_init(): u32 {
+  foundation.mem_set(&rtsp_state as *u8, 0, @sizeOf(RtspState))
+  rtsp_state.conn_id = RTSP_NO_CONN
+  rtsp_state.listen_id = tcp.tcp_listen(RTSP_PORT)
+  if rtsp_state.listen_id == RTSP_NO_CONN { return 0 }
+  rtsp_state.initialized = 1
+  return 1
+}
+
+// Accept at most one new connection and drain whatever it has sent. Returns
+// the number of complete requests handled this call.
+export fn rtsp_poll(): u32 {
+  if rtsp_state.initialized == 0 { return 0 }
+
+  if rtsp_state.conn_id == RTSP_NO_CONN {
+    let conn: u32 = tcp.tcp_accept_id(rtsp_state.listen_id)
+    if conn == RTSP_NO_CONN { return 0 }
+    rtsp_state.conn_id = conn
+    rtsp_state.buffered = 0
+    foundation.serial_write_string("[AIRPLAY] control connection accepted\n")
+  }
+
+  if tcp.tcp_has_data(rtsp_state.conn_id) == 0 { return 0 }
+
+  let space: u32 = RTSP_MAX_REQUEST - rtsp_state.buffered
+  if space == 0 {
+    // A request larger than the buffer is not one this server will ever
+    // satisfy; drop the connection rather than silently truncating it into
+    // something that parses as a different request.
+    tcp.tcp_close(rtsp_state.conn_id)
+    rtsp_state.conn_id = RTSP_NO_CONN
+    rtsp_state.buffered = 0
+    return 0
+  }
+
+  let got: u32 = tcp.tcp_recv(rtsp_state.conn_id,
+                              @intFromPtr(&rtsp_state.buffer) + rtsp_state.buffered,
+                              space, 0)
+  if got == 0 { return 0 }
+  rtsp_state.buffered = rtsp_state.buffered + got
+
+  var handled: u32 = 0
+  var request: RtspRequest
+  while rtsp_parse(@intFromPtr(&rtsp_state.buffer), rtsp_state.buffered, &request) == 1 {
+    rtsp_handle(&request)
+    handled = handled + 1
+
+    // Shift any bytes belonging to the next request down to the front.
+    let consumed: u32 = request.body_at + request.body_len
+    if consumed >= rtsp_state.buffered {
+      rtsp_state.buffered = 0
+      break
+    }
+    let remaining: u32 = rtsp_state.buffered - consumed
+    var i: u32 = 0
+    while i < remaining {
+      rtsp_state.buffer[i] = rtsp_state.buffer[consumed + i]
+      i = i + 1
+    }
+    rtsp_state.buffered = remaining
+  }
+
+  return handled
+}
+
+export fn rtsp_requests_served(): u64 {
+  return rtsp_state.requests_served
+}
+
+export fn rtsp_is_listening(): u32 {
+  return rtsp_state.initialized
+}
