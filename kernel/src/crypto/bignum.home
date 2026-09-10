@@ -1,0 +1,326 @@
+// home-os fixed-width modular arithmetic
+//
+// Sized for the RFC 5054 3072-bit group that AirPlay's SRP-6a uses: 96 limbs
+// of 32 bits. This is a separate module from rsa.home rather than a widening
+// of it. rsa.home's BigInt is [u32; 128], enough for RSA-2048 where a product
+// of two 64-limb numbers lands exactly in 128 limbs. A 96-limb product needs
+// 192, so bigint_mul there would truncate silently -- and widening a type that
+// RSA's known-answer test and stack budget are built around is a change that
+// deserves its own measurement, not a side effect of adding SRP.
+//
+// Reduction is Montgomery, not long division. The difference is not a
+// micro-optimisation: a 512-bit exponent costs about 14 million limb
+// multiply-adds this way and roughly a hundred times that with a shift-and-
+// subtract remainder, which is the difference between a boot self-test that
+// runs and one that never finishes under emulation.
+//
+// Nothing here is constant-time with respect to the modulus, and the
+// exponentiation ladder squares and multiplies on set bits only, so its timing
+// reveals the exponent's Hamming weight. SRP's server exponent is a per-session
+// random value and its verifier is not a long-term secret in the way an RSA
+// private key is, so that is a considered position rather than an oversight --
+// but it is the reason this module should not be reached for to implement
+// something like RSA-CRT signing.
+
+import "../core/foundation.home" as foundation
+
+export const BN_LIMBS: u32 = 96          // 3072 bits
+export const BN_BYTES: u32 = 384
+const BN_WORK_LIMBS: u32 = 98            // CIOS needs two extra
+
+export struct BigNum {
+  limbs: [u32; 96]
+}
+
+// ============================================================================
+// Basics
+// ============================================================================
+
+export fn bn_zero(a: *BigNum) {
+  var i: u32 = 0
+  while i < BN_LIMBS {
+    a.limbs[i] = 0
+    i = i + 1
+  }
+}
+
+export fn bn_copy(dst: *BigNum, src: *BigNum) {
+  var i: u32 = 0
+  while i < BN_LIMBS {
+    dst.limbs[i] = src.limbs[i]
+    i = i + 1
+  }
+}
+
+export fn bn_from_u32(a: *BigNum, value: u32) {
+  bn_zero(a)
+  a.limbs[0] = value
+}
+
+export fn bn_is_zero(a: *BigNum): u32 {
+  var acc: u32 = 0
+  var i: u32 = 0
+  while i < BN_LIMBS {
+    acc = acc | a.limbs[i]
+    i = i + 1
+  }
+  if acc == 0 { return 1 }
+  return 0
+}
+
+// Load from big-endian bytes, the order every SRP value travels in.
+export fn bn_from_bytes(a: *BigNum, data: u64, len: u32) {
+  bn_zero(a)
+  var i: u32 = 0
+  while i < len and i < BN_BYTES {
+    // Byte at the end of the buffer is the least significant.
+    let byte: u32 = @as(u32, @as(*u8, @ptrFromInt(data + (len - 1 - i))).*)
+    a.limbs[i / 4] = a.limbs[i / 4] | (byte << @as(u32, (i % 4) * 8))
+    i = i + 1
+  }
+}
+
+// Store big-endian, left-padded with zeros to exactly `len` bytes. SRP hashes
+// PAD(x) -- values padded to the modulus width -- so a short write here would
+// produce a proof the other end cannot reproduce.
+export fn bn_to_bytes(a: *BigNum, out: u64, len: u32) {
+  var i: u32 = 0
+  while i < len {
+    var byte: u8 = 0
+    let from_end: u32 = len - 1 - i
+    if from_end < BN_BYTES {
+      byte = @as(u8, (a.limbs[from_end / 4] >> @as(u32, (from_end % 4) * 8)) & 0xFF)
+    }
+    @as(*u8, @ptrFromInt(out + i)).* = byte
+    i = i + 1
+  }
+}
+
+// -1, 0 or 1 for a < b, a == b, a > b.
+export fn bn_cmp(a: *BigNum, b: *BigNum): i32 {
+  var i: i32 = @as(i32, BN_LIMBS) - 1
+  while i >= 0 {
+    let idx: u32 = @as(u32, i)
+    if a.limbs[idx] > b.limbs[idx] { return 1 }
+    if a.limbs[idx] < b.limbs[idx] { return -1 }
+    i = i - 1
+  }
+  return 0
+}
+
+// a = a + b, returning the carry out of the top limb.
+fn bn_add_into(a: *BigNum, b: *BigNum): u32 {
+  var carry: u64 = 0
+  var i: u32 = 0
+  while i < BN_LIMBS {
+    let sum: u64 = @as(u64, a.limbs[i]) + @as(u64, b.limbs[i]) + carry
+    a.limbs[i] = @as(u32, sum & 0xFFFFFFFF)
+    carry = sum >> 32
+    i = i + 1
+  }
+  return @as(u32, carry)
+}
+
+// a = a - b, returning the borrow out of the top limb.
+fn bn_sub_into(a: *BigNum, b: *BigNum): u32 {
+  var borrow: u64 = 0
+  var i: u32 = 0
+  while i < BN_LIMBS {
+    let diff: u64 = @as(u64, a.limbs[i]) - @as(u64, b.limbs[i]) - borrow
+    a.limbs[i] = @as(u32, diff & 0xFFFFFFFF)
+    if (diff >> 63) == 1 { borrow = 1 } else { borrow = 0 }
+    i = i + 1
+  }
+  return @as(u32, borrow)
+}
+
+// a = (a + b) mod n, for a and b already reduced.
+export fn bn_add_mod(a: *BigNum, b: *BigNum, n: *BigNum) {
+  let carry: u32 = bn_add_into(a, b)
+  // The sum can exceed n either by overflowing the top limb or by simply
+  // being larger; both mean one subtraction.
+  if carry == 1 or bn_cmp(a, n) >= 0 {
+    bn_sub_into(a, n)
+  }
+}
+
+// ============================================================================
+// Montgomery arithmetic
+// ============================================================================
+
+// -n^-1 mod 2^32, by Newton iteration. Each step doubles the number of
+// correct bits, so five steps take one bit to thirty-two.
+fn bn_n0inv(n: *BigNum): u32 {
+  let n0: u32 = n.limbs[0]
+  var inv: u32 = 1
+  var i: u32 = 0
+  while i < 5 {
+    // inv = inv * (2 - n0 * inv), all mod 2^32
+    let prod: u32 = n0 * inv
+    let term: u32 = 2 - prod
+    inv = inv * term
+    i = i + 1
+  }
+  return 0 - inv
+}
+
+// R^2 mod n, where R = 2^3072.
+//
+// Computed by doubling 1 up through 2*3072 conditional-subtract steps rather
+// than by dividing. Each step is a shift and at most one subtraction, so this
+// costs about six thousand cheap passes once per modulus -- and it avoids
+// needing a general remainder routine anywhere in this module.
+fn bn_r2_mod_n(out: *BigNum, n: *BigNum) {
+  bn_from_u32(out, 1)
+  var i: u32 = 0
+  while i < BN_LIMBS * 32 * 2 {
+    // out = out * 2
+    var carry: u32 = 0
+    var j: u32 = 0
+    while j < BN_LIMBS {
+      let next: u32 = out.limbs[j] >> 31
+      out.limbs[j] = (out.limbs[j] << 1) | carry
+      carry = next
+      j = j + 1
+    }
+    // A carry out of the top means the value passed 2^3072, which is above n,
+    // so it must come back down regardless of the comparison.
+    if carry == 1 or bn_cmp(out, n) >= 0 {
+      bn_sub_into(out, n)
+    }
+    i = i + 1
+  }
+}
+
+// Montgomery product: out = a * b * R^-1 mod n, by CIOS.
+fn bn_mont_mul(out: *BigNum, a: *BigNum, b: *BigNum, n: *BigNum, n0inv: u32) {
+  var t: [u32; 98]
+  var i: u32 = 0
+  while i < BN_WORK_LIMBS {
+    t[i] = 0
+    i = i + 1
+  }
+
+  i = 0
+  while i < BN_LIMBS {
+    // t = t + a * b[i]
+    var carry: u64 = 0
+    var j: u32 = 0
+    while j < BN_LIMBS {
+      let acc: u64 = @as(u64, t[j]) + @as(u64, a.limbs[j]) * @as(u64, b.limbs[i]) + carry
+      t[j] = @as(u32, acc & 0xFFFFFFFF)
+      carry = acc >> 32
+      j = j + 1
+    }
+    let sum_hi: u64 = @as(u64, t[BN_LIMBS]) + carry
+    t[BN_LIMBS] = @as(u32, sum_hi & 0xFFFFFFFF)
+    t[BN_LIMBS + 1] = @as(u32, sum_hi >> 32)
+
+    // m chosen so that t + m*n clears the bottom limb.
+    let m: u32 = t[0] * n0inv
+
+    let low: u64 = @as(u64, t[0]) + @as(u64, m) * @as(u64, n.limbs[0])
+    carry = low >> 32
+
+    j = 1
+    while j < BN_LIMBS {
+      let acc: u64 = @as(u64, t[j]) + @as(u64, m) * @as(u64, n.limbs[j]) + carry
+      t[j - 1] = @as(u32, acc & 0xFFFFFFFF)
+      carry = acc >> 32
+      j = j + 1
+    }
+
+    let hi: u64 = @as(u64, t[BN_LIMBS]) + carry
+    t[BN_LIMBS - 1] = @as(u32, hi & 0xFFFFFFFF)
+    t[BN_LIMBS] = @as(u32, t[BN_LIMBS + 1]) + @as(u32, hi >> 32)
+
+    i = i + 1
+  }
+
+  i = 0
+  while i < BN_LIMBS {
+    out.limbs[i] = t[i]
+    i = i + 1
+  }
+
+  // One conditional subtraction brings the result below n. CIOS leaves at
+  // most n-1 above it, so a single pass is enough.
+  if t[BN_LIMBS] != 0 or bn_cmp(out, n) >= 0 {
+    bn_sub_into(out, n)
+  }
+}
+
+// Which bit of a big-endian byte string, counting from the least significant.
+fn exp_bit(exp: u64, exp_len: u32, index: u32): u32 {
+  let byte_from_end: u32 = index / 8
+  if byte_from_end >= exp_len { return 0 }
+  let byte: u8 = @as(*u8, @ptrFromInt(exp + (exp_len - 1 - byte_from_end))).*
+  return @as(u32, (byte >> @as(u8, index % 8)) & 1)
+}
+
+// out = base^exp mod n, with exp a big-endian byte string.
+//
+// Left-to-right square-and-multiply. The ladder skips the multiply on clear
+// bits, so its running time depends on the exponent -- see the note at the top
+// of this file for why that is acceptable here and would not be elsewhere.
+export fn bn_mod_exp(out: *BigNum, base: *BigNum, exp: u64, exp_len: u32, n: *BigNum) {
+  if bn_is_zero(n) == 1 {
+    bn_zero(out)
+    return
+  }
+
+  let n0inv: u32 = bn_n0inv(n)
+
+  var r2: BigNum
+  bn_r2_mod_n(&r2, n)
+
+  // Move the base into Montgomery form, and start the accumulator at the
+  // Montgomery representation of 1, which is R mod n.
+  var base_mont: BigNum
+  bn_mont_mul(&base_mont, base, &r2, n, n0inv)
+
+  var one: BigNum
+  bn_from_u32(&one, 1)
+  var acc: BigNum
+  bn_mont_mul(&acc, &one, &r2, n, n0inv)
+
+  var scratch: BigNum
+
+  // Skip the leading zero bits so the ladder starts at the exponent's top set
+  // bit rather than squaring 3072 times through padding.
+  var bit: i32 = @as(i32, exp_len * 8) - 1
+  while bit >= 0 {
+    if exp_bit(exp, exp_len, @as(u32, bit)) == 1 { break }
+    bit = bit - 1
+  }
+
+  while bit >= 0 {
+    bn_mont_mul(&scratch, &acc, &acc, n, n0inv)
+    bn_copy(&acc, &scratch)
+
+    if exp_bit(exp, exp_len, @as(u32, bit)) == 1 {
+      bn_mont_mul(&scratch, &acc, &base_mont, n, n0inv)
+      bn_copy(&acc, &scratch)
+    }
+    bit = bit - 1
+  }
+
+  // Back out of Montgomery form: multiplying by 1 divides by R.
+  bn_mont_mul(out, &acc, &one, n, n0inv)
+}
+
+// out = (a * b) mod n, for a and b already reduced. Two Montgomery products:
+// one to bring the pair into the domain, one to leave it.
+export fn bn_mul_mod(out: *BigNum, a: *BigNum, b: *BigNum, n: *BigNum) {
+  let n0inv: u32 = bn_n0inv(n)
+  var r2: BigNum
+  bn_r2_mod_n(&r2, n)
+
+  var a_mont: BigNum
+  bn_mont_mul(&a_mont, a, &r2, n, n0inv)
+
+  var prod: BigNum
+  bn_mont_mul(&prod, &a_mont, b, n, n0inv)
+
+  bn_copy(out, &prod)
+}
