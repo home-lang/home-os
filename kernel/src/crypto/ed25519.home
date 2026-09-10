@@ -1,0 +1,623 @@
+// home-os Ed25519
+// RFC 8032 signatures over edwards25519.
+//
+// The prime field is the same one X25519 works in, so the 10-limb field
+// arithmetic is imported from curve25519.home rather than written twice. What
+// is here is the part Ed25519 does not share: the Edwards group law, scalar
+// arithmetic modulo the group order L, and the sign/verify constructions.
+//
+// Two deliberate choices, both trading speed for a smaller surface to get
+// wrong:
+//
+//   * The base point is decompressed at init from its canonical encoding
+//     instead of shipping ref10's 32x8 precomputed comb table. That table is
+//     ~2 KB of transcribed constants whose corruption would produce valid
+//     looking signatures against the wrong generator, which no unit test
+//     catches unless it checks a known vector end to end.
+//
+//   * Scalars are reduced modulo L by binary long division rather than
+//     ref10's 21-bit-limb reduction. It is slower and it is obviously right.
+//
+// Signing touches the secret scalar, so its scalar multiplication adds at
+// every bit and selects with conditional moves; it does not branch on key
+// material. Verification handles only public values and does not need that.
+
+import "../core/foundation.home" as foundation
+import "curve25519.home" as fe
+import "sha512.home" as sha512
+
+export const ED25519_SEED_SIZE: u32 = 32
+export const ED25519_PUBLIC_SIZE: u32 = 32
+export const ED25519_SIGNATURE_SIZE: u32 = 64
+
+// d2 = 2 * (-121665/121666) mod p, in the 10-limb representation.
+const D2: [i64; 10] = [
+  -21827239, -5839606, -30745221, 13898782, 229458,
+  15978800, -12551817, -6495438, 29715968, 9444199
+]
+
+// d = -121665/121666 mod p
+const D: [i64; 10] = [
+  -10913610, 13857413, -15372611, 6949391, 114729,
+  -8787816, -6275908, -3247719, -18696448, -12055116
+]
+
+// sqrt(-1) mod p
+const SQRTM1: [i64; 10] = [
+  -32595792, -7943725, 9377950, 3500415, 12389472,
+  -272473, -25146209, -2005654, 326686, 11406482
+]
+
+// The group order L = 2^252 + 27742317777372353535851937790883648493,
+// as eight little-endian 32-bit limbs.
+const L0: u32 = 0x5cf5d3ed
+const L1: u32 = 0x5812631a
+const L2: u32 = 0xa2f79cd6
+const L3: u32 = 0x14def9de
+const L4: u32 = 0x00000000
+const L5: u32 = 0x00000000
+const L6: u32 = 0x00000000
+const L7: u32 = 0x10000000
+
+// A point in extended coordinates: x = X/Z, y = Y/Z, and T = XY/Z.
+struct GePoint {
+  x: [i64; 10],
+  y: [i64; 10],
+  z: [i64; 10],
+  t: [i64; 10]
+}
+
+var base_point: GePoint = undefined
+var base_ready: u32 = 0
+
+// ============================================================================
+// Field helpers Ed25519 needs and X25519 does not
+// ============================================================================
+
+fn fe_neg(h: *[i64; 10], f: *[i64; 10]) {
+  var i: u32 = 0
+  while i < 10 {
+    h[i] = 0 - f[i]
+    i = i + 1
+  }
+}
+
+fn fe_cmov(f: *[i64; 10], g: *[i64; 10], b: u32) {
+  // b is 0 or 1; build a full-width mask so the choice is a bitwise select
+  // rather than a branch.
+  let mask: i64 = 0 - @as(i64, b)
+  var i: u32 = 0
+  while i < 10 {
+    let diff: i64 = (f[i] ^ g[i]) & mask
+    f[i] = f[i] ^ diff
+    i = i + 1
+  }
+}
+
+fn fe_from_const(h: *[i64; 10], src: *[i64; 10]) {
+  var i: u32 = 0
+  while i < 10 {
+    h[i] = src[i]
+    i = i + 1
+  }
+}
+
+fn fe_isnegative(f: *[i64; 10]): u32 {
+  var s: [u8; 32]
+  fe.fe_tobytes(@intFromPtr(&s), f)
+  return @as(u32, s[0] & 1)
+}
+
+fn fe_isnonzero(f: *[i64; 10]): u32 {
+  var s: [u8; 32]
+  fe.fe_tobytes(@intFromPtr(&s), f)
+  var acc: u8 = 0
+  var i: u32 = 0
+  while i < 32 {
+    acc = acc | s[i]
+    i = i + 1
+  }
+  if acc == 0 { return 0 }
+  return 1
+}
+
+// z^((p-5)/8), the exponent the square-root recovery needs. Squaring down the
+// exponent's bit pattern is simpler to read than a hand-scheduled addition
+// chain, and it only ever runs on public values.
+fn fe_pow22523(out: *[i64; 10], z: *[i64; 10]) {
+  var acc: [i64; 10]
+  fe.fe_copy(&acc, z)
+
+  // The exponent is 2^252 - 3: 250 set bits, then "01". Each iteration below
+  // squares and multiplies, taking the running exponent e to 2e+1, so after n
+  // iterations it is 2^(n+1) - 1. Starting from e = 1, reaching 2^250 - 1
+  // takes 249 of them, not 250 — one extra doubling here yields 2^253 - 3,
+  // which decompresses the base point to a different curve point and makes
+  // every key and signature derived from it self-consistently wrong.
+  var i: u32 = 0
+  while i < 249 {
+    fe.fe_sq(&acc, &acc)
+    fe.fe_mul(&acc, &acc, z)
+    i = i + 1
+  }
+  // Trailing "01": one squaring for the zero bit, then a squaring and a
+  // multiply for the final set bit.
+  fe.fe_sq(&acc, &acc)
+  fe.fe_sq(&acc, &acc)
+  fe.fe_mul(&acc, &acc, z)
+  fe.fe_copy(out, &acc)
+}
+
+// ============================================================================
+// Group law
+// ============================================================================
+
+fn ge_zero(p: *GePoint) {
+  fe.fe_zero(&p.x)
+  fe.fe_one(&p.y)
+  fe.fe_one(&p.z)
+  fe.fe_zero(&p.t)
+}
+
+fn ge_copy(dst: *GePoint, src: *GePoint) {
+  fe.fe_copy(&dst.x, &src.x)
+  fe.fe_copy(&dst.y, &src.y)
+  fe.fe_copy(&dst.z, &src.z)
+  fe.fe_copy(&dst.t, &src.t)
+}
+
+fn ge_cmov(f: *GePoint, g: *GePoint, b: u32) {
+  fe_cmov(&f.x, &g.x, b)
+  fe_cmov(&f.y, &g.y, b)
+  fe_cmov(&f.z, &g.z, b)
+  fe_cmov(&f.t, &g.t, b)
+}
+
+// The unified twisted-Edwards addition for a = -1 (Hisil-Wong-Carter-Dawson).
+// It is correct when the two points are equal, so doubling needs no separate
+// formula and no case analysis on the inputs.
+fn ge_add(r: *GePoint, p: *GePoint, q: *GePoint) {
+  var a: [i64; 10]
+  var b: [i64; 10]
+  var c: [i64; 10]
+  var d: [i64; 10]
+  var e: [i64; 10]
+  var f: [i64; 10]
+  var g: [i64; 10]
+  var h: [i64; 10]
+  var t0: [i64; 10]
+  var t1: [i64; 10]
+  var d2: [i64; 10]
+
+  // A = (Y1-X1)(Y2-X2)
+  fe.fe_sub(&t0, &p.y, &p.x)
+  fe.fe_sub(&t1, &q.y, &q.x)
+  fe.fe_mul(&a, &t0, &t1)
+
+  // B = (Y1+X1)(Y2+X2)
+  fe.fe_add(&t0, &p.y, &p.x)
+  fe.fe_add(&t1, &q.y, &q.x)
+  fe.fe_mul(&b, &t0, &t1)
+
+  // C = T1 * 2d * T2
+  fe_from_const(&d2, &D2)
+  fe.fe_mul(&t0, &p.t, &d2)
+  fe.fe_mul(&c, &t0, &q.t)
+
+  // D = Z1 * 2 * Z2
+  fe.fe_mul(&t0, &p.z, &q.z)
+  fe.fe_add(&d, &t0, &t0)
+
+  fe.fe_sub(&e, &b, &a)
+  fe.fe_sub(&f, &d, &c)
+  fe.fe_add(&g, &d, &c)
+  fe.fe_add(&h, &b, &a)
+
+  fe.fe_mul(&r.x, &e, &f)
+  fe.fe_mul(&r.y, &g, &h)
+  fe.fe_mul(&r.t, &e, &h)
+  fe.fe_mul(&r.z, &f, &g)
+}
+
+fn ge_tobytes(s: u64, p: *GePoint) {
+  var recip: [i64; 10]
+  var x: [i64; 10]
+  var y: [i64; 10]
+
+  fe.fe_invert(&recip, &p.z)
+  fe.fe_mul(&x, &p.x, &recip)
+  fe.fe_mul(&y, &p.y, &recip)
+
+  fe.fe_tobytes(s, &y)
+  // The encoding is y with x's sign in the top bit.
+  let sign: u8 = @as(u8, fe_isnegative(&x) << 7)
+  let last: *u8 = @ptrFromInt(s + 31)
+  last.* = last.* ^ sign
+}
+
+// Decompress an encoded point. Returns 1 on success, 0 if the encoding does
+// not name a curve point — a check verification depends on, since a forged
+// public key that decompresses to nothing must be refused rather than
+// silently treated as the identity.
+fn ge_frombytes(p: *GePoint, s: u64): u32 {
+  var u: [i64; 10]
+  var v: [i64; 10]
+  var v3: [i64; 10]
+  var vxx: [i64; 10]
+  var check: [i64; 10]
+  var t0: [i64; 10]
+  var dc: [i64; 10]
+
+  fe.fe_frombytes(&p.y, s)
+  fe.fe_one(&p.z)
+
+  // u = y^2 - 1, v = d*y^2 + 1
+  fe.fe_sq(&u, &p.y)
+  fe_from_const(&dc, &D)
+  fe.fe_mul(&v, &u, &dc)
+  fe.fe_sub(&u, &u, &p.z)
+  fe.fe_add(&v, &v, &p.z)
+
+  // x = u * v^3 * (u * v^7)^((p-5)/8)
+  fe.fe_sq(&v3, &v)
+  fe.fe_mul(&v3, &v3, &v)
+  fe.fe_sq(&p.x, &v3)
+  fe.fe_mul(&p.x, &p.x, &v)
+  fe.fe_mul(&p.x, &p.x, &u)
+
+  fe_pow22523(&p.x, &p.x)
+  fe.fe_mul(&p.x, &p.x, &v3)
+  fe.fe_mul(&p.x, &p.x, &u)
+
+  // Either x is already the root, or it is the root times sqrt(-1), or the
+  // encoding is not a point at all.
+  fe.fe_sq(&vxx, &p.x)
+  fe.fe_mul(&vxx, &vxx, &v)
+  fe.fe_sub(&check, &vxx, &u)
+  if fe_isnonzero(&check) == 1 {
+    fe.fe_add(&check, &vxx, &u)
+    if fe_isnonzero(&check) == 1 { return 0 }
+    fe_from_const(&t0, &SQRTM1)
+    fe.fe_mul(&p.x, &p.x, &t0)
+  }
+
+  // Match the sign bit the encoding asked for.
+  let sign: u32 = @as(u32, (@as(*u8, @ptrFromInt(s + 31)).* >> 7) & 1)
+  if fe_isnegative(&p.x) != sign {
+    fe_neg(&p.x, &p.x)
+  }
+
+  fe.fe_mul(&p.t, &p.x, &p.y)
+  return 1
+}
+
+// Constant-time scalar multiplication: every bit does an addition and a
+// doubling, and the result is chosen with a conditional move. Signing runs
+// this over the secret scalar.
+fn ge_scalarmult(r: *GePoint, scalar: u64, p: *GePoint) {
+  var acc: GePoint
+  var sum: GePoint
+  ge_zero(&acc)
+
+  var i: i32 = 255
+  while i >= 0 {
+    ge_add(&acc, &acc, &acc)
+
+    let byte: u8 = @as(*u8, @ptrFromInt(scalar + @as(u32, i / 8))).*
+    let bit: u32 = @as(u32, (byte >> @as(u8, i % 8)) & 1)
+
+    ge_add(&sum, &acc, p)
+    ge_cmov(&acc, &sum, bit)
+
+    i = i - 1
+  }
+
+  ge_copy(r, &acc)
+}
+
+fn ge_base(): *GePoint {
+  if base_ready == 0 {
+    // The canonical encoding of B: y = 4/5 with a clear sign bit.
+    var encoded: [u8; 32]
+    encoded[0] = 0x58
+    var i: u32 = 1
+    while i < 32 {
+      encoded[i] = 0x66
+      i = i + 1
+    }
+    ge_frombytes(&base_point, @intFromPtr(&encoded))
+    base_ready = 1
+  }
+  return &base_point
+}
+
+// ============================================================================
+// Scalar arithmetic modulo L
+// ============================================================================
+
+fn bn_load(limbs: *[u32; 16], bytes: u64, len: u32) {
+  var i: u32 = 0
+  while i < 16 {
+    limbs[i] = 0
+    i = i + 1
+  }
+  i = 0
+  while i < len {
+    let byte: u32 = @as(u32, @as(*u8, @ptrFromInt(bytes + i)).*)
+    limbs[i / 4] = limbs[i / 4] | (byte << @as(u32, (i % 4) * 8))
+    i = i + 1
+  }
+}
+
+fn bn_store32(limbs: *[u32; 16], out: u64) {
+  var i: u32 = 0
+  while i < 32 {
+    let limb: u32 = limbs[i / 4]
+    @as(*u8, @ptrFromInt(out + i)).* = @as(u8, (limb >> @as(u32, (i % 4) * 8)) & 0xFF)
+    i = i + 1
+  }
+}
+
+// Is a >= b, comparing 16-limb values?
+fn bn_ge(a: *[u32; 16], b: *[u32; 16]): u32 {
+  var i: i32 = 15
+  while i >= 0 {
+    let ai: u32 = a[@as(u32, i)]
+    let bi: u32 = b[@as(u32, i)]
+    if ai > bi { return 1 }
+    if ai < bi { return 0 }
+    i = i - 1
+  }
+  return 1
+}
+
+fn bn_sub(a: *[u32; 16], b: *[u32; 16]) {
+  var borrow: u64 = 0
+  var i: u32 = 0
+  while i < 16 {
+    let diff: u64 = @as(u64, a[i]) - @as(u64, b[i]) - borrow
+    a[i] = @as(u32, diff & 0xFFFFFFFF)
+    if (diff >> 63) == 1 { borrow = 1 } else { borrow = 0 }
+    i = i + 1
+  }
+}
+
+fn bn_shl1(v: *[u32; 16]) {
+  var carry: u32 = 0
+  var i: u32 = 0
+  while i < 16 {
+    let next: u32 = v[i] >> 31
+    v[i] = (v[i] << 1) | carry
+    carry = next
+    i = i + 1
+  }
+}
+
+fn bn_shr1(v: *[u32; 16]) {
+  var i: i32 = 15
+  var carry: u32 = 0
+  while i >= 0 {
+    let idx: u32 = @as(u32, i)
+    let next: u32 = v[idx] & 1
+    v[idx] = (v[idx] >> 1) | (carry << 31)
+    carry = next
+    i = i - 1
+  }
+}
+
+fn bn_load_order(l: *[u32; 16]) {
+  var i: u32 = 0
+  while i < 16 {
+    l[i] = 0
+    i = i + 1
+  }
+  l[0] = L0
+  l[1] = L1
+  l[2] = L2
+  l[3] = L3
+  l[4] = L4
+  l[5] = L5
+  l[6] = L6
+  l[7] = L7
+}
+
+// x mod L, by shifting L up to the top of x and subtracting down. 512 - 252
+// steps, each a compare and a conditional subtract.
+fn bn_mod_order(x: *[u32; 16]) {
+  var shifted: [u32; 16]
+  bn_load_order(&shifted)
+
+  // Raise L until it is just above x, counting how far it moved.
+  var shifts: u32 = 0
+  while shifts < 260 {
+    if bn_ge(&shifted, x) == 1 { break }
+    // Stop if another shift would push the top bit out of the 512-bit window.
+    if (shifted[15] >> 31) == 1 { break }
+    bn_shl1(&shifted)
+    shifts = shifts + 1
+  }
+
+  var step: u32 = 0
+  while step <= shifts {
+    if bn_ge(x, &shifted) == 1 {
+      bn_sub(x, &shifted)
+    }
+    bn_shr1(&shifted)
+    step = step + 1
+  }
+}
+
+// (a * b + c) mod L, with a, b and c 32-byte little-endian scalars.
+fn sc_muladd(out: u64, a: u64, b: u64, c: u64) {
+  var av: [u32; 16]
+  var bv: [u32; 16]
+  var cv: [u32; 16]
+  var product: [u32; 16]
+
+  bn_load(&av, a, 32)
+  bn_load(&bv, b, 32)
+  bn_load(&cv, c, 32)
+
+  var i: u32 = 0
+  while i < 16 {
+    product[i] = 0
+    i = i + 1
+  }
+
+  // Schoolbook: only the low eight limbs of each input are populated, so the
+  // 512-bit product fits without overflow.
+  i = 0
+  while i < 8 {
+    var carry: u64 = 0
+    var j: u32 = 0
+    while j < 8 {
+      if i + j < 16 {
+        let acc: u64 = @as(u64, product[i + j]) + @as(u64, av[i]) * @as(u64, bv[j]) + carry
+        product[i + j] = @as(u32, acc & 0xFFFFFFFF)
+        carry = acc >> 32
+      }
+      j = j + 1
+    }
+    if i + 8 < 16 {
+      product[i + 8] = product[i + 8] + @as(u32, carry & 0xFFFFFFFF)
+    }
+    i = i + 1
+  }
+
+  // Add c.
+  var carry2: u64 = 0
+  i = 0
+  while i < 16 {
+    let acc: u64 = @as(u64, product[i]) + @as(u64, cv[i]) + carry2
+    product[i] = @as(u32, acc & 0xFFFFFFFF)
+    carry2 = acc >> 32
+    i = i + 1
+  }
+
+  bn_mod_order(&product)
+  bn_store32(&product, out)
+}
+
+// Reduce a 64-byte hash to a scalar mod L.
+fn sc_reduce64(out: u64, wide: u64) {
+  var v: [u32; 16]
+  bn_load(&v, wide, 64)
+  bn_mod_order(&v)
+  bn_store32(&v, out)
+}
+
+// ============================================================================
+// Key handling
+// ============================================================================
+
+// h[0..32] with the low three bits cleared, bit 254 set and bit 255 cleared —
+// the cofactor and range clamping RFC 8032 §5.1.5 requires.
+fn clamp_scalar(a: u64) {
+  let first: *u8 = @ptrFromInt(a)
+  first.* = first.* & 248
+  let last: *u8 = @ptrFromInt(a + 31)
+  last.* = last.* & 63
+  last.* = last.* | 64
+}
+
+export fn ed25519_public_from_seed(seed: u64, public_key: u64) {
+  var h: [u8; 64]
+  sha512.sha512_hash(@ptrFromInt(seed), ED25519_SEED_SIZE, @intFromPtr(&h))
+  clamp_scalar(@intFromPtr(&h))
+
+  var a: GePoint
+  ge_scalarmult(&a, @intFromPtr(&h), ge_base())
+  ge_tobytes(public_key, &a)
+}
+
+export fn ed25519_sign(seed: u64, public_key: u64, message: u64, message_len: u32,
+                       signature: u64) {
+  var h: [u8; 64]
+  sha512.sha512_hash(@ptrFromInt(seed), ED25519_SEED_SIZE, @intFromPtr(&h))
+  clamp_scalar(@intFromPtr(&h))
+
+  // r = H(prefix || M) mod L, where the prefix is the upper half of the seed
+  // hash. Deriving the nonce from the message is what keeps Ed25519 safe
+  // without an entropy source at signing time.
+  var ctx: sha512.Sha512Context
+  var wide: [u8; 64]
+  sha512.sha512_ctx_init(&ctx)
+  sha512.sha512_update(&ctx, @ptrFromInt(@intFromPtr(&h) + 32), 32)
+  sha512.sha512_update(&ctx, @ptrFromInt(message), message_len)
+  sha512.sha512_final(&ctx, @intFromPtr(&wide))
+
+  var r: [u8; 32]
+  sc_reduce64(@intFromPtr(&r), @intFromPtr(&wide))
+
+  // R = rB
+  var rp: GePoint
+  ge_scalarmult(&rp, @intFromPtr(&r), ge_base())
+  ge_tobytes(signature, &rp)
+
+  // k = H(R || A || M) mod L
+  sha512.sha512_ctx_init(&ctx)
+  sha512.sha512_update(&ctx, @ptrFromInt(signature), 32)
+  sha512.sha512_update(&ctx, @ptrFromInt(public_key), 32)
+  sha512.sha512_update(&ctx, @ptrFromInt(message), message_len)
+  sha512.sha512_final(&ctx, @intFromPtr(&wide))
+
+  var k: [u8; 32]
+  sc_reduce64(@intFromPtr(&k), @intFromPtr(&wide))
+
+  // S = (r + k*a) mod L
+  sc_muladd(signature + 32, @intFromPtr(&k), @intFromPtr(&h), @intFromPtr(&r))
+}
+
+// Returns 1 when the signature is valid for this key and message, 0 otherwise.
+export fn ed25519_verify(public_key: u64, message: u64, message_len: u32,
+                         signature: u64): u32 {
+  // S must be canonical. An unreduced S is the classic malleability foothold:
+  // S + L verifies as readily as S unless it is refused here.
+  var s_limbs: [u32; 16]
+  var order: [u32; 16]
+  bn_load(&s_limbs, signature + 32, 32)
+  bn_load_order(&order)
+  if bn_ge(&s_limbs, &order) == 1 { return 0 }
+
+  var a: GePoint
+  if ge_frombytes(&a, public_key) == 0 { return 0 }
+
+  var r_point: GePoint
+  if ge_frombytes(&r_point, signature) == 0 { return 0 }
+
+  // k = H(R || A || M) mod L
+  var ctx: sha512.Sha512Context
+  var wide: [u8; 64]
+  sha512.sha512_ctx_init(&ctx)
+  sha512.sha512_update(&ctx, @ptrFromInt(signature), 32)
+  sha512.sha512_update(&ctx, @ptrFromInt(public_key), 32)
+  sha512.sha512_update(&ctx, @ptrFromInt(message), message_len)
+  sha512.sha512_final(&ctx, @intFromPtr(&wide))
+
+  var k: [u8; 32]
+  sc_reduce64(@intFromPtr(&k), @intFromPtr(&wide))
+
+  // Check [S]B == R + [k]A by comparing encodings.
+  var sb: GePoint
+  ge_scalarmult(&sb, signature + 32, ge_base())
+
+  var ka: GePoint
+  ge_scalarmult(&ka, @intFromPtr(&k), &a)
+
+  var rhs: GePoint
+  ge_add(&rhs, &r_point, &ka)
+
+  var lhs_bytes: [u8; 32]
+  var rhs_bytes: [u8; 32]
+  ge_tobytes(@intFromPtr(&lhs_bytes), &sb)
+  ge_tobytes(@intFromPtr(&rhs_bytes), &rhs)
+
+  var diff: u8 = 0
+  var i: u32 = 0
+  while i < 32 {
+    diff = diff | (lhs_bytes[i] ^ rhs_bytes[i])
+    i = i + 1
+  }
+  if diff == 0 { return 1 }
+  return 0
+}
