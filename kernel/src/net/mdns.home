@@ -1,0 +1,579 @@
+// home-os mDNS / DNS-SD responder
+//
+// Answers multicast DNS queries on 224.0.0.251:5353 so the box announces
+// itself on the LAN without a central name server. DNS-SD (RFC 6763) rides on
+// top of that: a service is three records that point at each other —
+//
+//   PTR   _airplay._tcp.local        -> Living Room._airplay._tcp.local
+//   SRV   Living Room._airplay._tcp.local -> port + homeos.local
+//   TXT   Living Room._airplay._tcp.local -> key=value pairs
+//   A     homeos.local               -> 192.0.2.10
+//
+// A sender browses for the PTR, follows it to the SRV for the port and target
+// host, reads the TXT for the service's capabilities, and resolves the A to
+// get somewhere to connect. All four have to be answerable or the service is
+// discovered but unusable.
+//
+// This is a responder only. Browsing for other people's services is a
+// different job and is not needed to be an AirPlay target.
+//
+// Names are written uncompressed. Compression (RFC 1035 §4.1.4) would save
+// perhaps eighty bytes in a response that already fits a single datagram, and
+// every pointer is a chance to emit an offset that is wrong in a way senders
+// disagree about.
+
+import "../core/foundation.home" as foundation
+import "udp.home" as udp
+
+const MDNS_PORT: u16 = 5353
+// 224.0.0.251, the IPv4 mDNS group.
+const MDNS_GROUP: u32 = 0xE00000FB
+
+const MDNS_TYPE_A: u16 = 1
+const MDNS_TYPE_PTR: u16 = 12
+const MDNS_TYPE_TXT: u16 = 16
+const MDNS_TYPE_SRV: u16 = 33
+const MDNS_TYPE_ANY: u16 = 255
+
+const MDNS_CLASS_IN: u16 = 1
+// Top bit of the class in a response means "this is the current truth, drop
+// what you had cached". Announcements set it; ordinary answers do not.
+const MDNS_CACHE_FLUSH: u16 = 0x8000
+
+const MDNS_TTL: u32 = 120
+const MDNS_MAX_SERVICES: u32 = 8
+const MDNS_MAX_NAME: u32 = 64
+const MDNS_MAX_TXT: u32 = 256
+const MDNS_BUFFER: u32 = 1400
+
+struct MdnsService {
+    active: u32,
+    // "Living Room"
+    instance: [u8; 64],
+    // "_airplay._tcp"
+    service: [u8; 64],
+    port: u16,
+    // Already in DNS-SD form: each entry a length byte then that many bytes.
+    txt: [u8; 256],
+    txt_len: u32
+}
+
+struct MdnsState {
+    initialized: u32,
+    sock: i32,
+    // "homeos", answered as homeos.local
+    host: [u8; 64],
+    ip: u32,
+    services: [MdnsService; 8],
+    service_count: u32,
+    queries_seen: u64,
+    answers_sent: u64
+}
+
+var mdns_state: MdnsState = undefined
+
+// ============================================================================
+// Small string and buffer helpers
+// ============================================================================
+
+fn mdns_str_len(s: u64): u32 {
+    var n: u32 = 0
+    while n < 4096 {
+        if @as(*u8, @ptrFromInt(s + n)).* == 0 { break }
+        n = n + 1
+    }
+    return n
+}
+
+fn mdns_copy_str(dst: u64, src: u64, max: u32): u32 {
+    var i: u32 = 0
+    while i < max - 1 {
+        let c: u8 = @as(*u8, @ptrFromInt(src + i)).*
+        if c == 0 { break }
+        @as(*u8, @ptrFromInt(dst + i)).* = c
+        i = i + 1
+    }
+    @as(*u8, @ptrFromInt(dst + i)).* = 0
+    return i
+}
+
+fn mdns_lower(c: u8): u8 {
+    if c >= 'A' and c <= 'Z' { return c + 32 }
+    return c
+}
+
+fn mdns_put_u16(buffer: u64, offset: u32, value: u16): u32 {
+    @as(*u8, @ptrFromInt(buffer + offset)).* = @as(u8, (value >> 8) & 0xFF)
+    @as(*u8, @ptrFromInt(buffer + offset + 1)).* = @as(u8, value & 0xFF)
+    return offset + 2
+}
+
+fn mdns_put_u32(buffer: u64, offset: u32, value: u32): u32 {
+    @as(*u8, @ptrFromInt(buffer + offset)).* = @as(u8, (value >> 24) & 0xFF)
+    @as(*u8, @ptrFromInt(buffer + offset + 1)).* = @as(u8, (value >> 16) & 0xFF)
+    @as(*u8, @ptrFromInt(buffer + offset + 2)).* = @as(u8, (value >> 8) & 0xFF)
+    @as(*u8, @ptrFromInt(buffer + offset + 3)).* = @as(u8, value & 0xFF)
+    return offset + 4
+}
+
+fn mdns_get_u16(buffer: u64, offset: u32): u16 {
+    let hi: u16 = @as(u16, @as(*u8, @ptrFromInt(buffer + offset)).*)
+    let lo: u16 = @as(u16, @as(*u8, @ptrFromInt(buffer + offset + 1)).*)
+    return (hi << 8) | lo
+}
+
+// ============================================================================
+// Name encoding
+// ============================================================================
+
+// Write a dotted name as DNS labels, terminated by a zero length byte.
+// Unlike the resolver's encoder this does not randomize case: a responder has
+// to echo names the way a sender will compare them.
+fn mdns_write_name(buffer: u64, offset: u32, name: u64): u32 {
+    var out: u32 = offset
+    var i: u32 = 0
+    let len: u32 = mdns_str_len(name)
+
+    while i < len {
+        // Measure the next label.
+        var label_len: u32 = 0
+        while i + label_len < len {
+            if @as(*u8, @ptrFromInt(name + i + label_len)).* == 0x2E { break }
+            label_len = label_len + 1
+        }
+        if label_len > 63 { label_len = 63 }
+
+        @as(*u8, @ptrFromInt(buffer + out)).* = @as(u8, label_len)
+        out = out + 1
+        var j: u32 = 0
+        while j < label_len {
+            @as(*u8, @ptrFromInt(buffer + out + j)).* = @as(*u8, @ptrFromInt(name + i + j)).*
+            j = j + 1
+        }
+        out = out + label_len
+        i = i + label_len + 1
+    }
+
+    @as(*u8, @ptrFromInt(buffer + out)).* = 0
+    return out + 1
+}
+
+// Walk past a name in a packet and return the offset after it. A compression
+// pointer ends the name wherever it appears, so the walk stops there.
+fn mdns_skip_name(packet: u64, len: u32, offset: u32): u32 {
+    var at: u32 = offset
+    while at < len {
+        let label_len: u8 = @as(*u8, @ptrFromInt(packet + at)).*
+        if label_len == 0 { return at + 1 }
+        if (label_len & 0xC0) == 0xC0 { return at + 2 }
+        at = at + 1 + @as(u32, label_len)
+    }
+    return len
+}
+
+// Compare a name in a packet against a dotted string, case-insensitively as
+// RFC 6762 §16 requires. Compression pointers are followed once; a pointer
+// chain is a malformed packet and is refused rather than walked.
+fn mdns_name_matches(packet: u64, len: u32, offset: u32, name: u64): u32 {
+    var at: u32 = offset
+    var pos: u32 = 0
+    let name_len: u32 = mdns_str_len(name)
+    var followed: u32 = 0
+
+    while at < len {
+        let label_len: u8 = @as(*u8, @ptrFromInt(packet + at)).*
+
+        if label_len == 0 {
+            // Name ended: it matches only if the string ended too.
+            if pos == name_len { return 1 }
+            return 0
+        }
+
+        if (label_len & 0xC0) == 0xC0 {
+            if followed != 0 { return 0 }
+            followed = 1
+            let lo: u8 = @as(*u8, @ptrFromInt(packet + at + 1)).*
+            at = ((@as(u32, label_len) & 0x3F) << 8) | @as(u32, lo)
+            if at >= len { return 0 }
+            continue
+        }
+
+        // A separator is expected before every label but the first.
+        if pos != 0 {
+            if pos >= name_len { return 0 }
+            if @as(*u8, @ptrFromInt(name + pos)).* != 0x2E { return 0 }
+            pos = pos + 1
+        }
+
+        if pos + @as(u32, label_len) > name_len { return 0 }
+        var k: u32 = 0
+        while k < @as(u32, label_len) {
+            let a: u8 = mdns_lower(@as(*u8, @ptrFromInt(packet + at + 1 + k)).*)
+            let b: u8 = mdns_lower(@as(*u8, @ptrFromInt(name + pos + k)).*)
+            if a != b { return 0 }
+            k = k + 1
+        }
+
+        pos = pos + @as(u32, label_len)
+        at = at + 1 + @as(u32, label_len)
+    }
+
+    return 0
+}
+
+// ============================================================================
+// Composed names
+// ============================================================================
+
+// "<host>.local"
+fn mdns_host_name(out: u64): u32 {
+    var n: u32 = mdns_copy_str(out, &mdns_state.host as u64, MDNS_MAX_NAME)
+    n = n + mdns_copy_str(out + n, ".local" as u64, 8)
+    return n
+}
+
+// "<service>.local", e.g. "_airplay._tcp.local"
+fn mdns_service_name(index: u32, out: u64): u32 {
+    var n: u32 = mdns_copy_str(out, &mdns_state.services[index].service as u64, MDNS_MAX_NAME)
+    n = n + mdns_copy_str(out + n, ".local" as u64, 8)
+    return n
+}
+
+// "<instance>.<service>.local"
+fn mdns_instance_name(index: u32, out: u64): u32 {
+    var n: u32 = mdns_copy_str(out, &mdns_state.services[index].instance as u64, MDNS_MAX_NAME)
+    @as(*u8, @ptrFromInt(out + n)).* = 0x2E
+    n = n + 1
+    n = n + mdns_service_name(index, out + n)
+    return n
+}
+
+// ============================================================================
+// Record writers
+// ============================================================================
+
+fn mdns_put_record_head(buffer: u64, offset: u32, name: u64, rtype: u16, flush: u32): u32 {
+    var out: u32 = mdns_write_name(buffer, offset, name)
+    out = mdns_put_u16(buffer, out, rtype)
+    var klass: u16 = MDNS_CLASS_IN
+    if flush != 0 { klass = klass | MDNS_CACHE_FLUSH }
+    out = mdns_put_u16(buffer, out, klass)
+    out = mdns_put_u32(buffer, out, MDNS_TTL)
+    return out
+}
+
+fn mdns_put_ptr(buffer: u64, offset: u32, index: u32): u32 {
+    var owner: [u8; 160]
+    var target: [u8; 160]
+    mdns_service_name(index, &owner as u64)
+    mdns_instance_name(index, &target as u64)
+
+    // PTR is shared ownership — many boxes answer the same browse name — so
+    // it never sets cache-flush.
+    var out: u32 = mdns_put_record_head(buffer, offset, &owner as u64, MDNS_TYPE_PTR, 0)
+    let len_at: u32 = out
+    out = mdns_put_u16(buffer, out, 0)
+    let start: u32 = out
+    out = mdns_write_name(buffer, out, &target as u64)
+    mdns_put_u16(buffer, len_at, @as(u16, out - start))
+    return out
+}
+
+fn mdns_put_srv(buffer: u64, offset: u32, index: u32): u32 {
+    var owner: [u8; 160]
+    var target: [u8; 96]
+    mdns_instance_name(index, &owner as u64)
+    mdns_host_name(&target as u64)
+
+    var out: u32 = mdns_put_record_head(buffer, offset, &owner as u64, MDNS_TYPE_SRV, 1)
+    let len_at: u32 = out
+    out = mdns_put_u16(buffer, out, 0)
+    let start: u32 = out
+    out = mdns_put_u16(buffer, out, 0)  // priority
+    out = mdns_put_u16(buffer, out, 0)  // weight
+    out = mdns_put_u16(buffer, out, mdns_state.services[index].port)
+    out = mdns_write_name(buffer, out, &target as u64)
+    mdns_put_u16(buffer, len_at, @as(u16, out - start))
+    return out
+}
+
+fn mdns_put_txt(buffer: u64, offset: u32, index: u32): u32 {
+    var owner: [u8; 160]
+    mdns_instance_name(index, &owner as u64)
+
+    var out: u32 = mdns_put_record_head(buffer, offset, &owner as u64, MDNS_TYPE_TXT, 1)
+    var txt_len: u32 = mdns_state.services[index].txt_len
+    // A TXT record is never empty on the wire: an empty one is a single zero
+    // length byte, and senders that read zero bytes treat the service as
+    // malformed rather than as having no keys.
+    if txt_len == 0 {
+        out = mdns_put_u16(buffer, out, 1)
+        @as(*u8, @ptrFromInt(buffer + out)).* = 0
+        return out + 1
+    }
+
+    out = mdns_put_u16(buffer, out, @as(u16, txt_len))
+    var i: u32 = 0
+    while i < txt_len {
+        @as(*u8, @ptrFromInt(buffer + out + i)).* = mdns_state.services[index].txt[i]
+        i = i + 1
+    }
+    return out + txt_len
+}
+
+fn mdns_put_a(buffer: u64, offset: u32): u32 {
+    var owner: [u8; 96]
+    mdns_host_name(&owner as u64)
+
+    var out: u32 = mdns_put_record_head(buffer, offset, &owner as u64, MDNS_TYPE_A, 1)
+    out = mdns_put_u16(buffer, out, 4)
+    out = mdns_put_u32(buffer, out, mdns_state.ip)
+    return out
+}
+
+// ============================================================================
+// Responding
+// ============================================================================
+
+fn mdns_send(buffer: u64, len: u32) {
+    if mdns_state.sock < 0 { return }
+    udp.udp_sendto(mdns_state.sock, @ptrFromInt(buffer), len, MDNS_GROUP, MDNS_PORT)
+    mdns_state.answers_sent = mdns_state.answers_sent + 1
+}
+
+// Write the fixed header of a response: mDNS replies carry no question
+// section and answer with QR=1, AA=1.
+fn mdns_put_header(buffer: u64, answers: u16): u32 {
+    var out: u32 = 0
+    out = mdns_put_u16(buffer, out, 0)        // ID is zero in mDNS
+    out = mdns_put_u16(buffer, out, 0x8400)   // QR=1, AA=1
+    out = mdns_put_u16(buffer, out, 0)        // QDCOUNT
+    out = mdns_put_u16(buffer, out, answers)  // ANCOUNT
+    out = mdns_put_u16(buffer, out, 0)        // NSCOUNT
+    out = mdns_put_u16(buffer, out, 0)        // ARCOUNT
+    return out
+}
+
+// Answer one service completely: PTR, SRV, TXT and the host's A record. A
+// sender that gets all four in one datagram never has to ask a second time.
+export fn mdns_announce_service(index: u32): u32 {
+    if mdns_state.initialized == 0 { return 0 }
+    if index >= mdns_state.service_count { return 0 }
+    if mdns_state.services[index].active == 0 { return 0 }
+
+    var buffer: [u8; 1400]
+    let base: u64 = &buffer as u64
+    var out: u32 = mdns_put_header(base, 4)
+    out = mdns_put_ptr(base, out, index)
+    out = mdns_put_srv(base, out, index)
+    out = mdns_put_txt(base, out, index)
+    out = mdns_put_a(base, out)
+    mdns_send(base, out)
+    return 1
+}
+
+export fn mdns_announce() {
+    var i: u32 = 0
+    while i < mdns_state.service_count {
+        mdns_announce_service(i)
+        i = i + 1
+    }
+}
+
+// Answer a single question. Returns the number of records written.
+fn mdns_answer_question(packet: u64, len: u32, name_at: u32, qtype: u16,
+                        buffer: u64, offset: *u32): u32 {
+    var written: u32 = 0
+    var scratch: [u8; 160]
+
+    // A record for this host.
+    if qtype == MDNS_TYPE_A or qtype == MDNS_TYPE_ANY {
+        mdns_host_name(&scratch as u64)
+        if mdns_name_matches(packet, len, name_at, &scratch as u64) == 1 {
+            offset.* = mdns_put_a(buffer, offset.*)
+            written = written + 1
+        }
+    }
+
+    var i: u32 = 0
+    while i < mdns_state.service_count {
+        if mdns_state.services[i].active == 0 {
+            i = i + 1
+            continue
+        }
+
+        // Browse: "_airplay._tcp.local PTR?"
+        if qtype == MDNS_TYPE_PTR or qtype == MDNS_TYPE_ANY {
+            mdns_service_name(i, &scratch as u64)
+            if mdns_name_matches(packet, len, name_at, &scratch as u64) == 1 {
+                offset.* = mdns_put_ptr(buffer, offset.*, i)
+                offset.* = mdns_put_srv(buffer, offset.*, i)
+                offset.* = mdns_put_txt(buffer, offset.*, i)
+                offset.* = mdns_put_a(buffer, offset.*)
+                written = written + 4
+            }
+        }
+
+        // Resolve: "Living Room._airplay._tcp.local SRV?/TXT?"
+        mdns_instance_name(i, &scratch as u64)
+        if mdns_name_matches(packet, len, name_at, &scratch as u64) == 1 {
+            if qtype == MDNS_TYPE_SRV or qtype == MDNS_TYPE_ANY {
+                offset.* = mdns_put_srv(buffer, offset.*, i)
+                offset.* = mdns_put_a(buffer, offset.*)
+                written = written + 2
+            }
+            if qtype == MDNS_TYPE_TXT or qtype == MDNS_TYPE_ANY {
+                offset.* = mdns_put_txt(buffer, offset.*, i)
+                written = written + 1
+            }
+        }
+
+        i = i + 1
+    }
+
+    return written
+}
+
+// Read one waiting datagram and answer whatever of it we own. Returns the
+// number of records sent, so a caller can tell "nothing asked" from "asked
+// about something else".
+export fn mdns_poll(): u32 {
+    if mdns_state.initialized == 0 { return 0 }
+    if mdns_state.sock < 0 { return 0 }
+
+    var packet: [u8; 1400]
+    var from_ip: u32 = 0
+    var from_port: u16 = 0
+    let got: i32 = udp.udp_recvfrom(mdns_state.sock, &packet as *u8, MDNS_BUFFER,
+                                    &from_ip, &from_port)
+    if got <= 0 { return 0 }
+
+    let len: u32 = @as(u32, got)
+    if len < 12 { return 0 }
+
+    let base: u64 = &packet as u64
+    let flags: u16 = mdns_get_u16(base, 2)
+    // Top bit set means this is somebody's response, not a question.
+    if (flags & 0x8000) != 0 { return 0 }
+
+    let qdcount: u16 = mdns_get_u16(base, 4)
+    if qdcount == 0 { return 0 }
+    mdns_state.queries_seen = mdns_state.queries_seen + 1
+
+    var reply: [u8; 1400]
+    let reply_base: u64 = &reply as u64
+    var out: u32 = mdns_put_header(reply_base, 0)
+    var answers: u32 = 0
+
+    var at: u32 = 12
+    var q: u32 = 0
+    while q < @as(u32, qdcount) {
+        if at >= len { break }
+        let name_at: u32 = at
+        at = mdns_skip_name(base, len, at)
+        if at + 4 > len { break }
+        let qtype: u16 = mdns_get_u16(base, at)
+        at = at + 4
+
+        answers = answers + mdns_answer_question(base, len, name_at, qtype, reply_base, &out)
+        q = q + 1
+    }
+
+    if answers == 0 { return 0 }
+
+    // Backfill the answer count now that it is known.
+    mdns_put_u16(reply_base, 6, @as(u16, answers))
+    mdns_send(reply_base, out)
+    return answers
+}
+
+// ============================================================================
+// Registration and setup
+// ============================================================================
+
+export fn mdns_register_service(instance: u64, service: u64, port: u16,
+                                txt: u64, txt_len: u32): i32 {
+    if mdns_state.service_count >= MDNS_MAX_SERVICES { return -1 }
+
+    let index: u32 = mdns_state.service_count
+    let entry: *MdnsService = &mdns_state.services[index]
+    foundation.mem_set(entry as *u8, 0, @sizeOf(MdnsService))
+
+    mdns_copy_str(&entry.instance as u64, instance, MDNS_MAX_NAME)
+    mdns_copy_str(&entry.service as u64, service, MDNS_MAX_NAME)
+    entry.port = port
+
+    var n: u32 = txt_len
+    if n > MDNS_MAX_TXT { n = MDNS_MAX_TXT }
+    var i: u32 = 0
+    while i < n {
+        entry.txt[i] = @as(*u8, @ptrFromInt(txt + i)).*
+        i = i + 1
+    }
+    entry.txt_len = n
+    entry.active = 1
+
+    mdns_state.service_count = index + 1
+    return index as i32
+}
+
+// Append one "key=value" to a TXT buffer in DNS-SD form: a length byte then
+// that many bytes. Returns the new offset, or the offset unchanged if the
+// entry would not fit or is longer than a single length byte can describe.
+export fn mdns_txt_add(buffer: u64, offset: u32, entry: u64, capacity: u32): u32 {
+    let len: u32 = mdns_str_len(entry)
+    if len == 0 or len > 255 { return offset }
+    if offset + 1 + len > capacity { return offset }
+
+    @as(*u8, @ptrFromInt(buffer + offset)).* = @as(u8, len)
+    var i: u32 = 0
+    while i < len {
+        @as(*u8, @ptrFromInt(buffer + offset + 1 + i)).* = @as(*u8, @ptrFromInt(entry + i)).*
+        i = i + 1
+    }
+    return offset + 1 + len
+}
+
+export fn mdns_set_address(ip: u32) {
+    mdns_state.ip = ip
+}
+
+export fn mdns_service_count(): u32 {
+    return mdns_state.service_count
+}
+
+export fn mdns_queries_seen(): u64 {
+    return mdns_state.queries_seen
+}
+
+export fn mdns_answers_sent(): u64 {
+    return mdns_state.answers_sent
+}
+
+export fn mdns_init(host: u64, ip: u32): u32 {
+    foundation.mem_set(&mdns_state as *u8, 0, @sizeOf(MdnsState))
+    mdns_state.sock = -1
+    mdns_copy_str(&mdns_state.host as u64, host, MDNS_MAX_NAME)
+    mdns_state.ip = ip
+
+    let handle: i32 = udp.udp_socket()
+    if handle < 0 { return 0 }
+
+    // Every responder on the link shares port 5353 — binding it is the whole
+    // point, not a conflict to avoid.
+    if udp.udp_bind(handle, 0, MDNS_PORT) < 0 {
+        udp.udp_close(handle)
+        return 0
+    }
+    if udp.udp_join_multicast_group(handle, MDNS_GROUP, 0) < 0 {
+        udp.udp_close(handle)
+        return 0
+    }
+    // RFC 6762 §11: link-local only. A TTL above 1 would leak the LAN's
+    // service list to anything routing multicast.
+    udp.udp_set_multicast_ttl(handle, 1)
+
+    mdns_state.sock = handle
+    mdns_state.initialized = 1
+    return 1
+}
