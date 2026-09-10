@@ -8,15 +8,20 @@
 //   pair-verify  M1..M4   proves both ends still hold those long-term keys
 //                         and derives the session keys for this connection
 //
-// pair-verify is implemented here in full. pair-setup's framing is here and
-// its SRP step is not: SRP-6a over the RFC 5054 3072-bit group needs modular
-// exponentiation on 96-limb numbers, and squaring those needs 192 limbs of
-// product. rsa.home's BigInt is [u32; 128], sized for RSA-2048, so its
-// bigint_mul would silently truncate rather than fail. Widening it under RSA,
-// which has its own known-answer test and its own stack budget, is a change
-// that deserves its own measurement rather than being smuggled in here.
-// pair-setup therefore answers with a documented error instead of a wrong
-// proof, and says so in the log.
+// pair-verify is implemented in full. pair-setup runs its SRP-6a exchange
+// through M1..M4 -- salt and public value out, client proof checked, server
+// proof back -- over the RFC 5054 3072-bit group in crypto/srp.home.
+//
+// M5/M6 is not here. That is the step where the two ends swap long-term
+// Ed25519 identities under the SRP session key, and the obstacle is not
+// cryptographic any more: there is nowhere to keep a pairing. Everything this
+// box learns about a controller is lost at reboot, so storing a key it could
+// never check again would be theatre. That is also why pair-verify M3 still
+// rejects: it has no stored key to verify a signature against.
+//
+// The setup code is a constant. Until it comes from the television's display,
+// SRP here proves both ends read the same source code rather than that a
+// person is in the room.
 //
 // The verify handshake, in full:
 //
@@ -36,6 +41,7 @@ import "../crypto/ed25519.home" as ed25519
 import "../crypto/sha512.home" as sha512
 import "../crypto/chacha20.home" as chacha
 import "../security/random.home" as random
+import "../crypto/srp.home" as srp
 
 // TLV8 item types, as HomeKit numbers them.
 const TLV_METHOD: u8 = 0x00
@@ -75,7 +81,11 @@ struct PairState {
   session_key: [u8; 32],
 
   verifies_completed: u64,
-  verifies_rejected: u64
+  verifies_rejected: u64,
+
+  setup_active: u32,
+  setups_completed: u64,
+  setups_rejected: u64
 }
 
 var pair_state: PairState = undefined
@@ -398,18 +408,121 @@ export fn pair_verify_handle(body: u64, len: u32, out: u64): u32 {
 // pair-setup
 // ============================================================================
 
-// The framing is here so the sender gets a well-formed refusal at the right
-// state rather than a closed connection, and so the SRP work has somewhere to
-// land. See the note at the top for why the SRP step is absent.
+// M1 -> M2: hand back the salt and our SRP public value.
+fn pair_setup_m1(out: u64): u32 {
+  srp.srp_init()
+
+  // A fixed setup code stands in for one shown on the television. It has to
+  // come from the display before this is a real defence: a PIN an attacker
+  // already knows makes SRP prove only that both ends read the same source.
+  var user: [u8; 11]
+  var i: u32 = 0
+  let name: u64 = @intFromPtr("Pair-Setup")
+  while i < 10 {
+    user[i] = @as(*u8, @ptrFromInt(name + i)).*
+    i = i + 1
+  }
+  user[10] = 0
+
+  var pass: [u8; 9]
+  let code: u64 = @intFromPtr("12345678")
+  i = 0
+  while i < 8 {
+    pass[i] = @as(*u8, @ptrFromInt(code + i)).*
+    i = i + 1
+  }
+  pass[8] = 0
+
+  var salt: [u8; 16]
+  random.random_get_bytes(@intFromPtr(&salt), 16)
+
+  srp.srp_set_credentials(@intFromPtr(&user), 10, @intFromPtr(&pass), 8,
+                          @intFromPtr(&salt))
+
+  var public_b: [u8; 384]
+  srp.srp_generate_public(@intFromPtr(&public_b))
+  pair_state.setup_active = 1
+
+  var n: u32 = tlv_put_byte(out, 0, TLV_STATE, 2)
+  n = tlv_put(out, n, TLV_SALT, @intFromPtr(&salt), 16)
+  n = tlv_put(out, n, TLV_PUBLIC_KEY, @intFromPtr(&public_b), 384)
+  return n
+}
+
+// M3 -> M4: take the controller's A and proof, answer with ours.
+fn pair_setup_m3(body: u64, len: u32, out: u64): u32 {
+  if pair_state.setup_active == 0 {
+    return pair_error_response(out, 4, TLV_ERROR_UNKNOWN)
+  }
+
+  var public_a: [u8; 384]
+  if tlv_get(body, len, TLV_PUBLIC_KEY, @intFromPtr(&public_a), 384) != 384 {
+    pair_state.setup_active = 0
+    return pair_error_response(out, 4, TLV_ERROR_AUTHENTICATION)
+  }
+
+  var proof: [u8; 64]
+  if tlv_get(body, len, TLV_PROOF, @intFromPtr(&proof), 64) != 64 {
+    pair_state.setup_active = 0
+    return pair_error_response(out, 4, TLV_ERROR_AUTHENTICATION)
+  }
+
+  // A ≡ 0 mod N forces the shared secret to zero whatever the verifier is, so
+  // RFC 5054 requires abandoning the exchange rather than continuing.
+  if srp.srp_accept_client_public(@intFromPtr(&public_a)) == 0 {
+    pair_state.setup_active = 0
+    foundation.serial_write_string("[AIRPLAY] pair-setup refused a degenerate client public\n")
+    return pair_error_response(out, 4, TLV_ERROR_AUTHENTICATION)
+  }
+
+  var user: [u8; 11]
+  var i: u32 = 0
+  let name: u64 = @intFromPtr("Pair-Setup")
+  while i < 10 {
+    user[i] = @as(*u8, @ptrFromInt(name + i)).*
+    i = i + 1
+  }
+  user[10] = 0
+
+  if srp.srp_verify_client_proof(@intFromPtr(&user), 10, @intFromPtr(&proof)) == 0 {
+    pair_state.setup_active = 0
+    pair_state.setups_rejected = pair_state.setups_rejected + 1
+    foundation.serial_write_string("[AIRPLAY] pair-setup rejected: wrong setup code\n")
+    return pair_error_response(out, 4, TLV_ERROR_AUTHENTICATION)
+  }
+
+  var server_proof: [u8; 64]
+  srp.srp_compute_server_proof(@intFromPtr(&server_proof))
+
+  pair_state.setups_completed = pair_state.setups_completed + 1
+  foundation.serial_write_string("[AIRPLAY] pair-setup proof accepted\n")
+
+  var n: u32 = tlv_put_byte(out, 0, TLV_STATE, 4)
+  n = tlv_put(out, n, TLV_PROOF, @intFromPtr(&server_proof), 64)
+  return n
+}
+
+// Dispatch a POST /pair-setup body.
+//
+// M5/M6 -- the exchange of long-term keys under the SRP session key -- is not
+// here. Without it the controller's Ed25519 public key is never stored, which
+// is why pair-verify still has nothing to check a signature against. The
+// cryptography that step needs now exists; what it also needs is somewhere to
+// persist a pairing across a reboot, and this box has no settings store.
 export fn pair_setup_handle(body: u64, len: u32, out: u64): u32 {
   var state: [u8; 1]
   if tlv_get(body, len, TLV_STATE, @intFromPtr(&state), 1) != 1 {
     return pair_error_response(out, 2, TLV_ERROR_UNKNOWN)
   }
 
-  let reply_state: u8 = state[0] + 1
-  foundation.serial_write_string("[AIRPLAY] pair-setup refused: SRP-6a not implemented\n")
-  return pair_error_response(out, reply_state, TLV_ERROR_UNAVAILABLE)
+  if state[0] == 1 { return pair_setup_m1(out) }
+  if state[0] == 3 { return pair_setup_m3(body, len, out) }
+
+  if state[0] == 5 {
+    foundation.serial_write_string("[AIRPLAY] pair-setup M5 refused: no pairing store\n")
+    return pair_error_response(out, 6, TLV_ERROR_UNAVAILABLE)
+  }
+  return pair_error_response(out, 2, TLV_ERROR_UNKNOWN)
 }
 
 export fn pair_verifies_completed(): u64 {
