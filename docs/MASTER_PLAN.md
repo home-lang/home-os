@@ -569,6 +569,9 @@ These were referenced by files already in the set and were not listed, which is 
 - `kernel/src/drivers/nvme.home`
 - `kernel/src/net/udp.home`
 - `kernel/src/net/dns.home`
+- `kernel/src/net/mdns.home`
+- `kernel/src/net/rtsp.home`
+- `kernel/src/net/airplay_pair.home`
 - `kernel/src/drivers/pci.home`
 - `kernel/src/drivers/e1000.home`
 - `kernel/src/mm/swap.home`
@@ -587,6 +590,8 @@ These were referenced by files already in the set and were not listed, which is 
 - `kernel/src/crypto/crypto_selftest.home`
 - `kernel/src/crypto/blake2s.home`
 - `kernel/src/crypto/sha256.home`
+- `kernel/src/crypto/sha512.home`
+- `kernel/src/crypto/ed25519.home`
 - `kernel/src/crypto/curve25519.home`
 - `kernel/src/pkg/pantry_local.home` — needed by Phase 3 `pantry-local-install`: reads a signed package, verifies it against the key built into the kernel, and installs it only if that succeeds.
 - `kernel/src/crypto/rsa.home` — the only asymmetric primitive in the tree, and what a signed package rests on. Added to the set when it gained a known-answer test; before that it had never been executed.
